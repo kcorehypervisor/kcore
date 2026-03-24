@@ -100,15 +100,15 @@ pub async fn start(
     vm_id: &str,
     target_node: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = client::controller_client(info).await?;
-    client
-        .start_vm(proto::StartVmRequest {
-            vm_id: vm_id.to_string(),
-            target_node: target_node.unwrap_or_default(),
-        })
-        .await?;
-    println!("VM '{vm_id}' desired state set to running (declarative apply started)");
-    Ok(())
+    // Legacy alias for set desired-state=running.
+    set_desired_state(
+        info,
+        vm_id,
+        proto::VmDesiredState::Running,
+        target_node,
+        "running",
+    )
+    .await
 }
 
 pub async fn stop(
@@ -116,15 +116,33 @@ pub async fn stop(
     vm_id: &str,
     target_node: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Legacy alias for set desired-state=stopped.
+    set_desired_state(
+        info,
+        vm_id,
+        proto::VmDesiredState::Stopped,
+        target_node,
+        "stopped",
+    )
+    .await
+}
+
+pub async fn set_desired_state(
+    info: &ConnectionInfo,
+    vm_id: &str,
+    desired_state: proto::VmDesiredState,
+    target_node: Option<String>,
+    state_label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = client::controller_client(info).await?;
     client
-        .stop_vm(proto::StopVmRequest {
+        .set_vm_desired_state(proto::SetVmDesiredStateRequest {
             vm_id: vm_id.to_string(),
-            force: false,
+            desired_state: desired_state as i32,
             target_node: target_node.unwrap_or_default(),
         })
         .await?;
-    println!("VM '{vm_id}' desired state set to stopped (declarative apply started)");
+    println!("VM '{vm_id}' desired state set to {state_label} (declarative apply started)");
     Ok(())
 }
 

@@ -47,8 +47,7 @@
 
 ## Practical Priorities
 
-1. Complete lifecycle API cleanup: rename/deprecate imperative-looking start/stop semantics and remove stale flags that do not apply in declarative mode.
-2. Add certificate lifecycle operations (rotation, expiry alerts, revocation strategy).
-3. Add fine-grained authorization on top of mTLS identity.
-4. Implement real VM state reconciliation in `sync_vm_state`.
-5. Improve scheduler to include resource checks and placement policy.
+1. Add certificate lifecycle operations (rotation, expiry alerts, revocation strategy).
+2. Add fine-grained authorization on top of mTLS identity.
+3. Implement real VM state reconciliation in `sync_vm_state`.
+4. Improve scheduler to include resource checks and placement policy.

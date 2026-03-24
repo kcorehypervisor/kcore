@@ -1,7 +1,10 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair,
+};
 
 #[derive(Debug, Clone)]
 pub struct ClusterPkiPaths {
@@ -69,7 +72,8 @@ fn sign_cert(
     let ca_key = KeyPair::from_pem(ca_key_pem).map_err(|e| format!("loading CA key: {e}"))?;
     let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem, ca_key)
         .map_err(|e| format!("loading CA cert: {e}"))?;
-    let ca_cert = Certificate::from_params(ca_params).map_err(|e| format!("building CA cert: {e}"))?;
+    let ca_cert =
+        Certificate::from_params(ca_params).map_err(|e| format!("building CA cert: {e}"))?;
 
     let cert = Certificate::from_params(params).map_err(|e| format!("building cert: {e}"))?;
     let cert_pem = cert
@@ -81,7 +85,8 @@ fn sign_cert(
 
 fn write_file(path: &Path, content: &str, mode: u32) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
 
     std::fs::write(path, content).map_err(|e| format!("writing {}: {e}", path.display()))?;
@@ -180,18 +185,18 @@ pub fn load_install_pki(certs_dir: &Path, node_host: &str) -> Result<InstallPkiP
     let kctl_cert_path = certs_dir.join("kctl.crt");
     let kctl_key_path = certs_dir.join("kctl.key");
 
-    let ca_cert_pem =
-        std::fs::read_to_string(&ca_cert_path).map_err(|e| format!("reading {}: {e}", ca_cert_path.display()))?;
-    let ca_key_pem =
-        std::fs::read_to_string(&ca_key_path).map_err(|e| format!("reading {}: {e}", ca_key_path.display()))?;
+    let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)
+        .map_err(|e| format!("reading {}: {e}", ca_cert_path.display()))?;
+    let ca_key_pem = std::fs::read_to_string(&ca_key_path)
+        .map_err(|e| format!("reading {}: {e}", ca_key_path.display()))?;
     let controller_cert_pem = std::fs::read_to_string(&controller_cert_path)
         .map_err(|e| format!("reading {}: {e}", controller_cert_path.display()))?;
     let controller_key_pem = std::fs::read_to_string(&controller_key_path)
         .map_err(|e| format!("reading {}: {e}", controller_key_path.display()))?;
-    let kctl_cert_pem =
-        std::fs::read_to_string(&kctl_cert_path).map_err(|e| format!("reading {}: {e}", kctl_cert_path.display()))?;
-    let kctl_key_pem =
-        std::fs::read_to_string(&kctl_key_path).map_err(|e| format!("reading {}: {e}", kctl_key_path.display()))?;
+    let kctl_cert_pem = std::fs::read_to_string(&kctl_cert_path)
+        .map_err(|e| format!("reading {}: {e}", kctl_cert_path.display()))?;
+    let kctl_key_pem = std::fs::read_to_string(&kctl_key_path)
+        .map_err(|e| format!("reading {}: {e}", kctl_key_path.display()))?;
 
     let (node_cert_pem, node_key_pem) = sign_cert(
         Some(node_host),

@@ -16,8 +16,7 @@ service Controller {
   // VM operations (declarative desired-state API managed by controller)
   rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
   rpc DeleteVm(DeleteVmRequest) returns (DeleteVmResponse);
-  rpc StartVm(StartVmRequest) returns (StartVmResponse);
-  rpc StopVm(StopVmRequest) returns (StopVmResponse);
+  rpc SetVmDesiredState(SetVmDesiredStateRequest) returns (SetVmDesiredStateResponse);
   rpc GetVm(GetVmRequest) returns (GetVmResponse);
   rpc ListVms(ListVmsRequest) returns (ListVmsResponse);
   
@@ -89,22 +88,19 @@ message DeleteVmResponse {
   bool success = 1;
 }
 
-message StartVmRequest {
-  string vm_id = 1;
-  string target_node = 2;  // Optional
+enum VmDesiredState {
+  VM_DESIRED_STATE_UNSPECIFIED = 0;
+  VM_DESIRED_STATE_RUNNING = 1;
+  VM_DESIRED_STATE_STOPPED = 2;
 }
 
-message StartVmResponse {
-  VmState state = 1;
-}
-
-message StopVmRequest {
+message SetVmDesiredStateRequest {
   string vm_id = 1;
-  bool force = 2;           // Deprecated/ignored in declarative mode
+  VmDesiredState desired_state = 2;
   string target_node = 3;  // Optional
 }
 
-message StopVmResponse {
+message SetVmDesiredStateResponse {
   VmState state = 1;
 }
 

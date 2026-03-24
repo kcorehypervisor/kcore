@@ -105,17 +105,10 @@ impl proto::node_compute_server::NodeCompute for ComputeService {
         Err(Status::unimplemented(DECLARATIVE_MSG))
     }
 
-    async fn start_vm(
+    async fn set_vm_desired_state(
         &self,
-        _request: Request<proto::StartVmRequest>,
-    ) -> Result<Response<proto::StartVmResponse>, Status> {
-        Err(Status::unimplemented(DECLARATIVE_MSG))
-    }
-
-    async fn stop_vm(
-        &self,
-        _request: Request<proto::StopVmRequest>,
-    ) -> Result<Response<proto::StopVmResponse>, Status> {
+        _request: Request<proto::SetVmDesiredStateRequest>,
+    ) -> Result<Response<proto::SetVmDesiredStateResponse>, Status> {
         Err(Status::unimplemented(DECLARATIVE_MSG))
     }
 

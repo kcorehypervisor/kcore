@@ -11,8 +11,7 @@ service NodeCompute {
   rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
   rpc UpdateVm(UpdateVmRequest) returns (UpdateVmResponse);
   rpc DeleteVm(DeleteVmRequest) returns (DeleteVmResponse);
-  rpc StartVm(StartVmRequest) returns (StartVmResponse);
-  rpc StopVm(StopVmRequest) returns (StopVmResponse);
+  rpc SetVmDesiredState(SetVmDesiredStateRequest) returns (SetVmDesiredStateResponse);
   rpc RebootVm(RebootVmRequest) returns (RebootVmResponse);
   rpc GetVm(GetVmRequest) returns (GetVmResponse);
   rpc ListVms(ListVmsRequest) returns (ListVmsResponse);
@@ -121,22 +120,18 @@ message DeleteVmRequest {
 
 message DeleteVmResponse {}
 
-// StartVm
-message StartVmRequest {
+enum VmDesiredState {
+  VM_DESIRED_STATE_UNSPECIFIED = 0;
+  VM_DESIRED_STATE_RUNNING = 1;
+  VM_DESIRED_STATE_STOPPED = 2;
+}
+
+message SetVmDesiredStateRequest {
   string vm_id = 1;
+  VmDesiredState desired_state = 2;
 }
 
-message StartVmResponse {
-  VmStatus status = 1;
-}
-
-// StopVm
-message StopVmRequest {
-  string vm_id = 1;
-  bool force = 2;
-}
-
-message StopVmResponse {
+message SetVmDesiredStateResponse {
   VmStatus status = 1;
 }
 

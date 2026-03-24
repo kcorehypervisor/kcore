@@ -68,7 +68,21 @@ kctl delete vm web-01
 
 ## 4) Declarative VM lifecycle operations
 
-`start` and `stop` are reconciliation requests (desired-state updates), not direct runtime hypervisor calls.
+`set vm --state ...` is the canonical declarative lifecycle command. `start` and `stop` are compatibility aliases.
+
+Set desired running state:
+
+```bash
+kctl set vm web-01 --state running
+```
+
+Set desired stopped state:
+
+```bash
+kctl set vm web-01 --state stopped
+```
+
+Compatibility aliases:
 
 Start (desired running state):
 
@@ -136,6 +150,14 @@ Apply a NixOS configuration to the controller:
 kctl apply -f ./controller-config.nix
 ```
 
+Targeting behavior:
+
+- `kctl apply` always targets the **controller endpoint**, selected by:
+  - `--controller <host:port>`, or
+  - current context in `~/.kcore/config`.
+- It does **not** select arbitrary nodes.
+- For node-specific apply, use `kctl --node <host:9091> node apply-nix -f ...`.
+
 Preview only:
 
 ```bash
@@ -150,6 +172,7 @@ Top-level commands:
 - `kctl create cluster ...`
 - `kctl delete vm ...`
 - `kctl delete image ...`
+- `kctl set vm ... --state <running|stopped>`
 - `kctl start vm ...`
 - `kctl stop vm ...`
 - `kctl get vms [name]`
@@ -173,5 +196,5 @@ New environment:
 Day-2 operations:
 
 1. inspect with `kctl get ...`
-2. adjust desired VM running state with `kctl start/stop vm ...`
+2. adjust desired VM running state with `kctl set vm ... --state ...` (or `kctl start/stop vm ...`)
 3. update configs with `kctl node apply-nix ...` or `kctl apply ...`
