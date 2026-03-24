@@ -7,7 +7,7 @@ mod pki;
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -55,6 +55,11 @@ enum Command {
     Stop {
         #[command(subcommand)]
         resource: StopResource,
+    },
+    /// Set desired resource state (declarative)
+    Set {
+        #[command(subcommand)]
+        resource: SetResource,
     },
     /// Get or list resources
     Get {
@@ -164,6 +169,27 @@ enum StopResource {
     Vm {
         /// VM ID or name
         vm_id: String,
+        /// Target node (optional)
+        #[arg(long = "target-node")]
+        target_node: Option<String>,
+    },
+}
+
+#[derive(Clone, ValueEnum)]
+enum DesiredVmState {
+    Running,
+    Stopped,
+}
+
+#[derive(Subcommand)]
+enum SetResource {
+    /// Set desired state for a virtual machine (declarative apply)
+    Vm {
+        /// VM ID or name
+        vm_id: String,
+        /// Desired VM state
+        #[arg(long, value_enum)]
+        state: DesiredVmState,
         /// Target node (optional)
         #[arg(long = "target-node")]
         target_node: Option<String>,
@@ -288,9 +314,7 @@ async fn main() {
                 .config
                 .clone()
                 .unwrap_or_else(config::default_config_path);
-            let certs_path = certs_dir
-                .clone()
-                .unwrap_or_else(config::default_certs_dir);
+            let certs_path = certs_dir.clone().unwrap_or_else(config::default_certs_dir);
             commands::cluster::create(&config_path, controller, &certs_path, context, *force)
         }
 
@@ -316,14 +340,30 @@ async fn main() {
         }
 
         Command::Stop {
+            resource: StopResource::Vm { vm_id, target_node },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::vm::stop(&info, vm_id, target_node.clone()).await
+        }
+
+        Command::Set {
             resource:
-                StopResource::Vm {
+                SetResource::Vm {
                     vm_id,
+                    state,
                     target_node,
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::vm::stop(&info, vm_id, target_node.clone()).await
+            let (desired, label) = match state {
+                DesiredVmState::Running => {
+                    (client::controller_proto::VmDesiredState::Running, "running")
+                }
+                DesiredVmState::Stopped => {
+                    (client::controller_proto::VmDesiredState::Stopped, "stopped")
+                }
+            };
+            commands::vm::set_desired_state(&info, vm_id, desired, target_node.clone(), label).await
         }
 
         Command::Get {

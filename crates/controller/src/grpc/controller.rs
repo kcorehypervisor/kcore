@@ -78,6 +78,28 @@ impl ControllerService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(format!("node {node_id} not found")))
     }
+
+    async fn set_vm_desired_state_internal(
+        &self,
+        vm_id: &str,
+        target_node: &str,
+        auto_start: bool,
+    ) -> Result<i32, Status> {
+        let node = self.resolve_node_for_vm(vm_id, target_node)?;
+        let updated = self
+            .db
+            .set_vm_auto_start(vm_id, auto_start)
+            .map_err(|e| Status::internal(format!("updating vm desired state: {e}")))?;
+        if !updated {
+            return Err(Status::not_found(format!("VM {vm_id} not found")));
+        }
+        self.push_config_to_node(&node).await?;
+        Ok(if auto_start {
+            controller_proto::VmState::Running as i32
+        } else {
+            controller_proto::VmState::Stopped as i32
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -256,42 +278,29 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
-    async fn start_vm(
+    async fn set_vm_desired_state(
         &self,
-        request: Request<controller_proto::StartVmRequest>,
-    ) -> Result<Response<controller_proto::StartVmResponse>, Status> {
+        request: Request<controller_proto::SetVmDesiredStateRequest>,
+    ) -> Result<Response<controller_proto::SetVmDesiredStateResponse>, Status> {
         let req = request.into_inner();
-        let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
-        let updated = self
-            .db
-            .set_vm_auto_start(&req.vm_id, true)
-            .map_err(|e| Status::internal(format!("updating vm desired state: {e}")))?;
-        if !updated {
-            return Err(Status::not_found(format!("VM {} not found", req.vm_id)));
-        }
-        self.push_config_to_node(&node).await?;
-        let state = controller_proto::VmState::Running as i32;
+        let auto_start = match controller_proto::VmDesiredState::try_from(req.desired_state)
+            .unwrap_or(controller_proto::VmDesiredState::Unspecified)
+        {
+            controller_proto::VmDesiredState::Running => true,
+            controller_proto::VmDesiredState::Stopped => false,
+            controller_proto::VmDesiredState::Unspecified => {
+                return Err(Status::invalid_argument(
+                    "desired_state must be RUNNING or STOPPED",
+                ));
+            }
+        };
+        let state = self
+            .set_vm_desired_state_internal(&req.vm_id, &req.target_node, auto_start)
+            .await?;
 
-        Ok(Response::new(controller_proto::StartVmResponse { state }))
-    }
-
-    async fn stop_vm(
-        &self,
-        request: Request<controller_proto::StopVmRequest>,
-    ) -> Result<Response<controller_proto::StopVmResponse>, Status> {
-        let req = request.into_inner();
-        let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
-        let updated = self
-            .db
-            .set_vm_auto_start(&req.vm_id, false)
-            .map_err(|e| Status::internal(format!("updating vm desired state: {e}")))?;
-        if !updated {
-            return Err(Status::not_found(format!("VM {} not found", req.vm_id)));
-        }
-        self.push_config_to_node(&node).await?;
-        let state = controller_proto::VmState::Stopped as i32;
-
-        Ok(Response::new(controller_proto::StopVmResponse { state }))
+        Ok(Response::new(controller_proto::SetVmDesiredStateResponse {
+            state,
+        }))
     }
 
     async fn get_vm(

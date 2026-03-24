@@ -83,7 +83,10 @@ async fn run_test_then_switch(path: PathBuf) {
     }
 }
 
-fn write_bootstrap_pki_at(req: &proto::InstallToDiskRequest, base_dir: &PathBuf) -> Result<(), Status> {
+fn write_bootstrap_pki_at(
+    req: &proto::InstallToDiskRequest,
+    base_dir: &PathBuf,
+) -> Result<(), Status> {
     let certs = [
         ("ca.crt", &req.ca_cert_pem),
         ("node.crt", &req.node_cert_pem),

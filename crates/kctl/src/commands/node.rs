@@ -76,7 +76,8 @@ pub async fn install(
     join_controller: &str,
     certs_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let node_host = pki::host_from_address(&info.address).map_err(|e| format!("node address: {e}"))?;
+    let node_host =
+        pki::host_from_address(&info.address).map_err(|e| format!("node address: {e}"))?;
     let install_pki =
         pki::load_install_pki(certs_dir, &node_host).map_err(|e| format!("loading PKI: {e}"))?;
 

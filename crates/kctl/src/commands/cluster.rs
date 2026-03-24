@@ -30,8 +30,15 @@ pub fn create(
     config::save_config(config_path, &cfg)?;
 
     println!("Cluster PKI generated in {}", pki_paths.certs_dir.display());
-    println!("Context '{}' saved to {}", context_name, config_path.display());
-    println!("Controller certificate: {}", pki_paths.controller_cert.display());
+    println!(
+        "Context '{}' saved to {}",
+        context_name,
+        config_path.display()
+    );
+    println!(
+        "Controller certificate: {}",
+        pki_paths.controller_cert.display()
+    );
     println!("Controller key: {}", pki_paths.controller_key.display());
     println!("CA certificate: {}", pki_paths.ca_cert.display());
     println!("mTLS is now the default for this context.");
@@ -48,14 +55,7 @@ mod tests {
         let config_path = temp.path().join("config.yaml");
         let certs_dir = temp.path().join("certs");
 
-        create(
-            &config_path,
-            "127.0.0.1:9090",
-            &certs_dir,
-            "test",
-            false,
-        )
-        .expect("create cluster");
+        create(&config_path, "127.0.0.1:9090", &certs_dir, "test", false).expect("create cluster");
 
         let cfg = config::load_config(&config_path).expect("load config");
         let ctx = cfg.contexts.get("test").expect("context");

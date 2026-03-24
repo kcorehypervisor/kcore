@@ -6,7 +6,7 @@ The node VM Nix config is generated in the controller flow when VM state changes
 
 - After `CreateVm` stores the VM in DB, it calls `push_config_to_node(...)`.
 - After `DeleteVm` removes the VM in DB, it calls `push_config_to_node(...)`.
-- `StartVm` and `StopVm` are declarative: controller updates VM `auto_start` desired state in DB, then calls `push_config_to_node(...)`.
+- `SetVmDesiredState` is declarative: controller updates VM `auto_start` desired state in DB, then calls `push_config_to_node(...)`.
 - `push_config_to_node(...)` builds Nix via `generate_node_config(...)` and sends it with `rebuild: true`.
 
 ### Function headers only

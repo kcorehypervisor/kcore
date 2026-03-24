@@ -177,12 +177,9 @@ pub fn resolve_node(
         let ctx_key = ctx.and_then(|c| c.key.clone());
         let ctx_ca = ctx.and_then(|c| c.ca.clone());
         (
-            ctx_cert
-                .or(Some(default_certs.join("kctl.crt").display().to_string())),
-            ctx_key
-                .or(Some(default_certs.join("kctl.key").display().to_string())),
-            ctx_ca
-                .or(Some(default_certs.join("ca.crt").display().to_string())),
+            ctx_cert.or(Some(default_certs.join("kctl.crt").display().to_string())),
+            ctx_key.or(Some(default_certs.join("kctl.key").display().to_string())),
+            ctx_ca.or(Some(default_certs.join("ca.crt").display().to_string())),
         )
     };
 
