@@ -107,7 +107,7 @@ pub async fn start(
             target_node: target_node.unwrap_or_default(),
         })
         .await?;
-    println!("VM '{vm_id}' started");
+    println!("VM '{vm_id}' desired state set to running (declarative apply started)");
     Ok(())
 }
 
@@ -125,7 +125,7 @@ pub async fn stop(
             target_node: target_node.unwrap_or_default(),
         })
         .await?;
-    println!("VM '{vm_id}' stopped");
+    println!("VM '{vm_id}' desired state set to stopped (declarative apply started)");
     Ok(())
 }
 

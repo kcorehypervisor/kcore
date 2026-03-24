@@ -37,7 +37,7 @@
 
 ## Key Risks / Gaps
 
-- **Lifecycle mismatch (high):** controller forwards `start_vm`/`stop_vm` to node compute RPC, but node-agent currently returns `unimplemented` for those mutating VM methods.
+- **Declarative convergence in progress (medium):** controller now treats `start_vm`/`stop_vm` as desired-state updates (autoStart + config apply), but API naming still reflects imperative semantics.
 - **Security hardening incomplete (medium):** mTLS is implemented and materially lowers network attack risk, but cert rotation/revocation workflows and finer-grained authorization are not yet in place.
 - **State sync is stubbed (medium):** `sync_vm_state` logs and returns success without persisting reconciliation.
 - **Scheduler is minimal (medium):** first-ready-node selection only; no capacity/affinity/load awareness.

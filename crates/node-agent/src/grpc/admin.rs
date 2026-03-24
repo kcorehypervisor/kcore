@@ -25,6 +25,64 @@ fn write_bootstrap_pki(req: &proto::InstallToDiskRequest) -> Result<(), Status> 
     write_bootstrap_pki_at(req, &PathBuf::from(BOOTSTRAP_CERT_DIR))
 }
 
+fn rebuild_args(mode: &'static str) -> Vec<&'static str> {
+    vec![mode]
+}
+
+fn rebuild_sequence(test_success: bool) -> Vec<&'static str> {
+    if test_success {
+        vec!["test", "switch"]
+    } else {
+        vec!["test"]
+    }
+}
+
+async fn run_rebuild_mode(mode: &'static str) -> Result<std::process::Output, std::io::Error> {
+    Command::new("nixos-rebuild")
+        .args(rebuild_args(mode))
+        .output()
+        .await
+}
+
+async fn run_test_then_switch(path: PathBuf) {
+    info!("starting nixos-rebuild test");
+    let test_out = match run_rebuild_mode("test").await {
+        Ok(out) => out,
+        Err(e) => {
+            error!(path = %path.display(), error = %e, "failed to run nixos-rebuild test");
+            return;
+        }
+    };
+
+    if !test_out.status.success() {
+        let stderr = String::from_utf8_lossy(&test_out.stderr);
+        error!(
+            path = %path.display(),
+            stderr = %stderr,
+            "nixos-rebuild test failed; skipping switch"
+        );
+        return;
+    }
+
+    info!("nixos-rebuild test succeeded; starting nixos-rebuild switch");
+    match run_rebuild_mode("switch").await {
+        Ok(out) if out.status.success() => {
+            info!("nixos-rebuild switch completed");
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(
+                path = %path.display(),
+                stderr = %stderr,
+                "nixos-rebuild switch failed"
+            );
+        }
+        Err(e) => {
+            error!(path = %path.display(), error = %e, "failed to run nixos-rebuild switch");
+        }
+    }
+}
+
 fn write_bootstrap_pki_at(req: &proto::InstallToDiskRequest, base_dir: &PathBuf) -> Result<(), Status> {
     let certs = [
         ("ca.crt", &req.ca_cert_pem),
@@ -97,31 +155,17 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             }));
         }
 
+        let planned_steps = rebuild_sequence(true).join(" -> ");
+        info!(path = %path.display(), steps = %planned_steps, "starting background nix apply flow");
         let rebuild_path = path.clone();
         tokio::spawn(async move {
-            info!("starting nixos-rebuild switch");
-            match Command::new("nixos-rebuild").arg("switch").output().await {
-                Ok(out) if out.status.success() => {
-                    info!("nixos-rebuild switch completed");
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    error!(
-                        path = %rebuild_path.display(),
-                        stderr = %stderr,
-                        "nixos-rebuild switch failed"
-                    );
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to run nixos-rebuild");
-                }
-            }
+            run_test_then_switch(rebuild_path).await;
         });
 
         Ok(Response::new(proto::ApplyNixConfigResponse {
             success: true,
             message: format!(
-                "config written to {}; nixos-rebuild switch started",
+                "config written to {}; nixos-rebuild test+switch started",
                 path.display()
             ),
         }))
@@ -212,5 +256,17 @@ mod tests {
             "node-key"
         );
         assert!(!cert_dir.join("controller.crt").exists());
+    }
+
+    #[test]
+    fn rebuild_args_uses_requested_mode() {
+        assert_eq!(rebuild_args("test"), vec!["test"]);
+        assert_eq!(rebuild_args("switch"), vec!["switch"]);
+    }
+
+    #[test]
+    fn rebuild_sequence_skips_switch_on_test_failure() {
+        assert_eq!(rebuild_sequence(false), vec!["test"]);
+        assert_eq!(rebuild_sequence(true), vec!["test", "switch"]);
     }
 }

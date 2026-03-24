@@ -262,20 +262,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
     ) -> Result<Response<controller_proto::StartVmResponse>, Status> {
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
-
-        let mut client = self.clients.get_compute(&node.address).ok_or_else(|| {
-            Status::unavailable(format!("no connection to node {}", node.address))
-        })?;
-
-        let resp = client
-            .start_vm(node_proto::StartVmRequest { vm_id: req.vm_id })
-            .await?;
-
-        let state = resp
-            .into_inner()
-            .status
-            .map(|s| s.state)
-            .unwrap_or(controller_proto::VmState::Unknown as i32);
+        let updated = self
+            .db
+            .set_vm_auto_start(&req.vm_id, true)
+            .map_err(|e| Status::internal(format!("updating vm desired state: {e}")))?;
+        if !updated {
+            return Err(Status::not_found(format!("VM {} not found", req.vm_id)));
+        }
+        self.push_config_to_node(&node).await?;
+        let state = controller_proto::VmState::Running as i32;
 
         Ok(Response::new(controller_proto::StartVmResponse { state }))
     }
@@ -286,23 +281,21 @@ impl controller_proto::controller_server::Controller for ControllerService {
     ) -> Result<Response<controller_proto::StopVmResponse>, Status> {
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
-
-        let mut client = self.clients.get_compute(&node.address).ok_or_else(|| {
-            Status::unavailable(format!("no connection to node {}", node.address))
-        })?;
-
-        let resp = client
-            .stop_vm(node_proto::StopVmRequest {
-                vm_id: req.vm_id,
-                force: req.force,
-            })
-            .await?;
-
-        let state = resp
-            .into_inner()
-            .status
-            .map(|s| s.state)
-            .unwrap_or(controller_proto::VmState::Unknown as i32);
+        if req.force {
+            warn!(
+                vm_id = %req.vm_id,
+                "force stop is ignored in declarative mode; applying desired stopped state"
+            );
+        }
+        let updated = self
+            .db
+            .set_vm_auto_start(&req.vm_id, false)
+            .map_err(|e| Status::internal(format!("updating vm desired state: {e}")))?;
+        if !updated {
+            return Err(Status::not_found(format!("VM {} not found", req.vm_id)));
+        }
+        self.push_config_to_node(&node).await?;
+        let state = controller_proto::VmState::Stopped as i32;
 
         Ok(Response::new(controller_proto::StopVmResponse { state }))
     }

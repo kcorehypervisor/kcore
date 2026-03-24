@@ -211,6 +211,19 @@ impl Database {
         let mut rows = stmt.query_map(params![vm_id], |row| row.get::<_, String>(0))?;
         rows.next().transpose()
     }
+
+    pub fn set_vm_auto_start(
+        &self,
+        vm_id_or_name: &str,
+        auto_start: bool,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE vms SET auto_start = ?1 WHERE id = ?2 OR name = ?2",
+            params![auto_start as i32, vm_id_or_name],
+        )?;
+        Ok(rows > 0)
+    }
 }
 
 fn row_to_node(row: &rusqlite::Row) -> Result<NodeRow, rusqlite::Error> {
@@ -239,4 +252,53 @@ fn row_to_vm(row: &rusqlite::Row) -> Result<VmRow, rusqlite::Error> {
         node_id: row.get(8)?,
         created_at: row.get(9)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_node() -> NodeRow {
+        NodeRow {
+            id: "n1".to_string(),
+            hostname: "n1".to_string(),
+            address: "127.0.0.1:9091".to_string(),
+            cpu_cores: 4,
+            memory_bytes: 8 * 1024 * 1024 * 1024,
+            status: "ready".to_string(),
+            last_heartbeat: String::new(),
+            gateway_interface: "eno1".to_string(),
+        }
+    }
+
+    fn test_vm(node_id: &str) -> VmRow {
+        VmRow {
+            id: "vm-1".to_string(),
+            name: "web-1".to_string(),
+            cpu: 2,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            image_path: "/var/lib/kcore/images/web-1.raw".to_string(),
+            image_size: 8192,
+            network: "default".to_string(),
+            auto_start: true,
+            node_id: node_id.to_string(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn set_vm_auto_start_updates_by_name() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        db.insert_vm(&test_vm(&node.id)).expect("insert vm");
+
+        let changed = db
+            .set_vm_auto_start("web-1", false)
+            .expect("update auto_start");
+        assert!(changed);
+
+        let updated = db.get_vm("vm-1").expect("get vm").expect("vm");
+        assert!(!updated.auto_start);
+    }
 }

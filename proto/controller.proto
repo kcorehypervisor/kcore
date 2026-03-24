@@ -13,7 +13,7 @@ service Controller {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc SyncVmState(SyncVmStateRequest) returns (SyncVmStateResponse);
   
-  // VM operations (forwarded to nodes)
+  // VM operations (declarative desired-state API managed by controller)
   rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
   rpc DeleteVm(DeleteVmRequest) returns (DeleteVmResponse);
   rpc StartVm(StartVmRequest) returns (StartVmResponse);

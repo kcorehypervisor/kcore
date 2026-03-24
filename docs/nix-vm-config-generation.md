@@ -6,6 +6,7 @@ The node VM Nix config is generated in the controller flow when VM state changes
 
 - After `CreateVm` stores the VM in DB, it calls `push_config_to_node(...)`.
 - After `DeleteVm` removes the VM in DB, it calls `push_config_to_node(...)`.
+- `StartVm` and `StopVm` are declarative: controller updates VM `auto_start` desired state in DB, then calls `push_config_to_node(...)`.
 - `push_config_to_node(...)` builds Nix via `generate_node_config(...)` and sends it with `rebuild: true`.
 
 ### Function headers only
@@ -51,13 +52,20 @@ async fn apply_nix_config(
 
 ## What gets applied on the node
 
-`apply_nix_config(...)` writes the generated text to the node's configured Nix path and, when `rebuild = true`, starts:
+`apply_nix_config(...)` writes the generated text to the node's configured Nix path and, when `rebuild = true`, runs a two-step background apply flow:
 
 ```bash
+nixos-rebuild test
 nixos-rebuild switch
 ```
 
-So for the VM create/delete controller path, generated Nix is both **written** and **applied**.
+Behavior details:
+
+- `switch` is executed only if `test` succeeds.
+- If `test` fails, activation is skipped and the failure is logged.
+- The RPC remains asynchronous: the API call returns once the background flow has started.
+
+So for the VM create/delete controller path, generated Nix is **written immediately** and then **validated before activation**.
 
 ## vm-module.nix (test module)
 
