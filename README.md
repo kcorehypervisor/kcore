@@ -37,7 +37,7 @@
 
 ## Key Risks / Gaps
 
-- **Declarative convergence in progress (medium):** controller now treats `start_vm`/`stop_vm` as desired-state updates (autoStart + config apply), but API naming still reflects imperative semantics.
+- **Lifecycle semantics clarity (low/medium):** `start_vm`/`stop_vm` now work declaratively (desired state + config apply), but RPC names/flags (for example `force`) still look imperative and can confuse operators.
 - **Security hardening incomplete (medium):** mTLS is implemented and materially lowers network attack risk, but cert rotation/revocation workflows and finer-grained authorization are not yet in place.
 - **State sync is stubbed (medium):** `sync_vm_state` logs and returns success without persisting reconciliation.
 - **Scheduler is minimal (medium):** first-ready-node selection only; no capacity/affinity/load awareness.
@@ -45,7 +45,7 @@
 
 ## Practical Priorities
 
-1. Align VM lifecycle semantics: either implement node mutating RPCs or remove/deprecate start/stop RPC path in controller.
+1. Complete lifecycle API cleanup: rename/deprecate imperative-looking start/stop semantics and remove stale flags that do not apply in declarative mode.
 2. Add certificate lifecycle operations (rotation, expiry alerts, revocation strategy).
 3. Add fine-grained authorization on top of mTLS identity.
 4. Implement real VM state reconciliation in `sync_vm_state`.
