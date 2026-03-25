@@ -5,7 +5,8 @@ This document shows how `kctl`, `kcore-controller`, Nix config generation, and `
 ## High-level flow
 
 ```mermaid
-flowchart LR
+%%{init: {"flowchart": {"nodeSpacing": 25, "rankSpacing": 120}} }%%
+flowchart TB
   U[Operator] --> K[kctl CLI]
   K -->|gRPC API calls| C[kcore-controller]
 
@@ -15,12 +16,21 @@ flowchart LR
 
   NIXGEN -->|ApplyNixConfig rebuild=true| A[kcore-node-agent<br/>NodeAdmin]
   A -->|write file| CFG["/etc/nixos/kcore-vms.nix"]
-  A -->|trigger| REBUILD[nixos-rebuild switch]
 
-  REBUILD --> MOD[ctrl-os-vms Nix module]
-  MOD --> NET[bridge/tap + NAT systemd services]
-  MOD --> VMUNIT[kcore-vm-*.service]
-  VMUNIT --> CH[cloud-hypervisor]
+  subgraph APPLY_PATH["Node apply + runtime (right lane)"]
+    direction TB
+    REBUILD[nixos-rebuild switch]
+    MOD[ctrl-os-vms Nix module]
+    NET[bridge/tap + NAT systemd services]
+    VMUNIT[kcore-vm-*.service]
+    CH[cloud-hypervisor]
+    REBUILD --> MOD
+    MOD --> NET
+    MOD --> VMUNIT
+    VMUNIT --> CH
+  end
+
+  A -->|trigger| REBUILD
 
   CH --> SOCK["/run/kcore/*.sock"]
   A -->|NodeCompute reads VM status| SOCK
