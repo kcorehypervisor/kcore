@@ -8,13 +8,15 @@ use crate::db::{Database, NodeRow, VmRow};
 use crate::node_proto;
 use crate::{nixgen, node_client::NodeClients, scheduler};
 
+#[cfg(test)]
+type PushHook = std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + Sync + 'static>;
+
 pub struct ControllerService {
     db: Database,
     clients: NodeClients,
     default_network: NetworkConfig,
     #[cfg(test)]
-    test_push_hook:
-        Option<std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + Sync + 'static>>,
+    test_push_hook: Option<PushHook>,
 }
 
 impl ControllerService {
@@ -33,7 +35,7 @@ impl ControllerService {
         db: Database,
         clients: NodeClients,
         default_network: NetworkConfig,
-        hook: std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + Sync + 'static>,
+        hook: PushHook,
     ) -> Self {
         Self {
             db,
@@ -539,6 +541,7 @@ fn uuid_v4() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -593,7 +596,7 @@ mod tests {
         let pushed_node = Arc::new(Mutex::new(String::new()));
         let count_clone = Arc::clone(&push_count);
         let node_clone = Arc::clone(&pushed_node);
-        let hook = Arc::new(move |n: &NodeRow| {
+        let hook: PushHook = Arc::new(move |n: &NodeRow| {
             count_clone.fetch_add(1, Ordering::SeqCst);
             *node_clone.lock().expect("lock pushed node") = n.id.clone();
             Ok(())
@@ -639,7 +642,7 @@ mod tests {
 
         let push_count = Arc::new(AtomicUsize::new(0));
         let count_clone = Arc::clone(&push_count);
-        let hook = Arc::new(move |_n: &NodeRow| {
+        let hook: PushHook = Arc::new(move |_n: &NodeRow| {
             count_clone.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });

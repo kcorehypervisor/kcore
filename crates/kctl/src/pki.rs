@@ -2,8 +2,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair,
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -65,6 +64,7 @@ fn sign_cert(
 ) -> Result<(String, String), String> {
     let mut params = if let Some(host) = host {
         CertificateParams::new(vec![host.to_string()])
+            .map_err(|e| format!("invalid SAN: {e}"))?
     } else {
         CertificateParams::default()
     };
@@ -76,16 +76,16 @@ fn sign_cert(
     params.not_after = OffsetDateTime::now_utc() + Duration::days(CERT_VALIDITY_DAYS);
 
     let ca_key = KeyPair::from_pem(ca_key_pem).map_err(|e| format!("loading CA key: {e}"))?;
-    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem, ca_key)
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)
         .map_err(|e| format!("loading CA cert: {e}"))?;
-    let ca_cert =
-        Certificate::from_params(ca_params).map_err(|e| format!("building CA cert: {e}"))?;
 
-    let cert = Certificate::from_params(params).map_err(|e| format!("building cert: {e}"))?;
-    let cert_pem = cert
-        .serialize_pem_with_signer(&ca_cert)
+    let cert_key =
+        KeyPair::generate().map_err(|e| format!("generating certificate key: {e}"))?;
+    let cert = params
+        .signed_by(&cert_key, &issuer)
         .map_err(|e| format!("signing cert: {e}"))?;
-    let key_pem = cert.serialize_private_key_pem();
+    let cert_pem = cert.pem();
+    let key_pem = cert_key.serialize_pem();
     Ok((cert_pem, key_pem))
 }
 
@@ -150,11 +150,12 @@ pub fn create_cluster_pki(
         .push(DnType::CommonName, "kcore-cluster-ca");
     ca_params.not_before = OffsetDateTime::now_utc();
     ca_params.not_after = OffsetDateTime::now_utc() + Duration::days(CA_VALIDITY_DAYS);
-    let ca_cert = Certificate::from_params(ca_params).map_err(|e| format!("CA build: {e}"))?;
-    let ca_cert_pem = ca_cert
-        .serialize_pem()
-        .map_err(|e| format!("CA serialize cert: {e}"))?;
-    let ca_key_pem = ca_cert.serialize_private_key_pem();
+    let ca_key = KeyPair::generate().map_err(|e| format!("CA key generation: {e}"))?;
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .map_err(|e| format!("CA build: {e}"))?;
+    let ca_cert_pem = ca_cert.pem();
+    let ca_key_pem = ca_key.serialize_pem();
 
     let (controller_cert_pem, controller_key_pem) = sign_cert(
         Some(controller_host),

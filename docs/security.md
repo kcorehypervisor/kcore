@@ -135,6 +135,9 @@ cargo test --workspace
 # Lint with clippy
 cargo clippy --workspace
 
+# Audit dependencies for known vulnerabilities
+cargo audit
+
 # Format check
 cargo fmt --check
 
