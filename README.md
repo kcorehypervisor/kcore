@@ -49,6 +49,12 @@ Cloud Hypervisor console endpoints:
 - Serial socket: `/run/kcore/<vm-name>.serial.sock`
 - Example attach from node host: `socat -,raw,echo=0,icanon=0 UNIX-CONNECT:/run/kcore/<vm-name>.serial.sock`
 
+Default guest access on generated cloud-init seeds:
+- DHCP leases are served by `kcore-dhcp-<network>.service` and written to `/run/kcore/dnsmasq-<network>.leases`.
+- Default VM user is `kcore` with password `kcore` (for first-boot/operator debugging).
+- Example from node host:
+  `ssh kcore@$(awk 'NR==1 {print $3}' /run/kcore/dnsmasq-default.leases)`
+
 See:
 - [kctl commands and workflows](docs/kctl-commands-and-workflows.md)
 - [Node install bootstrap flow](docs/node-install-bootstrap-flow.md)

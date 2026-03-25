@@ -29,6 +29,7 @@ pub struct VmRow {
     pub image_path: String,
     pub image_url: String,
     pub image_sha256: String,
+    pub image_format: String,
     pub image_size: i64,
     pub network: String,
     pub auto_start: bool,
@@ -81,6 +82,7 @@ impl Database {
                 image_path TEXT NOT NULL,
                 image_url TEXT NOT NULL DEFAULT '',
                 image_sha256 TEXT NOT NULL DEFAULT '',
+                image_format TEXT NOT NULL DEFAULT 'raw',
                 image_size INTEGER NOT NULL DEFAULT 8192,
                 network TEXT NOT NULL DEFAULT 'default',
                 auto_start INTEGER NOT NULL DEFAULT 1,
@@ -94,6 +96,21 @@ impl Database {
         );
         let _ = conn.execute(
             "ALTER TABLE vms ADD COLUMN image_sha256 TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE vms ADD COLUMN image_format TEXT NOT NULL DEFAULT 'raw'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE vms
+             SET image_format = CASE
+                 WHEN lower(image_path) LIKE '%.qcow2' OR lower(image_path) LIKE '%.qcow' THEN 'qcow2'
+                 ELSE 'raw'
+             END
+             WHERE image_format IS NULL
+                OR image_format = ''
+                OR (image_format = 'raw' AND image_url != '' AND (lower(image_path) LIKE '%.qcow2' OR lower(image_path) LIKE '%.qcow'))",
             [],
         );
         Ok(())
@@ -174,8 +191,8 @@ impl Database {
     pub fn insert_vm(&self, vm: &VmRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_size, network, auto_start, node_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))",
+            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))",
             params![
                 vm.id,
                 vm.name,
@@ -184,6 +201,7 @@ impl Database {
                 vm.image_path,
                 vm.image_url,
                 vm.image_sha256,
+                vm.image_format,
                 vm.image_size,
                 vm.network,
                 vm.auto_start as i32,
@@ -202,7 +220,7 @@ impl Database {
     pub fn get_vm(&self, vm_id: &str) -> Result<Option<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_size, network, auto_start, node_id, created_at FROM vms WHERE id = ?1",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at FROM vms WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![vm_id], row_to_vm)?;
         rows.next().transpose()
@@ -211,7 +229,7 @@ impl Database {
     pub fn list_vms(&self) -> Result<Vec<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_size, network, auto_start, node_id, created_at FROM vms",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at FROM vms",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
         rows.collect()
@@ -220,7 +238,7 @@ impl Database {
     pub fn list_vms_for_node(&self, node_id: &str) -> Result<Vec<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_size, network, auto_start, node_id, created_at FROM vms WHERE node_id = ?1",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at FROM vms WHERE node_id = ?1",
         )?;
         let rows = stmt.query_map(params![node_id], row_to_vm)?;
         rows.collect()
@@ -262,20 +280,49 @@ fn row_to_node(row: &rusqlite::Row) -> Result<NodeRow, rusqlite::Error> {
 }
 
 fn row_to_vm(row: &rusqlite::Row) -> Result<VmRow, rusqlite::Error> {
+    let image_path: String = row.get(4)?;
+    let image_url: String = row.get(5)?;
+    let image_format: String = row.get(7)?;
     Ok(VmRow {
         id: row.get(0)?,
         name: row.get(1)?,
         cpu: row.get(2)?,
         memory_bytes: row.get(3)?,
-        image_path: row.get(4)?,
-        image_url: row.get(5)?,
+        image_path: image_path.clone(),
+        image_url: image_url.clone(),
         image_sha256: row.get(6)?,
-        image_size: row.get(7)?,
-        network: row.get(8)?,
-        auto_start: row.get::<_, i32>(9)? != 0,
-        node_id: row.get(10)?,
-        created_at: row.get(11)?,
+        image_format: normalize_image_format(&image_format, &image_path, &image_url),
+        image_size: row.get(8)?,
+        network: row.get(9)?,
+        auto_start: row.get::<_, i32>(10)? != 0,
+        node_id: row.get(11)?,
+        created_at: row.get(12)?,
     })
+}
+
+fn normalize_image_format(format: &str, image_path: &str, image_url: &str) -> String {
+    let normalized = format.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        // Legacy rows can end up with "raw" as a default after migration.
+        // If they come from URL-backed images and the path clearly looks qcow2, correct it.
+        "raw"
+            if !image_url.is_empty()
+                && matches!(infer_image_format_from_path(image_path), "qcow2") =>
+        {
+            "qcow2".to_string()
+        }
+        "raw" | "qcow2" => normalized,
+        _ => infer_image_format_from_path(image_path).to_string(),
+    }
+}
+
+fn infer_image_format_from_path(path: &str) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".qcow2") || lower.ends_with(".qcow") {
+        "qcow2"
+    } else {
+        "raw"
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +351,7 @@ mod tests {
             image_path: "/var/lib/kcore/images/web-1.raw".to_string(),
             image_url: String::new(),
             image_sha256: String::new(),
+            image_format: "raw".to_string(),
             image_size: 8192,
             network: "default".to_string(),
             auto_start: true,
@@ -326,5 +374,33 @@ mod tests {
 
         let updated = db.get_vm("vm-1").expect("get vm").expect("vm");
         assert!(!updated.auto_start);
+    }
+
+    #[test]
+    fn migrate_infers_qcow2_for_legacy_url_rows() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+
+        db.insert_vm(&VmRow {
+            id: "vm-qcow".to_string(),
+            name: "vm-qcow".to_string(),
+            cpu: 1,
+            memory_bytes: 1024 * 1024 * 1024,
+            image_path: "/var/lib/kcore/images/debian.qcow2".to_string(),
+            image_url: "https://example.com/debian.qcow2".to_string(),
+            image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            image_format: "raw".to_string(),
+            image_size: 4096,
+            network: "default".to_string(),
+            auto_start: true,
+            node_id: node.id.clone(),
+            created_at: String::new(),
+        })
+        .expect("insert qcow vm");
+
+        let vm = db.get_vm("vm-qcow").expect("get vm").expect("vm exists");
+        assert_eq!(vm.image_format, "qcow2");
     }
 }
