@@ -195,8 +195,7 @@
                   pkgs.lvm2
                   nodeAgent
                   controller
-                  (pkgs.writeScriptBin "install-to-disk" ''
-                    #!/usr/bin/env bash
+                  (pkgs.writeShellScriptBin "install-to-disk" ''
                     set -euo pipefail
 
                     DISK=""
@@ -399,6 +398,28 @@
                       fi
                     fi
 
+                    GATEWAY_INTERFACE=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')
+                    GATEWAY_IP=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $3}')
+                    EXTERNAL_IP=""
+                    if [ -n "$GATEWAY_INTERFACE" ]; then
+                      EXTERNAL_IP=$(ip -4 -o addr show dev "$GATEWAY_INTERFACE" scope global 2>/dev/null | awk 'NR==1 {print $4}' | cut -d/ -f1)
+                    fi
+                    if [ -z "$EXTERNAL_IP" ] && [ -n "$CONTROLLER_HOST" ]; then
+                      EXTERNAL_IP="$CONTROLLER_HOST"
+                    fi
+                    if [ -z "$EXTERNAL_IP" ]; then
+                      EXTERNAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+                    fi
+                    if [ -z "$GATEWAY_INTERFACE" ]; then
+                      GATEWAY_INTERFACE="eno1"
+                    fi
+                    if [ -z "$GATEWAY_IP" ]; then
+                      GATEWAY_IP="0.0.0.0"
+                    fi
+                    if [ -z "$EXTERNAL_IP" ]; then
+                      EXTERNAL_IP="127.0.0.1"
+                    fi
+
                     cat > /mnt/etc/kcore/node-agent.yaml << AGENTEOF
 nodeId: kvm-node-01
 listenAddr: "0.0.0.0:9091"
@@ -415,7 +436,9 @@ AGENTEOF
 listenAddr: "0.0.0.0:9090"
 dbPath: /var/lib/kcore/controller.db
 defaultNetwork:
-  gatewayInterface: eno1
+  gatewayInterface: $GATEWAY_INTERFACE
+  externalIp: $EXTERNAL_IP
+  gatewayIp: $GATEWAY_IP
 tls:
   caFile: /etc/kcore/certs/ca.crt
   certFile: /etc/kcore/certs/controller.crt
@@ -460,6 +483,7 @@ CTRLSVC
   ];
 
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
+  nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
 
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
