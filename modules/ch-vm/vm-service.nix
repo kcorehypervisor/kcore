@@ -7,12 +7,7 @@
   cfg = config.ch-vm.vms;
   helpers = import ./helpers.nix {inherit lib;};
   tapName = helpers.tapName;
-
-  generateMac = vmName: let
-    hash = builtins.hashString "sha256" vmName;
-    hexChars = lib.stringToCharacters hash;
-    byte = n: lib.concatStrings (lib.sublist (n * 2) 2 hexChars);
-  in "52:54:00:${byte 0}:${byte 1}:${byte 2}";
+  generateMac = helpers.generateMac;
 
   mkVmService = vmName: vmCfg: let
     mac =
@@ -26,16 +21,18 @@
     firmwarePath =
       if cfg.firmwarePath != null
       then cfg.firmwarePath
-      else "${pkgs.OVMF.fd}/FV/OVMF.fd";
+      else "${pkgs.OVMF-cloud-hypervisor.firmware}";
     chBin = "${cfg.cloudHypervisorPackage}/bin/cloud-hypervisor";
+    vmDiskArg = "path=${toString vmCfg.image},image_type=${vmCfg.imageFormat}";
+    seedDiskArg = "path=${seedIso},readonly=on,image_type=raw";
 
     chArgs = lib.concatStringsSep " " ([
         "--api-socket ${socketPath}"
         "--cpus boot=${toString vmCfg.cores}"
         "--memory size=${toString vmCfg.memorySize}M"
-        "--firmware '${firmwarePath}'"
+        "--firmware ${firmwarePath}"
         "--serial socket=${serialSocket}"
-        "--disk path='${toString vmCfg.image}' path='${seedIso}',readonly=on"
+        "--disk ${vmDiskArg} ${seedDiskArg}"
         "--net tap=${tapName vmName},mac=${mac}"
       ]
       ++ vmCfg.extraArgs);

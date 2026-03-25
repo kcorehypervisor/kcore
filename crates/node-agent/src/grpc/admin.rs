@@ -156,6 +156,7 @@ async fn run_test_then_switch(path: PathBuf) {
     match run_rebuild_mode("switch").await {
         Ok(out) if out.status.success() => {
             info!("nixos-rebuild switch completed");
+            log_failed_kcore_units("after_nixos_rebuild_switch_success").await;
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);

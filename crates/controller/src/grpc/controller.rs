@@ -1,5 +1,6 @@
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
+use std::time::Duration;
 
 use crate::auth::{self, CN_KCTL, CN_NODE_PREFIX};
 use crate::config::NetworkConfig;
@@ -72,7 +73,7 @@ impl ControllerService {
             if vm.image_url.is_empty() {
                 continue;
             }
-            admin
+            let ensure = admin
                 .ensure_image(node_proto::EnsureImageRequest {
                     image_url: vm.image_url.clone(),
                     image_sha256: vm.image_sha256.clone(),
@@ -82,10 +83,20 @@ impl ControllerService {
                 .map_err(|e| {
                     error!(node = %node.id, vm_id = %vm.id, error = %e, "failed to ensure vm image on node");
                     Status::internal(format!("ensuring image for vm {} on node {}: {e}", vm.id, node.id))
-                })?;
+                })?
+                .into_inner();
+            info!(
+                node = %node.id,
+                vm_id = %vm.id,
+                path = %ensure.path,
+                size_bytes = ensure.size_bytes,
+                cached = ensure.cached,
+                downloaded = ensure.downloaded,
+                "ensured vm image on node"
+            );
         }
 
-        admin
+        let apply = admin
             .apply_nix_config(node_proto::ApplyNixConfigRequest {
                 configuration_nix: nix_config,
                 rebuild: true,
@@ -94,7 +105,25 @@ impl ControllerService {
             .map_err(|e| {
                 error!(node = %node.id, error = %e, "failed to push config to node");
                 Status::internal(format!("pushing config to node {}: {e}", node.id))
-            })?;
+            })?
+            .into_inner();
+        if !apply.success {
+            error!(
+                node = %node.id,
+                message = %apply.message,
+                "node rejected nix config apply request"
+            );
+            return Err(Status::internal(format!(
+                "node {} rejected nix apply: {}",
+                node.id, apply.message
+            )));
+        }
+
+        info!(
+            node = %node.id,
+            message = %apply.message,
+            "node accepted nix config apply request"
+        );
 
         info!(node = %node.id, "pushed config and triggered rebuild");
         Ok(())
@@ -202,6 +231,15 @@ fn derive_local_image_path(image_url: &str, image_sha256: &str) -> String {
         &image_sha256[..12],
         file_name
     )
+}
+
+fn derive_image_format(image_url: &str) -> String {
+    let lower = image_url.to_ascii_lowercase();
+    if lower.ends_with(".qcow2") || lower.ends_with(".qcow") {
+        "qcow2".to_string()
+    } else {
+        "raw".to_string()
+    }
 }
 
 fn controller_state_from_node_state(state: i32) -> i32 {
@@ -383,6 +421,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let image_url = validate_image_url(&req.image_url)?;
         let image_sha256 = validate_image_sha256(&req.image_sha256)?;
         let image_path = derive_local_image_path(&image_url, &image_sha256);
+        let image_format = derive_image_format(&image_url);
 
         let vm = VmRow {
             id: vm_id.clone(),
@@ -392,6 +431,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             image_path,
             image_url,
             image_sha256,
+            image_format,
             image_size: 8192,
             network: spec
                 .nics
@@ -606,51 +646,43 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map(|n| (n.id, n.address))
             .collect::<std::collections::HashMap<_, _>>();
 
-        let mut runtime_state = std::collections::HashMap::<(String, String), i32>::new();
-        let mut queried_nodes = std::collections::HashSet::new();
-        for vm in &rows {
-            if !queried_nodes.insert(vm.node_id.clone()) {
-                continue;
-            }
-            let Some(node_address) = node_address_by_id.get(&vm.node_id) else {
-                continue;
-            };
-            let Some(mut compute) = self.clients.get_compute(node_address) else {
-                continue;
-            };
-            match compute.list_vms(node_proto::ListVmsRequest {}).await {
-                Ok(resp) => {
-                    for runtime_vm in resp.into_inner().vms {
-                        let mapped = controller_state_from_node_state(runtime_vm.state);
-                        runtime_state.insert((vm.node_id.clone(), runtime_vm.id.clone()), mapped);
-                        runtime_state.insert((vm.node_id.clone(), runtime_vm.name.clone()), mapped);
+        let mut infos = Vec::with_capacity(rows.len());
+        for vm in rows {
+            let mut state = state_fallback_without_runtime(vm.auto_start);
+            if let Some(node_address) = node_address_by_id.get(&vm.node_id) {
+                if let Some(mut compute) = self.clients.get_compute(node_address) {
+                    match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        compute.get_vm(node_proto::GetVmRequest {
+                            vm_id: vm.name.clone(),
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) => {
+                            if let Some(status) = resp.into_inner().status {
+                                state = controller_state_from_node_state(status.state);
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            warn!(node_id = %vm.node_id, vm_name = %vm.name, address = %node_address, error = %err, "failed to fetch runtime VM state");
+                        }
+                        Err(_) => {
+                            warn!(node_id = %vm.node_id, vm_name = %vm.name, address = %node_address, "timed out fetching runtime VM state");
+                        }
                     }
                 }
-                Err(err) => {
-                    warn!(node_id = %vm.node_id, address = %node_address, error = %err, "failed to fetch runtime VM state");
-                }
             }
+            infos.push(controller_proto::VmInfo {
+                id: vm.id,
+                name: vm.name,
+                state,
+                cpu: vm.cpu,
+                memory_bytes: vm.memory_bytes,
+                node_id: vm.node_id,
+                created_at: None,
+            });
         }
-
-        let infos = rows
-            .into_iter()
-            .map(|vm| {
-                let state = runtime_state
-                    .get(&(vm.node_id.clone(), vm.id.clone()))
-                    .or_else(|| runtime_state.get(&(vm.node_id.clone(), vm.name.clone())))
-                    .copied()
-                    .unwrap_or_else(|| state_fallback_without_runtime(vm.auto_start));
-                controller_proto::VmInfo {
-                    id: vm.id,
-                    name: vm.name,
-                    state,
-                    cpu: vm.cpu,
-                    memory_bytes: vm.memory_bytes,
-                    node_id: vm.node_id,
-                    created_at: None,
-                }
-            })
-            .collect();
 
         Ok(Response::new(controller_proto::ListVmsResponse {
             vms: infos,
@@ -761,6 +793,7 @@ mod tests {
             image_url: "https://example.com/web-1.raw".to_string(),
             image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
+            image_format: "raw".to_string(),
             image_size: 8192,
             network: "default".to_string(),
             auto_start: true,
@@ -904,6 +937,15 @@ mod tests {
         );
         assert_eq!(p1, p2);
         assert!(p1.starts_with("/var/lib/kcore/images/aaaaaaaaaaaa-"));
+    }
+
+    #[test]
+    fn derive_image_format_uses_qcow2_extension() {
+        assert_eq!(
+            derive_image_format("https://example.com/debian-12-genericcloud-amd64.qcow2"),
+            "qcow2"
+        );
+        assert_eq!(derive_image_format("https://example.com/rootfs.raw"), "raw");
     }
 
     #[tokio::test]

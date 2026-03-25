@@ -9,6 +9,12 @@
 
   bridgeName = name: "kbr-${name}";
   tapName = helpers.tapName;
+  subnetPrefix = ip: let
+    match = builtins.match "([0-9]+\\.[0-9]+\\.[0-9]+)\\.[0-9]+" ip;
+  in
+    if match == null
+    then throw "invalid IPv4 address for gatewayIP: ${ip}"
+    else builtins.elemAt match 0;
 
   netmaskToCidr = mask:
     {
@@ -94,6 +100,23 @@ in {
               ip link set "$bridge" down 2>/dev/null || true
               ip link delete "$bridge" 2>/dev/null || true
             '';
+          }
+      )
+      cfg.networks
+      // lib.mapAttrs' (
+        netName: netCfg:
+          lib.nameValuePair "kcore-dhcp-${netName}" {
+            description = "kcore dnsmasq DHCP for network ${netName}";
+            requires = ["kcore-bridge-${netName}.service"];
+            after = ["kcore-bridge-${netName}.service"];
+            wantedBy = ["multi-user.target"];
+            serviceConfig = {
+              Type = "simple";
+              Restart = "always";
+              RestartSec = 2;
+              ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /run/kcore";
+              ExecStart = "${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --bind-interfaces --interface=${bridgeName netName} --except-interface=lo --dhcp-authoritative --dhcp-range=${subnetPrefix netCfg.gatewayIP}.100,${subnetPrefix netCfg.gatewayIP}.199,${netCfg.internalNetmask},12h --dhcp-option=option:router,${netCfg.gatewayIP} --dhcp-option=option:dns-server,1.1.1.1,8.8.8.8 --dhcp-leasefile=/run/kcore/dnsmasq-${netName}.leases --pid-file=/run/kcore/dnsmasq-${netName}.pid";
+            };
           }
       )
       cfg.networks

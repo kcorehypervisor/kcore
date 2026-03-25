@@ -33,6 +33,7 @@ in
 
     testScript = ''
       machine.wait_for_unit("kcore-bridge-default.service")
+      machine.wait_for_unit("kcore-dhcp-default.service")
       machine.succeed("ip link show kbr-default")
 
       status = machine.get_unit_info("kcore-vm-this-name-is-way-too-long.service")
@@ -42,6 +43,9 @@ in
       machine.wait_for_unit("kcore-tap-this-name-is-way-too-long.service")
       machine.succeed("test $(ip -o link show | awk -F': ' '/tap-[0-9a-f]{8}/ {print $2; exit}' | wc -c) -le 16")
       machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -E 'tap-[0-9a-f]{8}'")
+      machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F -- '--firmware /nix/store/'")
+      machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F 'CLOUDHV.fd'")
+      machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F 'image_type=raw'")
 
       machine.succeed("test -d /run/kcore")
       machine.succeed("test -f /etc/kcore/seeds/this-name-is-way-too-long.iso")

@@ -35,7 +35,13 @@
     options = {
       image = lib.mkOption {
         type = lib.types.path;
-        description = "Path to the VM disk image (raw format).";
+        description = "Path to the VM disk image.";
+      };
+
+      imageFormat = lib.mkOption {
+        type = lib.types.enum ["raw" "qcow2"];
+        default = "raw";
+        description = "Disk image format passed to Cloud Hypervisor (image_type).";
       };
 
       imageSize = lib.mkOption {
@@ -111,7 +117,7 @@ in {
     firmwarePath = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      description = "Optional firmware path passed to Cloud Hypervisor. Defaults to OVMF from nixpkgs.";
+      description = "Optional firmware path passed to Cloud Hypervisor. Defaults to OVMF-cloud-hypervisor firmware from nixpkgs.";
     };
 
     gatewayInterface = lib.mkOption {

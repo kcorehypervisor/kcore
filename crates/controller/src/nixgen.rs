@@ -73,6 +73,10 @@ pub fn generate_node_config(
             "      image = \"{}\";\n",
             nix_escape(&vm.image_path)
         ));
+        out.push_str(&format!(
+            "      imageFormat = \"{}\";\n",
+            nix_escape(&vm.image_format)
+        ));
         out.push_str(&format!("      imageSize = {};\n", vm.image_size));
         out.push_str(&format!("      cores = {};\n", vm.cpu));
         out.push_str(&format!(
@@ -108,6 +112,7 @@ mod tests {
             image_path: "/var/lib/kcore/images/debian.raw".into(),
             image_url: "https://example.com/debian.raw".into(),
             image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            image_format: "raw".into(),
             image_size: 8192,
             network: "default".into(),
             auto_start,
@@ -134,6 +139,7 @@ mod tests {
         assert!(config.contains("memorySize = 4096"));
         assert!(config.contains("gatewayInterface = \"eno1\""));
         assert!(config.contains("image = \"/var/lib/kcore/images/debian.raw\""));
+        assert!(config.contains("imageFormat = \"raw\""));
     }
 
     #[test]
@@ -175,6 +181,14 @@ mod tests {
         assert!(config.contains(r#"image = "/images/foo\"\${bar}.raw";"#));
         // The raw `${` is escaped to `\${`, preventing Nix interpolation.
         assert!(!config.contains("image = \"/images/foo\"${bar}.raw\";"));
+    }
+
+    #[test]
+    fn image_format_is_rendered_for_qcow2() {
+        let mut v = vm(true, "qcow");
+        v.image_format = "qcow2".into();
+        let config = generate_node_config(&[v], "eno1", &default_net());
+        assert!(config.contains("imageFormat = \"qcow2\";"));
     }
 
     #[test]
