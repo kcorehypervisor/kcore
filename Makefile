@@ -1,4 +1,4 @@
-.PHONY: all build check fmt clippy test test-all test-rust test-nix test-vm coverage test-controller test-node-agent test-kctl test-rust-filter iso iso-remote kctl clean help
+.PHONY: all build check fmt clippy audit test test-all test-rust test-nix test-vm coverage test-controller test-node-agent test-kctl test-rust-filter iso iso-remote kctl clean help
 
 VERSION := $(shell cat VERSION)
 V ?= v$(VERSION)
@@ -12,12 +12,16 @@ build:
 check:
 	cargo clippy --all-targets -- --deny warnings
 	cargo fmt --check
+	cargo audit
 
 fmt:
 	cargo fmt
 
 clippy:
 	cargo clippy --all-targets -- --deny warnings
+
+audit:
+	cargo audit
 
 test: test-rust
 
@@ -75,9 +79,10 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  build       Build all Rust binaries (release)"
-	@echo "  check       Run clippy + fmt check"
+	@echo "  check       Run clippy + fmt + audit checks"
 	@echo "  fmt         Format Rust code"
 	@echo "  clippy      Run clippy lints"
+	@echo "  audit       Run cargo-audit for known vulnerabilities"
 	@echo "  test        Run Rust tests (workspace)"
 	@echo "  test-all    Run Rust tests + Nix flake checks"
 	@echo "  test-rust   Run all Rust tests in workspace"

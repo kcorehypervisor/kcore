@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(false)
         .build_client(true)
-        .compile_protos(&[controller_proto], &[proto_dir.clone()])?;
+        .compile_protos(&[controller_proto], std::slice::from_ref(&proto_dir))?;
 
     tonic_build::configure()
         .build_server(false)

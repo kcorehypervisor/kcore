@@ -95,6 +95,7 @@
         devShells.default = craneLib.devShell {
           packages =
             [
+              pkgs.cargo-audit
               pkgs.protobuf
               pkgs.grpcurl
             ]

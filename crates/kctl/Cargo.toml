@@ -8,7 +8,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 prost = "0.13"
 prost-types = "0.13"
-rcgen = { version = "0.12", features = ["x509-parser"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
 serde = { version = "1", features = ["derive"] }
 time = "0.3"
 serde_yaml = "0.9"
