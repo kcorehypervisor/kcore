@@ -138,3 +138,43 @@ kcore-kctl create vm db-back-net \
 Note:
 - `--network` must reference a network that exists in the applied node Nix config under `ch-vm.vms.networks`.
 
+Create networks first (before `kctl create vm`):
+
+```nix
+# networks.nix
+{ pkgs, ... }: {
+  ch-vm.vms = {
+    enable = true;
+    cloudHypervisorPackage = pkgs.cloud-hypervisor;
+    gatewayInterface = "eno1";
+
+    # shared-network example
+    networks.default = {
+      externalIP = "192.168.40.105";
+      gatewayIP = "10.240.0.1";
+    };
+
+    # split-network example
+    networks.frontend = {
+      externalIP = "192.168.40.105";
+      gatewayIP = "10.240.10.1";
+    };
+    networks.backend = {
+      externalIP = "192.168.40.105";
+      gatewayIP = "10.240.20.1";
+    };
+  };
+}
+```
+
+Apply it to the node via controller:
+
+```bash
+kcore-kctl apply --filename ./networks.nix
+```
+
+After apply succeeds, the node should have:
+- `kcore-bridge-default.service`, `kcore-dhcp-default.service`
+- `kcore-bridge-frontend.service`, `kcore-dhcp-frontend.service`
+- `kcore-bridge-backend.service`, `kcore-dhcp-backend.service`
+
