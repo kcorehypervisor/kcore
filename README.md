@@ -57,6 +57,7 @@ Default guest access on generated cloud-init seeds:
 
 See:
 - [kctl commands and workflows](docs/kctl-commands-and-workflows.md)
+- [Networking model](docs/networking.md)
 - [Node install bootstrap flow](docs/node-install-bootstrap-flow.md)
 - [mTLS bootstrap and authentication](docs/mtls-bootstrap-and-auth.md)
 - [Nix VM config generation](docs/nix-vm-config-generation.md)
