@@ -26,7 +26,7 @@ schema_version
 
 ## Current schema version
 
-**2** (as of March 2026)
+**3** (as of March 2026)
 
 ## Migration history
 
@@ -34,6 +34,7 @@ schema_version
 |---------|-------------|-----|
 | 0 → 1 | Added `image_url`, `image_sha256`, `image_format` columns to `vms`. Backfilled `image_format` from file extension for URL-backed images. | Support downloading VM images by URL with integrity checks. |
 | 1 → 2 | Added `runtime_state` column to `vms` (default `'unknown'`). | Persist actual VM state reported by nodes via `SyncVmState`, so the controller doesn't have to poll every node on every `list_vms`. |
+| 2 → 3 | Added `cpu_used`, `memory_used` to `nodes`; `allowed_tcp_ports`, `allowed_udp_ports` to `networks`; `cloud_init_user_data` to `vms`; new `node_labels` table. | Persist heartbeat resource usage for scheduler, port-forwarding rules per network, cloud-init customization per VM, and node labels for placement hints. |
 
 ## Adding a new migration
 
@@ -50,16 +51,16 @@ schema_version
 ### Example
 
 ```rust
-// in Database::migrate(), after the version < 2 block:
+// in Database::migrate(), after the version < 3 block:
 
-if version < 3 {
+if version < 4 {
     let _ = conn.execute(
         "ALTER TABLE vms ADD COLUMN ssh_port INTEGER NOT NULL DEFAULT 0",
         [],
     );
 }
 
-const CURRENT_VERSION: i32 = 3;  // bump this
+const CURRENT_VERSION: i32 = 4;  // bump this
 ```
 
 ## Tables overview
@@ -86,6 +87,8 @@ Registered cluster nodes.
 | status | TEXT | `'unknown'` | `ready`, `unknown`, etc. |
 | last_heartbeat | TEXT | `''` | ISO 8601 timestamp |
 | gateway_interface | TEXT | `''` | NIC used for outbound NAT |
+| cpu_used | INTEGER | 0 | CPU cores in use (from heartbeat) |
+| memory_used | INTEGER | 0 | Memory in use (from heartbeat) |
 
 ### vms
 
@@ -107,6 +110,7 @@ Virtual machines managed by the controller.
 | node_id | TEXT | FK → nodes | v0 |
 | created_at | TEXT | `datetime('now')` | v0 |
 | runtime_state | TEXT | `'unknown'` | v2 |
+| cloud_init_user_data | TEXT | `''` | v3 |
 
 ### networks
 
@@ -118,7 +122,18 @@ Per-node network definitions for VM bridges.
 | external_ip | TEXT | | Public-facing IP for NAT/DNAT |
 | gateway_ip | TEXT | | Bridge gateway address |
 | internal_netmask | TEXT | `'255.255.255.0'` | Subnet mask |
+| allowed_tcp_ports | TEXT | `''` | Comma-separated TCP ports for DNAT |
+| allowed_udp_ports | TEXT | `''` | Comma-separated UDP ports for DNAT |
 | node_id | TEXT | PK (with name), FK → nodes | |
+
+### node_labels
+
+Per-node labels for placement hints and metadata.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| node_id | TEXT | PK (with label), FK → nodes |
+| label | TEXT | PK (with node_id), e.g. `dc=dc-a` |
 
 ## Notes
 

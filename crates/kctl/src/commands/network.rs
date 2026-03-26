@@ -20,6 +20,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             gateway_ip: args.gateway_ip,
             internal_netmask: args.internal_netmask,
             target_node: args.target_node.unwrap_or_default(),
+            allowed_tcp_ports: vec![],
+            allowed_udp_ports: vec![],
         })
         .await?
         .into_inner();

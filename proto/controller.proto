@@ -15,6 +15,7 @@ service Controller {
   
   // VM operations (declarative desired-state API managed by controller)
   rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
+  rpc UpdateVm(UpdateVmRequest) returns (UpdateVmResponse);
   rpc DeleteVm(DeleteVmRequest) returns (DeleteVmResponse);
   rpc SetVmDesiredState(SetVmDesiredStateRequest) returns (SetVmDesiredStateResponse);
   rpc GetVm(GetVmRequest) returns (GetVmResponse);
@@ -76,12 +77,25 @@ message CreateVmRequest {
   VmSpec spec = 2;
   string image_url = 3;     // HTTPS image URL to download on target node
   string image_sha256 = 4;  // Required SHA256 checksum for image_url
+  string cloud_init_user_data = 5;  // Optional cloud-init user-data (YAML); uses default if empty
 }
 
 message CreateVmResponse {
   string vm_id = 1;
   string node_id = 2;  // Which node created it
   VmState state = 3;
+}
+
+message UpdateVmRequest {
+  string vm_id = 1;
+  string target_node = 2;  // Optional
+  int32 cpu = 3;            // New CPU count (0 = no change)
+  int64 memory_bytes = 4;   // New memory (0 = no change)
+}
+
+message UpdateVmResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 message DeleteVmRequest {
@@ -134,6 +148,8 @@ message CreateNetworkRequest {
   string gateway_ip = 3;
   string internal_netmask = 4;
   string target_node = 5;  // Optional - controller picks if empty
+  repeated int32 allowed_tcp_ports = 6;  // TCP ports to DNAT-forward from external IP
+  repeated int32 allowed_udp_ports = 7;  // UDP ports to DNAT-forward from external IP
 }
 
 message CreateNetworkResponse {
@@ -165,6 +181,8 @@ message NetworkInfo {
   string gateway_ip = 3;
   string internal_netmask = 4;
   string node_id = 5;
+  repeated int32 allowed_tcp_ports = 6;
+  repeated int32 allowed_udp_ports = 7;
 }
 
 message VmInfo {
@@ -193,6 +211,7 @@ message NodeInfo {
   NodeUsage usage = 5;
   string status = 6;  // "ready", "not-ready", "unknown"
   google.protobuf.Timestamp last_heartbeat = 7;
+  repeated string labels = 8;  // e.g., "dc=dc-a", "rack=rack-1"
 }
 
 message GetNodeRequest {

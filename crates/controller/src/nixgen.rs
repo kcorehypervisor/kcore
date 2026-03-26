@@ -89,6 +89,34 @@ pub fn generate_node_config(
                 nix_escape(&net.internal_netmask)
             ));
         }
+        if !net.allowed_tcp_ports.is_empty() {
+            let ports: Vec<&str> = net
+                .allowed_tcp_ports
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !ports.is_empty() {
+                out.push_str(&format!(
+                    "      allowedTCPPorts = [ {} ];\n",
+                    ports.join(" ")
+                ));
+            }
+        }
+        if !net.allowed_udp_ports.is_empty() {
+            let ports: Vec<&str> = net
+                .allowed_udp_ports
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !ports.is_empty() {
+                out.push_str(&format!(
+                    "      allowedUDPPorts = [ {} ];\n",
+                    ports.join(" ")
+                ));
+            }
+        }
         out.push_str("    };\n");
     }
 
@@ -117,6 +145,12 @@ pub fn generate_node_config(
             "      autoStart = {};\n",
             if vm.auto_start { "true" } else { "false" }
         ));
+        if !vm.cloud_init_user_data.is_empty() {
+            let escaped = nix_escape(&vm.cloud_init_user_data);
+            out.push_str(&format!(
+                "      cloudInitUserConfigFile = pkgs.writeText \"{nix_name}-cloud-init.yaml\" \"{escaped}\";\n"
+            ));
+        }
         out.push_str("    };\n");
     }
 
@@ -145,6 +179,7 @@ mod tests {
             node_id: "node-1".into(),
             created_at: String::new(),
             runtime_state: "unknown".into(),
+            cloud_init_user_data: String::new(),
         }
     }
 
@@ -240,9 +275,27 @@ mod tests {
             gateway_ip: "10.240.10.1".into(),
             internal_netmask: "255.255.255.0".into(),
             node_id: "node-1".into(),
+            allowed_tcp_ports: String::new(),
+            allowed_udp_ports: String::new(),
         }];
         let config = generate_node_config(&[], "eno1", &default_net(), &networks);
         assert!(config.contains("networks.\"frontend\""));
         assert!(config.contains("gatewayIP = \"10.240.10.1\";"));
+    }
+
+    #[test]
+    fn renders_network_port_forwarding() {
+        let networks = vec![NetworkRow {
+            name: "frontend".into(),
+            external_ip: "198.51.100.5".into(),
+            gateway_ip: "10.240.10.1".into(),
+            internal_netmask: "255.255.255.0".into(),
+            node_id: "node-1".into(),
+            allowed_tcp_ports: "80,443,8080".into(),
+            allowed_udp_ports: "53".into(),
+        }];
+        let config = generate_node_config(&[], "eno1", &default_net(), &networks);
+        assert!(config.contains("allowedTCPPorts = [ 80 443 8080 ];"));
+        assert!(config.contains("allowedUDPPorts = [ 53 ];"));
     }
 }

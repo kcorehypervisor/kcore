@@ -18,6 +18,8 @@ pub struct NodeRow {
     pub status: String,
     pub last_heartbeat: String,
     pub gateway_interface: String,
+    pub cpu_used: i32,
+    pub memory_used: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,7 @@ pub struct VmRow {
     #[allow(dead_code)]
     pub created_at: String,
     pub runtime_state: String,
+    pub cloud_init_user_data: String,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +49,8 @@ pub struct NetworkRow {
     pub gateway_ip: String,
     pub internal_netmask: String,
     pub node_id: String,
+    pub allowed_tcp_ports: String,
+    pub allowed_udp_ports: String,
 }
 
 impl Database {
@@ -85,7 +90,9 @@ impl Database {
                 memory_bytes INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'unknown',
                 last_heartbeat TEXT NOT NULL DEFAULT '',
-                gateway_interface TEXT NOT NULL DEFAULT ''
+                gateway_interface TEXT NOT NULL DEFAULT '',
+                cpu_used INTEGER NOT NULL DEFAULT 0,
+                memory_used INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS vms (
                 id TEXT PRIMARY KEY,
@@ -101,7 +108,8 @@ impl Database {
                 auto_start INTEGER NOT NULL DEFAULT 1,
                 node_id TEXT NOT NULL REFERENCES nodes(id),
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                runtime_state TEXT NOT NULL DEFAULT 'unknown'
+                runtime_state TEXT NOT NULL DEFAULT 'unknown',
+                cloud_init_user_data TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS networks (
                 name TEXT NOT NULL,
@@ -109,7 +117,14 @@ impl Database {
                 gateway_ip TEXT NOT NULL,
                 internal_netmask TEXT NOT NULL DEFAULT '255.255.255.0',
                 node_id TEXT NOT NULL REFERENCES nodes(id),
+                allowed_tcp_ports TEXT NOT NULL DEFAULT '',
+                allowed_udp_ports TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (name, node_id)
+            );
+            CREATE TABLE IF NOT EXISTS node_labels (
+                node_id TEXT NOT NULL REFERENCES nodes(id),
+                label TEXT NOT NULL,
+                PRIMARY KEY (node_id, label)
             );",
         )?;
 
@@ -148,7 +163,30 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 2;
+        if version < 3 {
+            let _ = conn.execute(
+                "ALTER TABLE nodes ADD COLUMN cpu_used INTEGER NOT NULL DEFAULT 0",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE nodes ADD COLUMN memory_used INTEGER NOT NULL DEFAULT 0",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE networks ADD COLUMN allowed_tcp_ports TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE networks ADD COLUMN allowed_udp_ports TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE vms ADD COLUMN cloud_init_user_data TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+        }
+
+        const CURRENT_VERSION: i32 = 3;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -168,8 +206,8 @@ impl Database {
     pub fn upsert_node(&self, node: &NodeRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO nodes (id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO nodes (id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                 hostname=excluded.hostname,
                 address=excluded.address,
@@ -177,7 +215,9 @@ impl Database {
                 memory_bytes=excluded.memory_bytes,
                 status=excluded.status,
                 last_heartbeat=excluded.last_heartbeat,
-                gateway_interface=excluded.gateway_interface",
+                gateway_interface=excluded.gateway_interface,
+                cpu_used=excluded.cpu_used,
+                memory_used=excluded.memory_used",
             params![
                 node.id,
                 node.hostname,
@@ -187,6 +227,8 @@ impl Database {
                 node.status,
                 node.last_heartbeat,
                 node.gateway_interface,
+                node.cpu_used,
+                node.memory_used,
             ],
         )?;
         Ok(())
@@ -200,20 +242,16 @@ impl Database {
     ) -> Result<bool, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let rows = conn.execute(
-            "UPDATE nodes SET last_heartbeat = datetime('now'), status = 'ready' WHERE id = ?1",
-            params![node_id],
+            "UPDATE nodes SET last_heartbeat = datetime('now'), status = 'ready', cpu_used = ?2, memory_used = ?3 WHERE id = ?1",
+            params![node_id, cpu_used, mem_used],
         )?;
-        drop(conn);
-        if rows > 0 && (cpu_used > 0 || mem_used > 0) {
-            // usage fields could be stored if needed
-        }
         Ok(rows > 0)
     }
 
     pub fn get_node(&self, node_id: &str) -> Result<Option<NodeRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface FROM nodes WHERE id = ?1",
+            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used FROM nodes WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![node_id], row_to_node)?;
         rows.next().transpose()
@@ -222,7 +260,7 @@ impl Database {
     pub fn list_nodes(&self) -> Result<Vec<NodeRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface FROM nodes",
+            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used FROM nodes",
         )?;
         let rows = stmt.query_map([], row_to_node)?;
         rows.collect()
@@ -231,7 +269,7 @@ impl Database {
     pub fn get_node_by_address(&self, address: &str) -> Result<Option<NodeRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface FROM nodes WHERE address = ?1",
+            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used FROM nodes WHERE address = ?1",
         )?;
         let mut rows = stmt.query_map(params![address], row_to_node)?;
         rows.next().transpose()
@@ -240,8 +278,8 @@ impl Database {
     pub fn insert_vm(&self, vm: &VmRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13)",
+            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14)",
             params![
                 vm.id,
                 vm.name,
@@ -256,6 +294,7 @@ impl Database {
                 vm.auto_start as i32,
                 vm.node_id,
                 vm.runtime_state,
+                vm.cloud_init_user_data,
             ],
         )?;
         Ok(())
@@ -264,7 +303,7 @@ impl Database {
     pub fn get_vm(&self, vm_id: &str) -> Result<Option<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state FROM vms WHERE id = ?1",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data FROM vms WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![vm_id], row_to_vm)?;
         rows.next().transpose()
@@ -273,7 +312,7 @@ impl Database {
     pub fn list_vms(&self) -> Result<Vec<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state FROM vms",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data FROM vms",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
         rows.collect()
@@ -282,7 +321,7 @@ impl Database {
     pub fn list_vms_for_node(&self, node_id: &str) -> Result<Vec<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state FROM vms WHERE node_id = ?1",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data FROM vms WHERE node_id = ?1",
         )?;
         let rows = stmt.query_map(params![node_id], row_to_vm)?;
         rows.collect()
@@ -291,14 +330,16 @@ impl Database {
     pub fn insert_network(&self, network: &NetworkRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO networks (name, external_ip, gateway_ip, internal_netmask, node_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO networks (name, external_ip, gateway_ip, internal_netmask, node_id, allowed_tcp_ports, allowed_udp_ports)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 network.name,
                 network.external_ip,
                 network.gateway_ip,
                 network.internal_netmask,
-                network.node_id
+                network.node_id,
+                network.allowed_tcp_ports,
+                network.allowed_udp_ports
             ],
         )?;
         Ok(())
@@ -311,7 +352,7 @@ impl Database {
     ) -> Result<Option<NetworkRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT name, external_ip, gateway_ip, internal_netmask, node_id
+            "SELECT name, external_ip, gateway_ip, internal_netmask, node_id, allowed_tcp_ports, allowed_udp_ports
              FROM networks
              WHERE node_id = ?1 AND name = ?2",
         )?;
@@ -322,7 +363,7 @@ impl Database {
     pub fn list_networks(&self) -> Result<Vec<NetworkRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT name, external_ip, gateway_ip, internal_netmask, node_id
+            "SELECT name, external_ip, gateway_ip, internal_netmask, node_id, allowed_tcp_ports, allowed_udp_ports
              FROM networks",
         )?;
         let rows = stmt.query_map([], row_to_network)?;
@@ -335,7 +376,7 @@ impl Database {
     ) -> Result<Vec<NetworkRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT name, external_ip, gateway_ip, internal_netmask, node_id
+            "SELECT name, external_ip, gateway_ip, internal_netmask, node_id, allowed_tcp_ports, allowed_udp_ports
              FROM networks
              WHERE node_id = ?1",
         )?;
@@ -395,6 +436,93 @@ impl Database {
         )?;
         Ok(rows > 0)
     }
+
+    pub fn update_vm_spec(
+        &self,
+        id_or_name: &str,
+        cpu: Option<i32>,
+        memory_bytes: Option<i64>,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut parts = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(c) = cpu {
+            parts.push("cpu = ?");
+            values.push(Box::new(c));
+        }
+        if let Some(m) = memory_bytes {
+            parts.push("memory_bytes = ?");
+            values.push(Box::new(m));
+        }
+        if parts.is_empty() {
+            return Ok(false);
+        }
+        values.push(Box::new(id_or_name.to_string()));
+        let set_clause = parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p.replace('?', &format!("?{}", i + 1)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let id_param = values.len();
+        let sql = format!(
+            "UPDATE vms SET {} WHERE id = ?{} OR name = ?{}",
+            set_clause, id_param, id_param
+        );
+        let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        let rows = conn.execute(&sql, refs.as_slice())?;
+        Ok(rows > 0)
+    }
+
+    pub fn upsert_node_labels(
+        &self,
+        node_id: &str,
+        labels: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM node_labels WHERE node_id = ?1",
+            params![node_id],
+        )?;
+        for label in labels {
+            conn.execute(
+                "INSERT INTO node_labels (node_id, label) VALUES (?1, ?2)",
+                params![node_id, label],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_node_labels(&self, node_id: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare("SELECT label FROM node_labels WHERE node_id = ?1")?;
+        let rows = stmt.query_map(params![node_id], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    pub fn get_all_node_labels(&self) -> Result<Vec<(String, String)>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare("SELECT node_id, label FROM node_labels ORDER BY node_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    pub fn allocated_resources_per_node(&self) -> Result<Vec<(String, i64, i64)>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, COALESCE(SUM(cpu), 0), COALESCE(SUM(memory_bytes), 0) FROM vms GROUP BY node_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect()
+    }
 }
 
 fn row_to_node(row: &rusqlite::Row) -> Result<NodeRow, rusqlite::Error> {
@@ -407,6 +535,8 @@ fn row_to_node(row: &rusqlite::Row) -> Result<NodeRow, rusqlite::Error> {
         status: row.get(5)?,
         last_heartbeat: row.get(6)?,
         gateway_interface: row.get(7)?,
+        cpu_used: row.get(8)?,
+        memory_used: row.get(9)?,
     })
 }
 
@@ -429,6 +559,7 @@ fn row_to_vm(row: &rusqlite::Row) -> Result<VmRow, rusqlite::Error> {
         node_id: row.get(11)?,
         created_at: row.get(12)?,
         runtime_state: row.get(13)?,
+        cloud_init_user_data: row.get(14)?,
     })
 }
 
@@ -439,6 +570,8 @@ fn row_to_network(row: &rusqlite::Row) -> Result<NetworkRow, rusqlite::Error> {
         gateway_ip: row.get(2)?,
         internal_netmask: row.get(3)?,
         node_id: row.get(4)?,
+        allowed_tcp_ports: row.get(5)?,
+        allowed_udp_ports: row.get(6)?,
     })
 }
 
@@ -481,6 +614,8 @@ mod tests {
             status: "ready".to_string(),
             last_heartbeat: String::new(),
             gateway_interface: "eno1".to_string(),
+            cpu_used: 0,
+            memory_used: 0,
         }
     }
 
@@ -500,6 +635,7 @@ mod tests {
             node_id: node_id.to_string(),
             created_at: String::new(),
             runtime_state: "unknown".to_string(),
+            cloud_init_user_data: String::new(),
         }
     }
 
@@ -541,6 +677,7 @@ mod tests {
             node_id: node.id.clone(),
             created_at: String::new(),
             runtime_state: "unknown".to_string(),
+            cloud_init_user_data: String::new(),
         })
         .expect("insert qcow vm");
 
@@ -559,6 +696,8 @@ mod tests {
             gateway_ip: "10.240.10.1".to_string(),
             internal_netmask: "255.255.255.0".to_string(),
             node_id: node.id.clone(),
+            allowed_tcp_ports: String::new(),
+            allowed_udp_ports: String::new(),
         })
         .expect("insert network");
 

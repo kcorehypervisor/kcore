@@ -1,4 +1,3 @@
-use std::net::Ipv4Addr;
 use std::time::Duration;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
@@ -9,6 +8,15 @@ use crate::controller_proto;
 use crate::db::{Database, NetworkRow, NodeRow, VmRow};
 use crate::node_proto;
 use crate::{nixgen, node_client::NodeClients, scheduler};
+
+use super::helpers::{
+    controller_state_from_node_state, parse_datetime_to_timestamp, parse_port_list,
+    short_vm_id_seed, state_fallback_without_runtime,
+};
+use super::validation::{
+    derive_image_format, derive_local_image_path, validate_image_sha256, validate_image_url,
+    validate_ipv4, validate_netmask, validate_network_name,
+};
 
 #[cfg(test)]
 type PushHook = std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + Sync + 'static>;
@@ -182,144 +190,6 @@ impl ControllerService {
     }
 }
 
-fn short_vm_id_seed() -> String {
-    let raw = uuid_v4();
-    let start = raw.len().saturating_sub(8);
-    raw[start..].to_string()
-}
-
-fn validate_image_sha256(sha: &str) -> Result<String, Status> {
-    let normalized = sha.trim().to_ascii_lowercase();
-    if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(Status::invalid_argument(
-            "image_sha256 must be exactly 64 hexadecimal characters",
-        ));
-    }
-    Ok(normalized)
-}
-
-fn validate_image_url(url: &str) -> Result<String, Status> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return Err(Status::invalid_argument("image_url is required"));
-    }
-    if !trimmed.starts_with("https://") {
-        return Err(Status::invalid_argument(
-            "image_url must use https:// scheme",
-        ));
-    }
-    Ok(trimmed.to_string())
-}
-
-fn sanitize_image_file_name(url: &str) -> String {
-    let raw_name = url.rsplit('/').next().unwrap_or("image.raw");
-    let cleaned: String = raw_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "image.raw".to_string()
-    } else {
-        cleaned
-    }
-}
-
-fn derive_local_image_path(image_url: &str, image_sha256: &str) -> String {
-    let file_name = sanitize_image_file_name(image_url);
-    format!(
-        "/var/lib/kcore/images/{}-{}",
-        &image_sha256[..12],
-        file_name
-    )
-}
-
-fn derive_image_format(image_url: &str) -> String {
-    let lower = image_url.to_ascii_lowercase();
-    if lower.ends_with(".qcow2") || lower.ends_with(".qcow") {
-        "qcow2".to_string()
-    } else {
-        "raw".to_string()
-    }
-}
-
-fn validate_network_name(name: &str) -> Result<String, Status> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(Status::invalid_argument("network name is required"));
-    }
-    if trimmed == "default" {
-        return Err(Status::invalid_argument(
-            "network name 'default' is reserved; configure it via controller defaultNetwork",
-        ));
-    }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(Status::invalid_argument(
-            "network name must contain only letters, digits, '-' or '_'",
-        ));
-    }
-    Ok(trimmed.to_string())
-}
-
-fn validate_ipv4(value: &str, field: &str) -> Result<String, Status> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(Status::invalid_argument(format!("{field} is required")));
-    }
-    trimmed
-        .parse::<Ipv4Addr>()
-        .map_err(|_| Status::invalid_argument(format!("{field} must be a valid IPv4 address")))?;
-    Ok(trimmed.to_string())
-}
-
-fn validate_netmask(value: &str) -> Result<String, Status> {
-    let parsed = validate_ipv4(value, "internal_netmask")?;
-    // Keep validation simple and explicit: only contiguous masks are accepted.
-    let bits =
-        u32::from(parsed.parse::<Ipv4Addr>().map_err(|_| {
-            Status::invalid_argument("internal_netmask must be a valid IPv4 address")
-        })?);
-    let mut seen_zero = false;
-    for i in 0..32 {
-        let bit = (bits >> (31 - i)) & 1;
-        if bit == 0 {
-            seen_zero = true;
-        } else if seen_zero {
-            return Err(Status::invalid_argument(
-                "internal_netmask must be contiguous (for example 255.255.255.0)",
-            ));
-        }
-    }
-    Ok(parsed)
-}
-
-fn controller_state_from_node_state(state: i32) -> i32 {
-    match crate::node_proto::VmState::try_from(state).unwrap_or(crate::node_proto::VmState::Unknown)
-    {
-        crate::node_proto::VmState::Unknown => controller_proto::VmState::Unknown as i32,
-        crate::node_proto::VmState::Stopped => controller_proto::VmState::Stopped as i32,
-        crate::node_proto::VmState::Running => controller_proto::VmState::Running as i32,
-        crate::node_proto::VmState::Paused => controller_proto::VmState::Paused as i32,
-        crate::node_proto::VmState::Error => controller_proto::VmState::Error as i32,
-    }
-}
-
-fn state_fallback_without_runtime(auto_start: bool) -> i32 {
-    if auto_start {
-        controller_proto::VmState::Unknown as i32
-    } else {
-        controller_proto::VmState::Stopped as i32
-    }
-}
-
 #[tonic::async_trait]
 impl controller_proto::controller_server::Controller for ControllerService {
     async fn register_node(
@@ -342,11 +212,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
             status: "ready".into(),
             last_heartbeat: String::new(),
             gateway_interface: String::new(),
+            cpu_used: 0,
+            memory_used: 0,
         };
 
         self.db
             .upsert_node(&node)
             .map_err(|e| Status::internal(format!("storing node: {e}")))?;
+
+        if !req.labels.is_empty() {
+            self.db
+                .upsert_node_labels(&req.node_id, &req.labels)
+                .map_err(|e| Status::internal(format!("storing labels: {e}")))?;
+        }
 
         if let Err(e) = self.clients.connect(&req.address).await {
             warn!(address = %req.address, error = %e, "failed to connect to node");
@@ -408,7 +286,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 Ok(controller_proto::VmState::Error) => "error",
                 _ => "unknown",
             };
-            match self.db.update_vm_runtime_state(&req.node_id, &vm.name, state_str) {
+            match self
+                .db
+                .update_vm_runtime_state(&req.node_id, &vm.name, state_str)
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     warn!(
@@ -454,9 +335,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .db
                 .list_nodes()
                 .map_err(|e| Status::internal(e.to_string()))?;
-            scheduler::select_node(&nodes)
+            scheduler::select_node_for_vm(&nodes, spec.cpu, spec.memory_bytes)
                 .cloned()
-                .ok_or_else(|| Status::unavailable("no ready nodes"))?
+                .ok_or_else(|| Status::unavailable("no ready node with sufficient capacity"))?
         };
 
         let vm_id = if spec.id.is_empty() {
@@ -543,6 +424,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             node_id: node.id.clone(),
             created_at: String::new(),
             runtime_state: "unknown".to_string(),
+            cloud_init_user_data: req.cloud_init_user_data,
         };
 
         self.db
@@ -557,6 +439,49 @@ impl controller_proto::controller_server::Controller for ControllerService {
             vm_id,
             node_id: node.id,
             state: controller_proto::VmState::Stopped as i32,
+        }))
+    }
+
+    async fn update_vm(
+        &self,
+        request: Request<controller_proto::UpdateVmRequest>,
+    ) -> Result<Response<controller_proto::UpdateVmResponse>, Status> {
+        auth::require_peer(&request, &[CN_KCTL])?;
+        let req = request.into_inner();
+
+        if req.vm_id.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+
+        let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
+
+        let cpu = if req.cpu > 0 { Some(req.cpu) } else { None };
+        let mem = if req.memory_bytes > 0 {
+            Some(req.memory_bytes)
+        } else {
+            None
+        };
+
+        if cpu.is_none() && mem.is_none() {
+            return Err(Status::invalid_argument(
+                "at least one of cpu or memory_bytes must be set",
+            ));
+        }
+
+        let updated = self
+            .db
+            .update_vm_spec(&req.vm_id, cpu, mem)
+            .map_err(|e| Status::internal(format!("updating vm: {e}")))?;
+        if !updated {
+            return Err(Status::not_found(format!("VM '{}' not found", req.vm_id)));
+        }
+
+        info!(vm_id = %req.vm_id, cpu = ?cpu, memory_bytes = ?mem, "updated VM spec, pushing config");
+        self.push_config_to_node(&node).await?;
+
+        Ok(Response::new(controller_proto::UpdateVmResponse {
+            success: true,
+            message: format!("VM '{}' updated", req.vm_id),
         }))
     }
 
@@ -766,7 +691,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     set.spawn(async move {
                         let result = tokio::time::timeout(
                             Duration::from_secs(3),
-                            compute.get_vm(node_proto::GetVmRequest { vm_id: vm_name.clone() }),
+                            compute.get_vm(node_proto::GetVmRequest {
+                                vm_id: vm_name.clone(),
+                            }),
                         )
                         .await;
                         (idx, vm_name, node_id, addr, result)
@@ -864,6 +791,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 gateway_ip,
                 internal_netmask,
                 node_id: node.id.clone(),
+                allowed_tcp_ports: req
+                    .allowed_tcp_ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                allowed_udp_ports: req
+                    .allowed_udp_ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
             })
             .map_err(|e| Status::internal(format!("storing network: {e}")))?;
 
@@ -983,6 +922,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     gateway_ip: n.gateway_ip,
                     internal_netmask: n.internal_netmask,
                     node_id: n.node_id,
+                    allowed_tcp_ports: parse_port_list(&n.allowed_tcp_ports),
+                    allowed_udp_ports: parse_port_list(&n.allowed_udp_ports),
                 })
                 .collect(),
         }))
@@ -998,19 +939,37 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .list_nodes()
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let all_labels = self.db.get_all_node_labels().unwrap_or_default();
+
         let infos = nodes
             .into_iter()
-            .map(|n| controller_proto::NodeInfo {
-                node_id: n.id,
-                hostname: n.hostname,
-                address: n.address,
-                capacity: Some(controller_proto::NodeCapacity {
-                    cpu_cores: n.cpu_cores,
-                    memory_bytes: n.memory_bytes,
-                }),
-                usage: None,
-                status: n.status,
-                last_heartbeat: None,
+            .map(|n| {
+                let labels: Vec<String> = all_labels
+                    .iter()
+                    .filter(|(nid, _)| nid == &n.id)
+                    .map(|(_, l)| l.clone())
+                    .collect();
+                let hb = if n.last_heartbeat.is_empty() {
+                    None
+                } else {
+                    parse_datetime_to_timestamp(&n.last_heartbeat)
+                };
+                controller_proto::NodeInfo {
+                    node_id: n.id,
+                    hostname: n.hostname,
+                    address: n.address,
+                    capacity: Some(controller_proto::NodeCapacity {
+                        cpu_cores: n.cpu_cores,
+                        memory_bytes: n.memory_bytes,
+                    }),
+                    usage: Some(controller_proto::NodeUsage {
+                        cpu_cores_used: n.cpu_used,
+                        memory_bytes_used: n.memory_used,
+                    }),
+                    status: n.status,
+                    last_heartbeat: hb,
+                    labels,
+                }
             })
             .collect();
 
@@ -1031,6 +990,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(format!("node {} not found", req.node_id)))?;
 
+        let labels = self.db.get_node_labels(&node.id).unwrap_or_default();
+        let hb = if node.last_heartbeat.is_empty() {
+            None
+        } else {
+            parse_datetime_to_timestamp(&node.last_heartbeat)
+        };
+
         Ok(Response::new(controller_proto::GetNodeResponse {
             node: Some(controller_proto::NodeInfo {
                 node_id: node.id,
@@ -1040,16 +1006,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     cpu_cores: node.cpu_cores,
                     memory_bytes: node.memory_bytes,
                 }),
-                usage: None,
+                usage: Some(controller_proto::NodeUsage {
+                    cpu_cores_used: node.cpu_used,
+                    memory_bytes_used: node.memory_used,
+                }),
                 status: node.status,
-                last_heartbeat: None,
+                last_heartbeat: hb,
+                labels,
             }),
         }))
     }
-}
-
-fn uuid_v4() -> String {
-    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
@@ -1079,6 +1045,8 @@ mod tests {
             status: "ready".to_string(),
             last_heartbeat: String::new(),
             gateway_interface: "eno1".to_string(),
+            cpu_used: 0,
+            memory_used: 0,
         }
     }
 
@@ -1099,6 +1067,7 @@ mod tests {
             node_id: node_id.to_string(),
             created_at: String::new(),
             runtime_state: "unknown".to_string(),
+            cloud_init_user_data: String::new(),
         }
     }
 
@@ -1285,6 +1254,7 @@ mod tests {
             }),
             image_url: String::new(),
             image_sha256: String::new(),
+            cloud_init_user_data: String::new(),
         };
 
         let err =

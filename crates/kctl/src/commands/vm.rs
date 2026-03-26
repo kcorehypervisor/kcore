@@ -70,6 +70,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         spec: Some(spec),
         image_url: image.url,
         image_sha256: image.sha256,
+        cloud_init_user_data: String::new(),
     };
 
     let resp = client.create_vm(req).await?.into_inner();
@@ -93,6 +94,40 @@ pub async fn delete(info: &ConnectionInfo, vm_id: &str, target_node: Option<Stri
         .await?;
     println!("VM '{vm_id}' deleted");
     Ok(())
+}
+
+pub async fn update(
+    info: &ConnectionInfo,
+    vm_id: &str,
+    cpu: Option<i32>,
+    memory: Option<String>,
+    target_node: Option<String>,
+) -> Result<()> {
+    let memory_bytes = match &memory {
+        Some(m) => {
+            let bytes = client::parse_size_bytes(m).map_err(|e| anyhow::anyhow!(e))?;
+            bytes
+        }
+        None => 0,
+    };
+
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .update_vm(proto::UpdateVmRequest {
+            vm_id: vm_id.to_string(),
+            target_node: target_node.unwrap_or_default(),
+            cpu: cpu.unwrap_or(0),
+            memory_bytes,
+        })
+        .await?
+        .into_inner();
+
+    if resp.success {
+        println!("{}", resp.message);
+        Ok(())
+    } else {
+        anyhow::bail!("Update failed: {}", resp.message);
+    }
 }
 
 pub async fn start(info: &ConnectionInfo, vm_id: &str, target_node: Option<String>) -> Result<()> {

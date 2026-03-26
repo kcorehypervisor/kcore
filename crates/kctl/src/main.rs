@@ -61,6 +61,11 @@ enum Command {
         #[command(subcommand)]
         resource: SetResource,
     },
+    /// Update a resource
+    Update {
+        #[command(subcommand)]
+        resource: UpdateResource,
+    },
     /// Get or list resources
     Get {
         #[command(subcommand)]
@@ -218,6 +223,24 @@ enum SetResource {
         /// Desired VM state
         #[arg(long, value_enum)]
         state: DesiredVmState,
+        /// Target node (optional)
+        #[arg(long = "target-node")]
+        target_node: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpdateResource {
+    /// Update a virtual machine (resize CPU/memory)
+    Vm {
+        /// VM ID or name
+        vm_id: String,
+        /// New CPU count
+        #[arg(long)]
+        cpu: Option<i32>,
+        /// New memory size (e.g. 4G, 8192M)
+        #[arg(long)]
+        memory: Option<String>,
         /// Target node (optional)
         #[arg(long = "target-node")]
         target_node: Option<String>,
@@ -435,6 +458,19 @@ async fn main() {
                 }
             };
             commands::vm::set_desired_state(&info, vm_id, desired, target_node.clone(), label).await
+        }
+
+        Command::Update {
+            resource:
+                UpdateResource::Vm {
+                    vm_id,
+                    cpu,
+                    memory,
+                    target_node,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::vm::update(&info, vm_id, *cpu, memory.clone(), target_node.clone()).await
         }
 
         Command::Get {
