@@ -284,3 +284,8 @@ Status (incremental):
 - Implement three core specs and TLC configs.
 - Add CI checks for model invariants on bounded state spaces.
 - Track any model-vs-implementation drift via trace checking.
+
+Status (incremental):
+
+- `specs/tla/` contains bounded specs and configs for controller-node reconcile, controller replication, and cross-DC replication.
+- A repository check entrypoint now exists via `make test-tla` (backed by `scripts/check-tla.sh`) to run all TLC models in one pass.

@@ -1,11 +1,11 @@
-# TLA+ Starter Specs for HA Phase 1
+# TLA+ Specs for HA Replication
 
-This directory contains a small, bounded TLA+ starter set for the HA rollout.
-It is intentionally simple and focused on Phase 1 semantics:
+This directory contains bounded TLA+ models for HA/replication behavior.
+The intent is to check protocol-level safety/liveness properties with TLC.
 
-- controller fallback selection
-- heartbeat liveness under failover
-- eventual replication convergence (bounded)
+- controller fallback/heartbeat progression
+- replication convergence under anti-entropy
+- cross-DC eventual convergence assumptions
 
 ## Files
 
@@ -15,23 +15,31 @@ It is intentionally simple and focused on Phase 1 semantics:
   - Heartbeats only target the active controller.
 
 - `ControllerReplication.tla` + `ControllerReplication.cfg`
-  - Two controllers receive events and exchange missing events.
-  - Models realtime delivery + anti-entropy pull.
-  - Checks eventual set convergence.
+  - Controller-to-controller replication model.
+  - Checks event propagation safety and eventual convergence assumptions.
 
 - `CrossDcReplication.tla` + `CrossDcReplication.cfg`
-  - Three controllers in two DCs.
-  - Inter-DC links may flap; anti-entropy eventually repairs divergence.
+  - Three controllers across two DCs.
+  - Models inter-DC synchronization with bounded anti-entropy checks.
 
 ## Running locally
 
-Example with TLC:
+Preferred:
 
 ```bash
-tlc -config ControllerNodeReconcile.cfg ControllerNodeReconcile.tla
-tlc -config ControllerReplication.cfg ControllerReplication.tla
-tlc -config CrossDcReplication.cfg CrossDcReplication.tla
+make test-tla
 ```
+
+Direct:
+
+```bash
+bash ./scripts/check-tla.sh
+```
+
+If TLC is not in `PATH`, set one of:
+
+- `TLC_CMD` (full command to run TLC)
+- `TLA2TOOLS_JAR` (path to `tla2tools.jar`)
 
 Notes:
 

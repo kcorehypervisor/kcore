@@ -1,4 +1,4 @@
-.PHONY: all build check fmt clippy audit test test-all test-rust test-nix test-vm coverage test-controller test-node-agent test-kctl test-rust-filter iso iso-remote kctl clean help
+.PHONY: all build check fmt clippy audit test test-all test-rust test-nix test-vm test-tla coverage test-controller test-node-agent test-kctl test-rust-filter iso iso-remote kctl clean help
 
 VERSION := $(shell cat VERSION)
 V ?= v$(VERSION)
@@ -35,6 +35,9 @@ test-nix:
 
 test-vm:
 	nix build .#checks.$(SYSTEM).vm-module
+
+test-tla:
+	bash ./scripts/check-tla.sh
 
 coverage:
 	nix develop -c nix shell nixpkgs#cargo-llvm-cov nixpkgs#cargo nixpkgs#rustc nixpkgs#llvmPackages_21.llvm -c sh -lc 'LLVM_COV="$$(which llvm-cov)" LLVM_PROFDATA="$$(which llvm-profdata)" cargo llvm-cov --workspace --summary-only'
@@ -88,6 +91,7 @@ help:
 	@echo "  test-rust   Run all Rust tests in workspace"
 	@echo "  test-nix    Run Nix flake checks"
 	@echo "  test-vm     Run NixOS VM module test (tests/vm-module.nix)"
+	@echo "  test-tla    Run bounded TLC model checks in specs/tla"
 	@echo "  coverage    Run test coverage via nix develop + cargo-llvm-cov"
 	@echo "  test-controller  Run controller crate tests"
 	@echo "  test-node-agent  Run node-agent crate tests"
