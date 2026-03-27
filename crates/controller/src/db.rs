@@ -835,6 +835,15 @@ impl Database {
         )
     }
 
+    pub fn count_failed_compensation_jobs(&self) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM replication_compensation_jobs WHERE status = 'failed'",
+            [],
+            |row| row.get(0),
+        )
+    }
+
     pub fn claim_next_compensation_job(
         &self,
     ) -> Result<Option<ReplicationCompensationJobRow>, rusqlite::Error> {
@@ -989,6 +998,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn count_failed_replication_reservations(&self) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM replication_reservations WHERE status = 'failed'",
+            [],
+            |row| row.get(0),
+        )
+    }
+
     pub fn get_replication_reservation(
         &self,
         reservation_key: &str,
@@ -1010,6 +1028,30 @@ impl Database {
             })
         })?;
         rows.next().transpose()
+    }
+
+    pub fn count_replication_materialization_backlog(&self) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*)
+             FROM replication_resource_heads h
+             LEFT JOIN replication_materialized_heads m
+               ON m.resource_key = h.resource_key
+             WHERE m.last_op_id IS NULL OR m.last_op_id != h.last_op_id",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn oldest_unresolved_conflict_age_seconds(&self) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COALESCE(CAST(MAX((julianday('now') - julianday(created_at)) * 86400) AS INTEGER), 0)
+             FROM replication_conflicts
+             WHERE resolved = 0",
+            [],
+            |row| row.get(0),
+        )
     }
 
     pub fn upsert_node(&self, node: &NodeRow) -> Result<(), rusqlite::Error> {
@@ -2167,5 +2209,53 @@ mod tests {
         assert_eq!(row.op_id, "op-1");
         assert_eq!(row.status, "reserved");
         assert!(row.error.is_empty());
+    }
+
+    #[test]
+    fn replication_metrics_queries_work() {
+        let db = Database::open(":memory:").expect("open db");
+        db.insert_replication_conflict(
+            "vm/v1",
+            "op-a",
+            "op-b",
+            "ctrl-a",
+            "ctrl-b",
+            "conflict",
+        )
+        .expect("insert conflict");
+        db.upsert_replication_reservation("node-capacity/node-1", "vm/v1", "op-1", "failed", "x")
+            .expect("insert failed reservation");
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "vm/v1".to_string(),
+            last_op_id: "op-1".to_string(),
+            last_logical_ts_unix_ms: 1,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 1,
+            last_event_type: "vm.update".to_string(),
+            last_body_json: "{}".to_string(),
+        })
+        .expect("insert head");
+        db.upsert_materialized_replication_head("vm/v1", "op-0", "vm.update")
+            .expect("insert stale materialized head");
+
+        assert_eq!(
+            db.count_failed_replication_reservations()
+                .expect("count failed reservations"),
+            1
+        );
+        assert_eq!(
+            db.count_replication_materialization_backlog()
+                .expect("materialization backlog"),
+            1
+        );
+        assert!(
+            db.oldest_unresolved_conflict_age_seconds()
+                .expect("oldest unresolved age")
+                >= 0
+        );
     }
 }

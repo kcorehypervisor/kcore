@@ -277,6 +277,7 @@ Status (incremental):
 
 - ControllerAdmin now exposes conflict APIs: `ListReplicationConflicts(limit)` and `ResolveReplicationConflict(id)` backed by `replication_conflicts`.
 - `kctl` now exposes matching operator commands: `kctl get conflicts [--limit N]` and `kctl resolve conflict <id>`.
+- `GetReplicationStatus` now includes zero-manual SLO metrics and enforcement signals: pending/failed compensation jobs, materialization backlog, unresolved conflict age, failed reservations, and a `zero_manual_slo_healthy` verdict with violation reasons.
 
 ### Phase 5: TLA+ validation gates
 
