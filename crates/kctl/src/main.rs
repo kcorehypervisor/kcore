@@ -391,7 +391,7 @@ enum NodeAction {
         data_disk: Vec<String>,
         /// Controller to join after install
         #[arg(long)]
-        join_controller: Option<String>,
+        join_controller: Vec<String>,
         /// Install and run controller on this node
         #[arg(long)]
         run_controller: bool,
@@ -798,7 +798,7 @@ async fn main() {
                 &info,
                 os_disk,
                 data_disk.clone(),
-                join_controller.as_deref(),
+                join_controller,
                 *run_controller,
                 data_disk_mode,
                 storage_backend.as_ref().map(|v| match v {

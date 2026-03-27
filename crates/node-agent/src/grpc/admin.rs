@@ -489,7 +489,16 @@ fn prepare_install_log() -> Result<(std::fs::File, PathBuf), Status> {
 }
 
 fn build_install_command_args(req: &proto::InstallToDiskRequest) -> Result<Vec<String>, Status> {
-    let has_controller = !req.controller.trim().is_empty();
+    let mut controllers: Vec<String> = req
+        .controllers
+        .iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if controllers.is_empty() && !req.controller.trim().is_empty() {
+        controllers.push(req.controller.trim().to_string());
+    }
+    let has_controller = !controllers.is_empty();
     if has_controller == req.run_controller {
         return Err(Status::invalid_argument(
             "provide exactly one of controller or run_controller",
@@ -509,8 +518,13 @@ fn build_install_command_args(req: &proto::InstallToDiskRequest) -> Result<Vec<S
         args.push(dd.clone());
     }
     if has_controller {
+        for controller in &controllers {
+            args.push("--controller".to_string());
+            args.push(controller.clone());
+        }
+    } else if !req.controller.trim().is_empty() {
         args.push("--controller".to_string());
-        args.push(req.controller.clone());
+        args.push(req.controller.trim().to_string());
     }
     if req.run_controller {
         args.push("--run-controller".to_string());
@@ -1000,6 +1014,7 @@ mod tests {
             disable_vxlan: false,
             sub_ca_cert_pem: String::new(),
             sub_ca_key_pem: String::new(),
+            controllers: Vec::new(),
             dc_id: String::new(),
         };
 
@@ -1070,6 +1085,7 @@ mod tests {
             disable_vxlan: false,
             sub_ca_cert_pem: String::new(),
             sub_ca_key_pem: String::new(),
+            controllers: Vec::new(),
             dc_id: String::new(),
         };
         write_bootstrap_pki_at(&req, &cert_dir).expect("noop cert write");
@@ -1218,6 +1234,7 @@ mod tests {
                 disable_vxlan: false,
                 sub_ca_cert_pem: String::new(),
                 sub_ca_key_pem: String::new(),
+                controllers: Vec::new(),
                 dc_id: String::new(),
             }),
         )
@@ -1255,6 +1272,7 @@ mod tests {
                 disable_vxlan: false,
                 sub_ca_cert_pem: String::new(),
                 sub_ca_key_pem: String::new(),
+                controllers: Vec::new(),
                 dc_id: String::new(),
             }),
         )
@@ -1285,6 +1303,7 @@ mod tests {
                 disable_vxlan: false,
                 sub_ca_cert_pem: String::new(),
                 sub_ca_key_pem: String::new(),
+                controllers: Vec::new(),
                 dc_id: String::new(),
             }),
         )
@@ -1316,11 +1335,20 @@ mod tests {
             disable_vxlan: false,
             sub_ca_cert_pem: String::new(),
             sub_ca_key_pem: String::new(),
+            controllers: vec![
+                "192.168.40.10:9090".to_string(),
+                "192.168.40.11:9090".to_string(),
+            ],
             dc_id: "DC1".to_string(),
         };
         let args = build_install_command_args(&req).expect("args");
         assert!(args.contains(&"--controller".to_string()));
         assert!(args.contains(&"192.168.40.10:9090".to_string()));
+        assert!(args.contains(&"192.168.40.11:9090".to_string()));
+        assert_eq!(
+            args.iter().filter(|v| v.as_str() == "--controller").count(),
+            2
+        );
         assert!(!args.contains(&"--run-controller".to_string()));
         assert!(args.contains(&"--data-disk".to_string()));
         assert!(args.contains(&"/dev/nvme0n1".to_string()));
@@ -1351,6 +1379,7 @@ mod tests {
             disable_vxlan: false,
             sub_ca_cert_pem: String::new(),
             sub_ca_key_pem: String::new(),
+            controllers: Vec::new(),
             dc_id: String::new(),
         };
         let args = build_install_command_args(&req).expect("args");
@@ -1388,6 +1417,7 @@ mod tests {
             disable_vxlan: true,
             sub_ca_cert_pem: String::new(),
             sub_ca_key_pem: String::new(),
+            controllers: Vec::new(),
             dc_id: String::new(),
         };
         let args = build_install_command_args(&req).expect("args");

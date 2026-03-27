@@ -207,9 +207,10 @@
                     NON_INTERACTIVE="false"
                     FORCE_WIPE="false"
                     REBOOT_AFTER_INSTALL="false"
-                    CONTROLLER_ENDPOINT=""
+                    CONTROLLER_ENDPOINTS=()
                     RUN_CONTROLLER="false"
                     DISABLE_VXLAN="false"
+                    DC_ID="DC1"
                     DATA_DISKS=()
 
                     while [[ $# -gt 0 ]]; do
@@ -235,7 +236,11 @@
                           shift
                           ;;
                         --controller)
-                          CONTROLLER_ENDPOINT="''${2:-}"
+                          CONTROLLER_ENDPOINTS+=("''${2:-}")
+                          shift 2
+                          ;;
+                        --dc-id)
+                          DC_ID="''${2:-}"
                           shift 2
                           ;;
                         --run-controller)
@@ -252,7 +257,7 @@
                           ;;
                         *)
                           echo "Unknown argument: $1"
-                          echo "Usage: install-to-disk [--disk /dev/sda] [--data-disk /dev/nvme0n1] [--controller 192.168.40.135[:9090]] [--run-controller] [--disable-vxlan] [--yes --wipe --non-interactive --reboot]"
+                          echo "Usage: install-to-disk [--disk /dev/sda] [--data-disk /dev/nvme0n1] [--controller 192.168.40.135[:9090]]... [--dc-id DC1] [--run-controller] [--disable-vxlan] [--yes --wipe --non-interactive --reboot]"
                           exit 1
                           ;;
                       esac
@@ -373,8 +378,8 @@
                       cp -r /etc/kcore/* /mnt/etc/kcore/ 2>/dev/null || true
                     fi
 
-                    if [ -n "$CONTROLLER_ENDPOINT" ]; then
-                      echo "$CONTROLLER_ENDPOINT" > /mnt/etc/kcore/bootstrap-controller-endpoint
+                    if [ "''${#CONTROLLER_ENDPOINTS[@]}" -gt 0 ]; then
+                      echo "''${CONTROLLER_ENDPOINTS[0]}" > /mnt/etc/kcore/bootstrap-controller-endpoint
                     fi
                     if [ "''${#DATA_DISKS[@]}" -gt 0 ]; then
                       printf "%s\n" "''${DATA_DISKS[@]}" > /mnt/etc/kcore/data-disks
@@ -409,18 +414,29 @@
                     fi
 
                     # Controller is opt-in only. By default, install as node-agent that joins an existing controller.
-                    CONTROLLER_ADDR="$CONTROLLER_ENDPOINT"
+                    CONTROLLER_ADDR=""
                     if [ "$RUN_CONTROLLER" = "true" ]; then
                       CONTROLLER_ADDR="$EXTERNAL_IP:9090"
-                    elif [ -z "$CONTROLLER_ENDPOINT" ]; then
+                      CONTROLLER_ENDPOINTS=("$CONTROLLER_ADDR")
+                    elif [ "''${#CONTROLLER_ENDPOINTS[@]}" -eq 0 ]; then
                       echo "Error: provide --controller <host:9090> or pass --run-controller"
                       exit 1
+                    else
+                      CONTROLLER_ADDR="''${CONTROLLER_ENDPOINTS[0]}"
                     fi
+
+                    CONTROLLERS_YAML=""
+                    for ctrl in "''${CONTROLLER_ENDPOINTS[@]}"; do
+                      CONTROLLERS_YAML="$CONTROLLERS_YAML
+  - \"$ctrl\""
+                    done
 
                     cat > /mnt/etc/kcore/node-agent.yaml << AGENTEOF
 nodeId: kvm-node-01
 listenAddr: "0.0.0.0:9091"
 controllerAddr: "$CONTROLLER_ADDR"
+controllers:$CONTROLLERS_YAML
+dcId: "$DC_ID"
 vmSocketDir: /run/kcore
 nixConfigPath: /etc/nixos/kcore-vms.nix
 tls:
