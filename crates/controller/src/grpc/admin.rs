@@ -184,6 +184,62 @@ impl controller_proto::controller_admin_server::ControllerAdmin for ControllerAd
             unresolved_conflicts,
         }))
     }
+
+    async fn list_replication_conflicts(
+        &self,
+        request: Request<controller_proto::ListReplicationConflictsRequest>,
+    ) -> Result<Response<controller_proto::ListReplicationConflictsResponse>, Status> {
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let limit = if req.limit <= 0 {
+            100
+        } else {
+            i64::from(req.limit.min(1_000))
+        };
+        let rows = self
+            .db
+            .list_unresolved_replication_conflicts(limit)
+            .map_err(|e| Status::internal(format!("listing replication conflicts: {e}")))?;
+        let conflicts = rows
+            .into_iter()
+            .map(|r| controller_proto::ReplicationConflictInfo {
+                id: r.id,
+                resource_key: r.resource_key,
+                incumbent_op_id: r.incumbent_op_id,
+                challenger_op_id: r.challenger_op_id,
+                incumbent_controller_id: r.incumbent_controller_id,
+                challenger_controller_id: r.challenger_controller_id,
+                reason: r.reason,
+            })
+            .collect();
+        Ok(Response::new(
+            controller_proto::ListReplicationConflictsResponse { conflicts },
+        ))
+    }
+
+    async fn resolve_replication_conflict(
+        &self,
+        request: Request<controller_proto::ResolveReplicationConflictRequest>,
+    ) -> Result<Response<controller_proto::ResolveReplicationConflictResponse>, Status> {
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if req.id <= 0 {
+            return Err(Status::invalid_argument("id must be > 0"));
+        }
+        let resolved = self
+            .db
+            .resolve_replication_conflict(req.id)
+            .map_err(|e| Status::internal(format!("resolving replication conflict: {e}")))?;
+        if !resolved {
+            return Err(Status::not_found(format!(
+                "replication conflict {} not found or already resolved",
+                req.id
+            )));
+        }
+        Ok(Response::new(
+            controller_proto::ResolveReplicationConflictResponse { success: true },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +342,45 @@ mod tests {
         assert_eq!(resp.incoming[0].last_pulled_event_id, 5);
         assert_eq!(resp.incoming[0].last_applied_event_id, 4);
         assert_eq!(resp.unresolved_conflicts, 0);
+    }
+
+    #[tokio::test]
+    async fn list_and_resolve_replication_conflicts() {
+        let db = Database::open(":memory:").expect("open db");
+        let id = db
+            .insert_replication_conflict(
+                "vm/v9",
+                "op-a",
+                "op-b",
+                "ctrl-a",
+                "ctrl-b",
+                "test conflict",
+            )
+            .expect("insert conflict");
+        let svc = ControllerAdminService::new(db.clone(), None);
+
+        let listed = <ControllerAdminService as controller_proto::controller_admin_server::ControllerAdmin>::list_replication_conflicts(
+            &svc,
+            Request::new(controller_proto::ListReplicationConflictsRequest { limit: 10 }),
+        )
+        .await
+        .expect("list conflicts")
+        .into_inner();
+        assert_eq!(listed.conflicts.len(), 1);
+        assert_eq!(listed.conflicts[0].id, id);
+
+        let resolved = <ControllerAdminService as controller_proto::controller_admin_server::ControllerAdmin>::resolve_replication_conflict(
+            &svc,
+            Request::new(controller_proto::ResolveReplicationConflictRequest { id }),
+        )
+        .await
+        .expect("resolve conflict")
+        .into_inner();
+        assert!(resolved.success);
+        assert_eq!(
+            db.count_unresolved_replication_conflicts()
+                .expect("count conflicts"),
+            0
+        );
     }
 }

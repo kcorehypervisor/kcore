@@ -335,6 +335,10 @@ service ControllerAdmin {
   rpc AckReplicationEvents(AckReplicationEventsRequest) returns (AckReplicationEventsResponse);
   // Reports replication lag and frontier health.
   rpc GetReplicationStatus(GetReplicationStatusRequest) returns (GetReplicationStatusResponse);
+  // Lists unresolved replication conflicts for operator workflows.
+  rpc ListReplicationConflicts(ListReplicationConflictsRequest) returns (ListReplicationConflictsResponse);
+  // Marks a replication conflict resolved.
+  rpc ResolveReplicationConflict(ResolveReplicationConflictRequest) returns (ResolveReplicationConflictResponse);
 }
 
 message GetReplicationEventsRequest {
@@ -383,6 +387,32 @@ message GetReplicationStatusResponse {
   repeated ReplicationOutgoingStatus outgoing = 3;
   repeated ReplicationIncomingStatus incoming = 4;
   int64 unresolved_conflicts = 5;
+}
+
+message ListReplicationConflictsRequest {
+  int32 limit = 1;
+}
+
+message ReplicationConflictInfo {
+  int64 id = 1;
+  string resource_key = 2;
+  string incumbent_op_id = 3;
+  string challenger_op_id = 4;
+  string incumbent_controller_id = 5;
+  string challenger_controller_id = 6;
+  string reason = 7;
+}
+
+message ListReplicationConflictsResponse {
+  repeated ReplicationConflictInfo conflicts = 1;
+}
+
+message ResolveReplicationConflictRequest {
+  int64 id = 1;
+}
+
+message ResolveReplicationConflictResponse {
+  bool success = 1;
 }
 
 // SSH Key Management

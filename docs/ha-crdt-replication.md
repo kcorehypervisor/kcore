@@ -269,6 +269,10 @@ Status (incremental):
 - Improve visibility (`replication lag`, `peer health`, `last reconcile`).
 - Document operational playbooks for partition and recovery.
 
+Status (incremental):
+
+- ControllerAdmin now exposes conflict APIs: `ListReplicationConflicts(limit)` and `ResolveReplicationConflict(id)` backed by `replication_conflicts`.
+
 ### Phase 5: TLA+ validation gates
 
 - Implement three core specs and TLC configs.

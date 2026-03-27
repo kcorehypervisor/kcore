@@ -672,6 +672,17 @@ impl Database {
         rows.collect()
     }
 
+    pub fn resolve_replication_conflict(&self, id: i64) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE replication_conflicts
+             SET resolved = 1
+             WHERE id = ?1 AND resolved = 0",
+            params![id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn upsert_node(&self, node: &NodeRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
@@ -1745,5 +1756,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].resource_key, "vm/v1");
         assert_eq!(rows[0].challenger_controller_id, "ctrl-b");
+        assert!(db
+            .resolve_replication_conflict(rows[0].id)
+            .expect("resolve conflict"));
+        assert_eq!(
+            db.count_unresolved_replication_conflicts()
+                .expect("count after resolve"),
+            0
+        );
     }
 }
