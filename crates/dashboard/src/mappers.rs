@@ -1,0 +1,219 @@
+//! gRPC proto → dashboard DTO (testable without the network).
+
+use crate::controller_client::controller_proto;
+use crate::dto::{
+    AccessControlEntryDto, ComplianceDto, NetworkRowDto, NodeSummaryDto, VmRowDto, VmsPageDto,
+};
+use crate::format::{self, paginate_by_name, VM_PAGE_SIZE};
+
+pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -> ComplianceDto {
+    ComplianceDto {
+        controller_version: r.controller_version,
+        crypto_library: r.crypto_library,
+        tls13_cipher_suites: r.tls13_cipher_suites,
+        tls12_cipher_suites: r.tls12_cipher_suites,
+        kx_groups: r.kx_groups,
+        excluded_algorithms: r.excluded_algorithms,
+        mtls_enabled: r.mtls_enabled,
+        access_control: r
+            .access_control
+            .into_iter()
+            .map(|e| AccessControlEntryDto {
+                rpc_method: e.rpc_method,
+                allowed_identities: e.allowed_identities,
+            })
+            .collect(),
+        total_nodes: r.total_nodes,
+        approved_nodes: r.approved_nodes,
+        pending_nodes: r.pending_nodes,
+        rejected_nodes: r.rejected_nodes,
+        total_vms: r.total_vms,
+        running_vms: r.running_vms,
+        stopped_vms: r.stopped_vms,
+        total_networks: r.total_networks,
+        nat_networks: r.nat_networks,
+        bridge_networks: r.bridge_networks,
+        vxlan_networks: r.vxlan_networks,
+        sub_ca_enabled: r.sub_ca_enabled,
+        cert_auto_renewal_days: r.cert_auto_renewal_days,
+        nodes_expiring_30d: r.nodes_expiring_30d,
+        nodes_cert_unknown: r.nodes_cert_unknown,
+        nodes: r
+            .nodes
+            .into_iter()
+            .map(|n| NodeSummaryDto {
+                node_id: n.node_id,
+                hostname: n.hostname,
+                address: n.address,
+                approval_status: n.approval_status,
+                cert_expiry_days: n.cert_expiry_days,
+            })
+            .collect(),
+    }
+}
+
+pub fn vms_page_from_proto(
+    vms: Vec<controller_proto::VmInfo>,
+    page: u32,
+) -> VmsPageDto {
+    let rows: Vec<VmRowDto> = vms
+        .into_iter()
+        .map(|v| VmRowDto {
+            id: v.id,
+            name: v.name.clone(),
+            state: format::vm_state_label(v.state).to_string(),
+            cpu: v.cpu,
+            memory: format::memory_mebibytes(v.memory_bytes),
+            node_id: v.node_id,
+        })
+        .collect();
+    let page = page.max(1);
+    let pv = paginate_by_name(rows, |r| r.name.clone(), page, VM_PAGE_SIZE);
+    VmsPageDto {
+        total_pages: pv.total_pages(),
+        has_prev: pv.has_prev(),
+        has_next: pv.has_next(),
+        page: pv.page,
+        page_size: pv.page_size,
+        total: pv.total,
+        vms: pv.items,
+    }
+}
+
+pub fn networks_from_proto(nets: Vec<controller_proto::NetworkInfo>) -> Vec<NetworkRowDto> {
+    let mut rows: Vec<NetworkRowDto> = nets
+        .into_iter()
+        .map(|n| NetworkRowDto {
+            name: n.name.clone(),
+            network_type: n.network_type,
+            node_id: n.node_id,
+            external_ip: n.external_ip,
+            gateway_ip: n.gateway_ip,
+            internal_netmask: n.internal_netmask,
+            vlan_id: n.vlan_id,
+            enable_outbound_nat: n.enable_outbound_nat,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compliance_maps_core_fields() {
+        let r = controller_proto::GetComplianceReportResponse {
+            controller_version: "9.9.9".into(),
+            crypto_library: "test-lib".into(),
+            tls13_cipher_suites: vec!["A".into()],
+            tls12_cipher_suites: vec!["B".into()],
+            kx_groups: vec!["P-256".into()],
+            excluded_algorithms: vec!["X".into()],
+            mtls_enabled: true,
+            access_control: vec![controller_proto::AccessControlEntry {
+                rpc_method: "ListVms".into(),
+                allowed_identities: "kcore-kctl".into(),
+            }],
+            total_nodes: 2,
+            approved_nodes: 1,
+            pending_nodes: 1,
+            rejected_nodes: 0,
+            total_vms: 3,
+            running_vms: 2,
+            stopped_vms: 1,
+            total_networks: 4,
+            nat_networks: 2,
+            bridge_networks: 1,
+            vxlan_networks: 1,
+            sub_ca_enabled: false,
+            cert_auto_renewal_days: 30,
+            nodes_expiring_30d: 0,
+            nodes_cert_unknown: 0,
+            nodes: vec![controller_proto::NodeInfo {
+                node_id: "n1".into(),
+                hostname: "h1".into(),
+                address: "10.0.0.1:9091".into(),
+                capacity: None,
+                usage: None,
+                status: "ready".into(),
+                last_heartbeat: None,
+                labels: vec![],
+                storage_backend: 0,
+                disable_vxlan: false,
+                approval_status: "approved".into(),
+                cert_expiry_days: 90,
+            }],
+        };
+        let d = compliance_from_proto(r);
+        assert_eq!(d.controller_version, "9.9.9");
+        assert_eq!(d.total_vms, 3);
+        assert_eq!(d.nodes.len(), 1);
+        assert_eq!(d.nodes[0].hostname, "h1");
+        assert_eq!(d.access_control[0].rpc_method, "ListVms");
+    }
+
+    #[test]
+    fn vms_page_slices_and_sorts() {
+        let vms = vec![
+            controller_proto::VmInfo {
+                id: "1".into(),
+                name: "zebra".into(),
+                state: 2,
+                cpu: 2,
+                memory_bytes: 1024 * 1024 * 1024,
+                node_id: "n".into(),
+                created_at: None,
+            },
+            controller_proto::VmInfo {
+                id: "2".into(),
+                name: "alpha".into(),
+                state: 1,
+                cpu: 1,
+                memory_bytes: 512 * 1024 * 1024,
+                node_id: "n".into(),
+                created_at: None,
+            },
+        ];
+        let p = vms_page_from_proto(vms, 1);
+        assert_eq!(p.total, 2);
+        assert_eq!(p.vms.len(), 2);
+        assert_eq!(p.vms[0].name, "alpha");
+        assert_eq!(p.vms[0].state, "Stopped");
+        assert_eq!(p.vms[1].state, "Running");
+    }
+
+    #[test]
+    fn networks_sort_by_name() {
+        let nets = vec![
+            controller_proto::NetworkInfo {
+                name: "b-net".into(),
+                external_ip: "".into(),
+                gateway_ip: "".into(),
+                internal_netmask: "".into(),
+                node_id: "n".into(),
+                allowed_tcp_ports: vec![],
+                allowed_udp_ports: vec![],
+                vlan_id: 0,
+                network_type: "nat".into(),
+                enable_outbound_nat: true,
+            },
+            controller_proto::NetworkInfo {
+                name: "a-net".into(),
+                external_ip: "".into(),
+                gateway_ip: "".into(),
+                internal_netmask: "".into(),
+                node_id: "n".into(),
+                allowed_tcp_ports: vec![],
+                allowed_udp_ports: vec![],
+                vlan_id: 0,
+                network_type: "bridge".into(),
+                enable_outbound_nat: false,
+            },
+        ];
+        let rows = networks_from_proto(nets);
+        assert_eq!(rows[0].name, "a-net");
+        assert_eq!(rows[1].name, "b-net");
+    }
+}
