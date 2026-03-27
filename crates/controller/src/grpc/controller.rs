@@ -25,6 +25,16 @@ use super::validation::{
 
 #[cfg(test)]
 type PushHook = std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + Sync + 'static>;
+const EVT_NODE_REGISTER: &str = "node.register";
+const EVT_NODE_APPROVE: &str = "node.approve";
+const EVT_NODE_REJECT: &str = "node.reject";
+const EVT_VM_CREATE: &str = "vm.create";
+const EVT_VM_UPDATE: &str = "vm.update";
+const EVT_VM_DELETE: &str = "vm.delete";
+const EVT_VM_DESIRED_STATE_SET: &str = "vm.desired_state.set";
+const EVT_NETWORK_CREATE: &str = "network.create";
+const EVT_NETWORK_DELETE: &str = "network.delete";
+const EVT_NODE_DRAIN: &str = "node.drain";
 
 #[derive(Clone, Default)]
 pub struct SubCaState {
@@ -405,7 +415,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         self.log_replication_event(
-            "node.register",
+            EVT_NODE_REGISTER,
             &format!("node/{}", req.node_id),
             serde_json::json!({
                 "nodeId": req.node_id,
@@ -763,7 +773,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         self.log_replication_event(
-            "vm.create",
+            EVT_VM_CREATE,
             &format!("vm/{vm_id}"),
             serde_json::json!({
                 "vmId": vm_id,
@@ -815,6 +825,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         info!(vm_id = %req.vm_id, cpu = ?cpu, memory_bytes = ?mem, "updated VM spec, pushing config");
         self.push_config_to_node(&node).await?;
+        self.log_replication_event(
+            EVT_VM_UPDATE,
+            &format!("vm/{}", req.vm_id),
+            serde_json::json!({
+                "vmId": req.vm_id,
+                "nodeId": node.id,
+                "cpu": cpu,
+                "memoryBytes": mem,
+            }),
+        );
 
         Ok(Response::new(controller_proto::UpdateVmResponse {
             success: true,
@@ -841,6 +861,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
         info!(vm_id = %req.vm_id, node_id = %node.id, "deleted VM, pushing config");
 
         self.push_config_to_node(&node).await?;
+        self.log_replication_event(
+            EVT_VM_DELETE,
+            &format!("vm/{}", req.vm_id),
+            serde_json::json!({
+                "vmId": req.vm_id,
+                "nodeId": node.id,
+            }),
+        );
 
         Ok(Response::new(controller_proto::DeleteVmResponse {
             success: true,
@@ -867,6 +895,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let state = self
             .set_vm_desired_state_internal(&req.vm_id, &req.target_node, auto_start)
             .await?;
+        self.log_replication_event(
+            EVT_VM_DESIRED_STATE_SET,
+            &format!("vm/{}", req.vm_id),
+            serde_json::json!({
+                "vmId": req.vm_id,
+                "targetNode": req.target_node,
+                "autoStart": auto_start,
+            }),
+        );
 
         Ok(Response::new(controller_proto::SetVmDesiredStateResponse {
             state,
@@ -1176,6 +1213,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(format!("storing network: {e}")))?;
 
         self.push_config_to_node(&node).await?;
+        self.log_replication_event(
+            EVT_NETWORK_CREATE,
+            &format!("network/{}/{}", node.id, name),
+            serde_json::json!({
+                "name": name,
+                "nodeId": node.id,
+                "networkType": network_type,
+                "vlanId": req.vlan_id,
+                "vni": vni,
+            }),
+        );
 
         Ok(Response::new(controller_proto::CreateNetworkResponse {
             success: true,
@@ -1255,6 +1303,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         self.push_config_to_node(&node).await?;
+        self.log_replication_event(
+            EVT_NETWORK_DELETE,
+            &format!("network/{}/{}", node.id, name),
+            serde_json::json!({
+                "name": name,
+                "nodeId": node.id,
+            }),
+        );
         Ok(Response::new(controller_proto::DeleteNetworkResponse {
             success: true,
         }))
@@ -1636,6 +1692,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 errors.join("; ")
             )
         };
+        self.log_replication_event(
+            EVT_NODE_DRAIN,
+            &format!("node/{}", req.node_id),
+            serde_json::json!({
+                "nodeId": req.node_id,
+                "targetNode": req.target_node,
+                "migrated": migrated,
+                "errors": errors,
+            }),
+        );
 
         Ok(Response::new(controller_proto::DrainNodeResponse {
             success: errors.is_empty(),
@@ -1675,6 +1741,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
             warn!(address = %node.address, error = %e, "failed to connect to approved node");
         }
 
+        self.log_replication_event(
+            EVT_NODE_APPROVE,
+            &format!("node/{}", req.node_id),
+            serde_json::json!({
+                "nodeId": req.node_id,
+                "address": node.address,
+            }),
+        );
+
         info!(node_id = %req.node_id, "node approved");
 
         Ok(Response::new(controller_proto::ApproveNodeResponse {
@@ -1702,6 +1777,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.db
             .update_node_status(&req.node_id, "rejected")
             .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
+
+        self.log_replication_event(
+            EVT_NODE_REJECT,
+            &format!("node/{}", req.node_id),
+            serde_json::json!({
+                "nodeId": req.node_id,
+            }),
+        );
 
         info!(node_id = %req.node_id, "node rejected");
 
