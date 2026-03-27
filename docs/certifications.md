@@ -1,6 +1,6 @@
 # Certifications and Compliance Roadmap
 
-This document lays out a practical roadmap for achieving GDPR, SOC 2 Type II, PCI DSS, FIPS 140-3, VS-NfD, and SBOM compliance in kcore. Each section describes what the standard requires, what kcore already provides, the gaps, and the concrete work items to close them.
+This document lays out a practical roadmap for achieving GDPR, SOC 2 Type II, PCI DSS, FIPS 140-3, VS-NfD, UK Cyber Essentials Plus / NCSC Cloud Security Principles, and SBOM compliance in kcore. Each section describes what the standard requires, what kcore already provides, the gaps, and the concrete work items to close them.
 
 ## Current baseline
 
@@ -259,6 +259,67 @@ What is missing: BSI-approved cryptography, formal VM isolation evidence, BSI-ma
 
 ---
 
+## 7. UK — Cyber Essentials, NCSC Cloud Security Principles, and UK GDPR
+
+**Goal:** Enable kcore to be used by UK government departments, NHS bodies, and their suppliers for workloads classified at OFFICIAL and OFFICIAL-SENSITIVE, and ensure compliance with UK data protection law.
+
+### What is required
+
+Unlike a single certification, the UK landscape is a combination of:
+
+- **Cyber Essentials / Cyber Essentials Plus** — mandatory for UK government suppliers handling personal data or OFFICIAL data (required since February 2025). From April 2026, v3.3 explicitly brings cloud services into scope and makes MFA mandatory.
+- **NCSC 14 Cloud Security Principles** — the framework UK government buyers use to evaluate cloud and infrastructure services. Not a pass/fail certification, but alignment must be demonstrated for G-Cloud or Digital Marketplace listings.
+- **NCSC Virtualisation Security Design Principles** — dedicated NCSC guidance for hypervisor and orchestration security, directly applicable to kcore.
+- **UK GDPR / Data (Use and Access) Act 2025** — the UK's post-Brexit data protection regime, now diverging from EU GDPR via the Data (Use and Access) Act 2025 (Royal Assent June 2025).
+
+### Current state
+
+kcore's existing controls map well to the UK requirements:
+
+- mTLS and CN-based authorization satisfy NCSC Principle 9 (secure user management) and Principle 10 (identity and authentication)
+- NixOS declarative configuration supports Principle 5 (operational security) and Principle 6 (personnel security — auditable, reproducible systems)
+- VM isolation via cloud-hypervisor/KVM aligns with Principle 3 (separation between consumers) and the virtualisation design principles
+- Encryption in transit (TLS 1.2+) meets Principle 2 (asset protection and resilience)
+
+What is missing: MFA support (mandatory under Cyber Essentials v3.3), formal NCSC Principles alignment documentation, UK GDPR-specific data handling adjustments, and Cyber Essentials Plus certification itself.
+
+### Work items
+
+#### Cyber Essentials Plus (CE+)
+
+| # | Task | Detail |
+|---|------|--------|
+| 7.1 | Firewalls and internet gateways | Document and verify that kcore nodes expose only the required ports (gRPC management, VM networking). Provide reference NixOS firewall configuration that meets CE+ requirements. |
+| 7.2 | Secure configuration | Document the hardening applied by the kcore NixOS ISO: no default passwords, disabled unnecessary services, no default accounts. Ensure kcore binaries run as non-root where possible. |
+| 7.3 | Patch management | Implement and document a patching process for kcore nodes. NixOS `nixos-rebuild` provides atomic updates — document the expected patch cadence and how `cargo audit` / SBOM (section 1) feed into it. |
+| 7.4 | Access control with MFA | CE+ v3.3 (April 2026) makes MFA mandatory for cloud service access. Implement MFA for kctl authentication — options include client certificate on a hardware token (YubiKey/PIV), TOTP as a second factor alongside the client cert, or integration with an external IdP that enforces MFA. |
+| 7.5 | Malware protection | Document how kcore's architecture provides malware resilience: read-only NixOS store, no arbitrary code execution on the management plane, signed and reproducible builds. If CE+ assessors require endpoint protection, document the NixOS-compatible options (ClamAV, YARA rules). |
+| 7.6 | Obtain CE+ certification | Engage an NCSC-authorised CE+ assessor to perform the technical audit. The assessor will test the five control themes against a live kcore deployment. |
+
+#### NCSC 14 Cloud Security Principles
+
+| # | Task | Detail |
+|---|------|--------|
+| 7.7 | Principles alignment document | Produce a document mapping each of the 14 NCSC Cloud Security Principles to kcore's controls, with evidence references. This is the standard format UK government buyers expect. |
+| 7.8 | Principle 3 — Separation between consumers | Document cloud-hypervisor's VM isolation model, kcore's per-VM network separation (separate bridges, TAP devices, firewall rules), and management plane authorization that prevents cross-tenant visibility. |
+| 7.9 | Principle 5 — Operational security | Demonstrate vulnerability management (cargo audit, SBOM scanning), protective monitoring (audit logging from 3.2), incident management (runbook from 4.14), and configuration management (NixOS declarative config). |
+| 7.10 | Principle 12 — Audit information for consumers | Expose audit logs to operators so they can meet their own compliance obligations. Implement `kctl cluster audit-log` to retrieve and export audit events. |
+| 7.11 | NCSC Virtualisation Security Design Principles review | Review kcore against the NCSC's [virtualisation security design principles](https://www.ncsc.gov.uk/collection/cyber-security-design-principles/virtualisation-security-design-principles). Document how kcore addresses: hypervisor attack surface, management plane isolation, orchestration security, and guest-to-host breakout prevention. |
+
+#### UK GDPR / Data (Use and Access) Act 2025
+
+| # | Task | Detail |
+|---|------|--------|
+| 7.12 | UK GDPR delta assessment | Review the EU GDPR work items (section 3) and identify UK-specific differences: ICO as supervisory authority, "Senior Responsible Individual" instead of DPO, updated rules on legitimate interests and automated decision-making under the Data (Use and Access) Act 2025. |
+| 7.13 | UK-specific DPA template | Adapt the Data Processing Agreement template (item 3.6) for UK law, referencing the UK International Data Transfer Agreement (IDTA) instead of EU Standard Contractual Clauses for international transfers. |
+| 7.14 | ICO registration guidance | Document that kcore operators processing personal data in the UK must register with the ICO. Provide guidance on which registration tier applies. |
+
+### Priority
+
+**Medium-high.** Cyber Essentials Plus is a hard gate for UK government procurement since February 2025, and v3.3 (April 2026) tightens requirements further. The NCSC Principles alignment document (7.7) is essential for any G-Cloud listing. Most work items overlap with existing SOC 2 and GDPR efforts — the UK-specific incremental effort is modest once those foundations are in place.
+
+---
+
 ## Implementation order
 
 The roadmap is ordered to maximize reuse — earlier phases produce artifacts and controls that later phases depend on.
@@ -268,7 +329,8 @@ Phase 1: Foundation (months 1–2)
 ├── SBOM generation (1.1–1.7)
 ├── Audit logging (3.2, 4.13, 6.8)
 ├── Data inventory (3.1)
-└── IT-Grundschutz baseline mapping (6.10)
+├── IT-Grundschutz baseline mapping (6.10)
+└── NCSC Principles alignment document (7.7)
 
 Phase 2: Cryptographic hardening (months 2–4)
 ├── FIPS 140-3 crypto provider switch (2.1–2.2)
@@ -281,6 +343,7 @@ Phase 2: Cryptographic hardening (months 2–4)
 Phase 3: Access control and lifecycle (months 3–5)
 ├── RBAC (4.1)
 ├── Certificate rotation (4.2)
+├── MFA for kctl authentication (7.4)
 ├── Health checks and alerting (4.4–4.5)
 └── Backup and recovery (4.6)
 
@@ -315,11 +378,18 @@ Phase 8: VS-NfD accreditation (months 6–12)
 ├── Audit log BSI-compatible export (6.9)
 └── BSI approval procedure (ongoing, 12–24 months)
 
-Phase 9: Certification (months 12–24)
+Phase 9: UK certification (months 4–8)
+├── Cyber Essentials Plus hardening (7.1–7.3, 7.5)
+├── NCSC virtualisation principles review (7.11)
+├── UK GDPR delta assessment (7.12–7.14)
+└── Obtain CE+ certification (7.6)
+
+Phase 10: Certification (months 12–24)
 ├── SOC 2 Type II report issued
 ├── PCI DSS SAQ or ROC (if applicable)
 ├── FIPS 140-3 security policy published
-├── GDPR documentation package complete
+├── GDPR / UK GDPR documentation package complete
+├── Cyber Essentials Plus certificate obtained
 └── BSI VS-NfD approval (may extend to month 24+)
 ```
 
@@ -343,6 +413,11 @@ RBAC ──────────────► SOC 2 CC6.3 (access control)
                  └─► PCI 7 (restrict access)
                  └─► GDPR Art. 32 (security of processing)
                  └─► VS-NfD IT-Grundschutz ORP.4 (access control)
+                 └─► NCSC Principle 9/10 (user management)
+
+MFA ───────────────► Cyber Essentials Plus v3.3 (7.4)
+                 └─► PCI 8.3 (MFA for admin access)
+                 └─► NCSC Principle 10 (authentication)
 
 Encryption at rest ► SOC 2 C1 (confidentiality)
                  └─► PCI 3.5 (protect stored data)
@@ -352,6 +427,9 @@ Encryption at rest ► SOC 2 C1 (confidentiality)
 
 VM isolation ──────► VS-NfD BSI-VS-AP-0019 (6.4–6.7)
                  └─► PCI 2.2 (system hardening)
+                 └─► NCSC Principle 3 (separation) (7.8)
+
+EU GDPR ───────────► UK GDPR delta (7.12–7.14)
 
 Secure boot ───────► VS-NfD boot integrity (6.15)
                  └─► PCI 11.5 (file integrity)
@@ -369,6 +447,7 @@ Secure boot ───────► VS-NfD boot integrity (6.15)
 | 6 — SOC 2 audit period | 6–12 months (elapsed) | Phase 4 |
 | 7 — PCI-specific | 3–4 weeks | Phase 4 |
 | 8 — VS-NfD accreditation | 4–6 weeks + BSI lead time | Phase 5 |
-| 9 — Certification | 2–6 months (elapsed) | Phases 6, 7, 8 |
+| 9 — UK certification | 2–3 weeks | Phases 1, 3 |
+| 10 — Certification | 2–6 months (elapsed) | Phases 6–9 |
 
-Total engineering effort: approximately 5–6 months of focused work, spread across a 12–24 month calendar timeline driven by the SOC 2 observation period and the BSI approval process (which can take 12–24 months on its own).
+Total engineering effort: approximately 6–7 months of focused work, spread across a 12–24 month calendar timeline driven by the SOC 2 observation period and the BSI approval process (which can take 12–24 months on its own). The UK certification (Phase 9) can run in parallel with phases 5–8 and has the shortest lead time since most controls overlap with SOC 2 and GDPR.
