@@ -1823,6 +1823,47 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         let sub_ca_enabled = self.sub_ca.lock().unwrap().is_available();
 
+        let node_rows = self
+            .db
+            .list_nodes()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let all_labels = self.db.get_all_node_labels().unwrap_or_default();
+        let nodes: Vec<controller_proto::NodeInfo> = node_rows
+            .into_iter()
+            .map(|n| {
+                let labels: Vec<String> = all_labels
+                    .iter()
+                    .filter(|(nid, _)| nid == &n.id)
+                    .map(|(_, l)| l.clone())
+                    .collect();
+                let hb = if n.last_heartbeat.is_empty() {
+                    None
+                } else {
+                    parse_datetime_to_timestamp(&n.last_heartbeat)
+                };
+                controller_proto::NodeInfo {
+                    node_id: n.id,
+                    hostname: n.hostname,
+                    address: n.address,
+                    capacity: Some(controller_proto::NodeCapacity {
+                        cpu_cores: n.cpu_cores,
+                        memory_bytes: n.memory_bytes,
+                    }),
+                    usage: Some(controller_proto::NodeUsage {
+                        cpu_cores_used: n.cpu_used,
+                        memory_bytes_used: n.memory_used,
+                    }),
+                    status: n.status,
+                    last_heartbeat: hb,
+                    labels,
+                    storage_backend: storage_backend_to_proto(&n.storage_backend),
+                    disable_vxlan: n.disable_vxlan,
+                    approval_status: n.approval_status,
+                    cert_expiry_days: n.cert_expiry_days,
+                }
+            })
+            .collect();
+
         let access_control = vec![
             acl("RegisterNode", CN_NODE_PREFIX),
             acl("Heartbeat", CN_NODE_PREFIX),
@@ -1892,6 +1933,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 cert_auto_renewal_days: 30,
                 nodes_expiring_30d: expiring_30d,
                 nodes_cert_unknown: cert_unknown,
+                nodes,
             },
         ))
     }

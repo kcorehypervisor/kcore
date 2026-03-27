@@ -323,6 +323,7 @@ Top-level commands:
 - `kctl get nodes [name]`
 - `kctl get networks [--target-node ...]`
 - `kctl get ssh-keys`
+- `kctl get compliance-report` (full compliance report with per-node breakdown)
 - `kctl node disks`
 - `kctl node nics`
 - `kctl node install --os-disk ... --join-controller ... [--data-disk ...] [--storage-backend filesystem|lvm|zfs] [--disable-vxlan]`
@@ -347,10 +348,11 @@ New environment:
 Day-2 operations:
 
 1. inspect with `kctl get ...` (the nodes table includes a `CERT EXPIRY` column)
-2. adjust desired VM running state with `kctl set vm ... --state ...` (or `kctl start/stop vm ...`)
-3. update configs with `kctl node apply-nix ...` or `kctl apply ...`
-4. rotate controller cert with `kctl rotate certs --controller <host:port>`
-5. rotate sub-CA with `kctl rotate sub-ca`
+2. review compliance posture with `kctl get compliance-report` (crypto, mTLS, access control, per-node cert status)
+3. adjust desired VM running state with `kctl set vm ... --state ...` (or `kctl start/stop vm ...`)
+4. update configs with `kctl node apply-nix ...` or `kctl apply ...`
+5. rotate controller cert with `kctl rotate certs --controller <host:port>`
+6. rotate sub-CA with `kctl rotate sub-ca`
 
 ## 11) Storage backend examples
 

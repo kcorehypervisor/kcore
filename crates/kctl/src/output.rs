@@ -237,6 +237,24 @@ pub fn print_compliance_report(r: &controller_proto::GetComplianceReportResponse
         "Hardware KVM + per-VM TAP + per-network bridge",
     );
     field("Node Approval", "Required (approval queue)");
+
+    if !r.nodes.is_empty() {
+        section("Node Details", &["SOC 2 CC6.2", "PCI DSS 2.4"]);
+        println!(
+            "  {:<36}  {:<16}  {:<20}  {:<10}  {:<10}",
+            "ID", "HOSTNAME", "ADDRESS", "STATUS", "CERT EXPIRY"
+        );
+        for n in &r.nodes {
+            println!(
+                "  {:<36}  {:<16}  {:<20}  {:<10}  {:<10}",
+                n.node_id,
+                n.hostname,
+                n.address,
+                &n.approval_status,
+                format_cert_expiry(n.cert_expiry_days),
+            );
+        }
+    }
 }
 
 fn section(title: &str, standards: &[&str]) {

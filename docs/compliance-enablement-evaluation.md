@@ -216,7 +216,7 @@ KCore now uses FIPS-validated cryptography by default, without requiring a runti
 |------|--------|
 | Crypto provider switch | **Done.** `ring` replaced by `aws-lc-rs` as the `rustls` crypto backend in all three binaries (controller, node-agent, kctl). `rcgen` (certificate generation) also switched to `aws-lc-rs`. |
 | FIPS cipher suites | **Done (default, no flag needed).** Each binary installs a custom `CryptoProvider` at startup restricting cipher suites to AES-GCM + ECDHE P-256/P-384 only. ChaCha20-Poly1305 and X25519 are excluded. |
-| Crypto inventory API | Planned — expose active crypto configuration via the compliance report (2.2) so customers can present it to their assessors. |
+| Crypto inventory API | **Done.** `kctl get compliance-report` exposes crypto library, cipher suites, key exchange groups, excluded algorithms, mTLS status, access control matrix, node/VM/network inventories with aggregate counts, certificate lifecycle details, and a per-node breakdown showing hostname, address, approval status, and cert expiry for every registered agent. |
 
 **Active TLS configuration:**
 

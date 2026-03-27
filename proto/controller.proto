@@ -477,4 +477,6 @@ message GetComplianceReportResponse {
   int32 cert_auto_renewal_days = 21;
   int32 nodes_expiring_30d = 22;
   int32 nodes_cert_unknown = 23;
+
+  repeated NodeInfo nodes = 24;
 }
