@@ -7,6 +7,8 @@ use crate::config::ReplicationConfig;
 use crate::controller_proto;
 use crate::db::Database;
 
+const ZERO_MANUAL_MAX_UNRESOLVED_AGE_SECS: i64 = 30;
+
 pub struct ControllerAdminService {
     db: Database,
     replication_peers: Vec<String>,
@@ -144,6 +146,26 @@ impl controller_proto::controller_admin_server::ControllerAdmin for ControllerAd
             .db
             .count_unresolved_replication_conflicts()
             .map_err(|e| Status::internal(format!("counting replication conflicts: {e}")))?;
+        let pending_compensation_jobs = self
+            .db
+            .count_pending_compensation_jobs()
+            .map_err(|e| Status::internal(format!("counting pending compensation jobs: {e}")))?;
+        let failed_compensation_jobs = self
+            .db
+            .count_failed_compensation_jobs()
+            .map_err(|e| Status::internal(format!("counting failed compensation jobs: {e}")))?;
+        let materialization_backlog = self
+            .db
+            .count_replication_materialization_backlog()
+            .map_err(|e| Status::internal(format!("counting materialization backlog: {e}")))?;
+        let oldest_unresolved_conflict_age_seconds = self
+            .db
+            .oldest_unresolved_conflict_age_seconds()
+            .map_err(|e| Status::internal(format!("reading unresolved conflict age: {e}")))?;
+        let failed_reservations = self
+            .db
+            .count_failed_replication_reservations()
+            .map_err(|e| Status::internal(format!("counting failed reservations: {e}")))?;
 
         let outgoing = ack_rows
             .iter()
@@ -176,12 +198,45 @@ impl controller_proto::controller_admin_server::ControllerAdmin for ControllerAd
             });
         }
 
+        let mut zero_manual_slo_violations = Vec::new();
+        if unresolved_conflicts > 0 {
+            zero_manual_slo_violations.push(format!("unresolved_conflicts={unresolved_conflicts}"));
+        }
+        if pending_compensation_jobs > 0 {
+            zero_manual_slo_violations
+                .push(format!("pending_compensation_jobs={pending_compensation_jobs}"));
+        }
+        if failed_compensation_jobs > 0 {
+            zero_manual_slo_violations
+                .push(format!("failed_compensation_jobs={failed_compensation_jobs}"));
+        }
+        if materialization_backlog > 0 {
+            zero_manual_slo_violations.push(format!("materialization_backlog={materialization_backlog}"));
+        }
+        if oldest_unresolved_conflict_age_seconds > ZERO_MANUAL_MAX_UNRESOLVED_AGE_SECS {
+            zero_manual_slo_violations.push(format!(
+                "oldest_unresolved_conflict_age_seconds={} exceeds {}",
+                oldest_unresolved_conflict_age_seconds, ZERO_MANUAL_MAX_UNRESOLVED_AGE_SECS
+            ));
+        }
+        if failed_reservations > 0 {
+            zero_manual_slo_violations.push(format!("failed_reservations={failed_reservations}"));
+        }
+        let zero_manual_slo_healthy = zero_manual_slo_violations.is_empty();
+
         Ok(Response::new(controller_proto::GetReplicationStatusResponse {
             outbox_head_event_id,
             outbox_size,
             outgoing,
             incoming,
             unresolved_conflicts,
+            pending_compensation_jobs,
+            failed_compensation_jobs,
+            materialization_backlog,
+            oldest_unresolved_conflict_age_seconds,
+            failed_reservations,
+            zero_manual_slo_healthy,
+            zero_manual_slo_violations,
         }))
     }
 
@@ -342,6 +397,62 @@ mod tests {
         assert_eq!(resp.incoming[0].last_pulled_event_id, 5);
         assert_eq!(resp.incoming[0].last_applied_event_id, 4);
         assert_eq!(resp.unresolved_conflicts, 0);
+        assert_eq!(resp.pending_compensation_jobs, 0);
+        assert_eq!(resp.failed_compensation_jobs, 0);
+        assert_eq!(resp.materialization_backlog, 0);
+        assert_eq!(resp.failed_reservations, 0);
+        assert!(resp.zero_manual_slo_healthy);
+        assert!(resp.zero_manual_slo_violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_replication_status_reports_slo_violations() {
+        let db = Database::open(":memory:").expect("open db");
+        db.insert_replication_conflict("vm/v9", "op-a", "op-b", "ctrl-a", "ctrl-b", "test")
+            .expect("insert conflict");
+        let conflict_id = db
+            .insert_replication_conflict(
+                "vm/v10",
+                "op-c",
+                "op-d",
+                "ctrl-a",
+                "ctrl-b",
+                "test2",
+            )
+            .expect("insert conflict2");
+        db.insert_compensation_job(conflict_id, "vm/v10", "op-d")
+            .expect("insert pending job");
+        db.upsert_replication_reservation("node-capacity/missing", "vm/v9", "op-z", "failed", "x")
+            .expect("failed reservation");
+        db.upsert_replication_resource_head(&crate::db::ReplicationResourceHeadRow {
+            resource_key: "vm/v9".to_string(),
+            last_op_id: "op-a".to_string(),
+            last_logical_ts_unix_ms: 1,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 1,
+            last_event_type: "vm.update".to_string(),
+            last_body_json: "{}".to_string(),
+        })
+        .expect("head");
+
+        let svc = ControllerAdminService::new(db, None);
+        let resp = <ControllerAdminService as controller_proto::controller_admin_server::ControllerAdmin>::get_replication_status(
+            &svc,
+            Request::new(controller_proto::GetReplicationStatusRequest {}),
+        )
+        .await
+        .expect("status")
+        .into_inner();
+
+        assert!(!resp.zero_manual_slo_healthy);
+        assert!(resp.pending_compensation_jobs > 0);
+        assert!(resp.materialization_backlog > 0);
+        assert!(resp.failed_reservations > 0);
+        assert!(!resp.zero_manual_slo_violations.is_empty());
     }
 
     #[tokio::test]

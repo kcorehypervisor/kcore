@@ -85,6 +85,7 @@ No unresolved conflict is required for normal convergence.
 ## Operator Surface
 
 - Health endpoint reports lag/frontiers and conflict counts.
+- Health endpoint now includes zero-manual SLO signals (`zero_manual_slo_healthy` and violation reasons) derived from compensation backlog/failures, materialization backlog, unresolved age, and reservation failures.
 - Conflict list/resolve APIs remain available as break-glass tooling.
 - Normal operations should show zero unresolved conflicts.
 

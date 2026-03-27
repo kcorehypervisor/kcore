@@ -387,6 +387,13 @@ message GetReplicationStatusResponse {
   repeated ReplicationOutgoingStatus outgoing = 3;
   repeated ReplicationIncomingStatus incoming = 4;
   int64 unresolved_conflicts = 5;
+  int64 pending_compensation_jobs = 6;
+  int64 failed_compensation_jobs = 7;
+  int64 materialization_backlog = 8;
+  int64 oldest_unresolved_conflict_age_seconds = 9;
+  int64 failed_reservations = 10;
+  bool zero_manual_slo_healthy = 11;
+  repeated string zero_manual_slo_violations = 12;
 }
 
 message ListReplicationConflictsRequest {
