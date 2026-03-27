@@ -291,3 +291,4 @@ Status (incremental):
 - A repository check entrypoint now exists via `make test-tla` (backed by `scripts/check-tla.sh`) to run all TLC models in one pass.
 - `ControllerReplication.tla` now models outbox/delivery/apply/head/frontier/conflict state and checks safety invariants for deterministic winner selection, no-double-apply semantics, and auto-terminal (no-manual) conflict states.
 - `ControllerNodeReconcile.tla` now models deterministic priority-based failover and heartbeat progress with fairness constraints, improving failover-liveness guardrails.
+- A trace drift checker now exists (`make test-tla-trace`) to validate sampled replication traces against deterministic winner and auto-terminal assumptions used by the formal model.

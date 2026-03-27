@@ -1,0 +1,30 @@
+[
+  {
+    "resource_key": "vm/v1",
+    "op_id": "op-a",
+    "rank": 10,
+    "terminal_state": "auto_accepted",
+    "expected_winner_op_id": "op-a"
+  },
+  {
+    "resource_key": "vm/v1",
+    "op_id": "op-b",
+    "rank": 8,
+    "terminal_state": "auto_rejected",
+    "expected_winner_op_id": "op-a"
+  },
+  {
+    "resource_key": "vm/v2",
+    "op_id": "op-z",
+    "rank": 1,
+    "terminal_state": "auto_accepted",
+    "expected_winner_op_id": "op-z"
+  },
+  {
+    "resource_key": "vm/v2",
+    "op_id": "op-y",
+    "rank": 1,
+    "terminal_state": "auto_compensated",
+    "expected_winner_op_id": "op-z"
+  }
+]

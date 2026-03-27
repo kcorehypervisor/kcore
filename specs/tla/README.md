@@ -41,6 +41,19 @@ If TLC is not in `PATH`, set one of:
 - `TLC_CMD` (full command to run TLC)
 - `TLA2TOOLS_JAR` (path to `tla2tools.jar`)
 
+## Trace drift check
+
+Use the trace checker to validate that sampled implementation traces still satisfy
+the same deterministic winner and auto-terminal assumptions used in the TLA model:
+
+```bash
+make test-tla-trace
+```
+
+Sample fixture:
+
+- `specs/tla/traces/replication-sample.json`
+
 Notes:
 
 - These specs are intentionally bounded; they are guardrails, not full proofs.
