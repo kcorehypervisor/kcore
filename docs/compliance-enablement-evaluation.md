@@ -402,32 +402,3 @@ webhooks:
       Authorization: "Bearer <token>"
 ```
 
----
-
-## 5. Cost and effort summary
-
-### Engineering investment to make KCore compliance-enabling
-
-| Item | Effort | External cost | Priority |
-|------|--------|--------------|----------|
-| 2.1 Audit logging | 2–3 weeks | $0 | Critical — blocks all compliance use cases |
-| 2.2 Compliance evidence export | 2–3 weeks | $0 | High — saves customers weeks of evidence gathering |
-| 2.3 RBAC | 1–2 weeks | $0 | High — required for SOC 2 and PCI |
-| 2.4 FIPS crypto mode | 2–3 weeks | $0 | Medium — required for US federal customers |
-| 2.5 Encryption at rest | 1–2 weeks | $0 | Medium — required for GDPR and SOC 2 |
-| 2.6 Certificate lifecycle | 2–3 weeks | $0 | Medium — auditors will flag expiring certs |
-| 2.7 Health checks | 1 week | $0 | Medium — required for SOC 2 availability |
-| 2.8 Shared responsibility docs | 1 week | $0 | High — first thing customers and auditors read |
-| Webhook / event system | 1–2 weeks | $0 | Medium — enables SIEM integration |
-| **Total** | **~14–20 weeks** | **$0 external** | |
-
-### What it costs the customer to get certified using KCore
-
-| Standard | Customer cost (with KCore providing controls) | Customer cost (without KCore controls) | KCore's value |
-|----------|----------------------------------------------|---------------------------------------|---------------|
-| GDPR | €2,000–€5,000 (lawyer for DPA) | €15,000–€50,000 (build controls + legal) | Saves 70–90% |
-| SOC 2 Type II | $20,000–$50,000 (auditor + platform) | $50,000–$120,000 (build controls + audit) | Saves 40–60% |
-| PCI DSS 4.0 | $40,000–$100,000 (QSA + scanning) | $100,000–$250,000 (build controls + QSA) | Saves 40–60% |
-| FIPS 140-3 | $0 (KCore uses pre-validated library) | $150,000–$300,000 (validate own module) | Saves 100% |
-| Cyber Essentials Plus | £2,000–£5,000 (assessor) | £4,000–£25,000 (remediation + assessor) | Saves 50–80% |
-
