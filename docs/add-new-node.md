@@ -179,11 +179,45 @@ re-register, it stays rejected.
 - **Pending nodes** that re-register (e.g., agent restart) stay
   `pending` until approved.
 
+## Certificate renewal
+
+After installation, node certificates are valid for 1 year. The node-agent
+automatically checks certificate expiry at startup and once daily:
+
+- If the certificate expires in more than 30 days, no action is taken.
+- If the certificate is within 30 days of expiry, the node-agent calls
+  `RenewNodeCert` on the controller. The controller signs a new
+  certificate using its **sub-CA** (an intermediate CA deployed during
+  cluster creation) and returns the new cert chain + private key.
+- The node-agent writes the renewed certificate to disk. The new cert
+  takes effect on the next service restart.
+
+This is fully automatic and requires no operator intervention. The
+controller log shows:
+
+```
+INFO kcore_controller::grpc::controller: renewed node certificate via sub-CA
+     node_id=kvm-node-02 host=192.168.40.110
+```
+
+The operator can rotate the sub-CA at any time with:
+
+```bash
+kctl rotate sub-ca
+```
+
+This generates a new sub-CA from the root CA and pushes it to the
+controller. Existing node certs remain valid (the root CA is the trust
+anchor); future renewals use the new sub-CA.
+
 ## Security model
 
 The approval queue adds a human gate on top of the mTLS trust model. Even
 if an attacker obtains a certificate signed by the cluster CA, the node
 still needs operator approval before it can participate in the cluster.
+
+Only approved nodes can renew their certificates. Pending or rejected
+nodes receive a `PermissionDenied` error from the `RenewNodeCert` RPC.
 
 See [docs/security-k8s-vs-kcore.md](security-k8s-vs-kcore.md) for a
 full comparison of kcore's security model with Kubernetes.
@@ -199,3 +233,4 @@ full comparison of kcore's security model with Kubernetes.
 | Get node details | `kctl get node <NODE_ID>` |
 | Approve pending node | `kctl node approve <NODE_ID>` |
 | Reject pending node | `kctl node reject <NODE_ID>` |
+| Rotate sub-CA | `kctl rotate sub-ca` |

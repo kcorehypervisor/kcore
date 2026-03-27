@@ -23,8 +23,8 @@ the role (`kcore-controller`, `kcore-kctl`, or `kcore-node-<host>`).
 | Area | Kubernetes | kcore |
 |------|-----------|-------|
 | Bootstrap | TLS Bootstrap with short-lived tokens (24h default). Node submits a CSR; the control plane signs it. Token expires automatically. | Operator pushes a CA-signed cert directly to the node during `kctl node install`. No bootstrap token. |
-| Cert rotation | kubelet auto-renews its certificate before expiry. Built into the kubelet. | No auto-renewal. Node certs are valid for 1 year (configurable in `pki.rs`). Manual rotation with `kctl rotate certs` for the controller cert. |
-| Revocation | Can deny CSR renewals, delete the node object, or rotate the CA. RBAC blocks access immediately. | No revocation mechanism. A leaked certificate remains valid until the CA is regenerated. |
+| Cert rotation | kubelet auto-renews its certificate before expiry. Built into the kubelet. | Automatic renewal via sub-CA: node-agent checks expiry daily, renews within 30 days of expiry via `RenewNodeCert` RPC. Controller cert can be rotated with `kctl rotate certs`. Sub-CA rotatable with `kctl rotate sub-ca`. |
+| Revocation | Can deny CSR renewals, delete the node object, or rotate the CA. RBAC blocks access immediately. | Sub-CA can be revoked by rotating it (`kctl rotate sub-ca`). Only approved nodes can renew. The root CA can be regenerated as a last resort. |
 | Identity granularity | Each component has a distinct service account with RBAC bindings. Least-privilege by default. | Three CN-based roles: controller, kctl, and node. No fine-grained permissions within a role. |
 
 ### How kcore bootstrap works
@@ -48,7 +48,7 @@ cluster.
 
 | Area | Kubernetes | kcore |
 |------|-----------|-------|
-| Admission | Node CSR must be approved (automatically or manually). Node object is created only after approval. | Any node with a valid CA-signed cert self-registers immediately on startup. No approval gate. |
+| Admission | Node CSR must be approved (automatically or manually). Node object is created only after approval. | New nodes register as `pending` and require operator approval (`kctl node approve`). Rejected nodes cannot participate. |
 | Heartbeat | kubelet sends periodic leases. After `node-monitor-grace-period` (40s default) the node is marked `NotReady`. Pods get evicted after `pod-eviction-timeout`. | Heartbeat mechanism exists but there is no automatic VM migration when a node becomes unreachable. |
 | Graceful removal | `kubectl drain` cordons the node and evicts pods respecting PodDisruptionBudgets. `kubectl delete node` removes the identity. | `kctl drain node` migrates VMs but there is no cordon (prevent new scheduling without draining). Deleting a node from the DB does not invalidate its certificate. |
 
@@ -89,26 +89,25 @@ threat model and practical priorities are different.
   machine. Only signed certificates are transmitted to nodes.
 - **CN-based authorization**: the controller checks the certificate Common
   Name to enforce role separation (kctl vs node vs controller).
-- **Certificate rotation command**: `kctl rotate certs --controller <addr>`
-  re-signs the controller certificate with a new SAN using the existing CA.
+- **Node approval queue**: new nodes register as `pending` and must be
+  approved by the operator (`kctl node approve <id>`) before they can
+  participate in scheduling or heartbeats.
+- **Sub-CA certificate auto-rotation**: a sub-CA (intermediate CA) is
+  deployed to the controller. Nodes automatically renew their certificates
+  within 30 days of expiry. The sub-CA is revocable by the operator
+  (`kctl rotate sub-ca`) without affecting the root CA.
+- **Certificate rotation commands**: `kctl rotate certs` re-signs the
+  controller certificate; `kctl rotate sub-ca` generates a new sub-CA
+  and pushes it to the controller.
 
-### Planned improvements (high impact, moderate effort)
+### Planned improvements
 
-1. **Node approval queue** -- hold new registrations in a `pending` status
-   until the operator runs `kctl approve node <id>`. Prevents rogue nodes
-   from joining even if they possess a valid certificate.
-2. **Audit log** -- structured log of all mutating API calls recording
+1. **Audit log** -- structured log of all mutating API calls recording
    actor identity, action, resource, and timestamp. Essential for
    debugging and compliance.
-3. **Cert expiry warning** -- `kctl get nodes` displays days until each
+2. **Cert expiry warning** -- `kctl get nodes` displays days until each
    node's certificate expires to prevent silent expiry.
-
-### Future improvements (high effort, important at scale)
-
-4. **Automatic cert renewal** -- node-agent requests a new certificate
-   from the controller before its current cert expires. Eliminates manual
-   rotation.
-5. **RBAC** -- multiple operator roles such as read-only, vm-admin, and
+3. **RBAC** -- multiple operator roles such as read-only, vm-admin, and
    cluster-admin with fine-grained permission control.
 
 ### Not planned (Kubernetes-specific complexity)
