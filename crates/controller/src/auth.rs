@@ -3,6 +3,7 @@ use tonic::{Request, Status};
 
 pub const CN_KCTL: &str = "kcore-kctl";
 pub const CN_NODE_PREFIX: &str = "kcore-node-";
+pub const CN_CONTROLLER_PREFIX: &str = "kcore-controller-";
 
 /// Extract the Common Name from the peer's TLS client certificate.
 /// Returns `None` when TLS is not in use or no client cert was presented.
