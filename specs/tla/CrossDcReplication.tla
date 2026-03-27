@@ -1,67 +1,124 @@
 ------------------------------- MODULE CrossDcReplication -------------------------------
-EXTENDS FiniteSets, TLC
+EXTENDS FiniteSets, Integers, TLC
 
-CONSTANTS Controllers, Events, DcOf
+CONSTANTS
+  Controllers,
+  Events,
+  Dcs,
+  DcOf,
+  NoEvent
 
-ASSUME Controllers = {"c1", "c2", "c3"}
+ASSUME /\ Controllers # {}
+       /\ Events # {}
+       /\ Dcs # {}
+       /\ DcOf \in [Controllers -> Dcs]
+       /\ NoEvent \notin Events
 
-VARIABLES seen, linkUp
+VARIABLES Outbox, Delivered, Applied, DcHead, ReceivedOps, Frontier, LinkUp
+
+Vars == <<Outbox, Delivered, Applied, DcHead, ReceivedOps, Frontier, LinkUp>>
 
 Init ==
-  /\ seen = [c \in Controllers |-> {}]
-  /\ linkUp \in [Controllers \X Controllers -> BOOLEAN]
+  /\ Outbox = [c \in Controllers |-> {}]
+  /\ Delivered = [c \in Controllers |-> {}]
+  /\ Applied = [c \in Controllers |-> {}]
+  /\ DcHead = [dc \in Dcs |-> NoEvent]
+  /\ ReceivedOps = [c \in Controllers |-> {}]
+  /\ Frontier = [c \in Controllers |-> 0]
+  /\ LinkUp \in [Controllers \X Controllers -> BOOLEAN]
 
-Produce ==
+Emit ==
   /\ \E c \in Controllers, e \in Events :
-      /\ e \notin seen[c]
-      /\ seen' = [seen EXCEPT ![c] = @ \cup {e}]
-  /\ UNCHANGED linkUp
+      /\ e \notin Outbox[c]
+      /\ Outbox' = [Outbox EXCEPT ![c] = @ \cup {e}]
+  /\ UNCHANGED <<Delivered, Applied, DcHead, ReceivedOps, Frontier, LinkUp>>
 
-IntraDcSync ==
-  /\ \E a \in Controllers, b \in Controllers :
-      /\ a /= b
-      /\ DcOf[a] = DcOf[b]
-      /\ linkUp[<<a, b>>]
-      /\ seen' = [seen EXCEPT ![b] = @ \cup seen[a]]
-  /\ UNCHANGED linkUp
+Deliver ==
+  /\ \E src \in Controllers, dst \in Controllers, e \in Events :
+      /\ src /= dst
+      /\ LinkUp[<<src, dst>>]
+      /\ e \in Outbox[src]
+      /\ e \notin Delivered[dst]
+      /\ Delivered' = [Delivered EXCEPT ![dst] = @ \cup {e}]
+  /\ UNCHANGED <<Outbox, Applied, DcHead, ReceivedOps, Frontier, LinkUp>>
 
-CrossDcSync ==
-  /\ \E a \in Controllers, b \in Controllers :
-      /\ DcOf[a] /= DcOf[b]
-      /\ linkUp[<<a, b>>]
-      /\ seen' = [seen EXCEPT ![b] = @ \cup seen[a]]
-  /\ UNCHANGED linkUp
+IntraDcAntiEntropy ==
+  /\ \E src \in Controllers, dst \in Controllers :
+      /\ src /= dst
+      /\ DcOf[src] = DcOf[dst]
+      /\ LinkUp[<<src, dst>>]
+      /\ Delivered' = [Delivered EXCEPT ![dst] = @ \cup Outbox[src]]
+  /\ UNCHANGED <<Outbox, Applied, DcHead, ReceivedOps, Frontier, LinkUp>>
 
-AntiEntropy ==
-  /\ \E a \in Controllers, b \in Controllers :
-      /\ a /= b
-      /\ linkUp[<<a, b>>] /\ linkUp[<<b, a>>]
-      /\ seen' = [seen EXCEPT
-                    ![a] = @ \cup seen[b],
-                    ![b] = @ \cup seen[a]]
-  /\ UNCHANGED linkUp
+CrossDcAntiEntropy ==
+  /\ \E src \in Controllers, dst \in Controllers :
+      /\ src /= dst
+      /\ DcOf[src] # DcOf[dst]
+      /\ LinkUp[<<src, dst>>]
+      /\ Delivered' = [Delivered EXCEPT ![dst] = @ \cup Outbox[src]]
+  /\ UNCHANGED <<Outbox, Applied, DcHead, ReceivedOps, Frontier, LinkUp>>
+
+ApplyEvent ==
+  /\ \E c \in Controllers, e \in Delivered[c] \ Applied[c] :
+      LET dc == DcOf[c]
+      IN
+      /\ Applied' = [Applied EXCEPT ![c] = @ \cup {e}]
+      /\ ReceivedOps' = [ReceivedOps EXCEPT ![c] = @ \cup {e}]
+      /\ Frontier' = [Frontier EXCEPT ![c] = Cardinality(Applied[c] \cup {e})]
+      /\ DcHead' =
+          IF DcHead[dc] = NoEvent \/ e > DcHead[dc]
+            THEN [DcHead EXCEPT ![dc] = e]
+            ELSE DcHead
+  /\ UNCHANGED <<Outbox, Delivered, LinkUp>>
 
 ToggleLink ==
-  /\ \E a \in Controllers, b \in Controllers :
-      /\ a /= b
-      /\ linkUp' = [linkUp EXCEPT ![<<a, b>>] = ~@]
-  /\ UNCHANGED seen
+  /\ \E src \in Controllers, dst \in Controllers :
+      /\ src /= dst
+      /\ LinkUp' = [LinkUp EXCEPT ![<<src, dst>>] = ~@]
+  /\ UNCHANGED <<Outbox, Delivered, Applied, DcHead, ReceivedOps, Frontier>>
 
 Noop ==
-  UNCHANGED <<seen, linkUp>>
+  UNCHANGED Vars
 
 Next ==
-  Produce \/ IntraDcSync \/ CrossDcSync \/ AntiEntropy \/ ToggleLink \/ Noop
+  Emit
+  \/ Deliver
+  \/ IntraDcAntiEntropy
+  \/ CrossDcAntiEntropy
+  \/ ApplyEvent
+  \/ ToggleLink
+  \/ Noop
 
-Spec == Init /\ [][Next]_<<seen, linkUp>>
+Spec ==
+  Init /\ [][Next]_Vars
+       /\ WF_Vars(Deliver)
+       /\ WF_Vars(IntraDcAntiEntropy)
+       /\ WF_Vars(CrossDcAntiEntropy)
+       /\ WF_Vars(ApplyEvent)
 
-Safety_Subset ==
-  \A c \in Controllers : seen[c] \subseteq Events
+TypeOK ==
+  /\ Outbox \in [Controllers -> SUBSET Events]
+  /\ Delivered \in [Controllers -> SUBSET Events]
+  /\ Applied \in [Controllers -> SUBSET Events]
+  /\ ReceivedOps \in [Controllers -> SUBSET Events]
+  /\ Frontier \in [Controllers -> Nat]
+  /\ DcHead \in [Dcs -> (Events \cup {NoEvent})]
+  /\ \A c \in Controllers : Frontier[c] = Cardinality(Applied[c])
 
-AllConverged ==
-  \A a \in Controllers, b \in Controllers : seen[a] = seen[b]
+NoDoubleApply ==
+  \A c \in Controllers : Applied[c] = ReceivedOps[c]
+
+IntraDcSubsetSafety ==
+  \A a \in Controllers, b \in Controllers :
+    DcOf[a] = DcOf[b] => Applied[a] \subseteq Events /\ Applied[b] \subseteq Events
+
+CrossDcEventualPropagationCandidate ==
+  \A c \in Controllers : Applied[c] \subseteq UNION {Outbox[d] : d \in Controllers}
+
+Divergence ==
+  \E a \in Controllers, b \in Controllers : Applied[a] # Applied[b]
 
 Liveness_CrossDcConverges ==
-  <>AllConverged
+  <> ~Divergence
 
 ==========================================================================================
