@@ -431,39 +431,3 @@ webhooks:
 | FIPS 140-3 | $0 (KCore uses pre-validated library) | $150,000–$300,000 (validate own module) | Saves 100% |
 | Cyber Essentials Plus | £2,000–£5,000 (assessor) | £4,000–£25,000 (remediation + assessor) | Saves 50–80% |
 
-### Commercial positioning
-
-KCore's compliance enablement turns into a sales advantage:
-
-- **Enterprise procurement:** "KCore ships with SOC 2/PCI/GDPR compliance controls out of the box. Here's our shared responsibility model and evidence package."
-- **Regulated industries:** "KCore's FIPS mode uses a FIPS 140-3 validated crypto library. Enable `--fips` and your stack is covered."
-- **Government:** "KCore provides NCSC Principle alignment and Cyber Essentials Plus-ready configuration. Here's our 14-principle mapping."
-- **Competitive differentiation:** Most hypervisor management tools require customers to build compliance controls themselves. KCore provides them as platform features.
-
----
-
-## 6. Implementation order
-
-```
-Phase 1 (weeks 1–4): Foundation
-├── Audit logging (2.1) — unlocks all compliance
-├── Shared responsibility document (2.8)
-└── SBOM generation (part of 2.2)
-
-Phase 2 (weeks 4–8): Evidence and access
-├── Compliance evidence export (2.2)
-├── RBAC (2.3)
-└── Certificate lifecycle (2.6)
-
-Phase 3 (weeks 8–12): Hardening
-├── FIPS crypto mode (2.4)
-├── Encryption at rest (2.5)
-└── Health checks (2.7)
-
-Phase 4 (weeks 12–16): Integration
-├── Webhook / event system
-├── SIEM integration guide
-└── Customer compliance guide per standard
-```
-
-After phase 1, KCore can credibly claim "compliance-enabling" to customers. After phase 4, a customer's auditor should be able to complete their assessment using KCore's built-in evidence export with minimal manual evidence gathering.
