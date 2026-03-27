@@ -235,22 +235,56 @@ KCore now uses FIPS-validated cryptography by default, without requiring a runti
 
 ### 2.5 Encryption at rest (GDPR, SOC 2, PCI)
 
-Customers need to demonstrate that data at rest is encrypted. KCore stores state in SQLite and certificate files on disk.
+Customers need to demonstrate that data at rest is encrypted.
 
-**What to build:**
+**Data classification:** KCore's controller SQLite database stores only operational metadata — node IPs, hostnames, VM definitions, network configurations, and certificate Common Names. It does **not** store personal data (GDPR), cardholder data (PCI DSS), or customer secrets. Therefore application-level database encryption (e.g. SQLCipher) is unnecessary and would add build complexity and key management burden for zero compliance value.
 
-| Item | Detail |
-|------|--------|
-| SQLite encryption | Support SQLCipher as the SQLite backend, enabled via `database.encryption: true` in controller.yaml. Key derived from a passphrase or hardware token. |
-| Disk encryption guidance | Document that KCore nodes should use dm-crypt/LUKS for full-disk encryption. Provide a reference NixOS configuration. |
-| VM disk encryption | Document how customers can use guest-level encryption (LUKS inside the VM) for workload data. KCore does not manage guest disk encryption — this is the customer's responsibility. |
+**Why full-disk encryption (LUKS) is sufficient:**
+
+- **PCI DSS 4.0 Requirement 3.5.1.2** restricts disk-level-only encryption to removable media, but this applies specifically to stored PANs. The PCI SSC states: "Requirements 3.5–3.7 would not be applicable to systems that do not store or manage the storage of cardholder data." KCore never stores PANs.
+- **SOC 2** is principle-based and does not prescribe specific encryption methods. Auditors evaluate whether the approach is appropriate for the data classification. LUKS on the host disk, combined with file permissions (0600) on certificate files and mTLS on the network, is a defensible position for infrastructure metadata.
+- **GDPR Art. 32** requires "appropriate technical measures" proportional to risk. KCore stores no personal data. LUKS on the host disk protects operational metadata. Guest-level encryption for VMs containing personal data is the customer's responsibility.
+- **FIPS 140-3** has no opinion on encryption at rest beyond requiring a validated module if encryption is used. LUKS uses the kernel's `dm-crypt` which operates in FIPS mode when the `fips=1` kernel parameter is set.
+
+**What to provide:**
+
+| Layer | Protection | Responsibility | Engineering effort |
+|-------|-----------|---------------|-------------------|
+| Host disk (LUKS) | Full-disk encryption via dm-crypt/LUKS on NixOS nodes | Customer deploys using KCore's reference NixOS configuration | Documentation only |
+| Certificate files | File permissions (0600) + LUKS | Already implemented | Already done |
+| Controller SQLite DB | Protected by LUKS — no application-level encryption needed | N/A (operational metadata only) | None |
+| VM guest disks | Guest-level LUKS for workloads with sensitive/personal/cardholder data | Customer's responsibility | Documentation only |
+
+**Reference NixOS LUKS configuration:**
+
+```nix
+{
+  boot.initrd.luks.devices."cryptroot" = {
+    device = "/dev/disk/by-uuid/<PARTITION-UUID>";
+    preLVM = true;
+    allowDiscards = true;                    # for SSD TRIM
+    # Optional: FIDO2 hardware token unlock
+    # fido2.credential = "<credential-id>";
+  };
+
+  fileSystems."/" = {
+    device = "/dev/mapper/cryptroot";
+    fsType = "ext4";
+  };
+
+  # For FIPS-mode kernel crypto (optional):
+  # boot.kernelParams = [ "fips=1" ];
+}
+```
+
+Customers should apply this to all KCore nodes. The `kctl node install` workflow does not currently automate LUKS setup — the operator must partition and encrypt the disk before running the installer, or use a pre-encrypted NixOS image.
 
 **Why this matters for customers:**
-- GDPR Art. 32: "encryption of personal data"
-- SOC 2 C1: "confidential information is protected"
-- PCI DSS 3.5: "protect stored account data"
+- GDPR Art. 32: "encryption of personal data" — customer VMs with personal data use guest-level LUKS
+- SOC 2 C1.1: "confidential information is protected" — LUKS on host disk protects all KCore state
+- PCI DSS 2.2: "system hardening" — LUKS is a general hardening control; PCI 3.5 does not apply because KCore does not store cardholder data
 
-**Effort estimate:** 1–2 weeks for SQLCipher integration. Documentation only for disk/VM encryption.
+**Effort estimate:** Documentation only. No engineering required.
 
 ### 2.6 Certificate lifecycle management (SOC 2, PCI, NCSC)
 
@@ -296,7 +330,7 @@ This is the single most important non-engineering deliverable. Customers need a 
 | Control area | KCore responsibility | Customer responsibility |
 |-------------|---------------------|----------------------|
 | Encryption in transit | mTLS on all management traffic | Encryption of guest-to-guest and guest-to-internet traffic |
-| Encryption at rest | SQLCipher for controller DB, key file permissions | Full-disk encryption on nodes (LUKS), guest disk encryption |
+| Encryption at rest | LUKS reference NixOS configuration, certificate file permissions (0600) | Full-disk encryption on nodes (LUKS), guest disk encryption for VMs with sensitive data |
 | Access control | CN-based RBAC on gRPC API, node approval queue | Managing who holds which certificates, revoking access for departed staff |
 | Network segmentation | Per-VM network isolation, VLAN, firewall rules | Defining which workloads go on which networks, designing the topology |
 | Audit logging | Structured audit log of all API actions | Forwarding audit logs to SIEM, setting retention policies, monitoring alerts |
@@ -334,7 +368,7 @@ The customer gets audited, not KCore. KCore's controls count as "complementary s
 
 | Trust Services Criteria | KCore provides (platform controls) | Customer provides (user entity controls) |
 |------------------------|------------------------------------|-----------------------------------------|
-| CC6.1 (encryption) | mTLS, FIPS mode, SQLCipher | Key management procedures, guest encryption |
+| CC6.1 (encryption) | mTLS, FIPS-validated crypto (aws-lc-rs), LUKS reference config | Key management procedures, enabling LUKS on nodes, guest encryption |
 | CC6.3 (access control) | RBAC with three roles, node approval | Managing certificate distribution, offboarding |
 | CC7.2 (monitoring) | Structured audit logging, audit log API | SIEM integration, alert triage, incident response |
 | CC8.1 (change management) | Declarative NixOS config, SBOM, signed releases | Change approval workflow, deployment procedures |
@@ -352,7 +386,7 @@ PCI applies only if the customer's VMs process cardholder data. KCore is an "in-
 |----------------|----------------|-------------------|
 | 1.3 (network segmentation) | NAT/VLAN/VXLAN network isolation, per-network firewall rules | Define which networks are PCI scope, validate segmentation |
 | 2.2 (system hardening) | NixOS minimal install, no unnecessary services | Guest OS hardening, application hardening |
-| 4.2 (strong cryptography) | mTLS with configurable cipher suites, FIPS mode | Ensure FIPS mode is enabled, document crypto config |
+| 4.2 (strong cryptography) | mTLS with FIPS-approved cipher suites (always active) | Verify crypto config via `kctl get compliance-report`, document in security policy |
 | 6.3 (software inventory) | SBOM shipped with every release | Vulnerability management workflow using the SBOM |
 | 7.1 (restrict access) | RBAC with admin/operator/viewer roles | Map roles to staff, review access quarterly |
 | 8.3 (MFA) | Client certificate on hardware token (YubiKey/PIV support) | Enforce hardware token usage, manage token inventory |
@@ -367,12 +401,13 @@ The customer's system must use FIPS-validated cryptography. KCore enables this w
 
 | Component | KCore provides | Customer provides |
 |-----------|----------------|-------------------|
-| TLS library | `aws-lc-rs` (FIPS 140-3 certificate #4816) as `rustls` backend | Enable `--fips` flag, verify cipher suites |
-| Cipher suites | FIPS-approved only when `--fips` is set | Document that FIPS mode is enabled in their security policy |
-| Key management | Certificate generation, rotation, and destruction tools | Follow key management procedures, protect CA key |
+| TLS library | `aws-lc-rs` (FIPS 140-3 certificate #4816) as `rustls` backend — enabled by default, no flag needed | Verify cipher suites via `kctl get compliance-report` |
+| Cipher suites | FIPS-approved only (AES-GCM + ECDHE P-256/P-384) — always active, non-FIPS algorithms excluded at startup | Document the crypto configuration in their security policy |
+| Key management | Certificate generation, sub-CA rotation, auto-renewal, and destruction tools | Follow key management procedures, protect root CA key |
 | Kernel crypto | Documentation for `fips=1` kernel parameter on NixOS | Enable kernel FIPS mode on all nodes |
+| Encryption at rest | LUKS reference NixOS configuration (dm-crypt uses kernel FIPS module when `fips=1` is set) | Enable LUKS on all nodes |
 
-**Customer's cost to claim FIPS-compliant stack:** $0 external cost if using KCore's FIPS mode with `aws-lc-rs`. The customer documents the validated module and its certificate number in their own FIPS security policy. KCore does not need its own FIPS certificate.
+**Customer's cost to claim FIPS-compliant stack:** $0 external cost. KCore uses `aws-lc-rs` with FIPS-approved algorithms by default — no `--fips` flag or opt-in required. The customer documents the validated module and its certificate number in their own FIPS security policy. KCore does not need its own FIPS certificate.
 
 ---
 
