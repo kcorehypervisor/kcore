@@ -19,8 +19,9 @@ The intent is to check protocol-level safety/liveness properties with TLC.
   - Checks event propagation safety and eventual convergence assumptions.
 
 - `CrossDcReplication.tla` + `CrossDcReplication.cfg`
-  - Three controllers across two DCs.
-  - Models inter-DC synchronization with bounded anti-entropy checks.
+  - Three controllers across two DCs with explicit link state.
+  - Separates intra-DC and cross-DC anti-entropy actions.
+  - Checks no-double-apply plus eventual cross-DC convergence.
 
 ## Running locally
 
