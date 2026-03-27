@@ -746,6 +746,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "pem",
  "prost",
  "prost-types",
@@ -797,6 +798,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "hyperlocal",
+ "libc",
  "pem",
  "prost",
  "prost-types",

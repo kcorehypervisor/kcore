@@ -40,11 +40,18 @@ impl SubCaState {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct TlsPaths {
+    pub cert_file: String,
+    pub key_file: String,
+}
+
 pub struct ControllerService {
     db: Database,
     clients: NodeClients,
     default_network: NetworkConfig,
     sub_ca: Arc<Mutex<SubCaState>>,
+    tls_paths: Option<TlsPaths>,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
 }
@@ -61,9 +68,15 @@ impl ControllerService {
             clients,
             default_network,
             sub_ca,
+            tls_paths: None,
             #[cfg(test)]
             test_push_hook: None,
         }
+    }
+
+    pub fn with_tls_paths(mut self, paths: TlsPaths) -> Self {
+        self.tls_paths = Some(paths);
+        self
     }
 
     #[cfg(test)]
@@ -78,6 +91,7 @@ impl ControllerService {
             clients,
             default_network,
             sub_ca: Arc::new(Mutex::new(SubCaState::default())),
+            tls_paths: None,
             test_push_hook: Some(hook),
         }
     }
@@ -1728,6 +1742,49 @@ impl controller_proto::controller_server::Controller for ControllerService {
         Ok(Response::new(controller_proto::RotateSubCaResponse {
             success: true,
             message: "sub-CA rotated successfully".into(),
+        }))
+    }
+
+    async fn reload_tls(
+        &self,
+        request: Request<controller_proto::ReloadTlsRequest>,
+    ) -> Result<Response<controller_proto::ReloadTlsResponse>, Status> {
+        auth::require_peer(&request, &[CN_KCTL])?;
+        let req = request.into_inner();
+
+        if req.cert_pem.trim().is_empty() || req.key_pem.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "cert_pem and key_pem are required",
+            ));
+        }
+
+        let tls = self.tls_paths.as_ref().ok_or_else(|| {
+            Status::failed_precondition("TLS is not configured on this controller")
+        })?;
+
+        std::fs::write(&tls.cert_file, &req.cert_pem)
+            .map_err(|e| Status::internal(format!("writing cert: {e}")))?;
+        std::fs::write(&tls.key_file, &req.key_pem)
+            .map_err(|e| Status::internal(format!("writing key: {e}")))?;
+
+        info!(
+            cert = %tls.cert_file,
+            key = %tls.key_file,
+            "controller TLS cert written to disk"
+        );
+
+        #[cfg(unix)]
+        {
+            let pid = std::process::id();
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGHUP);
+            }
+            info!("SIGHUP sent to self, TLS reload in progress");
+        }
+
+        Ok(Response::new(controller_proto::ReloadTlsResponse {
+            success: true,
+            message: "TLS certificate updated; server reloading".into(),
         }))
     }
 }

@@ -871,6 +871,7 @@ async fn main() {
                 certs_dir,
             },
         } => {
+            let info = resolve_controller(&cli).ok();
             let certs_path = if let Some(dir) = certs_dir {
                 dir.clone()
             } else {
@@ -881,7 +882,7 @@ async fn main() {
                 config::resolve_install_certs_dir(&config_path)
                     .unwrap_or_else(|e| fatal(&e))
             };
-            commands::certs::rotate(&certs_path, controller)
+            commands::certs::rotate(&certs_path, controller, info.as_ref()).await
         }
         Command::Rotate {
             resource: RotateResource::SubCa { certs_dir },

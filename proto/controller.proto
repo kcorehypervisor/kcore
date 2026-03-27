@@ -42,6 +42,7 @@ service Controller {
   // Certificate rotation
   rpc RenewNodeCert(RenewNodeCertRequest) returns (RenewNodeCertResponse);
   rpc RotateSubCa(RotateSubCaRequest) returns (RotateSubCaResponse);
+  rpc ReloadTls(ReloadTlsRequest) returns (ReloadTlsResponse);
 }
 
 message RegisterNodeRequest {
@@ -420,3 +421,12 @@ message RotateSubCaResponse {
   string message = 2;
 }
 
+message ReloadTlsRequest {
+  string cert_pem = 1;
+  string key_pem = 2;
+}
+
+message ReloadTlsResponse {
+  bool success = 1;
+  string message = 2;
+}
