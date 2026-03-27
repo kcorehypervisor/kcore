@@ -252,8 +252,16 @@ async fn check_and_renew_cert(
 
     info!(
         node_id = %cfg.node_id,
-        "certificate renewed successfully; new cert written to disk"
+        "certificate renewed successfully; restarting to load new TLS identity"
     );
+
+    #[cfg(unix)]
+    {
+        let pid = std::process::id();
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
 
     Ok(())
 }

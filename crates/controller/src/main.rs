@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::Config::load(&cli.config)?;
-    let addr = cfg.listen_addr.parse()?;
+    let addr: std::net::SocketAddr = cfg.listen_addr.parse()?;
 
     if cfg.tls.is_none() && !cli.allow_insecure {
         anyhow::bail!(
@@ -62,37 +62,6 @@ async fn main() -> anyhow::Result<()> {
 
     let sub_ca_state = load_sub_ca(&cfg);
     let sub_ca = Arc::new(Mutex::new(sub_ca_state));
-
-    let controller_svc =
-        controller_proto::controller_server::ControllerServer::new(grpc::ControllerService::new(
-            database.clone(),
-            clients.clone(),
-            cfg.default_network.clone(),
-            sub_ca,
-        ));
-
-    let admin_svc = controller_proto::controller_admin_server::ControllerAdminServer::new(
-        grpc::ControllerAdminService::new(),
-    );
-
-    let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<controller_proto::controller_server::ControllerServer<grpc::ControllerService>>()
-        .await;
-
-    let mut server = Server::builder();
-    if let Some(tls) = cfg.tls.as_ref() {
-        let cert_pem = std::fs::read_to_string(&tls.cert_file)?;
-        let key_pem = std::fs::read_to_string(&tls.key_file)?;
-        let ca_pem = std::fs::read_to_string(&tls.ca_file)?;
-        let server_tls = ServerTlsConfig::new()
-            .identity(Identity::from_pem(cert_pem, key_pem))
-            .client_ca_root(Certificate::from_pem(ca_pem));
-        server = server.tls_config(server_tls)?;
-        info!(addr = %addr, "starting controller with mTLS");
-    } else {
-        warn!(addr = %addr, "starting controller WITHOUT TLS (--allow-insecure) — all RPCs are unauthenticated");
-    }
 
     let staleness_db = database.clone();
     tokio::spawn(async move {
@@ -122,14 +91,115 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    server
-        .add_service(health_svc)
-        .add_service(controller_svc)
-        .add_service(admin_svc)
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+    loop {
+        let mut svc = grpc::ControllerService::new(
+            database.clone(),
+            clients.clone(),
+            cfg.default_network.clone(),
+            sub_ca.clone(),
+        );
+        if let Some(tls) = cfg.tls.as_ref() {
+            svc = svc.with_tls_paths(grpc::TlsPaths {
+                cert_file: tls.cert_file.clone(),
+                key_file: tls.key_file.clone(),
+            });
+        }
+        let controller_svc = controller_proto::controller_server::ControllerServer::new(svc);
+
+        let admin_svc = controller_proto::controller_admin_server::ControllerAdminServer::new(
+            grpc::ControllerAdminService::new(),
+        );
+
+        let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
+        health_reporter
+            .set_serving::<controller_proto::controller_server::ControllerServer<grpc::ControllerService>>()
+            .await;
+
+        let mut server = Server::builder();
+        if let Some(tls) = cfg.tls.as_ref() {
+            let cert_pem = std::fs::read_to_string(&tls.cert_file)?;
+            let key_pem = std::fs::read_to_string(&tls.key_file)?;
+            let ca_pem = std::fs::read_to_string(&tls.ca_file)?;
+            let server_tls = ServerTlsConfig::new()
+                .identity(Identity::from_pem(cert_pem, key_pem))
+                .client_ca_root(Certificate::from_pem(ca_pem));
+            server = server.tls_config(server_tls)?;
+            info!(addr = %addr, "starting controller with mTLS");
+        } else {
+            warn!(addr = %addr, "starting controller WITHOUT TLS (--allow-insecure) — all RPCs are unauthenticated");
+        }
+
+        let action = shutdown_or_reload_signal();
+        let (action_tx, action_rx) = tokio::sync::oneshot::channel::<ShutdownAction>();
+
+        tokio::spawn(async move {
+            let result = action.await;
+            let _ = action_tx.send(result);
+        });
+
+        server
+            .add_service(health_svc)
+            .add_service(controller_svc)
+            .add_service(admin_svc)
+            .serve_with_shutdown(addr, async {
+                let _ = action_rx.await;
+            })
+            .await?;
+
+        if matches!(LAST_ACTION.lock().unwrap().as_deref(), Some("shutdown")) {
+            break;
+        }
+
+        info!("reloading TLS certificates and restarting listener");
+    }
 
     Ok(())
+}
+
+static LAST_ACTION: Mutex<Option<String>> = Mutex::new(None);
+
+enum ShutdownAction {
+    Shutdown,
+    Reload,
+}
+
+async fn shutdown_or_reload_signal() -> ShutdownAction {
+    let ctrl_c = signal::ctrl_c();
+    #[cfg(unix)]
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+    #[cfg(unix)]
+    let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
+        .expect("failed to register SIGHUP handler");
+
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("received Ctrl+C, shutting down");
+                *LAST_ACTION.lock().unwrap() = Some("shutdown".into());
+                ShutdownAction::Shutdown
+            },
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down");
+                *LAST_ACTION.lock().unwrap() = Some("shutdown".into());
+                ShutdownAction::Shutdown
+            },
+            _ = sighup.recv() => {
+                info!("received SIGHUP, reloading TLS certificates");
+                *LAST_ACTION.lock().unwrap() = Some("reload".into());
+                ShutdownAction::Reload
+            },
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        info!("received Ctrl+C, shutting down");
+        *LAST_ACTION.lock().unwrap() = Some("shutdown".into());
+        ShutdownAction::Shutdown
+    }
 }
 
 fn load_sub_ca(cfg: &config::Config) -> grpc::SubCaState {
@@ -181,18 +251,3 @@ fn load_sub_ca(cfg: &config::Config) -> grpc::SubCaState {
     }
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = signal::ctrl_c();
-    #[cfg(unix)]
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-        .expect("failed to register SIGTERM handler");
-    #[cfg(unix)]
-    let terminate = sigterm.recv();
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => { info!("received Ctrl+C, shutting down"); },
-        _ = terminate => { info!("received SIGTERM, shutting down"); },
-    }
-}
