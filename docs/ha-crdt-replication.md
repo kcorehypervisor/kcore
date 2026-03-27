@@ -242,6 +242,11 @@ Status: baseline implementation in progress and partially delivered:
 - Add peer RPCs for event exchange and frontier acknowledgement.
 - Implement hybrid merge semantics (LWW runtime, MV/OR desired state).
 
+Status (incremental):
+
+- Controller config accepts optional `replication` (`controllerId`, `dcId`, `peers`). When present, mutating RPCs append JSON envelopes to SQLite table `replication_outbox` (migration v11).
+- Emitters wired for `node.register` and `vm.create` (after successful node push). Peer fan-out, merge engine, and `replication_log` / ack frontiers are not implemented yet.
+
 ### Phase 3: in-process reconciler
 
 - Start anti-entropy task from controller `main`.

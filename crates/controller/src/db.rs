@@ -301,7 +301,19 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 10;
+        if version < 11 {
+            let _ = conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS replication_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    event_type TEXT NOT NULL,
+                    resource_key TEXT NOT NULL,
+                    payload BLOB NOT NULL
+                );",
+            );
+        }
+
+        const CURRENT_VERSION: i32 = 11;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -316,6 +328,29 @@ impl Database {
     fn schema_version(conn: &Connection) -> i32 {
         conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap_or(0)
+    }
+
+    pub fn append_replication_outbox(
+        &self,
+        event_type: &str,
+        resource_key: &str,
+        payload: &[u8],
+    ) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO replication_outbox (event_type, resource_key, payload) VALUES (?1, ?2, ?3)",
+            params![event_type, resource_key, payload],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn replication_outbox_len(&self) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM replication_outbox",
+            [],
+            |row| row.get(0),
+        )
     }
 
     pub fn upsert_node(&self, node: &NodeRow) -> Result<(), rusqlite::Error> {
@@ -1260,5 +1295,16 @@ mod tests {
 
         let got = db.get_vm("vm-1").expect("get").expect("exists");
         assert_eq!(got.vm_ip, "10.200.0.5");
+    }
+
+    #[test]
+    fn replication_outbox_append_and_count() {
+        let db = Database::open(":memory:").expect("open db");
+        assert_eq!(db.replication_outbox_len().expect("count"), 0);
+        let id = db
+            .append_replication_outbox("node.register", "node/n1", br#"{"x":1}"#)
+            .expect("append");
+        assert!(id >= 1);
+        assert_eq!(db.replication_outbox_len().expect("count"), 1);
     }
 }

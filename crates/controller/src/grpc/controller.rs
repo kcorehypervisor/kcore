@@ -4,7 +4,7 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use crate::auth::{self, CN_KCTL, CN_NODE_PREFIX};
-use crate::config::NetworkConfig;
+use crate::config::{NetworkConfig, ReplicationConfig};
 use crate::controller_proto;
 use crate::db::{Database, NetworkRow, NodeRow, VmRow};
 use crate::node_proto;
@@ -51,6 +51,7 @@ pub struct ControllerService {
     clients: NodeClients,
     default_network: NetworkConfig,
     sub_ca: Arc<Mutex<SubCaState>>,
+    replication: Option<ReplicationConfig>,
     tls_paths: Option<TlsPaths>,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
@@ -62,12 +63,14 @@ impl ControllerService {
         clients: NodeClients,
         default_network: NetworkConfig,
         sub_ca: Arc<Mutex<SubCaState>>,
+        replication: Option<ReplicationConfig>,
     ) -> Self {
         Self {
             db,
             clients,
             default_network,
             sub_ca,
+            replication,
             tls_paths: None,
             #[cfg(test)]
             test_push_hook: None,
@@ -84,6 +87,7 @@ impl ControllerService {
         db: Database,
         clients: NodeClients,
         default_network: NetworkConfig,
+        replication: Option<ReplicationConfig>,
         hook: PushHook,
     ) -> Self {
         Self {
@@ -91,6 +95,7 @@ impl ControllerService {
             clients,
             default_network,
             sub_ca: Arc::new(Mutex::new(SubCaState::default())),
+            replication,
             tls_paths: None,
             test_push_hook: Some(hook),
         }
@@ -310,6 +315,42 @@ impl ControllerService {
             .get_compute(address)
             .ok_or_else(|| Status::unavailable(format!("no connection to node {address}")))
     }
+
+    fn log_replication_event(&self, event_type: &str, resource_key: &str, body: serde_json::Value) {
+        let Some(rep) = &self.replication else {
+            return;
+        };
+        let envelope = serde_json::json!({
+            "controllerId": rep.controller_id,
+            "dcId": rep.dc_id,
+            "eventType": event_type,
+            "resourceKey": resource_key,
+            "body": body,
+        });
+        let payload = match serde_json::to_vec(&envelope) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    event_type = %event_type,
+                    resource_key = %resource_key,
+                    "failed to serialize replication envelope"
+                );
+                return;
+            }
+        };
+        if let Err(e) = self
+            .db
+            .append_replication_outbox(event_type, resource_key, &payload)
+        {
+            warn!(
+                error = %e,
+                event_type = %event_type,
+                resource_key = %resource_key,
+                "failed to append replication_outbox row"
+            );
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -362,6 +403,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .upsert_node_labels(&req.node_id, &req.labels)
                 .map_err(|e| Status::internal(format!("storing labels: {e}")))?;
         }
+
+        self.log_replication_event(
+            "node.register",
+            &format!("node/{}", req.node_id),
+            serde_json::json!({
+                "nodeId": req.node_id,
+                "hostname": req.hostname,
+                "address": req.address,
+                "approvalStatus": approval_status,
+                "labels": req.labels,
+            }),
+        );
 
         if approval_status == "approved" {
             if let Err(e) = self.clients.connect(&req.address).await {
@@ -708,6 +761,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 push_err.message()
             )));
         }
+
+        self.log_replication_event(
+            "vm.create",
+            &format!("vm/{vm_id}"),
+            serde_json::json!({
+                "vmId": vm_id,
+                "nodeId": node.id,
+                "name": vm.name,
+            }),
+        );
 
         Ok(Response::new(controller_proto::CreateVmResponse {
             vm_id,
@@ -1956,6 +2019,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::config::ReplicationConfig;
 
     fn empty_sub_ca() -> Arc<Mutex<SubCaState>> {
         Arc::new(Mutex::new(SubCaState::default()))
@@ -2034,6 +2098,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2079,6 +2144,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2181,6 +2247,7 @@ mod tests {
             db,
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2227,6 +2294,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2279,6 +2347,7 @@ mod tests {
             db,
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2325,6 +2394,7 @@ mod tests {
             db,
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2395,6 +2465,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2452,6 +2523,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2497,6 +2569,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2532,6 +2605,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2600,6 +2674,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2637,6 +2712,7 @@ mod tests {
             db.clone(),
             NodeClients::new(None),
             test_network(),
+            None,
             hook,
         );
 
@@ -2665,7 +2741,7 @@ mod tests {
     #[tokio::test]
     async fn new_node_registers_as_pending() {
         let db = Database::open(":memory:").expect("open db");
-        let svc = ControllerService::new(db.clone(), NodeClients::new(None), test_network(), empty_sub_ca());
+        let svc = ControllerService::new(db.clone(), NodeClients::new(None), test_network(), empty_sub_ca(), None);
 
         let resp =
             <ControllerService as controller_proto::controller_server::Controller>::register_node(
@@ -2697,13 +2773,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_node_appends_replication_outbox_when_configured() {
+        let db = Database::open(":memory:").expect("open db");
+        let replication = Some(ReplicationConfig {
+            controller_id: "ctrl-test".into(),
+            dc_id: "DC1".into(),
+            peers: vec![],
+        });
+        let svc = ControllerService::new(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            empty_sub_ca(),
+            replication,
+        );
+
+        <ControllerService as controller_proto::controller_server::Controller>::register_node(
+            &svc,
+            Request::new(controller_proto::RegisterNodeRequest {
+                node_id: "repl-node".to_string(),
+                hostname: "repl-node".to_string(),
+                address: "10.0.0.55:9091".to_string(),
+                capacity: Some(controller_proto::NodeCapacity {
+                    cpu_cores: 2,
+                    memory_bytes: 4_000_000_000,
+                }),
+                labels: vec!["role=test".to_string()],
+                storage_backend: 1,
+                disable_vxlan: false,
+                cert_expiry_days: 365,
+            }),
+        )
+        .await
+        .expect("register should succeed");
+
+        assert_eq!(db.replication_outbox_len().expect("count"), 1);
+    }
+
+    #[tokio::test]
     async fn approved_node_re_registers_as_approved() {
         let db = Database::open(":memory:").expect("open db");
         let mut node = test_node();
         node.approval_status = "approved".to_string();
         db.upsert_node(&node).expect("insert");
 
-        let svc = ControllerService::new(db.clone(), NodeClients::new(None), test_network(), empty_sub_ca());
+        let svc = ControllerService::new(db.clone(), NodeClients::new(None), test_network(), empty_sub_ca(), None);
 
         let resp =
             <ControllerService as controller_proto::controller_server::Controller>::register_node(
@@ -2742,7 +2856,7 @@ mod tests {
         node.status = "pending".to_string();
         db.upsert_node(&node).expect("insert");
 
-        let svc = ControllerService::new(db.clone(), NodeClients::new(None), test_network(), empty_sub_ca());
+        let svc = ControllerService::new(db.clone(), NodeClients::new(None), test_network(), empty_sub_ca(), None);
 
         let resp =
             <ControllerService as controller_proto::controller_server::Controller>::approve_node(
@@ -2770,7 +2884,7 @@ mod tests {
         node.status = "pending".to_string();
         db.upsert_node(&node).expect("insert");
 
-        let svc = ControllerService::new(db.clone(), NodeClients::new(None), test_network(), empty_sub_ca());
+        let svc = ControllerService::new(db.clone(), NodeClients::new(None), test_network(), empty_sub_ca(), None);
 
         let resp =
             <ControllerService as controller_proto::controller_server::Controller>::reject_node(
@@ -2864,6 +2978,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             test_sub_ca_state(),
+            None,
         );
 
         let resp =
@@ -2896,6 +3011,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             test_sub_ca_state(),
+            None,
         );
 
         let err =
@@ -2922,6 +3038,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             empty_sub_ca(),
+            None,
         );
 
         let err =
@@ -2947,6 +3064,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             sub_ca.clone(),
+            None,
         );
 
         let new_state = test_sub_ca_state();
@@ -2982,6 +3100,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             empty_sub_ca(),
+            None,
         );
 
         let err =

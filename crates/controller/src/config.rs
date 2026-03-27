@@ -11,6 +11,24 @@ pub struct Config {
     pub db_path: String,
     pub tls: Option<TlsConfig>,
     pub default_network: NetworkConfig,
+    /// When set, mutating RPCs append JSON envelopes to `replication_outbox` for future peer sync.
+    #[serde(default)]
+    pub replication: Option<ReplicationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationConfig {
+    #[serde(default)]
+    pub controller_id: String,
+    #[serde(default = "default_dc_id")]
+    pub dc_id: String,
+    #[serde(default)]
+    pub peers: Vec<String>,
+}
+
+fn default_dc_id() -> String {
+    "DC1".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +136,34 @@ defaultNetwork:
         assert_eq!(cfg.listen_addr, "0.0.0.0:9090");
         assert_eq!(cfg.db_path, "/var/lib/kcore/controller.db");
         assert_eq!(cfg.default_network.internal_netmask, "255.255.255.0");
+        assert!(cfg.replication.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_parses_replication_section() {
+        let path = temp_config_path("repl");
+        std::fs::write(
+            &path,
+            r#"
+defaultNetwork:
+  gatewayInterface: eno1
+  externalIp: 203.0.113.10
+  gatewayIp: 10.0.0.1
+replication:
+  controllerId: ctrl-a
+  dcId: DC2
+  peers:
+    - 10.0.0.11:9090
+"#,
+        )
+        .expect("write config");
+
+        let cfg = Config::load(path.to_str().expect("path str")).expect("load config");
+        let rep = cfg.replication.expect("replication");
+        assert_eq!(rep.controller_id, "ctrl-a");
+        assert_eq!(rep.dc_id, "DC2");
+        assert_eq!(rep.peers, vec!["10.0.0.11:9090"]);
         let _ = std::fs::remove_file(path);
     }
 
