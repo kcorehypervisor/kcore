@@ -65,6 +65,16 @@ pub struct NetworkRow {
     pub next_ip: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplicationOutboxRow {
+    pub id: i64,
+    #[allow(dead_code)]
+    pub created_at: String,
+    pub event_type: String,
+    pub resource_key: String,
+    pub payload: Vec<u8>,
+}
+
 impl Database {
     pub fn open(path: &str) -> Result<Self> {
         if let Some(parent) = std::path::Path::new(path).parent() {
@@ -313,7 +323,17 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 11;
+        if version < 12 {
+            let _ = conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS replication_ack (
+                    peer_id TEXT PRIMARY KEY,
+                    last_event_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
+            );
+        }
+
+        const CURRENT_VERSION: i32 = 12;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -351,6 +371,61 @@ impl Database {
             [],
             |row| row.get(0),
         )
+    }
+
+    pub fn list_replication_outbox_since(
+        &self,
+        min_id_exclusive: i64,
+        limit: i64,
+    ) -> Result<Vec<ReplicationOutboxRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at, event_type, resource_key, payload
+             FROM replication_outbox
+             WHERE id > ?1
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![min_id_exclusive, limit], |row| {
+            Ok(ReplicationOutboxRow {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                event_type: row.get(2)?,
+                resource_key: row.get(3)?,
+                payload: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn upsert_replication_ack(
+        &self,
+        peer_id: &str,
+        last_event_id: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO replication_ack (peer_id, last_event_id, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(peer_id) DO UPDATE SET
+                last_event_id=excluded.last_event_id,
+                updated_at=datetime('now')",
+            params![peer_id, last_event_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_replication_ack(&self, peer_id: &str) -> Result<Option<i64>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        match conn.query_row(
+            "SELECT last_event_id FROM replication_ack WHERE peer_id = ?1",
+            params![peer_id],
+            |row| row.get(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn upsert_node(&self, node: &NodeRow) -> Result<(), rusqlite::Error> {
@@ -1306,5 +1381,40 @@ mod tests {
             .expect("append");
         assert!(id >= 1);
         assert_eq!(db.replication_outbox_len().expect("count"), 1);
+    }
+
+    #[test]
+    fn replication_outbox_list_since_orders_and_limits() {
+        let db = Database::open(":memory:").expect("open db");
+        let id1 = db
+            .append_replication_outbox("node.register", "node/n1", br#"{"seq":1}"#)
+            .expect("append 1");
+        let _id2 = db
+            .append_replication_outbox("vm.create", "vm/v1", br#"{"seq":2}"#)
+            .expect("append 2");
+
+        let rows = db
+            .list_replication_outbox_since(id1, 10)
+            .expect("list since id1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "vm.create");
+        assert_eq!(rows[0].resource_key, "vm/v1");
+        assert_eq!(rows[0].payload, br#"{"seq":2}"#);
+
+        let all = db.list_replication_outbox_since(0, 1).expect("list limited");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, id1);
+    }
+
+    #[test]
+    fn replication_ack_upsert_and_read() {
+        let db = Database::open(":memory:").expect("open db");
+        assert_eq!(db.get_replication_ack("peer-a").expect("get"), None);
+
+        db.upsert_replication_ack("peer-a", 42).expect("upsert first");
+        assert_eq!(db.get_replication_ack("peer-a").expect("get"), Some(42));
+
+        db.upsert_replication_ack("peer-a", 105).expect("upsert second");
+        assert_eq!(db.get_replication_ack("peer-a").expect("get"), Some(105));
     }
 }
