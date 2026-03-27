@@ -16,6 +16,7 @@ pub fn spawn_replication_pollers(
     db: Database,
     replication: Option<ReplicationConfig>,
     tls: Option<TlsConfig>,
+    listen_addr: &str,
 ) {
     let Some(replication) = replication else {
         return;
@@ -34,6 +35,10 @@ pub fn spawn_replication_pollers(
     for peer in replication.peers {
         let peer = peer.trim().to_string();
         if peer.is_empty() {
+            continue;
+        }
+        if same_endpoint(listen_addr, &peer) {
+            info!(peer = %peer, "skipping replication peer that resolves to local controller");
             continue;
         }
         let db = db.clone();
@@ -156,5 +161,41 @@ fn normalize_endpoint(endpoint: &str, use_tls: bool) -> String {
         format!("https://{endpoint}")
     } else {
         format!("http://{endpoint}")
+    }
+}
+
+fn endpoint_host_port(endpoint: &str) -> &str {
+    if endpoint.len() >= 7 && endpoint[..7].eq_ignore_ascii_case("http://") {
+        &endpoint[7..]
+    } else if endpoint.len() >= 8 && endpoint[..8].eq_ignore_ascii_case("https://") {
+        &endpoint[8..]
+    } else {
+        endpoint
+    }
+}
+
+fn same_endpoint(a: &str, b: &str) -> bool {
+    endpoint_host_port(a).eq_ignore_ascii_case(endpoint_host_port(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_endpoint_adds_scheme() {
+        assert_eq!(normalize_endpoint("10.0.0.10:9090", true), "https://10.0.0.10:9090");
+        assert_eq!(normalize_endpoint("10.0.0.10:9090", false), "http://10.0.0.10:9090");
+        assert_eq!(
+            normalize_endpoint("https://10.0.0.10:9090", true),
+            "https://10.0.0.10:9090"
+        );
+    }
+
+    #[test]
+    fn same_endpoint_ignores_scheme() {
+        assert!(same_endpoint("10.0.0.10:9090", "https://10.0.0.10:9090"));
+        assert!(same_endpoint("HTTP://10.0.0.10:9090", "10.0.0.10:9090"));
+        assert!(!same_endpoint("10.0.0.10:9090", "10.0.0.11:9090"));
     }
 }

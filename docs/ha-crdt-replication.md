@@ -254,6 +254,10 @@ Status (incremental):
 - Per-peer periodic sync with backoff, snapshot fallback, and metrics.
 - Add integrity repair checks (missing references, tombstone consistency).
 
+Status (incremental):
+
+- Controller now starts per-peer background pollers when `replication.peers` is configured. Pollers use `GetReplicationEvents` and `AckReplicationEvents`, maintain a local pull frontier, and skip self-referential peer endpoints.
+
 ### Phase 4: conflict UX and operator tools
 
 - Add `kctl get conflicts` and `kctl resolve conflict` commands.

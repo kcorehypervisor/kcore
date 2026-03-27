@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         database.clone(),
         cfg.replication.clone(),
         cfg.tls.clone(),
+        &cfg.listen_addr,
     );
 
     let staleness_db = database.clone();
