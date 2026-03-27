@@ -128,7 +128,7 @@ pub async fn install(
     info: &ConnectionInfo,
     os_disk: &str,
     data_disks: Vec<String>,
-    join_controller: Option<&str>,
+    join_controllers: &[String],
     run_controller: bool,
     data_disk_mode: &str,
     storage_backend: Option<&str>,
@@ -140,7 +140,11 @@ pub async fn install(
     disable_vxlan: bool,
     dc_id: &str,
 ) -> Result<()> {
-    let join_controller = validate_install_controller_mode(join_controller, run_controller)?;
+    let join_controllers = validate_install_controller_mode(join_controllers, run_controller)?;
+    let primary_controller = join_controllers
+        .first()
+        .cloned()
+        .unwrap_or_default();
 
     let node_host =
         pki::host_from_address(&info.address).map_err(|e| anyhow::anyhow!("node address: {e}"))?;
@@ -158,7 +162,8 @@ pub async fn install(
         .install_to_disk(node_proto::InstallToDiskRequest {
             os_disk: os_disk.to_string(),
             data_disks,
-            controller: join_controller.to_string(),
+            controller: primary_controller,
+            controllers: join_controllers,
             run_controller,
             ca_cert_pem: install_pki.ca_cert_pem,
             node_cert_pem: install_pki.node_cert_pem,
@@ -190,15 +195,19 @@ pub async fn install(
 }
 
 fn validate_install_controller_mode(
-    join_controller: Option<&str>,
+    join_controllers: &[String],
     run_controller: bool,
-) -> Result<String> {
-    let join = join_controller.map(str::trim).unwrap_or("");
-    let has_join = !join.is_empty();
+) -> Result<Vec<String>> {
+    let normalized: Vec<String> = join_controllers
+        .iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let has_join = !normalized.is_empty();
     if has_join == run_controller {
         anyhow::bail!("provide exactly one of --join-controller <host:port> or --run-controller");
     }
-    Ok(join.to_string())
+    Ok(normalized)
 }
 
 fn storage_backend_to_proto(value: &str) -> i32 {
@@ -361,7 +370,7 @@ mod tests {
 
     #[test]
     fn validate_install_mode_rejects_neither() {
-        let err = validate_install_controller_mode(None, false).expect_err("should fail");
+        let err = validate_install_controller_mode(&[], false).expect_err("should fail");
         assert!(err
             .to_string()
             .contains("provide exactly one of --join-controller"));
@@ -369,7 +378,7 @@ mod tests {
 
     #[test]
     fn validate_install_mode_rejects_both() {
-        let err = validate_install_controller_mode(Some("192.168.1.10:9090"), true)
+        let err = validate_install_controller_mode(&["192.168.1.10:9090".to_string()], true)
             .expect_err("should fail");
         assert!(err
             .to_string()
@@ -378,14 +387,14 @@ mod tests {
 
     #[test]
     fn validate_install_mode_accepts_join_only() {
-        let join = validate_install_controller_mode(Some(" 192.168.1.10:9090 "), false)
+        let join = validate_install_controller_mode(&[" 192.168.1.10:9090 ".to_string()], false)
             .expect("should pass");
-        assert_eq!(join, "192.168.1.10:9090");
+        assert_eq!(join, vec!["192.168.1.10:9090"]);
     }
 
     #[test]
     fn validate_install_mode_accepts_run_controller_only() {
-        let join = validate_install_controller_mode(None, true).expect("should pass");
+        let join = validate_install_controller_mode(&[], true).expect("should pass");
         assert!(join.is_empty());
     }
 

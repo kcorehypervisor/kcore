@@ -161,9 +161,13 @@ Install with VXLAN disabled (simple networking only):
 kctl --node 10.0.0.21:9091 node install \
   --os-disk /dev/sda \
   --join-controller 10.0.0.10:9090 \
+  --join-controller 10.0.0.11:9090 \
+  --dc-id DC1 \
   --storage-backend filesystem \
   --disable-vxlan
 ```
+
+`--join-controller` is repeatable; the first endpoint is treated as primary and the rest are stored in node-agent config for fallback order.
 
 Apply Nix to a node:
 
