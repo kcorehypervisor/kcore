@@ -130,6 +130,11 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Resolve resources requiring operator action
+    Resolve {
+        #[command(subcommand)]
+        resource: ResolveResource,
+    },
     /// Show version
     Version,
 }
@@ -373,6 +378,21 @@ enum GetResource {
     /// Show compliance report
     #[command(alias = "compliance")]
     ComplianceReport,
+    /// List unresolved replication conflicts
+    Conflicts {
+        /// Max conflicts to return
+        #[arg(long, default_value_t = 100)]
+        limit: i32,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResolveResource {
+    /// Resolve a replication conflict by ID
+    Conflict {
+        /// Conflict ID (from `kctl get conflicts`)
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -740,6 +760,12 @@ async fn main() {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::compliance::report(&info).await
         }
+        Command::Get {
+            resource: GetResource::Conflicts { limit },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::conflict::list(&info, *limit).await
+        }
 
         Command::Node {
             action: NodeAction::Approve { node_id },
@@ -943,6 +969,13 @@ async fn main() {
         Command::Apply { file, dry_run } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::apply::apply(&info, file, *dry_run).await
+        }
+
+        Command::Resolve {
+            resource: ResolveResource::Conflict { id },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::conflict::resolve(&info, *id).await
         }
 
         Command::Version => {

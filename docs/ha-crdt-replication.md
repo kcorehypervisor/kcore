@@ -272,6 +272,7 @@ Status (incremental):
 Status (incremental):
 
 - ControllerAdmin now exposes conflict APIs: `ListReplicationConflicts(limit)` and `ResolveReplicationConflict(id)` backed by `replication_conflicts`.
+- `kctl` now exposes matching operator commands: `kctl get conflicts [--limit N]` and `kctl resolve conflict <id>`.
 
 ### Phase 5: TLA+ validation gates
 

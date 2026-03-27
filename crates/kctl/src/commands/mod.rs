@@ -2,6 +2,7 @@ pub mod apply;
 pub mod certs;
 pub mod cluster;
 pub mod compliance;
+pub mod conflict;
 pub mod image;
 pub mod network;
 pub mod node;
