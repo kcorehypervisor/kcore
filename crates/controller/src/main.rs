@@ -123,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
             clients.clone(),
             cfg.default_network.clone(),
             sub_ca.clone(),
+            cfg.replication.clone(),
         );
         if let Some(tls) = cfg.tls.as_ref() {
             svc = svc.with_tls_paths(grpc::TlsPaths {
