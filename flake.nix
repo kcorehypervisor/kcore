@@ -35,7 +35,8 @@
           src = ./.;
           filter = path: type:
             (craneLib.filterCargoSources path type)
-            || pkgs.lib.hasPrefix "${toString ./.}/proto/" (toString path);
+            || pkgs.lib.hasPrefix "${toString ./.}/proto/" (toString path)
+            || pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/assets/" (toString path);
         };
 
         commonArgs = {
@@ -68,14 +69,21 @@
             pname = "kcore-kctl";
             cargoExtraArgs = "-p kcore-kctl";
           });
+
+        kcore-dashboard = craneLib.buildPackage (commonArgs
+          // {
+            inherit cargoArtifacts;
+            pname = "kcore-dashboard";
+            cargoExtraArgs = "-p kcore-dashboard";
+          });
       in {
         packages = {
           default = kcore-node-agent;
-          inherit kcore-node-agent kcore-controller kcore-kctl;
+          inherit kcore-node-agent kcore-controller kcore-kctl kcore-dashboard;
         };
 
         checks = {
-          inherit kcore-node-agent kcore-controller kcore-kctl;
+          inherit kcore-node-agent kcore-controller kcore-kctl kcore-dashboard;
           clippy = craneLib.cargoClippy (commonArgs
             // {
               inherit cargoArtifacts;
@@ -110,10 +118,12 @@
       flake = let
         kcoreVersion = builtins.replaceStrings ["\n"] [""] (builtins.readFile ./VERSION);
         chVmModule = ./modules/ch-vm;
+        dashboardModule = ./modules/kcore-dashboard.nix;
       in {
         nixosModules = {
           ch-vm = chVmModule;
           default = chVmModule;
+          kcore-dashboard = dashboardModule;
         };
 
         nixosConfigurations.kcore-iso = inputs.nixpkgs.lib.nixosSystem {
