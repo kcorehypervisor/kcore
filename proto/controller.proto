@@ -329,6 +329,36 @@ service ControllerAdmin {
   // ApplyNixConfig replaces the controller's /etc/nixos/configuration.nix with
   // the provided content and (optionally) triggers a nixos-rebuild.
   rpc ApplyNixConfig(ApplyNixConfigRequest) returns (ApplyNixConfigResponse);
+  // Returns a page of replication outbox events after the provided cursor.
+  rpc GetReplicationEvents(GetReplicationEventsRequest) returns (GetReplicationEventsResponse);
+  // Stores peer replication acknowledgement frontier.
+  rpc AckReplicationEvents(AckReplicationEventsRequest) returns (AckReplicationEventsResponse);
+}
+
+message GetReplicationEventsRequest {
+  int64 after_event_id = 1; // Exclusive cursor; 0 means from start.
+  int32 limit = 2; // Max rows to return; defaults server-side when <= 0.
+}
+
+message ReplicationEvent {
+  int64 event_id = 1;
+  string created_at = 2;
+  string event_type = 3;
+  string resource_key = 4;
+  bytes payload = 5;
+}
+
+message GetReplicationEventsResponse {
+  repeated ReplicationEvent events = 1;
+}
+
+message AckReplicationEventsRequest {
+  string peer_id = 1;
+  int64 last_event_id = 2;
+}
+
+message AckReplicationEventsResponse {
+  bool success = 1;
 }
 
 // SSH Key Management
