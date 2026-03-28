@@ -302,3 +302,4 @@ Status (incremental):
 - Preflight capacity/readiness failures now include deterministic scheduling hints (up to three alternative compatible nodes), reducing operator trial-and-error.
 - Reservation failures are now classified as retryable vs non-retryable with a bounded retry budget (`retry_exhausted` terminal reservation status), and status metrics expose the split.
 - A background reservation retry executor now re-checks `failed_retryable` rows (with cooldown) and auto-promotes them to `reserved` when nodes recover, or auto-escalates to `retry_exhausted`.
+- VM create now auto-falls back to a compatible alternative node when an explicit `target_node` fails storage/preflight checks, reducing manual retry loops.

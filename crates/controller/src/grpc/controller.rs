@@ -278,27 +278,21 @@ impl ControllerService {
         spec: &controller_proto::VmSpec,
         requested_storage_backend: &str,
     ) -> Result<(), Status> {
-        let alternative_nodes = self
-            .db
-            .list_nodes()
-            .ok()
-            .unwrap_or_default()
+        let alternative_nodes = self.alternative_vm_create_nodes(
+            &node.id,
+            requested_storage_backend,
+            spec.cpu,
+            spec.memory_bytes,
+        );
+        let alternative_ids = alternative_nodes
             .into_iter()
-            .filter(|n| {
-                n.id != node.id
-                    && n.storage_backend == requested_storage_backend
-                    && n.approval_status == "approved"
-                    && n.status == "ready"
-                    && (n.cpu_cores - n.cpu_used) >= spec.cpu
-                    && (n.memory_bytes - n.memory_used) >= spec.memory_bytes
-            })
             .map(|n| n.id)
             .take(3)
             .collect::<Vec<_>>();
-        let hint = if alternative_nodes.is_empty() {
+        let hint = if alternative_ids.is_empty() {
             String::new()
         } else {
-            format!("; try target_node one of: {}", alternative_nodes.join(", "))
+            format!("; try target_node one of: {}", alternative_ids.join(", "))
         };
 
         if node.approval_status != "approved" {
@@ -323,6 +317,29 @@ impl ControllerService {
             )));
         }
         Ok(())
+    }
+
+    fn alternative_vm_create_nodes(
+        &self,
+        exclude_node_id: &str,
+        requested_storage_backend: &str,
+        cpu: i32,
+        memory_bytes: i64,
+    ) -> Vec<NodeRow> {
+        self.db
+            .list_nodes()
+            .ok()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| {
+                n.id != exclude_node_id
+                    && n.storage_backend == requested_storage_backend
+                    && n.approval_status == "approved"
+                    && n.status == "ready"
+                    && (n.cpu_cores - n.cpu_used) >= cpu
+                    && (n.memory_bytes - n.memory_used) >= memory_bytes
+            })
+            .collect()
     }
 
     async fn set_vm_desired_state_internal(
@@ -598,7 +615,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let requested_storage_backend = normalize_storage_backend(req.storage_backend, true)?;
         let requested_storage_size_bytes = validate_storage_size_bytes(req.storage_size_bytes)?;
 
-        let node = if !req.target_node.is_empty() {
+        let target_node_requested = !req.target_node.is_empty();
+        let mut node = if target_node_requested {
             self.db
                 .get_node_by_address(&req.target_node)
                 .map_err(|e| Status::internal(e.to_string()))?
@@ -621,7 +639,42 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     )
                 })?
         };
-        if node.storage_backend != requested_storage_backend {
+        if target_node_requested {
+            let preflight_error = if node.storage_backend != requested_storage_backend {
+                Some(Status::failed_precondition(format!(
+                    "VM storage backend '{}' does not match node '{}' backend '{}'",
+                    requested_storage_backend, node.id, node.storage_backend
+                )))
+            } else {
+                self.preflight_vm_create_on_node(&node, &spec, &requested_storage_backend)
+                    .err()
+            };
+            if let Some(err) = preflight_error {
+                if let Some(fallback) = scheduler::select_node_for_vm(
+                    &self.alternative_vm_create_nodes(
+                        &node.id,
+                        &requested_storage_backend,
+                        spec.cpu,
+                        spec.memory_bytes,
+                    ),
+                    spec.cpu,
+                    spec.memory_bytes,
+                )
+                .cloned()
+                {
+                    warn!(
+                        vm_name = %spec.name,
+                        requested_node = %node.id,
+                        fallback_node = %fallback.id,
+                        reason = %err.message(),
+                        "target node failed preflight; auto-falling back to alternative node"
+                    );
+                    node = fallback;
+                } else {
+                    return Err(err);
+                }
+            }
+        } else if node.storage_backend != requested_storage_backend {
             return Err(Status::failed_precondition(format!(
                 "VM storage backend '{}' does not match node '{}' backend '{}'",
                 requested_storage_backend, node.id, node.storage_backend
@@ -2644,6 +2697,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_vm_storage_backend_mismatch_auto_falls_back_when_possible() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut wrong_node = test_node();
+        wrong_node.id = "node-fs".to_string();
+        wrong_node.storage_backend = "fs".to_string();
+        db.upsert_node(&wrong_node).expect("insert wrong node");
+
+        let mut candidate = test_node();
+        candidate.id = "node-zfs".to_string();
+        candidate.address = "127.0.0.2:9091".to_string();
+        candidate.storage_backend = "zfs".to_string();
+        db.upsert_node(&candidate).expect("insert candidate");
+
+        let hook: PushHook = Arc::new(|_n: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db,
+            NodeClients::new(None),
+            test_network(),
+            None,
+            hook,
+        );
+
+        let req = controller_proto::CreateVmRequest {
+            target_node: wrong_node.id.clone(),
+            spec: Some(controller_proto::VmSpec {
+                id: String::new(),
+                name: "vm-zfs-fallback".to_string(),
+                cpu: 1,
+                memory_bytes: 512 * 1024 * 1024,
+                disks: vec![],
+                nics: vec![],
+            }),
+            image_url: String::new(),
+            image_sha256: String::new(),
+            cloud_init_user_data: String::new(),
+            image_path: "/var/lib/kcore/images/base.raw".to_string(),
+            image_format: "raw".to_string(),
+            ssh_key_names: vec![],
+            storage_backend: controller_proto::StorageBackendType::Zfs as i32,
+            storage_size_bytes: 8 * 1024 * 1024 * 1024,
+        };
+
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::create_vm(
+                &svc,
+                Request::new(req),
+            )
+            .await
+            .expect("fallback should choose compatible node")
+            .into_inner();
+        assert_eq!(resp.node_id, "node-zfs");
+    }
+
+    #[tokio::test]
     async fn create_vm_rejects_target_node_without_capacity_in_preflight() {
         let db = Database::open(":memory:").expect("open db");
         let mut node = test_node();
@@ -2692,7 +2799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_vm_preflight_suggests_alternative_node() {
+    async fn create_vm_preflight_auto_falls_back_to_alternative_node() {
         let db = Database::open(":memory:").expect("open db");
         let mut overloaded = test_node();
         overloaded.id = "node-overloaded".to_string();
@@ -2734,15 +2841,15 @@ mod tests {
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
         };
 
-        let err =
+        let resp =
             <ControllerService as controller_proto::controller_server::Controller>::create_vm(
                 &svc,
                 Request::new(req),
             )
             .await
-            .expect_err("preflight should fail and suggest alternative");
-        assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert!(err.message().contains("try target_node one of: node-candidate"));
+            .expect("preflight should auto-fallback to alternative")
+            .into_inner();
+        assert_eq!(resp.node_id, "node-candidate");
     }
 
     #[tokio::test]
