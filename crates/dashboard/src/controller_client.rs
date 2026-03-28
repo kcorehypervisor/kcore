@@ -100,6 +100,18 @@ pub async fn get_network_overview(
     Ok(resp.into_inner())
 }
 
+pub async fn get_replication_status(
+    cfg: &DashboardConfig,
+) -> Result<controller_proto::GetReplicationStatusResponse> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_admin_client::ControllerAdminClient::new(channel);
+    let resp = client
+        .get_replication_status(controller_proto::GetReplicationStatusRequest {})
+        .await
+        .context("GetReplicationStatus RPC")?;
+    Ok(resp.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

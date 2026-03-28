@@ -1,7 +1,10 @@
-use crate::api::{get_compliance_dto, get_network_overview_dto, list_networks_dto, list_vms_page};
+use crate::api::{
+    get_compliance_dto, get_network_overview_dto, get_replication_status_dto, list_networks_dto,
+    list_vms_page,
+};
 use crate::dto::{
     ComplianceDto, HostInterfaceDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
-    NodeSummaryDto, VmRowDto, VmsPageDto,
+    NodeSummaryDto, ReplicationStatusDto, VmRowDto, VmsPageDto,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};
@@ -101,6 +104,7 @@ fn HomePage() -> impl IntoView {
 #[component]
 fn CompliancePage() -> impl IntoView {
     let res = Resource::new(|| (), |_| get_compliance_dto());
+    let replication_res = Resource::new(|| (), |_| get_replication_status_dto());
     view! {
         <section class="hero">
             <h1>"Compliance report"</h1>
@@ -114,6 +118,46 @@ fn CompliancePage() -> impl IntoView {
                 }
             })}
         </Suspense>
+        <section class="card" style="margin-top: 1rem;">
+            <h2>"Replication resilience"</h2>
+            <Suspense fallback=move || view! { <p class="muted">"Loading replication status…"</p> }>
+                {move || Suspend::new(async move {
+                    match replication_res.await {
+                        Ok(data) => replication_status_view(data).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })}
+            </Suspense>
+        </section>
+    }
+}
+
+fn replication_status_view(data: ReplicationStatusDto) -> impl IntoView {
+    let health = if data.zero_manual_slo_healthy {
+        "healthy"
+    } else {
+        "violations"
+    };
+    view! {
+        <div>
+            <div class="stat-row" style="margin-bottom: 0.75rem;">
+                <div class="stat"><div class="label">"SLO"</div><div class="value">{health}</div></div>
+                <div class="stat"><div class="label">"Conflicts"</div><div class="value">{data.unresolved_conflicts}</div></div>
+                <div class="stat"><div class="label">"Comp. pending"</div><div class="value">{data.pending_compensation_jobs}</div></div>
+                <div class="stat"><div class="label">"Materialization"</div><div class="value">{data.materialization_backlog}</div></div>
+            </div>
+            <dl class="kv">
+                <dt>"Reservation failures"</dt><dd>{data.failed_reservations}</dd>
+                <dt>"Retryable"</dt><dd>{data.failed_retryable_reservations}</dd>
+                <dt>"Non-retryable"</dt><dd>{data.failed_non_retryable_reservations}</dd>
+                <dt>"Retry exhausted"</dt><dd>{data.retry_exhausted_reservations}</dd>
+            </dl>
+            <Show when=move || !data.zero_manual_slo_healthy>
+                <p class="muted" style="margin-top: 0.75rem;">
+                    {format!("Violations: {}", data.zero_manual_slo_violations.join(", "))}
+                </p>
+            </Show>
+        </div>
     }
 }
 

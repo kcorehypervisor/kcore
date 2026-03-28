@@ -304,3 +304,4 @@ Status (incremental):
 - A background reservation retry executor now re-checks `failed_retryable` rows (with cooldown) and auto-promotes them to `reserved` when nodes recover, or auto-escalates to `retry_exhausted`.
 - VM create now auto-falls back to a compatible alternative node when an explicit `target_node` fails storage/preflight checks, reducing manual retry loops.
 - Replication status now reports `retry_exhausted_reservations` explicitly, separating bounded-retry terminals from in-progress retryable failures.
+- Dashboard compliance view now shows replication resilience/SLO counters (including retry-exhausted reservations) using the admin replication-status RPC.

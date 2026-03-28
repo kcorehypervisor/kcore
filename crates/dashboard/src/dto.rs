@@ -106,3 +106,17 @@ pub struct NetworkOverviewDto {
     pub default_internal_netmask: String,
     pub nodes: Vec<NodeNetworkDto>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationStatusDto {
+    pub unresolved_conflicts: i64,
+    pub pending_compensation_jobs: i64,
+    pub failed_compensation_jobs: i64,
+    pub materialization_backlog: i64,
+    pub failed_reservations: i64,
+    pub failed_retryable_reservations: i64,
+    pub failed_non_retryable_reservations: i64,
+    pub retry_exhausted_reservations: i64,
+    pub zero_manual_slo_healthy: bool,
+    pub zero_manual_slo_violations: Vec<String>,
+}

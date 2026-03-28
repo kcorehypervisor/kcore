@@ -3,7 +3,7 @@
 use crate::controller_client::controller_proto;
 use crate::dto::{
     AccessControlEntryDto, ComplianceDto, HostInterfaceDto, NetworkOverviewDto, NetworkRowDto,
-    NodeNetworkDto, NodeSummaryDto, VmRowDto, VmsPageDto,
+    NodeNetworkDto, NodeSummaryDto, ReplicationStatusDto, VmRowDto, VmsPageDto,
 };
 use crate::format::{self, paginate_by_name, VM_PAGE_SIZE};
 
@@ -161,6 +161,23 @@ pub fn networks_from_proto(nets: Vec<controller_proto::NetworkInfo>) -> Vec<Netw
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
+}
+
+pub fn replication_status_from_proto(
+    r: controller_proto::GetReplicationStatusResponse,
+) -> ReplicationStatusDto {
+    ReplicationStatusDto {
+        unresolved_conflicts: r.unresolved_conflicts,
+        pending_compensation_jobs: r.pending_compensation_jobs,
+        failed_compensation_jobs: r.failed_compensation_jobs,
+        materialization_backlog: r.materialization_backlog,
+        failed_reservations: r.failed_reservations,
+        failed_retryable_reservations: r.failed_retryable_reservations,
+        failed_non_retryable_reservations: r.failed_non_retryable_reservations,
+        retry_exhausted_reservations: r.retry_exhausted_reservations,
+        zero_manual_slo_healthy: r.zero_manual_slo_healthy,
+        zero_manual_slo_violations: r.zero_manual_slo_violations,
+    }
 }
 
 #[cfg(test)]
@@ -342,5 +359,31 @@ mod tests {
         assert_eq!(dto.nodes[0].interfaces.len(), 2);
         assert_eq!(dto.nodes[0].interfaces[0].kind, "physical");
         assert_eq!(dto.nodes[0].interfaces[1].kind, "bridge");
+    }
+
+    #[test]
+    fn replication_status_maps_fields() {
+        let r = controller_proto::GetReplicationStatusResponse {
+            outbox_head_event_id: 10,
+            outbox_size: 20,
+            outgoing: vec![],
+            incoming: vec![],
+            unresolved_conflicts: 1,
+            pending_compensation_jobs: 2,
+            failed_compensation_jobs: 3,
+            materialization_backlog: 4,
+            oldest_unresolved_conflict_age_seconds: 5,
+            failed_reservations: 6,
+            zero_manual_slo_healthy: false,
+            zero_manual_slo_violations: vec!["failed_reservations=6".into()],
+            failed_retryable_reservations: 7,
+            failed_non_retryable_reservations: 8,
+            retry_exhausted_reservations: 9,
+        };
+        let dto = replication_status_from_proto(r);
+        assert_eq!(dto.unresolved_conflicts, 1);
+        assert_eq!(dto.failed_retryable_reservations, 7);
+        assert_eq!(dto.retry_exhausted_reservations, 9);
+        assert!(!dto.zero_manual_slo_healthy);
     }
 }
