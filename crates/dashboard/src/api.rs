@@ -3,9 +3,10 @@
 use leptos::prelude::*;
 
 use crate::controller_client;
-use crate::dto::{ComplianceDto, NetworkOverviewDto, NetworkRowDto, VmsPageDto};
+use crate::dto::{ComplianceDto, NetworkOverviewDto, NetworkRowDto, ReplicationStatusDto, VmsPageDto};
 use crate::mappers::{
-    compliance_from_proto, network_overview_from_proto, networks_from_proto, vms_page_from_proto,
+    compliance_from_proto, network_overview_from_proto, networks_from_proto,
+    replication_status_from_proto, vms_page_from_proto,
 };
 use crate::state::dashboard_config;
 
@@ -45,4 +46,13 @@ pub async fn get_network_overview_dto() -> Result<NetworkOverviewDto, ServerFnEr
         .await
         .map_err(map_err)?;
     Ok(network_overview_from_proto(overview))
+}
+
+#[server(GetReplicationStatus, "/api")]
+pub async fn get_replication_status_dto() -> Result<ReplicationStatusDto, ServerFnError> {
+    let cfg = dashboard_config();
+    let status = controller_client::get_replication_status(cfg)
+        .await
+        .map_err(map_err)?;
+    Ok(replication_status_from_proto(status))
 }
