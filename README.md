@@ -7,6 +7,49 @@
 `kcore-rust` is a Rust control plane for declarative VM lifecycle management on NixOS hosts.
 It is organized as a multi-crate workspace with a controller, node agent, and CLI.
 
+## Licensing and editions
+
+kcore Community Edition is open source under the **Apache License 2.0** (see [`LICENSE`](LICENSE)). The core platform remains open and buildable from source. **Commercial use of that Apache-2.0 code is not restricted by us** beyond what the licence states.
+
+More detail: [docs/licensing.md](docs/licensing.md).
+
+## Commercial subscriptions
+
+Organizations that want the **official supported distribution** of kcore can purchase a subscription. Subscriptions provide access to **official signed ISO images**, the **stable production update channel**, **tested updates**, and **commercial support**.
+
+## Community Edition
+
+Community Edition is suitable for **contributors**, **labs**, **homelabs**, and **evaluation** environments. No subscription is required to build or run from source.
+
+## Production use
+
+For **production** environments, **kcore Standard** or **kcore Premium** is **recommended**.
+
+## Pricing
+
+- **Standard** — £295 / year / CPU socket  
+- **Premium** — £695 / year / CPU socket  
+
+Full tier definitions, support limits, and billing rules: **[PRICING.md](PRICING.md)**.
+
+## Pricing model
+
+Pricing is based on **physical CPU sockets**, not CPU cores. Each occupied CPU socket on each subscribed node requires a subscription. For production clusters, **all nodes should be subscribed at the same level** for repository consistency and support eligibility.
+
+## Licensing FAQ
+
+**Is kcore open source?**  
+Yes. The Community Edition core is under **Apache-2.0**.
+
+**Can I use kcore without a subscription?**  
+Yes. You can build and use Community Edition from source without a subscription. Subscriptions apply to the official supported distribution, stable production updates, signed ISOs, and support—not to permission to use the open-source core.
+
+**What does a subscription include?**  
+See [PRICING.md](PRICING.md). In short: the official supported distribution (signed ISOs, stable production channel, tested updates) and commercial support per tier.
+
+**How is pricing calculated?**  
+Per **physical CPU socket**, not per core (see [PRICING.md](PRICING.md)).
+
 ## Current Project State
 
 - Declarative VM lifecycle is implemented end-to-end (`create/delete/set desired state` -> controller DB -> generated Nix -> node apply).
