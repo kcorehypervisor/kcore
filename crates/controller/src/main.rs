@@ -12,6 +12,7 @@ mod db;
 mod grpc;
 mod nixgen;
 mod node_client;
+mod path_safety;
 mod replication;
 mod replication_policy;
 mod scheduler;

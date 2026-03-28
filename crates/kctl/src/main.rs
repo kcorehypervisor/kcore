@@ -4,6 +4,7 @@ mod client;
 mod commands;
 mod config;
 mod output;
+mod path_safety;
 mod pki;
 
 use std::path::PathBuf;
