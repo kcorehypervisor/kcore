@@ -55,6 +55,8 @@ The trace harness now also generates a fixture from a Rust replication unit test
 (`replication::tests::export_replication_trace_fixture`) before validating it.
 Trace rows include winner rank plus reservation/compensation branch signals:
 `reservation_status` and `compensation_status`.
+The generated fixture covers bounded reservation retry progression to
+`retry_exhausted` for drift checks.
 
 Sample fixture:
 

@@ -1124,6 +1124,9 @@ mod tests {
         };
 
         let db = Database::open(":memory:").expect("open db");
+        let mut retry_node = test_node("node-retry-trace");
+        retry_node.status = "not-ready".to_string();
+        db.upsert_node(&retry_node).expect("insert retry trace node");
         let events = vec![
             (
                 controller_proto::ReplicationEvent {
@@ -1174,6 +1177,36 @@ mod tests {
                     payload: br#"{"opId":"op-trace-r","controllerId":"ctrl-r","logicalTsUnixMs":1500,"eventType":"vm.create","resourceKey":"vm/v-trace-reservation","body":{"vmId":"v-trace-reservation","nodeId":"missing-node","name":"vtrace"}}"#.to_vec(),
                 },
                 80,
+            ),
+            (
+                controller_proto::ReplicationEvent {
+                    event_id: 6,
+                    created_at: "2026-01-01T00:00:03Z".to_string(),
+                    event_type: "vm.create".to_string(),
+                    resource_key: "vm/v-trace-retry".to_string(),
+                    payload: br#"{"opId":"op-trace-r1","controllerId":"ctrl-r","logicalTsUnixMs":1600,"eventType":"vm.create","resourceKey":"vm/v-trace-retry","body":{"vmId":"v-trace-retry","nodeId":"node-retry-trace","name":"vtrace-retry"}}"#.to_vec(),
+                },
+                70,
+            ),
+            (
+                controller_proto::ReplicationEvent {
+                    event_id: 7,
+                    created_at: "2026-01-01T00:00:03.500Z".to_string(),
+                    event_type: "vm.create".to_string(),
+                    resource_key: "vm/v-trace-retry".to_string(),
+                    payload: br#"{"opId":"op-trace-r2","controllerId":"ctrl-r","logicalTsUnixMs":1700,"eventType":"vm.create","resourceKey":"vm/v-trace-retry","body":{"vmId":"v-trace-retry","nodeId":"node-retry-trace","name":"vtrace-retry"}}"#.to_vec(),
+                },
+                60,
+            ),
+            (
+                controller_proto::ReplicationEvent {
+                    event_id: 8,
+                    created_at: "2026-01-01T00:00:04Z".to_string(),
+                    event_type: "vm.create".to_string(),
+                    resource_key: "vm/v-trace-retry".to_string(),
+                    payload: br#"{"opId":"op-trace-r3","controllerId":"ctrl-r","logicalTsUnixMs":1800,"eventType":"vm.create","resourceKey":"vm/v-trace-retry","body":{"vmId":"v-trace-retry","nodeId":"node-retry-trace","name":"vtrace-retry"}}"#.to_vec(),
+                },
+                50,
             ),
         ];
 
