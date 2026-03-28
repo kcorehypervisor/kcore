@@ -48,8 +48,12 @@ pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -
                 address: n.address,
                 approval_status: n.approval_status,
                 cert_expiry_days: n.cert_expiry_days,
+                luks_method: n.luks_method,
             })
             .collect(),
+        nodes_luks_tpm2: r.nodes_luks_tpm2,
+        nodes_luks_keyfile: r.nodes_luks_keyfile,
+        nodes_luks_unknown: r.nodes_luks_unknown,
     }
 }
 
@@ -226,7 +230,11 @@ mod tests {
                 disable_vxlan: false,
                 approval_status: "approved".into(),
                 cert_expiry_days: 90,
+                luks_method: "tpm2".into(),
             }],
+            nodes_luks_tpm2: 1,
+            nodes_luks_keyfile: 0,
+            nodes_luks_unknown: 0,
         };
         let d = compliance_from_proto(r);
         assert_eq!(d.controller_version, "9.9.9");

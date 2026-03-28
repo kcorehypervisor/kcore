@@ -480,6 +480,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             disable_vxlan: req.disable_vxlan,
             approval_status: approval_status.clone(),
             cert_expiry_days: req.cert_expiry_days,
+            luks_method: req.luks_method.clone(),
         };
 
         self.db
@@ -501,6 +502,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "address": req.address,
                 "approvalStatus": approval_status,
                 "labels": req.labels,
+                "luksMethod": req.luks_method,
             }),
         );
 
@@ -539,7 +541,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         let found = self
             .db
-            .update_heartbeat(&req.node_id, cpu_used, mem_used, req.cert_expiry_days)
+            .update_heartbeat(&req.node_id, cpu_used, mem_used, req.cert_expiry_days, &req.luks_method)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         if !found {
@@ -1516,6 +1518,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     disable_vxlan: n.disable_vxlan,
                     approval_status: n.approval_status,
                     cert_expiry_days: n.cert_expiry_days,
+                    luks_method: n.luks_method,
                 }
             })
             .collect();
@@ -1564,6 +1567,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 disable_vxlan: node.disable_vxlan,
                 approval_status: node.approval_status,
                 cert_expiry_days: node.cert_expiry_days,
+                luks_method: node.luks_method,
             }),
         }))
     }
@@ -2151,6 +2155,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .count_nodes_cert_expiry()
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let (luks_tpm2, luks_keyfile, luks_unknown) = self
+            .db
+            .count_nodes_luks_method()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
         let sub_ca_enabled = self.sub_ca.lock().unwrap().is_available();
 
         let node_rows = self
@@ -2190,6 +2199,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     disable_vxlan: n.disable_vxlan,
                     approval_status: n.approval_status,
                     cert_expiry_days: n.cert_expiry_days,
+                    luks_method: n.luks_method,
                 }
             })
             .collect();
@@ -2264,6 +2274,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 nodes_expiring_30d: expiring_30d,
                 nodes_cert_unknown: cert_unknown,
                 nodes,
+                nodes_luks_tpm2: luks_tpm2,
+                nodes_luks_keyfile: luks_keyfile,
+                nodes_luks_unknown: luks_unknown,
             },
         ))
     }
@@ -2317,6 +2330,7 @@ mod tests {
             disable_vxlan: false,
             approval_status: "approved".to_string(),
             cert_expiry_days: -1,
+            luks_method: String::new(),
         }
     }
 
@@ -3228,6 +3242,7 @@ mod tests {
                     storage_backend: 1,
                     disable_vxlan: false,
                     cert_expiry_days: 365,
+                    luks_method: String::new(),
                 }),
             )
             .await
@@ -3272,6 +3287,7 @@ mod tests {
                 storage_backend: 1,
                 disable_vxlan: false,
                 cert_expiry_days: 365,
+                luks_method: String::new(),
             }),
         )
         .await
@@ -3304,6 +3320,7 @@ mod tests {
                     storage_backend: 1,
                     disable_vxlan: false,
                     cert_expiry_days: 300,
+                    luks_method: "tpm2".to_string(),
                 }),
             )
             .await
@@ -3391,6 +3408,7 @@ mod tests {
             disable_vxlan: false,
             approval_status: "pending".into(),
             cert_expiry_days: -1,
+            luks_method: String::new(),
         };
         assert!(
             scheduler::select_node(&[n.clone()]).is_none(),

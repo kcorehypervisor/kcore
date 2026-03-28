@@ -351,8 +351,8 @@ New environment:
 
 Day-2 operations:
 
-1. inspect with `kctl get ...` (the nodes table includes a `CERT EXPIRY` column)
-2. review compliance posture with `kctl get compliance-report` (crypto, mTLS, access control, per-node cert status)
+1. inspect with `kctl get ...` (the nodes table includes `CERT EXPIRY` and `LUKS` columns)
+2. review compliance posture with `kctl get compliance-report` (crypto, mTLS, access control, encryption at rest, per-node cert and LUKS status)
 3. adjust desired VM running state with `kctl set vm ... --state ...` (or `kctl start/stop vm ...`)
 4. update configs with `kctl node apply-nix ...` or `kctl apply ...`
 5. rotate controller cert with `kctl rotate certs --controller <host:port>`

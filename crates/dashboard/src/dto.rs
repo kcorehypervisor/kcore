@@ -15,6 +15,7 @@ pub struct NodeSummaryDto {
     pub address: String,
     pub approval_status: String,
     pub cert_expiry_days: i32,
+    pub luks_method: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +44,9 @@ pub struct ComplianceDto {
     pub nodes_expiring_30d: i32,
     pub nodes_cert_unknown: i32,
     pub nodes: Vec<NodeSummaryDto>,
+    pub nodes_luks_tpm2: i32,
+    pub nodes_luks_keyfile: i32,
+    pub nodes_luks_unknown: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -379,6 +379,7 @@ enum StorageBackendType {
 message InstallToDiskResponse {
   bool accepted = 1;
   string message = 2;
+  string luks_method = 3;  // "tpm2" or "key-file"
 }
 
 // Image management

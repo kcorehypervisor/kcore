@@ -48,8 +48,8 @@ pub fn print_vm_detail(
 
 pub fn print_node_table(nodes: &[controller_proto::NodeInfo]) {
     println!(
-        "{:<20}  {:<20}  {:<16}  {:>6}  {:>10}  {:<10}  {:<10}  {:<10}  {:>11}",
-        "ID", "HOSTNAME", "ADDRESS", "CORES", "MEMORY", "STATUS", "STORAGE", "APPROVAL", "CERT EXPIRY"
+        "{:<20}  {:<20}  {:<16}  {:>6}  {:>10}  {:<10}  {:<10}  {:<10}  {:>11}  {:<8}",
+        "ID", "HOSTNAME", "ADDRESS", "CORES", "MEMORY", "STATUS", "STORAGE", "APPROVAL", "CERT EXPIRY", "LUKS"
     );
     for n in nodes {
         let (cores, mem) = if let Some(cap) = &n.capacity {
@@ -58,8 +58,9 @@ pub fn print_node_table(nodes: &[controller_proto::NodeInfo]) {
             (0, "n/a".to_string())
         };
         let cert_expiry = format_cert_expiry(n.cert_expiry_days);
+        let luks = format_luks_method(&n.luks_method);
         println!(
-            "{:<20}  {:<20}  {:<16}  {:>6}  {:>10}  {:<10}  {:<10}  {:<10}  {:>11}",
+            "{:<20}  {:<20}  {:<16}  {:>6}  {:>10}  {:<10}  {:<10}  {:<10}  {:>11}  {:<8}",
             n.node_id,
             n.hostname,
             n.address,
@@ -69,6 +70,7 @@ pub fn print_node_table(nodes: &[controller_proto::NodeInfo]) {
             storage_backend_str(n.storage_backend),
             n.approval_status,
             cert_expiry,
+            luks,
         );
     }
 }
@@ -97,6 +99,7 @@ pub fn print_node_detail(n: &controller_proto::NodeInfo) {
         println!("Labels:    {}", n.labels.join(", "));
     }
     println!("Storage:   {}", storage_backend_str(n.storage_backend));
+    println!("LUKS:      {}", format_luks_method(&n.luks_method));
     println!("Cert:      {}", format_cert_expiry(n.cert_expiry_days));
 }
 
@@ -146,6 +149,14 @@ fn format_cert_expiry(days: i32) -> String {
         format!("{days}d ⚠")
     } else {
         format!("{days}d")
+    }
+}
+
+fn format_luks_method(method: &str) -> &str {
+    match method {
+        "tpm2" => "TPM2",
+        "key-file" => "key-file",
+        _ => "-",
     }
 }
 
@@ -227,6 +238,15 @@ pub fn print_compliance_report(r: &controller_proto::GetComplianceReportResponse
     field("Unknown", &format!("{} nodes", r.nodes_cert_unknown));
 
     section(
+        "Encryption at rest",
+        &["NCSC Principle 2", "NIST 800-53 SC-28", "SOC 2 CC6.1"],
+    );
+    field("Method", "LUKS2 full-disk encryption (mandatory)");
+    field("TPM2-sealed", &format!("{} nodes", r.nodes_luks_tpm2));
+    field("Key-file", &format!("{} nodes", r.nodes_luks_keyfile));
+    field("Unknown/unreported", &format!("{} nodes", r.nodes_luks_unknown));
+
+    section(
         "Infrastructure",
         &["SOC 2 CC8.1", "PCI DSS 2.2", "PCI DSS 6.3"],
     );
@@ -241,17 +261,18 @@ pub fn print_compliance_report(r: &controller_proto::GetComplianceReportResponse
     if !r.nodes.is_empty() {
         section("Node Details", &["SOC 2 CC6.2", "PCI DSS 2.4"]);
         println!(
-            "  {:<36}  {:<16}  {:<20}  {:<10}  {:<10}",
-            "ID", "HOSTNAME", "ADDRESS", "STATUS", "CERT EXPIRY"
+            "  {:<36}  {:<16}  {:<20}  {:<10}  {:<10}  {:<8}",
+            "ID", "HOSTNAME", "ADDRESS", "STATUS", "CERT EXPIRY", "LUKS"
         );
         for n in &r.nodes {
             println!(
-                "  {:<36}  {:<16}  {:<20}  {:<10}  {:<10}",
+                "  {:<36}  {:<16}  {:<20}  {:<10}  {:<10}  {:<8}",
                 n.node_id,
                 n.hostname,
                 n.address,
                 &n.approval_status,
                 format_cert_expiry(n.cert_expiry_days),
+                format_luks_method(&n.luks_method),
             );
         }
     }

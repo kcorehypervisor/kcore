@@ -69,10 +69,17 @@ kctl --node <NEW_NODE_IP>:9091 node install \
    - The freshly signed node certificate and private key
    - Ordered controller endpoints (`192.168.40.105:9090`, `192.168.40.106:9090`, ...)
    - Datacenter identity (`dcId`, default `DC1`)
-4. The node-agent writes the OS to disk, places the certificates in
-   `/etc/kcore/certs/`, and writes `node-agent.yaml` with
+4. The node-agent detects whether TPM 2.0 is available
+   (`/sys/class/tpm/tpm0`).
+5. The `install-to-disk` script sets up **mandatory LUKS2 full-disk
+   encryption** on the OS partition:
+   - **TPM 2.0 present:** the LUKS key is sealed to TPM PCRs (auto-unlock on same machine, disk removal protection).
+   - **No TPM:** a random key-file is generated and stored on the unencrypted `/boot` partition.
+6. The OS is installed on the encrypted partition. Certificates are
+   placed in `/etc/kcore/certs/`, and `node-agent.yaml` is written with
    both `controllerAddr` (primary) and `controllers` (fallback list), plus `dcId`.
-5. The node reboots into the installed system.
+7. For TPM nodes, TPM enrollment is completed and the temporary passphrase is wiped.
+8. The node reboots into the installed system.
 
 ## Step 3: Node self-registration (automatic)
 

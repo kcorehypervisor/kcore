@@ -825,6 +825,7 @@ mod tests {
             disable_vxlan: false,
             approval_status: "approved".to_string(),
             cert_expiry_days: -1,
+            luks_method: String::new(),
         }
     }
 

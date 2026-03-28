@@ -14,10 +14,11 @@ python3 "${CHECKER}" "${TRACE_DIR}/replication-sample-2.json"
 bash "${GENERATOR}" "${GENERATED_TRACE}"
 python3 "${CHECKER}" "${GENERATED_TRACE}"
 
-echo "==> replication trace checker (negative)"
+echo "==> replication trace checker (negative, expected failure)"
 if python3 "${CHECKER}" "${TRACE_DIR}/replication-invalid-terminal.json"; then
   echo "expected invalid-terminal trace to fail, but it passed"
   exit 1
 fi
+echo "negative fixture failed as expected."
 
 echo "trace harness passed."
