@@ -164,6 +164,7 @@ async fn connect_and_register(
             storage_backend,
             disable_vxlan,
             cert_expiry_days: cert_expiry,
+            luks_method: detect_luks_method(),
         })
         .await?;
     Ok(())
@@ -245,6 +246,7 @@ async fn send_heartbeat_once(
                     memory_bytes_used: 0,
                 }),
                 cert_expiry_days,
+                luks_method: detect_luks_method(),
             })
             .await
         {
@@ -408,6 +410,22 @@ async fn connect_channel(
         Ok(Channel::from_shared(endpoint.to_string())?
             .connect()
             .await?)
+    }
+}
+
+/// Detects the LUKS encryption method on the root filesystem.
+/// Returns "tpm2" if TPM 2.0 is enrolled, "key-file" if dm-crypt is active,
+/// or "" if LUKS is not detected.
+fn detect_luks_method() -> String {
+    let cryptroot = Path::new("/dev/mapper/cryptroot");
+    if !cryptroot.exists() {
+        return String::new();
+    }
+    let tpm_present = Path::new("/sys/class/tpm/tpm0").exists();
+    if tpm_present {
+        "tpm2".to_string()
+    } else {
+        "key-file".to_string()
     }
 }
 

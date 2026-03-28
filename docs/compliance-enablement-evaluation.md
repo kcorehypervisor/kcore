@@ -278,7 +278,9 @@ Although most standards do not require encrypting the OS partition or operationa
 | VM guest disks (host-level) | LUKS on host protects qcow2/ZFS volumes at rest | Automatic — images reside on encrypted host disk | Baseline protection |
 | VM guest disks (app-level) | Guest-level LUKS or app-level encryption inside the VM | **Customer's responsibility** | Required for PCI DSS Req 3.5 if VMs process cardholder data |
 
-**Reference NixOS LUKS configuration:**
+**Status: Done.** `kctl node install` automatically sets up LUKS2 encryption on the OS disk (TPM 2.0 auto-detect with key-file fallback). The node-agent reports the LUKS method to the controller on registration and heartbeat, visible in `kctl get nodes` and `kctl get compliance-report`.
+
+**Reference NixOS LUKS configuration (generated automatically by `install-to-disk`):**
 
 **Option A — TPM 2.0 sealed key (recommended for servers):**
 
@@ -415,7 +417,7 @@ This is the single most important non-engineering deliverable. Customers need a 
 | Control area | KCore responsibility | Customer responsibility |
 |-------------|---------------------|----------------------|
 | Encryption in transit | mTLS on all management traffic | Encryption of guest-to-guest and guest-to-internet traffic |
-| Encryption at rest | LUKS reference NixOS configuration, certificate file permissions (0600) | Full-disk encryption on nodes (LUKS), guest disk encryption for VMs with sensitive data |
+| Encryption at rest | **Mandatory full-disk LUKS** enforced by `kctl node install` (TPM 2.0 auto-detect, key-file fallback), certificate file permissions (0600) | Guest disk encryption for VMs with sensitive data |
 | Access control | CN-based RBAC on gRPC API, node approval queue | Managing who holds which certificates, revoking access for departed staff |
 | Network segmentation | Per-VM network isolation, VLAN, firewall rules | Defining which workloads go on which networks, designing the topology |
 | Audit logging | Structured audit log of all API actions | Forwarding audit logs to SIEM, setting retention policies, monitoring alerts |
@@ -490,7 +492,7 @@ The customer's system must use FIPS-validated cryptography. KCore enables this w
 | Cipher suites | FIPS-approved only (AES-GCM + ECDHE P-256/P-384) — always active, non-FIPS algorithms excluded at startup | Document the crypto configuration in their security policy |
 | Key management | Certificate generation, sub-CA rotation, auto-renewal, and destruction tools | Follow key management procedures, protect root CA key |
 | Kernel crypto | Documentation for `fips=1` kernel parameter on NixOS | Enable kernel FIPS mode on all nodes |
-| Encryption at rest | LUKS reference NixOS configuration (dm-crypt uses kernel FIPS module when `fips=1` is set) | Enable LUKS on all nodes |
+| Encryption at rest | **Mandatory full-disk LUKS** enforced at install (dm-crypt uses kernel FIPS module when `fips=1` is set) | Automatic — LUKS enforced by `kctl node install` |
 
 **Customer's cost to claim FIPS-compliant stack:** $0 external cost. KCore uses `aws-lc-rs` with FIPS-approved algorithms by default — no `--fips` flag or opt-in required. The customer documents the validated module and its certificate number in their own FIPS security policy. KCore does not need its own FIPS certificate.
 

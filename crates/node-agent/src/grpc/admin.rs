@@ -943,7 +943,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             tokio::task::spawn_blocking(move || -> Result<proto::InstallToDiskResponse, Status> {
                 write_bootstrap_pki(&req)?;
 
-                let args = build_install_command_args(&req)?;
+                let mut args = build_install_command_args(&req)?;
+
+                let tpm_present = std::path::Path::new("/sys/class/tpm/tpm0").exists();
+                let luks_method = if tpm_present { "tpm2" } else { "key-file" };
+                args.push("--luks-method".to_string());
+                args.push(luks_method.to_string());
 
                 let cmd_str = format!("install-to-disk {}", args.join(" "));
                 let (mut log_file, log_path) = prepare_install_log()?;
@@ -972,6 +977,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                                 "install started (pid {pid}): {cmd_str}; logs: {}",
                                 log_path.display()
                             ),
+                            luks_method: luks_method.to_string(),
                         })
                     }
                     Err(e) => Err(Status::internal(format!("failed to start install: {e}"))),

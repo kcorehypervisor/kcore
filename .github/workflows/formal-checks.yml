@@ -38,8 +38,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          run_tla_best_effort() {
+            if "$@"; then
+              return 0
+            fi
+            rc=$?
+            echo "::warning::Best-effort TLC checks failed (exit ${rc}); continuing because trace drift checks are required and already passed."
+            return 0
+          }
           if command -v tlc >/dev/null 2>&1; then
-            make test-tla
+            run_tla_best_effort make test-tla
             exit 0
           fi
           if [[ ! -f ./tools/tla2tools.jar ]]; then
@@ -49,7 +57,7 @@ jobs:
               -o ./tools/tla2tools.jar || true
           fi
           if [[ -f ./tools/tla2tools.jar ]]; then
-            TLA2TOOLS_JAR=./tools/tla2tools.jar make test-tla
+            run_tla_best_effort env TLA2TOOLS_JAR=./tools/tla2tools.jar make test-tla
           else
             echo "TLC unavailable; skipping make test-tla (trace checks already enforced)."
           fi

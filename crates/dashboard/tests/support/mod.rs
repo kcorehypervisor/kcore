@@ -290,6 +290,9 @@ impl Controller for MockController {
             nodes_expiring_30d: 0,
             nodes_cert_unknown: 0,
             nodes: vec![],
+            nodes_luks_tpm2: 0,
+            nodes_luks_keyfile: 0,
+            nodes_luks_unknown: 0,
         }))
     }
 }

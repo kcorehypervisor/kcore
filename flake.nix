@@ -207,6 +207,8 @@
                   pkgs.jq
                   pkgs.parted
                   pkgs.lvm2
+                  pkgs.cryptsetup
+                  pkgs.tpm2-tools
                   nodeAgent
                   controller
                   (pkgs.writeShellScriptBin "install-to-disk" ''
@@ -221,6 +223,7 @@
                     RUN_CONTROLLER="false"
                     DISABLE_VXLAN="false"
                     DC_ID="DC1"
+                    LUKS_METHOD=""
                     DATA_DISKS=()
 
                     while [[ $# -gt 0 ]]; do
@@ -265,9 +268,13 @@
                           DISABLE_VXLAN="true"
                           shift
                           ;;
+                        --luks-method)
+                          LUKS_METHOD="''${2:-}"
+                          shift 2
+                          ;;
                         *)
                           echo "Unknown argument: $1"
-                          echo "Usage: install-to-disk [--disk /dev/sda] [--data-disk /dev/nvme0n1] [--controller 192.168.40.135[:9090]]... [--dc-id DC1] [--run-controller] [--disable-vxlan] [--yes --wipe --non-interactive --reboot]"
+                          echo "Usage: install-to-disk [--disk /dev/sda] [--data-disk /dev/nvme0n1] [--controller 192.168.40.135[:9090]]... [--dc-id DC1] [--run-controller] [--disable-vxlan] [--luks-method tpm2|key-file] [--yes --wipe --non-interactive --reboot]"
                           exit 1
                           ;;
                       esac
@@ -358,15 +365,45 @@
                       ROOT_PART="''${DISK_PATH}2"
                     fi
 
+                    # Auto-detect LUKS method if not provided
+                    if [ -z "$LUKS_METHOD" ]; then
+                      if [ -d /sys/class/tpm/tpm0 ]; then
+                        LUKS_METHOD="tpm2"
+                      else
+                        LUKS_METHOD="key-file"
+                      fi
+                    fi
+
+                    echo "Setting up LUKS encryption (method: $LUKS_METHOD)..."
+                    if [ "$LUKS_METHOD" = "tpm2" ]; then
+                      echo "Formatting $ROOT_PART with LUKS2 (TPM2 will be enrolled after install)..."
+                      echo -n "kcore-temp-passphrase" | cryptsetup luksFormat --batch-mode --type luks2 "$ROOT_PART" -
+                      echo -n "kcore-temp-passphrase" | cryptsetup open "$ROOT_PART" cryptroot -
+                    else
+                      echo "Generating LUKS key-file..."
+                      mkdir -p /tmp/luks
+                      dd if=/dev/urandom of=/tmp/luks/root.key bs=4096 count=1 2>/dev/null
+                      chmod 0400 /tmp/luks/root.key
+                      cryptsetup luksFormat --batch-mode --type luks2 "$ROOT_PART" /tmp/luks/root.key
+                      cryptsetup open --key-file /tmp/luks/root.key "$ROOT_PART" cryptroot
+                    fi
+                    ROOT_DEV="/dev/mapper/cryptroot"
+
                     echo "Formatting partitions..."
                     mkfs.fat -F 32 -n BOOT "$BOOT_PART"
-                    mkfs.ext4 -F -L nixos "$ROOT_PART"
+                    mkfs.ext4 -F -L nixos "$ROOT_DEV"
 
                     echo "Mounting partitions..."
                     mkdir -p /mnt
-                    mount "$ROOT_PART" /mnt
+                    mount "$ROOT_DEV" /mnt
                     mkdir -p /mnt/boot
                     mount "$BOOT_PART" /mnt/boot
+
+                    # For key-file method, copy key to /boot so the initrd can use it
+                    if [ "$LUKS_METHOD" = "key-file" ]; then
+                      cp /tmp/luks/root.key /mnt/boot/crypto_keyfile.bin
+                      chmod 0400 /mnt/boot/crypto_keyfile.bin
+                    fi
 
                     echo "Generating NixOS hardware configuration..."
                     nixos-generate-config --root /mnt
@@ -497,6 +534,31 @@ VMSEOF
 CTRLSVC
                     fi
 
+                    # Build LUKS boot config for NixOS
+                    ROOT_PART_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+                    LUKS_BOOT_CONFIG=""
+                    if [ "$LUKS_METHOD" = "tpm2" ]; then
+                      read -r -d "" LUKS_BOOT_CONFIG << 'LUKSEOF' || true
+  boot.initrd.luks.devices.cryptroot = {
+    device = "/dev/disk/by-uuid/ROOT_PART_UUID_PLACEHOLDER";
+    preLVM = true;
+    crypttabExtraOpts = [ "tpm2-device=auto" ];
+  };
+  boot.initrd.systemd.enable = true;
+LUKSEOF
+                      LUKS_BOOT_CONFIG="''${LUKS_BOOT_CONFIG//ROOT_PART_UUID_PLACEHOLDER/$ROOT_PART_UUID}"
+                    else
+                      read -r -d "" LUKS_BOOT_CONFIG << 'LUKSEOF' || true
+  boot.initrd.luks.devices.cryptroot = {
+    device = "/dev/disk/by-uuid/ROOT_PART_UUID_PLACEHOLDER";
+    preLVM = true;
+    keyFile = "/crypto_keyfile.bin";
+  };
+  boot.initrd.secrets."/crypto_keyfile.bin" = "/boot/crypto_keyfile.bin";
+LUKSEOF
+                      LUKS_BOOT_CONFIG="''${LUKS_BOOT_CONFIG//ROOT_PART_UUID_PLACEHOLDER/$ROOT_PART_UUID}"
+                    fi
+
                     echo "Writing NixOS configuration..."
                     cat > /mnt/etc/nixos/configuration.nix << NIXEOF
 { config, pkgs, lib, ... }:
@@ -514,6 +576,8 @@ CTRLSVC
   boot.loader.efi.canTouchEfiVariables = true;
   boot.kernelModules = [ "kvm" "kvm-intel" "kvm-amd" "tap" "tun" "br_netfilter" ];
   boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
+
+$LUKS_BOOT_CONFIG
 
   networking.hostName = "kvm-node";
   networking.useDHCP = true;
@@ -576,6 +640,8 @@ $CONTROLLER_SERVICE
     jq
     parted
     lvm2
+    cryptsetup
+    tpm2-tools
   ];
 
   system.stateVersion = "25.05";
@@ -591,6 +657,14 @@ NIXEOF
                     export NIX_PATH="nixos-config=/mnt/etc/nixos/configuration.nix:nixpkgs=${pkgs.path}"
                     nixos-install
 
+                    # Enroll TPM2 and remove temporary passphrase
+                    if [ "$LUKS_METHOD" = "tpm2" ]; then
+                      echo "Enrolling TPM2 for LUKS..."
+                      echo -n "kcore-temp-passphrase" | systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$ROOT_PART"
+                      echo -n "kcore-temp-passphrase" | systemd-cryptenroll --wipe-slot=password "$ROOT_PART"
+                      echo "TPM2 enrolled, temporary passphrase removed."
+                    fi
+
                     echo ""
                     echo "======================================================"
                     echo "  Installation complete!"
@@ -599,6 +673,8 @@ NIXEOF
                     echo "Login credentials:"
                     echo "  Username: root"
                     echo "  Password: kcore"
+                    echo ""
+                    echo "Disk encryption: LUKS2 ($LUKS_METHOD)"
                     echo ""
                     if [ "$RUN_CONTROLLER" = "true" ]; then
                       echo "This node is configured as a controller + agent."

@@ -60,6 +60,7 @@ message RegisterNodeRequest {
   StorageBackendType storage_backend = 6; // Node storage backend capability (filesystem/lvm/zfs)
   bool disable_vxlan = 7; // When true, node does not support VXLAN overlay networking
   int32 cert_expiry_days = 8; // Days until node TLS certificate expires
+  string luks_method = 9;     // "tpm2", "key-file", or "" (not reported)
 }
 
 message RegisterNodeResponse {
@@ -72,6 +73,7 @@ message HeartbeatRequest {
   string node_id = 1;
   NodeUsage usage = 2;
   int32 cert_expiry_days = 3; // Days until node TLS certificate expires
+  string luks_method = 4;     // "tpm2", "key-file", or "" (not reported)
 }
 
 message HeartbeatResponse {
@@ -261,6 +263,7 @@ message NodeInfo {
   bool disable_vxlan = 10; // When true, VXLAN overlay networking is disabled
   string approval_status = 11; // "pending", "approved", or "rejected"
   int32 cert_expiry_days = 12; // Days until node TLS certificate expires (-1 = unknown)
+  string luks_method = 13;     // "tpm2", "key-file", or "" (unknown/not reported)
 }
 
 message GetNodeRequest {
@@ -576,6 +579,10 @@ message GetComplianceReportResponse {
   int32 nodes_cert_unknown = 23;
 
   repeated NodeInfo nodes = 24;
+
+  int32 nodes_luks_tpm2 = 25;      // Nodes with TPM2-sealed LUKS
+  int32 nodes_luks_keyfile = 26;   // Nodes with key-file LUKS
+  int32 nodes_luks_unknown = 27;   // Nodes with unknown/unreported LUKS status
 }
 
 // Network overview
