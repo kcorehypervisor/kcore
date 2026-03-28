@@ -6,7 +6,7 @@
 }: let
   cfg = config.ch-vm.vms;
   helpers = import ./helpers.nix {inherit lib;};
-  generateMac = helpers.generateMac;
+  inherit (helpers) generateMac;
 
   mkSeedIso = vmName: vmCfg: let
     userData =

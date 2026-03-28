@@ -8,8 +8,8 @@
   helpers = import ./helpers.nix {inherit lib;};
 
   bridgeName = name: "kbr-${name}";
-  tapName = helpers.tapName;
-  upstreamIface = netName: netCfg:
+  inherit (helpers) tapName;
+  upstreamIface = _netName: netCfg:
     if netCfg.vlanId > 0
     then "${cfg.gatewayInterface}.${toString netCfg.vlanId}"
     else cfg.gatewayInterface;
@@ -62,7 +62,7 @@ in {
             wantedBy = ["multi-user.target"];
             before =
               lib.mapAttrsToList (
-                vmName: vmCfg:
+                vmName: _vmCfg:
                   "kcore-vm-${vmName}.service"
               ) (lib.filterAttrs (_: vm: vm.network == netName) cfg.virtualMachines);
 

@@ -108,6 +108,8 @@
               pkgs.grpcurl
               pkgs.cmake
               pkgs.perl
+              pkgs.statix
+              pkgs.deadnix
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.cloud-hypervisor
@@ -134,7 +136,6 @@
             ./modules/kcore-branding.nix
             (
               {
-                config,
                 pkgs,
                 lib,
                 ...

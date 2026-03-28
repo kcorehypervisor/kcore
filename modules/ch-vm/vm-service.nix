@@ -6,8 +6,7 @@
 }: let
   cfg = config.ch-vm.vms;
   helpers = import ./helpers.nix {inherit lib;};
-  tapName = helpers.tapName;
-  generateMac = helpers.generateMac;
+  inherit (helpers) tapName generateMac;
 
   mkVmService = vmName: vmCfg: let
     mac =

@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }: {
+{ lib, ... }: {
   # OS Release branding
   system.nixos.label = "kcore";
   

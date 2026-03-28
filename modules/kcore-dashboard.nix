@@ -2,7 +2,6 @@
 {
   config,
   lib,
-  pkgs,
   ...
 }: let
   cfg = config.services.kcore-dashboard;
