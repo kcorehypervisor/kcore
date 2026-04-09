@@ -7,4 +7,5 @@ pub mod image;
 pub mod network;
 pub mod node;
 pub mod ssh_key;
+pub mod storage_class;
 pub mod vm;

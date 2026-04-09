@@ -401,6 +401,9 @@ enum GetResource {
         #[arg(long = "target-node")]
         target_node: Option<String>,
     },
+    /// List storage classes
+    #[command(name = "storage-class", alias = "storage-classes")]
+    StorageClass,
     /// Show compliance report
     #[command(alias = "compliance")]
     ComplianceReport,
@@ -447,16 +450,17 @@ enum DescribeResource {
         #[arg(long = "target-node")]
         target_node: Option<String>,
     },
+    /// Describe a storage class
+    #[command(name = "storage-class", alias = "storage-classes")]
+    StorageClass {
+        /// Storage class name (filesystem, lvm, zfs, unspecified)
+        name: String,
+    },
     /// Describe an SSH key
     #[command(name = "ssh-key", alias = "sshkey")]
     SshKey {
         /// Key name
         name: String,
-    },
-    /// Describe a replication conflict
-    Conflict {
-        /// Conflict ID
-        id: i64,
     },
     /// Describe cluster compliance report
     #[command(name = "compliance-report", alias = "compliance")]
@@ -839,6 +843,12 @@ async fn main() {
             commands::network::list(&info, target_node.clone()).await
         }
         Command::Get {
+            resource: GetResource::StorageClass,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::storage_class::list(&info).await
+        }
+        Command::Get {
             resource: GetResource::ComplianceReport,
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -870,16 +880,16 @@ async fn main() {
             commands::network::describe(&info, name, target_node.clone()).await
         }
         Command::Describe {
+            resource: DescribeResource::StorageClass { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::storage_class::describe(&info, name).await
+        }
+        Command::Describe {
             resource: DescribeResource::SshKey { name },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::ssh_key::get(&info, name).await
-        }
-        Command::Describe {
-            resource: DescribeResource::Conflict { id },
-        } => {
-            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::conflict::describe(&info, *id).await
         }
         Command::Describe {
             resource: DescribeResource::ComplianceReport,
