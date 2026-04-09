@@ -58,6 +58,9 @@ service NodeAdmin {
   // ListNetworkInterfaces returns network interfaces and addresses.
   rpc ListNetworkInterfaces(ListNetworkInterfacesRequest) returns (ListNetworkInterfacesResponse);
 
+  // GetLvmInfo returns node LVM topology (VG/LV/PV) when available.
+  rpc GetLvmInfo(GetLvmInfoRequest) returns (GetLvmInfoResponse);
+
   // InstallToDisk triggers a non-interactive install-to-disk workflow.
   // The implementation enforces disk wipe and reboot at the end.
   rpc InstallToDisk(InstallToDiskRequest) returns (InstallToDiskResponse);
@@ -342,6 +345,43 @@ message NetworkInterfaceInfo {
 
 message ListNetworkInterfacesResponse {
   repeated NetworkInterfaceInfo interfaces = 1;
+}
+
+message GetLvmInfoRequest {}
+
+message LvmVolumeGroupInfo {
+  string name = 1;
+  int64 size_bytes = 2;
+  int64 free_bytes = 3;
+  string attr = 4;
+}
+
+message LvmLogicalVolumeInfo {
+  string name = 1;
+  string vg_name = 2;
+  int64 size_bytes = 3;
+  string attr = 4;
+  string path = 5;
+  string pool = 6;
+  string origin = 7;
+  string data_percent = 8;
+  string metadata_percent = 9;
+}
+
+message LvmPhysicalVolumeInfo {
+  string name = 1;
+  string vg_name = 2;
+  int64 size_bytes = 3;
+  int64 free_bytes = 4;
+  string attr = 5;
+}
+
+message GetLvmInfoResponse {
+  bool available = 1;
+  string message = 2;
+  repeated LvmVolumeGroupInfo volume_groups = 3;
+  repeated LvmLogicalVolumeInfo logical_volumes = 4;
+  repeated LvmPhysicalVolumeInfo physical_volumes = 5;
 }
 
 message InstallToDiskRequest {

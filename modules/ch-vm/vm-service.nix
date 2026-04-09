@@ -41,6 +41,9 @@ let
       requires = [ "kcore-tap-${vmName}.service" ];
       after = [ "kcore-tap-${vmName}.service" ];
       wantedBy = lib.optionals vmCfg.autoStart [ "multi-user.target" ];
+      # Ensure desired-state flips are applied to live units during switch.
+      # Without this, a running VM can remain active even after autoStart=false.
+      stopIfChanged = true;
 
       serviceConfig = {
         Type = "simple";

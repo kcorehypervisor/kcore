@@ -47,6 +47,91 @@ let
       "255.255.255.252" = "30";
     }
     .${mask} or (throw "unsupported netmask: ${mask}");
+
+  hexDigitToInt =
+    c:
+    {
+      "0" = 0;
+      "1" = 1;
+      "2" = 2;
+      "3" = 3;
+      "4" = 4;
+      "5" = 5;
+      "6" = 6;
+      "7" = 7;
+      "8" = 8;
+      "9" = 9;
+      "a" = 10;
+      "b" = 11;
+      "c" = 12;
+      "d" = 13;
+      "e" = 14;
+      "f" = 15;
+    }
+    .${lib.toLower c} or (throw "invalid hex digit '${c}'");
+
+  hexByteToInt =
+    hex:
+    let
+      chars = lib.stringToCharacters hex;
+      hi = hexDigitToInt (builtins.elemAt chars 0);
+      lo = hexDigitToInt (builtins.elemAt chars 1);
+    in
+    (hi * 16) + lo;
+
+  # Keep deterministic host reservation per VM name.
+  # We reserve from .10-.249 and use linear probing for rare collisions.
+  dhcpReservedHostForName =
+    vmName:
+    let
+      hash = builtins.hashString "sha256" vmName;
+      b0 = hexByteToInt (builtins.substring 0 2 hash);
+      b1 = hexByteToInt (builtins.substring 2 2 hash);
+      b2 = hexByteToInt (builtins.substring 4 2 hash);
+      minHost = 10;
+      maxHost = 249;
+      size = (maxHost - minHost) + 1;
+      offset = lib.mod ((((b0 * 256) + b1) * 256) + b2) size;
+    in
+    minHost + offset;
+
+  assignDhcpReservedHosts =
+    vmNames:
+    let
+      minHost = 10;
+      maxHost = 249;
+      size = (maxHost - minHost) + 1;
+      sorted = lib.sort builtins.lessThan vmNames;
+      pickHost =
+        used: startOffset: probe:
+        if probe >= size then
+          throw "unable to allocate deterministic DHCP reservation host (pool exhausted)"
+        else
+          let
+            offset = lib.mod (startOffset + probe) size;
+            host = minHost + offset;
+          in
+          if builtins.elem host used then pickHost used startOffset (probe + 1) else host;
+      step =
+        acc: vmName:
+        let
+          preferred = (dhcpReservedHostForName vmName) - minHost;
+          selected = pickHost acc.used preferred 0;
+        in
+        {
+          used = acc.used ++ [ selected ];
+          hosts = acc.hosts // { "${vmName}" = selected; };
+        };
+    in
+    (lib.foldl' step { used = [ ]; hosts = { }; } sorted).hosts;
+
+  vmMacAddress =
+    vmName: vmCfg:
+    if vmCfg.macAddress != null then lib.toLower vmCfg.macAddress else lib.toLower (helpers.generateMac vmName);
+
+  natVmConfigsForNetwork =
+    netName:
+    lib.filterAttrs (_: vmCfg: vmCfg.network == netName) cfg.virtualMachines;
 in
 {
   config = lib.mkIf cfg.enable {
@@ -200,7 +285,25 @@ in
             Restart = "always";
             RestartSec = 2;
             ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /run/kcore";
-            ExecStart = "${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --bind-interfaces --interface=${bridgeName netName} --except-interface=lo --dhcp-authoritative --dhcp-range=${subnetPrefix netCfg.gatewayIP}.100,${subnetPrefix netCfg.gatewayIP}.199,${netCfg.internalNetmask},12h --dhcp-option=option:router,${netCfg.gatewayIP} --dhcp-option=option:dns-server,1.1.1.1,8.8.8.8 --dhcp-leasefile=/run/kcore/dnsmasq-${netName}.leases --pid-file=/run/kcore/dnsmasq-${netName}.pid";
+            ExecStart =
+              let
+                netVms = natVmConfigsForNetwork netName;
+                vmNames = lib.attrNames netVms;
+                reservedHosts = assignDhcpReservedHosts vmNames;
+                dhcpHostArgs = lib.concatMapStringsSep " " (
+                  vmName:
+                  let
+                    vmCfg = netVms.${vmName};
+                    mac = vmMacAddress vmName vmCfg;
+                    hostOctet = toString reservedHosts.${vmName};
+                    fallbackIp = "${subnetPrefix netCfg.gatewayIP}.${hostOctet}";
+                    fixedIp =
+                      if vmCfg.dhcpReservedIPv4 != null then vmCfg.dhcpReservedIPv4 else fallbackIp;
+                  in
+                  "--dhcp-host=${mac},${fixedIp},${vmName},infinite"
+                ) vmNames;
+              in
+              "${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --bind-interfaces --interface=${bridgeName netName} --except-interface=lo --dhcp-authoritative --dhcp-range=${subnetPrefix netCfg.gatewayIP}.100,${subnetPrefix netCfg.gatewayIP}.199,${netCfg.internalNetmask},12h --dhcp-option=option:router,${netCfg.gatewayIP} --dhcp-option=option:dns-server,1.1.1.1,8.8.8.8 --dhcp-leasefile=/run/kcore/dnsmasq-${netName}.leases --pid-file=/run/kcore/dnsmasq-${netName}.pid ${dhcpHostArgs}";
           };
         }
       ) (lib.filterAttrs (_: netCfg: netCfg.networkType == "nat") cfg.networks)

@@ -49,6 +49,31 @@ pub async fn resolve(info: &ConnectionInfo, id: i64) -> Result<()> {
     Ok(())
 }
 
+pub async fn describe(info: &ConnectionInfo, id: i64) -> Result<()> {
+    if id <= 0 {
+        bail!("conflict id must be > 0");
+    }
+    let mut client = client::controller_admin_client(info).await?;
+    let resp = client
+        .list_replication_conflicts(proto::ListReplicationConflictsRequest { limit: 1000 })
+        .await?
+        .into_inner();
+    let conflict = resp
+        .conflicts
+        .into_iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| anyhow::anyhow!("conflict id {id} not found in unresolved conflicts"))?;
+
+    println!("ID:                    {}", conflict.id);
+    println!("Resource key:          {}", conflict.resource_key);
+    println!("Reason:                {}", conflict.reason);
+    println!("Incumbent operation:   {}", conflict.incumbent_op_id);
+    println!("Incumbent controller:  {}", conflict.incumbent_controller_id);
+    println!("Challenger operation:  {}", conflict.challenger_op_id);
+    println!("Challenger controller: {}", conflict.challenger_controller_id);
+    Ok(())
+}
+
 fn truncate(input: &str, max: usize) -> String {
     if input.chars().count() <= max {
         input.to_string()

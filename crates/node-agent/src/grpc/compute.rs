@@ -1,4 +1,5 @@
 use tonic::{Request, Response, Status};
+use tokio::process::Command;
 
 use crate::auth::{self, CN_CONTROLLER, CN_KCTL};
 use crate::proto;
@@ -25,6 +26,10 @@ fn ch_state_to_proto(state: &str) -> i32 {
 
 const DECLARATIVE_MSG: &str = "VMs are managed declaratively via NixOS config (ch-vm.vms). \
     Use `nixos-rebuild switch` to add, remove, or reconfigure VMs.";
+
+fn vm_unit_name(vm_name: &str) -> String {
+    format!("kcore-vm-{vm_name}.service")
+}
 
 #[tonic::async_trait]
 impl proto::node_compute_server::NodeCompute for ComputeService {
@@ -116,7 +121,45 @@ impl proto::node_compute_server::NodeCompute for ComputeService {
         request: Request<proto::SetVmDesiredStateRequest>,
     ) -> Result<Response<proto::SetVmDesiredStateResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
-        Err(Status::unimplemented(DECLARATIVE_MSG))
+        let req = request.into_inner();
+        let vm_name = req.vm_id.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+        let desired = proto::VmDesiredState::try_from(req.desired_state)
+            .unwrap_or(proto::VmDesiredState::Unspecified);
+        let unit = vm_unit_name(vm_name);
+        let (cmd, resulting_state) = match desired {
+            proto::VmDesiredState::Running => ("start", proto::VmState::Running as i32),
+            proto::VmDesiredState::Stopped => ("stop", proto::VmState::Stopped as i32),
+            proto::VmDesiredState::Unspecified => {
+                return Err(Status::invalid_argument(
+                    "desired_state must be RUNNING or STOPPED",
+                ));
+            }
+        };
+
+        let out = Command::new("systemctl")
+            .args([cmd, &unit])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("running systemctl {cmd} {unit}: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(Status::failed_precondition(format!(
+                "systemctl {cmd} {unit} failed: {}",
+                stderr.trim()
+            )));
+        }
+
+        Ok(Response::new(proto::SetVmDesiredStateResponse {
+            status: Some(proto::VmStatus {
+                id: vm_name.to_string(),
+                state: resulting_state,
+                created_at: None,
+                updated_at: None,
+            }),
+        }))
     }
 
     async fn reboot_vm(

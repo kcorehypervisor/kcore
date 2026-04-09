@@ -372,6 +372,195 @@ pub async fn get(info: &ConnectionInfo, vm_id: &str, target_node: Option<String>
     Ok(())
 }
 
+pub async fn describe(info: &ConnectionInfo, vm_id: &str, target_node: Option<String>) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .get_vm(proto::GetVmRequest {
+            vm_id: vm_id.to_string(),
+            target_node: target_node.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+
+    let spec = resp.spec.as_ref().context("no spec in response")?;
+    let status = resp.status.as_ref().context("no status in response")?;
+    output::print_vm_detail(spec, status, &resp.node_id);
+
+    if spec.nics.is_empty() {
+        return Ok(());
+    }
+
+    let mut controller = client::controller_client(info).await?;
+    let networks = controller
+        .list_networks(proto::ListNetworksRequest {
+            target_node: resp.node_id.clone(),
+        })
+        .await?
+        .into_inner()
+        .networks;
+    let default_network_overview = controller
+        .get_network_overview(proto::GetNetworkOverviewRequest {})
+        .await
+        .ok()
+        .map(|r| r.into_inner());
+
+    let primary_network = spec
+        .nics
+        .first()
+        .map(|n| n.network.clone())
+        .filter(|s| !s.trim().is_empty());
+    let primary_network_type = primary_network
+        .as_deref()
+        .map(|name| network_type_for(name, &resp.node_id, &networks));
+
+    let nodes = controller
+        .list_nodes(proto::ListNodesRequest {})
+        .await?
+        .into_inner()
+        .nodes;
+    let mut probed_ip: Option<String> = None;
+    let mut probe_reason: Option<String> = None;
+    if let Some(node_address) = node_address_for_vm_node_id(&nodes, &resp.node_id) {
+        let node_info = ConnectionInfo {
+            address: node_address,
+            addresses: vec![],
+            insecure: info.insecure,
+            cert: info.cert.clone(),
+            key: info.key.clone(),
+            ca: info.ca.clone(),
+        };
+        if let Ok(ssh_probe) = node::check_vm_ssh_ready(
+            &node_info,
+            &spec.name,
+            primary_network.as_deref(),
+            22,
+            1200,
+        )
+        .await
+        {
+            if !ssh_probe.ip.is_empty() {
+                probed_ip = Some(ssh_probe.ip);
+            } else if !ssh_probe.reason.is_empty() {
+                probe_reason = Some(ssh_probe.reason);
+            }
+        }
+    }
+
+    if let Some(ip) = probed_ip {
+        println!("IP:       {}", ip);
+    } else if !resp.assigned_ip.trim().is_empty() {
+        if primary_network_type.as_deref() == Some("vxlan") {
+            println!("IP:       {} (static vxlan assignment)", resp.assigned_ip);
+        } else {
+            println!("IP:       {} (controller assignment)", resp.assigned_ip);
+        }
+    } else if let Some(reason) = probe_reason {
+        println!("IP:       unavailable ({reason})");
+    } else {
+        println!("IP:       unavailable (no address strategy produced an IP)");
+    }
+
+    println!("\nNetwork configuration:");
+    for nic in &spec.nics {
+        println!(
+            "  NIC: network={} model={} mac={}",
+            nic.network,
+            if nic.model.is_empty() {
+                "virtio"
+            } else {
+                nic.model.as_str()
+            },
+            if nic.mac_address.is_empty() {
+                "(auto)"
+            } else {
+                nic.mac_address.as_str()
+            }
+        );
+
+        if let Some(net) = networks
+            .iter()
+            .find(|n| n.name == nic.network && n.node_id == resp.node_id)
+        {
+            let net_type = if net.network_type.is_empty() {
+                "nat".to_string()
+            } else {
+                net.network_type.clone()
+            };
+            println!("    network_type:   {net_type}");
+            println!("    gateway_ip:     {}", net.gateway_ip);
+            println!("    netmask:        {}", net.internal_netmask);
+            println!("    external_ip:    {}", net.external_ip);
+            println!(
+                "    outbound_nat:   {}",
+                if net.enable_outbound_nat {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
+                "    allowed_tcp:    {}",
+                if net.allowed_tcp_ports.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    net.allowed_tcp_ports
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+            println!(
+                "    allowed_udp:    {}",
+                if net.allowed_udp_ports.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    net.allowed_udp_ports
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+        } else {
+            if nic.network == "default" {
+                if let Some(overview) = &default_network_overview {
+                    println!("    network_type:   nat");
+                    println!("    gateway_ip:     {}", overview.default_gateway_ip);
+                    println!("    netmask:        {}", overview.default_internal_netmask);
+                    println!("    external_ip:    {}", overview.default_external_ip);
+                    println!("    outbound_nat:   enabled");
+                    println!("    allowed_tcp:    (cluster defaults)");
+                    println!("    allowed_udp:    (cluster defaults)");
+                } else {
+                    println!("    details:        default network overview unavailable");
+                }
+            } else {
+                println!("    details:        not found in controller network inventory");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn network_type_for(network_name: &str, node_id: &str, networks: &[proto::NetworkInfo]) -> String {
+    if network_name == "default" {
+        return "nat".to_string();
+    }
+    networks
+        .iter()
+        .find(|n| n.name == network_name && n.node_id == node_id)
+        .map(|n| {
+            if n.network_type.trim().is_empty() {
+                "nat".to_string()
+            } else {
+                n.network_type.trim().to_string()
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 pub async fn list(info: &ConnectionInfo, target_node: Option<String>) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let resp = client
@@ -946,5 +1135,29 @@ mod tests {
         assert!(data.contains("ssh_authorized_keys"));
         assert!(data.contains("lock_passwd: true"));
         assert!(data.contains("ssh_pwauth: false"));
+    }
+
+    #[test]
+    fn network_type_for_defaults_to_nat_for_default_network() {
+        let networks = vec![];
+        assert_eq!(network_type_for("default", "node-a", &networks), "nat");
+    }
+
+    #[test]
+    fn network_type_for_uses_inventory_value_or_unknown() {
+        let networks = vec![proto::NetworkInfo {
+            name: "vxlan-test".to_string(),
+            external_ip: "192.168.1.10".to_string(),
+            gateway_ip: "10.241.0.1".to_string(),
+            internal_netmask: "255.255.255.0".to_string(),
+            node_id: "node-a".to_string(),
+            allowed_tcp_ports: vec![],
+            allowed_udp_ports: vec![],
+            vlan_id: 0,
+            network_type: "vxlan".to_string(),
+            enable_outbound_nat: true,
+        }];
+        assert_eq!(network_type_for("vxlan-test", "node-a", &networks), "vxlan");
+        assert_eq!(network_type_for("missing", "node-a", &networks), "unknown");
     }
 }

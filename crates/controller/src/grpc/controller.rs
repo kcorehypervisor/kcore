@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tonic::{Request, Response, Status};
@@ -71,6 +72,82 @@ pub struct ControllerService {
 }
 
 impl ControllerService {
+    fn reserve_nat_vm_ip_for_network(
+        &self,
+        node_id: &str,
+        vm_network: &str,
+        vm_id: &str,
+        gateway_ip: &str,
+    ) -> Result<String, Status> {
+        let mut octets = gateway_ip.split('.');
+        let o0 = octets
+            .next()
+            .ok_or_else(|| Status::internal(format!("invalid gateway IP '{}'", gateway_ip)))?;
+        let o1 = octets
+            .next()
+            .ok_or_else(|| Status::internal(format!("invalid gateway IP '{}'", gateway_ip)))?;
+        let o2 = octets
+            .next()
+            .ok_or_else(|| Status::internal(format!("invalid gateway IP '{}'", gateway_ip)))?;
+        let _o3 = octets
+            .next()
+            .ok_or_else(|| Status::internal(format!("invalid gateway IP '{}'", gateway_ip)))?;
+        let prefix = format!("{o0}.{o1}.{o2}");
+
+        let existing = self
+            .db
+            .list_vms_for_node(node_id)
+            .map_err(|e| Status::internal(format!("listing vms for IP reservation: {e}")))?;
+        let mut used_hosts: HashSet<u16> = HashSet::new();
+        for vm in existing {
+            if vm.network != vm_network || vm.vm_ip.is_empty() {
+                continue;
+            }
+            let mut vm_octets = vm.vm_ip.split('.');
+            let Some(v0) = vm_octets.next() else {
+                continue;
+            };
+            let Some(v1) = vm_octets.next() else {
+                continue;
+            };
+            let Some(v2) = vm_octets.next() else {
+                continue;
+            };
+            let Some(v3) = vm_octets.next() else {
+                continue;
+            };
+            if format!("{v0}.{v1}.{v2}") != prefix {
+                continue;
+            }
+            if let Ok(host) = v3.parse::<u16>() {
+                used_hosts.insert(host);
+            }
+        }
+
+        // Keep .1 for gateway and reserve lower addresses for infra.
+        const MIN_HOST: u16 = 10;
+        const MAX_HOST: u16 = 249;
+        const POOL_SIZE: u16 = (MAX_HOST - MIN_HOST) + 1;
+
+        let mut seed: u32 = 0;
+        for b in vm_id.as_bytes() {
+            seed = seed.wrapping_mul(131).wrapping_add(*b as u32);
+        }
+        let preferred_offset = (seed % POOL_SIZE as u32) as u16;
+
+        for probe in 0..POOL_SIZE {
+            let offset = (preferred_offset + probe) % POOL_SIZE;
+            let host = MIN_HOST + offset;
+            if !used_hosts.contains(&host) {
+                return Ok(format!("{prefix}.{host}"));
+            }
+        }
+        Err(Status::resource_exhausted(format!(
+            "no free NAT reservation addresses for network '{}' on node '{}'",
+            vm_network, node_id
+        )))
+    }
+
     pub fn new(
         db: Database,
         clients: NodeClients,
@@ -351,6 +428,19 @@ impl ControllerService {
         auto_start: bool,
     ) -> Result<i32, Status> {
         let node = self.resolve_node_for_vm(vm_id, target_node)?;
+        let vm_name = self
+            .db
+            .get_vm(vm_id)
+            .map_err(|e| Status::internal(format!("fetching vm: {e}")))?
+            .map(|vm| vm.name)
+            .or_else(|| {
+                self.db
+                    .list_vms_for_node(&node.id)
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|vm| vm.name == vm_id))
+                    .map(|vm| vm.name)
+            })
+            .ok_or_else(|| Status::not_found(format!("VM {vm_id} not found")))?;
         let updated = self
             .db
             .set_vm_auto_start(vm_id, auto_start)
@@ -359,6 +449,24 @@ impl ControllerService {
             return Err(Status::not_found(format!("VM {vm_id} not found")));
         }
         self.push_config_to_node(&node).await?;
+        let desired_state = if auto_start {
+            node_proto::VmDesiredState::Running as i32
+        } else {
+            node_proto::VmDesiredState::Stopped as i32
+        };
+        let mut compute = self.ensure_compute_client_for_address(&node.address).await?;
+        compute
+            .set_vm_desired_state(node_proto::SetVmDesiredStateRequest {
+                vm_id: vm_name,
+                desired_state,
+            })
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "applying desired runtime state on node {} for VM {}: {e}",
+                    node.id, vm_id
+                ))
+            })?;
         Ok(if auto_start {
             controller_proto::VmState::Running as i32
         } else {
@@ -802,21 +910,27 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )));
         }
 
-        let vm_ip = if vm_network != "default" {
-            if let Some(net) = self
-                .db
-                .get_network_for_node(&node.id, &vm_network)
-                .map_err(|e| Status::internal(format!("fetching network: {e}")))?
-            {
-                if net.network_type == "vxlan" {
-                    self.db
-                        .allocate_vm_ip(&vm_network, &node.id)
-                        .map_err(|e| Status::internal(format!("allocating VM IP: {e}")))?
-                } else {
-                    String::new()
+        let vm_ip = if vm_network == "default" {
+            self.reserve_nat_vm_ip_for_network(
+                &node.id,
+                &vm_network,
+                &vm_id,
+                &self.default_network.gateway_ip,
+            )?
+        } else if let Some(net) = self
+            .db
+            .get_network_for_node(&node.id, &vm_network)
+            .map_err(|e| Status::internal(format!("fetching network: {e}")))?
+        {
+            match net.network_type.as_str() {
+                "vxlan" => self
+                    .db
+                    .allocate_vm_ip(&vm_network, &node.id)
+                    .map_err(|e| Status::internal(format!("allocating VM IP: {e}")))?,
+                "nat" => {
+                    self.reserve_nat_vm_ip_for_network(&node.id, &vm_network, &vm_id, &net.gateway_ip)?
                 }
-            } else {
-                String::new()
+                _ => String::new(),
             }
         } else {
             String::new()
@@ -1105,16 +1219,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     spec,
                     status,
                     node_id: node.id,
+                    assigned_ip: db_vm.vm_ip.clone(),
                 }));
             }
         };
 
-        let spec = inner.spec.map(|s| controller_proto::VmSpec {
-            id: s.id,
-            name: s.name,
-            cpu: s.cpu,
-            memory_bytes: s.memory_bytes,
-            disks: s
+        let spec = inner.spec.map(|s| {
+            let mut disks: Vec<controller_proto::Disk> = s
                 .disks
                 .into_iter()
                 .map(|d| controller_proto::Disk {
@@ -1123,16 +1234,67 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     bus: d.bus,
                     device: d.device,
                 })
-                .collect(),
-            nics: s
+                .collect();
+            if disks.is_empty() {
+                disks.push(controller_proto::Disk {
+                    name: "boot".to_string(),
+                    backend_handle: db_vm.image_path.clone(),
+                    bus: String::new(),
+                    device: String::new(),
+                });
+            }
+
+            let mut nics: Vec<controller_proto::Nic> = s
                 .nics
                 .into_iter()
                 .map(|n| controller_proto::Nic {
-                    network: n.network,
+                    network: {
+                        let raw = n.network.trim().to_string();
+                        if raw.is_empty()
+                            || raw.starts_with("tap-")
+                            || raw.starts_with("veth")
+                            || raw.contains("[kcore-net:")
+                        {
+                            db_vm.network.clone()
+                        } else {
+                            raw
+                        }
+                    },
                     model: n.model,
                     mac_address: n.mac_address,
                 })
-                .collect(),
+                .collect();
+            if nics.is_empty() || nics.iter().all(|n| n.network.trim().is_empty()) {
+                nics = vec![controller_proto::Nic {
+                    network: db_vm.network.clone(),
+                    model: "virtio".to_string(),
+                    mac_address: nics
+                        .first()
+                        .map(|n| n.mac_address.clone())
+                        .unwrap_or_default(),
+                }];
+            }
+
+            controller_proto::VmSpec {
+                id: if s.id.is_empty() {
+                    db_vm.id.clone()
+                } else {
+                    s.id
+                },
+                name: if s.name.is_empty() {
+                    db_vm.name.clone()
+                } else {
+                    s.name
+                },
+                cpu: if s.cpu == 0 { db_vm.cpu } else { s.cpu },
+                memory_bytes: if s.memory_bytes == 0 {
+                    db_vm.memory_bytes
+                } else {
+                    s.memory_bytes
+                },
+                disks,
+                nics,
+            }
         });
 
         let status = inner.status.map(|s| controller_proto::VmStatus {
@@ -1146,6 +1308,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             spec,
             status,
             node_id: node.id,
+            assigned_ip: db_vm.vm_ip,
         }))
     }
 
@@ -2186,40 +2349,117 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut total_block_devices: i32 = 0;
 
         for node in &approved {
-            let (disks, disk_inventory_ok) = match self.ensure_admin_client_for_node(node).await {
-                Ok(mut admin) => match admin.list_disks(node_proto::ListDisksRequest {}).await {
-                    Ok(resp) => {
-                        let disks: Vec<controller_proto::StorageDiskDetail> = resp
-                            .into_inner()
-                            .disks
-                            .into_iter()
-                            .map(|d| controller_proto::StorageDiskDetail {
-                                name: d.name,
-                                path: d.path,
-                                size: d.size,
-                                model: d.model,
-                                fstype: d.fstype,
-                                mountpoint: d.mountpoint,
-                            })
-                            .collect();
-                        (disks, true)
-                    }
-                    Err(e) => {
-                        warn!(
-                            node_id = %node.id,
-                            error = %e,
-                            "ListDisks failed for storage overview"
-                        );
-                        (vec![], false)
-                    }
-                },
+            let (
+                disks,
+                disk_inventory_ok,
+                lvm_inventory_ok,
+                lvm_volume_groups,
+                lvm_logical_volumes,
+                lvm_physical_volumes,
+            ) = match self.ensure_admin_client_for_node(node).await {
+                Ok(mut admin) => {
+                    let (disks, disk_inventory_ok) =
+                        match admin.list_disks(node_proto::ListDisksRequest {}).await {
+                            Ok(resp) => {
+                                let disks: Vec<controller_proto::StorageDiskDetail> = resp
+                                    .into_inner()
+                                    .disks
+                                    .into_iter()
+                                    .map(|d| controller_proto::StorageDiskDetail {
+                                        name: d.name,
+                                        path: d.path,
+                                        size: d.size,
+                                        model: d.model,
+                                        fstype: d.fstype,
+                                        mountpoint: d.mountpoint,
+                                    })
+                                    .collect();
+                                (disks, true)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    node_id = %node.id,
+                                    error = %e,
+                                    "ListDisks failed for storage overview"
+                                );
+                                (vec![], false)
+                            }
+                        };
+
+                    let (lvm_inventory_ok, lvm_volume_groups, lvm_logical_volumes, lvm_physical_volumes) =
+                        match admin.get_lvm_info(node_proto::GetLvmInfoRequest {}).await {
+                            Ok(resp) => {
+                                let inner = resp.into_inner();
+                                if inner.available {
+                                    (
+                                        true,
+                                        inner
+                                            .volume_groups
+                                            .into_iter()
+                                            .map(|vg| controller_proto::StorageLvmVolumeGroupDetail {
+                                                name: vg.name,
+                                                size_bytes: vg.size_bytes,
+                                                free_bytes: vg.free_bytes,
+                                                attr: vg.attr,
+                                            })
+                                            .collect(),
+                                        inner
+                                            .logical_volumes
+                                            .into_iter()
+                                            .map(|lv| controller_proto::StorageLvmLogicalVolumeDetail {
+                                                name: lv.name,
+                                                vg_name: lv.vg_name,
+                                                size_bytes: lv.size_bytes,
+                                                attr: lv.attr,
+                                                path: lv.path,
+                                                pool: lv.pool,
+                                                origin: lv.origin,
+                                                data_percent: lv.data_percent,
+                                                metadata_percent: lv.metadata_percent,
+                                            })
+                                            .collect(),
+                                        inner
+                                            .physical_volumes
+                                            .into_iter()
+                                            .map(|pv| controller_proto::StorageLvmPhysicalVolumeDetail {
+                                                name: pv.name,
+                                                vg_name: pv.vg_name,
+                                                size_bytes: pv.size_bytes,
+                                                free_bytes: pv.free_bytes,
+                                                attr: pv.attr,
+                                            })
+                                            .collect(),
+                                    )
+                                } else {
+                                    (false, vec![], vec![], vec![])
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    node_id = %node.id,
+                                    error = %e,
+                                    "GetLvmInfo failed for storage overview"
+                                );
+                                (false, vec![], vec![], vec![])
+                            }
+                        };
+
+                    (
+                        disks,
+                        disk_inventory_ok,
+                        lvm_inventory_ok,
+                        lvm_volume_groups,
+                        lvm_logical_volumes,
+                        lvm_physical_volumes,
+                    )
+                }
                 Err(e) => {
                     warn!(
                         node_id = %node.id,
                         error = %e,
                         "cannot reach node for storage overview"
                     );
-                    (vec![], false)
+                    (vec![], false, false, vec![], vec![], vec![])
                 }
             };
 
@@ -2236,6 +2476,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 luks_method: node.luks_method.clone(),
                 disk_inventory_ok,
                 disks,
+                lvm_inventory_ok,
+                lvm_volume_groups,
+                lvm_logical_volumes,
+                lvm_physical_volumes,
             });
         }
 

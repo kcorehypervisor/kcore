@@ -101,6 +101,11 @@ enum Command {
         #[command(subcommand)]
         resource: GetResource,
     },
+    /// Describe a resource with full details
+    Describe {
+        #[command(subcommand)]
+        resource: DescribeResource,
+    },
     /// Node administration commands
     Node {
         #[command(subcommand)]
@@ -414,6 +419,48 @@ enum ResolveResource {
         /// Conflict ID (from `kctl get conflicts`)
         id: i64,
     },
+}
+
+#[derive(Subcommand)]
+enum DescribeResource {
+    /// Describe a virtual machine
+    #[command(alias = "vms")]
+    Vm {
+        /// VM ID or name
+        name: String,
+        /// Target node (optional)
+        #[arg(long = "target-node")]
+        target_node: Option<String>,
+    },
+    /// Describe a node
+    #[command(alias = "nodes")]
+    Node {
+        /// Node ID
+        name: String,
+    },
+    /// Describe a network
+    #[command(alias = "networks")]
+    Network {
+        /// Network name
+        name: String,
+        /// Target node (optional; required if name exists on multiple nodes)
+        #[arg(long = "target-node")]
+        target_node: Option<String>,
+    },
+    /// Describe an SSH key
+    #[command(name = "ssh-key", alias = "sshkey")]
+    SshKey {
+        /// Key name
+        name: String,
+    },
+    /// Describe a replication conflict
+    Conflict {
+        /// Conflict ID
+        id: i64,
+    },
+    /// Describe cluster compliance report
+    #[command(name = "compliance-report", alias = "compliance")]
+    ComplianceReport,
 }
 
 #[derive(Subcommand)]
@@ -802,6 +849,43 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::conflict::list(&info, *limit).await
+        }
+
+        Command::Describe {
+            resource: DescribeResource::Vm { name, target_node },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::vm::describe(&info, name, target_node.clone()).await
+        }
+        Command::Describe {
+            resource: DescribeResource::Node { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::node::get_node(&info, name).await
+        }
+        Command::Describe {
+            resource: DescribeResource::Network { name, target_node },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::network::describe(&info, name, target_node.clone()).await
+        }
+        Command::Describe {
+            resource: DescribeResource::SshKey { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ssh_key::get(&info, name).await
+        }
+        Command::Describe {
+            resource: DescribeResource::Conflict { id },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::conflict::describe(&info, *id).await
+        }
+        Command::Describe {
+            resource: DescribeResource::ComplianceReport,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::compliance::report(&info).await
         }
 
         Command::Node {

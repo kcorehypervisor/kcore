@@ -197,6 +197,12 @@ pub fn generate_node_config(
             "      cloudInitInstanceId = \"{}\";\n",
             nix_escape(&vm.id)
         ));
+        if !vm.vm_ip.is_empty() {
+            out.push_str(&format!(
+                "      dhcpReservedIPv4 = \"{}\";\n",
+                nix_escape(&vm.vm_ip)
+            ));
+        }
         out.push_str(&format!(
             "      autoStart = {};\n",
             if vm.auto_start { "true" } else { "false" }
@@ -236,7 +242,9 @@ pub fn generate_node_config(
             if let Some(net) = vm_net {
                 if net.network_type == "vxlan" {
                     let cidr = netmask_to_cidr(&net.internal_netmask);
-                    let mut net_cfg = String::from("version: 2\nethernets:\n  eth0:\n");
+                    let mut net_cfg = String::from(
+                        "version: 2\nethernets:\n  kcore0:\n    match:\n      name: \"e*\"\n    dhcp4: false\n",
+                    );
                     net_cfg.push_str(&format!("    addresses: [\"{}/{}\"]\n", vm.vm_ip, cidr));
                     net_cfg.push_str(&format!("    gateway4: \"{}\"\n", net.gateway_ip));
                     net_cfg.push_str("    nameservers:\n      addresses: [1.1.1.1, 8.8.8.8]\n");
@@ -636,6 +644,8 @@ mod tests {
             config.contains("cloudInitNetworkConfigFile"),
             "should have static network config"
         );
+        assert!(config.contains("name: \\\"e*\\\""));
+        assert!(config.contains("dhcp4: false"));
         assert!(config.contains("10.200.0.5/24"));
         assert!(config.contains("gateway4"));
     }

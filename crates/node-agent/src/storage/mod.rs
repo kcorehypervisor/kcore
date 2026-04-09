@@ -641,12 +641,26 @@ fn ensure_image_cached(
                 downloaded: false,
             });
         }
-        std::fs::remove_file(&destination).map_err(|e| {
-            StorageError::new(
-                ErrorKind::Internal,
-                format!("removing {}: {e}", destination.display()),
-            )
-        })?;
+        // Important: destination_path can be the active writable VM disk.
+        // If that disk has diverged from the original image hash (normal after boot),
+        // deleting and re-downloading here would destroy guest state.
+        //
+        // Keep the existing file and treat it as cached. URL/SHA validation still
+        // happens on first materialization when the path does not already exist.
+        let size_bytes = std::fs::metadata(&destination)
+            .map_err(|e| {
+                StorageError::new(
+                    ErrorKind::Internal,
+                    format!("stat {}: {e}", destination.display()),
+                )
+            })?
+            .len() as i64;
+        return Ok(EnsureImageResult {
+            path: destination.display().to_string(),
+            size_bytes,
+            cached: true,
+            downloaded: false,
+        });
     }
 
     let timestamp = SystemTime::now()
@@ -1135,5 +1149,38 @@ mod tests {
         assert_eq!(result.image_format, "qcow2");
         assert_eq!(result.image_sha256, expected);
         assert!(PathBuf::from(result.path).exists());
+    }
+
+    #[test]
+    fn ensure_image_keeps_existing_file_when_hash_diverged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache_dir = temp.path().join("images");
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+
+        let destination = cache_dir.join("existing.qcow2");
+        std::fs::write(&destination, b"mutated-vm-disk").expect("write destination");
+        let original_contents = std::fs::read(&destination).expect("read before ensure");
+        let original_size = std::fs::metadata(&destination).expect("stat before").len() as i64;
+
+        // Deliberately provide a valid but different SHA and an invalid URL host.
+        // The implementation should not delete/re-download because the destination
+        // already exists.
+        let result = ensure_image_cached(
+            &cache_dir,
+            EnsureImageRequest {
+                image_url: "https://example.invalid/base.qcow2".to_string(),
+                image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                destination_path: destination.display().to_string(),
+            },
+        )
+        .expect("existing image should be preserved");
+
+        assert_eq!(result.path, destination.display().to_string());
+        assert_eq!(result.size_bytes, original_size);
+        assert!(result.cached);
+        assert!(!result.downloaded);
+        let after_contents = std::fs::read(&destination).expect("read after ensure");
+        assert_eq!(after_contents, original_contents);
     }
 }

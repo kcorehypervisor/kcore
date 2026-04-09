@@ -2,9 +2,12 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::Value as JsonValue;
 use tokio::process::Command;
+use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 use tracing::{error, info};
 
@@ -12,12 +15,11 @@ use crate::auth::{self, CN_CONTROLLER, CN_KCTL};
 use crate::discovery;
 use crate::proto;
 use crate::storage::{self, StorageAdapter};
-use std::sync::Arc;
-
 pub struct AdminService {
     nix_config_path: PathBuf,
     vm_socket_dir: PathBuf,
     storage: Arc<dyn StorageAdapter>,
+    apply_lock: Arc<AsyncMutex<()>>,
 }
 
 const BOOTSTRAP_CERT_DIR: &str = "/etc/kcore/certs";
@@ -69,6 +71,7 @@ impl AdminService {
             nix_config_path: PathBuf::from(nix_config_path),
             vm_socket_dir: PathBuf::from(vm_socket_dir),
             storage,
+            apply_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 }
@@ -143,6 +146,14 @@ async fn log_failed_kcore_units(context: &'static str) {
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    if stdout.contains("0 loaded units listed.") {
+        info!(
+            context = context,
+            exit_code = out.status.code().unwrap_or(-1),
+            "no failed kcore VM units after nix apply"
+        );
+        return;
+    }
     error!(
         context = context,
         exit_code = out.status.code().unwrap_or(-1),
@@ -152,7 +163,57 @@ async fn log_failed_kcore_units(context: &'static str) {
     );
 }
 
-async fn run_test_then_switch(path: PathBuf) {
+fn parse_stopped_vms_from_nix(configuration_nix: &str) -> Vec<String> {
+    let mut current_vm: Option<String> = None;
+    let mut stopped = Vec::new();
+    for raw in configuration_nix.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("virtualMachines.\"") {
+            if let Some((vm_name, _)) = rest.split_once("\"") {
+                current_vm = Some(vm_name.to_string());
+            }
+            continue;
+        }
+        if line.starts_with("};") {
+            current_vm = None;
+            continue;
+        }
+        if let Some(vm_name) = current_vm.as_ref() {
+            if line == "autoStart = false;" {
+                stopped.push(vm_name.clone());
+            }
+        }
+    }
+    stopped.sort();
+    stopped.dedup();
+    stopped
+}
+
+async fn enforce_stopped_vm_units(stopped_vms: &[String]) {
+    for vm_name in stopped_vms {
+        let unit = format!("kcore-vm-{vm_name}.service");
+        let out = match Command::new("systemctl").args(["stop", &unit]).output().await {
+            Ok(out) => out,
+            Err(e) => {
+                error!(vm_name = %vm_name, error = %e, "failed to spawn systemctl stop");
+                continue;
+            }
+        };
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!(
+                vm_name = %vm_name,
+                unit = %unit,
+                stderr = %stderr,
+                "failed to enforce stopped VM unit after switch"
+            );
+        } else {
+            info!(vm_name = %vm_name, unit = %unit, "enforced stopped VM unit");
+        }
+    }
+}
+
+async fn run_test_then_switch(path: PathBuf, desired_stopped_vms: Vec<String>) {
     info!("starting nixos-rebuild test");
     let test_out = match run_rebuild_mode("test").await {
         Ok(out) => out,
@@ -177,6 +238,7 @@ async fn run_test_then_switch(path: PathBuf) {
     match run_rebuild_mode("switch").await {
         Ok(out) if out.status.success() => {
             info!("nixos-rebuild switch completed");
+            enforce_stopped_vm_units(&desired_stopped_vms).await;
             log_failed_kcore_units("after_nixos_rebuild_switch_success").await;
         }
         Ok(out) => {
@@ -313,6 +375,172 @@ fn validate_timeout_ms_or_default(timeout_ms: i32) -> u64 {
         1500
     } else {
         timeout_ms as u64
+    }
+}
+
+fn parse_i64_field(v: &JsonValue, key: &str) -> i64 {
+    if let Some(n) = v.get(key).and_then(|x| x.as_i64()) {
+        return n;
+    }
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn parse_string_field(v: &JsonValue, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+async fn lvm_report_json(bin: &str, args: &[&str]) -> Result<JsonValue, String> {
+    let resolved = resolve_lvm_bin(bin);
+    let out = Command::new(&resolved)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("spawn {resolved} {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("{bin} {} failed: {}", args.join(" "), stderr.trim()));
+    }
+    serde_json::from_slice::<JsonValue>(&out.stdout)
+        .map_err(|e| format!("parse {resolved} {} json: {e}", args.join(" ")))
+}
+
+fn resolve_lvm_bin(bin: &str) -> String {
+    let candidates = [
+        format!("/run/current-system/sw/bin/{bin}"),
+        format!("/nix/var/nix/profiles/default/bin/{bin}"),
+        format!("/usr/sbin/{bin}"),
+        format!("/usr/bin/{bin}"),
+        bin.to_string(),
+    ];
+    for c in candidates {
+        if std::path::Path::new(&c).exists() || !c.starts_with('/') {
+            return c;
+        }
+    }
+    bin.to_string()
+}
+
+async fn collect_lvm_info() -> proto::GetLvmInfoResponse {
+    let vg = lvm_report_json("vgs", &[
+        "--reportformat",
+        "json",
+        "--units",
+        "b",
+        "--nosuffix",
+        "-o",
+        "vg_name,vg_size,vg_free,vg_attr",
+    ])
+    .await;
+    let lv = lvm_report_json("lvs", &[
+        "--reportformat",
+        "json",
+        "--units",
+        "b",
+        "--nosuffix",
+        "-o",
+        "lv_name,vg_name,lv_size,lv_attr,lv_path,pool_lv,origin,data_percent,metadata_percent",
+    ])
+    .await;
+    let pv = lvm_report_json("pvs", &[
+        "--reportformat",
+        "json",
+        "--units",
+        "b",
+        "--nosuffix",
+        "-o",
+        "pv_name,vg_name,pv_size,pv_free,pv_attr",
+    ])
+    .await;
+
+    if vg.is_err() && lv.is_err() && pv.is_err() {
+        return proto::GetLvmInfoResponse {
+            available: false,
+            message: "lvm tooling unavailable or no readable reports".to_string(),
+            volume_groups: vec![],
+            logical_volumes: vec![],
+            physical_volumes: vec![],
+        };
+    }
+
+    let mut volume_groups = Vec::new();
+    if let Ok(vg_json) = vg {
+        if let Some(vgs) = vg_json
+            .get("report")
+            .and_then(|r| r.as_array())
+            .and_then(|r| r.first())
+            .and_then(|x| x.get("vg"))
+            .and_then(|x| x.as_array())
+        {
+            for row in vgs {
+                volume_groups.push(proto::LvmVolumeGroupInfo {
+                    name: parse_string_field(row, "vg_name"),
+                    size_bytes: parse_i64_field(row, "vg_size"),
+                    free_bytes: parse_i64_field(row, "vg_free"),
+                    attr: parse_string_field(row, "vg_attr"),
+                });
+            }
+        }
+    }
+
+    let mut logical_volumes = Vec::new();
+    if let Ok(lv_json) = lv {
+        if let Some(lvs) = lv_json
+            .get("report")
+            .and_then(|r| r.as_array())
+            .and_then(|r| r.first())
+            .and_then(|x| x.get("lv"))
+            .and_then(|x| x.as_array())
+        {
+            for row in lvs {
+                logical_volumes.push(proto::LvmLogicalVolumeInfo {
+                    name: parse_string_field(row, "lv_name"),
+                    vg_name: parse_string_field(row, "vg_name"),
+                    size_bytes: parse_i64_field(row, "lv_size"),
+                    attr: parse_string_field(row, "lv_attr"),
+                    path: parse_string_field(row, "lv_path"),
+                    pool: parse_string_field(row, "pool_lv"),
+                    origin: parse_string_field(row, "origin"),
+                    data_percent: parse_string_field(row, "data_percent"),
+                    metadata_percent: parse_string_field(row, "metadata_percent"),
+                });
+            }
+        }
+    }
+
+    let mut physical_volumes = Vec::new();
+    if let Ok(pv_json) = pv {
+        if let Some(pvs) = pv_json
+            .get("report")
+            .and_then(|r| r.as_array())
+            .and_then(|r| r.first())
+            .and_then(|x| x.get("pv"))
+            .and_then(|x| x.as_array())
+        {
+            for row in pvs {
+                physical_volumes.push(proto::LvmPhysicalVolumeInfo {
+                    name: parse_string_field(row, "pv_name"),
+                    vg_name: parse_string_field(row, "vg_name"),
+                    size_bytes: parse_i64_field(row, "pv_size"),
+                    free_bytes: parse_i64_field(row, "pv_free"),
+                    attr: parse_string_field(row, "pv_attr"),
+                });
+            }
+        }
+    }
+
+    proto::GetLvmInfoResponse {
+        available: true,
+        message: "ok".to_string(),
+        volume_groups,
+        logical_volumes,
+        physical_volumes,
     }
 }
 
@@ -612,6 +840,14 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn get_lvm_info(
+        &self,
+        request: Request<proto::GetLvmInfoRequest>,
+    ) -> Result<Response<proto::GetLvmInfoResponse>, Status> {
+        auth::require_peer_insecure_ok(&request, &[CN_KCTL, CN_CONTROLLER])?;
+        Ok(Response::new(collect_lvm_info().await))
+    }
+
     async fn apply_nix_config(
         &self,
         request: Request<proto::ApplyNixConfigRequest>,
@@ -642,8 +878,11 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let planned_steps = rebuild_sequence(true).join(" -> ");
         info!(path = %path.display(), steps = %planned_steps, "starting background nix apply flow");
         let rebuild_path = path.clone();
+        let desired_stopped_vms = parse_stopped_vms_from_nix(&req.configuration_nix);
+        let apply_lock = Arc::clone(&self.apply_lock);
         tokio::spawn(async move {
-            run_test_then_switch(rebuild_path).await;
+            let _guard = apply_lock.lock().await;
+            run_test_then_switch(rebuild_path, desired_stopped_vms).await;
         });
 
         Ok(Response::new(proto::ApplyNixConfigResponse {

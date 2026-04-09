@@ -89,7 +89,197 @@ pub async fn get_node(info: &ConnectionInfo, node_id: &str) -> Result<()> {
             println!("  {:<36}  {:<20}  {:<10}", vm.id, vm.name, state);
         }
     }
+
+    // Network view (default + custom networks on this node).
+    if let Ok(overview) = client
+        .get_network_overview(controller_proto::GetNetworkOverviewRequest {})
+        .await
+        .map(|r| r.into_inner())
+    {
+        if let Some(node_net) = overview.nodes.iter().find(|n| n.node_id == node_id) {
+            let gateway_if = if node_net.gateway_interface.trim().is_empty() {
+                overview.default_gateway_interface.as_str()
+            } else {
+                node_net.gateway_interface.as_str()
+            };
+            println!("\nNetwork:");
+            println!("  Gateway interface: {}", gateway_if);
+            println!("  External IP:       {}", overview.default_external_ip);
+            println!("  Gateway IP:        {}", overview.default_gateway_ip);
+            println!("  Netmask:           {}", overview.default_internal_netmask);
+            if let Some(subnet) =
+                ipv4_subnet_from_gateway_mask(&overview.default_gateway_ip, &overview.default_internal_netmask)
+            {
+                println!("  Subnet:            {subnet}");
+            }
+            println!("  Network type:      nat (default)");
+            println!("  DNS forwarders:    1.1.1.1, 8.8.8.8");
+        }
+    }
+
+    if let Ok(networks) = client
+        .list_networks(controller_proto::ListNetworksRequest {
+            target_node: node_id.to_string(),
+        })
+        .await
+        .map(|r| r.into_inner().networks)
+    {
+        if !networks.is_empty() {
+            println!("\nConfigured networks on node:");
+            for net in networks {
+                let net_type = if net.network_type.is_empty() {
+                    "nat".to_string()
+                } else {
+                    net.network_type
+                };
+                println!(
+                    "  - {}: type={} gateway={} mask={} external={} vlan={}",
+                    net.name,
+                    net_type,
+                    net.gateway_ip,
+                    net.internal_netmask,
+                    net.external_ip,
+                    if net.vlan_id > 0 {
+                        net.vlan_id.to_string()
+                    } else {
+                        "-".to_string()
+                    }
+                );
+            }
+        }
+    }
+
+    // Storage/disk inventory from node agent.
+    if let Ok(storage) = client
+        .get_storage_overview(controller_proto::GetStorageOverviewRequest {})
+        .await
+        .map(|r| r.into_inner())
+    {
+        if let Some(node_storage) = storage.nodes.into_iter().find(|n| n.node_id == node_id) {
+            println!("\nDisks:");
+            if node_storage.disks.is_empty() {
+                println!("  (none reported)");
+            } else {
+                println!(
+                    "  {:<10}  {:<22}  {:>10}  {:<8}  {:<18}  {:<20}",
+                    "NAME", "PATH", "SIZE", "FSTYPE", "MOUNTPOINT", "MODEL"
+                );
+                for d in node_storage.disks {
+                    println!(
+                        "  {:<10}  {:<22}  {:>10}  {:<8}  {:<18}  {:<20}",
+                        d.name, d.path, d.size, d.fstype, d.mountpoint, d.model
+                    );
+                }
+            }
+            println!("\nLVM:");
+            if !node_storage.lvm_inventory_ok {
+                println!("  unavailable: node did not report LVM inventory");
+            } else {
+                if node_storage.lvm_volume_groups.is_empty() {
+                    println!("  Volume groups: (none)");
+                } else {
+                    println!("  Volume groups:");
+                    for vg in node_storage.lvm_volume_groups {
+                        println!(
+                            "    - {} size={} free={} attr={}",
+                            vg.name,
+                            client::format_bytes(vg.size_bytes),
+                            client::format_bytes(vg.free_bytes),
+                            vg.attr
+                        );
+                    }
+                }
+
+                if node_storage.lvm_logical_volumes.is_empty() {
+                    println!("  Logical volumes: (none)");
+                } else {
+                    println!("  Logical volumes:");
+                    for lv in node_storage.lvm_logical_volumes {
+                        println!(
+                            "    - {}/{} size={} path={} attr={}{}{}{}{}",
+                            lv.vg_name,
+                            lv.name,
+                            client::format_bytes(lv.size_bytes),
+                            lv.path,
+                            lv.attr,
+                            if lv.pool.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" pool={}", lv.pool)
+                            },
+                            if lv.origin.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" origin={}", lv.origin)
+                            },
+                            if lv.data_percent.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" data%={}", lv.data_percent)
+                            },
+                            if lv.metadata_percent.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" meta%={}", lv.metadata_percent)
+                            },
+                        );
+                    }
+                }
+
+                if node_storage.lvm_physical_volumes.is_empty() {
+                    println!("  Physical volumes: (none)");
+                } else {
+                    println!("  Physical volumes:");
+                    for pv in node_storage.lvm_physical_volumes {
+                        println!(
+                            "    - {} vg={} size={} free={} attr={}",
+                            pv.name,
+                            if pv.vg_name.is_empty() {
+                                "-".to_string()
+                            } else {
+                                pv.vg_name
+                            },
+                            client::format_bytes(pv.size_bytes),
+                            client::format_bytes(pv.free_bytes),
+                            pv.attr
+                        );
+                    }
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+fn ipv4_subnet_from_gateway_mask(gateway_ip: &str, netmask: &str) -> Option<String> {
+    fn parse(ip: &str) -> Option<[u8; 4]> {
+        let mut parts = ip.split('.');
+        let a = parts.next()?.parse::<u8>().ok()?;
+        let b = parts.next()?.parse::<u8>().ok()?;
+        let c = parts.next()?.parse::<u8>().ok()?;
+        let d = parts.next()?.parse::<u8>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some([a, b, c, d])
+    }
+
+    let ip = parse(gateway_ip)?;
+    let mask = parse(netmask)?;
+    let net = [
+        ip[0] & mask[0],
+        ip[1] & mask[1],
+        ip[2] & mask[2],
+        ip[3] & mask[3],
+    ];
+    let prefix_len = mask
+        .iter()
+        .map(|b| b.count_ones())
+        .sum::<u32>();
+    Some(format!(
+        "{}.{}.{}.{}/{}",
+        net[0], net[1], net[2], net[3], prefix_len
+    ))
 }
 
 pub async fn disks(info: &ConnectionInfo) -> Result<()> {

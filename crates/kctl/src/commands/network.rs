@@ -92,3 +92,111 @@ pub async fn list(info: &ConnectionInfo, target_node: Option<String>) -> Result<
     }
     Ok(())
 }
+
+pub async fn describe(info: &ConnectionInfo, name: &str, target_node: Option<String>) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .list_networks(proto::ListNetworksRequest {
+            target_node: target_node.clone().unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+
+    let mut matches: Vec<_> = resp.networks.into_iter().filter(|n| n.name == name).collect();
+    if matches.is_empty() {
+        anyhow::bail!("network '{name}' not found");
+    }
+    if matches.len() > 1 && target_node.is_none() {
+        let nodes = matches
+            .iter()
+            .map(|n| n.node_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "network '{name}' exists on multiple nodes ({nodes}); rerun with --target-node"
+        );
+    }
+    let net = matches.swap_remove(0);
+    let net_type = if net.network_type.is_empty() {
+        "nat".to_string()
+    } else {
+        net.network_type.clone()
+    };
+    let vlan = if net.vlan_id > 0 {
+        net.vlan_id.to_string()
+    } else {
+        "-".to_string()
+    };
+
+    println!("Name:              {}", net.name);
+    println!("Node:              {}", net.node_id);
+    println!("Type:              {net_type}");
+    println!("Gateway IP:        {}", net.gateway_ip);
+    println!("Internal netmask:  {}", net.internal_netmask);
+    if let Some(cidr) = ipv4_subnet_from_gateway_mask(&net.gateway_ip, &net.internal_netmask) {
+        println!("Network CIDR:      {cidr}");
+    }
+    println!("External IP:       {}", net.external_ip);
+    println!("VLAN:              {vlan}");
+    println!(
+        "Outbound NAT:      {}",
+        if net.enable_outbound_nat {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "Allowed TCP ports: {}",
+        if net.allowed_tcp_ports.is_empty() {
+            "(none)".to_string()
+        } else {
+            net.allowed_tcp_ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    println!(
+        "Allowed UDP ports: {}",
+        if net.allowed_udp_ports.is_empty() {
+            "(none)".to_string()
+        } else {
+            net.allowed_udp_ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    Ok(())
+}
+
+fn ipv4_subnet_from_gateway_mask(gateway_ip: &str, netmask: &str) -> Option<String> {
+    fn parse_ipv4(ip: &str) -> Option<[u8; 4]> {
+        let mut parts = ip.split('.');
+        let a = parts.next()?.parse::<u8>().ok()?;
+        let b = parts.next()?.parse::<u8>().ok()?;
+        let c = parts.next()?.parse::<u8>().ok()?;
+        let d = parts.next()?.parse::<u8>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some([a, b, c, d])
+    }
+
+    let ip = parse_ipv4(gateway_ip)?;
+    let mask = parse_ipv4(netmask)?;
+    let network = [
+        ip[0] & mask[0],
+        ip[1] & mask[1],
+        ip[2] & mask[2],
+        ip[3] & mask[3],
+    ];
+    let prefix = mask.iter().map(|b| b.count_ones()).sum::<u32>();
+    Some(format!(
+        "{}.{}.{}.{}/{}",
+        network[0], network[1], network[2], network[3], prefix
+    ))
+}

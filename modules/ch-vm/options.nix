@@ -158,6 +158,12 @@ let
         description = "MAC address for the VM NIC. Auto-generated if null.";
       };
 
+      dhcpReservedIPv4 = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional static DHCP reservation IP (used by dnsmasq on NAT networks).";
+      };
+
       extraArgs = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];

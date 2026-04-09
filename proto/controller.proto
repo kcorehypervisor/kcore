@@ -177,6 +177,7 @@ message GetVmResponse {
   VmSpec spec = 1;
   VmStatus status = 2;
   string node_id = 3;  // Which node it's on
+  string assigned_ip = 4; // Controller-assigned VM IP (static/reserved when available)
 }
 
 message ListVmsRequest {
@@ -631,6 +632,33 @@ message StorageDiskDetail {
   string mountpoint = 6;
 }
 
+message StorageLvmVolumeGroupDetail {
+  string name = 1;
+  int64 size_bytes = 2;
+  int64 free_bytes = 3;
+  string attr = 4;
+}
+
+message StorageLvmLogicalVolumeDetail {
+  string name = 1;
+  string vg_name = 2;
+  int64 size_bytes = 3;
+  string attr = 4;
+  string path = 5;
+  string pool = 6;
+  string origin = 7;
+  string data_percent = 8;
+  string metadata_percent = 9;
+}
+
+message StorageLvmPhysicalVolumeDetail {
+  string name = 1;
+  string vg_name = 2;
+  int64 size_bytes = 3;
+  int64 free_bytes = 4;
+  string attr = 5;
+}
+
 message NodeStorageOverview {
   string node_id = 1;
   string hostname = 2;
@@ -639,6 +667,10 @@ message NodeStorageOverview {
   string luks_method = 5;
   bool disk_inventory_ok = 6;
   repeated StorageDiskDetail disks = 7;
+  bool lvm_inventory_ok = 8;
+  repeated StorageLvmVolumeGroupDetail lvm_volume_groups = 9;
+  repeated StorageLvmLogicalVolumeDetail lvm_logical_volumes = 10;
+  repeated StorageLvmPhysicalVolumeDetail lvm_physical_volumes = 11;
 }
 
 message GetStorageOverviewResponse {

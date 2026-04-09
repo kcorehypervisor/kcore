@@ -1,4 +1,4 @@
-.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace coverage test-controller test-node-agent test-kctl test-rust-filter iso iso-remote kctl clean help
+.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace coverage test-controller test-node-agent test-kctl test-rust-filter loc iso iso-remote kctl clean help
 
 VERSION := $(shell cat VERSION)
 V ?= v$(VERSION)
@@ -66,6 +66,11 @@ test-rust-filter:
 	fi
 	cargo test --workspace "$(TEST)"
 
+loc:
+	@echo "Counting source lines..."
+	@echo "Rust (.rs): $$(rg --files -g '*.rs' | xargs wc -l | awk 'END {print $$1}')"
+	@echo "Nix  (.nix): $$(rg --files -g '*.nix' | xargs wc -l | awk 'END {print $$1}')"
+
 iso:
 	@echo "Building kcore ISO $(V) (requires Linux)..."
 	nix build .#nixosConfigurations.kcore-iso.config.system.build.isoImage -o result-iso
@@ -107,6 +112,7 @@ help:
 	@echo "  test-node-agent  Run node-agent crate tests"
 	@echo "  test-kctl   Run kctl crate tests"
 	@echo "  test-rust-filter TEST=<pattern>  Run matching Rust tests only"
+	@echo "  loc         Count Rust and Nix source lines"
 	@echo "  iso         Build NixOS ISO (Linux only)"
 	@echo "  iso-remote  Build NixOS ISO on remote Linux server (from macOS)"
 	@echo "  kctl        Build kctl CLI only"
