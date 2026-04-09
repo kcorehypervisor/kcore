@@ -86,18 +86,26 @@ Notes:
 
 #### Data disks during `install-to-disk`
 
-The installer **only** records dedicated block devices in `/etc/kcore/data-disks` and writes the intended **storage backend** and parameters (LVM VG name, ZFS pool name, etc.) into `/etc/kcore/node-agent.yaml`. It does **not** create volume groups, pools, or logical volumes/zvols: there is often **no controller** yet, and destroying or reshaping data disks belongs in a **post-install**, **declarative** or **controller-driven** step (see below).
+The installer uses [disko](https://github.com/nix-community/disko) to declaratively partition, format, and mount both the OS disk and any data disks at install time. The generated `disko-config.nix` includes data disk entries matching the requested `--storage-backend`:
 
-### Declarative LVM and ZFS on NixOS (after install)
+- **filesystem**: GPT + ext4 partition mounted at `/var/lib/kcore/volumes`
+- **lvm**: GPT + LVM PV added to a VG named per `--lvm-vg-name` (default `vg_kcore`)
+- **zfs**: GPT + ZFS partition in a zpool named per `--zfs-pool-name` (default `tank0`)
 
-NixOS does **not** ship a single high-level option like `services.lvm.volumeGroups.<name> = { ... }` for creating arbitrary VGs/LVs from scratch. Typical patterns:
+VGs and zpools are **created at install time** by disko. The installer also writes the matching storage backend and parameters into `/etc/kcore/node-agent.yaml`. LVs / zvols are created later by `node-agent` on demand once the backing VG or pool exists.
+
+Device paths are recorded in `/etc/kcore/data-disks` for reference. The authoritative disk layout is the `disko-config.nix` saved at `/etc/nixos/disko-config.nix`.
+
+### Declarative LVM and ZFS on NixOS (day-2)
+
+For day-2 additions of new data disks, the `disko` CLI is available on installed nodes. Typical patterns:
 
 - **[disko](https://github.com/nix-community/disko)** — declarative partition / LUKS / LVM / ZFS / btrfs layout; applies layout from Nix (often run once at install or via a dedicated activation).
 - **`fileSystems` + `swapDevices`** — mount ext4/xfs partitions or ZFS datasets **after** the underlying block device or pool already exists (`fsType = "zfs"` expects an **importable** pool).
 - **ZFS** — enable `boot.supportedFilesystems = [ "zfs" ];` (and usually `boot.initrd.supportedFilesystems = [ "zfs" ];` when pools must be available in initrd). Pool and dataset **creation** is usually done by **disko**, **manual** `zpool create` / `zfs create`, or a **one-shot** `systemd` service guarded by a state file.
 - **LVM** — VG/LV creation is usually **disko**, **imperative** `pvcreate`/`vgcreate`/`lvcreate` once, or a **one-shot** unit; then use `fileSystems` for mount points if needed.
 
-For kcore, VM **volumes** are created at runtime by the node agent (`lvcreate`, `zfs create -V`, etc.) **once** the backing VG or pool exists and matches `node-agent.yaml`.
+For kcore, the backing VG or pool is created by disko at install time. VM **volumes** are then created at runtime by the node agent (`lvcreate`, `zfs create -V`, etc.) against the VG or pool named in `node-agent.yaml`.
 
 ### 2) Create VM with required storage metadata
 
@@ -292,6 +300,9 @@ storage:
   Renders node storage backend in operator output.
 
 ### Nix module surface
+
+- `modules/kcore-disko.nix`  
+  NixOS module that generates `disko.devices` from `kcore.disko.*` options (OS disk with LUKS, data disks with LVM/ZFS/filesystem). Used at install time via the generated `disko-config.nix` and available on installed nodes for day-2 operations.
 
 - `modules/ch-vm/options.nix`  
   Declares VM storage options accepted by generated config (`storageBackend`, `storageSizeBytes`).

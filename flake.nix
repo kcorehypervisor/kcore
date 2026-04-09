@@ -5,6 +5,10 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     crane.url = "github:ipetkov/crane";
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -128,6 +132,7 @@
             );
             fmt-rust = craneLib.cargoFmt { inherit src; };
             vm-module = import ./tests/vm-module.nix { inherit pkgs; };
+            disko-module = import ./tests/disko-module.nix { inherit pkgs; };
             fmt-nix =
               pkgs.runCommand "check-nix-fmt"
                 {
@@ -171,6 +176,7 @@
           nixosModules = {
             ch-vm = chVmModule;
             default = chVmModule;
+            kcore-disko = ./modules/kcore-disko.nix;
             kcore-dashboard = dashboardModule;
           };
 
@@ -189,6 +195,8 @@
                 let
                   nodeAgent = inputs.self.packages.x86_64-linux.kcore-node-agent;
                   controller = inputs.self.packages.x86_64-linux.kcore-controller;
+                  diskoPackage = inputs.disko.packages.x86_64-linux.default;
+                  kcoreDiskoModule = ./modules/kcore-disko.nix;
                 in
                 {
                   system.stateVersion = "25.05";
@@ -279,6 +287,7 @@
                     pkgs.openssl
                     nodeAgent
                     controller
+                    diskoPackage
                     (pkgs.writeShellScriptBin "install-to-disk" ''
                                           set -euo pipefail
 
@@ -300,6 +309,7 @@
                                           LVM_LV_PREFIX="kcore-"
                                           ZFS_POOL_NAME=""
                                           ZFS_DATASET_PREFIX="kcore-"
+                                          RECOVERY_KEY_OUTPUT=""
 
                                           while [[ $# -gt 0 ]]; do
                                             case "$1" in
@@ -375,9 +385,13 @@
                                                 ZFS_DATASET_PREFIX="''${2:-}"
                                                 shift 2
                                                 ;;
+                                              --recovery-key-output)
+                                                RECOVERY_KEY_OUTPUT="''${2:-}"
+                                                shift 2
+                                                ;;
                                               *)
                                                 echo "Unknown argument: $1"
-                                                echo "Usage: install-to-disk [--disk /dev/sda] [--data-disk /dev/nvme0n1] [--hostname HOSTNAME] [--node-id ID] [--data-disk-mode filesystem|lvm|zfs] [--lvm-vg-name VG] [--lvm-lv-prefix PREFIX] [--zfs-pool-name POOL] [--zfs-dataset-prefix PREFIX] [--controller 192.168.40.135[:9090]]... [--dc-id DC1] [--run-controller] [--disable-vxlan] [--luks-method tpm2|key-file] [--yes --wipe --non-interactive --reboot]"
+                                                echo "Usage: install-to-disk [--disk /dev/sda] [--data-disk /dev/nvme0n1] [--hostname HOSTNAME] [--node-id ID] [--data-disk-mode filesystem|lvm|zfs] [--lvm-vg-name VG] [--lvm-lv-prefix PREFIX] [--zfs-pool-name POOL] [--zfs-dataset-prefix PREFIX] [--recovery-key-output /path/file.txt] [--controller 192.168.40.135[:9090]]... [--dc-id DC1] [--run-controller] [--disable-vxlan] [--luks-method tpm2|key-file] [--yes --wipe --non-interactive --reboot]"
                                                 exit 1
                                                 ;;
                                             esac
@@ -445,27 +459,13 @@
                                             fi
                                           done
 
-                                          echo "Partitioning disk..."
-
-                                          for i in {1..3}; do
-                                            wipefs -a -f "$DISK_PATH" && break || sleep 2
-                                          done
-
-                                          parted -s "$DISK_PATH" mklabel gpt
-                                          parted -s "$DISK_PATH" mkpart ESP fat32 1MiB 512MiB
-                                          parted -s "$DISK_PATH" set 1 esp on
-                                          parted -s "$DISK_PATH" mkpart primary ext4 512MiB 100%
-
-                                          sleep 2
-                                          partprobe "$DISK_PATH" || true
-                                          sleep 2
-
-                                          if [[ "$DISK" == *nvme* ]] || [[ "$DISK" == *mmcblk* ]]; then
-                                            BOOT_PART="''${DISK_PATH}p1"
-                                            ROOT_PART="''${DISK_PATH}p2"
-                                          else
-                                            BOOT_PART="''${DISK_PATH}1"
-                                            ROOT_PART="''${DISK_PATH}2"
+                                          # Always wipe signatures on target disks for clean re-installs.
+                                          # This prevents stale LUKS/LVM metadata from previous attempts.
+                                          if [ "$FORCE_WIPE" = "true" ]; then
+                                            wipefs -a "$DISK_PATH" 2>/dev/null || true
+                                            for dd in "''${DATA_DISKS[@]}"; do
+                                              wipefs -a "$dd" 2>/dev/null || true
+                                            done
                                           fi
 
                                           # Auto-detect LUKS method if not provided
@@ -477,42 +477,164 @@
                                             fi
                                           fi
 
-                                          echo "Setting up LUKS encryption (method: $LUKS_METHOD)..."
-                                          if [ "$LUKS_METHOD" = "tpm2" ]; then
-                                            echo "Formatting $ROOT_PART with LUKS2 (TPM2 will be enrolled after install)..."
-                                            TPM_TEMP_PASS=$(${pkgs.openssl}/bin/openssl rand -base64 32)
-                                            echo -n "$TPM_TEMP_PASS" | cryptsetup luksFormat --batch-mode --type luks2 "$ROOT_PART" -
-                                            echo -n "$TPM_TEMP_PASS" | cryptsetup open "$ROOT_PART" cryptroot -
+                                          echo "Disk encryption method: $LUKS_METHOD"
+
+                                          # Generate LUKS passphrase for disko (hex avoids shell-special chars)
+                                          LUKS_PASSPHRASE=$(${pkgs.openssl}/bin/openssl rand -hex 32)
+                                          mkdir -p /tmp/luks
+                                          printf "%s" "$LUKS_PASSPHRASE" > /tmp/luks/password
+                                          chmod 0400 /tmp/luks/password
+
+                                          # Compute ROOT_PART path for post-install TPM enrollment
+                                          if [[ "$DISK" == *nvme* ]] || [[ "$DISK" == *mmcblk* ]]; then
+                                            ROOT_PART="''${DISK_PATH}p2"
                                           else
-                                            echo "Generating LUKS key-file..."
-                                            mkdir -p /tmp/luks
-                                            dd if=/dev/urandom of=/tmp/luks/root.key bs=4096 count=1 2>/dev/null
-                                            chmod 0400 /tmp/luks/root.key
-                                            cryptsetup luksFormat --batch-mode --type luks2 "$ROOT_PART" /tmp/luks/root.key
-                                            cryptsetup open --key-file /tmp/luks/root.key "$ROOT_PART" cryptroot
+                                            ROOT_PART="''${DISK_PATH}2"
                                           fi
-                                          ROOT_DEV="/dev/mapper/cryptroot"
 
-                                          echo "Formatting partitions..."
-                                          mkfs.fat -F 32 -n BOOT "$BOOT_PART"
-                                          mkfs.ext4 -F -L nixos "$ROOT_DEV"
+                                          # --- Build disko device configuration ---
+                                          DATA_DISK_NIX=""
+                                          EXTRA_DEVICES_NIX=""
+                                          for i in "''${!DATA_DISKS[@]}"; do
+                                            dd="''${DATA_DISKS[$i]}"
+                                            case "$DATA_DISK_MODE" in
+                                              filesystem)
+                                                MOUNT="/var/lib/kcore/volumes"
+                                                if [ "$i" -gt 0 ]; then MOUNT="/var/lib/kcore/volumes$i"; fi
+                                                DATA_DISK_NIX="$DATA_DISK_NIX
+      data$i = {
+        type = \"disk\";
+        device = \"$dd\";
+        content = {
+          type = \"gpt\";
+          partitions = {
+            data = {
+              size = \"100%\";
+              content = {
+                type = \"filesystem\";
+                format = \"ext4\";
+                mountpoint = \"$MOUNT\";
+              };
+            };
+          };
+        };
+      };"
+                                                ;;
+                                              lvm)
+                                                DATA_DISK_NIX="$DATA_DISK_NIX
+      data$i = {
+        type = \"disk\";
+        device = \"$dd\";
+        content = {
+          type = \"gpt\";
+          partitions = {
+            lvm = {
+              size = \"100%\";
+              content = {
+                type = \"lvm_pv\";
+                vg = \"$LVM_VG_NAME\";
+              };
+            };
+          };
+        };
+      };"
+                                                if [ -z "$EXTRA_DEVICES_NIX" ]; then
+                                                  EXTRA_DEVICES_NIX="
+    lvm_vg = {
+      $LVM_VG_NAME = {
+        type = \"lvm_vg\";
+        lvs = {};
+      };
+    };"
+                                                fi
+                                                ;;
+                                              zfs)
+                                                DATA_DISK_NIX="$DATA_DISK_NIX
+      data$i = {
+        type = \"disk\";
+        device = \"$dd\";
+        content = {
+          type = \"gpt\";
+          partitions = {
+            zfs = {
+              size = \"100%\";
+              content = {
+                type = \"zfs\";
+                pool = \"$ZFS_POOL_NAME\";
+              };
+            };
+          };
+        };
+      };"
+                                                if [ -z "$EXTRA_DEVICES_NIX" ]; then
+                                                  EXTRA_DEVICES_NIX="
+    zpool = {
+      $ZFS_POOL_NAME = {
+        type = \"zpool\";
+        datasets = {};
+      };
+    };"
+                                                fi
+                                                ;;
+                                            esac
+                                          done
 
-                                          echo "Mounting partitions..."
-                                          mkdir -p /mnt
-                                          mount "$ROOT_DEV" /mnt
-                                          mkdir -p /mnt/boot
-                                          mount "$BOOT_PART" /mnt/boot
+                                          echo "Generating disko configuration..."
+                                          cat > /tmp/disko-config.nix << DISKOEOF
+{
+  disko.devices = {
+    disk = {
+      os = {
+        type = "disk";
+        device = "$DISK_PATH";
+        content = {
+          type = "gpt";
+          partitions = {
+            ESP = {
+              size = "512M";
+              type = "EF00";
+              content = {
+                type = "filesystem";
+                format = "vfat";
+                mountpoint = "/boot";
+                mountOptions = [ "umask=0077" ];
+              };
+            };
+            root = {
+              size = "100%";
+              content = {
+                type = "luks";
+                name = "cryptroot";
+                passwordFile = "/tmp/luks/password";
+                settings = {
+                  allowDiscards = true;
+                };
+                content = {
+                  type = "filesystem";
+                  format = "ext4";
+                  mountpoint = "/";
+                };
+              };
+            };
+          };
+        };
+      };$DATA_DISK_NIX
+    };$EXTRA_DEVICES_NIX
+  };
+}
+DISKOEOF
 
-                                          # For key-file method, copy key to /boot so the initrd can use it
+                                          echo "Running disko (partition, format, mount)..."
+                                          disko --mode format,mount --root-mountpoint /mnt /tmp/disko-config.nix
+
+                                          # For key-file method, copy passphrase to /boot for initrd unlock
                                           if [ "$LUKS_METHOD" = "key-file" ]; then
-                                            cp /tmp/luks/root.key /mnt/boot/crypto_keyfile.bin
+                                            cp /tmp/luks/password /mnt/boot/crypto_keyfile.bin
                                             chmod 0400 /mnt/boot/crypto_keyfile.bin
                                           fi
 
                                           if [ "''${#DATA_DISKS[@]}" -gt 0 ]; then
-                                            echo ""
-                                            echo "Data disk paths recorded under /etc/kcore/data-disks (not modified here)."
-                                            echo "VG/pool/LV/zvol creation is deferred until after install: use declarative Nix (disko, fileSystems, ZFS options) or controller-pushed configuration."
+                                            echo "Data disks formatted via disko (backend: $DATA_DISK_MODE)."
                                           fi
 
                                           echo "Generating NixOS hardware configuration..."
@@ -528,6 +650,10 @@
                                           echo "Copying ch-vm module..."
                                           mkdir -p /mnt/etc/nixos/modules/ch-vm
                                           cp -r ${chVmModule}/* /mnt/etc/nixos/modules/ch-vm/
+
+                                          echo "Copying disko configuration..."
+                                          cp ${kcoreDiskoModule} /mnt/etc/nixos/modules/kcore-disko.nix
+                                          cp /tmp/disko-config.nix /mnt/etc/nixos/disko-config.nix
 
                                           echo "Copying kcore config and certificates..."
                                           mkdir -p /mnt/etc/kcore
@@ -578,6 +704,9 @@
                                           if [ -z "$INSTALL_NODE_ID" ]; then
                                             INSTALL_NODE_ID="$INSTALL_HOSTNAME"
                                           fi
+                                          if [ -z "$RECOVERY_KEY_OUTPUT" ]; then
+                                            RECOVERY_KEY_OUTPUT="/var/log/kcore/recovery-keys/$INSTALL_NODE_ID-$(date +%Y%m%d%H%M%S).txt"
+                                          fi
 
                                           # Controller is opt-in only. By default, install as node-agent that joins an existing controller.
                                           CONTROLLER_ADDR=""
@@ -623,48 +752,48 @@
                                               ;;
                                           esac
 
-                                          cat > /mnt/etc/kcore/node-agent.yaml << AGENTEOF
-                      nodeId: $INSTALL_NODE_ID
-                      listenAddr: "0.0.0.0:9091"
-                      controllerAddr: "$CONTROLLER_ADDR"
-                      controllers:$CONTROLLERS_YAML
-                      dcId: "$DC_ID"
-                      vmSocketDir: /run/kcore
-                      nixConfigPath: /etc/nixos/kcore-vms.nix
-                      tls:
-                        caFile: /etc/kcore/certs/ca.crt
-                        certFile: /etc/kcore/certs/node.crt
-                        keyFile: /etc/kcore/certs/node.key
-                      $STORAGE_YAML
-                      AGENTEOF
+                                          cat > /mnt/etc/kcore/node-agent.yaml <<AGENTEOF
+nodeId: $INSTALL_NODE_ID
+listenAddr: "0.0.0.0:9091"
+controllerAddr: "$CONTROLLER_ADDR"
+controllers:$CONTROLLERS_YAML
+dcId: "$DC_ID"
+vmSocketDir: /run/kcore
+nixConfigPath: /etc/nixos/kcore-vms.nix
+tls:
+  caFile: /etc/kcore/certs/ca.crt
+  certFile: /etc/kcore/certs/node.crt
+  keyFile: /etc/kcore/certs/node.key
+$STORAGE_YAML
+AGENTEOF
 
                                           if [ "$RUN_CONTROLLER" = "true" ]; then
-                                            cat > /mnt/etc/kcore/controller.yaml << CTRLEOF
-                      listenAddr: "0.0.0.0:9090"
-                      dbPath: /var/lib/kcore/controller.db
-                      defaultNetwork:
-                        gatewayInterface: $GATEWAY_INTERFACE
-                        externalIp: $EXTERNAL_IP
-                        gatewayIp: $INTERNAL_GATEWAY_IP
-                      tls:
-                        caFile: /etc/kcore/certs/ca.crt
-                        certFile: /etc/kcore/certs/controller.crt
-                        keyFile: /etc/kcore/certs/controller.key
-                        subCaCertFile: /etc/kcore/certs/sub-ca.crt
-                        subCaKeyFile: /etc/kcore/certs/sub-ca.key
-                      CTRLEOF
+                                            cat > /mnt/etc/kcore/controller.yaml <<CTRLEOF
+listenAddr: "0.0.0.0:9090"
+dbPath: /var/lib/kcore/controller.db
+defaultNetwork:
+  gatewayInterface: $GATEWAY_INTERFACE
+  externalIp: $EXTERNAL_IP
+  gatewayIp: $INTERNAL_GATEWAY_IP
+tls:
+  caFile: /etc/kcore/certs/ca.crt
+  certFile: /etc/kcore/certs/controller.crt
+  keyFile: /etc/kcore/certs/controller.key
+  subCaCertFile: /etc/kcore/certs/sub-ca.crt
+  subCaKeyFile: /etc/kcore/certs/sub-ca.key
+CTRLEOF
                                           fi
 
-                                          cat > /mnt/etc/nixos/kcore-vms.nix << 'VMSEOF'
-                      { ... }:
-                      {
-                      }
-                      VMSEOF
+                                          cat > /mnt/etc/nixos/kcore-vms.nix <<'VMSEOF'
+{ ... }:
+{
+}
+VMSEOF
 
                                           # Build controller service block conditionally
                                           CONTROLLER_SERVICE=""
                                           if [ "$RUN_CONTROLLER" = "true" ]; then
-                                            read -r -d "" CONTROLLER_SERVICE << 'CTRLSVC' || true
+                                            CONTROLLER_SERVICE=$(cat <<'CTRLSVC'
                         systemd.services.kcore-controller = {
                           description = "kcore Controller";
                           wantedBy = [ "multi-user.target" ];
@@ -679,127 +808,129 @@
                             LimitNOFILE = 65536;
                           };
                         };
-                      CTRLSVC
+CTRLSVC
+                                            )
                                           fi
 
                                           # Build LUKS boot config for NixOS
                                           ROOT_PART_UUID=$(blkid -s UUID -o value "$ROOT_PART")
                                           LUKS_BOOT_CONFIG=""
                                           if [ "$LUKS_METHOD" = "tpm2" ]; then
-                                            read -r -d "" LUKS_BOOT_CONFIG << 'LUKSEOF' || true
+                                            LUKS_BOOT_CONFIG=$(cat <<'LUKSEOF'
                         boot.initrd.luks.devices.cryptroot = {
                           device = "/dev/disk/by-uuid/ROOT_PART_UUID_PLACEHOLDER";
                           preLVM = true;
                           crypttabExtraOpts = [ "tpm2-device=auto" ];
                         };
                         boot.initrd.systemd.enable = true;
-                      LUKSEOF
+LUKSEOF
+                                            )
                                             LUKS_BOOT_CONFIG="''${LUKS_BOOT_CONFIG//ROOT_PART_UUID_PLACEHOLDER/$ROOT_PART_UUID}"
                                           else
-                                            read -r -d "" LUKS_BOOT_CONFIG << 'LUKSEOF' || true
+                                            LUKS_BOOT_CONFIG=$(cat <<'LUKSEOF'
                         boot.initrd.luks.devices.cryptroot = {
                           device = "/dev/disk/by-uuid/ROOT_PART_UUID_PLACEHOLDER";
                           preLVM = true;
                           keyFile = "/crypto_keyfile.bin";
                         };
                         boot.initrd.secrets."/crypto_keyfile.bin" = "/boot/crypto_keyfile.bin";
-                      LUKSEOF
+LUKSEOF
+                                            )
                                             LUKS_BOOT_CONFIG="''${LUKS_BOOT_CONFIG//ROOT_PART_UUID_PLACEHOLDER/$ROOT_PART_UUID}"
                                           fi
 
                                           echo "Writing NixOS configuration..."
-                                          cat > /mnt/etc/nixos/configuration.nix << NIXEOF
-                      { config, pkgs, lib, ... }:
-                      {
-                        imports = [
-                          ./hardware-configuration.nix
-                          ./modules/ch-vm
-                          ./kcore-vms.nix
-                        ];
+                                          cat > /mnt/etc/nixos/configuration.nix <<NIXEOF
+{ config, pkgs, lib, ... }:
+{
+  # disko-config.nix and modules/kcore-disko.nix are saved for
+  # reference and day-2 data-disk operations (see docs/storage.md).
+  imports = [
+    ./hardware-configuration.nix
+    ./modules/ch-vm
+    ./kcore-vms.nix
+  ];
 
-                        nix.settings.experimental-features = [ "nix-command" "flakes" ];
-                        nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+  nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
 
-                        boot.loader.systemd-boot.enable = true;
-                        boot.loader.efi.canTouchEfiVariables = true;
-                        boot.kernelModules = [ "kvm" "kvm-intel" "kvm-amd" "tap" "tun" "br_netfilter" ];
-                        boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
+  boot.loader.systemd-boot.enable = true;
+  boot.loader.efi.canTouchEfiVariables = true;
+  boot.kernelModules = [ "kvm" "kvm-intel" "kvm-amd" "tap" "tun" "br_netfilter" ];
+  boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
 
-                      $LUKS_BOOT_CONFIG
+$LUKS_BOOT_CONFIG
 
-                        networking.hostName = "$INSTALL_HOSTNAME";
-                        networking.useDHCP = true;
-                        networking.firewall.enable = true;
-                        networking.firewall.allowedTCPPorts = [ 22 9091 $( [ "$RUN_CONTROLLER" = "true" ] && echo "9090" ) ];
+  networking.hostName = "$INSTALL_HOSTNAME";
+  networking.useDHCP = true;
+  networking.firewall.enable = true;
+  networking.firewall.allowedTCPPorts = [ 22 9091 $( [ "$RUN_CONTROLLER" = "true" ] && echo "9090" ) ];
 
-                        users.users.root = {
-                          initialPassword = "kcore";
-                          openssh.authorizedKeys.keys = [
-                      $SSH_KEYS
-                          ];
-                        };
-                        users.mutableUsers = true;
+  users.users.root = {
+    initialPassword = "kcore";
+    openssh.authorizedKeys.keys = [
+$SSH_KEYS
+    ];
+  };
+  users.mutableUsers = true;
 
-                        services.openssh = {
-                          enable = true;
-                          listenAddresses = [ { addr = "0.0.0.0"; port = 22; } ];
-                          settings = {
-                            PermitRootLogin = "yes";
-                            PasswordAuthentication = true;
-                          };
-                        };
+  services.openssh = {
+    enable = true;
+    listenAddresses = [ { addr = "0.0.0.0"; port = 22; } ];
+    settings = {
+      PermitRootLogin = "yes";
+      PasswordAuthentication = true;
+    };
+  };
 
-                        systemd.services.kcore-node-agent = {
-                          description = "kcore Node Agent";
-                          wantedBy = [ "multi-user.target" ];
-                          after = [ "network-online.target" ];
-                          wants = [ "network-online.target" ];
-                          serviceConfig = {
-                            Type = "simple";
-                            ExecStart = "/opt/kcore/bin/kcore-node-agent --config /etc/kcore/node-agent.yaml";
-                            Environment = "PATH=/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/run/wrappers/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-                            Restart = "always";
-                            RestartSec = "10s";
-                            User = "root";
-                            LimitNOFILE = 65536;
-                          };
-                        };
+  systemd.services.kcore-node-agent = {
+    description = "kcore Node Agent";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      Type = "simple";
+      ExecStart = "/opt/kcore/bin/kcore-node-agent --config /etc/kcore/node-agent.yaml";
+      Environment = "PATH=/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/run/wrappers/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+      Restart = "always";
+      RestartSec = "10s";
+      User = "root";
+      LimitNOFILE = 65536;
+    };
+  };
 
-                      $CONTROLLER_SERVICE
+$CONTROLLER_SERVICE
 
-                        systemd.tmpfiles.rules = [
-                          "d /var/lib/kcore 0755 root root -"
-                          "d /var/lib/kcore/images 0755 root root -"
-                          "d /var/lib/kcore/volumes 0755 root root -"
-                          "d /opt/kcore 0755 root root -"
-                          "d /opt/kcore/bin 0755 root root -"
-                          "d /etc/kcore 0755 root root -"
-                          "d /run/kcore 0755 root root -"
-                        ];
+  systemd.tmpfiles.rules = [
+    "d /var/lib/kcore 0755 root root -"
+    "d /var/lib/kcore/images 0755 root root -"
+    "d /var/lib/kcore/volumes 0755 root root -"
+    "d /opt/kcore 0755 root root -"
+    "d /opt/kcore/bin 0755 root root -"
+    "d /etc/kcore 0755 root root -"
+    "d /run/kcore 0755 root root -"
+  ];
 
-                        environment.systemPackages = with pkgs; [
-                          vim
-                          htop
-                          curl
-                          wget
-                          iproute2
-                          cloud-hypervisor
-                          qemu-utils
-                          cloud-utils
-                          jq
-                          parted
-                          lvm2
-                          cryptsetup
-                          tpm2-tools
-                        ];
+  environment.systemPackages = with pkgs; [
+    vim
+    htop
+    curl
+    wget
+    iproute2
+    cloud-hypervisor
+    qemu-utils
+    cloud-utils
+    jq
+    parted
+    lvm2
+    cryptsetup
+    tpm2-tools
+    disko
+  ];
 
-                        system.stateVersion = "25.05";
-                      }
-                      NIXEOF
-
-                                          echo "Configuring Nix with flakes support..."
-                                          mkdir -p /mnt/etc/nix
-                                          echo "experimental-features = nix-command flakes" > /mnt/etc/nix/nix.conf
+  system.stateVersion = "25.05";
+}
+NIXEOF
 
                                           echo "Installing NixOS (this will take 10-20 minutes)..."
                                           export NIX_CONFIG="experimental-features = nix-command flakes"
@@ -809,13 +940,52 @@
                                           # Enroll TPM2 and add recovery key
                                           if [ "$LUKS_METHOD" = "tpm2" ]; then
                                             echo "Enrolling TPM2 for LUKS..."
-                                            echo -n "$TPM_TEMP_PASS" | systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$ROOT_PART"
+                                            if ! timeout 120s systemd-cryptenroll --unlock-key-file /tmp/luks/password --tpm2-device=auto --tpm2-pcrs=7 "$ROOT_PART"; then
+                                              echo "Error: TPM2 enrollment failed or timed out"
+                                              exit 1
+                                            fi
                                             echo ""
-                                            echo "Adding LUKS recovery key (save this somewhere safe!)..."
-                                            echo -n "$TPM_TEMP_PASS" | systemd-cryptenroll --recovery-key "$ROOT_PART"
-                                            echo -n "$TPM_TEMP_PASS" | systemd-cryptenroll --wipe-slot=password "$ROOT_PART"
-                                            unset TPM_TEMP_PASS
+                                            echo "Adding and persisting LUKS recovery key..."
+                                            if ! RECOVERY_ENROLL_OUTPUT=$(timeout 120s systemd-cryptenroll --unlock-key-file /tmp/luks/password --recovery-key "$ROOT_PART" 2>&1); then
+                                              echo "$RECOVERY_ENROLL_OUTPUT"
+                                              echo "Error: failed to add LUKS recovery key"
+                                              exit 1
+                                            fi
+                                            RECOVERY_KEY=$(printf "%s\n" "$RECOVERY_ENROLL_OUTPUT" | awk '/^[a-z0-9]{8}(-[a-z0-9]{8}){7}$/ {print; exit}')
+                                            if [ -z "$RECOVERY_KEY" ]; then
+                                              echo "$RECOVERY_ENROLL_OUTPUT"
+                                              echo "Error: recovery key output did not contain a parseable key"
+                                              exit 1
+                                            fi
+                                            RECOVERY_KEY_FINGERPRINT=$(printf "%s" "$RECOVERY_KEY" | sha256sum | awk '{print $1}')
+                                            RECOVERY_KEY_TMP=$(mktemp)
+                                            cat > "$RECOVERY_KEY_TMP" <<EOF
+nodeId: $INSTALL_NODE_ID
+hostname: $INSTALL_HOSTNAME
+disk: $DISK_PATH
+rootPart: $ROOT_PART
+rootUuid: $ROOT_PART_UUID
+luksMethod: tpm2
+createdAtUtc: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+recoveryKey: $RECOVERY_KEY
+recoveryKeySha256: $RECOVERY_KEY_FINGERPRINT
+EOF
+                                            chmod 0400 "$RECOVERY_KEY_TMP"
+                                            install -d -m 0700 /mnt/etc/kcore/recovery
+                                            install -m 0400 "$RECOVERY_KEY_TMP" /mnt/etc/kcore/recovery/luks-recovery-key.txt
+                                            install -d -m 0700 "$(dirname "$RECOVERY_KEY_OUTPUT")"
+                                            install -m 0400 "$RECOVERY_KEY_TMP" "$RECOVERY_KEY_OUTPUT"
+                                            rm -f "$RECOVERY_KEY_TMP"
+                                            if ! timeout 120s systemd-cryptenroll --unlock-key-file /tmp/luks/password --wipe-slot=password "$ROOT_PART"; then
+                                              echo "Error: failed to remove temporary LUKS password slot"
+                                              exit 1
+                                            fi
+                                            rm -f /tmp/luks/password
+                                            unset LUKS_PASSPHRASE
                                             echo "TPM2 enrolled, temporary passphrase replaced with recovery key."
+                                            echo "Recovery key artifact saved on installed node: /etc/kcore/recovery/luks-recovery-key.txt"
+                                            echo "Recovery key artifact saved on live env: $RECOVERY_KEY_OUTPUT"
+                                            echo "Recovery key fingerprint (sha256): $RECOVERY_KEY_FINGERPRINT"
                                           fi
 
                                           echo ""

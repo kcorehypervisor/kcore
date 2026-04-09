@@ -38,9 +38,10 @@ Expected local layout on the operator machine:
    - generates node cert/key signed by cluster CA (SAN = node host/IP)
 6. `kctl` sends `InstallToDiskRequest` including cert PEM payload, ordered `controllers`, and `dc_id`.
 7. Live `node-agent` writes certs to `/etc/kcore/certs` and starts `install-to-disk`.
-8. Installer copies `/etc/kcore/*` into `/mnt/etc/kcore` on target disk.
-9. `nixos-install` completes and host reboots from installed disk.
-10. Installed services read `/etc/kcore/certs/*` and start successfully.
+8. Installer generates a `disko-config.nix` from install parameters and runs `disko --mode format,mount` to partition, encrypt, format, and mount disks declaratively.
+9. Installer copies `/etc/kcore/*`, binaries, and NixOS config into `/mnt` on target disk.
+10. `nixos-install` completes and host reboots from installed disk.
+11. Installed services read `/etc/kcore/certs/*` and start successfully.
 
 ## Detailed flowchart
 
@@ -63,9 +64,10 @@ flowchart TD
   buildReq --> sendRpc["NodeAdmin.InstallToDisk RPC<br/>controllers + dc_id"]
 
   sendRpc --> writeBootstrap["node-agent writes<br/>/etc/kcore/certs/*"]
-  writeBootstrap --> runInstaller["Spawn install-to-disk<br/>--controller … --dc-id"]
-  runInstaller --> partitionDisk["Partition / format<br/>mount target disk"]
-  partitionDisk --> copyKcore["Copy /etc/kcore<br/>and binaries to /mnt"]
+  writeBootstrap --> runInstaller["Spawn install-to-disk<br/>--controller ... --dc-id"]
+  runInstaller --> genDisko["Generate disko-config.nix<br/>from install parameters"]
+  genDisko --> diskoRun["disko --mode format,mount<br/>OS disk LUKS + data disks"]
+  diskoRun --> copyKcore["Copy /etc/kcore<br/>and binaries to /mnt"]
   copyKcore --> writeNixos["Write /mnt/etc/nixos<br/>configuration.nix"]
   writeNixos --> nixosInstall["nixos-install"]
   nixosInstall --> rebootHost["Reboot from<br/>installed disk"]
@@ -75,47 +77,99 @@ flowchart TD
   tlsReady --> healthy["Node reachable<br/>ready for reconciliation"]
 ```
 
-## Declarative disk layout (disko) — target architecture
+## Declarative disk layout (disko)
 
-Today the live ISO’s `install-to-disk` script uses **imperative** partitioning and LUKS (`parted`, `cryptsetup`, …). The direction below is a **sketch** of how **declarative layout** with [disko](https://github.com/nix-community/disko) can align install intent (YAML or RPC fields), **one-shot formatting** on the installer, and **ongoing** Nix evolution on the node. See also [storage](storage.md) for how data disks and VM backends relate.
+The live ISO's `install-to-disk` script uses [disko](https://github.com/nix-community/disko) for declarative disk partitioning, LUKS encryption, and filesystem creation. Disko replaces imperative `parted` / `cryptsetup` / `mkfs` commands with a single Nix-evaluated device graph. See also [storage](storage.md) for how data disks and VM backends relate.
 
-### Install-time: YAML or RPC → disko → NixOS
+### Install-time: RPC fields to disko-config.nix to format + mount
 
-Disk intent is captured once (e.g. a checked-in YAML template, or fields carried by `InstallToDiskRequest` and rendered to Nix). The **same** disko device graph is used for **format** on the ISO and for **imports** in the installed `configuration.nix`, so the running system can `nixos-rebuild` without drifting from what was laid down at install.
+The `install-to-disk` script renders `InstallToDiskRequest` fields into a `/tmp/disko-config.nix` that describes the full device graph, then runs `disko --mode format,mount --root-mountpoint /mnt` to apply it.
+
+**OS disk layout** (always present):
+
+| Partition | Type | Content |
+|-----------|------|---------|
+| ESP | 512 MiB FAT32 | `/boot` (systemd-boot) |
+| root | remaining space | LUKS2 ext4 `/` |
+
+LUKS unlock method is auto-detected (TPM2 when `/sys/class/tpm/tpm0` exists, otherwise key-file). TPM2 enrollment happens after `nixos-install`.
+
+When TPM2 is used, the installer now captures the generated recovery key as a root-only artifact:
+
+- installed node: `/etc/kcore/recovery/luks-recovery-key.txt`
+- live installer env: `/var/log/kcore/recovery-keys/<nodeId>-<timestamp>.txt` (or explicit `--recovery-key-output /path/file.txt`)
+
+The artifact includes metadata (`nodeId`, disk/root UUID, creation timestamp) and a `recoveryKeySha256` fingerprint for audit/escrow workflows.
+
+**Data disk layout** (when `--data-disk` is passed):
+
+| Backend | disko content |
+|---------|---------------|
+| filesystem | GPT, single ext4 partition mounted at `/var/lib/kcore/volumes` |
+| lvm | GPT, LVM PV, VG (named per `--lvm-vg-name`, default `vg_kcore`) |
+| zfs | GPT, ZFS partition, zpool (named per `--zfs-pool-name`, default `tank0`) |
+
+VGs and zpools are **created at install time** by disko. LVs / zvols are created later by `node-agent` on demand.
 
 ```mermaid
 flowchart TD
-  intent["Disk intent<br/>YAML or install RPC fields"]
-  translate["Translate to<br/>disko devices Nix module"]
-  diskoFmt["disko format<br/>once on live ISO"]
-  mount["Mount root + boot<br/>per layout"]
+  intent["InstallToDiskRequest fields<br/>os-disk, data-disks,<br/>storage-backend, lvm/zfs names"]
+  render["install-to-disk renders<br/>disko-config.nix"]
+  diskoRun["disko --mode format,mount<br/>--root-mountpoint /mnt"]
   hwcfg["nixos-generate-config<br/>--root /mnt"]
-  cfg["configuration.nix<br/>disko + kcore imports"]
+  copyBin["Copy binaries, certs,<br/>kcore YAML configs"]
+  cfg["Write configuration.nix<br/>with LUKS boot config"]
   install["nixos-install"]
+  tpmEnroll["TPM2 enrollment<br/>if tpm2 method"]
   reboot["Reboot from<br/>installed disk"]
   match["node-agent.yaml storage<br/>matches VG / pool in layout"]
 
-  intent --> translate
-  translate --> diskoFmt
-  diskoFmt --> mount
-  mount --> hwcfg
-  hwcfg --> cfg
+  intent --> render
+  render --> diskoRun
+  diskoRun --> hwcfg
+  hwcfg --> copyBin
+  copyBin --> cfg
   cfg --> install
-  install --> reboot
+  install --> tpmEnroll
+  tpmEnroll --> reboot
   reboot --> match
 ```
 
+### Files on the installed system
+
+After install, the following disko-related files are saved on the node:
+
+- `/etc/nixos/disko-config.nix` -- the exact device graph used at format time (reference and day-2 use)
+- `/etc/nixos/modules/kcore-disko.nix` -- NixOS module with `kcore.disko.*` options for generating disko layouts
+
+### NixOS module: `modules/kcore-disko.nix`
+
+A NixOS module that generates `disko.devices` from high-level options:
+
+- `kcore.disko.osDisk` -- block device path (e.g. `/dev/sda`)
+- `kcore.disko.luksPasswordFile` -- path to LUKS passphrase file (format-time only)
+- `kcore.disko.dataDisks` -- list of data disk device paths
+- `kcore.disko.storageBackend` -- `"filesystem"`, `"lvm"`, or `"zfs"`
+- `kcore.disko.lvm.vgName` / `kcore.disko.zfs.poolName` -- backend-specific names
+
+This module can be imported on any system that has the disko NixOS module available.
+
 ### Day-2: evolving layout on a running node
 
-A running node can **keep** disko in its flake or `imports` and change the **Nix** description over time. **Formatting** is never implicit on every boot: scope changes to **new** data devices when possible; anything that repartitions the **OS disk** is a **reinstall-class** event (rescue ISO, replace node, or full maintenance window).
+Formatting is never implicit on every boot. Day-2 changes follow these rules:
+
+- **Add data disks only**: write a new disko config for the new devices, run `disko --mode format,mount`, then `nixos-rebuild switch` or `ApplyNixConfig` to update `fileSystems`.
+- **Reshape OS root / repartition system disk**: this is a **reinstall-class** event requiring rescue ISO or node replacement.
+
+The installed node has `disko` available in `environment.systemPackages` for day-2 formatting of new data devices.
 
 ```mermaid
 flowchart TD
   run["Installed node<br/>running kcore"]
-  publish["Operator or controller<br/>publishes updated disko Nix"]
+  publish["Operator or controller<br/>publishes updated disko config"]
   scope{"What changes?"}
   data["Add / reshape<br/>data disks only"]
-  oneshot["disko format once<br/>those devices only"]
+  oneshot["disko --mode format,mount<br/>new devices only"]
   apply["nixos-rebuild switch<br/>or ApplyNixConfig"]
   os["Reshape OS root<br/>repartition system disk"]
   maint["Maintenance:<br/>rescue ISO or reinstall"]
@@ -130,13 +184,6 @@ flowchart TD
   maint --> run
 ```
 
-### Where translation might live
-
-- **Installer / ISO**: render disk intent → disko Nix, run `disko` before `nixos-install` (no controller required).
-- **Controller (optional)**: store or generate disko fragments for **approved** nodes; push via existing Nix apply paths for day-2 **additive** storage only.
-
-This document does not yet mandate a single file layout; it records the **intended** vertical flow from intent → format → install → reconcile, and a **safe** split for later layout changes.
-
 ## Verification checklist
 
 - On live ISO (before install):
@@ -144,12 +191,16 @@ This document does not yet mandate a single file layout; it records the **intend
   - `kctl --node <host:9091> --insecure node nics`
 - During install:
   - install response includes accepted status and log path
-  - logs show full installer progression and final status
+  - logs show disko format+mount success and full installer progression
 - After reboot:
   - `findmnt /` shows root on installed disk
   - `/etc/kcore/certs` exists with expected files
+  - `/etc/nixos/disko-config.nix` exists with the device graph
+  - if TPM2 was used: `/etc/kcore/recovery/luks-recovery-key.txt` exists and is mode `0400`
   - `systemctl is-active kcore-node-agent` is `active`
   - if same-host controller mode, `systemctl is-active kcore-controller` is `active`
+  - if LVM data disks: `vgs` shows expected VG
+  - if ZFS data disks: `zpool status` shows expected pool
 
 ## ISO-to-VM acceptance checklist (regression guard)
 
@@ -159,13 +210,16 @@ Run this sequence on every new ISO candidate:
    - `kctl --node <host:9091> --insecure node install --os-disk <disk> --data-disk <disk> --run-controller`
 2. After reboot, verify first-node services:
    - `systemctl is-active kcore-controller kcore-node-agent`
-3. Verify image contract:
+3. Verify disko layout:
+   - `lsblk` shows expected partition layout (ESP + LUKS root)
+   - `/etc/nixos/disko-config.nix` exists and describes the installed layout
+4. Verify image contract:
    - `kctl create vm smoke-no-image` must fail with URL/SHA-required error.
-4. Create VM with Debian 12 direct URL + SHA256:
+5. Create VM with Debian 12 direct URL + SHA256:
    - `kctl create vm smoke --image https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 --image-sha256 <sha256>`
-5. Verify runtime realization (not just DB intent):
+6. Verify runtime realization (not just DB intent):
    - `systemctl status kcore-vm-smoke`
    - `ls /run/kcore/smoke.sock /run/kcore/smoke.serial.sock`
    - `ls /var/lib/kcore/images/` contains controller-derived cached image path
-6. Verify console attach path:
+7. Verify console attach path:
    - `socat -,raw,echo=0,icanon=0 UNIX-CONNECT:/run/kcore/smoke.serial.sock`

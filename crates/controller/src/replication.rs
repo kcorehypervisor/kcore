@@ -868,7 +868,7 @@ mod tests {
             name: "vm-name".to_string(),
             cpu: 1,
             memory_bytes: 512 * 1024 * 1024,
-            image_path: "/var/lib/libvirt/images/vm-name.qcow2".to_string(),
+            image_path: "/var/lib/kcore/images/vm-name.qcow2".to_string(),
             image_url: String::new(),
             image_sha256: String::new(),
             image_format: "qcow2".to_string(),
