@@ -24,6 +24,11 @@ pub struct CreateArgs {
     pub ssh_port: i32,
     pub ssh_probe_timeout_ms: i32,
     pub ssh_keys: Vec<String>,
+    pub ssh_public_keys: Vec<String>,
+    pub cloud_init_user_data_file: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub compliant: bool,
     pub storage_backend: String,
     pub storage_size_bytes: i64,
 }
@@ -39,6 +44,12 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
     if args.storage_size_bytes <= 0 {
         bail!("--storage-size-bytes must be > 0");
     }
+    if args.password.is_some() && args.username.is_none() {
+        bail!("--password requires --username");
+    }
+    if !args.ssh_public_keys.is_empty() && args.username.is_none() {
+        bail!("--ssh-public-key requires --username");
+    }
     let (
         vm_name,
         vm_cpu,
@@ -49,7 +60,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_image_format,
     ) = if let Some(path) = &args.filename {
         let manifest = parse_vm_manifest(path)?;
-        let n = args.name.unwrap_or(manifest.name);
+        let n = args.name.clone().unwrap_or(manifest.name);
         (
             n,
             manifest.cpu,
@@ -62,14 +73,16 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
     } else {
         let n = args
             .name
+            .clone()
             .context("NAME required (or use -f to create from a manifest)")?;
         let mem = client::parse_size_bytes(&args.memory).map_err(|e| anyhow::anyhow!(e))?;
         let cpu = args.cpu;
         let nics = args
             .network
+            .as_ref()
             .map(|net| {
                 vec![proto::Nic {
-                    network: net,
+                    network: net.clone(),
                     model: "virtio".to_string(),
                     mac_address: String::new(),
                 }]
@@ -86,6 +99,12 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_image_sha256.as_deref(),
         manifest_image_format.as_deref(),
     )?;
+    let cloud_init_user_data = prepare_cloud_init_user_data(&vm_name, &args)?;
+    if !cloud_init_user_data.is_empty() && !args.ssh_keys.is_empty() {
+        bail!(
+            "cannot combine --ssh-key with custom/generated cloud-init user-data; include SSH keys in cloud-init or omit --cloud-init-user-data-file/--username/--password"
+        );
+    }
 
     let mut client = client::controller_client(info).await?;
 
@@ -103,7 +122,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         spec: Some(spec),
         image_url: image.url,
         image_sha256: image.sha256,
-        cloud_init_user_data: String::new(),
+        cloud_init_user_data,
         image_path: image.path,
         image_format: image.format,
         ssh_key_names: args.ssh_keys,
@@ -387,6 +406,100 @@ struct ImageSource {
     sha256: String,
     path: String,
     format: String,
+}
+
+fn prepare_cloud_init_user_data(vm_name: &str, args: &CreateArgs) -> Result<String> {
+    let has_explicit_cloud_init = args.cloud_init_user_data_file.is_some();
+    let has_identity_overrides = args.username.is_some()
+        || args.password.is_some()
+        || !args.ssh_public_keys.is_empty();
+
+    if has_explicit_cloud_init && has_identity_overrides {
+        bail!(
+            "--cloud-init-user-data-file cannot be combined with --username/--password/--ssh-public-key"
+        );
+    }
+
+    if let Some(path) = &args.cloud_init_user_data_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading cloud-init user-data file: {path}"))?;
+        if content.trim().is_empty() {
+            bail!("cloud-init user-data file is empty: {path}");
+        }
+        return Ok(content);
+    }
+
+    if !has_identity_overrides {
+        return Ok(String::new());
+    }
+
+    let username = args
+        .username
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--username is required when overriding cloud-init identity"))?
+        .trim();
+    if username.is_empty() {
+        bail!("--username must not be empty");
+    }
+    if username.contains(char::is_whitespace) {
+        bail!("--username must not contain whitespace");
+    }
+
+    let password = args.password.as_deref().unwrap_or("").trim();
+    if !password.is_empty() && args.compliant {
+        bail!(
+            "password-based VM access is non-compliant; rerun with --compliant=false to acknowledge risk"
+        );
+    }
+    if password.is_empty() && args.ssh_public_keys.is_empty() {
+        bail!(
+            "identity override requires at least one --ssh-public-key, or --password with --compliant=false"
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str("#cloud-config\n");
+    out.push_str(&format!("hostname: {vm_name}\n"));
+    out.push_str("users:\n");
+    out.push_str("  - default\n");
+    out.push_str(&format!("  - name: {username}\n"));
+    out.push_str("    gecos: kcore VM user\n");
+    out.push_str("    groups: [sudo]\n");
+    out.push_str("    shell: /bin/bash\n");
+    if password.is_empty() {
+        out.push_str("    lock_passwd: true\n");
+    } else {
+        out.push_str("    lock_passwd: false\n");
+    }
+    if !args.ssh_public_keys.is_empty() {
+        out.push_str("    ssh_authorized_keys:\n");
+        for key in &args.ssh_public_keys {
+            let trimmed = key.trim();
+            if !trimmed.starts_with("ssh-") {
+                bail!("invalid --ssh-public-key value (must start with ssh-): {trimmed}");
+            }
+            out.push_str(&format!("      - \"{}\"\n", yaml_escape_double_quoted(trimmed)));
+        }
+        out.push_str("ssh_pwauth: false\n");
+    } else {
+        out.push_str("ssh_pwauth: true\n");
+    }
+    if !password.is_empty() {
+        out.push_str("chpasswd:\n");
+        out.push_str("  expire: false\n");
+        out.push_str("  users:\n");
+        out.push_str(&format!("    - name: {username}\n"));
+        out.push_str(&format!(
+            "      password: \"{}\"\n",
+            yaml_escape_double_quoted(password)
+        ));
+    }
+
+    Ok(out)
+}
+
+fn yaml_escape_double_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn resolve_create_image_source(
@@ -782,5 +895,56 @@ mod tests {
         assert_eq!(normalize_storage_backend_arg("LVM").expect("lvm"), "lvm");
         assert_eq!(normalize_storage_backend_arg("zfs").expect("zfs"), "zfs");
         assert!(normalize_storage_backend_arg("ceph").is_err());
+    }
+
+    fn base_create_args() -> CreateArgs {
+        CreateArgs {
+            name: Some("vm-a".into()),
+            filename: None,
+            cpu: 2,
+            memory: "2G".into(),
+            image: Some("https://example.com/debian.qcow2".into()),
+            image_sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ),
+            image_path: None,
+            image_format: None,
+            network: None,
+            target_node: None,
+            wait: false,
+            wait_for_ssh: false,
+            wait_timeout_seconds: 300,
+            ssh_port: 22,
+            ssh_probe_timeout_ms: 1500,
+            ssh_keys: vec![],
+            ssh_public_keys: vec![],
+            cloud_init_user_data_file: None,
+            username: None,
+            password: None,
+            compliant: true,
+            storage_backend: "filesystem".into(),
+            storage_size_bytes: 10 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn prepare_cloud_init_rejects_password_in_compliant_mode() {
+        let mut args = base_create_args();
+        args.username = Some("alice".into());
+        args.password = Some("secret".into());
+        let err = prepare_cloud_init_user_data("vm-a", &args).expect_err("must reject");
+        assert!(err.to_string().contains("non-compliant"));
+    }
+
+    #[test]
+    fn prepare_cloud_init_builds_passwordless_key_auth() {
+        let mut args = base_create_args();
+        args.username = Some("alice".into());
+        args.ssh_public_keys = vec!["ssh-ed25519 AAAA test@example".into()];
+        let data = prepare_cloud_init_user_data("vm-a", &args).expect("cloud-init");
+        assert!(data.contains("name: alice"));
+        assert!(data.contains("ssh_authorized_keys"));
+        assert!(data.contains("lock_passwd: true"));
+        assert!(data.contains("ssh_pwauth: false"));
     }
 }

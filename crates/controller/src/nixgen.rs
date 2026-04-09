@@ -194,6 +194,10 @@ pub fn generate_node_config(
             nix_escape(&vm.network)
         ));
         out.push_str(&format!(
+            "      cloudInitInstanceId = \"{}\";\n",
+            nix_escape(&vm.id)
+        ));
+        out.push_str(&format!(
             "      autoStart = {};\n",
             if vm.auto_start { "true" } else { "false" }
         ));
@@ -307,6 +311,7 @@ mod tests {
         assert!(config.contains("imageFormat = \"raw\""));
         assert!(config.contains("storageBackend = \"filesystem\""));
         assert!(config.contains("storageSizeBytes = 10737418240"));
+        assert!(config.contains("cloudInitInstanceId = \"vm-1\";"));
     }
 
     #[test]
