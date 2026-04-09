@@ -36,6 +36,8 @@ const EVT_VM_DESIRED_STATE_SET: &str = "vm.desired_state.set";
 const EVT_NETWORK_CREATE: &str = "network.create";
 const EVT_NETWORK_DELETE: &str = "network.delete";
 const EVT_NODE_DRAIN: &str = "node.drain";
+const EVT_SSH_KEY_CREATE: &str = "ssh_key.create";
+const EVT_SSH_KEY_DELETE: &str = "ssh_key.delete";
 
 #[derive(Clone, Default)]
 pub struct SubCaState {
@@ -1612,6 +1614,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
             })?;
 
         info!(name = %req.name, "created SSH key");
+        self.log_replication_event(
+            EVT_SSH_KEY_CREATE,
+            &format!("ssh-key/{}", req.name.trim()),
+            serde_json::json!({
+                "name": req.name.trim(),
+                "publicKey": req.public_key.trim(),
+            }),
+        );
 
         Ok(Response::new(controller_proto::CreateSshKeyResponse {
             success: true,
@@ -1639,6 +1649,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         info!(name = %req.name, "deleted SSH key");
+        self.log_replication_event(
+            EVT_SSH_KEY_DELETE,
+            &format!("ssh-key/{}", req.name.trim()),
+            serde_json::json!({
+                "name": req.name.trim(),
+            }),
+        );
 
         Ok(Response::new(controller_proto::DeleteSshKeyResponse {
             success: true,
