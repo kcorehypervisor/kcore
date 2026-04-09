@@ -140,6 +140,12 @@ let
         description = "Path to cloud-init network-config YAML file.";
       };
 
+      cloudInitInstanceId = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Cloud-init instance-id. Set to a unique VM lifecycle identifier to force per-create initialization.";
+      };
+
       autoStart = lib.mkOption {
         type = lib.types.bool;
         default = true;

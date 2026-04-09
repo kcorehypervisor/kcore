@@ -174,6 +174,27 @@ fn derive_external_address(listen_addr: &str) -> String {
 }
 
 fn get_primary_ip() -> Result<String, std::io::Error> {
+    // Prefer the IPv4 on the default-route interface so we don't accidentally
+    // register bridge/gateway addresses like 10.240.0.1 as the node endpoint.
+    let route = std::process::Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()?;
+    if route.status.success() {
+        let route_stdout = String::from_utf8_lossy(&route.stdout);
+        if let Some(dev) = parse_default_route_dev(&route_stdout) {
+            let addr = std::process::Command::new("ip")
+                .args(["-4", "-o", "addr", "show", "dev", dev, "scope", "global"])
+                .output()?;
+            if addr.status.success() {
+                let addr_stdout = String::from_utf8_lossy(&addr.stdout);
+                if let Some(ip) = parse_first_ipv4_addr(&addr_stdout) {
+                    return Ok(ip);
+                }
+            }
+        }
+    }
+
+    // Fallback for environments without `ip route` output.
     let output = std::process::Command::new("hostname").arg("-I").output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout
@@ -181,6 +202,32 @@ fn get_primary_ip() -> Result<String, std::io::Error> {
         .next()
         .map(|s| s.to_string())
         .ok_or_else(|| std::io::Error::other("no IP found"))
+}
+
+fn parse_default_route_dev(route_stdout: &str) -> Option<&str> {
+    // Example: "default via 192.168.40.1 dev eno1 proto dhcp src 192.168.40.105"
+    let mut prev = "";
+    for tok in route_stdout.split_whitespace() {
+        if prev == "dev" {
+            return Some(tok);
+        }
+        prev = tok;
+    }
+    None
+}
+
+fn parse_first_ipv4_addr(addr_stdout: &str) -> Option<String> {
+    // Example: "4: eno1    inet 192.168.40.105/24 brd ... scope global ..."
+    for line in addr_stdout.lines() {
+        let mut prev = "";
+        for tok in line.split_whitespace() {
+            if prev == "inet" {
+                return tok.split('/').next().map(|s| s.to_string());
+            }
+            prev = tok;
+        }
+    }
+    None
 }
 
 /// Spawn a background task that checks cert expiry daily and renews via
@@ -424,6 +471,22 @@ mod tests {
     fn derive_external_address_replaces_wildcard() {
         let addr = derive_external_address("192.168.1.5:9091");
         assert_eq!(addr, "192.168.1.5:9091");
+    }
+
+    #[test]
+    fn parse_default_route_dev_extracts_interface() {
+        let line = "default via 192.168.40.1 dev eno1 proto dhcp src 192.168.40.105";
+        assert_eq!(parse_default_route_dev(line), Some("eno1"));
+    }
+
+    #[test]
+    fn parse_first_ipv4_addr_extracts_ip() {
+        let line =
+            "4: eno1    inet 192.168.40.105/24 brd 192.168.40.255 scope global dynamic noprefixroute eno1";
+        assert_eq!(
+            parse_first_ipv4_addr(line),
+            Some("192.168.40.105".to_string())
+        );
     }
 
     #[test]

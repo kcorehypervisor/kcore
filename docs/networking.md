@@ -275,6 +275,10 @@ auth enabled. When SSH keys are attached to the VM (via `kctl create vm
 ### Boot sequence (systemd ordering)
 
 ```
+
+Cloud-init seed metadata uses a per-VM lifecycle `instance-id` (controller VM ID),
+so deleting and recreating a VM with the same name still triggers cloud-init on the
+next boot.
 kcore-bridge-<net>  →  kcore-dhcp-<net>  (nat only)
                     →  kcore-tap-<vm>  →  kcore-vm-<vm>
 ```

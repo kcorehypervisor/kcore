@@ -233,7 +233,10 @@ in
         }
       ) cfg.virtualMachines;
 
-    networking.firewall.trustedInterfaces = lib.optional (cfg.networks != { }) "kbr-+";
+    # NixOS firewall trustedInterfaces expects explicit interface names, not globs.
+    # Build the exact bridge interface list so DHCP/DNS traffic from VM bridges
+    # reaches host services like dnsmasq.
+    networking.firewall.trustedInterfaces = lib.mapAttrsToList (netName: _netCfg: bridgeName netName) cfg.networks;
 
     networking.firewall.allowedUDPPorts = lib.optional (lib.any (n: n.networkType == "vxlan") (
       lib.attrValues cfg.networks

@@ -52,6 +52,46 @@ kctl create vm web-01 \
   --image-sha256 <sha256>
 ```
 
+Compliance-first auth (recommended): provide username + SSH public key(s) and keep
+`--compliant` at its default `true`:
+
+```bash
+kctl create vm web-01 \
+  --network default \
+  --storage-backend filesystem \
+  --storage-size-bytes 42949672960 \
+  --image https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 \
+  --image-sha256 <sha256> \
+  --username kcore \
+  --ssh-public-key "ssh-ed25519 AAAA... user@host"
+```
+
+If you explicitly choose password auth, you must acknowledge non-compliance:
+
+```bash
+kctl create vm web-01 \
+  --network default \
+  --storage-backend filesystem \
+  --storage-size-bytes 42949672960 \
+  --image https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 \
+  --image-sha256 <sha256> \
+  --username kcore \
+  --password '<temporary-password>' \
+  --compliant=false
+```
+
+Custom cloud-init user-data is also supported:
+
+```bash
+kctl create vm web-01 \
+  --network default \
+  --storage-backend filesystem \
+  --storage-size-bytes 42949672960 \
+  --image https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 \
+  --image-sha256 <sha256> \
+  --cloud-init-user-data-file ./user-data.yaml
+```
+
 Wait until VM is fully ready:
 
 ```bash

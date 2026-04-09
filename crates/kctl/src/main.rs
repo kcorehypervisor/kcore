@@ -216,6 +216,21 @@ enum CreateResource {
         /// SSH key names to inject (can specify multiple times)
         #[arg(long = "ssh-key")]
         ssh_keys: Vec<String>,
+        /// SSH public key values to embed directly in generated cloud-init user-data
+        #[arg(long = "ssh-public-key")]
+        ssh_public_keys: Vec<String>,
+        /// Path to cloud-init user-data YAML (overrides default/generated user-data)
+        #[arg(long = "cloud-init-user-data-file")]
+        cloud_init_user_data_file: Option<String>,
+        /// VM login username for generated cloud-init user-data
+        #[arg(long)]
+        username: Option<String>,
+        /// VM login password for generated cloud-init user-data (non-compliant unless --compliant=false)
+        #[arg(long)]
+        password: Option<String>,
+        /// Compliance mode (default true). Set false to acknowledge non-compliant auth like password login.
+        #[arg(long = "compliant", default_value_t = true, action = clap::ArgAction::Set)]
+        compliant: bool,
         /// Required VM storage backend (filesystem, lvm, zfs)
         #[arg(long = "storage-backend", value_enum)]
         storage_backend: StorageBackend,
@@ -590,6 +605,11 @@ async fn main() {
                     ssh_port,
                     ssh_probe_timeout_ms,
                     ssh_keys,
+                    ssh_public_keys,
+                    cloud_init_user_data_file,
+                    username,
+                    password,
+                    compliant,
                     storage_backend,
                     storage_size_bytes,
                 },
@@ -614,6 +634,11 @@ async fn main() {
                     ssh_port: *ssh_port,
                     ssh_probe_timeout_ms: *ssh_probe_timeout_ms,
                     ssh_keys: ssh_keys.clone(),
+                    ssh_public_keys: ssh_public_keys.clone(),
+                    cloud_init_user_data_file: cloud_init_user_data_file.clone(),
+                    username: username.clone(),
+                    password: password.clone(),
+                    compliant: *compliant,
                     storage_backend: match storage_backend {
                         StorageBackend::Filesystem => "filesystem".to_string(),
                         StorageBackend::Lvm => "lvm".to_string(),
