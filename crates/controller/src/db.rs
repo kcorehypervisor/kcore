@@ -1608,6 +1608,16 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_ssh_key(&self, name: &str, public_key: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ssh_keys (name, public_key) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET public_key = excluded.public_key",
+            params![name, public_key],
+        )?;
+        Ok(())
+    }
+
     pub fn get_ssh_key(
         &self,
         name: &str,
@@ -1641,6 +1651,7 @@ impl Database {
 
     pub fn delete_ssh_key(&self, name: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM vm_ssh_keys WHERE key_name = ?1", params![name])?;
         let rows = conn.execute("DELETE FROM ssh_keys WHERE name = ?1", params![name])?;
         Ok(rows > 0)
     }

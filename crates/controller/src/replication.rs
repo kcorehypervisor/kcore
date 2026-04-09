@@ -395,7 +395,9 @@ fn apply_replication_event(
         | "vm.delete"
         | "vm.desired_state.set"
         | "network.create"
-        | "network.delete" => {
+        | "network.delete"
+        | "ssh_key.create"
+        | "ssh_key.delete" => {
             // Phase-2 skeleton: payload validation + typed dispatch point.
             Ok(())
         }
@@ -748,6 +750,28 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let _ = db
                 .update_node_status(node_id, "drained")
                 .map_err(|e| format!("set node status drained {node_id}: {e}"))?;
+            Ok(())
+        }
+        "ssh_key.create" => {
+            let name = body
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("missing name for {}", head.resource_key))?;
+            let public_key = body
+                .get("publicKey")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("missing publicKey for {}", head.resource_key))?;
+            db.upsert_ssh_key(name, public_key)
+                .map_err(|e| format!("upsert ssh key {name}: {e}"))?;
+            Ok(())
+        }
+        "ssh_key.delete" => {
+            let name = body
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("missing name for {}", head.resource_key))?;
+            db.delete_ssh_key(name)
+                .map_err(|e| format!("delete ssh key {name}: {e}"))?;
             Ok(())
         }
         _ => Ok(()),
@@ -1157,6 +1181,76 @@ mod tests {
             .expect("row");
         assert_eq!(row.status, "retry_exhausted");
         assert_eq!(row.retry_count, 3);
+    }
+
+    #[test]
+    fn apply_head_to_domain_upserts_ssh_key() {
+        let db = Database::open(":memory:").expect("open db");
+        let head = ReplicationResourceHeadRow {
+            resource_key: "ssh-key/operator-key".to_string(),
+            last_op_id: "op-ssh-1".to_string(),
+            last_logical_ts_unix_ms: 1,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 1,
+            last_event_type: "ssh_key.create".to_string(),
+            last_body_json: r#"{"name":"operator-key","publicKey":"ssh-ed25519 AAAA test@example"}"#
+                .to_string(),
+        };
+        apply_head_to_domain(&db, &head).expect("apply");
+        let row = db.get_ssh_key("operator-key").expect("db").expect("key row");
+        assert_eq!(row.0, "operator-key");
+        assert_eq!(row.1, "ssh-ed25519 AAAA test@example");
+    }
+
+    #[test]
+    fn apply_head_to_domain_deletes_ssh_key_and_vm_associations() {
+        let db = Database::open(":memory:").expect("open db");
+        db.insert_ssh_key("operator-key", "ssh-ed25519 AAAA test@example")
+            .expect("insert key");
+
+        let vm = VmRow {
+            id: "vm-ssh".to_string(),
+            name: "vm-ssh".to_string(),
+            cpu: 2,
+            memory_bytes: 1024 * 1024 * 1024,
+            image_path: "/var/lib/kcore/images/test.qcow2".to_string(),
+            image_url: "".to_string(),
+            image_sha256: "".to_string(),
+            image_format: "qcow2".to_string(),
+            image_size: 8192,
+            network: "default".to_string(),
+            auto_start: true,
+            node_id: "node-1".to_string(),
+            created_at: String::new(),
+            runtime_state: "unknown".to_string(),
+            cloud_init_user_data: String::new(),
+            storage_backend: "filesystem".to_string(),
+            storage_size_bytes: 10 * 1024 * 1024 * 1024,
+            vm_ip: String::new(),
+        };
+        db.insert_vm(&vm).expect("insert vm");
+        db.associate_vm_ssh_keys("vm-ssh", &[String::from("operator-key")])
+            .expect("associate key");
+
+        let head = ReplicationResourceHeadRow {
+            resource_key: "ssh-key/operator-key".to_string(),
+            last_op_id: "op-ssh-del-1".to_string(),
+            last_logical_ts_unix_ms: 2,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 2,
+            last_event_type: "ssh_key.delete".to_string(),
+            last_body_json: r#"{"name":"operator-key"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &head).expect("apply");
+        assert!(db.get_ssh_key("operator-key").expect("db").is_none());
     }
 
     #[test]

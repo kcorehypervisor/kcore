@@ -100,6 +100,10 @@ kcore-kctl create vm web-01 \
 
 This also produces passwordless cloud-init behavior.
 
+In HA mode, SSH key create/delete is persisted in controller SQLite and propagated
+to peer controllers through CRDT replication events (`ssh_key.create`,
+`ssh_key.delete`), so key names converge across controllers.
+
 ## 6) Custom cloud-init user-data file
 
 ```bash
