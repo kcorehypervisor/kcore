@@ -42,6 +42,7 @@ Expected local layout on the operator machine:
 9. Installer copies `/etc/kcore/*`, binaries, and NixOS config into `/mnt` on target disk.
 10. `nixos-install` completes and host reboots from installed disk.
 11. Installed services read `/etc/kcore/certs/*` and start successfully.
+12. Installer writes `/etc/kcore/disko-management-mode=installer-only` to enforce safe default ownership split.
 
 ## Detailed flowchart
 
@@ -141,6 +142,7 @@ After install, the following disko-related files are saved on the node:
 
 - `/etc/nixos/disko-config.nix` -- the exact device graph used at format time (reference and day-2 use)
 - `/etc/nixos/modules/kcore-disko.nix` -- NixOS module with `kcore.disko.*` options for generating disko layouts
+- `/etc/kcore/disko-management-mode` -- disko ownership mode (`installer-only` by default)
 
 ### NixOS module: `modules/kcore-disko.nix`
 
@@ -162,6 +164,12 @@ Formatting is never implicit on every boot. Day-2 changes follow these rules:
 - **Reshape OS root / repartition system disk**: this is a **reinstall-class** event requiring rescue ISO or node replacement.
 
 The installed node has `disko` available in `environment.systemPackages` for day-2 formatting of new data devices.
+
+Safe ownership split:
+
+- `installer-only` mode blocks controller/kctl apply actions.
+- `controller-managed` mode allows `ApplyDiskoLayout` / `kctl node apply-disko --apply`.
+- promotion from installer-only to controller-managed is explicit operator action.
 
 ```mermaid
 flowchart TD
@@ -196,11 +204,25 @@ flowchart TD
   - `findmnt /` shows root on installed disk
   - `/etc/kcore/certs` exists with expected files
   - `/etc/nixos/disko-config.nix` exists with the device graph
+  - `/etc/kcore/disko-management-mode` exists and is `installer-only` by default
   - if TPM2 was used: `/etc/kcore/recovery/luks-recovery-key.txt` exists and is mode `0400`
   - `systemctl is-active kcore-node-agent` is `active`
   - if same-host controller mode, `systemctl is-active kcore-controller` is `active`
   - if LVM data disks: `vgs` shows expected VG
   - if ZFS data disks: `zpool status` shows expected pool
+
+## Day-2 apply checklist (controller-managed mode)
+
+1. Confirm ownership mode:
+   - `cat /etc/kcore/disko-management-mode`
+2. If still installer-only, explicitly promote:
+   - `echo controller-managed | sudo tee /etc/kcore/disko-management-mode`
+3. Validate layout first:
+   - `kcore-kctl --node <host:9091> node apply-disko -f ./day2-disko.nix`
+4. Apply with bounded timeout:
+   - `kcore-kctl --node <host:9091> node apply-disko -f ./day2-disko.nix --apply --timeout-seconds 600`
+5. Reconcile Nix mounts/services:
+   - `kcore-kctl --node <host:9091> node apply-nix -f ./node-config.nix`
 
 ## ISO-to-VM acceptance checklist (regression guard)
 

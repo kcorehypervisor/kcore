@@ -107,6 +107,82 @@ For day-2 additions of new data disks, the `disko` CLI is available on installed
 
 For kcore, the backing VG or pool is created by disko at install time. VM **volumes** are then created at runtime by the node agent (`lvcreate`, `zfs create -V`, etc.) against the VG or pool named in `node-agent.yaml`.
 
+## Disko Ownership Modes (safe installer/controller split)
+
+kcore uses an explicit ownership split for disk partitioning state:
+
+- `installer-only` (default): install-time layout is authoritative; controller day-2 disko apply is blocked.
+- `controller-managed`: controller/kctl day-2 disko apply is allowed.
+
+Install-time behavior writes the default mode marker:
+
+- `/etc/kcore/disko-management-mode` contains `installer-only` after `node install`.
+
+This prevents accidental day-2 destructive layout changes on newly installed nodes until operators explicitly promote ownership.
+
+### Promote a node to controller-managed mode
+
+Operators can promote a node explicitly once runbooks and maintenance windows are in place:
+
+```bash
+echo controller-managed | sudo tee /etc/kcore/disko-management-mode
+```
+
+### Apply mode safety gate
+
+`kcore-kctl node apply-disko --apply` succeeds only in `controller-managed` mode.  
+In `installer-only`, the RPC returns a clear rejection and reports the active mode.
+
+## Day-2 Disko workflow (validate first, then apply)
+
+### 1) Prepare disko layout file
+
+Create a Nix file that defines `disko.devices` for the intended day-2 change (for example adding a new data disk).
+
+### 2) Validate only (recommended first step)
+
+```bash
+kcore-kctl --node 192.168.40.105:9091 node apply-disko \
+  -f ./day2-disko.nix
+```
+
+Validation parses/evaluates layout input without partitioning disks.
+
+### 3) Apply with bounded timeout (controller-managed mode only)
+
+```bash
+kcore-kctl --node 192.168.40.105:9091 node apply-disko \
+  -f ./day2-disko.nix \
+  --apply \
+  --timeout-seconds 600
+```
+
+Runtime is bounded server-side (`timeout`), and command output includes success/failure detail plus active ownership mode.
+
+### 4) Reconcile mounts/services
+
+After successful day-2 disko apply, run:
+
+- `kcore-kctl --node <node:9091> node apply-nix -f <node-config.nix>`
+- or a full `nixos-rebuild switch` on-node, depending on your operational workflow.
+
+## Controller-side disko fragments (multi-node consistency)
+
+`modules/kcore-disko.nix` now supports optional controller fragments to keep day-2 layouts consistent across nodes while still allowing deterministic overrides.
+
+New options:
+
+- `kcore.disko.managementMode = "installer-only" | "controller-managed"`
+- `kcore.disko.controllerFragments = [ { name; priority; devices; } ... ]`
+
+Merge behavior:
+
+- fragments are sorted by `(priority, name)`
+- merged into base layout using recursive update
+- fragments are rejected in `installer-only` mode via Nix assertion
+
+This gives deterministic composition for fleet-wide storage profiles with explicit opt-in safety.
+
 ### 2) Create VM with required storage metadata
 
 Create a VM using a node-local image with filesystem backend request:
@@ -268,7 +344,11 @@ storage:
   Runtime storage config schema and backend-specific requirements.
 
 - `crates/node-agent/src/grpc/admin.rs`  
-  Builds `install-to-disk` command arguments from typed request fields; applies compatibility fallback from legacy mode when needed.
+  Builds `install-to-disk` command arguments from typed request fields; applies compatibility fallback from legacy mode when needed.  
+  Also enforces day-2 disko safety and execution via:
+  - `ApplyDiskoLayout` RPC
+  - ownership mode gate (`installer-only` vs `controller-managed`)
+  - bounded command timeout
 
 - `crates/node-agent/src/storage/mod.rs`  
   Storage adapter trait and concrete backends:
@@ -289,12 +369,14 @@ storage:
   CLI flag surface:
   - `create vm --storage-backend --storage-size-bytes`
   - `node install --storage-backend` and backend-specific LVM/ZFS flags
+  - `node apply-disko -f <file> [--apply] [--timeout-seconds N]`
 
 - `crates/kctl/src/commands/vm.rs`  
   Validates and maps storage CLI arguments into `CreateVmRequest`.
 
 - `crates/kctl/src/commands/node.rs`  
-  Maps typed install storage flags into `InstallToDiskRequest`.
+  Maps typed install storage flags into `InstallToDiskRequest`.  
+  Implements day-2 disko RPC client call via `apply_disko_layout`.
 
 - `crates/kctl/src/output.rs`  
   Renders node storage backend in operator output.
@@ -302,7 +384,8 @@ storage:
 ### Nix module surface
 
 - `modules/kcore-disko.nix`  
-  NixOS module that generates `disko.devices` from `kcore.disko.*` options (OS disk with LUKS, data disks with LVM/ZFS/filesystem). Used at install time via the generated `disko-config.nix` and available on installed nodes for day-2 operations.
+  NixOS module that generates `disko.devices` from `kcore.disko.*` options (OS disk with LUKS, data disks with LVM/ZFS/filesystem). Used at install time via the generated `disko-config.nix` and available on installed nodes for day-2 operations.  
+  Includes management mode and optional controller fragments for deterministic multi-node day-2 layout composition.
 
 - `modules/ch-vm/options.nix`  
   Declares VM storage options accepted by generated config (`storageBackend`, `storageSizeBytes`).
