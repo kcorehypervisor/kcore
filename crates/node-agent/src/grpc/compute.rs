@@ -250,6 +250,169 @@ impl proto::node_compute_server::NodeCompute for ComputeService {
             message: format!("image deleted: {}", path.display()),
         }))
     }
+
+    async fn create_workload(
+        &self,
+        request: Request<proto::CreateWorkloadRequest>,
+    ) -> Result<Response<proto::CreateWorkloadResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
+        let req = request.into_inner();
+        let kind = proto::WorkloadKind::try_from(req.kind)
+            .unwrap_or(proto::WorkloadKind::Unspecified);
+        match kind {
+            proto::WorkloadKind::Vm => {
+                let vm_spec = req.vm_spec.ok_or_else(|| Status::invalid_argument("vm_spec is required"))?;
+                if vm_spec.name.trim().is_empty() {
+                    return Err(Status::invalid_argument("vm_spec.name is required"));
+                }
+                Err(Status::unimplemented(DECLARATIVE_MSG))
+            }
+            proto::WorkloadKind::Container => Err(Status::unimplemented(
+                "container workloads are managed by NodeContainer service",
+            )),
+            proto::WorkloadKind::Unspecified => Err(Status::invalid_argument("kind is required")),
+        }
+    }
+
+    async fn delete_workload(
+        &self,
+        request: Request<proto::DeleteWorkloadRequest>,
+    ) -> Result<Response<proto::DeleteWorkloadResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
+        let req = request.into_inner();
+        let kind = proto::WorkloadKind::try_from(req.kind)
+            .unwrap_or(proto::WorkloadKind::Unspecified);
+        match kind {
+            proto::WorkloadKind::Vm => Err(Status::unimplemented(DECLARATIVE_MSG)),
+            proto::WorkloadKind::Container => Err(Status::unimplemented(
+                "container workloads are managed by NodeContainer service",
+            )),
+            proto::WorkloadKind::Unspecified => Err(Status::invalid_argument("kind is required")),
+        }
+    }
+
+    async fn set_workload_desired_state(
+        &self,
+        request: Request<proto::SetWorkloadDesiredStateRequest>,
+    ) -> Result<Response<proto::SetWorkloadDesiredStateResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
+        let req = request.into_inner();
+        let kind = proto::WorkloadKind::try_from(req.kind)
+            .unwrap_or(proto::WorkloadKind::Unspecified);
+        match kind {
+            proto::WorkloadKind::Vm => {
+                let desired = match proto::WorkloadDesiredState::try_from(req.desired_state)
+                    .unwrap_or(proto::WorkloadDesiredState::Unspecified)
+                {
+                    proto::WorkloadDesiredState::Running => proto::VmDesiredState::Running as i32,
+                    proto::WorkloadDesiredState::Stopped => proto::VmDesiredState::Stopped as i32,
+                    proto::WorkloadDesiredState::Unspecified => {
+                        return Err(Status::invalid_argument("desired_state is required"))
+                    }
+                };
+                let vm_resp = self
+                    .set_vm_desired_state(Request::new(proto::SetVmDesiredStateRequest {
+                        vm_id: req.workload_id,
+                        desired_state: desired,
+                    }))
+                    .await?
+                    .into_inner();
+                let vm_status = vm_resp.status.unwrap_or_default();
+                Ok(Response::new(proto::SetWorkloadDesiredStateResponse {
+                    workload: Some(proto::WorkloadInfo {
+                        kind: proto::WorkloadKind::Vm as i32,
+                        vm: Some(proto::VmInfo {
+                            id: vm_status.id.clone(),
+                            name: vm_status.id,
+                            state: vm_status.state,
+                            cpu: 0,
+                            memory_bytes: 0,
+                            created_at: None,
+                        }),
+                        container: None,
+                    }),
+                }))
+            }
+            proto::WorkloadKind::Container => Err(Status::unimplemented(
+                "container workloads are managed by NodeContainer service",
+            )),
+            proto::WorkloadKind::Unspecified => Err(Status::invalid_argument("kind is required")),
+        }
+    }
+
+    async fn get_workload(
+        &self,
+        request: Request<proto::GetWorkloadRequest>,
+    ) -> Result<Response<proto::GetWorkloadResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
+        let req = request.into_inner();
+        let kind = proto::WorkloadKind::try_from(req.kind)
+            .unwrap_or(proto::WorkloadKind::Unspecified);
+        match kind {
+            proto::WorkloadKind::Vm => {
+                let vm = self
+                    .get_vm(Request::new(proto::GetVmRequest {
+                        vm_id: req.workload_id,
+                    }))
+                    .await?
+                    .into_inner();
+                let spec = vm.spec.unwrap_or_default();
+                let status = vm.status.unwrap_or_default();
+                Ok(Response::new(proto::GetWorkloadResponse {
+                    workload: Some(proto::WorkloadInfo {
+                        kind: proto::WorkloadKind::Vm as i32,
+                        vm: Some(proto::VmInfo {
+                            id: spec.id,
+                            name: spec.name,
+                            state: status.state,
+                            cpu: spec.cpu,
+                            memory_bytes: spec.memory_bytes,
+                            created_at: None,
+                        }),
+                        container: None,
+                    }),
+                }))
+            }
+            proto::WorkloadKind::Container => Err(Status::unimplemented(
+                "container workloads are managed by NodeContainer service",
+            )),
+            proto::WorkloadKind::Unspecified => Err(Status::invalid_argument("kind is required")),
+        }
+    }
+
+    async fn list_workloads(
+        &self,
+        request: Request<proto::ListWorkloadsRequest>,
+    ) -> Result<Response<proto::ListWorkloadsResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
+        let req = request.into_inner();
+        let kind = proto::WorkloadKind::try_from(req.kind)
+            .unwrap_or(proto::WorkloadKind::Unspecified);
+        match kind {
+            proto::WorkloadKind::Unspecified | proto::WorkloadKind::Vm => {
+                let vm_list = self
+                    .list_vms(Request::new(proto::ListVmsRequest {}))
+                    .await?
+                    .into_inner();
+                let workloads: Vec<proto::WorkloadInfo> = vm_list
+                    .vms
+                    .into_iter()
+                    .map(|vm| proto::WorkloadInfo {
+                        kind: proto::WorkloadKind::Vm as i32,
+                        vm: Some(vm),
+                        container: None,
+                    })
+                    .collect();
+                if kind == proto::WorkloadKind::Unspecified {
+                    // Containers are served by NodeContainer and intentionally omitted here.
+                }
+                Ok(Response::new(proto::ListWorkloadsResponse { workloads }))
+            }
+            proto::WorkloadKind::Container => Err(Status::unimplemented(
+                "container workloads are managed by NodeContainer service",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

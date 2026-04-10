@@ -7,6 +7,7 @@ mod config;
 mod discovery;
 mod grpc;
 mod registration;
+mod runtime;
 mod storage;
 mod vmm;
 
@@ -91,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let info_svc =
         proto::node_info_server::NodeInfoServer::new(grpc::InfoService::new(cfg.node_id.clone()));
+    let container_svc =
+        proto::node_container_server::NodeContainerServer::new(grpc::ContainerService::new());
     let admin_svc =
         proto::node_admin_server::NodeAdminServer::new(grpc::AdminService::new_with_storage(
             cfg.nix_config_path.clone(),
@@ -106,6 +109,9 @@ async fn main() -> anyhow::Result<()> {
     let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<proto::node_compute_server::NodeComputeServer<grpc::ComputeService>>()
+        .await;
+    health_reporter
+        .set_serving::<proto::node_container_server::NodeContainerServer<grpc::ContainerService>>()
         .await;
 
     if !cfg.controller_endpoints().is_empty() {
@@ -134,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
     server
         .add_service(health_svc)
         .add_service(compute_svc)
+        .add_service(container_svc)
         .add_service(info_svc)
         .add_service(admin_svc)
         .add_service(storage_svc)

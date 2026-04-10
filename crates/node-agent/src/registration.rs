@@ -287,13 +287,85 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
             })
             .await
         {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                let workloads = collect_local_workload_runtime();
+                if !workloads.is_empty() {
+                    let _ = client
+                        .sync_workload_state(controller_proto::SyncWorkloadStateRequest {
+                            node_id: cfg.node_id.clone(),
+                            workloads,
+                        })
+                        .await;
+                }
+                return Ok(());
+            }
             Err(e) => {
                 last_err = Some(Box::new(e));
             }
         }
     }
     Err(last_err.unwrap_or_else(|| Box::new(std::io::Error::other("heartbeat failed"))))
+}
+
+fn collect_local_workload_runtime() -> Vec<controller_proto::WorkloadRuntimeInfo> {
+    let mut workloads = Vec::new();
+    let runtime = if std::process::Command::new("nerdctl")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        "nerdctl"
+    } else if std::process::Command::new("docker")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        "docker"
+    } else {
+        return workloads;
+    };
+
+    let output = std::process::Command::new(runtime)
+        .args([
+            "ps",
+            "-a",
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Status}}",
+        ])
+        .output();
+    let Ok(out) = output else {
+        return workloads;
+    };
+    if !out.status.success() {
+        return workloads;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let id = parts.next().unwrap_or_default().trim().to_string();
+        let name = parts.next().unwrap_or_default().trim().to_string();
+        let status = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+        if id.is_empty() || name.is_empty() {
+            continue;
+        }
+        let container_state = if status.starts_with("up ") || status == "running" {
+            controller_proto::ContainerState::Running as i32
+        } else if status.starts_with("exited") || status.starts_with("created") {
+            controller_proto::ContainerState::Stopped as i32
+        } else {
+            controller_proto::ContainerState::Unknown as i32
+        };
+        workloads.push(controller_proto::WorkloadRuntimeInfo {
+            id,
+            name,
+            kind: controller_proto::WorkloadKind::Container as i32,
+            vm_state: controller_proto::VmState::Unknown as i32,
+            container_state,
+        });
+    }
+    workloads
 }
 
 async fn check_and_renew_cert(
@@ -571,5 +643,10 @@ mod tests {
 
         let days = cert_days_remaining(&pem).unwrap();
         assert!((4..=5).contains(&days), "expected ~5 days, got {days}");
+    }
+
+    #[test]
+    fn collect_local_workload_runtime_is_non_panicking() {
+        let _ = collect_local_workload_runtime();
     }
 }
