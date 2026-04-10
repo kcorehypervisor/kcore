@@ -2,7 +2,7 @@
 
 kcore keeps the core platform open source under Apache-2.0. Paid subscriptions provide the official supported distribution, stable production updates, official signed ISO images, and commercial support.
 
-For how licensing relates to subscriptions, see [docs/licensing.md](docs/licensing.md).
+For how licensing relates to subscriptions, see [Licensing & editions](https://kcorehypervisor.com/docs/user/licensing.html) on the product site.
 
 ## Community Edition
 

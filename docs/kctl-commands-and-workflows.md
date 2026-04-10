@@ -221,6 +221,21 @@ Skip rebuild (write only):
 kctl --node 10.0.0.21:9091 node apply-nix -f ./node-config.nix --no-rebuild
 ```
 
+Validate a day-2 disko layout on a node:
+
+```bash
+kctl --node 10.0.0.21:9091 node apply-disko -f ./day2-disko.nix
+```
+
+Apply a day-2 disko layout (requires `controller-managed` disko mode on node):
+
+```bash
+kctl --node 10.0.0.21:9091 node apply-disko \
+  -f ./day2-disko.nix \
+  --apply \
+  --timeout-seconds 600
+```
+
 ## 6) Image operations
 
 There are two supported VM image flows:
@@ -372,6 +387,7 @@ Top-level commands:
 - `kctl node nics`
 - `kctl node install --os-disk ... --join-controller ... [--data-disk ...] [--storage-backend filesystem|lvm|zfs] [--disable-vxlan]`
 - `kctl node apply-nix -f ... [--no-rebuild]`
+- `kctl node apply-disko -f ... [--apply] [--timeout-seconds N]`
 - `kctl pull image <uri>` (legacy/manual path)
 - `kctl node approve <NODE_ID>`
 - `kctl node reject <NODE_ID>`
@@ -395,8 +411,9 @@ Day-2 operations:
 2. review compliance posture with `kctl get compliance-report` (crypto, mTLS, access control, encryption at rest, per-node cert and LUKS status)
 3. adjust desired VM running state with `kctl set vm ... --state ...` (or `kctl start/stop vm ...`)
 4. update configs with `kctl node apply-nix ...` or `kctl apply ...`
-5. rotate controller cert with `kctl rotate certs --controller <host:port>`
-6. rotate sub-CA with `kctl rotate sub-ca`
+5. for day-2 disk layout changes, use `kctl node apply-disko ...` (validate first, then `--apply`)
+6. rotate controller cert with `kctl rotate certs --controller <host:port>`
+7. rotate sub-CA with `kctl rotate sub-ca`
 
 ## 11) Storage backend examples
 

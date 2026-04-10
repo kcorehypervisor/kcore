@@ -11,7 +11,7 @@ It is organized as a multi-crate workspace with a controller, node agent, and CL
 
 kcore Community Edition is open source under the **Apache License 2.0** (see [`LICENSE`](LICENSE)). The core platform remains open and buildable from source. **Commercial use of that Apache-2.0 code is not restricted by us** beyond what the licence states.
 
-More detail: [docs/licensing.md](docs/licensing.md).
+More detail: [Licensing & editions](https://kcorehypervisor.com/docs/user/licensing.html) (product site).
 
 ## Commercial subscriptions
 
@@ -113,7 +113,7 @@ Default guest access on generated cloud-init seeds:
 
 See:
 - [kctl commands and workflows](docs/kctl-commands-and-workflows.md)
-- [VM images workflow](docs/images.md)
+- [VM images workflow](https://kcorehypervisor.com/docs/user/images.html)
 - [Networking model](docs/networking.md)
 - [Node install bootstrap flow](docs/node-install-bootstrap-flow.md)
 - [mTLS bootstrap and authentication](docs/mtls-bootstrap-and-auth.md)
