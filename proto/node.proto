@@ -18,6 +18,21 @@ service NodeCompute {
   rpc PullImage(PullImageRequest) returns (PullImageResponse);
   rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
   rpc DeleteImage(DeleteImageRequest) returns (DeleteImageResponse);
+  rpc CreateWorkload(CreateWorkloadRequest) returns (CreateWorkloadResponse);
+  rpc DeleteWorkload(DeleteWorkloadRequest) returns (DeleteWorkloadResponse);
+  rpc SetWorkloadDesiredState(SetWorkloadDesiredStateRequest) returns (SetWorkloadDesiredStateResponse);
+  rpc GetWorkload(GetWorkloadRequest) returns (GetWorkloadResponse);
+  rpc ListWorkloads(ListWorkloadsRequest) returns (ListWorkloadsResponse);
+}
+
+// NodeContainer service handles container lifecycle operations on a node.
+service NodeContainer {
+  rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
+  rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
+  rpc StopContainer(StopContainerRequest) returns (StopContainerResponse);
+  rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse);
+  rpc GetContainer(GetContainerRequest) returns (GetContainerResponse);
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
 }
 
 // NodeStorage service handles volume operations
@@ -184,6 +199,149 @@ message VmInfo {
   int32 cpu = 4;
   int64 memory_bytes = 5;
   google.protobuf.Timestamp created_at = 6;
+}
+
+enum ContainerState {
+  CONTAINER_STATE_UNKNOWN = 0;
+  CONTAINER_STATE_CREATED = 1;
+  CONTAINER_STATE_RUNNING = 2;
+  CONTAINER_STATE_STOPPED = 3;
+  CONTAINER_STATE_ERROR = 4;
+}
+
+enum WorkloadKind {
+  WORKLOAD_KIND_UNSPECIFIED = 0;
+  WORKLOAD_KIND_VM = 1;
+  WORKLOAD_KIND_CONTAINER = 2;
+}
+
+enum WorkloadDesiredState {
+  WORKLOAD_DESIRED_STATE_UNSPECIFIED = 0;
+  WORKLOAD_DESIRED_STATE_RUNNING = 1;
+  WORKLOAD_DESIRED_STATE_STOPPED = 2;
+}
+
+message ContainerSpec {
+  string name = 1;
+  string image = 2;
+  string network = 3; // host runtime network name (e.g. bridge or kcore-managed bridge)
+  repeated string command = 4;
+  map<string, string> env = 5;
+  repeated string ports = 6; // host:container or ip:host:container
+  string storage_backend = 7; // filesystem|lvm|zfs
+  int64 storage_size_bytes = 8;
+  string mount_target = 9; // container mount point, defaults to /data
+}
+
+message ContainerInfo {
+  string id = 1;
+  string name = 2;
+  string image = 3;
+  ContainerState state = 4;
+  string status = 5;
+}
+
+message CreateContainerRequest {
+  ContainerSpec spec = 1;
+}
+
+message CreateContainerResponse {
+  ContainerInfo container = 1;
+}
+
+message StartContainerRequest {
+  string name = 1;
+}
+
+message StartContainerResponse {
+  ContainerInfo container = 1;
+}
+
+message StopContainerRequest {
+  string name = 1;
+}
+
+message StopContainerResponse {
+  ContainerInfo container = 1;
+}
+
+message DeleteContainerRequest {
+  string name = 1;
+  bool force = 2;
+}
+
+message DeleteContainerResponse {
+  bool success = 1;
+}
+
+message GetContainerRequest {
+  string name = 1;
+}
+
+message GetContainerResponse {
+  ContainerInfo container = 1;
+}
+
+message ListContainersRequest {}
+
+message ListContainersResponse {
+  repeated ContainerInfo containers = 1;
+}
+
+message WorkloadInfo {
+  WorkloadKind kind = 1;
+  VmInfo vm = 2;
+  ContainerInfo container = 3;
+}
+
+message CreateWorkloadRequest {
+  WorkloadKind kind = 1;
+  VmSpec vm_spec = 2;
+  ContainerSpec container_spec = 3;
+  string image_uri = 4;
+  string image_path = 5;
+  string image_format = 6;
+}
+
+message CreateWorkloadResponse {
+  WorkloadInfo workload = 1;
+}
+
+message DeleteWorkloadRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+  bool force = 3;
+}
+
+message DeleteWorkloadResponse {
+  bool success = 1;
+}
+
+message SetWorkloadDesiredStateRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+  WorkloadDesiredState desired_state = 3;
+}
+
+message SetWorkloadDesiredStateResponse {
+  WorkloadInfo workload = 1;
+}
+
+message GetWorkloadRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+}
+
+message GetWorkloadResponse {
+  WorkloadInfo workload = 1;
+}
+
+message ListWorkloadsRequest {
+  WorkloadKind kind = 1; // optional filter
+}
+
+message ListWorkloadsResponse {
+  repeated WorkloadInfo workloads = 1;
 }
 
 // CreateVolume
