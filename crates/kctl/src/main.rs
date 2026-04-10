@@ -140,11 +140,6 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Resolve resources requiring operator action
-    Resolve {
-        #[command(subcommand)]
-        resource: ResolveResource,
-    },
     /// Show version
     Version,
     /// Unified workload operations via controller API
@@ -467,14 +462,12 @@ enum GetResource {
         #[arg(long, default_value_t = 100)]
         limit: i32,
     },
-}
-
-#[derive(Subcommand)]
-enum ResolveResource {
-    /// Resolve a replication conflict by ID
-    Conflict {
-        /// Conflict ID (from `kctl get conflicts`)
-        id: i64,
+    /// Show replication zero-manual SLO status
+    #[command(name = "replication-status")]
+    ReplicationStatus {
+        /// Exit non-zero when status is unhealthy
+        #[arg(long)]
+        require_healthy: bool,
     },
 }
 
@@ -1109,6 +1102,12 @@ async fn main() {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::conflict::list(&info, *limit).await
         }
+        Command::Get {
+            resource: GetResource::ReplicationStatus { require_healthy },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::conflict::status(&info, *require_healthy).await
+        }
 
         Command::Describe {
             resource: DescribeResource::Vm { name, target_node },
@@ -1352,13 +1351,6 @@ async fn main() {
         Command::Apply { file, dry_run } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::apply::apply(&info, file, *dry_run).await
-        }
-
-        Command::Resolve {
-            resource: ResolveResource::Conflict { id },
-        } => {
-            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::conflict::resolve(&info, *id).await
         }
 
         Command::Version => {

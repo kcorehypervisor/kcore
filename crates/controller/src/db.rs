@@ -184,6 +184,8 @@ pub struct ReplicationCompensationJobRow {
     pub conflict_id: i64,
     pub resource_key: String,
     pub loser_op_id: String,
+    pub loser_event_type: String,
+    pub loser_body_json: String,
     pub status: String,
     pub attempts: i32,
 }
@@ -685,7 +687,18 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 23;
+        if version < 24 {
+            let _ = conn.execute(
+                "ALTER TABLE replication_compensation_jobs ADD COLUMN loser_event_type TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE replication_compensation_jobs ADD COLUMN loser_body_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            );
+        }
+
+        const CURRENT_VERSION: i32 = 24;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -1002,12 +1015,20 @@ impl Database {
         conflict_id: i64,
         resource_key: &str,
         loser_op_id: &str,
+        loser_event_type: &str,
+        loser_body_json: &str,
     ) -> Result<i64, rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO replication_compensation_jobs (conflict_id, resource_key, loser_op_id)
-             VALUES (?1, ?2, ?3)",
-            params![conflict_id, resource_key, loser_op_id],
+            "INSERT INTO replication_compensation_jobs (conflict_id, resource_key, loser_op_id, loser_event_type, loser_body_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                conflict_id,
+                resource_key,
+                loser_op_id,
+                loser_event_type,
+                loser_body_json
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1035,7 +1056,7 @@ impl Database {
     ) -> Result<Option<ReplicationCompensationJobRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, conflict_id, resource_key, loser_op_id, status, attempts
+            "SELECT id, conflict_id, resource_key, loser_op_id, loser_event_type, loser_body_json, status, attempts
              FROM replication_compensation_jobs
              WHERE status IN ('pending', 'failed')
              ORDER BY id ASC
@@ -1047,8 +1068,10 @@ impl Database {
                 conflict_id: row.get(1)?,
                 resource_key: row.get(2)?,
                 loser_op_id: row.get(3)?,
-                status: row.get(4)?,
-                attempts: row.get(5)?,
+                loser_event_type: row.get(4)?,
+                loser_body_json: row.get(5)?,
+                status: row.get(6)?,
+                attempts: row.get(7)?,
             })
         })?;
         let Some(job) = rows.next().transpose()? else {
@@ -2983,7 +3006,13 @@ mod tests {
             .expect("insert conflict");
         assert_eq!(db.count_pending_compensation_jobs().expect("count"), 0);
         let job_id = db
-            .insert_compensation_job(conflict_id, "vm/v1", "op-loser")
+            .insert_compensation_job(
+                conflict_id,
+                "vm/v1",
+                "op-loser",
+                "vm.update",
+                r#"{"vmId":"vm/v1","cpu":4}"#,
+            )
             .expect("insert job");
         assert!(job_id >= 1);
         assert_eq!(db.count_pending_compensation_jobs().expect("count"), 1);

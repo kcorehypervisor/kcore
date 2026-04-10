@@ -86,7 +86,8 @@ No unresolved conflict is required for normal convergence.
 
 - Health endpoint reports lag/frontiers and conflict counts.
 - Health endpoint now includes zero-manual SLO signals (`zero_manual_slo_healthy` and violation reasons) derived from compensation backlog/failures, materialization backlog, unresolved age, and reservation failures.
-- Conflict list/resolve APIs remain available as break-glass tooling.
+- Conflict list APIs remain available for audit visibility; runtime automation should gate on replication status health.
+- `kctl get replication-status --require-healthy` is the preferred hard-gate command for CI/CD and operational readiness checks.
 - Normal operations should show zero unresolved conflicts.
 
 ## TLA+ Modeling Notes
@@ -109,7 +110,7 @@ Key invariants:
 Current bounded TLC model coverage:
 
 - `ControllerReplication.tla` encodes `Outbox`, `Delivered`, `Applied`, `Head`, `ReceivedOps`, `Frontier`, and `Conflicts`.
-- Invariants checked include `TypeOK`, `NoDoubleApply`, `DeterministicWinner`, and `NoManualRequired`.
+- Invariants checked include `TypeOK`, `NoDoubleApply`, `DeterministicWinner`, `NoManualRequired`, and `CompensatedConflictsHaveLoser`.
 - `CrossDcReplication.tla` encodes DC-aware delivery/anti-entropy and checks bounded cross-DC convergence with no-double-apply semantics.
 - Drift checks now include a trace fixture generated from controller replication Rust tests, in addition to static fixtures.
 - Drift checker rows now carry reservation/compensation branch signals so `auto_rejected` (reservation failure) and `auto_compensated` paths are validated directly.
@@ -124,7 +125,7 @@ Liveness:
 
 ## Current Limitations
 
-- Compensation executor is currently a deterministic skeleton (no domain-specific rollback yet).
-- Head materialization currently covers a subset of event types; full desired-state projection is still in progress.
+- Compensation executor now applies domain-specific, idempotent correction handlers for create-style loser events and reconciles to the current winning head.
+- Head materialization now covers node registration/lifecycle, vm lifecycle, network lifecycle, security-group lifecycle, and ssh-key lifecycle event families.
 - Reservation model currently gates `vm.create` with a node-capacity token; full IP/storage escrow remains in progress.
-- Domain materialization from heads to desired-state tables remains incremental.
+- Remaining maturity focus is deeper compensation semantics for destructive operations and broader soak evidence under long-running fault injection.

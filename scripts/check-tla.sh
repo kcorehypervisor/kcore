@@ -9,7 +9,12 @@ if [[ -n "${TLC_CMD:-}" ]]; then
 elif command -v tlc >/dev/null 2>&1; then
   TLC_BIN="tlc"
 elif [[ -n "${TLA2TOOLS_JAR:-}" ]]; then
-  TLC_BIN="java -cp \"${TLA2TOOLS_JAR}\" tlc2.TLC"
+  if [[ "${TLA2TOOLS_JAR}" = /* ]]; then
+    TLC_JAR="${TLA2TOOLS_JAR}"
+  else
+    TLC_JAR="${ROOT_DIR}/${TLA2TOOLS_JAR}"
+  fi
+  TLC_BIN="java -cp \"${TLC_JAR}\" tlc2.TLC"
 else
   echo "TLC not found."
   echo "Install a 'tlc' command or set TLA2TOOLS_JAR=/path/to/tla2tools.jar"

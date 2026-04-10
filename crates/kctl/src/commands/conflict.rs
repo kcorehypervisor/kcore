@@ -74,6 +74,53 @@ pub async fn describe(info: &ConnectionInfo, id: i64) -> Result<()> {
     Ok(())
 }
 
+pub async fn status(info: &ConnectionInfo, require_healthy: bool) -> Result<()> {
+    let mut client = client::controller_admin_client(info).await?;
+    let resp = client
+        .get_replication_status(proto::GetReplicationStatusRequest {})
+        .await?
+        .into_inner();
+
+    println!("zero_manual_slo_healthy: {}", resp.zero_manual_slo_healthy);
+    println!("outbox_head_event_id: {}", resp.outbox_head_event_id);
+    println!("outbox_size: {}", resp.outbox_size);
+    println!("unresolved_conflicts: {}", resp.unresolved_conflicts);
+    println!(
+        "oldest_unresolved_conflict_age_seconds: {}",
+        resp.oldest_unresolved_conflict_age_seconds
+    );
+    println!(
+        "pending_compensation_jobs: {}",
+        resp.pending_compensation_jobs
+    );
+    println!("failed_compensation_jobs: {}", resp.failed_compensation_jobs);
+    println!("materialization_backlog: {}", resp.materialization_backlog);
+    println!("failed_reservations: {}", resp.failed_reservations);
+    println!(
+        "failed_retryable_reservations: {}",
+        resp.failed_retryable_reservations
+    );
+    println!(
+        "failed_non_retryable_reservations: {}",
+        resp.failed_non_retryable_reservations
+    );
+    println!(
+        "retry_exhausted_reservations: {}",
+        resp.retry_exhausted_reservations
+    );
+    if !resp.zero_manual_slo_violations.is_empty() {
+        println!("violations:");
+        for reason in resp.zero_manual_slo_violations {
+            println!("  - {reason}");
+        }
+    }
+
+    if require_healthy && !resp.zero_manual_slo_healthy {
+        bail!("replication zero-manual SLO is unhealthy");
+    }
+    Ok(())
+}
+
 fn truncate(input: &str, max: usize) -> String {
     if input.chars().count() <= max {
         input.to_string()

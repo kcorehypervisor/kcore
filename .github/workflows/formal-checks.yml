@@ -26,36 +26,29 @@ jobs:
       - name: Run replication trace drift checks
         run: make test-tla-trace
 
-      - name: Install Java (for TLC fallback)
+      - name: Install Java (for TLC)
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "21"
 
-      - name: Attempt bounded TLC checks (best effort)
+      - name: Run bounded TLC checks (required)
         shell: bash
         run: |
           set -euo pipefail
-          run_tla_best_effort() {
-            if "$@"; then
-              return 0
-            fi
-            rc=$?
-            echo "::warning::Best-effort TLC checks failed (exit ${rc}); continuing because trace drift checks are required and already passed."
-            return 0
-          }
           if command -v tlc >/dev/null 2>&1; then
-            run_tla_best_effort make test-tla
+            make test-tla
             exit 0
           fi
           if [[ ! -f ./tools/tla2tools.jar ]]; then
             mkdir -p ./tools
             curl -fsSL \
               https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar \
-              -o ./tools/tla2tools.jar || true
+              -o ./tools/tla2tools.jar
           fi
           if [[ -f ./tools/tla2tools.jar ]]; then
-            run_tla_best_effort env TLA2TOOLS_JAR=./tools/tla2tools.jar make test-tla
+            env TLA2TOOLS_JAR=./tools/tla2tools.jar make test-tla
           else
-            echo "TLC unavailable; skipping make test-tla (trace checks already enforced)."
+            echo "::error::TLC unavailable and tla2tools.jar could not be downloaded."
+            exit 1
           fi

@@ -751,6 +751,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "nodeId": req.node_id,
                 "hostname": req.hostname,
                 "address": req.address,
+                "cpuCores": req.capacity.as_ref().map(|c| c.cpu_cores).unwrap_or(0),
+                "memoryBytes": req.capacity.as_ref().map(|c| c.memory_bytes).unwrap_or(0),
+                "status": if approval_status == "approved" { "ready" } else { "pending" },
+                "gatewayInterface": "",
+                "storageBackend": req.storage_backend,
+                "disableVxlan": req.disable_vxlan,
+                "certExpiryDays": req.cert_expiry_days,
                 "approvalStatus": approval_status,
                 "labels": req.labels,
                 "luksMethod": req.luks_method,
@@ -1200,6 +1207,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "vmId": vm_id,
                 "nodeId": node.id,
                 "name": vm.name,
+                "cpu": vm.cpu,
+                "memoryBytes": vm.memory_bytes,
+                "imagePath": vm.image_path,
+                "imageUrl": vm.image_url,
+                "imageSha256": vm.image_sha256,
+                "imageFormat": vm.image_format,
+                "imageSize": vm.image_size,
+                "network": vm.network,
+                "autoStart": vm.auto_start,
+                "runtimeState": vm.runtime_state,
+                "cloudInitUserData": vm.cloud_init_user_data,
+                "storageBackend": vm.storage_backend,
+                "storageSizeBytes": vm.storage_size_bytes,
+                "vmIp": vm.vm_ip,
             }),
         );
 
@@ -2159,9 +2180,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
             serde_json::json!({
                 "name": name,
                 "nodeId": node.id,
+                "externalIp": req.external_ip,
+                "gatewayIp": req.gateway_ip,
+                "internalNetmask": req.internal_netmask,
+                "allowedTcpPorts": req.allowed_tcp_ports,
+                "allowedUdpPorts": req.allowed_udp_ports,
                 "networkType": network_type,
                 "vlanId": req.vlan_id,
+                "enableOutboundNat": enable_outbound_nat,
                 "vni": vni,
+                "nextIp": 2,
             }),
         );
 
@@ -2348,7 +2376,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.log_replication_event(
             EVT_SECURITY_GROUP_CREATE,
             &format!("security-group/{name}"),
-            serde_json::json!({ "name": name }),
+            serde_json::json!({
+                "name": name,
+                "description": row.description,
+                "rules": rules.iter().map(|r| serde_json::json!({
+                    "id": r.id,
+                    "protocol": r.protocol,
+                    "hostPort": r.host_port,
+                    "targetPort": r.target_port,
+                    "sourceCidr": r.source_cidr,
+                    "targetVm": r.target_vm,
+                    "enableDnat": r.enable_dnat,
+                })).collect::<Vec<_>>(),
+            }),
         );
 
         let created = self

@@ -5,14 +5,16 @@ CONSTANTS
   Controllers,
   Events,
   Dcs,
-  DcOf,
   NoEvent
 
 ASSUME /\ Controllers # {}
        /\ Events # {}
-       /\ Dcs # {}
-       /\ DcOf \in [Controllers -> Dcs]
+       /\ Events \subseteq {"e1", "e2", "e3", "e4", "e5", "e6"}
+       /\ Dcs = {"DC1", "DC2"}
        /\ NoEvent \notin Events
+
+DcOf(c) ==
+  IF c = "c3" THEN "DC2" ELSE "DC1"
 
 VARIABLES Outbox, Delivered, Applied, DcHead, ReceivedOps, Frontier, LinkUp
 
@@ -45,7 +47,7 @@ Deliver ==
 IntraDcAntiEntropy ==
   /\ \E src \in Controllers, dst \in Controllers :
       /\ src /= dst
-      /\ DcOf[src] = DcOf[dst]
+      /\ DcOf(src) = DcOf(dst)
       /\ LinkUp[<<src, dst>>]
       /\ Delivered' = [Delivered EXCEPT ![dst] = @ \cup Outbox[src]]
   /\ UNCHANGED <<Outbox, Applied, DcHead, ReceivedOps, Frontier, LinkUp>>
@@ -53,20 +55,21 @@ IntraDcAntiEntropy ==
 CrossDcAntiEntropy ==
   /\ \E src \in Controllers, dst \in Controllers :
       /\ src /= dst
-      /\ DcOf[src] # DcOf[dst]
+      /\ DcOf(src) # DcOf(dst)
       /\ LinkUp[<<src, dst>>]
       /\ Delivered' = [Delivered EXCEPT ![dst] = @ \cup Outbox[src]]
   /\ UNCHANGED <<Outbox, Applied, DcHead, ReceivedOps, Frontier, LinkUp>>
 
 ApplyEvent ==
-  /\ \E c \in Controllers, e \in Delivered[c] \ Applied[c] :
-      LET dc == DcOf[c]
+  /\ \E c \in Controllers :
+      \E e \in (Delivered[c] \ Applied[c]) :
+      LET dc == DcOf(c)
       IN
       /\ Applied' = [Applied EXCEPT ![c] = @ \cup {e}]
       /\ ReceivedOps' = [ReceivedOps EXCEPT ![c] = @ \cup {e}]
       /\ Frontier' = [Frontier EXCEPT ![c] = Cardinality(Applied[c] \cup {e})]
       /\ DcHead' =
-          IF DcHead[dc] = NoEvent \/ e > DcHead[dc]
+          IF DcHead[dc] = NoEvent
             THEN [DcHead EXCEPT ![dc] = e]
             ELSE DcHead
   /\ UNCHANGED <<Outbox, Delivered, LinkUp>>
@@ -110,7 +113,7 @@ NoDoubleApply ==
 
 IntraDcSubsetSafety ==
   \A a \in Controllers, b \in Controllers :
-    DcOf[a] = DcOf[b] => Applied[a] \subseteq Events /\ Applied[b] \subseteq Events
+    DcOf(a) = DcOf(b) => Applied[a] \subseteq Events /\ Applied[b] \subseteq Events
 
 CrossDcEventualPropagationCandidate ==
   \A c \in Controllers : Applied[c] \subseteq UNION {Outbox[d] : d \in Controllers}

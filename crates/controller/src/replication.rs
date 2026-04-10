@@ -6,7 +6,10 @@ use tracing::{info, warn};
 
 use crate::config::{ReplicationConfig, TlsConfig};
 use crate::controller_proto;
-use crate::db::{Database, ReplicationResourceHeadRow};
+use crate::db::{
+    Database, NetworkRow, NodeRow, ReplicationResourceHeadRow, SecurityGroupRow,
+    SecurityGroupRuleRow, VmRow,
+};
 use crate::replication_policy::{
     compare_rank, loser_terminal_state, parse_safety_class, parse_validity_class, ArbitrationRank,
 };
@@ -340,6 +343,18 @@ fn apply_replication_event(
         } else {
             existing.last_op_id.as_str()
         };
+        let (loser_event_type, loser_body_json) = if challenger_is_loser {
+            (
+                payload_event_type.to_string(),
+                serde_json::to_string(&body)
+                    .map_err(|e| format!("serialize loser body for event {}: {e}", event.event_id))?,
+            )
+        } else {
+            (
+                existing.last_event_type.clone(),
+                existing.last_body_json.clone(),
+            )
+        };
         let conflict_id = db
             .insert_replication_conflict_with_resolved(
                 payload_resource_key,
@@ -352,10 +367,14 @@ fn apply_replication_event(
             )
             .map_err(|e| format!("insert conflict for event {}: {e}", event.event_id))?;
         if loser_state == crate::replication_policy::ReconcileTerminalState::AutoCompensated {
-            db.insert_compensation_job(conflict_id, payload_resource_key, loser_op_id)
-                .map_err(|e| {
-                    format!("insert compensation job for event {}: {e}", event.event_id)
-                })?;
+            db.insert_compensation_job(
+                conflict_id,
+                payload_resource_key,
+                loser_op_id,
+                &loser_event_type,
+                &loser_body_json,
+            )
+            .map_err(|e| format!("insert compensation job for event {}: {e}", event.event_id))?;
         }
     }
 
@@ -396,6 +415,10 @@ fn apply_replication_event(
         | "vm.desired_state.set"
         | "network.create"
         | "network.delete"
+        | "security_group.create"
+        | "security_group.delete"
+        | "security_group.attach"
+        | "security_group.detach"
         | "ssh_key.create"
         | "ssh_key.delete" => {
             // Phase-2 skeleton: payload validation + typed dispatch point.
@@ -624,8 +647,7 @@ fn process_compensation_once(db: &Database) -> Result<bool, String> {
     };
 
     let result: Result<(), String> = (|| {
-        // Skeleton executor: deterministic no-op compensation hook.
-        // Future steps can map `job.resource_key` and `job.loser_op_id` to concrete rollback actions.
+        apply_domain_compensation(db, &job)?;
         db.resolve_replication_conflict(job.conflict_id)
             .map_err(|e| format!("resolve conflict {}: {e}", job.conflict_id))?;
         db.complete_compensation_job(job.id)
@@ -634,6 +656,7 @@ fn process_compensation_once(db: &Database) -> Result<bool, String> {
             conflict_id = job.conflict_id,
             resource_key = %job.resource_key,
             loser_op_id = %job.loser_op_id,
+            loser_event_type = %job.loser_event_type,
             "completed compensation job"
         );
         Ok(())
@@ -644,6 +667,62 @@ fn process_compensation_once(db: &Database) -> Result<bool, String> {
         return Err(e);
     }
     Ok(true)
+}
+
+fn apply_domain_compensation(db: &Database, job: &crate::db::ReplicationCompensationJobRow) -> Result<(), String> {
+    let loser_body: Value = serde_json::from_str(&job.loser_body_json).map_err(|e| {
+        format!(
+            "parse loser body for compensation job {} (op {}): {e}",
+            job.id, job.loser_op_id
+        )
+    })?;
+
+    match job.loser_event_type.as_str() {
+        "vm.create" => {
+            if let Some(vm_id) = loser_body.get("vmId").and_then(Value::as_str) {
+                let _ = db
+                    .delete_vm_by_id_or_name(vm_id)
+                    .map_err(|e| format!("compensate vm.create delete {vm_id}: {e}"))?;
+            }
+        }
+        "network.create" => {
+            if let (Some(node_id), Some(name)) = (
+                loser_body.get("nodeId").and_then(Value::as_str),
+                loser_body.get("name").and_then(Value::as_str),
+            ) {
+                let _ = db
+                    .delete_network(node_id, name)
+                    .map_err(|e| format!("compensate network.create delete {name} on {node_id}: {e}"))?;
+            }
+        }
+        "security_group.create" => {
+            if let Some(name) = loser_body.get("name").and_then(Value::as_str) {
+                let _ = db
+                    .delete_security_group(name)
+                    .map_err(|e| format!("compensate security_group.create delete {name}: {e}"))?;
+            }
+        }
+        "ssh_key.create" => {
+            if let Some(name) = loser_body.get("name").and_then(Value::as_str) {
+                let _ = db
+                    .delete_ssh_key(name)
+                    .map_err(|e| format!("compensate ssh_key.create delete {name}: {e}"))?;
+            }
+        }
+        _ => {}
+    }
+
+    reconcile_resource_to_current_head(db, &job.resource_key)
+}
+
+fn reconcile_resource_to_current_head(db: &Database, resource_key: &str) -> Result<(), String> {
+    if let Some(head) = db
+        .get_replication_resource_head(resource_key)
+        .map_err(|e| format!("load head for compensation resource {resource_key}: {e}"))?
+    {
+        apply_head_to_domain(db, &head)?;
+    }
+    Ok(())
 }
 
 fn process_materialization_once(db: &Database) -> Result<bool, String> {
@@ -677,11 +756,158 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
     let body: Value = serde_json::from_str(&head.last_body_json)
         .map_err(|e| format!("parse head body for {}: {e}", head.resource_key))?;
     match head.last_event_type.as_str() {
-        "vm.desired_state.set" => {
-            let vm_id = body
-                .get("vmId")
+        "node.register" => {
+            let node_id = required_str(&body, "nodeId", &head.resource_key)?;
+            let approval_status =
+                body.get("approvalStatus").and_then(Value::as_str).unwrap_or("pending");
+            let status = body
+                .get("status")
                 .and_then(Value::as_str)
-                .ok_or_else(|| format!("missing vmId for {}", head.resource_key))?;
+                .unwrap_or(if approval_status == "approved" {
+                    "ready"
+                } else {
+                    "pending"
+                });
+            let node = NodeRow {
+                id: node_id.to_string(),
+                hostname: body
+                    .get("hostname")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                address: body
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                cpu_cores: body.get("cpuCores").and_then(Value::as_i64).unwrap_or(0) as i32,
+                memory_bytes: body.get("memoryBytes").and_then(Value::as_i64).unwrap_or(0),
+                status: status.to_string(),
+                last_heartbeat: String::new(),
+                gateway_interface: body
+                    .get("gatewayInterface")
+                    .and_then(Value::as_str)
+                    .unwrap_or("eth0")
+                    .to_string(),
+                cpu_used: 0,
+                memory_used: 0,
+                storage_backend: storage_backend_from_i32(
+                    body.get("storageBackend")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default() as i32,
+                )
+                .to_string(),
+                disable_vxlan: body
+                    .get("disableVxlan")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                approval_status: approval_status.to_string(),
+                cert_expiry_days: body
+                    .get("certExpiryDays")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1) as i32,
+                luks_method: body
+                    .get("luksMethod")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            db.upsert_node(&node)
+                .map_err(|e| format!("upsert node {node_id}: {e}"))?;
+            let labels = body
+                .get("labels")
+                .and_then(Value::as_array)
+                .map(|vals| {
+                    vals.iter()
+                        .filter_map(|v| v.as_str().map(ToString::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !labels.is_empty() {
+                db.upsert_node_labels(node_id, &labels)
+                    .map_err(|e| format!("upsert node labels {node_id}: {e}"))?;
+            }
+            Ok(())
+        }
+        "vm.create" => {
+            let vm_id = required_str(&body, "vmId", &head.resource_key)?;
+            let vm = VmRow {
+                id: vm_id.to_string(),
+                name: body
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(vm_id)
+                    .to_string(),
+                cpu: body.get("cpu").and_then(Value::as_i64).unwrap_or(2) as i32,
+                memory_bytes: body
+                    .get("memoryBytes")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(2 * 1024 * 1024 * 1024),
+                image_path: body
+                    .get("imagePath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                image_url: body
+                    .get("imageUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                image_sha256: body
+                    .get("imageSha256")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                image_format: body
+                    .get("imageFormat")
+                    .and_then(Value::as_str)
+                    .unwrap_or("qcow2")
+                    .to_string(),
+                image_size: body.get("imageSize").and_then(Value::as_i64).unwrap_or(0),
+                network: body
+                    .get("network")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default")
+                    .to_string(),
+                auto_start: body.get("autoStart").and_then(Value::as_bool).unwrap_or(true),
+                node_id: body
+                    .get("nodeId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: String::new(),
+                runtime_state: body
+                    .get("runtimeState")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                cloud_init_user_data: body
+                    .get("cloudInitUserData")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                storage_backend: body
+                    .get("storageBackend")
+                    .and_then(Value::as_str)
+                    .unwrap_or("filesystem")
+                    .to_string(),
+                storage_size_bytes: body
+                    .get("storageSizeBytes")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                vm_ip: body
+                    .get("vmIp")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            let _ = db.delete_vm_by_id_or_name(vm_id);
+            db.insert_vm(&vm)
+                .map_err(|e| format!("insert vm {vm_id} from replication head: {e}"))?;
+            Ok(())
+        }
+        "vm.desired_state.set" => {
+            let vm_id = vm_id_from_body_or_resource(&body, &head.resource_key)?;
             let auto_start = body
                 .get("autoStart")
                 .and_then(Value::as_bool)
@@ -692,10 +918,7 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             Ok(())
         }
         "vm.update" => {
-            let vm_id = body
-                .get("vmId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("missing vmId for {}", head.resource_key))?;
+            let vm_id = vm_id_from_body_or_resource(&body, &head.resource_key)?;
             let cpu = body
                 .get("cpu")
                 .and_then(Value::as_i64)
@@ -707,10 +930,7 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             Ok(())
         }
         "vm.delete" => {
-            let vm_id = body
-                .get("vmId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("missing vmId for {}", head.resource_key))?;
+            let vm_id = vm_id_from_body_or_resource(&body, &head.resource_key)?;
             let _ = db
                 .delete_vm_by_id_or_name(vm_id)
                 .map_err(|e| format!("delete vm {vm_id}: {e}"))?;
@@ -752,6 +972,180 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 .map_err(|e| format!("set node status drained {node_id}: {e}"))?;
             Ok(())
         }
+        "network.create" => {
+            let node_id = required_str(&body, "nodeId", &head.resource_key)?;
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let network = NetworkRow {
+                name: name.to_string(),
+                external_ip: body
+                    .get("externalIp")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                gateway_ip: body
+                    .get("gatewayIp")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                internal_netmask: body
+                    .get("internalNetmask")
+                    .and_then(Value::as_str)
+                    .unwrap_or("255.255.255.0")
+                    .to_string(),
+                node_id: node_id.to_string(),
+                allowed_tcp_ports: body
+                    .get("allowedTcpPorts")
+                    .map(json_as_compact_string)
+                    .unwrap_or_else(|| "[]".to_string()),
+                allowed_udp_ports: body
+                    .get("allowedUdpPorts")
+                    .map(json_as_compact_string)
+                    .unwrap_or_else(|| "[]".to_string()),
+                vlan_id: body.get("vlanId").and_then(Value::as_i64).unwrap_or(0) as i32,
+                network_type: body
+                    .get("networkType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("nat")
+                    .to_string(),
+                enable_outbound_nat: body
+                    .get("enableOutboundNat")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                vni: body.get("vni").and_then(Value::as_i64).unwrap_or(0) as i32,
+                next_ip: body.get("nextIp").and_then(Value::as_i64).unwrap_or(2) as i32,
+            };
+            let _ = db.delete_network(node_id, name);
+            db.insert_network(&network)
+                .map_err(|e| format!("insert network {name} on {node_id}: {e}"))?;
+            Ok(())
+        }
+        "network.delete" => {
+            let node_id = required_str(&body, "nodeId", &head.resource_key)?;
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let _ = db
+                .delete_network(node_id, name)
+                .map_err(|e| format!("delete network {name} on {node_id}: {e}"))?;
+            Ok(())
+        }
+        "security_group.create" => {
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let sg = SecurityGroupRow {
+                name: name.to_string(),
+                description: body
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: String::new(),
+            };
+            db.upsert_security_group(&sg)
+                .map_err(|e| format!("upsert security group {name}: {e}"))?;
+            if let Some(rule_vals) = body.get("rules").and_then(Value::as_array) {
+                let rules = rule_vals
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, rule)| SecurityGroupRuleRow {
+                        id: rule
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| format!("rule-{idx}")),
+                        security_group: name.to_string(),
+                        protocol: rule
+                            .get("protocol")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tcp")
+                            .to_string(),
+                        host_port: rule.get("hostPort").and_then(Value::as_i64).unwrap_or(0) as i32,
+                        target_port: rule
+                            .get("targetPort")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0) as i32,
+                        source_cidr: rule
+                            .get("sourceCidr")
+                            .and_then(Value::as_str)
+                            .unwrap_or("0.0.0.0/0")
+                            .to_string(),
+                        target_vm: rule
+                            .get("targetVm")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        enable_dnat: rule
+                            .get("enableDnat")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                    .collect::<Vec<_>>();
+                db.replace_security_group_rules(name, &rules)
+                    .map_err(|e| format!("replace security group rules for {name}: {e}"))?;
+            }
+            Ok(())
+        }
+        "security_group.delete" => {
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let _ = db
+                .delete_security_group(name)
+                .map_err(|e| format!("delete security group {name}: {e}"))?;
+            Ok(())
+        }
+        "security_group.attach" => {
+            let sg = required_str(&body, "securityGroup", &head.resource_key)?;
+            let target_id = required_str(&body, "targetId", &head.resource_key)?;
+            let target_kind = body.get("targetKind").and_then(Value::as_i64).unwrap_or_default();
+            match target_kind {
+                1 => db
+                    .attach_security_group_to_vm(sg, target_id)
+                    .map_err(|e| format!("attach security group {sg} to vm {target_id}: {e}"))?,
+                2 => {
+                    let node_id = required_str(&body, "targetNode", &head.resource_key)?;
+                    db.attach_security_group_to_network(sg, target_id, node_id)
+                        .map_err(|e| {
+                            format!(
+                                "attach security group {sg} to network {target_id} on {node_id}: {e}"
+                            )
+                        })?
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported security_group.attach targetKind {other} for {}",
+                        head.resource_key
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "security_group.detach" => {
+            let sg = required_str(&body, "securityGroup", &head.resource_key)?;
+            let target_id = required_str(&body, "targetId", &head.resource_key)?;
+            let target_kind = body.get("targetKind").and_then(Value::as_i64).unwrap_or_default();
+            match target_kind {
+                1 => {
+                    let _ = db
+                        .detach_security_group_from_vm(sg, target_id)
+                        .map_err(|e| {
+                            format!("detach security group {sg} from vm {target_id}: {e}")
+                        })?;
+                }
+                2 => {
+                    let node_id = required_str(&body, "targetNode", &head.resource_key)?;
+                    let _ = db
+                        .detach_security_group_from_network(sg, target_id, node_id)
+                        .map_err(|e| {
+                            format!(
+                                "detach security group {sg} from network {target_id} on {node_id}: {e}"
+                            )
+                        })?;
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported security_group.detach targetKind {other} for {}",
+                        head.resource_key
+                    ));
+                }
+            }
+            Ok(())
+        }
         "ssh_key.create" => {
             let name = body
                 .get("name")
@@ -775,6 +1169,40 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn required_str<'a>(body: &'a Value, key: &str, resource_key: &str) -> Result<&'a str, String> {
+    body.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing {key} for {resource_key}"))
+}
+
+fn vm_id_from_body_or_resource<'a>(body: &'a Value, resource_key: &'a str) -> Result<&'a str, String> {
+    if let Some(vm_id) = body.get("vmId").and_then(Value::as_str) {
+        return Ok(vm_id);
+    }
+    resource_key
+        .strip_prefix("vm/")
+        .ok_or_else(|| format!("missing vmId for {resource_key}"))
+}
+
+fn json_as_compact_string(value: &Value) -> String {
+    if let Some(as_str) = value.as_str() {
+        as_str.to_string()
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+fn storage_backend_from_i32(raw: i32) -> &'static str {
+    let kind = controller_proto::StorageBackendType::try_from(raw)
+        .unwrap_or(controller_proto::StorageBackendType::Unspecified);
+    match kind {
+        controller_proto::StorageBackendType::Lvm => "lvm",
+        controller_proto::StorageBackendType::Zfs => "zfs",
+        controller_proto::StorageBackendType::Filesystem
+        | controller_proto::StorageBackendType::Unspecified => "filesystem",
     }
 }
 
@@ -1080,6 +1508,205 @@ mod tests {
 
         // Replay-safe: same winner op should not produce further work.
         assert!(!process_materialization_once(&db).expect("materialize no-op"));
+    }
+
+    #[test]
+    fn materializer_applies_node_register_with_labels() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "node/node-2".to_string(),
+            last_op_id: "op-node-2".to_string(),
+            last_logical_ts_unix_ms: 100,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 11,
+            last_event_type: "node.register".to_string(),
+            last_body_json: r#"{"nodeId":"node-2","hostname":"node2","address":"10.0.0.2:9091","cpuCores":8,"memoryBytes":17179869184,"status":"pending","gatewayInterface":"","storageBackend":1,"disableVxlan":false,"approvalStatus":"pending","certExpiryDays":30,"luksMethod":"tpm2","labels":["dc=DC1","role=edge"]}"#.to_string(),
+        })
+        .expect("upsert head");
+
+        assert!(process_materialization_once(&db).expect("materialize"));
+        let node = db.get_node("node-2").expect("db").expect("node");
+        assert_eq!(node.hostname, "node2");
+        let labels = db.get_node_labels("node-2").expect("labels");
+        assert_eq!(labels.len(), 2);
+    }
+
+    #[test]
+    fn materializer_applies_network_create_and_delete() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node("node-net")).expect("insert node");
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "network/node-net/vxlan-test".to_string(),
+            last_op_id: "op-net-create".to_string(),
+            last_logical_ts_unix_ms: 100,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 12,
+            last_event_type: "network.create".to_string(),
+            last_body_json: r#"{"name":"vxlan-test","nodeId":"node-net","externalIp":"192.168.40.105","gatewayIp":"10.240.0.1","internalNetmask":"255.255.255.0","allowedTcpPorts":[22,80],"allowedUdpPorts":[],"networkType":"vxlan","vlanId":0,"enableOutboundNat":true,"vni":4200,"nextIp":2}"#.to_string(),
+        })
+        .expect("upsert network head");
+        assert!(process_materialization_once(&db).expect("materialize create"));
+        let net = db
+            .get_network_for_node("node-net", "vxlan-test")
+            .expect("network lookup")
+            .expect("network exists");
+        assert_eq!(net.network_type, "vxlan");
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "network/node-net/vxlan-test".to_string(),
+            last_op_id: "op-net-delete".to_string(),
+            last_logical_ts_unix_ms: 101,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 13,
+            last_event_type: "network.delete".to_string(),
+            last_body_json: r#"{"name":"vxlan-test","nodeId":"node-net"}"#.to_string(),
+        })
+        .expect("upsert network delete head");
+        assert!(process_materialization_once(&db).expect("materialize delete"));
+        assert!(
+            db.get_network_for_node("node-net", "vxlan-test")
+                .expect("network lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn materializer_applies_security_group_create_attach_detach_delete() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node("node-sg");
+        db.upsert_node(&node).expect("insert node");
+        db.insert_vm(&test_vm("vm-sg", &node.id)).expect("insert vm");
+        db.insert_network(&NetworkRow {
+            name: "vxlan-sg".to_string(),
+            external_ip: "192.168.40.105".to_string(),
+            gateway_ip: "10.240.0.1".to_string(),
+            internal_netmask: "255.255.255.0".to_string(),
+            node_id: node.id.clone(),
+            allowed_tcp_ports: "[]".to_string(),
+            allowed_udp_ports: "[]".to_string(),
+            vlan_id: 0,
+            network_type: "vxlan".to_string(),
+            enable_outbound_nat: true,
+            vni: 4200,
+            next_ip: 2,
+        })
+        .expect("insert network");
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "security-group/web".to_string(),
+            last_op_id: "op-sg-create".to_string(),
+            last_logical_ts_unix_ms: 100,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 14,
+            last_event_type: "security_group.create".to_string(),
+            last_body_json: r#"{"name":"web","description":"web ingress","rules":[{"id":"allow-http","protocol":"tcp","hostPort":80,"targetPort":80,"sourceCidr":"0.0.0.0/0","targetVm":"","enableDnat":false}]}"#.to_string(),
+        })
+        .expect("upsert sg create");
+        assert!(process_materialization_once(&db).expect("sg create"));
+        assert!(db.get_security_group("web").expect("db").is_some());
+        assert_eq!(
+            db.list_security_group_rules("web").expect("rules").len(),
+            1
+        );
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "security-group/web".to_string(),
+            last_op_id: "op-sg-attach-vm".to_string(),
+            last_logical_ts_unix_ms: 101,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 15,
+            last_event_type: "security_group.attach".to_string(),
+            last_body_json: r#"{"securityGroup":"web","targetKind":1,"targetId":"vm-sg","targetNode":""}"#.to_string(),
+        })
+        .expect("upsert sg attach vm");
+        assert!(process_materialization_once(&db).expect("sg attach vm"));
+        assert_eq!(
+            db.list_security_groups_for_vm("vm-sg")
+                .expect("vm attachments")
+                .len(),
+            1
+        );
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "security-group/web".to_string(),
+            last_op_id: "op-sg-attach-net".to_string(),
+            last_logical_ts_unix_ms: 102,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 16,
+            last_event_type: "security_group.attach".to_string(),
+            last_body_json: r#"{"securityGroup":"web","targetKind":2,"targetId":"vxlan-sg","targetNode":"node-sg"}"#.to_string(),
+        })
+        .expect("upsert sg attach network");
+        assert!(process_materialization_once(&db).expect("sg attach network"));
+        assert_eq!(
+            db.list_security_groups_for_network("vxlan-sg", "node-sg")
+                .expect("network attachments")
+                .len(),
+            1
+        );
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "security-group/web".to_string(),
+            last_op_id: "op-sg-detach".to_string(),
+            last_logical_ts_unix_ms: 103,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 17,
+            last_event_type: "security_group.detach".to_string(),
+            last_body_json: r#"{"securityGroup":"web","targetKind":1,"targetId":"vm-sg","targetNode":""}"#.to_string(),
+        })
+        .expect("upsert sg detach");
+        assert!(process_materialization_once(&db).expect("sg detach"));
+        assert!(
+            db.list_security_groups_for_vm("vm-sg")
+                .expect("vm attachments")
+                .is_empty()
+        );
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "security-group/web".to_string(),
+            last_op_id: "op-sg-delete".to_string(),
+            last_logical_ts_unix_ms: 104,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 18,
+            last_event_type: "security_group.delete".to_string(),
+            last_body_json: r#"{"name":"web"}"#.to_string(),
+        })
+        .expect("upsert sg delete");
+        assert!(process_materialization_once(&db).expect("sg delete"));
+        assert!(db.get_security_group("web").expect("db").is_none());
     }
 
     #[test]

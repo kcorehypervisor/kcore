@@ -258,25 +258,25 @@ Status (incremental):
 Status (incremental):
 
 - Controller now starts per-peer background pollers when `replication.peers` is configured. Pollers use `GetReplicationEvents` and `AckReplicationEvents`, maintain a local pull frontier, and skip self-referential peer endpoints.
-- Pollers now include an event-apply skeleton path that validates JSON payload shape and tracks an `apply/<peer>` frontier separate from pull progress.
+- Pollers now include a typed event-apply path that validates JSON payloads, updates deterministic heads, and tracks an `apply/<peer>` frontier separate from pull progress.
 - `ControllerAdmin.GetReplicationStatus` exposes replication health counters (`outbox_head_event_id`, `outbox_size`, outgoing ack lag, and incoming pull/apply frontiers).
-- Apply path now maintains `replication_resource_heads` using deterministic LWW ordering (`logicalTsUnixMs`, then `controllerId`, then `opId`) as a merge foundation before full domain materialization.
+- Apply path now maintains `replication_resource_heads` using deterministic LWW ordering (`logicalTsUnixMs`, then `controllerId`, then `opId`) and drives domain materialization for node/network/vm/security-group and ssh-key event families.
 - Equal-timestamp cross-controller contenders are now logged into `replication_conflicts`; `GetReplicationStatus` reports an `unresolved_conflicts` count for operator visibility.
 - Deterministic zero-manual arbitration model is documented in `docs/zero-external-resolution-algorithm.md`.
-- Controller now runs a compensation executor skeleton: `auto_compensated` losers enqueue jobs in `replication_compensation_jobs`, and a background worker closes those conflicts without manual intervention.
-- Controller now runs a head materializer skeleton: winning `replication_resource_heads` are replay-safely projected into selected domain intents (`vm.update`, `vm.desired_state.set`, `vm.delete`, `node.approve/reject/drain`) using `replication_materialized_heads`.
+- Controller now runs a domain-aware compensation executor: `auto_compensated` losers enqueue jobs in `replication_compensation_jobs` with loser event metadata and payload snapshots, and handlers apply idempotent corrective actions before marking conflicts resolved.
+- Controller now runs a replay-safe head materializer that projects winning `replication_resource_heads` into domain rows (node registration/approval lifecycle, vm lifecycle, network lifecycle, security-group CRUD/attachments, and ssh-key lifecycle) using `replication_materialized_heads`.
 - Replication apply now includes an initial reservation ledger gate for `vm.create`; failures are auto-rejected and persisted in `replication_reservations` for audit/retry evolution.
 
 ### Phase 4: conflict UX and operator tools
 
-- Add `kctl get conflicts` and `kctl resolve conflict` commands.
+- Add operator visibility commands for conflict and replication maturity status.
 - Improve visibility (`replication lag`, `peer health`, `last reconcile`).
 - Document operational playbooks for partition and recovery.
 
 Status (incremental):
 
 - ControllerAdmin now exposes conflict APIs: `ListReplicationConflicts(limit)` and `ResolveReplicationConflict(id)` backed by `replication_conflicts`.
-- `kctl` now exposes matching operator commands: `kctl get conflicts [--limit N]` and `kctl resolve conflict <id>`.
+- `kctl` now exposes `kctl get conflicts [--limit N]` and `kctl get replication-status [--require-healthy]` for scripting hard SLO gates.
 - `GetReplicationStatus` now includes zero-manual SLO metrics and enforcement signals: pending/failed compensation jobs, materialization backlog, unresolved conflict age, failed reservations, and a `zero_manual_slo_healthy` verdict with violation reasons.
 
 ### Phase 5: TLA+ validation gates
@@ -294,7 +294,7 @@ Status (incremental):
 - A trace drift checker now exists (`make test-tla-trace`) to validate sampled replication traces against deterministic winner and auto-terminal assumptions used by the formal model.
 - `CrossDcReplication.tla` now models explicit intra-DC vs cross-DC anti-entropy and checks bounded cross-DC convergence/no-double-apply safety.
 - Trace drift validation now includes both positive and negative fixtures (expected pass and expected fail) via `scripts/test-replication-trace.sh`, reducing silent checker regressions.
-- CI now includes a formal checks workflow (`.github/workflows/formal-checks.yml`) that enforces trace drift checks and runs TLC model checks when available.
+- CI now includes a formal checks workflow (`.github/workflows/formal-checks.yml`) that enforces trace drift checks and requires bounded TLC model checks.
 - The trace gate now consumes a generated artifact emitted from a Rust replication test (`replication::tests::export_replication_trace_fixture`) in addition to static fixtures, reducing model-vs-implementation drift risk.
 - Generated trace rows now include reservation and compensation branch signals (`reservation_status`, `compensation_status`) so drift checks cover zero-manual rejection/compensation paths explicitly.
 - Generated traces now exercise both compensation lifecycle states (`queued` and `completed`) by processing one compensation job during export.

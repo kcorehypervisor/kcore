@@ -1,0 +1,16 @@
+kind: SecurityGroup
+metadata:
+  name: expose-nginx-host
+spec:
+  description: Open TCP/80 for nginx exposure
+  rules:
+    - id: allow-http
+      protocol: tcp
+      hostPort: 80
+      targetPort: 80
+      sourceCidr: 0.0.0.0/0
+      enableDnat: false
+  attachments:
+    - kind: network
+      target: vxlan-test
+      node: kvm-node-192-168-40-105

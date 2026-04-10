@@ -443,7 +443,13 @@ mod tests {
         let conflict_id = db
             .insert_replication_conflict("vm/v10", "op-c", "op-d", "ctrl-a", "ctrl-b", "test2")
             .expect("insert conflict2");
-        db.insert_compensation_job(conflict_id, "vm/v10", "op-d")
+        db.insert_compensation_job(
+            conflict_id,
+            "vm/v10",
+            "op-d",
+            "vm.update",
+            r#"{"vmId":"v10","cpu":4}"#,
+        )
             .expect("insert pending job");
         db.record_replication_reservation_failure(
             "node-capacity/missing",

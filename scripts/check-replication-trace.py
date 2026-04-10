@@ -81,6 +81,13 @@ def main() -> int:
             errors.append(
                 f"event[{idx}] auto_compensated requires queued/completed compensation"
             )
+        if (
+            event["terminal_state"] != "auto_compensated"
+            and event["compensation_status"] != "not_applicable"
+        ):
+            errors.append(
+                f"event[{idx}] non-compensated terminal requires compensation_status=not_applicable"
+            )
 
         key = event["resource_key"]
         prior = heads.get(key)

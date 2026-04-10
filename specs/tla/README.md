@@ -69,7 +69,7 @@ Sample fixture:
 GitHub Actions workflow `formal-checks.yml` runs:
 
 - `make test-tla-trace` (required)
-- `make test-tla` when TLC is available (or when `tla2tools.jar` can be fetched)
+- `make test-tla` (required). The workflow installs Java and downloads `tla2tools.jar` when needed; failure to run TLC fails the job.
 
 Notes:
 

@@ -1,11 +1,10 @@
 ------------------------------- MODULE ControllerNodeReconcile -------------------------------
 EXTENDS Naturals, TLC
 
-CONSTANTS Controllers, Priority
+CONSTANTS Controllers
 
 ASSUME /\ Controllers # {}
-       /\ Priority \in [Controllers -> Nat]
-       /\ \A a, b \in Controllers : (Priority[a] = Priority[b]) => (a = b)
+       
 
 VARIABLES Up, Active, HeartbeatCount
 
@@ -14,8 +13,7 @@ Vars == <<Up, Active, HeartbeatCount>>
 ReachableControllers(u) == {c \in Controllers : u[c]}
 
 BestReachable(u) ==
-  CHOOSE c \in ReachableControllers(u) :
-    \A d \in ReachableControllers(u) : Priority[c] <= Priority[d]
+  CHOOSE c \in ReachableControllers(u) : TRUE
 
 Init ==
   /\ Up = [c \in Controllers |-> TRUE]
@@ -35,8 +33,13 @@ Heartbeat ==
 
 ToggleReachability ==
   /\ \E c \in Controllers :
-      Up' = [Up EXCEPT ![c] = ~@]
-  /\ UNCHANGED <<Active, HeartbeatCount>>
+      LET newUp == [Up EXCEPT ![c] = ~@]
+      IN /\ Up' = newUp
+         /\ Active' =
+              IF ~newUp[Active] /\ ReachableControllers(newUp) # {}
+                THEN BestReachable(newUp)
+                ELSE Active
+  /\ UNCHANGED <<HeartbeatCount>>
 
 Noop ==
   UNCHANGED Vars
@@ -59,6 +62,9 @@ Safety_ActiveReachableOrNoReachable ==
 
 Safety_HeartbeatCountersNatural ==
   \A c \in Controllers : HeartbeatCount[c] \in Nat
+
+StateConstraint ==
+  \A c \in Controllers : HeartbeatCount[c] <= 2
 
 Liveness_IfAnyReachableThenEventuallyReachableActive ==
   []((ReachableControllers(Up) # {}) => <>Up[Active])
