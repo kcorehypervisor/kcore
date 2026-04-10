@@ -9,6 +9,7 @@ use crate::node_proto;
 
 type ComputeClient = node_proto::node_compute_client::NodeComputeClient<Channel>;
 type AdminClient = node_proto::node_admin_client::NodeAdminClient<Channel>;
+type ContainerClient = node_proto::node_container_client::NodeContainerClient<Channel>;
 
 #[derive(Clone)]
 pub struct TlsClientConfig {
@@ -19,7 +20,7 @@ pub struct TlsClientConfig {
 
 #[derive(Clone)]
 pub struct NodeClients {
-    clients: Arc<Mutex<HashMap<String, (ComputeClient, AdminClient)>>>,
+    clients: Arc<Mutex<HashMap<String, (ComputeClient, AdminClient, ContainerClient)>>>,
     tls: Option<TlsClientConfig>,
 }
 
@@ -49,13 +50,14 @@ impl NodeClients {
             Channel::from_shared(endpoint)?.connect().await?
         };
         let compute = ComputeClient::new(channel.clone());
-        let admin = AdminClient::new(channel);
+        let admin = AdminClient::new(channel.clone());
+        let container = ContainerClient::new(channel);
 
         info!(address, "connected to node");
         self.clients
             .lock()
             .unwrap()
-            .insert(address.to_string(), (compute, admin));
+            .insert(address.to_string(), (compute, admin, container));
         Ok(())
     }
 
@@ -64,7 +66,7 @@ impl NodeClients {
             .lock()
             .unwrap()
             .get(address)
-            .map(|(c, _)| c.clone())
+            .map(|(c, _, _)| c.clone())
     }
 
     pub fn get_admin(&self, address: &str) -> Option<AdminClient> {
@@ -72,6 +74,14 @@ impl NodeClients {
             .lock()
             .unwrap()
             .get(address)
-            .map(|(_, a)| a.clone())
+            .map(|(_, a, _)| a.clone())
+    }
+
+    pub fn get_container(&self, address: &str) -> Option<ContainerClient> {
+        self.clients
+            .lock()
+            .unwrap()
+            .get(address)
+            .map(|(_, _, c)| c.clone())
     }
 }

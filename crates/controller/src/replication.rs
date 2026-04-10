@@ -1209,6 +1209,8 @@ mod tests {
     #[test]
     fn apply_head_to_domain_deletes_ssh_key_and_vm_associations() {
         let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node("node-1"))
+            .expect("insert backing node");
         db.insert_ssh_key("operator-key", "ssh-ed25519 AAAA test@example")
             .expect("insert key");
 

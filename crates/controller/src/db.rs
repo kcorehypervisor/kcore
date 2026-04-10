@@ -71,6 +71,22 @@ pub struct VmRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkloadRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub node_id: String,
+    pub runtime_state: String,
+    pub desired_state: String,
+    pub vm_id: String,
+    pub container_image: String,
+    pub network: String,
+    pub storage_backend: String,
+    pub storage_size_bytes: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct NetworkRow {
     pub name: String,
     pub external_ip: String,
@@ -263,6 +279,20 @@ impl Database {
                 vm_id TEXT NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
                 key_name TEXT NOT NULL REFERENCES ssh_keys(name),
                 PRIMARY KEY (vm_id, key_name)
+            );
+            CREATE TABLE IF NOT EXISTS workloads (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                node_id TEXT NOT NULL REFERENCES nodes(id),
+                runtime_state TEXT NOT NULL DEFAULT 'unknown',
+                desired_state TEXT NOT NULL DEFAULT 'running',
+                vm_id TEXT NOT NULL DEFAULT '',
+                container_image TEXT NOT NULL DEFAULT '',
+                network TEXT NOT NULL DEFAULT 'default',
+                storage_backend TEXT NOT NULL DEFAULT 'filesystem',
+                storage_size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );",
         )?;
 
@@ -545,7 +575,29 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 21;
+        if version < 22 {
+            let _ = conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS workloads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    node_id TEXT NOT NULL REFERENCES nodes(id),
+                    runtime_state TEXT NOT NULL DEFAULT 'unknown',
+                    desired_state TEXT NOT NULL DEFAULT 'running',
+                    vm_id TEXT NOT NULL DEFAULT '',
+                    container_image TEXT NOT NULL DEFAULT '',
+                    network TEXT NOT NULL DEFAULT 'default',
+                    storage_backend TEXT NOT NULL DEFAULT 'filesystem',
+                    storage_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_workloads_node_id ON workloads(node_id);
+                CREATE INDEX IF NOT EXISTS idx_workloads_kind ON workloads(kind);
+                CREATE INDEX IF NOT EXISTS idx_workloads_runtime_state ON workloads(runtime_state);",
+            );
+        }
+
+        const CURRENT_VERSION: i32 = 22;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -1355,6 +1407,144 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_workload(&self, workload: &WorkloadRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO workloads (
+                id, name, kind, node_id, runtime_state, desired_state, vm_id, container_image,
+                network, storage_backend, storage_size_bytes, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                kind=excluded.kind,
+                node_id=excluded.node_id,
+                runtime_state=excluded.runtime_state,
+                desired_state=excluded.desired_state,
+                vm_id=excluded.vm_id,
+                container_image=excluded.container_image,
+                network=excluded.network,
+                storage_backend=excluded.storage_backend,
+                storage_size_bytes=excluded.storage_size_bytes",
+            params![
+                workload.id,
+                workload.name,
+                workload.kind,
+                workload.node_id,
+                workload.runtime_state,
+                workload.desired_state,
+                workload.vm_id,
+                workload.container_image,
+                workload.network,
+                workload.storage_backend,
+                workload.storage_size_bytes,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_workload(&self, workload_id_or_name: &str) -> Result<Option<WorkloadRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind, node_id, runtime_state, desired_state, vm_id, container_image, network, storage_backend, storage_size_bytes, created_at
+             FROM workloads
+             WHERE id = ?1 OR name = ?1
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![workload_id_or_name], row_to_workload)?;
+        rows.next().transpose()
+    }
+
+    pub fn list_workloads(
+        &self,
+        kind_filter: Option<&str>,
+        node_filter: Option<&str>,
+    ) -> Result<Vec<WorkloadRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        match (kind_filter, node_filter) {
+            (Some(kind), Some(node)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, kind, node_id, runtime_state, desired_state, vm_id, container_image, network, storage_backend, storage_size_bytes, created_at
+                     FROM workloads
+                     WHERE kind = ?1 AND node_id = ?2
+                     ORDER BY created_at ASC",
+                )?;
+                let rows = stmt.query_map(params![kind, node], row_to_workload)?;
+                rows.collect()
+            }
+            (Some(kind), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, kind, node_id, runtime_state, desired_state, vm_id, container_image, network, storage_backend, storage_size_bytes, created_at
+                     FROM workloads
+                     WHERE kind = ?1
+                     ORDER BY created_at ASC",
+                )?;
+                let rows = stmt.query_map(params![kind], row_to_workload)?;
+                rows.collect()
+            }
+            (None, Some(node)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, kind, node_id, runtime_state, desired_state, vm_id, container_image, network, storage_backend, storage_size_bytes, created_at
+                     FROM workloads
+                     WHERE node_id = ?1
+                     ORDER BY created_at ASC",
+                )?;
+                let rows = stmt.query_map(params![node], row_to_workload)?;
+                rows.collect()
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, kind, node_id, runtime_state, desired_state, vm_id, container_image, network, storage_backend, storage_size_bytes, created_at
+                     FROM workloads
+                     ORDER BY created_at ASC",
+                )?;
+                let rows = stmt.query_map([], row_to_workload)?;
+                rows.collect()
+            }
+        }
+    }
+
+    pub fn update_workload_runtime_state(
+        &self,
+        id_or_name: &str,
+        runtime_state: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE workloads
+             SET runtime_state = ?2
+             WHERE id = ?1 OR name = ?1",
+            params![id_or_name, runtime_state],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn update_workload_desired_state(
+        &self,
+        id_or_name: &str,
+        desired_state: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE workloads
+             SET desired_state = ?2
+             WHERE id = ?1 OR name = ?1",
+            params![id_or_name, desired_state],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn delete_workload_by_id_or_name(
+        &self,
+        id_or_name: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "DELETE FROM workloads WHERE id = ?1 OR name = ?1",
+            params![id_or_name],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn get_vm(&self, vm_id: &str) -> Result<Option<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
@@ -1852,6 +2042,23 @@ fn row_to_network(row: &rusqlite::Row) -> Result<NetworkRow, rusqlite::Error> {
     })
 }
 
+fn row_to_workload(row: &rusqlite::Row) -> Result<WorkloadRow, rusqlite::Error> {
+    Ok(WorkloadRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        node_id: row.get(3)?,
+        runtime_state: row.get(4)?,
+        desired_state: row.get(5)?,
+        vm_id: row.get(6)?,
+        container_image: row.get(7)?,
+        network: row.get(8)?,
+        storage_backend: row.get(9)?,
+        storage_size_bytes: row.get(10)?,
+        created_at: row.get(11)?,
+    })
+}
+
 fn normalize_image_format(format: &str, image_path: &str, image_url: &str) -> String {
     let normalized = format.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -1921,6 +2128,23 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_size_bytes: 0,
             vm_ip: String::new(),
+        }
+    }
+
+    fn test_workload(node_id: &str) -> WorkloadRow {
+        WorkloadRow {
+            id: "wl-1".to_string(),
+            name: "workload-1".to_string(),
+            kind: "container".to_string(),
+            node_id: node_id.to_string(),
+            runtime_state: "running".to_string(),
+            desired_state: "running".to_string(),
+            vm_id: String::new(),
+            container_image: "nginx:alpine".to_string(),
+            network: "default".to_string(),
+            storage_backend: "filesystem".to_string(),
+            storage_size_bytes: 1024,
+            created_at: String::new(),
         }
     }
 
@@ -2241,6 +2465,45 @@ mod tests {
 
         let got = db.get_vm("vm-1").expect("get").expect("exists");
         assert_eq!(got.vm_ip, "10.200.0.5");
+    }
+
+    #[test]
+    fn workload_roundtrip_works() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+
+        let mut wl = test_workload(&node.id);
+        db.upsert_workload(&wl).expect("upsert workload");
+
+        let got = db
+            .get_workload(&wl.id)
+            .expect("get workload")
+            .expect("exists");
+        assert_eq!(got.kind, "container");
+        assert_eq!(got.container_image, "nginx:alpine");
+
+        let listed = db
+            .list_workloads(Some("container"), Some(&node.id))
+            .expect("list workloads");
+        assert_eq!(listed.len(), 1);
+
+        assert!(db
+            .update_workload_runtime_state(&wl.id, "stopped")
+            .expect("update state"));
+        assert!(db
+            .update_workload_desired_state(&wl.id, "stopped")
+            .expect("update desired"));
+        wl = db
+            .get_workload(&wl.id)
+            .expect("reload")
+            .expect("exists");
+        assert_eq!(wl.runtime_state, "stopped");
+        assert_eq!(wl.desired_state, "stopped");
+
+        assert!(db
+            .delete_workload_by_id_or_name(&wl.id)
+            .expect("delete workload"));
     }
 
     #[test]

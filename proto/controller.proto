@@ -12,6 +12,7 @@ service Controller {
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc SyncVmState(SyncVmStateRequest) returns (SyncVmStateResponse);
+  rpc SyncWorkloadState(SyncWorkloadStateRequest) returns (SyncWorkloadStateResponse);
   
   // VM operations (declarative desired-state API managed by controller)
   rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
@@ -20,6 +21,11 @@ service Controller {
   rpc SetVmDesiredState(SetVmDesiredStateRequest) returns (SetVmDesiredStateResponse);
   rpc GetVm(GetVmRequest) returns (GetVmResponse);
   rpc ListVms(ListVmsRequest) returns (ListVmsResponse);
+  rpc CreateWorkload(CreateWorkloadRequest) returns (CreateWorkloadResponse);
+  rpc DeleteWorkload(DeleteWorkloadRequest) returns (DeleteWorkloadResponse);
+  rpc SetWorkloadDesiredState(SetWorkloadDesiredStateRequest) returns (SetWorkloadDesiredStateResponse);
+  rpc GetWorkload(GetWorkloadRequest) returns (GetWorkloadResponse);
+  rpc ListWorkloads(ListWorkloadsRequest) returns (ListWorkloadsResponse);
   rpc CreateNetwork(CreateNetworkRequest) returns (CreateNetworkResponse);
   rpc DeleteNetwork(DeleteNetworkRequest) returns (DeleteNetworkResponse);
   rpc ListNetworks(ListNetworksRequest) returns (ListNetworksResponse);
@@ -93,6 +99,15 @@ message SyncVmStateResponse {
   bool success = 1;
 }
 
+message SyncWorkloadStateRequest {
+  string node_id = 1;
+  repeated WorkloadRuntimeInfo workloads = 2;
+}
+
+message SyncWorkloadStateResponse {
+  bool success = 1;
+}
+
 message NodeCapacity {
   int32 cpu_cores = 1;
   int64 memory_bytes = 2;
@@ -108,6 +123,56 @@ enum StorageBackendType {
   STORAGE_BACKEND_TYPE_FILESYSTEM = 1;
   STORAGE_BACKEND_TYPE_LVM = 2;
   STORAGE_BACKEND_TYPE_ZFS = 3;
+}
+
+enum WorkloadKind {
+  WORKLOAD_KIND_UNSPECIFIED = 0;
+  WORKLOAD_KIND_VM = 1;
+  WORKLOAD_KIND_CONTAINER = 2;
+}
+
+enum WorkloadDesiredState {
+  WORKLOAD_DESIRED_STATE_UNSPECIFIED = 0;
+  WORKLOAD_DESIRED_STATE_RUNNING = 1;
+  WORKLOAD_DESIRED_STATE_STOPPED = 2;
+}
+
+enum ContainerState {
+  CONTAINER_STATE_UNKNOWN = 0;
+  CONTAINER_STATE_CREATED = 1;
+  CONTAINER_STATE_RUNNING = 2;
+  CONTAINER_STATE_STOPPED = 3;
+  CONTAINER_STATE_ERROR = 4;
+}
+
+message ContainerSpec {
+  string name = 1;
+  string image = 2;
+  string network = 3;
+  repeated string command = 4;
+  map<string, string> env = 5;
+  repeated string ports = 6;
+  string storage_backend = 7; // filesystem|lvm|zfs
+  int64 storage_size_bytes = 8;
+  string mount_target = 9;
+}
+
+message ContainerInfo {
+  string id = 1;
+  string name = 2;
+  string image = 3;
+  ContainerState state = 4;
+  string status = 5;
+  string node_id = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message WorkloadRuntimeInfo {
+  string id = 1;
+  string name = 2;
+  WorkloadKind kind = 3;
+  VmState vm_state = 4;
+  ContainerState container_state = 5;
 }
 
 // VM Operations - all include target_node for explicit node selection
@@ -186,6 +251,78 @@ message ListVmsRequest {
 
 message ListVmsResponse {
   repeated VmInfo vms = 1;
+}
+
+message CreateWorkloadRequest {
+  WorkloadKind kind = 1;
+  string target_node = 2;
+  VmSpec vm_spec = 3;
+  ContainerSpec container_spec = 4;
+  string image_url = 5;
+  string image_sha256 = 6;
+  string cloud_init_user_data = 7;
+  string image_path = 8;
+  string image_format = 9;
+  repeated string ssh_key_names = 10;
+  StorageBackendType storage_backend = 11;
+  int64 storage_size_bytes = 12;
+}
+
+message CreateWorkloadResponse {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+  string node_id = 3;
+  VmState vm_state = 4;
+  ContainerState container_state = 5;
+}
+
+message DeleteWorkloadRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+  string target_node = 3;
+}
+
+message DeleteWorkloadResponse {
+  bool success = 1;
+}
+
+message SetWorkloadDesiredStateRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+  WorkloadDesiredState desired_state = 3;
+  string target_node = 4;
+}
+
+message SetWorkloadDesiredStateResponse {
+  WorkloadKind kind = 1;
+  VmState vm_state = 2;
+  ContainerState container_state = 3;
+}
+
+message GetWorkloadRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+  string target_node = 3;
+}
+
+message GetWorkloadResponse {
+  WorkloadKind kind = 1;
+  VmSpec vm_spec = 2;
+  ContainerSpec container_spec = 3;
+  VmStatus vm_status = 4;
+  ContainerInfo container_info = 5;
+  string node_id = 6;
+  string assigned_ip = 7;
+}
+
+message ListWorkloadsRequest {
+  WorkloadKind kind = 1; // optional filter
+  string target_node = 2;
+}
+
+message ListWorkloadsResponse {
+  repeated VmInfo vms = 1;
+  repeated ContainerInfo containers = 2;
 }
 
 message CreateNetworkRequest {
