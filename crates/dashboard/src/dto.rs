@@ -131,6 +131,10 @@ pub struct NodeStorageDto {
     pub luks_method: String,
     pub disk_inventory_ok: bool,
     pub disks: Vec<StorageDiskRowDto>,
+    pub lvm_inventory_ok: bool,
+    pub lvm_volume_groups: Vec<LvmVolumeGroupDto>,
+    pub lvm_logical_volumes: Vec<LvmLogicalVolumeDto>,
+    pub lvm_physical_volumes: Vec<LvmPhysicalVolumeDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,7 +153,25 @@ pub struct StorageOverviewDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationOutgoingDto {
+    pub peer_id: String,
+    pub last_acked_event_id: i64,
+    pub lag_events: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationIncomingDto {
+    pub peer_endpoint: String,
+    pub last_pulled_event_id: i64,
+    pub last_applied_event_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicationStatusDto {
+    pub outbox_head_event_id: i64,
+    pub outbox_size: i64,
+    pub outgoing: Vec<ReplicationOutgoingDto>,
+    pub incoming: Vec<ReplicationIncomingDto>,
     pub unresolved_conflicts: i64,
     pub pending_compensation_jobs: i64,
     pub failed_compensation_jobs: i64,
@@ -160,4 +182,43 @@ pub struct ReplicationStatusDto {
     pub retry_exhausted_reservations: i64,
     pub zero_manual_slo_healthy: bool,
     pub zero_manual_slo_violations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationConflictDto {
+    pub id: i64,
+    pub resource_key: String,
+    pub incumbent_op_id: String,
+    pub challenger_op_id: String,
+    pub incumbent_controller_id: String,
+    pub challenger_controller_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LvmVolumeGroupDto {
+    pub name: String,
+    pub size: String,
+    pub free: String,
+    pub attr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LvmLogicalVolumeDto {
+    pub name: String,
+    pub vg_name: String,
+    pub size: String,
+    pub attr: String,
+    pub path: String,
+    pub pool: String,
+    pub data_percent: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LvmPhysicalVolumeDto {
+    pub name: String,
+    pub vg_name: String,
+    pub size: String,
+    pub free: String,
+    pub attr: String,
 }

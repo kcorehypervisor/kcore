@@ -2,9 +2,11 @@
 
 use crate::controller_client::controller_proto;
 use crate::dto::{
-    AccessControlEntryDto, ComplianceDto, HostInterfaceDto, NetworkOverviewDto, NetworkRowDto,
-    NodeNetworkDto, NodeStorageDto, NodeSummaryDto, ReplicationStatusDto, StorageDiskRowDto,
-    StorageOverviewDto, VmRowDto, VmsPageDto,
+    AccessControlEntryDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto,
+    LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
+    NodeStorageDto, NodeSummaryDto, ReplicationConflictDto, ReplicationIncomingDto,
+    ReplicationOutgoingDto, ReplicationStatusDto, StorageDiskRowDto, StorageOverviewDto, VmRowDto,
+    VmsPageDto,
 };
 use crate::format::{self, paginate_by_name, VM_PAGE_SIZE};
 
@@ -183,6 +185,41 @@ pub fn storage_overview_from_proto(
                         }
                     })
                     .collect(),
+                lvm_inventory_ok: n.lvm_inventory_ok,
+                lvm_volume_groups: n
+                    .lvm_volume_groups
+                    .into_iter()
+                    .map(|vg| LvmVolumeGroupDto {
+                        name: vg.name,
+                        size: format::bytes_human(vg.size_bytes),
+                        free: format::bytes_human(vg.free_bytes),
+                        attr: vg.attr,
+                    })
+                    .collect(),
+                lvm_logical_volumes: n
+                    .lvm_logical_volumes
+                    .into_iter()
+                    .map(|lv| LvmLogicalVolumeDto {
+                        name: lv.name,
+                        vg_name: lv.vg_name,
+                        size: format::bytes_human(lv.size_bytes),
+                        attr: lv.attr,
+                        path: lv.path,
+                        pool: lv.pool,
+                        data_percent: lv.data_percent,
+                    })
+                    .collect(),
+                lvm_physical_volumes: n
+                    .lvm_physical_volumes
+                    .into_iter()
+                    .map(|pv| LvmPhysicalVolumeDto {
+                        name: pv.name,
+                        vg_name: pv.vg_name,
+                        size: format::bytes_human(pv.size_bytes),
+                        free: format::bytes_human(pv.free_bytes),
+                        attr: pv.attr,
+                    })
+                    .collect(),
             })
             .collect(),
     }
@@ -247,6 +284,26 @@ pub fn replication_status_from_proto(
     r: controller_proto::GetReplicationStatusResponse,
 ) -> ReplicationStatusDto {
     ReplicationStatusDto {
+        outbox_head_event_id: r.outbox_head_event_id,
+        outbox_size: r.outbox_size,
+        outgoing: r
+            .outgoing
+            .into_iter()
+            .map(|o| ReplicationOutgoingDto {
+                peer_id: o.peer_id,
+                last_acked_event_id: o.last_acked_event_id,
+                lag_events: o.lag_events,
+            })
+            .collect(),
+        incoming: r
+            .incoming
+            .into_iter()
+            .map(|i| ReplicationIncomingDto {
+                peer_endpoint: i.peer_endpoint,
+                last_pulled_event_id: i.last_pulled_event_id,
+                last_applied_event_id: i.last_applied_event_id,
+            })
+            .collect(),
         unresolved_conflicts: r.unresolved_conflicts,
         pending_compensation_jobs: r.pending_compensation_jobs,
         failed_compensation_jobs: r.failed_compensation_jobs,
@@ -258,6 +315,23 @@ pub fn replication_status_from_proto(
         zero_manual_slo_healthy: r.zero_manual_slo_healthy,
         zero_manual_slo_violations: r.zero_manual_slo_violations,
     }
+}
+
+pub fn conflicts_from_proto(
+    r: controller_proto::ListReplicationConflictsResponse,
+) -> Vec<ReplicationConflictDto> {
+    r.conflicts
+        .into_iter()
+        .map(|c| ReplicationConflictDto {
+            id: c.id,
+            resource_key: c.resource_key,
+            incumbent_op_id: c.incumbent_op_id,
+            challenger_op_id: c.challenger_op_id,
+            incumbent_controller_id: c.incumbent_controller_id,
+            challenger_controller_id: c.challenger_controller_id,
+            reason: c.reason,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -473,16 +547,46 @@ mod tests {
                     fstype: String::new(),
                     mountpoint: "/".into(),
                 }],
-                lvm_inventory_ok: false,
-                lvm_volume_groups: vec![],
-                lvm_logical_volumes: vec![],
-                lvm_physical_volumes: vec![],
+                lvm_inventory_ok: true,
+                lvm_volume_groups: vec![controller_proto::StorageLvmVolumeGroupDetail {
+                    name: "vg-kcore".into(),
+                    size_bytes: 500 * 1024 * 1024 * 1024,
+                    free_bytes: 200 * 1024 * 1024 * 1024,
+                    attr: "wz--n-".into(),
+                }],
+                lvm_logical_volumes: vec![controller_proto::StorageLvmLogicalVolumeDetail {
+                    name: "thin-pool".into(),
+                    vg_name: "vg-kcore".into(),
+                    size_bytes: 300 * 1024 * 1024 * 1024,
+                    attr: "twi-a-t---".into(),
+                    path: "/dev/vg-kcore/thin-pool".into(),
+                    pool: String::new(),
+                    origin: String::new(),
+                    data_percent: "42.00".into(),
+                    metadata_percent: "1.20".into(),
+                }],
+                lvm_physical_volumes: vec![controller_proto::StorageLvmPhysicalVolumeDetail {
+                    name: "/dev/sda3".into(),
+                    vg_name: "vg-kcore".into(),
+                    size_bytes: 500 * 1024 * 1024 * 1024,
+                    free_bytes: 200 * 1024 * 1024 * 1024,
+                    attr: "a--".into(),
+                }],
             }],
         };
         let dto = storage_overview_from_proto(r);
         assert_eq!(dto.nodes.len(), 1);
         assert_eq!(dto.nodes[0].storage_backend, "ZFS");
         assert_eq!(dto.nodes[0].disks[0].role_hint, "OS (root)");
+        assert!(dto.nodes[0].lvm_inventory_ok);
+        assert_eq!(dto.nodes[0].lvm_volume_groups.len(), 1);
+        assert_eq!(dto.nodes[0].lvm_volume_groups[0].name, "vg-kcore");
+        assert!(dto.nodes[0].lvm_volume_groups[0].size.contains("500"));
+        assert_eq!(dto.nodes[0].lvm_logical_volumes.len(), 1);
+        assert_eq!(dto.nodes[0].lvm_logical_volumes[0].name, "thin-pool");
+        assert_eq!(dto.nodes[0].lvm_logical_volumes[0].data_percent, "42.00");
+        assert_eq!(dto.nodes[0].lvm_physical_volumes.len(), 1);
+        assert_eq!(dto.nodes[0].lvm_physical_volumes[0].name, "/dev/sda3");
     }
 
     #[test]
@@ -490,8 +594,16 @@ mod tests {
         let r = controller_proto::GetReplicationStatusResponse {
             outbox_head_event_id: 10,
             outbox_size: 20,
-            outgoing: vec![],
-            incoming: vec![],
+            outgoing: vec![controller_proto::ReplicationOutgoingStatus {
+                peer_id: "dc-west".into(),
+                last_acked_event_id: 8,
+                lag_events: 2,
+            }],
+            incoming: vec![controller_proto::ReplicationIncomingStatus {
+                peer_endpoint: "10.0.1.1:9090".into(),
+                last_pulled_event_id: 7,
+                last_applied_event_id: 6,
+            }],
             unresolved_conflicts: 1,
             pending_compensation_jobs: 2,
             failed_compensation_jobs: 3,
@@ -505,9 +617,36 @@ mod tests {
             retry_exhausted_reservations: 9,
         };
         let dto = replication_status_from_proto(r);
+        assert_eq!(dto.outbox_head_event_id, 10);
+        assert_eq!(dto.outbox_size, 20);
+        assert_eq!(dto.outgoing.len(), 1);
+        assert_eq!(dto.outgoing[0].peer_id, "dc-west");
+        assert_eq!(dto.outgoing[0].lag_events, 2);
+        assert_eq!(dto.incoming.len(), 1);
+        assert_eq!(dto.incoming[0].peer_endpoint, "10.0.1.1:9090");
         assert_eq!(dto.unresolved_conflicts, 1);
         assert_eq!(dto.failed_retryable_reservations, 7);
         assert_eq!(dto.retry_exhausted_reservations, 9);
         assert!(!dto.zero_manual_slo_healthy);
+    }
+
+    #[test]
+    fn conflicts_from_proto_maps_fields() {
+        let r = controller_proto::ListReplicationConflictsResponse {
+            conflicts: vec![controller_proto::ReplicationConflictInfo {
+                id: 42,
+                resource_key: "vm:abc".into(),
+                incumbent_op_id: "op-1".into(),
+                challenger_op_id: "op-2".into(),
+                incumbent_controller_id: "ctrl-east".into(),
+                challenger_controller_id: "ctrl-west".into(),
+                reason: "concurrent create".into(),
+            }],
+        };
+        let dtos = conflicts_from_proto(r);
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(dtos[0].id, 42);
+        assert_eq!(dtos[0].resource_key, "vm:abc");
+        assert_eq!(dtos[0].reason, "concurrent create");
     }
 }

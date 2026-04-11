@@ -29,8 +29,8 @@ pub struct CreateArgs {
     pub username: Option<String>,
     pub password: Option<String>,
     pub compliant: bool,
-    pub storage_backend: String,
-    pub storage_size_bytes: i64,
+    pub storage_backend: Option<String>,
+    pub storage_size_bytes: Option<i64>,
 }
 
 pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
@@ -40,10 +40,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
     if (args.wait || args.wait_for_ssh) && args.wait_timeout_seconds == 0 {
         bail!("--wait-timeout-seconds must be > 0");
     }
-    let storage_backend = normalize_storage_backend_arg(&args.storage_backend)?;
-    if args.storage_size_bytes <= 0 {
-        bail!("--storage-size-bytes must be > 0");
-    }
+    let cli_storage_backend = args.storage_backend.clone();
+    let cli_storage_size_bytes = args.storage_size_bytes;
     if args.password.is_some() && args.username.is_none() {
         bail!("--password requires --username");
     }
@@ -58,6 +56,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_image,
         manifest_image_sha256,
         manifest_image_format,
+        manifest_storage_backend,
+        manifest_storage_size_bytes,
     ) = if let Some(path) = &args.filename {
         let manifest = parse_vm_manifest(path)?;
         let n = args.name.clone().unwrap_or(manifest.name);
@@ -69,6 +69,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             manifest.image,
             manifest.image_sha256,
             manifest.image_format,
+            manifest.storage_backend,
+            manifest.storage_size_bytes,
         )
     } else {
         let n = args
@@ -88,7 +90,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
                 }]
             })
             .unwrap_or_default();
-        (n, cpu, mem, nics, None, None, None)
+        (n, cpu, mem, nics, None, None, None, None, None)
     };
     let image = resolve_create_image_source(
         args.image.as_deref(),
@@ -104,6 +106,17 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         bail!(
             "cannot combine --ssh-key with custom/generated cloud-init user-data; include SSH keys in cloud-init or omit --cloud-init-user-data-file/--username/--password"
         );
+    }
+
+    let storage_backend_raw = cli_storage_backend
+        .or(manifest_storage_backend)
+        .unwrap_or_else(|| "filesystem".to_string());
+    let storage_backend = normalize_storage_backend_arg(&storage_backend_raw)?;
+    let storage_size_bytes = cli_storage_size_bytes
+        .or(manifest_storage_size_bytes)
+        .unwrap_or(0);
+    if storage_size_bytes <= 0 {
+        bail!("--storage-size-bytes must be > 0 (set via CLI flag or spec.storageSizeBytes in YAML)");
     }
 
     let mut client = client::controller_client(info).await?;
@@ -127,7 +140,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         image_format: image.format,
         ssh_key_names: args.ssh_keys,
         storage_backend: storage_backend_to_proto(&storage_backend),
-        storage_size_bytes: args.storage_size_bytes,
+        storage_size_bytes,
     };
 
     let resp = client.create_vm(req).await?.into_inner();
@@ -587,6 +600,8 @@ struct VmManifest {
     image: Option<String>,
     image_sha256: Option<String>,
     image_format: Option<String>,
+    storage_backend: Option<String>,
+    storage_size_bytes: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -897,6 +912,20 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         })
         .map(|s| s.to_string());
 
+    let storage_backend = doc["spec"]["storageBackend"]
+        .as_str()
+        .or_else(|| doc["spec"]["storage_backend"].as_str())
+        .map(|s| s.to_string());
+    let storage_size_bytes = doc["spec"]["storageSizeBytes"]
+        .as_i64()
+        .or_else(|| doc["spec"]["storage_size_bytes"].as_i64())
+        .or_else(|| {
+            doc["spec"]["storageSizeBytes"]
+                .as_str()
+                .or_else(|| doc["spec"]["storage_size_bytes"].as_str())
+                .and_then(|s| client::parse_size_bytes(s).ok())
+        });
+
     Ok(VmManifest {
         name,
         cpu,
@@ -905,6 +934,8 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         image,
         image_sha256,
         image_format,
+        storage_backend,
+        storage_size_bytes,
     })
 }
 
@@ -1111,8 +1142,8 @@ mod tests {
             username: None,
             password: None,
             compliant: true,
-            storage_backend: "filesystem".into(),
-            storage_size_bytes: 10 * 1024 * 1024 * 1024,
+            storage_backend: Some("filesystem".into()),
+            storage_size_bytes: Some(10 * 1024 * 1024 * 1024),
         }
     }
 

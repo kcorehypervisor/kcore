@@ -1,11 +1,12 @@
 use crate::api::{
     get_compliance_dto, get_network_overview_dto, get_replication_status_dto,
-    get_storage_overview_dto, list_networks_dto, list_vms_page,
+    get_storage_overview_dto, list_networks_dto, list_replication_conflicts_dto, list_vms_page,
 };
 use crate::dto::{
-    ComplianceDto, HostInterfaceDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
-    NodeStorageDto, NodeSummaryDto, ReplicationStatusDto, StorageDiskRowDto, StorageOverviewDto,
-    VmRowDto, VmsPageDto,
+    ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
+    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
+    NodeSummaryDto, ReplicationConflictDto, ReplicationStatusDto, StorageDiskRowDto,
+    StorageOverviewDto, VmRowDto, VmsPageDto,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};
@@ -112,6 +113,7 @@ fn HomePage() -> impl IntoView {
 fn CompliancePage() -> impl IntoView {
     let res = Resource::new(|| (), |_| get_compliance_dto());
     let replication_res = Resource::new(|| (), |_| get_replication_status_dto());
+    let conflicts_res = Resource::new(|| (), |_| list_replication_conflicts_dto());
     view! {
         <section class="hero">
             <h1>"Compliance report"</h1>
@@ -136,6 +138,17 @@ fn CompliancePage() -> impl IntoView {
                 })}
             </Suspense>
         </section>
+        <section class="card" style="margin-top: 1rem;">
+            <h2>"Replication conflicts"</h2>
+            <Suspense fallback=move || view! { <p class="muted">"Loading conflicts…"</p> }>
+                {move || Suspend::new(async move {
+                    match conflicts_res.await {
+                        Ok(data) => conflicts_view(data).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })}
+            </Suspense>
+        </section>
     }
 }
 
@@ -145,10 +158,16 @@ fn replication_status_view(data: ReplicationStatusDto) -> impl IntoView {
     } else {
         "violations"
     };
+    let has_outgoing = !data.outgoing.is_empty();
+    let has_incoming = !data.incoming.is_empty();
+    let outgoing = data.outgoing.clone();
+    let incoming = data.incoming.clone();
     view! {
         <div>
             <div class="stat-row" style="margin-bottom: 0.75rem;">
                 <div class="stat"><div class="label">"SLO"</div><div class="value">{health}</div></div>
+                <div class="stat"><div class="label">"Outbox head"</div><div class="value">{data.outbox_head_event_id}</div></div>
+                <div class="stat"><div class="label">"Outbox size"</div><div class="value">{data.outbox_size}</div></div>
                 <div class="stat"><div class="label">"Conflicts"</div><div class="value">{data.unresolved_conflicts}</div></div>
                 <div class="stat"><div class="label">"Comp. pending"</div><div class="value">{data.pending_compensation_jobs}</div></div>
                 <div class="stat"><div class="label">"Materialization"</div><div class="value">{data.materialization_backlog}</div></div>
@@ -164,8 +183,104 @@ fn replication_status_view(data: ReplicationStatusDto) -> impl IntoView {
                     {format!("Violations: {}", data.zero_manual_slo_violations.join(", "))}
                 </p>
             </Show>
+            {
+                let outgoing_view = outgoing.clone();
+                view! {
+                    <Show when=move || has_outgoing>
+                        <h3 style="margin-top: 1rem; font-size: 0.85rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.06em;">"Outgoing peers"</h3>
+                        <div class="table-wrap" style="margin-top: 0.5rem;">
+                            <table class="data">
+                                <thead>
+                                    <tr>
+                                        <th>"Peer"</th>
+                                        <th>"Last acked"</th>
+                                        <th>"Lag"</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {outgoing_view.clone().into_iter().map(|o| view! {
+                                        <tr>
+                                            <td><code class="inline">{o.peer_id.clone()}</code></td>
+                                            <td>{o.last_acked_event_id}</td>
+                                            <td>{o.lag_events}</td>
+                                        </tr>
+                                    }).collect_view()}
+                                </tbody>
+                            </table>
+                        </div>
+                    </Show>
+                }
+            }
+            {
+                let incoming_view = incoming.clone();
+                view! {
+                    <Show when=move || has_incoming>
+                        <h3 style="margin-top: 1rem; font-size: 0.85rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.06em;">"Incoming peers"</h3>
+                        <div class="table-wrap" style="margin-top: 0.5rem;">
+                            <table class="data">
+                                <thead>
+                                    <tr>
+                                        <th>"Endpoint"</th>
+                                        <th>"Last pulled"</th>
+                                        <th>"Last applied"</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {incoming_view.clone().into_iter().map(|i| view! {
+                                        <tr>
+                                            <td><code class="inline">{i.peer_endpoint.clone()}</code></td>
+                                            <td>{i.last_pulled_event_id}</td>
+                                            <td>{i.last_applied_event_id}</td>
+                                        </tr>
+                                    }).collect_view()}
+                                </tbody>
+                            </table>
+                        </div>
+                    </Show>
+                }
+            }
         </div>
     }
+}
+
+fn conflicts_view(conflicts: Vec<ReplicationConflictDto>) -> impl IntoView {
+    if conflicts.is_empty() {
+        return view! {
+            <p class="muted">"No unresolved replication conflicts."</p>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"ID"</th>
+                        <th>"Resource"</th>
+                        <th>"Incumbent"</th>
+                        <th>"Challenger"</th>
+                        <th>"Reason"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {conflicts.into_iter().map(|c| {
+                        let incumbent = format!("{} ({})", c.incumbent_op_id, c.incumbent_controller_id);
+                        let challenger = format!("{} ({})", c.challenger_op_id, c.challenger_controller_id);
+                        view! {
+                            <tr>
+                                <td>{c.id}</td>
+                                <td><code class="inline">{c.resource_key.clone()}</code></td>
+                                <td>{incumbent}</td>
+                                <td>{challenger}</td>
+                                <td>{c.reason.clone()}</td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
 }
 
 fn compliance_view(data: ComplianceDto) -> impl IntoView {
@@ -654,6 +769,13 @@ fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
     } else {
         node.luks_method.clone()
     };
+    let has_vgs = !node.lvm_volume_groups.is_empty();
+    let has_lvs = !node.lvm_logical_volumes.is_empty();
+    let has_pvs = !node.lvm_physical_volumes.is_empty();
+    let has_lvm = node.lvm_inventory_ok && (has_vgs || has_lvs || has_pvs);
+    let vgs = node.lvm_volume_groups.clone();
+    let lvs = node.lvm_logical_volumes.clone();
+    let pvs = node.lvm_physical_volumes.clone();
     view! {
         <section class="card node-card">
             <div class="node-card-header">
@@ -695,7 +817,103 @@ fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
                     }}
                 </p>
             </Show>
+            <Show when=move || has_lvm>
+                {lvm_detail_view(vgs.clone(), lvs.clone(), pvs.clone())}
+            </Show>
         </section>
+    }
+}
+
+fn lvm_detail_view(
+    vgs: Vec<LvmVolumeGroupDto>,
+    lvs: Vec<LvmLogicalVolumeDto>,
+    pvs: Vec<LvmPhysicalVolumeDto>,
+) -> impl IntoView {
+    let has_vgs = !vgs.is_empty();
+    let has_lvs = !lvs.is_empty();
+    let has_pvs = !pvs.is_empty();
+    view! {
+        <h3 style="margin-top: 1rem; font-size: 0.85rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.06em;">"LVM inventory"</h3>
+        <Show when=move || has_vgs>
+            <div class="table-wrap" style="margin-top: 0.5rem;">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>"Volume group"</th>
+                            <th>"Size"</th>
+                            <th>"Free"</th>
+                            <th>"Attr"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {vgs.clone().into_iter().map(|vg| view! {
+                            <tr>
+                                <td><code class="inline">{vg.name.clone()}</code></td>
+                                <td>{vg.size.clone()}</td>
+                                <td>{vg.free.clone()}</td>
+                                <td><code class="inline">{vg.attr.clone()}</code></td>
+                            </tr>
+                        }).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        </Show>
+        <Show when=move || has_lvs>
+            <div class="table-wrap" style="margin-top: 0.5rem;">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>"Logical volume"</th>
+                            <th>"VG"</th>
+                            <th>"Size"</th>
+                            <th>"Attr"</th>
+                            <th>"Path"</th>
+                            <th>"Pool"</th>
+                            <th>"Data %"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {lvs.clone().into_iter().map(|lv| view! {
+                            <tr>
+                                <td><code class="inline">{lv.name.clone()}</code></td>
+                                <td><code class="inline">{lv.vg_name.clone()}</code></td>
+                                <td>{lv.size.clone()}</td>
+                                <td><code class="inline">{lv.attr.clone()}</code></td>
+                                <td><code class="inline">{lv.path.clone()}</code></td>
+                                <td>{if lv.pool.is_empty() { "—".to_string() } else { lv.pool.clone() }}</td>
+                                <td>{if lv.data_percent.is_empty() { "—".to_string() } else { lv.data_percent.clone() }}</td>
+                            </tr>
+                        }).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        </Show>
+        <Show when=move || has_pvs>
+            <div class="table-wrap" style="margin-top: 0.5rem;">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>"Physical volume"</th>
+                            <th>"VG"</th>
+                            <th>"Size"</th>
+                            <th>"Free"</th>
+                            <th>"Attr"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {pvs.clone().into_iter().map(|pv| view! {
+                            <tr>
+                                <td><code class="inline">{pv.name.clone()}</code></td>
+                                <td><code class="inline">{pv.vg_name.clone()}</code></td>
+                                <td>{pv.size.clone()}</td>
+                                <td>{pv.free.clone()}</td>
+                                <td><code class="inline">{pv.attr.clone()}</code></td>
+                            </tr>
+                        }).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        </Show>
     }
 }
 

@@ -8,6 +8,10 @@ This document explains how storage works end-to-end in kcore:
 - generated Nix VM configuration fields
 - source files involved in the storage flow (with detailed responsibilities)
 
+For a deep operational runbook focused specifically on day-2 filesystem changes, see:
+
+- `docs/day-2-filesystem-operations.md`
+
 ## Storage Model
 
 There are two connected storage concepts:

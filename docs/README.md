@@ -8,6 +8,7 @@
 | Topic | Document |
 |--------|-----------|
 | Architecture | [Architecture.md](./Architecture.md) |
+| Day-2 filesystem operations | [day-2-filesystem-operations.md](./day-2-filesystem-operations.md) |
 | CRDT / HA replication | [ha-crdt-replication.md](./ha-crdt-replication.md) |
 | File layout | [file-structure.md](./file-structure.md) |
 | Formal methods | [formal-methods-and-verification.md](./formal-methods-and-verification.md) |

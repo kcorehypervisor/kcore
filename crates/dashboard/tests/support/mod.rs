@@ -3,9 +3,10 @@
 
 use std::net::SocketAddr;
 
+use kcore_dashboard::controller_client::controller_proto::controller_admin_server::ControllerAdmin;
 use kcore_dashboard::controller_client::controller_proto::controller_server::Controller;
 use kcore_dashboard::controller_client::controller_proto::{
-    controller_server::ControllerServer, *,
+    controller_admin_server::ControllerAdminServer, controller_server::ControllerServer, *,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -429,6 +430,77 @@ impl Controller for MockController {
     }
 }
 
+#[tonic::async_trait]
+impl ControllerAdmin for MockController {
+    async fn apply_nix_config(
+        &self,
+        _: Request<ApplyNixConfigRequest>,
+    ) -> Result<Response<ApplyNixConfigResponse>, Status> {
+        Err(unimp("apply_nix_config"))
+    }
+
+    async fn get_replication_events(
+        &self,
+        _: Request<GetReplicationEventsRequest>,
+    ) -> Result<Response<GetReplicationEventsResponse>, Status> {
+        Err(unimp("get_replication_events"))
+    }
+
+    async fn ack_replication_events(
+        &self,
+        _: Request<AckReplicationEventsRequest>,
+    ) -> Result<Response<AckReplicationEventsResponse>, Status> {
+        Err(unimp("ack_replication_events"))
+    }
+
+    async fn get_replication_status(
+        &self,
+        _: Request<GetReplicationStatusRequest>,
+    ) -> Result<Response<GetReplicationStatusResponse>, Status> {
+        Ok(Response::new(GetReplicationStatusResponse {
+            outbox_head_event_id: 42,
+            outbox_size: 100,
+            outgoing: vec![ReplicationOutgoingStatus {
+                peer_id: "dc-west".into(),
+                last_acked_event_id: 40,
+                lag_events: 2,
+            }],
+            incoming: vec![ReplicationIncomingStatus {
+                peer_endpoint: "10.0.1.1:9090".into(),
+                last_pulled_event_id: 38,
+                last_applied_event_id: 37,
+            }],
+            unresolved_conflicts: 0,
+            pending_compensation_jobs: 0,
+            failed_compensation_jobs: 0,
+            materialization_backlog: 0,
+            oldest_unresolved_conflict_age_seconds: 0,
+            failed_reservations: 0,
+            zero_manual_slo_healthy: true,
+            zero_manual_slo_violations: vec![],
+            failed_retryable_reservations: 0,
+            failed_non_retryable_reservations: 0,
+            retry_exhausted_reservations: 0,
+        }))
+    }
+
+    async fn list_replication_conflicts(
+        &self,
+        _: Request<ListReplicationConflictsRequest>,
+    ) -> Result<Response<ListReplicationConflictsResponse>, Status> {
+        Ok(Response::new(ListReplicationConflictsResponse {
+            conflicts: vec![],
+        }))
+    }
+
+    async fn resolve_replication_conflict(
+        &self,
+        _: Request<ResolveReplicationConflictRequest>,
+    ) -> Result<Response<ResolveReplicationConflictResponse>, Status> {
+        Err(unimp("resolve_replication_conflict"))
+    }
+}
+
 /// Binds an ephemeral port and serves the mock controller until the process exits.
 pub async fn spawn_mock_controller() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -439,6 +511,7 @@ pub async fn spawn_mock_controller() -> SocketAddr {
     tokio::spawn(async move {
         Server::builder()
             .add_service(ControllerServer::new(MockController))
+            .add_service(ControllerAdminServer::new(MockController))
             .serve_with_incoming(incoming)
             .await
             .expect("mock controller serve");

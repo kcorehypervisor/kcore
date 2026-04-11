@@ -241,12 +241,12 @@ enum CreateResource {
         /// Compliance mode (default true). Set false to acknowledge non-compliant auth like password login.
         #[arg(long = "compliant", default_value_t = true, action = clap::ArgAction::Set)]
         compliant: bool,
-        /// Required VM storage backend (filesystem, lvm, zfs)
+        /// VM storage backend (filesystem, lvm, zfs). Can also be set in YAML manifest under spec.storageBackend.
         #[arg(long = "storage-backend", value_enum)]
-        storage_backend: StorageBackend,
-        /// Required VM storage size in bytes (for backend provisioning metadata)
+        storage_backend: Option<StorageBackend>,
+        /// VM storage size in bytes. Can also be set in YAML manifest under spec.storageSizeBytes.
         #[arg(long = "storage-size-bytes")]
-        storage_size_bytes: i64,
+        storage_size_bytes: Option<i64>,
     },
     /// Create a container on a node
     Container {
@@ -893,11 +893,11 @@ async fn main() {
                     username: username.clone(),
                     password: password.clone(),
                     compliant: *compliant,
-                    storage_backend: match storage_backend {
+                    storage_backend: storage_backend.as_ref().map(|v| match v {
                         StorageBackend::Filesystem => "filesystem".to_string(),
                         StorageBackend::Lvm => "lvm".to_string(),
                         StorageBackend::Zfs => "zfs".to_string(),
-                    },
+                    }),
                     storage_size_bytes: *storage_size_bytes,
                 },
             )

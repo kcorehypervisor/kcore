@@ -99,6 +99,42 @@ async fn all_dashboard_pages_against_mock_controller() {
         "compliance must have page title"
     );
 
+    // Replication section (now from ControllerAdmin mock)
+    assert!(
+        compliance.contains("Replication resilience"),
+        "compliance must have replication section"
+    );
+    assert!(
+        compliance.contains("healthy"),
+        "replication SLO must show healthy"
+    );
+    assert!(
+        compliance.contains("dc-west"),
+        "replication must show outgoing peer"
+    );
+    assert!(
+        compliance.contains("Outgoing peers"),
+        "replication must have outgoing peers table"
+    );
+    assert!(
+        compliance.contains("Incoming peers"),
+        "replication must have incoming peers table"
+    );
+    assert!(
+        compliance.contains("10.0.1.1:9090"),
+        "replication must show incoming peer endpoint"
+    );
+
+    // Conflicts section
+    assert!(
+        compliance.contains("Replication conflicts"),
+        "compliance must have conflicts section"
+    );
+    assert!(
+        compliance.contains("No unresolved replication conflicts"),
+        "empty conflict list must show no-conflict message"
+    );
+
     // ── VMs page 1 ───────────────────────────────────────────────────
     let (status, vms) = fetch(&app, "/vms").await;
     assert_eq!(status, StatusCode::OK, "/vms status");

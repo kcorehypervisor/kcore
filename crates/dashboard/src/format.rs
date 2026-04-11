@@ -30,6 +30,23 @@ pub fn memory_mebibytes(bytes: i64) -> String {
     format!("{mb:.0} MiB")
 }
 
+/// Human-readable bytes with auto-scaled unit (GiB preferred).
+pub fn bytes_human(bytes: i64) -> String {
+    if bytes <= 0 {
+        return "0".to_string();
+    }
+    let b = bytes as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} TiB", b / (1024.0 * 1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} GiB", b / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.0} MiB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KiB", b / 1024.0)
+    }
+}
+
 pub const VM_PAGE_SIZE: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -45,9 +45,8 @@ pub async fn connect_channel(cfg: &DashboardConfig) -> Result<Channel> {
 
     endpoint.connect().await.with_context(|| {
         format!(
-            "gRPC to {} (mTLS: set {} if the cert is for a hostname, not the connection IP)",
+            "gRPC connect to {} failed (check KCORE_CONTROLLER matches a SAN in the controller cert)",
             cfg.controller_addr,
-            crate::config::ENV_TLS_DOMAIN
         )
     })
 }
@@ -121,6 +120,20 @@ pub async fn get_replication_status(
         .get_replication_status(controller_proto::GetReplicationStatusRequest {})
         .await
         .context("GetReplicationStatus RPC")?;
+    Ok(resp.into_inner())
+}
+
+pub async fn list_replication_conflicts(
+    cfg: &DashboardConfig,
+) -> Result<controller_proto::ListReplicationConflictsResponse> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_admin_client::ControllerAdminClient::new(channel);
+    let resp = client
+        .list_replication_conflicts(controller_proto::ListReplicationConflictsRequest {
+            limit: 100,
+        })
+        .await
+        .context("ListReplicationConflicts RPC")?;
     Ok(resp.into_inner())
 }
 
