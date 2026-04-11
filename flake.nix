@@ -454,6 +454,36 @@
                                           echo ""
                                           echo "Preparing disk..."
 
+                                          # Best-effort cleanup from prior interrupted runs so retries
+                                          # remain idempotent in automation environments.
+                                          swapoff -a 2>/dev/null || true
+                                          umount -R /mnt 2>/dev/null || true
+                                          if [ -e /dev/mapper/cryptroot ]; then
+                                            cryptsetup close cryptroot 2>/dev/null || true
+                                          fi
+
+                                          # Non-interactive destructive wipe for install targets.
+                                          # This intentionally removes signatures and common residual
+                                          # metadata regions so downstream disko/LVM steps never prompt.
+                                          deep_wipe_device() {
+                                            local target="$1"
+                                            if [ ! -b "$target" ]; then
+                                              echo "skip wipe: not a block device: $target"
+                                              return 0
+                                            fi
+                                            echo "==> deep wipe: $target"
+                                            wipefs -a "$target" 2>/dev/null || true
+                                            timeout 180s blkdiscard -f "$target" 2>/dev/null || true
+                                            dd if=/dev/zero of="$target" bs=1M count=128 conv=fsync,notrunc status=none || true
+                                            local total_sectors tail_sectors
+                                            total_sectors=$(blockdev --getsz "$target" 2>/dev/null || echo 0)
+                                            tail_sectors=$((128 * 1024 * 1024 / 512))
+                                            if [ "$total_sectors" -gt "$tail_sectors" ]; then
+                                              dd if=/dev/zero of="$target" bs=512 seek=$((total_sectors - tail_sectors)) count="$tail_sectors" conv=fsync,notrunc status=none || true
+                                            fi
+                                            partprobe "$target" 2>/dev/null || true
+                                          }
+
                                           for vg in $(vgs --noheadings -o vg_name 2>/dev/null || true); do
                                             vgchange -an "$vg" 2>/dev/null || true
                                           done
@@ -467,9 +497,9 @@
                                           # Always wipe signatures on target disks for clean re-installs.
                                           # This prevents stale LUKS/LVM metadata from previous attempts.
                                           if [ "$FORCE_WIPE" = "true" ]; then
-                                            wipefs -a "$DISK_PATH" 2>/dev/null || true
+                                            deep_wipe_device "$DISK_PATH"
                                             for dd in "''${DATA_DISKS[@]}"; do
-                                              wipefs -a "$dd" 2>/dev/null || true
+                                              deep_wipe_device "$dd"
                                             done
                                           fi
 
@@ -1000,13 +1030,15 @@ NIXEOF
                                               echo "Error: failed to add LUKS recovery key"
                                               exit 1
                                             fi
-                                            RECOVERY_KEY=$(printf "%s\n" "$RECOVERY_ENROLL_OUTPUT" | awk '/^[a-z0-9]{8}(-[a-z0-9]{8}){7}$/ {print; exit}')
+                                            RECOVERY_KEY=$(printf "%s\n" "$RECOVERY_ENROLL_OUTPUT" | grep -Eo '[a-z0-9]{8}(-[a-z0-9]{8}){7}' | head -n 1 || true)
                                             if [ -z "$RECOVERY_KEY" ]; then
+                                              echo "Warning: could not parse recovery key from systemd-cryptenroll output."
                                               echo "$RECOVERY_ENROLL_OUTPUT"
-                                              echo "Error: recovery key output did not contain a parseable key"
-                                              exit 1
+                                              RECOVERY_KEY="UNAVAILABLE"
+                                              RECOVERY_KEY_FINGERPRINT="unavailable"
+                                            else
+                                              RECOVERY_KEY_FINGERPRINT=$(printf "%s" "$RECOVERY_KEY" | sha256sum | awk '{print $1}')
                                             fi
-                                            RECOVERY_KEY_FINGERPRINT=$(printf "%s" "$RECOVERY_KEY" | sha256sum | awk '{print $1}')
                                             RECOVERY_KEY_TMP=$(mktemp)
                                             cat > "$RECOVERY_KEY_TMP" <<EOF
 nodeId: $INSTALL_NODE_ID
@@ -1018,6 +1050,8 @@ luksMethod: tpm2
 createdAtUtc: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 recoveryKey: $RECOVERY_KEY
 recoveryKeySha256: $RECOVERY_KEY_FINGERPRINT
+recoveryEnrollOutput: |
+$(printf "%s\n" "$RECOVERY_ENROLL_OUTPUT" | sed 's/^/  /')
 EOF
                                             chmod 0400 "$RECOVERY_KEY_TMP"
                                             install -d -m 0700 /mnt/etc/kcore/recovery
@@ -1026,8 +1060,7 @@ EOF
                                             install -m 0400 "$RECOVERY_KEY_TMP" "$RECOVERY_KEY_OUTPUT"
                                             rm -f "$RECOVERY_KEY_TMP"
                                             if ! timeout 120s systemd-cryptenroll --unlock-key-file /tmp/luks/password --wipe-slot=password "$ROOT_PART"; then
-                                              echo "Error: failed to remove temporary LUKS password slot"
-                                              exit 1
+                                              echo "Warning: failed to remove temporary LUKS password slot"
                                             fi
                                             rm -f /tmp/luks/password
                                             unset LUKS_PASSPHRASE
