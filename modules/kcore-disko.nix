@@ -10,10 +10,14 @@ let
     mkOption
     mkEnableOption
     mkIf
+    mkMerge
     types
     listToAttrs
     imap0
     optionalAttrs
+    sort
+    foldl'
+    recursiveUpdate
     ;
 
   dataDiskPartitions =
@@ -62,6 +66,76 @@ let
       };
     };
   };
+
+  baseDevices =
+    {
+      disk =
+        {
+          os = {
+            type = "disk";
+            device = cfg.osDisk;
+            content = {
+              type = "gpt";
+              partitions = {
+                ESP = {
+                  size = "512M";
+                  type = "EF00";
+                  content = {
+                    type = "filesystem";
+                    format = "vfat";
+                    mountpoint = "/boot";
+                    mountOptions = [ "umask=0077" ];
+                  };
+                };
+                root = {
+                  size = "100%";
+                  content = {
+                    type = "luks";
+                    name = "cryptroot";
+                    passwordFile = cfg.luksPasswordFile;
+                    settings = {
+                      allowDiscards = true;
+                    };
+                    content = {
+                      type = "filesystem";
+                      format = "ext4";
+                      mountpoint = "/";
+                    };
+                  };
+                };
+              };
+            };
+          };
+        }
+        // listToAttrs (imap0 mkDataDisk cfg.dataDisks);
+    }
+    // optionalAttrs (cfg.storageBackend == "lvm" && cfg.dataDisks != [ ]) {
+      lvm_vg = {
+        ${cfg.lvm.vgName} = {
+          type = "lvm_vg";
+          lvs = { };
+        };
+      };
+    }
+    // optionalAttrs (cfg.storageBackend == "zfs" && cfg.dataDisks != [ ]) {
+      zpool = {
+        ${cfg.zfs.poolName} = {
+          type = "zpool";
+          datasets = { };
+        };
+      };
+    };
+
+  sortedFragments =
+    sort (
+      a: b:
+      if a.priority == b.priority then
+        a.name < b.name
+      else
+        a.priority < b.priority
+    ) cfg.controllerFragments;
+
+  mergedControllerDevices = foldl' recursiveUpdate { } (map (f: f.devices) sortedFragments);
 in
 {
   options.kcore.disko = {
@@ -96,6 +170,40 @@ in
       description = "Storage backend for data disks.";
     };
 
+    managementMode = mkOption {
+      type = types.enum [
+        "installer-only"
+        "controller-managed"
+      ];
+      default = "installer-only";
+      description = "Ownership mode for disko changes.";
+    };
+
+    controllerFragments = mkOption {
+      type = types.listOf (
+        types.submodule {
+          options = {
+            name = mkOption {
+              type = types.str;
+              description = "Stable fragment name used for deterministic ordering.";
+            };
+            priority = mkOption {
+              type = types.int;
+              default = 100;
+              description = "Lower value applies earlier during recursive merge.";
+            };
+            devices = mkOption {
+              type = types.attrs;
+              default = { };
+              description = "Partial disko.devices fragment merged into base layout.";
+            };
+          };
+        }
+      );
+      default = [ ];
+      description = "Optional controller-managed disko fragments for day-2 operations.";
+    };
+
     lvm = {
       vgName = mkOption {
         type = types.str;
@@ -113,64 +221,20 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
-    disko.devices =
-      {
-        disk =
-          {
-            os = {
-              type = "disk";
-              device = cfg.osDisk;
-              content = {
-                type = "gpt";
-                partitions = {
-                  ESP = {
-                    size = "512M";
-                    type = "EF00";
-                    content = {
-                      type = "filesystem";
-                      format = "vfat";
-                      mountpoint = "/boot";
-                      mountOptions = [ "umask=0077" ];
-                    };
-                  };
-                  root = {
-                    size = "100%";
-                    content = {
-                      type = "luks";
-                      name = "cryptroot";
-                      passwordFile = cfg.luksPasswordFile;
-                      settings = {
-                        allowDiscards = true;
-                      };
-                      content = {
-                        type = "filesystem";
-                        format = "ext4";
-                        mountpoint = "/";
-                      };
-                    };
-                  };
-                };
-              };
-            };
-          }
-          // listToAttrs (imap0 mkDataDisk cfg.dataDisks);
-      }
-      // optionalAttrs (cfg.storageBackend == "lvm" && cfg.dataDisks != [ ]) {
-        lvm_vg = {
-          ${cfg.lvm.vgName} = {
-            type = "lvm_vg";
-            lvs = { };
-          };
-        };
-      }
-      // optionalAttrs (cfg.storageBackend == "zfs" && cfg.dataDisks != [ ]) {
-        zpool = {
-          ${cfg.zfs.poolName} = {
-            type = "zpool";
-            datasets = { };
-          };
-        };
-      };
-  };
+  config = mkIf cfg.enable (mkMerge [
+    {
+      assertions = [
+        {
+          assertion = cfg.managementMode == "controller-managed" || cfg.controllerFragments == [ ];
+          message = "kcore.disko.controllerFragments requires kcore.disko.managementMode = \"controller-managed\".";
+        }
+      ];
+    }
+    {
+      disko.devices =
+        recursiveUpdate
+          baseDevices
+          (if cfg.managementMode == "controller-managed" then mergedControllerDevices else { });
+    }
+  ]);
 }

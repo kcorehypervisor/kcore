@@ -19,6 +19,32 @@ pkgs.testers.runNixOSTest {
         luksPasswordFile = "/tmp/luks-password";
         storageBackend = "filesystem";
         dataDisks = [ ];
+        managementMode = "controller-managed";
+        controllerFragments = [
+          {
+            name = "day2-data-extension";
+            priority = 10;
+            devices = {
+              disk.extra = {
+                type = "disk";
+                device = "/dev/vdb";
+                content = {
+                  type = "gpt";
+                  partitions = {
+                    data = {
+                      size = "100%";
+                      content = {
+                        type = "filesystem";
+                        format = "ext4";
+                        mountpoint = "/var/lib/kcore/day2";
+                      };
+                    };
+                  };
+                };
+              };
+            };
+          }
+        ];
       };
 
       virtualisation.memorySize = 2048;

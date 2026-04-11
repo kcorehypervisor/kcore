@@ -584,6 +584,18 @@ enum NodeAction {
         #[arg(long)]
         no_rebuild: bool,
     },
+    /// Validate/apply a day-2 disko layout on a node
+    ApplyDisko {
+        /// Path to disko Nix expression file
+        #[arg(short = 'f', long = "filename")]
+        file: String,
+        /// Apply partitioning/mount changes (default validates only)
+        #[arg(long)]
+        apply: bool,
+        /// Command timeout in seconds
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: i32,
+    },
     /// Upload a local image file to a node image cache
     UploadImage {
         /// Local image filename (qcow2 or raw)
@@ -1231,6 +1243,17 @@ async fn main() {
         } => {
             let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
             commands::node::apply_nix(&info, file, !no_rebuild).await
+        }
+        Command::Node {
+            action:
+                NodeAction::ApplyDisko {
+                    file,
+                    apply,
+                    timeout_seconds,
+                },
+        } => {
+            let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::node::apply_disko_layout(&info, file, *apply, *timeout_seconds).await
         }
         Command::Node {
             action:

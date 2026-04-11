@@ -26,6 +26,9 @@ const BOOTSTRAP_CERT_DIR: &str = "/etc/kcore/certs";
 const INSTALL_LOG_DIR: &str = "/var/log/kcore";
 const NIXOS_CONFIG_PATH: &str = "/etc/nixos/configuration.nix";
 const IMAGE_CACHE_DIR: &str = "/var/lib/kcore/images";
+const DISKO_MANAGEMENT_MODE_PATH: &str = "/etc/kcore/disko-management-mode";
+const DISKO_MODE_INSTALLER_ONLY: &str = "installer-only";
+const DISKO_MODE_CONTROLLER_MANAGED: &str = "controller-managed";
 
 async fn resolve_nixpkgs_path() -> Option<String> {
     for candidate in [
@@ -93,6 +96,27 @@ fn validate_disk_path(path: &str, field: &str) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+fn normalize_disko_management_mode(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        DISKO_MODE_CONTROLLER_MANAGED => DISKO_MODE_CONTROLLER_MANAGED,
+        _ => DISKO_MODE_INSTALLER_ONLY,
+    }
+}
+
+fn read_disko_management_mode() -> &'static str {
+    let raw = std::fs::read_to_string(DISKO_MANAGEMENT_MODE_PATH)
+        .unwrap_or_else(|_| DISKO_MODE_INSTALLER_ONLY.to_string());
+    normalize_disko_management_mode(&raw)
+}
+
+fn validate_disko_timeout_seconds_or_default(timeout_seconds: i32) -> u64 {
+    if timeout_seconds <= 0 {
+        300
+    } else {
+        timeout_seconds.min(3600) as u64
+    }
 }
 
 fn write_bootstrap_pki(req: &proto::InstallToDiskRequest) -> Result<(), Status> {
@@ -891,6 +915,93 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 "config written to {}; nixos-rebuild test+switch started",
                 path.display()
             ),
+        }))
+    }
+
+    async fn apply_disko_layout(
+        &self,
+        request: Request<proto::ApplyDiskoLayoutRequest>,
+    ) -> Result<Response<proto::ApplyDiskoLayoutResponse>, Status> {
+        auth::require_peer_insecure_ok(&request, &[CN_KCTL, CN_CONTROLLER])?;
+        let req = request.into_inner();
+        let mode = read_disko_management_mode();
+
+        if req.disko_nix.trim().is_empty() {
+            return Err(Status::invalid_argument("disko_nix cannot be empty"));
+        }
+        if !req.disko_nix.contains("disko.devices") {
+            return Err(Status::invalid_argument(
+                "disko_nix must define disko.devices",
+            ));
+        }
+        if req.apply && mode != DISKO_MODE_CONTROLLER_MANAGED {
+            return Ok(Response::new(proto::ApplyDiskoLayoutResponse {
+                success: false,
+                message: "node is in installer-only disko mode; enable controller-managed mode first"
+                    .to_string(),
+                mode: mode.to_string(),
+            }));
+        }
+
+        let timeout_seconds = validate_disko_timeout_seconds_or_default(req.timeout_seconds);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("system clock error: {e}")))?
+            .as_secs();
+        let temp_path = PathBuf::from(format!("/tmp/kcore-disko-day2-{timestamp}.nix"));
+
+        let write_path = temp_path.clone();
+        let disko_nix = req.disko_nix.clone();
+        tokio::task::spawn_blocking(move || std::fs::write(&write_path, disko_nix))
+            .await
+            .map_err(|e| Status::internal(format!("task join: {e}")))?
+            .map_err(|e| {
+                Status::internal(format!("writing disko config {}: {e}", temp_path.display()))
+            })?;
+
+        let mut cmd = Command::new("timeout");
+        cmd.args([format!("{timeout_seconds}s")]);
+        if req.apply {
+            cmd.arg("disko")
+                .arg("--mode")
+                .arg("format,mount")
+                .arg(temp_path.as_os_str());
+        } else {
+            cmd.arg("nix-instantiate")
+                .arg("--parse")
+                .arg(temp_path.as_os_str());
+        }
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("running disko command: {e}")))?;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if output.status.success() {
+            let action = if req.apply { "applied" } else { "validated" };
+            let detail = if stdout.is_empty() {
+                format!("disko layout {action} successfully")
+            } else {
+                format!("disko layout {action} successfully: {stdout}")
+            };
+            return Ok(Response::new(proto::ApplyDiskoLayoutResponse {
+                success: true,
+                message: detail,
+                mode: mode.to_string(),
+            }));
+        }
+
+        let detail = if stderr.is_empty() {
+            format!("disko command failed with status {}", output.status)
+        } else {
+            format!("disko command failed: {stderr}")
+        };
+        Ok(Response::new(proto::ApplyDiskoLayoutResponse {
+            success: false,
+            message: detail,
+            mode: mode.to_string(),
         }))
     }
 
@@ -1765,6 +1876,26 @@ mod tests {
         assert_eq!(validate_timeout_ms_or_default(0), 1500);
         assert_eq!(validate_timeout_ms_or_default(-1), 1500);
         assert_eq!(validate_timeout_ms_or_default(3000), 3000);
+    }
+
+    #[test]
+    fn disko_management_mode_defaults_to_installer_only() {
+        assert_eq!(
+            normalize_disko_management_mode(""),
+            DISKO_MODE_INSTALLER_ONLY
+        );
+        assert_eq!(
+            normalize_disko_management_mode("unknown"),
+            DISKO_MODE_INSTALLER_ONLY
+        );
+    }
+
+    #[test]
+    fn disko_timeout_defaults_and_caps() {
+        assert_eq!(validate_disko_timeout_seconds_or_default(0), 300);
+        assert_eq!(validate_disko_timeout_seconds_or_default(-1), 300);
+        assert_eq!(validate_disko_timeout_seconds_or_default(120), 120);
+        assert_eq!(validate_disko_timeout_seconds_or_default(7200), 3600);
     }
 
     #[test]

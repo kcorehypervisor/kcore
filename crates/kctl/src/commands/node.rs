@@ -430,6 +430,31 @@ pub async fn apply_nix(info: &ConnectionInfo, file: &str, rebuild: bool) -> Resu
     }
 }
 
+pub async fn apply_disko_layout(
+    info: &ConnectionInfo,
+    file: &str,
+    apply: bool,
+    timeout_seconds: i32,
+) -> Result<()> {
+    let content = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    let mut client = client::node_admin_client(info).await?;
+    let resp = client
+        .apply_disko_layout(node_proto::ApplyDiskoLayoutRequest {
+            disko_nix: content,
+            apply,
+            timeout_seconds,
+        })
+        .await?
+        .into_inner();
+    if resp.success {
+        println!("{}", resp.message);
+        println!("disko mode: {}", resp.mode);
+        Ok(())
+    } else {
+        anyhow::bail!("disko apply failed (mode={}): {}", resp.mode, resp.message)
+    }
+}
+
 pub async fn upload_image(
     info: &ConnectionInfo,
     file: &str,

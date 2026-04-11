@@ -7,11 +7,23 @@
 #   FLAKE=/path/to/kcore ./scripts/deploy-kcore-to-host.sh user@host
 #
 # Requires: passwordless sudo on the remote for systemctl/te mkdir, or run as root@host.
+#
+# Non-interactive password auth: install `sshpass`, then e.g.
+#   SSHPASS=kcore ./scripts/deploy-kcore-to-host.sh root@192.168.40.105
+# Also sets NIX_SSHOPTS so ssh does not try every local key first (avoids "Too many authentication failures").
 set -euo pipefail
 
 TARGET="${1:?usage: $0 [user@]host}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FLAKE="${FLAKE:-$ROOT}"
+
+run_ssh() {
+  if [[ -n "${SSHPASS:-}" ]] && command -v sshpass >/dev/null 2>&1; then
+    sshpass -e ssh "$@"
+  else
+    ssh "$@"
+  fi
+}
 
 echo "==> Building kcore-dashboard and kcore-controller from $FLAKE"
 DASH="$(nix build "$FLAKE#kcore-dashboard" --no-link --print-out-paths)"
@@ -19,11 +31,19 @@ CTRL="$(nix build "$FLAKE#kcore-controller" --no-link --print-out-paths)"
 echo "    dashboard: $DASH"
 echo "    controller: $CTRL"
 
+if [[ -n "${SSHPASS:-}" ]]; then
+  export NIX_SSHOPTS="${NIX_SSHOPTS:+$NIX_SSHOPTS }-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+fi
+
 echo "==> nix copy (closures) -> ssh://$TARGET"
-nix copy --to "ssh://$TARGET" "$DASH" "$CTRL"
+if [[ -n "${SSHPASS:-}" ]] && command -v sshpass >/dev/null 2>&1; then
+  sshpass -e nix copy --to "ssh://$TARGET" "$DASH" "$CTRL"
+else
+  nix copy --to "ssh://$TARGET" "$DASH" "$CTRL"
+fi
 
 echo "==> Remote: systemd drop-ins + restart"
-ssh "$TARGET" bash -s -- "$DASH" "$CTRL" <<'REMOTE'
+run_ssh "$TARGET" bash -s -- "$DASH" "$CTRL" <<'REMOTE'
 set -euo pipefail
 DASH="$1"
 CTRL="$2"

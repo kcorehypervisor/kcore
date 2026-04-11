@@ -55,6 +55,10 @@ service NodeAdmin {
   // provided content and (optionally) triggers a nixos-rebuild.
   rpc ApplyNixConfig(ApplyNixConfigRequest) returns (ApplyNixConfigResponse);
 
+  // ApplyDiskoLayout validates/applies a disko layout for day-2 disk operations.
+  // Apply mode is only allowed when node disko management mode is controller-managed.
+  rpc ApplyDiskoLayout(ApplyDiskoLayoutRequest) returns (ApplyDiskoLayoutResponse);
+
   // EnsureImage verifies/downloads an image file at destination_path and
   // enforces SHA256 integrity before VM activation.
   rpc EnsureImage(EnsureImageRequest) returns (EnsureImageResponse);
@@ -423,6 +427,21 @@ message ApplyNixConfigRequest {
 message ApplyNixConfigResponse {
   bool success = 1;
   string message = 2;
+}
+
+message ApplyDiskoLayoutRequest {
+  // Full Nix expression containing disko.devices definition.
+  string disko_nix = 1;
+  // When true, run disko --mode format,mount. When false, syntax/eval validation only.
+  bool apply = 2;
+  // Maximum allowed runtime for command execution.
+  int32 timeout_seconds = 3;
+}
+
+message ApplyDiskoLayoutResponse {
+  bool success = 1;
+  string message = 2;
+  string mode = 3; // installer-only or controller-managed
 }
 
 message EnsureImageRequest {

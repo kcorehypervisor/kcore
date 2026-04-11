@@ -676,6 +676,8 @@ DISKOEOF
                                           if [ "''${#DATA_DISKS[@]}" -gt 0 ]; then
                                             printf "%s\n" "''${DATA_DISKS[@]}" > /mnt/etc/kcore/data-disks
                                           fi
+                                          # Safe split default: installer owns disk layout until explicitly promoted.
+                                          echo "installer-only" > /mnt/etc/kcore/disko-management-mode
 
                                           if [ "$DISABLE_VXLAN" = "true" ]; then
                                             touch /mnt/etc/kcore/disable-vxlan
@@ -795,7 +797,7 @@ CTRLEOF
 
                                           if [ "$RUN_CONTROLLER" = "true" ]; then
                                             cat > /mnt/etc/kcore/dashboard.env <<DASHENV
-KCORE_CONTROLLER=127.0.0.1:9090
+KCORE_CONTROLLER=$EXTERNAL_IP:9090
 KCORE_TLS_DOMAIN=$INSTALL_HOSTNAME
 KCORE_CA_FILE=/etc/kcore/certs/ca.crt
 KCORE_CERT_FILE=/etc/kcore/certs/kctl.crt
