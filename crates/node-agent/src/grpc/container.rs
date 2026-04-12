@@ -72,7 +72,9 @@ fn prepare_storage_mount(
     if size_bytes > 0 {
         let quota_file = format!("{host_path}/.kcore.requested_size_bytes");
         std::fs::write(&quota_file, size_bytes.to_string()).map_err(|e| {
-            Status::internal(format!("writing storage quota metadata at {quota_file}: {e}"))
+            Status::internal(format!(
+                "writing storage quota metadata at {quota_file}: {e}"
+            ))
         })?;
     }
 
@@ -84,7 +86,10 @@ fn prepare_storage_mount(
     Ok(Some((host_path, target)))
 }
 
-async fn inspect_container(rt: &ContainerdRuntime, name: &str) -> Result<proto::ContainerInfo, Status> {
+async fn inspect_container(
+    rt: &ContainerdRuntime,
+    name: &str,
+) -> Result<proto::ContainerInfo, Status> {
     let format = "{{.ID}}\t{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}";
     let args = vec![
         "inspect".to_string(),
@@ -239,7 +244,9 @@ impl proto::node_container_server::NodeContainer for ContainerService {
         }
         args.push(name.to_string());
         let _ = rt.run(&args).await?;
-        Ok(Response::new(proto::DeleteContainerResponse { success: true }))
+        Ok(Response::new(proto::DeleteContainerResponse {
+            success: true,
+        }))
     }
 
     async fn get_container(

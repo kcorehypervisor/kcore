@@ -3,10 +3,10 @@ use crate::api::{
     get_storage_overview_dto, list_networks_dto, list_replication_conflicts_dto, list_vms_page,
 };
 use crate::dto::{
-    ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
-    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
-    NodeSummaryDto, ReplicationConflictDto, ReplicationStatusDto, StorageDiskRowDto,
-    StorageOverviewDto, VmRowDto, VmsPageDto,
+    ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto,
+    NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto,
+    ReplicationConflictDto, ReplicationStatusDto, StorageDiskRowDto, StorageOverviewDto, VmRowDto,
+    VmsPageDto,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};

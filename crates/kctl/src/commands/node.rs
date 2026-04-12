@@ -107,9 +107,10 @@ pub async fn get_node(info: &ConnectionInfo, node_id: &str) -> Result<()> {
             println!("  External IP:       {}", overview.default_external_ip);
             println!("  Gateway IP:        {}", overview.default_gateway_ip);
             println!("  Netmask:           {}", overview.default_internal_netmask);
-            if let Some(subnet) =
-                ipv4_subnet_from_gateway_mask(&overview.default_gateway_ip, &overview.default_internal_netmask)
-            {
+            if let Some(subnet) = ipv4_subnet_from_gateway_mask(
+                &overview.default_gateway_ip,
+                &overview.default_internal_netmask,
+            ) {
                 println!("  Subnet:            {subnet}");
             }
             println!("  Network type:      nat (default)");
@@ -272,10 +273,7 @@ fn ipv4_subnet_from_gateway_mask(gateway_ip: &str, netmask: &str) -> Option<Stri
         ip[2] & mask[2],
         ip[3] & mask[3],
     ];
-    let prefix_len = mask
-        .iter()
-        .map(|b| b.count_ones())
-        .sum::<u32>();
+    let prefix_len = mask.iter().map(|b| b.count_ones()).sum::<u32>();
     Some(format!(
         "{}.{}.{}.{}/{}",
         net[0], net[1], net[2], net[3], prefix_len
@@ -316,6 +314,7 @@ pub async fn nics(info: &ConnectionInfo) -> Result<()> {
 
 pub async fn install(
     info: &ConnectionInfo,
+    controller_info: Option<&ConnectionInfo>,
     os_disk: &str,
     data_disks: Vec<String>,
     join_controllers: &[String],
@@ -340,8 +339,129 @@ pub async fn install(
 
     let node_is_controller = run_controller;
 
-    let install_pki = pki::load_install_pki(certs_dir, &node_host, node_is_controller)
-        .map_err(|e| anyhow::anyhow!("loading PKI: {e}"))?;
+    let install_pki = if node_is_controller {
+        pki::load_install_pki(certs_dir, &node_host, true)
+            .map_err(|e| anyhow::anyhow!("loading controller install PKI: {e}"))?
+    } else {
+        let ca_path = certs_dir.join("ca.crt");
+        let ca_cert_pem = std::fs::read_to_string(&ca_path)
+            .with_context(|| format!("reading {}", ca_path.display()))?;
+
+        // For agent-only installs, always ask the target controller to issue
+        // the node bootstrap cert/key so cert issuance is tied to controller CA.
+        let controller_conn = if let Some(ci) = controller_info {
+            let usable_tls = !ci.insecure
+                && ci.cert.as_deref().is_some()
+                && ci.key.as_deref().is_some()
+                && ci.ca.as_deref().is_some();
+            if usable_tls {
+                ConnectionInfo {
+                    address: primary_controller.clone(),
+                    addresses: join_controllers.clone(),
+                    insecure: false,
+                    cert: ci.cert.clone(),
+                    key: ci.key.clone(),
+                    ca: ci.ca.clone(),
+                }
+            } else {
+                ConnectionInfo {
+                    address: primary_controller.clone(),
+                    addresses: join_controllers.clone(),
+                    insecure: false,
+                    cert: Some(certs_dir.join("kctl.crt").display().to_string()),
+                    key: Some(certs_dir.join("kctl.key").display().to_string()),
+                    ca: Some(certs_dir.join("ca.crt").display().to_string()),
+                }
+            }
+        } else {
+            ConnectionInfo {
+                address: primary_controller.clone(),
+                addresses: join_controllers.clone(),
+                insecure: false,
+                cert: Some(certs_dir.join("kctl.crt").display().to_string()),
+                key: Some(certs_dir.join("kctl.key").display().to_string()),
+                ca: Some(certs_dir.join("ca.crt").display().to_string()),
+            }
+        };
+        let default_certs = crate::config::default_certs_dir();
+        let fallback_conn = ConnectionInfo {
+            address: primary_controller.clone(),
+            addresses: join_controllers.clone(),
+            insecure: false,
+            cert: Some(default_certs.join("kctl.crt").display().to_string()),
+            key: Some(default_certs.join("kctl.key").display().to_string()),
+            ca: Some(default_certs.join("ca.crt").display().to_string()),
+        };
+
+        let mut attempts = vec![controller_conn];
+        if attempts[0].cert != fallback_conn.cert
+            || attempts[0].key != fallback_conn.key
+            || attempts[0].ca != fallback_conn.ca
+        {
+            attempts.push(fallback_conn);
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut issued: Option<controller_proto::IssueNodeBootstrapCertResponse> = None;
+        for conn in attempts {
+            match client::controller_client(&conn).await {
+                Ok(mut ctl) => {
+                    match ctl
+                        .issue_node_bootstrap_cert(
+                            controller_proto::IssueNodeBootstrapCertRequest {
+                                node_id: node_id
+                                    .unwrap_or(&format!("kcore-node-{node_host}"))
+                                    .to_string(),
+                                node_host: node_host.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(resp) => {
+                            issued = Some(resp.into_inner());
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e.into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let issued = if let Some(resp) = issued {
+            resp
+        } else if let Some(err) = last_err {
+            return Err(err.context(format!(
+                "connecting to controller {} to issue bootstrap certs",
+                primary_controller
+            )));
+        } else {
+            anyhow::bail!(
+                "connecting to controller {} to issue bootstrap certs",
+                primary_controller
+            );
+        };
+        if !issued.success {
+            anyhow::bail!(
+                "controller refused bootstrap cert issuance: {}",
+                issued.message
+            );
+        }
+
+        pki::InstallPkiPayload {
+            ca_cert_pem,
+            node_cert_pem: issued.cert_pem,
+            node_key_pem: issued.key_pem,
+            controller_cert_pem: String::new(),
+            controller_key_pem: String::new(),
+            sub_ca_cert_pem: String::new(),
+            sub_ca_key_pem: String::new(),
+        }
+    };
 
     let typed_storage_backend = storage_backend
         .map(storage_backend_to_proto)

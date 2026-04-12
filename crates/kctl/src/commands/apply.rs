@@ -1,6 +1,6 @@
 use crate::client::{self, controller_proto};
-use crate::config::ConnectionInfo;
 use crate::commands::security_group;
+use crate::config::ConnectionInfo;
 use anyhow::{Context, Result};
 
 pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<()> {

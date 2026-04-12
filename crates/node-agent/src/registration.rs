@@ -328,12 +328,7 @@ fn collect_local_workload_runtime() -> Vec<controller_proto::WorkloadRuntimeInfo
     };
 
     let output = std::process::Command::new(runtime)
-        .args([
-            "ps",
-            "-a",
-            "--format",
-            "{{.ID}}\t{{.Names}}\t{{.Status}}",
-        ])
+        .args(["ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}"])
         .output();
     let Ok(out) = output else {
         return workloads;

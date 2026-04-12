@@ -280,6 +280,13 @@ impl Controller for MockController {
         Err(unimp("renew_node_cert"))
     }
 
+    async fn issue_node_bootstrap_cert(
+        &self,
+        _: Request<IssueNodeBootstrapCertRequest>,
+    ) -> Result<Response<IssueNodeBootstrapCertResponse>, Status> {
+        Err(unimp("issue_node_bootstrap_cert"))
+    }
+
     async fn rotate_sub_ca(
         &self,
         _: Request<RotateSubCaRequest>,

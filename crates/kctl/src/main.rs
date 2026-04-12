@@ -1210,11 +1210,14 @@ async fn main() {
                 .config
                 .clone()
                 .unwrap_or_else(config::default_config_path);
+            let controller_info =
+                config::resolve_controller(&config_path, &cli.controller, false).ok();
             let certs_dir = config::resolve_install_certs_dir(&config_path).unwrap_or_else(|e| {
                 fatal(&format!("resolving install cert directory: {e}"));
             });
             commands::node::install(
                 &info,
+                controller_info.as_ref(),
                 os_disk,
                 data_disk.clone(),
                 join_controller,
@@ -1440,12 +1443,18 @@ async fn main() {
                     kind,
                     id,
                     target_node,
-                } => commands::workload::set_state(&info, kind, id, true, target_node.as_deref()).await,
+                } => {
+                    commands::workload::set_state(&info, kind, id, true, target_node.as_deref())
+                        .await
+                }
                 WorkloadAction::Stop {
                     kind,
                     id,
                     target_node,
-                } => commands::workload::set_state(&info, kind, id, false, target_node.as_deref()).await,
+                } => {
+                    commands::workload::set_state(&info, kind, id, false, target_node.as_deref())
+                        .await
+                }
             }
         }
         Command::SecurityGroup { action } => {
@@ -1458,7 +1467,9 @@ async fn main() {
                     commands::security_group::apply_from_file(&info, file).await
                 }
                 SecurityGroupAction::List => commands::security_group::list(&info).await,
-                SecurityGroupAction::Get { name } => commands::security_group::get(&info, name).await,
+                SecurityGroupAction::Get { name } => {
+                    commands::security_group::get(&info, name).await
+                }
                 SecurityGroupAction::Delete { name } => {
                     commands::security_group::delete(&info, name).await
                 }
