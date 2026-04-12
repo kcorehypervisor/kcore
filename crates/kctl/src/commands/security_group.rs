@@ -218,7 +218,10 @@ fn parse_manifest(path: &str) -> Result<SecurityGroupManifest> {
     Ok(manifest)
 }
 
-async fn create_from_manifest(info: &ConnectionInfo, manifest: &SecurityGroupManifest) -> Result<()> {
+async fn create_from_manifest(
+    info: &ConnectionInfo,
+    manifest: &SecurityGroupManifest,
+) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let rules = manifest
         .spec

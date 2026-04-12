@@ -93,7 +93,11 @@ pub async fn list(info: &ConnectionInfo, target_node: Option<String>) -> Result<
     Ok(())
 }
 
-pub async fn describe(info: &ConnectionInfo, name: &str, target_node: Option<String>) -> Result<()> {
+pub async fn describe(
+    info: &ConnectionInfo,
+    name: &str,
+    target_node: Option<String>,
+) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let resp = client
         .list_networks(proto::ListNetworksRequest {
@@ -102,7 +106,11 @@ pub async fn describe(info: &ConnectionInfo, name: &str, target_node: Option<Str
         .await?
         .into_inner();
 
-    let mut matches: Vec<_> = resp.networks.into_iter().filter(|n| n.name == name).collect();
+    let mut matches: Vec<_> = resp
+        .networks
+        .into_iter()
+        .filter(|n| n.name == name)
+        .collect();
     if matches.is_empty() {
         anyhow::bail!("network '{name}' not found");
     }

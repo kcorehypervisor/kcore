@@ -4,8 +4,8 @@ use leptos::prelude::*;
 
 use crate::controller_client;
 use crate::dto::{
-    ComplianceDto, NetworkOverviewDto, NetworkRowDto, ReplicationConflictDto,
-    ReplicationStatusDto, StorageOverviewDto, VmsPageDto,
+    ComplianceDto, NetworkOverviewDto, NetworkRowDto, ReplicationConflictDto, ReplicationStatusDto,
+    StorageOverviewDto, VmsPageDto,
 };
 use crate::mappers::{
     compliance_from_proto, conflicts_from_proto, network_overview_from_proto, networks_from_proto,
@@ -70,7 +70,8 @@ pub async fn get_replication_status_dto() -> Result<ReplicationStatusDto, Server
 }
 
 #[server(ListReplicationConflicts, "/api")]
-pub async fn list_replication_conflicts_dto() -> Result<Vec<ReplicationConflictDto>, ServerFnError> {
+pub async fn list_replication_conflicts_dto() -> Result<Vec<ReplicationConflictDto>, ServerFnError>
+{
     let cfg = dashboard_config();
     let resp = controller_client::list_replication_conflicts(cfg)
         .await

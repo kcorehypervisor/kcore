@@ -68,9 +68,15 @@ pub async fn describe(info: &ConnectionInfo, id: i64) -> Result<()> {
     println!("Resource key:          {}", conflict.resource_key);
     println!("Reason:                {}", conflict.reason);
     println!("Incumbent operation:   {}", conflict.incumbent_op_id);
-    println!("Incumbent controller:  {}", conflict.incumbent_controller_id);
+    println!(
+        "Incumbent controller:  {}",
+        conflict.incumbent_controller_id
+    );
     println!("Challenger operation:  {}", conflict.challenger_op_id);
-    println!("Challenger controller: {}", conflict.challenger_controller_id);
+    println!(
+        "Challenger controller: {}",
+        conflict.challenger_controller_id
+    );
     Ok(())
 }
 
@@ -93,7 +99,10 @@ pub async fn status(info: &ConnectionInfo, require_healthy: bool) -> Result<()> 
         "pending_compensation_jobs: {}",
         resp.pending_compensation_jobs
     );
-    println!("failed_compensation_jobs: {}", resp.failed_compensation_jobs);
+    println!(
+        "failed_compensation_jobs: {}",
+        resp.failed_compensation_jobs
+    );
     println!("materialization_backlog: {}", resp.materialization_backlog);
     println!("failed_reservations: {}", resp.failed_reservations);
     println!(

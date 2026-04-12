@@ -1,5 +1,5 @@
-use tonic::{Request, Response, Status};
 use tokio::process::Command;
+use tonic::{Request, Response, Status};
 
 use crate::auth::{self, CN_CONTROLLER, CN_KCTL};
 use crate::proto;
@@ -257,11 +257,13 @@ impl proto::node_compute_server::NodeCompute for ComputeService {
     ) -> Result<Response<proto::CreateWorkloadResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
         let req = request.into_inner();
-        let kind = proto::WorkloadKind::try_from(req.kind)
-            .unwrap_or(proto::WorkloadKind::Unspecified);
+        let kind =
+            proto::WorkloadKind::try_from(req.kind).unwrap_or(proto::WorkloadKind::Unspecified);
         match kind {
             proto::WorkloadKind::Vm => {
-                let vm_spec = req.vm_spec.ok_or_else(|| Status::invalid_argument("vm_spec is required"))?;
+                let vm_spec = req
+                    .vm_spec
+                    .ok_or_else(|| Status::invalid_argument("vm_spec is required"))?;
                 if vm_spec.name.trim().is_empty() {
                     return Err(Status::invalid_argument("vm_spec.name is required"));
                 }
@@ -280,8 +282,8 @@ impl proto::node_compute_server::NodeCompute for ComputeService {
     ) -> Result<Response<proto::DeleteWorkloadResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
         let req = request.into_inner();
-        let kind = proto::WorkloadKind::try_from(req.kind)
-            .unwrap_or(proto::WorkloadKind::Unspecified);
+        let kind =
+            proto::WorkloadKind::try_from(req.kind).unwrap_or(proto::WorkloadKind::Unspecified);
         match kind {
             proto::WorkloadKind::Vm => Err(Status::unimplemented(DECLARATIVE_MSG)),
             proto::WorkloadKind::Container => Err(Status::unimplemented(
@@ -297,8 +299,8 @@ impl proto::node_compute_server::NodeCompute for ComputeService {
     ) -> Result<Response<proto::SetWorkloadDesiredStateResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
         let req = request.into_inner();
-        let kind = proto::WorkloadKind::try_from(req.kind)
-            .unwrap_or(proto::WorkloadKind::Unspecified);
+        let kind =
+            proto::WorkloadKind::try_from(req.kind).unwrap_or(proto::WorkloadKind::Unspecified);
         match kind {
             proto::WorkloadKind::Vm => {
                 let desired = match proto::WorkloadDesiredState::try_from(req.desired_state)
@@ -346,8 +348,8 @@ impl proto::node_compute_server::NodeCompute for ComputeService {
     ) -> Result<Response<proto::GetWorkloadResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
         let req = request.into_inner();
-        let kind = proto::WorkloadKind::try_from(req.kind)
-            .unwrap_or(proto::WorkloadKind::Unspecified);
+        let kind =
+            proto::WorkloadKind::try_from(req.kind).unwrap_or(proto::WorkloadKind::Unspecified);
         match kind {
             proto::WorkloadKind::Vm => {
                 let vm = self
@@ -386,8 +388,8 @@ impl proto::node_compute_server::NodeCompute for ComputeService {
     ) -> Result<Response<proto::ListWorkloadsResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER, CN_KCTL])?;
         let req = request.into_inner();
-        let kind = proto::WorkloadKind::try_from(req.kind)
-            .unwrap_or(proto::WorkloadKind::Unspecified);
+        let kind =
+            proto::WorkloadKind::try_from(req.kind).unwrap_or(proto::WorkloadKind::Unspecified);
         match kind {
             proto::WorkloadKind::Unspecified | proto::WorkloadKind::Vm => {
                 let vm_list = self

@@ -216,7 +216,11 @@ fn parse_stopped_vms_from_nix(configuration_nix: &str) -> Vec<String> {
 async fn enforce_stopped_vm_units(stopped_vms: &[String]) {
     for vm_name in stopped_vms {
         let unit = format!("kcore-vm-{vm_name}.service");
-        let out = match Command::new("systemctl").args(["stop", &unit]).output().await {
+        let out = match Command::new("systemctl")
+            .args(["stop", &unit])
+            .output()
+            .await
+        {
             Ok(out) => out,
             Err(e) => {
                 error!(vm_name = %vm_name, error = %e, "failed to spawn systemctl stop");
@@ -429,7 +433,11 @@ async fn lvm_report_json(bin: &str, args: &[&str]) -> Result<JsonValue, String> 
         .map_err(|e| format!("spawn {resolved} {}: {e}", args.join(" ")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("{bin} {} failed: {}", args.join(" "), stderr.trim()));
+        return Err(format!(
+            "{bin} {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
     }
     serde_json::from_slice::<JsonValue>(&out.stdout)
         .map_err(|e| format!("parse {resolved} {} json: {e}", args.join(" ")))
@@ -452,35 +460,44 @@ fn resolve_lvm_bin(bin: &str) -> String {
 }
 
 async fn collect_lvm_info() -> proto::GetLvmInfoResponse {
-    let vg = lvm_report_json("vgs", &[
-        "--reportformat",
-        "json",
-        "--units",
-        "b",
-        "--nosuffix",
-        "-o",
-        "vg_name,vg_size,vg_free,vg_attr",
-    ])
+    let vg = lvm_report_json(
+        "vgs",
+        &[
+            "--reportformat",
+            "json",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "vg_name,vg_size,vg_free,vg_attr",
+        ],
+    )
     .await;
-    let lv = lvm_report_json("lvs", &[
-        "--reportformat",
-        "json",
-        "--units",
-        "b",
-        "--nosuffix",
-        "-o",
-        "lv_name,vg_name,lv_size,lv_attr,lv_path,pool_lv,origin,data_percent,metadata_percent",
-    ])
+    let lv = lvm_report_json(
+        "lvs",
+        &[
+            "--reportformat",
+            "json",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "lv_name,vg_name,lv_size,lv_attr,lv_path,pool_lv,origin,data_percent,metadata_percent",
+        ],
+    )
     .await;
-    let pv = lvm_report_json("pvs", &[
-        "--reportformat",
-        "json",
-        "--units",
-        "b",
-        "--nosuffix",
-        "-o",
-        "pv_name,vg_name,pv_size,pv_free,pv_attr",
-    ])
+    let pv = lvm_report_json(
+        "pvs",
+        &[
+            "--reportformat",
+            "json",
+            "--units",
+            "b",
+            "--nosuffix",
+            "-o",
+            "pv_name,vg_name,pv_size,pv_free,pv_attr",
+        ],
+    )
     .await;
 
     if vg.is_err() && lv.is_err() && pv.is_err() {
@@ -937,8 +954,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if req.apply && mode != DISKO_MODE_CONTROLLER_MANAGED {
             return Ok(Response::new(proto::ApplyDiskoLayoutResponse {
                 success: false,
-                message: "node is in installer-only disko mode; enable controller-managed mode first"
-                    .to_string(),
+                message:
+                    "node is in installer-only disko mode; enable controller-managed mode first"
+                        .to_string(),
                 mode: mode.to_string(),
             }));
         }

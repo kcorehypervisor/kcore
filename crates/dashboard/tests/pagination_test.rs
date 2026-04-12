@@ -309,6 +309,12 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<RenewNodeCertResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn issue_node_bootstrap_cert(
+        &self,
+        _: TRequest<IssueNodeBootstrapCertRequest>,
+    ) -> Result<Response<IssueNodeBootstrapCertResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
     async fn rotate_sub_ca(
         &self,
         _: TRequest<RotateSubCaRequest>,

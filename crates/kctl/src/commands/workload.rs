@@ -115,7 +115,12 @@ pub async fn list(info: &ConnectionInfo, kind: &str, target_node: Option<&str>) 
     Ok(())
 }
 
-pub async fn get(info: &ConnectionInfo, kind: &str, id: &str, target_node: Option<&str>) -> Result<()> {
+pub async fn get(
+    info: &ConnectionInfo,
+    kind: &str,
+    id: &str,
+    target_node: Option<&str>,
+) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let kind = normalize_kind(kind)?;
     let resp = client
@@ -126,7 +131,10 @@ pub async fn get(info: &ConnectionInfo, kind: &str, id: &str, target_node: Optio
         })
         .await?
         .into_inner();
-    println!("Workload kind: {:?}", controller_proto::WorkloadKind::try_from(resp.kind));
+    println!(
+        "Workload kind: {:?}",
+        controller_proto::WorkloadKind::try_from(resp.kind)
+    );
     println!("Node: {}", resp.node_id);
     if let Some(vm) = resp.vm_spec {
         println!("VM {} cpu={} mem={}", vm.name, vm.cpu, vm.memory_bytes);
@@ -137,7 +145,12 @@ pub async fn get(info: &ConnectionInfo, kind: &str, id: &str, target_node: Optio
     Ok(())
 }
 
-pub async fn delete(info: &ConnectionInfo, kind: &str, id: &str, target_node: Option<&str>) -> Result<()> {
+pub async fn delete(
+    info: &ConnectionInfo,
+    kind: &str,
+    id: &str,
+    target_node: Option<&str>,
+) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let kind = normalize_kind(kind)?;
     client
@@ -184,7 +197,9 @@ fn normalize_kind(kind: &str) -> Result<controller_proto::WorkloadKind> {
     match kind.trim().to_ascii_lowercase().as_str() {
         "vm" => Ok(controller_proto::WorkloadKind::Vm),
         "container" => Ok(controller_proto::WorkloadKind::Container),
-        other => Err(anyhow::anyhow!("invalid kind '{other}', expected vm|container")),
+        other => Err(anyhow::anyhow!(
+            "invalid kind '{other}', expected vm|container"
+        )),
     }
 }
 

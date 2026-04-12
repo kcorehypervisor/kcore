@@ -95,7 +95,10 @@ mod tests {
 
     #[test]
     fn normalize_storage_class_accepts_expected_values() {
-        assert_eq!(normalize_storage_class("filesystem").expect("filesystem"), "filesystem");
+        assert_eq!(
+            normalize_storage_class("filesystem").expect("filesystem"),
+            "filesystem"
+        );
         assert_eq!(normalize_storage_class("fs").expect("fs"), "filesystem");
         assert_eq!(normalize_storage_class("lvm").expect("lvm"), "lvm");
         assert_eq!(normalize_storage_class("zfs").expect("zfs"), "zfs");

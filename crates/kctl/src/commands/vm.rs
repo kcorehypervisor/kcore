@@ -116,7 +116,9 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         .or(manifest_storage_size_bytes)
         .unwrap_or(0);
     if storage_size_bytes <= 0 {
-        bail!("--storage-size-bytes must be > 0 (set via CLI flag or spec.storageSizeBytes in YAML)");
+        bail!(
+            "--storage-size-bytes must be > 0 (set via CLI flag or spec.storageSizeBytes in YAML)"
+        );
     }
 
     let mut client = client::controller_client(info).await?;
@@ -385,7 +387,11 @@ pub async fn get(info: &ConnectionInfo, vm_id: &str, target_node: Option<String>
     Ok(())
 }
 
-pub async fn describe(info: &ConnectionInfo, vm_id: &str, target_node: Option<String>) -> Result<()> {
+pub async fn describe(
+    info: &ConnectionInfo,
+    vm_id: &str,
+    target_node: Option<String>,
+) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let resp = client
         .get_vm(proto::GetVmRequest {
@@ -442,14 +448,9 @@ pub async fn describe(info: &ConnectionInfo, vm_id: &str, target_node: Option<St
             key: info.key.clone(),
             ca: info.ca.clone(),
         };
-        if let Ok(ssh_probe) = node::check_vm_ssh_ready(
-            &node_info,
-            &spec.name,
-            primary_network.as_deref(),
-            22,
-            1200,
-        )
-        .await
+        if let Ok(ssh_probe) =
+            node::check_vm_ssh_ready(&node_info, &spec.name, primary_network.as_deref(), 22, 1200)
+                .await
         {
             if !ssh_probe.ip.is_empty() {
                 probed_ip = Some(ssh_probe.ip);
@@ -614,9 +615,8 @@ struct ImageSource {
 
 fn prepare_cloud_init_user_data(vm_name: &str, args: &CreateArgs) -> Result<String> {
     let has_explicit_cloud_init = args.cloud_init_user_data_file.is_some();
-    let has_identity_overrides = args.username.is_some()
-        || args.password.is_some()
-        || !args.ssh_public_keys.is_empty();
+    let has_identity_overrides =
+        args.username.is_some() || args.password.is_some() || !args.ssh_public_keys.is_empty();
 
     if has_explicit_cloud_init && has_identity_overrides {
         bail!(
@@ -640,7 +640,9 @@ fn prepare_cloud_init_user_data(vm_name: &str, args: &CreateArgs) -> Result<Stri
     let username = args
         .username
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("--username is required when overriding cloud-init identity"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("--username is required when overriding cloud-init identity")
+        })?
         .trim();
     if username.is_empty() {
         bail!("--username must not be empty");
@@ -682,7 +684,10 @@ fn prepare_cloud_init_user_data(vm_name: &str, args: &CreateArgs) -> Result<Stri
             if !trimmed.starts_with("ssh-") {
                 bail!("invalid --ssh-public-key value (must start with ssh-): {trimmed}");
             }
-            out.push_str(&format!("      - \"{}\"\n", yaml_escape_double_quoted(trimmed)));
+            out.push_str(&format!(
+                "      - \"{}\"\n",
+                yaml_escape_double_quoted(trimmed)
+            ));
         }
         out.push_str("ssh_pwauth: false\n");
     } else {
