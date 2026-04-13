@@ -120,18 +120,25 @@ let
         in
         {
           used = acc.used ++ [ selected ];
-          hosts = acc.hosts // { "${vmName}" = selected; };
+          hosts = acc.hosts // {
+            "${vmName}" = selected;
+          };
         };
     in
-    (lib.foldl' step { used = [ ]; hosts = { }; } sorted).hosts;
+    (lib.foldl' step {
+      used = [ ];
+      hosts = { };
+    } sorted).hosts;
 
   vmMacAddress =
     vmName: vmCfg:
-    if vmCfg.macAddress != null then lib.toLower vmCfg.macAddress else lib.toLower (helpers.generateMac vmName);
+    if vmCfg.macAddress != null then
+      lib.toLower vmCfg.macAddress
+    else
+      lib.toLower (helpers.generateMac vmName);
 
   natVmConfigsForNetwork =
-    netName:
-    lib.filterAttrs (_: vmCfg: vmCfg.network == netName) cfg.virtualMachines;
+    netName: lib.filterAttrs (_: vmCfg: vmCfg.network == netName) cfg.virtualMachines;
 in
 {
   config = lib.mkIf cfg.enable {
@@ -230,22 +237,19 @@ in
                                   nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" udp dport ${toString port} accept'')
                   netCfg.allowedUDPPorts
                 }
-                ${lib.concatMapStringsSep "\n              "
-                  (rule: ''
-                    ${
-                      if rule.enableDnat && rule.targetIp != "" then
-                        ''
-                          nft add rule ip kcore-${netName} prerouting ip daddr ${netCfg.externalIP} ${rule.protocol} dport ${toString rule.hostPort} ip saddr ${rule.sourceCidr} dnat to ${rule.targetIp}:${toString rule.targetPort}
-                          nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" ip daddr ${rule.targetIp} ${rule.protocol} dport ${toString rule.targetPort} ip saddr ${rule.sourceCidr} accept
-                        ''
-                      else
-                        ''
-                          nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" ${rule.protocol} dport ${toString rule.hostPort} ip saddr ${rule.sourceCidr} accept
-                        ''
-                    }
-                  '')
-                  netCfg.securityGroupRules
-                }
+                ${lib.concatMapStringsSep "\n              " (rule: ''
+                  ${
+                    if rule.enableDnat && rule.targetIp != "" then
+                      ''
+                        nft add rule ip kcore-${netName} prerouting ip daddr ${netCfg.externalIP} ${rule.protocol} dport ${toString rule.hostPort} ip saddr ${rule.sourceCidr} dnat to ${rule.targetIp}:${toString rule.targetPort}
+                        nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" ip daddr ${rule.targetIp} ${rule.protocol} dport ${toString rule.targetPort} ip saddr ${rule.sourceCidr} accept
+                      ''
+                    else
+                      ''
+                        nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" ${rule.protocol} dport ${toString rule.hostPort} ip saddr ${rule.sourceCidr} accept
+                      ''
+                  }
+                '') netCfg.securityGroupRules}
               ''}
 
               ${lib.optionalString isVxlan ''
@@ -313,8 +317,7 @@ in
                     mac = vmMacAddress vmName vmCfg;
                     hostOctet = toString reservedHosts.${vmName};
                     fallbackIp = "${subnetPrefix netCfg.gatewayIP}.${hostOctet}";
-                    fixedIp =
-                      if vmCfg.dhcpReservedIPv4 != null then vmCfg.dhcpReservedIPv4 else fallbackIp;
+                    fixedIp = if vmCfg.dhcpReservedIPv4 != null then vmCfg.dhcpReservedIPv4 else fallbackIp;
                   in
                   "--dhcp-host=${mac},${fixedIp},${vmName},infinite"
                 ) vmNames;
@@ -355,7 +358,9 @@ in
     # NixOS firewall trustedInterfaces expects explicit interface names, not globs.
     # Build the exact bridge interface list so DHCP/DNS traffic from VM bridges
     # reaches host services like dnsmasq.
-    networking.firewall.trustedInterfaces = lib.mapAttrsToList (netName: _netCfg: bridgeName netName) cfg.networks;
+    networking.firewall.trustedInterfaces = lib.mapAttrsToList (
+      netName: _netCfg: bridgeName netName
+    ) cfg.networks;
 
     networking.firewall.allowedUDPPorts = lib.optional (lib.any (n: n.networkType == "vxlan") (
       lib.attrValues cfg.networks
