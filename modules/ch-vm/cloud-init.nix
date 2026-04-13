@@ -47,11 +47,7 @@ let
                 dhcp4: true
           '';
 
-      instanceId =
-        if vmCfg.cloudInitInstanceId != null then
-          vmCfg.cloudInitInstanceId
-        else
-          vmName;
+      instanceId = if vmCfg.cloudInitInstanceId != null then vmCfg.cloudInitInstanceId else vmName;
       metaData = pkgs.writeText "${vmName}-meta-data" ''
         instance-id: ${instanceId}
         local-hostname: ${vmName}

@@ -5,7 +5,7 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::auth::{self, CN_KCTL, CN_NODE_PREFIX};
+use crate::auth::{self, CN_CONTROLLER_PREFIX, CN_KCTL, CN_NODE_PREFIX};
 use crate::config::{NetworkConfig, ReplicationConfig};
 use crate::controller_proto;
 use crate::db::{
@@ -107,6 +107,7 @@ pub struct ControllerService {
     sub_ca: Arc<Mutex<SubCaState>>,
     replication: Option<ReplicationConfig>,
     tls_paths: Option<TlsPaths>,
+    require_manual_approval: bool,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
 }
@@ -194,6 +195,7 @@ impl ControllerService {
         default_network: NetworkConfig,
         sub_ca: Arc<Mutex<SubCaState>>,
         replication: Option<ReplicationConfig>,
+        require_manual_approval: bool,
     ) -> Self {
         Self {
             db,
@@ -202,6 +204,7 @@ impl ControllerService {
             sub_ca,
             replication,
             tls_paths: None,
+            require_manual_approval,
             #[cfg(test)]
             test_push_hook: None,
         }
@@ -227,6 +230,7 @@ impl ControllerService {
             sub_ca: Arc::new(Mutex::new(SubCaState::default())),
             replication,
             tls_paths: None,
+            require_manual_approval: false,
             test_push_hook: Some(hook),
         }
     }
@@ -740,7 +744,22 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         let approval_status = match &existing {
             Some(n) => n.approval_status.clone(),
-            None => "pending".to_string(),
+            None => {
+                if self.require_manual_approval {
+                    "pending".to_string()
+                } else {
+                    "approved".to_string()
+                }
+            }
+        };
+
+        let dc_id = if req.dc_id.trim().is_empty() {
+            existing
+                .as_ref()
+                .map(|n| n.dc_id.clone())
+                .unwrap_or_default()
+        } else {
+            req.dc_id.clone()
         };
 
         let node = NodeRow {
@@ -763,6 +782,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             approval_status: approval_status.clone(),
             cert_expiry_days: req.cert_expiry_days,
             luks_method: req.luks_method.clone(),
+            dc_id: dc_id.clone(),
         };
 
         self.db
@@ -792,6 +812,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "approvalStatus": approval_status,
                 "labels": req.labels,
                 "luksMethod": req.luks_method,
+                "dcId": dc_id,
             }),
         )?;
 
@@ -974,7 +995,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateVmRequest>,
     ) -> Result<Response<controller_proto::CreateVmResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let spec = req
             .spec
@@ -999,13 +1020,30 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .into_iter()
                 .filter(|n| n.storage_backend == requested_storage_backend)
                 .collect();
-            scheduler::select_node_for_vm(&compatible_nodes, spec.cpu, spec.memory_bytes)
-                .cloned()
-                .ok_or_else(|| {
+            let target_dc = req.target_dc.trim();
+            if target_dc.is_empty() {
+                scheduler::select_node_for_vm(&compatible_nodes, spec.cpu, spec.memory_bytes)
+            } else {
+                scheduler::select_node_for_vm_in_dc(
+                    &compatible_nodes,
+                    spec.cpu,
+                    spec.memory_bytes,
+                    target_dc,
+                )
+            }
+            .cloned()
+            .ok_or_else(|| {
+                if target_dc.is_empty() {
                     Status::unavailable(
                         "no ready node with sufficient capacity matching requested storage backend",
                     )
-                })?
+                } else {
+                    Status::unavailable(format!(
+                        "no ready node in DC '{}' with sufficient capacity matching requested storage backend",
+                        target_dc,
+                    ))
+                }
+            })?
         };
         if target_node_requested {
             let preflight_error = if node.storage_backend != requested_storage_backend {
@@ -1264,6 +1302,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )));
         }
 
+        let ssh_key_names: Vec<String> = self
+            .db
+            .get_vm_ssh_key_names(&vm_id)
+            .map_err(|e| Status::internal(format!("listing VM SSH keys for replication: {e}")))?;
+
         self.log_replication_event(
             EVT_VM_CREATE,
             &format!("vm/{vm_id}"),
@@ -1285,6 +1328,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "storageBackend": vm.storage_backend,
                 "storageSizeBytes": vm.storage_size_bytes,
                 "vmIp": vm.vm_ip,
+                "sshKeyNames": ssh_key_names,
             }),
         );
 
@@ -1299,7 +1343,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::UpdateVmRequest>,
     ) -> Result<Response<controller_proto::UpdateVmResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         if req.vm_id.is_empty() {
@@ -1352,7 +1396,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteVmRequest>,
     ) -> Result<Response<controller_proto::DeleteVmResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
 
@@ -1385,7 +1429,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::SetVmDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetVmDesiredStateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let auto_start = match controller_proto::VmDesiredState::try_from(req.desired_state)
             .unwrap_or(controller_proto::VmDesiredState::Unspecified)
@@ -1420,7 +1464,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetVmRequest>,
     ) -> Result<Response<controller_proto::GetVmResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
         let db_vm = self
@@ -1579,7 +1623,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListVmsRequest>,
     ) -> Result<Response<controller_proto::ListVmsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         let rows = if !req.target_node.is_empty() {
@@ -1679,7 +1723,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateWorkloadRequest>,
     ) -> Result<Response<controller_proto::CreateWorkloadResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -1700,6 +1744,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         ssh_key_names: req.ssh_key_names.clone(),
                         storage_backend: req.storage_backend,
                         storage_size_bytes: req.storage_size_bytes,
+                        target_dc: String::new(),
                     }))
                     .await?
                     .into_inner();
@@ -1825,7 +1870,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteWorkloadRequest>,
     ) -> Result<Response<controller_proto::DeleteWorkloadResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -1894,7 +1939,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::SetWorkloadDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetWorkloadDesiredStateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let desired = controller_proto::WorkloadDesiredState::try_from(req.desired_state)
             .unwrap_or(controller_proto::WorkloadDesiredState::Unspecified);
@@ -2006,7 +2051,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetWorkloadRequest>,
     ) -> Result<Response<controller_proto::GetWorkloadResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -2092,7 +2137,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListWorkloadsRequest>,
     ) -> Result<Response<controller_proto::ListWorkloadsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -2158,7 +2203,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateNetworkRequest>,
     ) -> Result<Response<controller_proto::CreateNetworkResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let name = validate_network_name(&req.name)?;
         let external_ip = validate_ipv4(&req.external_ip, "external_ip")?;
@@ -2277,7 +2322,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteNetworkRequest>,
     ) -> Result<Response<controller_proto::DeleteNetworkResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let name = req.name.trim();
         if name.is_empty() {
@@ -2361,7 +2406,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListNetworksRequest>,
     ) -> Result<Response<controller_proto::ListNetworksResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let rows = if req.target_node.is_empty() {
             self.db
@@ -2402,7 +2447,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::CreateSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let sg = req
             .security_group
@@ -2502,7 +2547,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::GetSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let name = req.name.trim();
         if name.is_empty() {
@@ -2569,7 +2614,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListSecurityGroupsRequest>,
     ) -> Result<Response<controller_proto::ListSecurityGroupsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let groups = self
             .db
             .list_security_groups()
@@ -2609,7 +2654,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::DeleteSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let name = req.name.trim();
         if name.is_empty() {
@@ -2638,7 +2683,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::AttachSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::AttachSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let sg = req.security_group.trim();
         if sg.is_empty() {
@@ -2733,7 +2778,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DetachSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::DetachSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let sg = req.security_group.trim();
         if sg.is_empty() {
@@ -2806,7 +2851,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListNodesRequest>,
     ) -> Result<Response<controller_proto::ListNodesResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let nodes = self
             .db
             .list_nodes()
@@ -2847,6 +2892,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     approval_status: n.approval_status,
                     cert_expiry_days: n.cert_expiry_days,
                     luks_method: n.luks_method,
+                    dc_id: n.dc_id,
                 }
             })
             .collect();
@@ -2860,7 +2906,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetNodeRequest>,
     ) -> Result<Response<controller_proto::GetNodeResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let node = self
             .db
@@ -2896,6 +2942,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 approval_status: node.approval_status,
                 cert_expiry_days: node.cert_expiry_days,
                 luks_method: node.luks_method,
+                dc_id: node.dc_id,
             }),
         }))
     }
@@ -2904,7 +2951,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateSshKeyRequest>,
     ) -> Result<Response<controller_proto::CreateSshKeyResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         if req.name.trim().is_empty() {
@@ -2949,7 +2996,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteSshKeyRequest>,
     ) -> Result<Response<controller_proto::DeleteSshKeyResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         let deleted = self
@@ -2982,7 +3029,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListSshKeysRequest>,
     ) -> Result<Response<controller_proto::ListSshKeysResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
 
         let keys = self
             .db
@@ -3010,7 +3057,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetSshKeyRequest>,
     ) -> Result<Response<controller_proto::GetSshKeyResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         let (name, public_key, created_at) = self
@@ -3034,7 +3081,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DrainNodeRequest>,
     ) -> Result<Response<controller_proto::DrainNodeResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         let source_node = self
@@ -3176,7 +3223,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ApproveNodeRequest>,
     ) -> Result<Response<controller_proto::ApproveNodeResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         let node = self
@@ -3224,7 +3271,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::RejectNodeRequest>,
     ) -> Result<Response<controller_proto::RejectNodeResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         let _node = self
@@ -3314,7 +3361,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::IssueNodeBootstrapCertRequest>,
     ) -> Result<Response<controller_proto::IssueNodeBootstrapCertResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         let node_id = req.node_id.trim();
@@ -3358,7 +3405,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::RotateSubCaRequest>,
     ) -> Result<Response<controller_proto::RotateSubCaResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         if req.sub_ca_cert_pem.trim().is_empty() || req.sub_ca_key_pem.trim().is_empty() {
@@ -3399,7 +3446,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ReloadTlsRequest>,
     ) -> Result<Response<controller_proto::ReloadTlsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
 
         if req.cert_pem.trim().is_empty() || req.key_pem.trim().is_empty() {
@@ -3442,7 +3489,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetNetworkOverviewRequest>,
     ) -> Result<Response<controller_proto::GetNetworkOverviewResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
 
         let node_rows = self
             .db
@@ -3511,7 +3558,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetStorageOverviewRequest>,
     ) -> Result<Response<controller_proto::GetStorageOverviewResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let _ = request.into_inner();
 
         let node_rows = self
@@ -3708,7 +3755,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetComplianceReportRequest>,
     ) -> Result<Response<controller_proto::GetComplianceReportResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL])?;
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
 
         let (approved, pending, rejected) = self
             .db
@@ -3778,6 +3825,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     approval_status: n.approval_status,
                     cert_expiry_days: n.cert_expiry_days,
                     luks_method: n.luks_method,
+                    dc_id: n.dc_id,
                 }
             })
             .collect();
@@ -3915,6 +3963,7 @@ mod tests {
             approval_status: "approved".to_string(),
             cert_expiry_days: -1,
             luks_method: String::new(),
+            dc_id: "DC1".to_string(),
         }
     }
 
@@ -4134,6 +4183,7 @@ mod tests {
             ssh_key_names: vec![],
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            target_dc: String::new(),
         };
 
         let err =
@@ -4182,6 +4232,7 @@ mod tests {
             ssh_key_names: vec![],
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            target_dc: String::new(),
         };
 
         let err =
@@ -4234,6 +4285,7 @@ mod tests {
             ssh_key_names: vec![],
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            target_dc: String::new(),
         };
 
         let err =
@@ -4281,6 +4333,7 @@ mod tests {
             ssh_key_names: vec![],
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            target_dc: String::new(),
         };
 
         let err =
@@ -4335,6 +4388,7 @@ mod tests {
             ssh_key_names: vec![],
             storage_backend: controller_proto::StorageBackendType::Zfs as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            target_dc: String::new(),
         };
 
         let resp =
@@ -4383,6 +4437,7 @@ mod tests {
             ssh_key_names: vec![],
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            target_dc: String::new(),
         };
 
         let err =
@@ -4437,6 +4492,7 @@ mod tests {
             ssh_key_names: vec![],
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            target_dc: String::new(),
         };
 
         let resp =
@@ -4484,6 +4540,7 @@ mod tests {
             ssh_key_names: vec![],
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            target_dc: String::new(),
         };
 
         let err =
@@ -4724,6 +4781,7 @@ mod tests {
                     storage_size_bytes: 10 * 1024 * 1024 * 1024,
                     image_path: String::new(),
                     image_format: String::new(),
+                    target_dc: String::new(),
                 }),
             )
             .await
@@ -4814,7 +4872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_node_registers_as_pending() {
+    async fn new_node_auto_approved_by_default() {
         let db = Database::open(":memory:").expect("open db");
         let svc = ControllerService::new(
             db.clone(),
@@ -4822,6 +4880,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
         );
 
         let resp =
@@ -4840,6 +4899,50 @@ mod tests {
                     disable_vxlan: false,
                     cert_expiry_days: 365,
                     luks_method: String::new(),
+                    dc_id: String::new(),
+                }),
+            )
+            .await
+            .expect("register should succeed")
+            .into_inner();
+
+        assert!(resp.success);
+        assert_eq!(resp.approval_status, "approved");
+
+        let node = db.get_node("new-node").expect("get").expect("exists");
+        assert_eq!(node.approval_status, "approved");
+        assert_eq!(node.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn new_node_pending_when_manual_approval_required() {
+        let db = Database::open(":memory:").expect("open db");
+        let svc = ControllerService::new(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            empty_sub_ca(),
+            None,
+            true,
+        );
+
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::register_node(
+                &svc,
+                Request::new(controller_proto::RegisterNodeRequest {
+                    node_id: "new-node".to_string(),
+                    hostname: "new-node".to_string(),
+                    address: "10.0.0.99:9091".to_string(),
+                    capacity: Some(controller_proto::NodeCapacity {
+                        cpu_cores: 4,
+                        memory_bytes: 8_000_000_000,
+                    }),
+                    labels: vec![],
+                    storage_backend: 1,
+                    disable_vxlan: false,
+                    cert_expiry_days: 365,
+                    luks_method: String::new(),
+                    dc_id: String::new(),
                 }),
             )
             .await
@@ -4868,6 +4971,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             replication,
+            false,
         );
 
         <ControllerService as controller_proto::controller_server::Controller>::register_node(
@@ -4885,6 +4989,7 @@ mod tests {
                 disable_vxlan: false,
                 cert_expiry_days: 365,
                 luks_method: String::new(),
+                dc_id: String::new(),
             }),
         )
         .await
@@ -4911,6 +5016,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             replication,
+            false,
         );
         <ControllerService as controller_proto::controller_server::Controller>::heartbeat(
             &svc,
@@ -4947,6 +5053,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
         );
 
         let resp =
@@ -4965,6 +5072,7 @@ mod tests {
                     disable_vxlan: false,
                     cert_expiry_days: 300,
                     luks_method: "tpm2".to_string(),
+                    dc_id: String::new(),
                 }),
             )
             .await
@@ -4993,6 +5101,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
         );
 
         let resp =
@@ -5027,6 +5136,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
         );
 
         let resp =
@@ -5065,6 +5175,7 @@ mod tests {
             approval_status: "pending".into(),
             cert_expiry_days: -1,
             luks_method: String::new(),
+            dc_id: "DC1".to_string(),
         };
         assert!(
             scheduler::select_node(&[n.clone()]).is_none(),
@@ -5123,6 +5234,7 @@ mod tests {
             test_network(),
             test_sub_ca_state(),
             None,
+            false,
         );
 
         let resp =
@@ -5156,6 +5268,7 @@ mod tests {
             test_network(),
             test_sub_ca_state(),
             None,
+            false,
         );
 
         let err =
@@ -5183,6 +5296,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
         );
 
         let err =
@@ -5209,6 +5323,7 @@ mod tests {
             test_network(),
             sub_ca.clone(),
             None,
+            false,
         );
 
         let new_state = test_sub_ca_state();
@@ -5245,6 +5360,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
         );
 
         let err =

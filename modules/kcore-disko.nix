@@ -49,8 +49,7 @@ let
           content = {
             type = "filesystem";
             format = "ext4";
-            mountpoint =
-              if idx == 0 then "/var/lib/kcore/volumes" else "/var/lib/kcore/volumes${toString idx}";
+            mountpoint = if idx == 0 then "/var/lib/kcore/volumes" else "/var/lib/kcore/volumes${toString idx}";
           };
         };
       };
@@ -67,73 +66,66 @@ let
     };
   };
 
-  baseDevices =
-    {
-      disk =
-        {
-          os = {
-            type = "disk";
-            device = cfg.osDisk;
-            content = {
-              type = "gpt";
-              partitions = {
-                ESP = {
-                  size = "512M";
-                  type = "EF00";
-                  content = {
-                    type = "filesystem";
-                    format = "vfat";
-                    mountpoint = "/boot";
-                    mountOptions = [ "umask=0077" ];
-                  };
+  baseDevices = {
+    disk = {
+      os = {
+        type = "disk";
+        device = cfg.osDisk;
+        content = {
+          type = "gpt";
+          partitions = {
+            ESP = {
+              size = "512M";
+              type = "EF00";
+              content = {
+                type = "filesystem";
+                format = "vfat";
+                mountpoint = "/boot";
+                mountOptions = [ "umask=0077" ];
+              };
+            };
+            root = {
+              size = "100%";
+              content = {
+                type = "luks";
+                name = "cryptroot";
+                passwordFile = cfg.luksPasswordFile;
+                settings = {
+                  allowDiscards = true;
                 };
-                root = {
-                  size = "100%";
-                  content = {
-                    type = "luks";
-                    name = "cryptroot";
-                    passwordFile = cfg.luksPasswordFile;
-                    settings = {
-                      allowDiscards = true;
-                    };
-                    content = {
-                      type = "filesystem";
-                      format = "ext4";
-                      mountpoint = "/";
-                    };
-                  };
+                content = {
+                  type = "filesystem";
+                  format = "ext4";
+                  mountpoint = "/";
                 };
               };
             };
           };
-        }
-        // listToAttrs (imap0 mkDataDisk cfg.dataDisks);
-    }
-    // optionalAttrs (cfg.storageBackend == "lvm" && cfg.dataDisks != [ ]) {
-      lvm_vg = {
-        ${cfg.lvm.vgName} = {
-          type = "lvm_vg";
-          lvs = { };
         };
       };
     }
-    // optionalAttrs (cfg.storageBackend == "zfs" && cfg.dataDisks != [ ]) {
-      zpool = {
-        ${cfg.zfs.poolName} = {
-          type = "zpool";
-          datasets = { };
-        };
+    // listToAttrs (imap0 mkDataDisk cfg.dataDisks);
+  }
+  // optionalAttrs (cfg.storageBackend == "lvm" && cfg.dataDisks != [ ]) {
+    lvm_vg = {
+      ${cfg.lvm.vgName} = {
+        type = "lvm_vg";
+        lvs = { };
       };
     };
+  }
+  // optionalAttrs (cfg.storageBackend == "zfs" && cfg.dataDisks != [ ]) {
+    zpool = {
+      ${cfg.zfs.poolName} = {
+        type = "zpool";
+        datasets = { };
+      };
+    };
+  };
 
-  sortedFragments =
-    sort (
-      a: b:
-      if a.priority == b.priority then
-        a.name < b.name
-      else
-        a.priority < b.priority
-    ) cfg.controllerFragments;
+  sortedFragments = sort (
+    a: b: if a.priority == b.priority then a.name < b.name else a.priority < b.priority
+  ) cfg.controllerFragments;
 
   mergedControllerDevices = foldl' recursiveUpdate { } (map (f: f.devices) sortedFragments);
 in
@@ -231,10 +223,9 @@ in
       ];
     }
     {
-      disko.devices =
-        recursiveUpdate
-          baseDevices
-          (if cfg.managementMode == "controller-managed" then mergedControllerDevices else { });
+      disko.devices = recursiveUpdate baseDevices (
+        if cfg.managementMode == "controller-managed" then mergedControllerDevices else { }
+      );
     }
   ]);
 }

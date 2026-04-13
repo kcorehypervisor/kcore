@@ -17,6 +17,7 @@ check:
 
 fmt:
 	cargo fmt
+	find . -name '*.nix' -not -path './result*' -exec nixfmt {} +
 
 clippy:
 	cargo clippy --all-targets -- --deny warnings
@@ -25,6 +26,7 @@ audit:
 	cargo audit
 
 lint-nix:
+	find . -name '*.nix' -not -path './result*' -exec nixfmt --check {} +
 	statix check -c .statix.toml .
 	deadnix --fail .
 
@@ -99,10 +101,10 @@ help:
 	@echo "Targets:"
 	@echo "  build       Build all Rust binaries (release)"
 	@echo "  check       Run clippy + fmt + audit checks"
-	@echo "  fmt         Format Rust code"
+	@echo "  fmt         Format Rust and Nix code"
 	@echo "  clippy      Run clippy lints"
 	@echo "  audit       Run cargo-audit for known vulnerabilities"
-	@echo "  lint-nix    Run statix and deadnix on Nix files"
+	@echo "  lint-nix    Run nixfmt --check, statix, and deadnix on Nix files"
 	@echo "  test        Run Rust tests (workspace)"
 	@echo "  test-all    Run Rust tests + Nix flake checks"
 	@echo "  test-rust   Run all Rust tests in workspace"

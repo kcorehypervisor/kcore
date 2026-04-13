@@ -14,6 +14,10 @@ pub struct Config {
     /// When set, mutating RPCs append JSON envelopes to `replication_outbox` for future peer sync.
     #[serde(default)]
     pub replication: Option<ReplicationConfig>,
+    /// When true, nodes must be manually approved via `kctl node approve`.
+    /// Default false: nodes with valid mTLS certificates are auto-approved on registration.
+    #[serde(default)]
+    pub require_manual_approval: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,8 +118,10 @@ impl Config {
             if replication.dc_id.trim().is_empty() {
                 anyhow::bail!("replication.dcId must not be empty");
             }
-            if !replication.peers.is_empty() && replication.controller_id.trim().is_empty() {
-                anyhow::bail!("replication.controllerId is required when replication.peers is set");
+            if replication.controller_id.trim().is_empty() {
+                anyhow::bail!(
+                    "replication.controllerId is required when replication section is present"
+                );
             }
             if replication.peers.iter().any(|p| p.trim().is_empty()) {
                 anyhow::bail!("replication.peers must not contain empty endpoints");
@@ -156,6 +162,7 @@ defaultNetwork:
         assert_eq!(cfg.listen_addr, "0.0.0.0:9090");
         assert_eq!(cfg.db_path, "/var/lib/kcore/controller.db");
         assert_eq!(cfg.default_network.internal_netmask, "255.255.255.0");
+        assert!(!cfg.require_manual_approval);
         assert!(cfg.replication.is_none());
         let _ = std::fs::remove_file(path);
     }
@@ -201,6 +208,29 @@ replication:
   dcId: DC1
   peers:
     - 10.0.0.11:9090
+"#,
+        )
+        .expect("write config");
+        let err = Config::load(path.to_str().expect("path str")).expect_err("must fail");
+        assert!(err
+            .to_string()
+            .contains("replication.controllerId is required"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_empty_peers_replication_without_controller_id() {
+        let path = temp_config_path("repl-empty-peers");
+        std::fs::write(
+            &path,
+            r#"
+defaultNetwork:
+  gatewayInterface: eno1
+  externalIp: 203.0.113.10
+  gatewayIp: 10.0.0.1
+replication:
+  dcId: DC1
+  peers: []
 "#,
         )
         .expect("write config");
