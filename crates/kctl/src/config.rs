@@ -79,10 +79,18 @@ fn decode_inline_pem(b64: &str, label: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| format!("invalid UTF-8 in {label}: {e}"))
 }
 
+type PemTriple = (Option<String>, Option<String>, Option<String>);
+type TlsFieldsTuple = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// Resolve inline base64 data from a `Context` into decoded PEM strings.
-fn resolve_inline_pems(
-    ctx: &Context,
-) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+fn resolve_inline_pems(ctx: &Context) -> Result<PemTriple, String> {
     let cert_pem = ctx
         .cert_data
         .as_deref()
@@ -364,19 +372,7 @@ pub fn resolve_controller(
 /// Extract TLS material from a `Context`: inline data (decoded) or file paths.
 /// Inline data takes precedence per field — a config may mix inline `ca_data`
 /// with file-backed `cert`/`key`.
-fn resolve_tls_fields(
-    ctx: &Context,
-) -> Result<
-    (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ),
-    String,
-> {
+fn resolve_tls_fields(ctx: &Context) -> Result<TlsFieldsTuple, String> {
     let (cert_pem, key_pem, ca_pem) = resolve_inline_pems(ctx)?;
     let cert_path = if ctx.cert_data.is_some() {
         None

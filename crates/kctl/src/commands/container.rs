@@ -131,12 +131,12 @@ pub async fn list(info: &ConnectionInfo) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24}  {:<16}  {:<28}  {}",
+        "{:<24}  {:<16}  {:<28}  {:<16}",
         "NAME", "STATE", "IMAGE", "STATUS"
     );
     for c in resp.containers {
         println!(
-            "{:<24}  {:<16}  {:<28}  {}",
+            "{:<24}  {:<16}  {:<28}  {:<16}",
             c.name,
             state_label(c.state),
             c.image,

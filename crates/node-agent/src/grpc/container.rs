@@ -42,6 +42,7 @@ fn parse_list_line(line: &str) -> Option<proto::ContainerInfo> {
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn prepare_storage_mount(
     container_name: &str,
     backend: &str,

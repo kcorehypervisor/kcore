@@ -18,9 +18,11 @@ pub struct TlsClientConfig {
     pub key_file: String,
 }
 
+type ClientTuple = (ComputeClient, AdminClient, ContainerClient);
+
 #[derive(Clone)]
 pub struct NodeClients {
-    clients: Arc<Mutex<HashMap<String, (ComputeClient, AdminClient, ContainerClient)>>>,
+    clients: Arc<Mutex<HashMap<String, ClientTuple>>>,
     tls: Option<TlsClientConfig>,
 }
 

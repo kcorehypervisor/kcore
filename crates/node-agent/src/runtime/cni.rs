@@ -2,6 +2,7 @@ use std::path::Path;
 
 use tonic::Status;
 
+#[allow(clippy::result_large_err)]
 pub fn ensure_bridge_backed_network(network: &str) -> Result<(), Status> {
     let net = network.trim();
     if net.is_empty() || net == "bridge" || net == "host" || net == "none" {

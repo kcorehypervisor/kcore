@@ -127,14 +127,12 @@ impl controller_proto::controller_admin_server::ControllerAdmin for ControllerAd
         }
         if let Some(cn) = peer_cn {
             // Controllers may only acknowledge their own frontier identity.
-            if cn.starts_with(CN_CONTROLLER_PREFIX) {
-                if req.peer_id.trim() != cn {
-                    return Err(Status::permission_denied(format!(
-                        "peer '{}' is not allowed to ack as '{}'",
-                        cn,
-                        req.peer_id.trim()
-                    )));
-                }
+            if cn.starts_with(CN_CONTROLLER_PREFIX) && req.peer_id.trim() != cn {
+                return Err(Status::permission_denied(format!(
+                    "peer '{}' is not allowed to ack as '{}'",
+                    cn,
+                    req.peer_id.trim()
+                )));
             }
         }
         self.db

@@ -181,6 +181,7 @@ enum RotateResource {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum CreateResource {
     /// Create a virtual machine
     Vm {
