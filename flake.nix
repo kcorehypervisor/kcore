@@ -137,7 +137,7 @@
               pkgs.runCommand "check-nix-fmt"
                 {
                   nativeBuildInputs = [
-                    pkgs.nixfmt-rfc-style
+                    pkgs.nixfmt
                     pkgs.findutils
                   ];
                 }
@@ -159,10 +159,22 @@
               pkgs.perl
               pkgs.statix
               pkgs.deadnix
+              pkgs.nixfmt
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.cloud-hypervisor
             ];
+            shellHook = ''
+              if [ -d .git ] && [ -d scripts/hooks ]; then
+                for hook in scripts/hooks/*; do
+                  name="$(basename "$hook")"
+                  target=".git/hooks/$name"
+                  if [ ! -L "$target" ] || [ "$(readlink "$target")" != "../../$hook" ]; then
+                    ln -sf "../../$hook" "$target"
+                  fi
+                done
+              fi
+            '';
           };
         };
 
