@@ -852,7 +852,7 @@
                       listenAddr: "0.0.0.0:9090"
                       dbPath: /var/lib/kcore/controller.db
                       defaultNetwork:
-                        gatewayInterface: $GATEWAY_INTERFACE
+                        gatewayInterface: br0
                         externalIp: $EXTERNAL_IP
                         gatewayIp: $INTERNAL_GATEWAY_IP
                       tls:
@@ -985,6 +985,26 @@
                                                                   LUKS_BOOT_CONFIG="''${LUKS_BOOT_CONFIG//ROOT_PART_UUID_PLACEHOLDER/$ROOT_PART_UUID}"
                                                                 fi
 
+                                                                # --- Storage-specific NixOS configuration ---
+                                                                STORAGE_BOOT_CONFIG=""
+                                                                HOST_ID=$(echo "$INSTALL_HOSTNAME" | md5sum | head -c 8)
+                                                                case "$DATA_DISK_MODE" in
+                                                                  lvm)
+                                                                    STORAGE_BOOT_CONFIG=$(cat <<'STOREOF'
+                        services.lvm.enable = true;
+                      STOREOF
+                                                                    )
+                                                                    ;;
+                                                                  zfs)
+                                                                    STORAGE_BOOT_CONFIG=$(cat <<STOREOF
+                        boot.supportedFilesystems = [ "zfs" ];
+                        boot.zfs.extraPools = [ "$ZFS_POOL_NAME" ];
+                        networking.hostId = "$HOST_ID";
+                      STOREOF
+                                                                    )
+                                                                    ;;
+                                                                esac
+
                                                                 echo "Writing NixOS configuration..."
                                                                 cat > /mnt/etc/nixos/configuration.nix <<NIXEOF
                       { config, pkgs, lib, ... }:
@@ -1005,10 +1025,15 @@
                         boot.kernelModules = [ "kvm" "kvm-intel" "kvm-amd" "tap" "tun" "br_netfilter" ];
                         boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
 
+                      $STORAGE_BOOT_CONFIG
+
                       $LUKS_BOOT_CONFIG
 
                         networking.hostName = "$INSTALL_HOSTNAME";
-                        networking.useDHCP = true;
+                        networking.useDHCP = false;
+                        networking.bridges.br0.interfaces = [ "$GATEWAY_INTERFACE" ];
+                        networking.interfaces.br0.useDHCP = true;
+                        networking.interfaces."$GATEWAY_INTERFACE".useDHCP = false;
                         networking.firewall.enable = true;
                         networking.firewall.allowedTCPPorts = [ 22 9091 $EXTRA_TCP_PORTS ];
                         networking.firewall.allowedUDPPorts = [ $EXTRA_UDP_PORTS ];

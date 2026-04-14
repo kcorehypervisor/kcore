@@ -44,6 +44,100 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
     Ok(())
 }
 
+pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<()> {
+    let data = std::fs::read_to_string(path)?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&data)?;
+
+    let kind = doc["kind"].as_str().unwrap_or("");
+    if !kind.eq_ignore_ascii_case("Network") {
+        anyhow::bail!("expected kind=Network, got {kind}");
+    }
+
+    let name = doc["metadata"]["name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("metadata.name is required"))?
+        .to_string();
+
+    let spec = &doc["spec"];
+    let network_type = spec["type"]
+        .as_str()
+        .or_else(|| spec["networkType"].as_str())
+        .unwrap_or("nat")
+        .to_string();
+    let external_ip = spec["externalIp"]
+        .as_str()
+        .or_else(|| spec["external_ip"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let gateway_ip = spec["gatewayIp"]
+        .as_str()
+        .or_else(|| spec["gateway_ip"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let internal_netmask = spec["internalNetmask"]
+        .as_str()
+        .or_else(|| spec["internal_netmask"].as_str())
+        .or_else(|| spec["netmask"].as_str())
+        .unwrap_or("255.255.255.0")
+        .to_string();
+    let target_node = spec["targetNode"]
+        .as_str()
+        .or_else(|| spec["target_node"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let vlan_id = spec["vlanId"]
+        .as_i64()
+        .or_else(|| spec["vlan_id"].as_i64())
+        .unwrap_or(0) as i32;
+    let enable_outbound_nat = spec["enableOutboundNat"]
+        .as_bool()
+        .or_else(|| spec["enable_outbound_nat"].as_bool())
+        .unwrap_or(network_type != "bridge");
+    let allowed_tcp_ports: Vec<i32> = spec["allowedTcpPorts"]
+        .as_sequence()
+        .or_else(|| spec["allowed_tcp_ports"].as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_i64().map(|p| p as i32))
+                .collect()
+        })
+        .unwrap_or_default();
+    let allowed_udp_ports: Vec<i32> = spec["allowedUdpPorts"]
+        .as_sequence()
+        .or_else(|| spec["allowed_udp_ports"].as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_i64().map(|p| p as i32))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .create_network(proto::CreateNetworkRequest {
+            name: name.clone(),
+            external_ip,
+            gateway_ip,
+            internal_netmask,
+            target_node,
+            allowed_tcp_ports,
+            allowed_udp_ports,
+            vlan_id,
+            network_type,
+            enable_outbound_nat,
+        })
+        .await?
+        .into_inner();
+
+    if resp.success {
+        println!("Network '{name}' created");
+        println!("  Node: {}", resp.node_id);
+    } else {
+        println!("Network '{name}' creation rejected");
+    }
+    Ok(())
+}
+
 pub async fn delete(info: &ConnectionInfo, name: &str, target_node: Option<String>) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     client
@@ -114,7 +208,13 @@ pub async fn list(info: &ConnectionInfo, target_node: Option<String>) -> Result<
         let bridge = compute_bridge_name(&s.name);
         println!(
             "{:<20}  {:<7}  {:<16}  {:<16}  {:>4}  {:<8}  {:<16}  {:<8}",
-            s.name, s.net_type, s.gateway_ip, s.internal_netmask, vlan, overlay, bridge,
+            s.name,
+            s.net_type,
+            s.gateway_ip,
+            s.internal_netmask,
+            vlan,
+            overlay,
+            bridge,
             s.node_count
         );
     }
@@ -158,13 +258,14 @@ pub async fn describe(
 
     println!("Name:              {}", first.name);
     println!("Type:              {net_type}");
-    println!("Overlay:           {}", if is_overlay { "yes" } else { "no" });
+    println!(
+        "Overlay:           {}",
+        if is_overlay { "yes" } else { "no" }
+    );
     println!("Bridge:            {}", compute_bridge_name(name));
     println!("Gateway IP:        {}", first.gateway_ip);
     println!("Internal netmask:  {}", first.internal_netmask);
-    if let Some(cidr) =
-        ipv4_subnet_from_gateway_mask(&first.gateway_ip, &first.internal_netmask)
-    {
+    if let Some(cidr) = ipv4_subnet_from_gateway_mask(&first.gateway_ip, &first.internal_netmask) {
         println!("Network CIDR:      {cidr}");
     }
     println!("VLAN:              {vlan}");

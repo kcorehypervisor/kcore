@@ -1870,10 +1870,7 @@ impl Database {
     /// network name (used for VXLAN overlays where every node is in the
     /// same L2 domain). Picks the global max `next_ip`, returns it, and
     /// bumps every row's counter so the next call is also unique.
-    pub fn allocate_vm_ip_global(
-        &self,
-        network_name: &str,
-    ) -> Result<String, rusqlite::Error> {
+    pub fn allocate_vm_ip_global(&self, network_name: &str) -> Result<String, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let (gateway_ip, global_next): (String, i32) = conn.query_row(
             "SELECT gateway_ip, MAX(next_ip) FROM networks WHERE name = ?1",
