@@ -3,6 +3,21 @@ use crate::commands::{container, network, security_group, ssh_key, vm};
 use crate::config::ConnectionInfo;
 use anyhow::{Context, Result};
 
+/// Returns true if `kind` is a bootstrap manifest that does not need a controller connection.
+pub fn is_local_manifest_kind(file: &str) -> bool {
+    let content = match std::fs::read_to_string(file) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match detect_manifest_kind(&content).as_deref() {
+        Some(k) => matches!(
+            k.to_ascii_lowercase().as_str(),
+            "cluster" | "nodeinstall" | "node-install" | "node_install"
+        ),
+        None => false,
+    }
+}
+
 pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<()> {
     let content = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
 
@@ -43,7 +58,7 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
     }
 }
 
-fn detect_manifest_kind(content: &str) -> Option<String> {
+pub fn detect_manifest_kind(content: &str) -> Option<String> {
     let doc = serde_yaml::from_str::<serde_yaml::Value>(content).ok()?;
     let map = doc.as_mapping()?;
     let key = serde_yaml::Value::String("kind".to_string());
@@ -55,7 +70,7 @@ fn detect_manifest_kind(content: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_manifest_kind;
+    use super::*;
 
     #[test]
     fn detect_manifest_kind_reads_top_level_kind() {
@@ -101,5 +116,41 @@ metadata:
     fn detect_manifest_kind_container() {
         let manifest = "kind: Container\nmetadata:\n  name: c1\n";
         assert_eq!(detect_manifest_kind(manifest).as_deref(), Some("Container"));
+    }
+
+    #[test]
+    fn detect_manifest_kind_cluster() {
+        let manifest =
+            "kind: Cluster\nmetadata:\n  name: prod\nspec:\n  controller: 1.2.3.4:9090\n";
+        assert_eq!(detect_manifest_kind(manifest).as_deref(), Some("Cluster"));
+    }
+
+    #[test]
+    fn detect_manifest_kind_nodeinstall() {
+        let manifest = "kind: NodeInstall\nmetadata:\n  name: node1\nspec:\n  node: 1.2.3.4:9091\n  osDisk: /dev/sda\n";
+        assert_eq!(
+            detect_manifest_kind(manifest).as_deref(),
+            Some("NodeInstall")
+        );
+    }
+
+    #[test]
+    fn is_local_manifest_kind_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.yaml");
+        std::fs::write(
+            &path,
+            "kind: Cluster\nmetadata:\n  name: test\nspec:\n  controller: 1.2.3.4:9090\n",
+        )
+        .unwrap();
+        assert!(is_local_manifest_kind(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_local_manifest_kind_vm_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vm.yaml");
+        std::fs::write(&path, "kind: VM\nmetadata:\n  name: test\n").unwrap();
+        assert!(!is_local_manifest_kind(path.to_str().unwrap()));
     }
 }

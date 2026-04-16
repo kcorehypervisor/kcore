@@ -104,6 +104,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_target_dc,
         manifest_ssh_keys,
         manifest_cloud_init,
+        manifest_desired_state,
     ) = if let Some(path) = &args.filename {
         let manifest = parse_vm_manifest(path)?;
         let n = args.name.clone().unwrap_or(manifest.name);
@@ -121,6 +122,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             manifest.target_dc,
             manifest.ssh_keys,
             manifest.cloud_init_user_data,
+            manifest.desired_state,
         )
     } else {
         let n = args
@@ -154,6 +156,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             None,
             vec![],
             None,
+            proto::VmDesiredState::Unspecified,
         )
     };
     let image = resolve_create_image_source(
@@ -196,6 +199,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         nics,
         storage_backend: String::new(),
         storage_size_bytes: 0,
+        desired_state: manifest_desired_state as i32,
     };
 
     let target_node = args
@@ -230,7 +234,11 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
 
     let resp = client.create_vm(req).await?.into_inner();
 
-    println!("VM '{vm_name}' created");
+    let label = format!("VM '{vm_name}'");
+    println!(
+        "{}",
+        crate::apply_summary::render_apply_summary(resp.action, &resp.changed_fields, &label)
+    );
     println!("  ID:   {}", resp.vm_id);
     println!("  Node: {}", resp.node_id);
     println!("  CPU:  {vm_cpu} cores");
@@ -698,6 +706,7 @@ struct VmManifest {
     target_dc: Option<String>,
     ssh_keys: Vec<String>,
     cloud_init_user_data: Option<String>,
+    desired_state: proto::VmDesiredState,
 }
 
 #[derive(Debug)]
@@ -1049,6 +1058,19 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         .or_else(|| doc["spec"]["cloud_init_user_data"].as_str())
         .map(|s| s.to_string());
 
+    let desired_state_raw = doc["spec"]["desiredState"]
+        .as_str()
+        .or_else(|| doc["spec"]["desired_state"].as_str())
+        .map(|s| s.trim().to_ascii_lowercase());
+    let desired_state = match desired_state_raw.as_deref() {
+        Some("running") | Some("run") | Some("started") => proto::VmDesiredState::Running,
+        Some("stopped") | Some("stop") | Some("halted") => proto::VmDesiredState::Stopped,
+        Some(other) => {
+            bail!("invalid spec.desiredState '{other}': expected 'running' or 'stopped'")
+        }
+        None => proto::VmDesiredState::Unspecified,
+    };
+
     Ok(VmManifest {
         name,
         cpu,
@@ -1063,6 +1085,7 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         target_dc,
         ssh_keys,
         cloud_init_user_data,
+        desired_state,
     })
 }
 
@@ -1373,5 +1396,93 @@ spec:
         assert_eq!(m.image.as_deref(), Some("https://example.com/debian.qcow2"));
         assert_eq!(m.image_sha256.as_deref(), Some("abc123"));
         assert_eq!(m.image_format.as_deref(), Some("qcow2"));
+        assert_eq!(m.desired_state, proto::VmDesiredState::Unspecified);
+    }
+
+    fn write_manifest_with_desired_state(value: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("kctl-test-vm-ds-{value}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+kind: VM
+metadata:
+  name: ds-test
+spec:
+  cpu: 1
+  memoryBytes: "512M"
+  desiredState: {value}
+  nics:
+    - network: default
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_vm_manifest_desired_state_running_aliases() {
+        for alias in ["running", "run", "started", "Running", "STARTED"] {
+            let path = write_manifest_with_desired_state(alias);
+            let m = parse_vm_manifest(path.to_str().unwrap()).unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(
+                m.desired_state,
+                proto::VmDesiredState::Running,
+                "alias {alias} should map to Running"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_vm_manifest_desired_state_stopped_aliases() {
+        for alias in ["stopped", "stop", "halted", "Stopped"] {
+            let path = write_manifest_with_desired_state(alias);
+            let m = parse_vm_manifest(path.to_str().unwrap()).unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(
+                m.desired_state,
+                proto::VmDesiredState::Stopped,
+                "alias {alias} should map to Stopped"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_vm_manifest_desired_state_invalid_rejected() {
+        let path = write_manifest_with_desired_state("paused");
+        let result = parse_vm_manifest(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 'paused' to be rejected"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid spec.desiredState"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_vm_manifest_desired_state_snake_case_accepted() {
+        let path = std::env::temp_dir().join("kctl-test-vm-ds-snake.yaml");
+        std::fs::write(
+            &path,
+            r#"
+kind: VM
+metadata:
+  name: ds-snake
+spec:
+  cpu: 1
+  memoryBytes: "256M"
+  desired_state: stopped
+"#,
+        )
+        .unwrap();
+        let m = parse_vm_manifest(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(m.desired_state, proto::VmDesiredState::Stopped);
     }
 }
