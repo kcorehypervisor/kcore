@@ -15,12 +15,12 @@ pub async fn create(info: &ConnectionInfo, name: &str, public_key: &str) -> Resu
 
     if resp.success {
         let label = format!("SSH key '{name}'");
-        println!(
-            "{}",
-            crate::apply_summary::render_apply_summary(resp.action, &resp.changed_fields, &label)
-        );
-        if !resp.message.is_empty() {
-            println!("  {}", resp.message);
+        let summary =
+            crate::apply_summary::render_apply_summary(resp.action, &resp.changed_fields, &label);
+        println!("{summary}");
+        let msg = resp.message.trim();
+        if !msg.is_empty() && msg != summary.trim() {
+            println!("  {msg}");
         }
     }
     Ok(())
