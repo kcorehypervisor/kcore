@@ -237,7 +237,7 @@ async fn create_from_manifest(
             enable_dnat: r.enable_dnat,
         })
         .collect();
-    client
+    let resp = client
         .create_security_group(controller_proto::CreateSecurityGroupRequest {
             security_group: Some(controller_proto::SecurityGroup {
                 name: manifest.metadata.name.clone(),
@@ -246,8 +246,13 @@ async fn create_from_manifest(
                 created_at: None,
             }),
         })
-        .await?;
-    println!("Applied security group '{}'", manifest.metadata.name);
+        .await?
+        .into_inner();
+    let label = format!("security group '{}'", manifest.metadata.name);
+    println!(
+        "{}",
+        crate::apply_summary::render_apply_summary(resp.action, &resp.changed_fields, &label)
+    );
     Ok(())
 }
 

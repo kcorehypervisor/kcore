@@ -123,10 +123,32 @@ When using `--wait-for-ssh`, failures are surfaced early:
 - VM unit crash loops/failures are treated as fatal (wait stops immediately)
 - if DHCP lease files are empty, node-agent also attempts ARP/neighbor IP fallback
 
-Create from YAML:
+Create from YAML (idempotent — see §5):
 
 ```bash
 kctl create vm -f vm.yaml
+```
+
+Example VM manifest including `desiredState`:
+
+```yaml
+kind: VM
+metadata:
+  name: web-01
+spec:
+  cpu: 2
+  memoryBytes: 4G
+  desiredState: running   # running | stopped (optional; preserves current state if omitted)
+  nics:
+    - network: default
+  disks:
+    - image: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
+      sha256: <sha256>
+      format: qcow2
+  sshKeys: [deploy-key]
+  cloudInitUserData: |
+    #cloud-config
+    packages: [htop]
 ```
 
 List and inspect:
@@ -176,7 +198,69 @@ kctl stop vm web-01
 
 Both operations update desired state in controller and trigger config apply on the node.
 
-## 5) Node operations
+## 5) Declarative apply and idempotency (server-side upsert)
+
+`kctl create -f <manifest>` is **idempotent**: the controller performs a
+server-side upsert — it fetches the existing resource (if any), diffs it against
+the incoming spec, and then:
+
+- **creates** the resource when no match exists,
+- **updates** only mutable fields when the spec drifted,
+- **rejects** any change to an immutable field with `InvalidArgument`,
+- **does nothing** when stored and desired state already match.
+
+This lets you re-apply the same manifest as often as you want — `kubectl apply`
+semantics — so tools like **Terraform** and **Crossplane** can drive kcore with
+a single verb (`create`) instead of an imperative mix of `create/update/set`.
+
+The server returns an `ApplyAction` (`CREATED` | `UPDATED` | `UNCHANGED`) and
+the list of `changed_fields`, which `kctl` prints as a reconcile summary:
+
+```text
+$ kctl create vm -f vm.yaml
+updated VM 'web-01' (fields: cpu, memory_bytes, desired_state)
+  ID:   vm-…
+  Node: node-a
+  CPU:  4 cores
+  Mem:  8.0 GiB
+
+$ kctl create vm -f vm.yaml
+unchanged VM 'web-01'
+  …
+```
+
+### Mutable vs. immutable fields (v1)
+
+| Kind              | Mutable                                   | Immutable (rejects with `InvalidArgument`)                                                                                 |
+| ----------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **VM**            | `cpu`, `memoryBytes`, `desiredState`      | `disks`, `nics`, `storageBackend`, `storageSizeBytes`, `targetNode`, `targetDc`, `sshKeys`, `cloudInitUserData`, `image_*` |
+| **Container**     | `desiredState`                            | `image`, `command`, `network`, `env`, `ports`, `storageBackend`, `storageSizeBytes`, `mountTarget`                         |
+| **Network**       | — (all immutable in v1)                   | all fields                                                                                                                 |
+| **SshKey**        | — (public key immutable)                  | `publicKey`                                                                                                                |
+| **SecurityGroup** | `description`, `rules`, attachments       | `name`                                                                                                                     |
+
+Rationale: v1 rejects any change that would require rebuilding or recreating
+the resource, so reconciliation stays predictable and safe. Future versions can
+promote more fields to mutable as controlled rebuild paths are added. Today the
+remediation for an immutable change is always `kctl delete … && kctl create -f`.
+
+### Terraform / Crossplane integration
+
+Because every `create*` RPC is already a declarative upsert, a Terraform
+provider or Crossplane composition needs only **one** verb per resource:
+
+- `Create` (in Terraform) / reconcile loop (in Crossplane) → gRPC `CreateX`
+  with the desired spec.
+- `Update` (Terraform) / reconcile on drift (Crossplane) → same gRPC
+  `CreateX`. The controller handles the diff server-side and either applies
+  mutable fields or returns `InvalidArgument`, which the provider surfaces as
+  a diagnostic telling the user to destroy + recreate.
+- `Delete` → existing gRPC `DeleteX`.
+
+No client-side diff, no client-side state of mutable/immutable fields — the
+controller is the single source of truth.
+
+## 6) Node operations
 
 Direct node inspection:
 
@@ -236,7 +320,7 @@ kctl --node 10.0.0.21:9091 node apply-disko \
   --timeout-seconds 600
 ```
 
-## 6) Image operations
+## 7) Image operations
 
 There are two supported VM image flows:
 
@@ -276,7 +360,7 @@ For a full image-centric guide (including large raw upload and wait-for-ssh flow
 
 - `docs/images.md`
 
-## 7) Network operations
+## 8) Network operations
 
 ### Create a network
 
@@ -341,7 +425,7 @@ The list output includes a `TYPE` column showing the network type.
 
 For detailed networking documentation, see `docs/networking.md`.
 
-## 8) Controller apply
+## 9) Controller apply
 
 Apply a NixOS configuration to the controller:
 
@@ -363,7 +447,7 @@ Preview only:
 kctl apply -f ./controller-config.nix --dry-run
 ```
 
-## 9) Complete command reference
+## 10) Complete command reference
 
 Top-level commands:
 
@@ -396,7 +480,7 @@ Top-level commands:
 - `kctl apply -f ... [--dry-run]`
 - `kctl version`
 
-## 10) Common operator patterns
+## 11) Common operator patterns
 
 
 New environment:
@@ -415,7 +499,7 @@ Day-2 operations:
 6. rotate controller cert with `kctl rotate certs --controller <host:port>`
 7. rotate sub-CA with `kctl rotate sub-ca`
 
-## 11) Storage backend examples
+## 12) Storage backend examples
 
 Install node with LVM data disk mode:
 

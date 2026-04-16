@@ -1,8 +1,9 @@
 use crate::client::{self, controller_proto, node_proto};
-use crate::config::ConnectionInfo;
+use crate::config::{self, ConnectionInfo};
 use crate::output;
 use crate::pki;
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -310,6 +311,112 @@ pub async fn nics(info: &ConnectionInfo) -> Result<()> {
 
     output::print_nic_table(&resp.interfaces);
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeInstallManifest {
+    metadata: Option<NodeInstallMetadata>,
+    spec: NodeInstallSpec,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeInstallMetadata {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeInstallSpec {
+    node: String,
+    #[serde(alias = "os_disk")]
+    os_disk: String,
+    #[serde(default, alias = "data_disks")]
+    data_disks: Vec<String>,
+    #[serde(default, alias = "run_controller")]
+    run_controller: bool,
+    #[serde(default, alias = "join_controllers")]
+    join_controllers: Vec<String>,
+    #[serde(alias = "storage_backend")]
+    storage_backend: Option<String>,
+    #[serde(alias = "data_disk_mode")]
+    data_disk_mode: Option<String>,
+    #[serde(alias = "lvm_vg_name")]
+    lvm_vg_name: Option<String>,
+    #[serde(alias = "lvm_lv_prefix")]
+    lvm_lv_prefix: Option<String>,
+    #[serde(alias = "zfs_pool_name")]
+    zfs_pool_name: Option<String>,
+    #[serde(alias = "zfs_dataset_prefix")]
+    zfs_dataset_prefix: Option<String>,
+    #[serde(default, alias = "disable_vxlan")]
+    disable_vxlan: bool,
+    #[serde(default = "default_dc_id", alias = "dc_id")]
+    dc_id: String,
+    hostname: Option<String>,
+    #[serde(alias = "node_id")]
+    node_id: Option<String>,
+    #[serde(default = "default_true")]
+    insecure: bool,
+}
+
+fn default_dc_id() -> String {
+    "DC1".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
+pub async fn install_from_manifest(file: &str, config_path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    let manifest: NodeInstallManifest = serde_yaml::from_str(&content)
+        .with_context(|| format!("parsing NodeInstall manifest {file}"))?;
+
+    let spec = &manifest.spec;
+
+    let node_info = ConnectionInfo {
+        address: spec.node.clone(),
+        addresses: vec![spec.node.clone()],
+        insecure: spec.insecure,
+        tls_server_name: None,
+        cert_pem: None,
+        key_pem: None,
+        ca_pem: None,
+        cert: None,
+        key: None,
+        ca: None,
+    };
+
+    let controller_info = config::resolve_controller(config_path, &[], false, None).ok();
+
+    let certs_dir = config::resolve_install_certs_dir(config_path)
+        .unwrap_or_else(|_| config::default_cluster_certs_dir("default"));
+
+    let node_id_from_manifest = spec
+        .node_id
+        .clone()
+        .or_else(|| manifest.metadata.as_ref().and_then(|m| m.name.clone()));
+
+    install(
+        &node_info,
+        controller_info.as_ref(),
+        &spec.os_disk,
+        spec.data_disks.clone(),
+        &spec.join_controllers,
+        spec.run_controller,
+        spec.data_disk_mode.as_deref().unwrap_or("filesystem"),
+        spec.storage_backend.as_deref(),
+        spec.lvm_vg_name.as_deref(),
+        spec.lvm_lv_prefix.as_deref(),
+        spec.zfs_pool_name.as_deref(),
+        spec.zfs_dataset_prefix.as_deref(),
+        &certs_dir,
+        spec.disable_vxlan,
+        &spec.dc_id,
+        spec.hostname.as_deref(),
+        node_id_from_manifest.as_deref(),
+        config_path,
+    )
+    .await
 }
 
 pub async fn install(
@@ -789,5 +896,83 @@ mod tests {
             super::storage_backend_to_proto(""),
             super::node_proto::StorageBackendType::Unspecified as i32
         );
+    }
+
+    #[test]
+    fn nodeinstall_manifest_parses_camel_case() {
+        let yaml = r#"
+kind: NodeInstall
+metadata:
+  name: kvm-node-107
+spec:
+  node: 192.168.40.107:9091
+  osDisk: /dev/sda
+  dataDisks:
+    - /dev/sdb
+  runController: true
+  storageBackend: lvm
+  lvmVgName: vg_kcore
+  dcId: DC1
+  insecure: true
+"#;
+        let manifest: super::NodeInstallManifest =
+            serde_yaml::from_str(yaml).expect("parse camelCase");
+        assert_eq!(manifest.spec.node, "192.168.40.107:9091");
+        assert_eq!(manifest.spec.os_disk, "/dev/sda");
+        assert_eq!(manifest.spec.data_disks, vec!["/dev/sdb"]);
+        assert!(manifest.spec.run_controller);
+        assert_eq!(manifest.spec.storage_backend.as_deref(), Some("lvm"));
+        assert_eq!(manifest.spec.lvm_vg_name.as_deref(), Some("vg_kcore"));
+        assert_eq!(manifest.spec.dc_id, "DC1");
+        assert!(manifest.spec.insecure);
+        assert_eq!(
+            manifest.metadata.as_ref().unwrap().name.as_deref(),
+            Some("kvm-node-107")
+        );
+    }
+
+    #[test]
+    fn nodeinstall_manifest_parses_snake_case() {
+        let yaml = r#"
+kind: NodeInstall
+spec:
+  node: 10.0.0.5:9091
+  os_disk: /dev/nvme0n1
+  run_controller: false
+  join_controllers:
+    - 10.0.0.1:9090
+  storage_backend: zfs
+  zfs_pool_name: tank0
+  dc_id: DC2
+  disable_vxlan: true
+"#;
+        let manifest: super::NodeInstallManifest =
+            serde_yaml::from_str(yaml).expect("parse snake_case");
+        assert_eq!(manifest.spec.os_disk, "/dev/nvme0n1");
+        assert!(!manifest.spec.run_controller);
+        assert_eq!(manifest.spec.join_controllers, vec!["10.0.0.1:9090"]);
+        assert_eq!(manifest.spec.storage_backend.as_deref(), Some("zfs"));
+        assert_eq!(manifest.spec.zfs_pool_name.as_deref(), Some("tank0"));
+        assert_eq!(manifest.spec.dc_id, "DC2");
+        assert!(manifest.spec.disable_vxlan);
+    }
+
+    #[test]
+    fn nodeinstall_manifest_defaults() {
+        let yaml = r#"
+kind: NodeInstall
+spec:
+  node: 10.0.0.5:9091
+  osDisk: /dev/sda
+  runController: true
+"#;
+        let manifest: super::NodeInstallManifest =
+            serde_yaml::from_str(yaml).expect("parse defaults");
+        assert_eq!(manifest.spec.dc_id, "DC1");
+        assert!(manifest.spec.insecure);
+        assert!(manifest.spec.data_disks.is_empty());
+        assert!(manifest.spec.join_controllers.is_empty());
+        assert!(!manifest.spec.disable_vxlan);
+        assert!(manifest.spec.storage_backend.is_none());
     }
 }
