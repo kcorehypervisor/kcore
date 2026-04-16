@@ -244,6 +244,13 @@ the resource, so reconciliation stays predictable and safe. Future versions can
 promote more fields to mutable as controlled rebuild paths are added. Today the
 remediation for an immutable change is always `kctl delete … && kctl create -f`.
 
+For **SecurityGroup** specifically, attachments are reconciled as a set:
+attachments listed in the manifest are added if missing, and attachments
+present on the controller but absent from the manifest are detached. The
+reconcile summary aggregates rule/description changes with attachment
+deltas, e.g. `updated security group 'web' (fields: rules,
+attachments(+1,-2))`.
+
 ### Terraform / Crossplane integration
 
 Because every `create*` RPC is already a declarative upsert, a Terraform

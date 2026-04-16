@@ -58,16 +58,63 @@ struct SecurityGroupAttachmentManifest {
 
 pub async fn create_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
     let manifest = parse_manifest(file)?;
-    create_from_manifest(info, &manifest).await?;
-    apply_manifest_attachments(info, &manifest, false).await?;
-    Ok(())
+    // `create -f` is declarative: reconcile the security group AND its
+    // attachments. Use `replace = true` so attachments removed from the
+    // manifest are detached on re-apply (matches the docs' idempotency
+    // claims and `kubectl apply` semantics).
+    apply_manifest(info, &manifest, true).await
 }
 
 pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
     let manifest = parse_manifest(file)?;
-    create_from_manifest(info, &manifest).await?;
-    apply_manifest_attachments(info, &manifest, true).await?;
+    apply_manifest(info, &manifest, true).await
+}
+
+async fn apply_manifest(
+    info: &ConnectionInfo,
+    manifest: &SecurityGroupManifest,
+    replace_attachments: bool,
+) -> Result<()> {
+    let resp = create_from_manifest(info, manifest).await?;
+    let attachment_changes =
+        apply_manifest_attachments(info, manifest, replace_attachments).await?;
+
+    // Merge the SG-level apply action with attachment reconcile results so
+    // the rendered summary tells the truth even when attachments were the
+    // only thing that changed.
+    let sg_action = controller_proto::ApplyAction::try_from(resp.action).unwrap_or_default();
+    let mut changed_fields = resp.changed_fields.clone();
+    if attachment_changes.attached > 0 || attachment_changes.detached > 0 {
+        changed_fields.push(format!(
+            "attachments(+{},-{})",
+            attachment_changes.attached, attachment_changes.detached
+        ));
+    }
+    let combined_action = if matches!(sg_action, controller_proto::ApplyAction::Unchanged)
+        && (attachment_changes.attached > 0 || attachment_changes.detached > 0)
+    {
+        controller_proto::ApplyAction::Updated as i32
+    } else if matches!(sg_action, controller_proto::ApplyAction::Created) {
+        controller_proto::ApplyAction::Created as i32
+    } else if !changed_fields.is_empty() {
+        controller_proto::ApplyAction::Updated as i32
+    } else {
+        resp.action
+    };
+
+    let label = format!("security group '{}'", manifest.metadata.name);
+    println!(
+        "{}",
+        crate::apply_summary::render_apply_summary(combined_action, &changed_fields, &label)
+    );
     Ok(())
+}
+
+/// Counts of attachment changes performed during reconcile.
+#[derive(Debug, Default, Clone, Copy)]
+struct AttachmentChanges {
+    attached: usize,
+    detached: usize,
 }
 
 pub async fn list(info: &ConnectionInfo) -> Result<()> {
@@ -221,7 +268,7 @@ fn parse_manifest(path: &str) -> Result<SecurityGroupManifest> {
 async fn create_from_manifest(
     info: &ConnectionInfo,
     manifest: &SecurityGroupManifest,
-) -> Result<()> {
+) -> Result<controller_proto::CreateSecurityGroupResponse> {
     let mut client = client::controller_client(info).await?;
     let rules = manifest
         .spec
@@ -248,19 +295,14 @@ async fn create_from_manifest(
         })
         .await?
         .into_inner();
-    let label = format!("security group '{}'", manifest.metadata.name);
-    println!(
-        "{}",
-        crate::apply_summary::render_apply_summary(resp.action, &resp.changed_fields, &label)
-    );
-    Ok(())
+    Ok(resp)
 }
 
 async fn apply_manifest_attachments(
     info: &ConnectionInfo,
     manifest: &SecurityGroupManifest,
     replace: bool,
-) -> Result<()> {
+) -> Result<AttachmentChanges> {
     let mut client = client::controller_client(info).await?;
     let current = client
         .get_security_group(controller_proto::GetSecurityGroupRequest {
@@ -283,7 +325,16 @@ async fn apply_manifest_attachments(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let mut changes = AttachmentChanges::default();
+
     for (kind, target, node) in &desired {
+        let already_attached = current.iter().any(|att| {
+            controller_proto::SecurityGroupTargetKind::try_from(att.target_kind)
+                .map(|k| k == *kind)
+                .unwrap_or(false)
+                && att.target_id == *target
+                && att.target_node == *node
+        });
         client
             .attach_security_group(controller_proto::AttachSecurityGroupRequest {
                 security_group: manifest.metadata.name.clone(),
@@ -292,6 +343,9 @@ async fn apply_manifest_attachments(
                 target_node: node.clone(),
             })
             .await?;
+        if !already_attached {
+            changes.attached += 1;
+        }
     }
 
     if replace {
@@ -310,11 +364,12 @@ async fn apply_manifest_attachments(
                         target_node: att.target_node,
                     })
                     .await?;
+                changes.detached += 1;
             }
         }
     }
 
-    Ok(())
+    Ok(changes)
 }
 
 fn target_kind(kind: &str) -> Result<controller_proto::SecurityGroupTargetKind> {

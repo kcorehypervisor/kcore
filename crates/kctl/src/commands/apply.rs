@@ -3,19 +3,20 @@ use crate::commands::{container, network, security_group, ssh_key, vm};
 use crate::config::ConnectionInfo;
 use anyhow::{Context, Result};
 
-/// Returns true if `kind` is a bootstrap manifest that does not need a controller connection.
-pub fn is_local_manifest_kind(file: &str) -> bool {
-    let content = match std::fs::read_to_string(file) {
-        Ok(c) => c,
-        Err(_) => return false,
+/// Returns `Ok(true)` if the manifest at `file` has a `kind` that is handled
+/// locally by `kctl` (i.e. without contacting the controller). I/O errors and
+/// YAML parse errors are propagated rather than collapsed to `false`, so
+/// callers can surface real manifest problems instead of silently falling
+/// back to the controller path.
+pub fn is_local_manifest_kind(file: &str) -> Result<bool> {
+    let content = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    let Some(kind) = detect_manifest_kind(&content) else {
+        return Ok(false);
     };
-    match detect_manifest_kind(&content).as_deref() {
-        Some(k) => matches!(
-            k.to_ascii_lowercase().as_str(),
-            "cluster" | "nodeinstall" | "node-install" | "node_install"
-        ),
-        None => false,
-    }
+    Ok(matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "cluster" | "nodeinstall" | "node-install" | "node_install"
+    ))
 }
 
 pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<()> {
@@ -143,7 +144,7 @@ metadata:
             "kind: Cluster\nmetadata:\n  name: test\nspec:\n  controller: 1.2.3.4:9090\n",
         )
         .unwrap();
-        assert!(is_local_manifest_kind(path.to_str().unwrap()));
+        assert!(is_local_manifest_kind(path.to_str().unwrap()).unwrap());
     }
 
     #[test]
@@ -151,6 +152,15 @@ metadata:
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vm.yaml");
         std::fs::write(&path, "kind: VM\nmetadata:\n  name: test\n").unwrap();
-        assert!(!is_local_manifest_kind(path.to_str().unwrap()));
+        assert!(!is_local_manifest_kind(path.to_str().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn is_local_manifest_kind_missing_file_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.yaml");
+        let err = is_local_manifest_kind(path.to_str().unwrap()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("reading"), "unexpected error: {msg}");
     }
 }

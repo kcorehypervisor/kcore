@@ -224,7 +224,14 @@ pub fn diff_container(
     if !incoming.spec.image.is_empty() && extras.image != incoming.spec.image {
         diff.immutable.push("image".into());
     }
-    if !incoming.spec.command.is_empty() && extras.command != incoming.spec.command {
+    // command / mount_target are not persisted on `WorkloadRow`. To avoid
+    // false-positive immutable rejections on every re-apply, only diff them
+    // when the caller actually tracks the stored value (i.e. extras is
+    // non-empty). Once the DB starts persisting these, the diff just works.
+    if !extras.command.is_empty()
+        && !incoming.spec.command.is_empty()
+        && extras.command != incoming.spec.command
+    {
         diff.immutable.push("command".into());
     }
     if !incoming.spec.network.is_empty() && stored.network != incoming.spec.network {
@@ -236,7 +243,10 @@ pub fn diff_container(
     if incoming.storage_size_bytes > 0 && stored.storage_size_bytes != incoming.storage_size_bytes {
         diff.immutable.push("storage_size_bytes".into());
     }
-    if !incoming.spec.mount_target.is_empty() && extras.mount_target != incoming.spec.mount_target {
+    if !extras.mount_target.is_empty()
+        && !incoming.spec.mount_target.is_empty()
+        && extras.mount_target != incoming.spec.mount_target
+    {
         diff.immutable.push("mount_target".into());
     }
 
@@ -645,6 +655,53 @@ mod tests {
         };
         let diff = diff_container(&stored, &extras, &apply);
         assert_eq!(diff.immutable, vec!["image".to_string()]);
+    }
+
+    #[test]
+    fn container_command_and_mount_skip_diff_when_not_persisted() {
+        // The controller currently does not persist command / mount_target
+        // (extras is built with empty defaults). A re-apply that includes a
+        // non-empty command + mount_target must NOT be flagged as immutable
+        // — that would break idempotency for every real container manifest.
+        let stored = sample_container_row();
+        let extras = StoredContainerExtras {
+            image: "nginx:1".into(),
+            command: Vec::new(),
+            env: HashMap::new(),
+            ports: Vec::new(),
+            mount_target: String::new(),
+        };
+        let mut spec = sample_container_spec();
+        spec.command = vec!["nginx".into(), "-g".into(), "daemon off;".into()];
+        spec.mount_target = "/data".into();
+        let apply = ContainerApply {
+            spec: &spec,
+            storage_backend: "filesystem",
+            storage_size_bytes: 0,
+        };
+        let diff = diff_container(&stored, &extras, &apply);
+        assert!(diff.is_unchanged(), "got {diff:?}");
+    }
+
+    #[test]
+    fn container_command_change_is_immutable_when_stored() {
+        let stored = sample_container_row();
+        let extras = StoredContainerExtras {
+            image: "nginx:1".into(),
+            command: vec!["nginx".into()],
+            env: HashMap::new(),
+            ports: Vec::new(),
+            mount_target: String::new(),
+        };
+        let mut spec = sample_container_spec();
+        spec.command = vec!["sh".into()];
+        let apply = ContainerApply {
+            spec: &spec,
+            storage_backend: "filesystem",
+            storage_size_bytes: 0,
+        };
+        let diff = diff_container(&stored, &extras, &apply);
+        assert_eq!(diff.immutable, vec!["command".to_string()]);
     }
 
     #[test]

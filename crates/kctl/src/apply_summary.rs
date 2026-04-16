@@ -22,7 +22,9 @@ pub fn render_apply_summary(action: i32, changed_fields: &[String], kind_and_nam
             }
         }
         ApplyAction::Unchanged => format!("unchanged {kind_and_name}"),
-        ApplyAction::Unspecified => format!("created {kind_and_name}"),
+        // Don't lie when the server omitted (or regressed) the action: print
+        // a neutral summary instead of pretending the resource was created.
+        ApplyAction::Unspecified => format!("applied {kind_and_name}"),
     }
 }
 
@@ -64,10 +66,10 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_falls_back_to_created() {
+    fn unspecified_falls_back_to_neutral_applied() {
         assert_eq!(
             render_apply_summary(ApplyAction::Unspecified as i32, &[], "VM 'web'"),
-            "created VM 'web'"
+            "applied VM 'web'"
         );
     }
 }

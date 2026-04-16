@@ -661,7 +661,7 @@ impl ControllerService {
         let storage_backend_str = if req.storage_backend == 0 {
             String::new()
         } else {
-            normalize_storage_backend(req.storage_backend, false).unwrap_or_default()
+            normalize_storage_backend(req.storage_backend, false)?
         };
 
         let image_url_trim = req.image_url.trim();
@@ -718,6 +718,41 @@ impl ControllerService {
             } else {
                 None
             };
+
+            // Re-run placement preflight before accepting a larger shape so an
+            // idempotent CreateVm cannot overcommit a node that the original
+            // CreateVm path would have rejected.
+            let node = self
+                .db
+                .get_node(&stored.node_id)
+                .map_err(|e| Status::internal(format!("resolving node for update: {e}")))?
+                .ok_or_else(|| Status::not_found(format!("node '{}' not found", stored.node_id)))?;
+            // Build a preflight spec that reflects only the *delta* in cpu/mem
+            // (existing reservations are already counted in node.cpu_used /
+            // node.memory_used), so we only check headroom for the increase.
+            let cpu_delta = cpu
+                .map(|new_cpu| (new_cpu - stored.cpu).max(0))
+                .unwrap_or(0);
+            let mem_delta = mem
+                .map(|new_mem| (new_mem - stored.memory_bytes).max(0))
+                .unwrap_or(0);
+            if cpu_delta > 0 || mem_delta > 0 {
+                let preflight_spec = controller_proto::VmSpec {
+                    cpu: cpu_delta,
+                    memory_bytes: mem_delta,
+                    ..spec.clone()
+                };
+                let backend_for_preflight = if storage_backend_str.is_empty() {
+                    stored.storage_backend.as_str()
+                } else {
+                    storage_backend_str.as_str()
+                };
+                self.preflight_vm_create_on_node(&node, &preflight_spec, backend_for_preflight)?;
+            }
+
+            // Persist the new spec, then push declarative config to the node.
+            // If the push fails, roll back the DB update so the next retry
+            // sees the original spec and runs the reconcile again.
             let updated = self
                 .db
                 .update_vm_spec(&stored.id, cpu, mem)
@@ -728,19 +763,28 @@ impl ControllerService {
                     stored.id
                 )));
             }
+            if let Err(e) = self.push_config_to_node(&node).await {
+                let rollback_cpu = cpu_changed.then_some(stored.cpu);
+                let rollback_mem = mem_changed.then_some(stored.memory_bytes);
+                if let Err(rollback_err) =
+                    self.db
+                        .update_vm_spec(&stored.id, rollback_cpu, rollback_mem)
+                {
+                    warn!(
+                        vm_id = %stored.id,
+                        node_id = %stored.node_id,
+                        error = %rollback_err,
+                        "failed to roll back vm spec after node push failure; DB may be inconsistent"
+                    );
+                }
+                return Err(e);
+            }
             if cpu_changed {
                 changed_fields.push("cpu".into());
             }
             if mem_changed {
                 changed_fields.push("memory_bytes".into());
             }
-
-            let node = self
-                .db
-                .get_node(&stored.node_id)
-                .map_err(|e| Status::internal(format!("resolving node for update: {e}")))?
-                .ok_or_else(|| Status::not_found(format!("node '{}' not found", stored.node_id)))?;
-            self.push_config_to_node(&node).await?;
 
             self.log_replication_event(
                 EVT_VM_UPDATE,
@@ -2048,7 +2092,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     let storage_backend_str = if req.storage_backend == 0 {
                         String::new()
                     } else {
-                        normalize_storage_backend(req.storage_backend, false).unwrap_or_default()
+                        normalize_storage_backend(req.storage_backend, false)?
                     };
                     let extras = crate::grpc::diff::StoredContainerExtras {
                         image: existing.container_image.clone(),
@@ -2185,17 +2229,44 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     controller_proto::WorkloadDesiredState::Stopped,
                 );
 
+                // For declarative desired_state=stopped: try to stop the
+                // container BEFORE persisting the row so that the persisted
+                // runtime_state and the response state never claim "stopped"
+                // while the container is actually still running on the node.
+                // The desired_state is recorded unconditionally so the
+                // reconciler keeps trying if the immediate stop attempt fails.
+                let mut runtime_state_str = "running".to_string();
+                let mut final_state = created.state;
+                if !desired_running {
+                    let mut stop_client = container.clone();
+                    match stop_client
+                        .stop_container(node_proto::StopContainerRequest {
+                            name: created.name.clone(),
+                        })
+                        .await
+                    {
+                        Ok(_) => {
+                            runtime_state_str = "stopped".to_string();
+                            final_state = controller_proto::ContainerState::Stopped as i32;
+                        }
+                        Err(e) => {
+                            warn!(
+                                name = %created.name,
+                                node_id = %node.id,
+                                error = %e,
+                                "failed to stop container after create for desired_state=stopped; reconciler will retry"
+                            );
+                        }
+                    }
+                }
+
                 self.db
                     .upsert_workload(&WorkloadRow {
                         id: workload_id.clone(),
                         name: created.name.clone(),
                         kind: "container".to_string(),
                         node_id: node.id.clone(),
-                        runtime_state: if desired_running {
-                            "running".to_string()
-                        } else {
-                            "stopped".to_string()
-                        },
+                        runtime_state: runtime_state_str,
                         desired_state: if desired_running {
                             "running".to_string()
                         } else {
@@ -2209,26 +2280,6 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         created_at: String::new(),
                     })
                     .map_err(|e| Status::internal(format!("storing workload row: {e}")))?;
-
-                let final_state = if !desired_running {
-                    let mut stop_client = container.clone();
-                    if let Err(e) = stop_client
-                        .stop_container(node_proto::StopContainerRequest {
-                            name: created.name.clone(),
-                        })
-                        .await
-                    {
-                        warn!(
-                            name = %created.name,
-                            node_id = %node.id,
-                            error = %e,
-                            "failed to stop container after create for desired_state=stopped; will retry via reconcile"
-                        );
-                    }
-                    controller_proto::ContainerState::Stopped as i32
-                } else {
-                    created.state
-                };
 
                 Ok(Response::new(controller_proto::CreateWorkloadResponse {
                     kind: controller_proto::WorkloadKind::Container as i32,

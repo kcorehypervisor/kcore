@@ -1418,7 +1418,13 @@ async fn main() {
         }
 
         Command::Apply { file, dry_run } => {
-            if !dry_run && commands::apply::is_local_manifest_kind(file) {
+            let local = if *dry_run {
+                false
+            } else {
+                commands::apply::is_local_manifest_kind(file)
+                    .unwrap_or_else(|e| fatal(&format!("{e:#}")))
+            };
+            if local {
                 let content =
                     std::fs::read_to_string(file).unwrap_or_else(|e| fatal(&format!("{e}")));
                 let kind = commands::apply::detect_manifest_kind(&content)
@@ -1433,7 +1439,7 @@ async fn main() {
                     "nodeinstall" | "node-install" | "node_install" => {
                         commands::node::install_from_manifest(file, &config_path).await
                     }
-                    _ => unreachable!(),
+                    other => fatal(&format!("unsupported local manifest kind: '{other}'")),
                 }
             } else {
                 let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
