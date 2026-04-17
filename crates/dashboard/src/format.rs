@@ -305,5 +305,52 @@ mod proptests {
             }
             prop_assert_eq!(collected, sorted);
         }
+
+        /// `memory_mebibytes` and `bytes_human` never panic for any
+        /// i64 input (including negatives).
+        #[test]
+        fn byte_formatters_never_panic(n in any::<i64>()) {
+            let _ = memory_mebibytes(n);
+            let _ = bytes_human(n);
+        }
+
+        /// `memory_mebibytes` always ends with `" MiB"`.
+        #[test]
+        fn memory_mebibytes_unit_label(n in any::<i64>()) {
+            prop_assert!(memory_mebibytes(n).ends_with(" MiB"));
+        }
+
+        /// `memory_mebibytes` returns `"0 MiB"` for any non-positive
+        /// input (encodes the documented zero-clamp).
+        #[test]
+        fn memory_mebibytes_clamps_non_positive(n in i64::MIN..=0) {
+            prop_assert_eq!(memory_mebibytes(n), "0 MiB");
+        }
+
+        /// `bytes_human`'s unit always corresponds to the magnitude.
+        /// We assert the suffix matches one of the four documented
+        /// labels.
+        #[test]
+        fn bytes_human_unit_in_known_set(n in any::<i64>()) {
+            let s = bytes_human(n);
+            prop_assert!(
+                s == "0"
+                    || s.ends_with(" KiB")
+                    || s.ends_with(" MiB")
+                    || s.ends_with(" GiB")
+                    || s.ends_with(" TiB"),
+                "unexpected unit in {s:?}"
+            );
+        }
+
+        /// `vm_state_label` and `storage_backend_label` always return
+        /// one of the documented strings, for any i32.
+        #[test]
+        fn enum_labels_known_set(state in any::<i32>(), backend in any::<i32>()) {
+            let v = vm_state_label(state);
+            prop_assert!(matches!(v, "Stopped" | "Running" | "Paused" | "Error" | "Unknown"));
+            let s = storage_backend_label(backend);
+            prop_assert!(matches!(s, "Filesystem" | "LVM" | "ZFS" | "Unspecified"));
+        }
     }
 }
