@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{self, CN_CONTROLLER_PREFIX, CN_KCTL, CN_NODE_PREFIX};
@@ -611,14 +611,29 @@ impl ControllerService {
         if let Err(e) = self.push_config_to_node(&node).await {
             // Roll back the desired_state mutation so retries see the stale
             // spec and re-trigger the reconcile on the next CreateVm/Apply.
+            // Use compare-and-swap so a concurrent successful update is not
+            // overwritten by this request's stale snapshot.
             if original_auto_start != auto_start {
-                if let Err(rb) = self.db.set_vm_auto_start(vm_id, original_auto_start) {
-                    warn!(
-                        vm_id = %vm_id,
-                        node_id = %node.id,
-                        error = %rb,
-                        "failed to roll back vm auto_start after node push failure; DB may be inconsistent"
-                    );
+                match self
+                    .db
+                    .set_vm_auto_start_if_current(vm_id, auto_start, original_auto_start)
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!(
+                            vm_id = %vm_id,
+                            node_id = %node.id,
+                            "skipped auto_start rollback after push failure; row changed concurrently"
+                        );
+                    }
+                    Err(rb) => {
+                        warn!(
+                            vm_id = %vm_id,
+                            node_id = %node.id,
+                            error = %rb,
+                            "failed to roll back vm auto_start after node push failure; DB may be inconsistent"
+                        );
+                    }
                 }
             }
             return Err(e);

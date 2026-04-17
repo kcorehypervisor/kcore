@@ -2144,6 +2144,23 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Compare-and-swap for `auto_start`: set to `new_value` only if the row
+    /// currently equals `expected_current`. Used to roll back a failed node
+    /// push without clobbering a concurrent successful update.
+    pub fn set_vm_auto_start_if_current(
+        &self,
+        vm_id_or_name: &str,
+        expected_current: bool,
+        new_value: bool,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE vms SET auto_start = ?1 WHERE (id = ?2 OR name = ?2) AND auto_start = ?3",
+            params![new_value as i32, vm_id_or_name, expected_current as i32,],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_vm_runtime_state(
         &self,
         node_id: &str,
@@ -2654,6 +2671,27 @@ mod tests {
 
         let updated = db.get_vm("vm-1").expect("get vm").expect("vm");
         assert!(!updated.auto_start);
+    }
+
+    #[test]
+    fn set_vm_auto_start_if_current_skips_when_value_mismatch() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        db.insert_vm(&test_vm(&node.id)).expect("insert vm");
+
+        assert!(
+            db.set_vm_auto_start_if_current("web-1", true, false)
+                .expect("cas"),
+            "expected update from true to false"
+        );
+        assert!(
+            !db.set_vm_auto_start_if_current("web-1", true, true)
+                .expect("cas skip"),
+            "expected no update when expected_current does not match"
+        );
+        let v = db.get_vm("vm-1").expect("get vm").expect("vm");
+        assert!(!v.auto_start);
     }
 
     #[test]
