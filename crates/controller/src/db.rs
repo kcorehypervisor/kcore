@@ -3756,12 +3756,21 @@ mod proptests {
 
             let vm = make_vm(&vm_id, &vm_id, &missing_node, 1, 1024, false);
             let err = db.insert_vm(&vm).unwrap_err();
-            // SQLite reports FK violations as ConstraintViolation /
-            // SqliteFailure with extended code FOREIGN_KEY (787).
-            prop_assert!(
-                err.to_string().to_ascii_lowercase().contains("foreign"),
-                "expected FOREIGN KEY error for unknown node, got: {err}"
-            );
+            // Structured match: rusqlite surfaces FK violations as
+            // SqliteFailure with code = ConstraintViolation and
+            // extended_code = SQLITE_CONSTRAINT_FOREIGNKEY (787).
+            // The integer literal is used because rusqlite does not
+            // re-export the extended-code constant publicly.
+            const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = 787;
+            match &err {
+                rusqlite::Error::SqliteFailure(sqlite_err, _)
+                    if sqlite_err.code == rusqlite::ErrorCode::ConstraintViolation
+                        && sqlite_err.extended_code == SQLITE_CONSTRAINT_FOREIGNKEY => {}
+                other => prop_assert!(
+                    false,
+                    "expected SQLITE_CONSTRAINT_FOREIGNKEY for unknown node, got: {other}"
+                ),
+            }
         }
 
         /// **VM CRUD round-trip**: insert + get_vm returns a row whose
