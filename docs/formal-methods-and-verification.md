@@ -189,10 +189,11 @@ mod kani_proofs {
 ```bash
 cargo install --locked kani-verifier
 cargo kani setup
-make kani                 # runs the controller and kctl proof suites
+make kani                 # runs controller, kctl, and node-agent proof suites
 # or per crate:
 cargo kani -p kcore-controller
 cargo kani -p kcore-kctl
+cargo kani -p kcore-node-agent
 ```
 
 **CI:** the `kani` job in `.github/workflows/formal-checks.yml` runs the same suite on every pull request via `model-checking/kani-github-action@v1.1`.
@@ -200,8 +201,8 @@ cargo kani -p kcore-kctl
 **Follow-up work:**
 
 - Raise `MAX_INPUT_LEN` once we've measured the runtime cost on CI.
-- Add a Kani proof for `validate_safe_segment` in `crates/node-agent/src/path_safety.rs` once that file lands (tracked separately by the Phase 1 proptest expansion).
-- Consider adding a Kani proof for `validate_path_under_root`; it walks `Path::components`, which costs more symbolic state, so it may need a smaller bound.
+- Consider adding a Kani proof for `validate_path_under_root` in `crates/node-agent/src/path_safety.rs`; it walks `Path::components`, which costs more symbolic state, so it may need a smaller bound.
+- Factor the Kani harness scaffolding (`MAX_INPUT_LEN`, `any_ascii_str`) into a shared `#[cfg(kani)] pub mod kani_support` so each crate keeps only the `#[kani::proof]` entrypoints (CodeRabbit nitpick on PR #11).
 
 ### Phase 3: property-based testing on database invariants
 
@@ -217,23 +218,15 @@ cargo kani -p kcore-kctl
 6. **Delete consistency** — after `delete_vm_by_id_or_name`, the VM disappears from `get_vm`, `find_node_for_vm`, and `list_vms`.
 7. **Heartbeat idempotence (modulo timestamp)** — two `update_heartbeat` calls with identical args produce identical state in every field except `last_heartbeat`.
 
-**Target:** `crates/controller/src/db.rs`
+**Target:** `crates/controller/src/db.rs` (`#[cfg(test)] mod proptests`).
 
 **Why third:** the database layer is the source of truth for the entire system. Subtle bugs here (a VM referencing a non-existent node, a heartbeat updating a deleted node) propagate silently and cause wrong Nix configs to be pushed.
 
-**Properties to verify:**
+**How to run locally:**
 
-1. **Foreign key integrity** — inserting a `VmRow` with a `node_id` that does not exist in `nodes` must fail.
-
-2. **CRUD round-trip** — for any valid `NodeRow`, `upsert_node` followed by `get_node` returns an identical row.
-
-3. **Delete consistency** — after `delete_vm`, `find_node_for_vm` returns `None` and `list_vms` no longer contains the deleted VM.
-
-4. **Heartbeat idempotence** — calling `update_heartbeat` twice with the same arguments produces the same node state.
-
-5. **Upsert semantics** — upserting a node twice with different addresses updates the address rather than creating a duplicate.
-
-**Effort estimate:** 2–3 days. Requires building `proptest` strategies for `NodeRow` and `VmRow` with constrained string fields.
+```bash
+cargo test -p kcore-controller proptests
+```
 
 ### Phase 4: TLA+ model of controller–node reconciliation
 

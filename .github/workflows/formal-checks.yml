@@ -77,3 +77,6 @@ jobs:
 
       - name: Run bounded Kani proofs (kctl)
         run: cargo kani -p kcore-kctl
+
+      - name: Run bounded Kani proofs (node-agent)
+        run: cargo kani -p kcore-node-agent
