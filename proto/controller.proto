@@ -167,6 +167,15 @@ message ContainerSpec {
   string storage_backend = 7; // filesystem|lvm|zfs
   int64 storage_size_bytes = 8;
   string mount_target = 9;
+  WorkloadDesiredState desired_state = 10; // declarative desired state (running|stopped)
+}
+
+// Reconcile action returned by idempotent Create* (upsert) RPCs.
+enum ApplyAction {
+  APPLY_ACTION_UNSPECIFIED = 0;
+  APPLY_ACTION_CREATED = 1;
+  APPLY_ACTION_UPDATED = 2;
+  APPLY_ACTION_UNCHANGED = 3;
 }
 
 message ContainerInfo {
@@ -207,6 +216,8 @@ message CreateVmResponse {
   string vm_id = 1;
   string node_id = 2;  // Which node created it
   VmState state = 3;
+  ApplyAction action = 4;              // upsert outcome: created|updated|unchanged
+  repeated string changed_fields = 5;  // names of mutated fields when action == UPDATED
 }
 
 message UpdateVmRequest {
@@ -287,6 +298,8 @@ message CreateWorkloadResponse {
   string node_id = 3;
   VmState vm_state = 4;
   ContainerState container_state = 5;
+  ApplyAction action = 6;              // upsert outcome: created|updated|unchanged
+  repeated string changed_fields = 7;  // names of mutated fields when action == UPDATED
 }
 
 message DeleteWorkloadRequest {
@@ -355,6 +368,8 @@ message CreateNetworkResponse {
   bool success = 1;
   string message = 2;
   string node_id = 3;
+  ApplyAction action = 4;              // upsert outcome: created|unchanged (all fields immutable in v1)
+  repeated string changed_fields = 5;  // unused in v1; reserved for future mutable fields
 }
 
 message DeleteNetworkRequest {
@@ -424,6 +439,8 @@ message CreateSecurityGroupRequest {
 message CreateSecurityGroupResponse {
   bool success = 1;
   SecurityGroup security_group = 2;
+  ApplyAction action = 3;              // upsert outcome: created|updated|unchanged
+  repeated string changed_fields = 4;  // names of mutated fields when action == UPDATED
 }
 
 message GetSecurityGroupRequest {
@@ -527,6 +544,7 @@ message VmSpec {
   repeated Nic nics = 6;
   string storage_backend = 7;   // filesystem, lvm, zfs
   int64 storage_size_bytes = 8; // Provisioned volume size
+  VmDesiredState desired_state = 9; // declarative desired state (running|stopped)
 }
 
 message Disk {
@@ -685,6 +703,8 @@ message CreateSshKeyRequest {
 message CreateSshKeyResponse {
   bool success = 1;
   string message = 2;
+  ApplyAction action = 3;              // upsert outcome: created|unchanged (public_key immutable in v1)
+  repeated string changed_fields = 4;  // unused in v1; reserved for future mutable fields
 }
 
 message DeleteSshKeyRequest {

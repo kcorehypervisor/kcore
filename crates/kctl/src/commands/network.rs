@@ -33,8 +33,11 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         .into_inner();
 
     if resp.success {
-        println!("Network '{}' created", args.name);
-        println!("  Node: {}", resp.node_id);
+        let label = format!("Network '{}' on node {}", args.name, resp.node_id);
+        println!(
+            "{}",
+            crate::apply_summary::render_apply_summary(resp.action, &resp.changed_fields, &label)
+        );
         if !resp.message.is_empty() {
             println!("  Info: {}", resp.message);
         }
@@ -130,8 +133,11 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
         .into_inner();
 
     if resp.success {
-        println!("Network '{name}' created");
-        println!("  Node: {}", resp.node_id);
+        let label = format!("Network '{name}' on node {}", resp.node_id);
+        println!(
+            "{}",
+            crate::apply_summary::render_apply_summary(resp.action, &resp.changed_fields, &label)
+        );
     } else {
         println!("Network '{name}' creation rejected");
     }

@@ -1,5 +1,6 @@
 #![allow(dead_code, clippy::too_many_arguments, clippy::enum_variant_names)]
 
+mod apply_summary;
 mod client;
 mod commands;
 mod config;
@@ -1417,8 +1418,33 @@ async fn main() {
         }
 
         Command::Apply { file, dry_run } => {
-            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::apply::apply(&info, file, *dry_run).await
+            let local = if *dry_run {
+                false
+            } else {
+                commands::apply::is_local_manifest_kind(file)
+                    .unwrap_or_else(|e| fatal(&format!("{e:#}")))
+            };
+            if local {
+                let content =
+                    std::fs::read_to_string(file).unwrap_or_else(|e| fatal(&format!("{e}")));
+                let kind = commands::apply::detect_manifest_kind(&content)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let config_path = cli
+                    .config
+                    .clone()
+                    .unwrap_or_else(config::default_config_path);
+                match kind.as_str() {
+                    "cluster" => commands::cluster::create_from_manifest(file, &config_path),
+                    "nodeinstall" | "node-install" | "node_install" => {
+                        commands::node::install_from_manifest(file, &config_path).await
+                    }
+                    other => fatal(&format!("unsupported local manifest kind: '{other}'")),
+                }
+            } else {
+                let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+                commands::apply::apply(&info, file, *dry_run).await
+            }
         }
 
         Command::Version => {

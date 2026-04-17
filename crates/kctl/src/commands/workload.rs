@@ -34,6 +34,7 @@ pub async fn create(
                 }],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             container_spec: None,
             image_url: image.unwrap_or_default().to_string(),
@@ -59,6 +60,7 @@ pub async fn create(
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
                 mount_target: String::new(),
+                desired_state: controller_proto::WorkloadDesiredState::Unspecified as i32,
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -72,17 +74,22 @@ pub async fn create(
         controller_proto::WorkloadKind::Unspecified => unreachable!(),
     };
     let resp = client.create_workload(req).await?.into_inner();
+    let kind_label = match controller_proto::WorkloadKind::try_from(resp.kind)
+        .unwrap_or(controller_proto::WorkloadKind::Unspecified)
+    {
+        controller_proto::WorkloadKind::Vm => "vm",
+        controller_proto::WorkloadKind::Container => "container",
+        controller_proto::WorkloadKind::Unspecified => "workload",
+    };
+    let label = format!(
+        "{kind_label} '{name}' ({id}) on node {node}",
+        name = name,
+        id = resp.workload_id,
+        node = resp.node_id,
+    );
     println!(
-        "Created workload {} on node {} ({})",
-        resp.workload_id,
-        resp.node_id,
-        match controller_proto::WorkloadKind::try_from(resp.kind)
-            .unwrap_or(controller_proto::WorkloadKind::Unspecified)
-        {
-            controller_proto::WorkloadKind::Vm => "vm",
-            controller_proto::WorkloadKind::Container => "container",
-            controller_proto::WorkloadKind::Unspecified => "unknown",
-        }
+        "{}",
+        crate::apply_summary::render_apply_summary(resp.action, &resp.changed_fields, &label)
     );
     Ok(())
 }
