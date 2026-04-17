@@ -58,6 +58,17 @@ fn normalize_sg_protocol(protocol: &str) -> Result<String, Status> {
     }
 }
 
+/// Map a VmRow.runtime_state string back into the proto VmState enum value.
+fn vm_state_from_runtime_str(s: &str) -> i32 {
+    match s {
+        "running" => controller_proto::VmState::Running as i32,
+        "stopped" => controller_proto::VmState::Stopped as i32,
+        "paused" => controller_proto::VmState::Paused as i32,
+        "error" => controller_proto::VmState::Error as i32,
+        _ => controller_proto::VmState::Unknown as i32,
+    }
+}
+
 fn validate_port(port: i32, field: &str) -> Result<i32, Status> {
     if (1..=65535).contains(&port) {
         Ok(port)
@@ -631,6 +642,193 @@ impl ControllerService {
         })
     }
 
+    /// Upsert path for `CreateVm`: compare incoming spec against the stored
+    /// VM row, reject any immutable-field changes, and apply mutable-field
+    /// changes (cpu, memory_bytes, desired_state) via the existing update and
+    /// desired-state paths. Returns `UPDATED` (with the changed_fields list)
+    /// or `UNCHANGED` when the incoming spec already matches storage.
+    async fn upsert_existing_vm(
+        &self,
+        req: controller_proto::CreateVmRequest,
+        spec: controller_proto::VmSpec,
+        stored: VmRow,
+    ) -> Result<Response<controller_proto::CreateVmResponse>, Status> {
+        let stored_ssh = self
+            .db
+            .get_vm_ssh_key_names(&stored.id)
+            .map_err(|e| Status::internal(format!("listing vm ssh keys: {e}")))?;
+
+        let storage_backend_str = if req.storage_backend == 0 {
+            String::new()
+        } else {
+            normalize_storage_backend(req.storage_backend, false)?
+        };
+
+        let image_url_trim = req.image_url.trim();
+        let image_sha256_trim = req.image_sha256.trim();
+        let image_path_trim = req.image_path.trim();
+        let cloud_init_trim = req.cloud_init_user_data.trim();
+
+        let apply = crate::grpc::diff::VmApply {
+            spec: &spec,
+            image_url: image_url_trim,
+            image_sha256: image_sha256_trim,
+            image_path: image_path_trim,
+            cloud_init_user_data: cloud_init_trim,
+            ssh_key_names: &req.ssh_key_names,
+            storage_backend: &storage_backend_str,
+            storage_size_bytes: req.storage_size_bytes,
+            target_node: req.target_node.trim(),
+            target_dc: req.target_dc.trim(),
+        };
+        let diff = crate::grpc::diff::diff_vm(&stored, &stored_ssh, &apply);
+
+        if !diff.immutable.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "cannot change immutable field(s) on VM '{}': {} (delete the VM and recreate)",
+                stored.name,
+                diff.immutable.join(", ")
+            )));
+        }
+
+        let current_state_enum = vm_state_from_runtime_str(&stored.runtime_state);
+
+        if diff.mutable.is_empty() {
+            return Ok(Response::new(controller_proto::CreateVmResponse {
+                vm_id: stored.id,
+                node_id: stored.node_id,
+                state: current_state_enum,
+                action: controller_proto::ApplyAction::Unchanged as i32,
+                changed_fields: Vec::new(),
+            }));
+        }
+
+        let mut changed_fields: Vec<String> = Vec::new();
+
+        let cpu_changed = diff.mutable.iter().any(|f| f == "cpu");
+        let mem_changed = diff.mutable.iter().any(|f| f == "memory_bytes");
+        if cpu_changed || mem_changed {
+            let cpu = if cpu_changed && spec.cpu > 0 {
+                Some(spec.cpu)
+            } else {
+                None
+            };
+            let mem = if mem_changed && spec.memory_bytes > 0 {
+                Some(spec.memory_bytes)
+            } else {
+                None
+            };
+
+            // Re-run placement preflight before accepting a larger shape so an
+            // idempotent CreateVm cannot overcommit a node that the original
+            // CreateVm path would have rejected.
+            let node = self
+                .db
+                .get_node(&stored.node_id)
+                .map_err(|e| Status::internal(format!("resolving node for update: {e}")))?
+                .ok_or_else(|| Status::not_found(format!("node '{}' not found", stored.node_id)))?;
+            // Build a preflight spec that reflects only the *delta* in cpu/mem
+            // (existing reservations are already counted in node.cpu_used /
+            // node.memory_used), so we only check headroom for the increase.
+            let cpu_delta = cpu
+                .map(|new_cpu| (new_cpu - stored.cpu).max(0))
+                .unwrap_or(0);
+            let mem_delta = mem
+                .map(|new_mem| (new_mem - stored.memory_bytes).max(0))
+                .unwrap_or(0);
+            if cpu_delta > 0 || mem_delta > 0 {
+                let preflight_spec = controller_proto::VmSpec {
+                    cpu: cpu_delta,
+                    memory_bytes: mem_delta,
+                    ..spec.clone()
+                };
+                let backend_for_preflight = if storage_backend_str.is_empty() {
+                    stored.storage_backend.as_str()
+                } else {
+                    storage_backend_str.as_str()
+                };
+                self.preflight_vm_create_on_node(&node, &preflight_spec, backend_for_preflight)?;
+            }
+
+            // Persist the new spec, then push declarative config to the node.
+            // If the push fails, roll back the DB update so the next retry
+            // sees the original spec and runs the reconcile again.
+            let updated = self
+                .db
+                .update_vm_spec(&stored.id, cpu, mem)
+                .map_err(|e| Status::internal(format!("updating vm spec: {e}")))?;
+            if !updated {
+                return Err(Status::not_found(format!(
+                    "VM '{}' disappeared during upsert",
+                    stored.id
+                )));
+            }
+            if let Err(e) = self.push_config_to_node(&node).await {
+                let rollback_cpu = cpu_changed.then_some(stored.cpu);
+                let rollback_mem = mem_changed.then_some(stored.memory_bytes);
+                if let Err(rollback_err) =
+                    self.db
+                        .update_vm_spec(&stored.id, rollback_cpu, rollback_mem)
+                {
+                    warn!(
+                        vm_id = %stored.id,
+                        node_id = %stored.node_id,
+                        error = %rollback_err,
+                        "failed to roll back vm spec after node push failure; DB may be inconsistent"
+                    );
+                }
+                return Err(e);
+            }
+            if cpu_changed {
+                changed_fields.push("cpu".into());
+            }
+            if mem_changed {
+                changed_fields.push("memory_bytes".into());
+            }
+
+            self.log_replication_event(
+                EVT_VM_UPDATE,
+                &format!("vm/{}", stored.id),
+                serde_json::json!({
+                    "vmId": stored.id,
+                    "nodeId": stored.node_id,
+                    "cpu": cpu,
+                    "memoryBytes": mem,
+                }),
+            );
+        }
+
+        let mut final_state_enum = current_state_enum;
+        if diff.mutable.iter().any(|f| f == "desired_state") {
+            let want_running = matches!(
+                controller_proto::VmDesiredState::try_from(spec.desired_state)
+                    .unwrap_or(controller_proto::VmDesiredState::Unspecified),
+                controller_proto::VmDesiredState::Running,
+            );
+            final_state_enum = self
+                .set_vm_desired_state_internal(&stored.id, "", want_running)
+                .await?;
+            changed_fields.push("desired_state".into());
+            self.log_replication_event(
+                EVT_VM_DESIRED_STATE_SET,
+                &format!("vm/{}", stored.id),
+                serde_json::json!({
+                    "vmId": stored.id,
+                    "targetNode": "",
+                    "autoStart": want_running,
+                }),
+            );
+        }
+
+        Ok(Response::new(controller_proto::CreateVmResponse {
+            vm_id: stored.id,
+            node_id: stored.node_id,
+            state: final_state_enum,
+            action: controller_proto::ApplyAction::Updated as i32,
+            changed_fields,
+        }))
+    }
+
     async fn ensure_admin_client_for_node(
         &self,
         node: &NodeRow,
@@ -1031,10 +1229,28 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateVmRequest>,
     ) -> Result<Response<controller_proto::CreateVmResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         let spec = req
             .spec
+            .take()
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+
+        // Upsert: if a VM with the requested name already exists, diff the
+        // incoming spec against the stored row and apply any mutable changes
+        // (rejecting immutable diffs). This makes CreateVm idempotent so
+        // `kctl apply -f` is a no-op when nothing changed.
+        let name_key = spec.name.trim().to_string();
+        if !name_key.is_empty() {
+            if let Some(existing) = self
+                .db
+                .list_vms()
+                .map_err(|e| Status::internal(format!("listing vms for upsert: {e}")))?
+                .into_iter()
+                .find(|v| v.name == name_key)
+            {
+                return self.upsert_existing_vm(req, spec, existing).await;
+            }
+        }
 
         let requested_storage_backend = normalize_storage_backend(req.storage_backend, true)?;
         let requested_storage_size_bytes = validate_storage_size_bytes(req.storage_size_bytes)?;
@@ -1258,6 +1474,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
             String::new()
         };
 
+        // Honor declarative desired_state when supplied; default to running.
+        let desired_auto_start =
+            match controller_proto::VmDesiredState::try_from(spec.desired_state)
+                .unwrap_or(controller_proto::VmDesiredState::Unspecified)
+            {
+                controller_proto::VmDesiredState::Stopped => false,
+                controller_proto::VmDesiredState::Running
+                | controller_proto::VmDesiredState::Unspecified => true,
+            };
+
         let vm = VmRow {
             id: vm_id.clone(),
             name: vm_name,
@@ -1269,7 +1495,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             image_format,
             image_size: 8192,
             network: vm_network,
-            auto_start: true,
+            auto_start: desired_auto_start,
             node_id: node.id.clone(),
             created_at: String::new(),
             runtime_state: "unknown".to_string(),
@@ -1371,6 +1597,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             vm_id,
             node_id: node.id,
             state: controller_proto::VmState::Stopped as i32,
+            action: controller_proto::ApplyAction::Created as i32,
+            changed_fields: Vec::new(),
         }))
     }
 
@@ -1552,6 +1780,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     }],
                     storage_backend: db_vm.storage_backend.clone(),
                     storage_size_bytes: db_vm.storage_size_bytes,
+                    desired_state: if db_vm.auto_start {
+                        controller_proto::VmDesiredState::Running as i32
+                    } else {
+                        controller_proto::VmDesiredState::Stopped as i32
+                    },
                 });
                 let status = Some(controller_proto::VmStatus {
                     id: db_vm.id.clone(),
@@ -1649,6 +1882,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 nics,
                 storage_backend: db_vm.storage_backend.clone(),
                 storage_size_bytes: db_vm.storage_size_bytes,
+                desired_state: if db_vm.auto_start {
+                    controller_proto::VmDesiredState::Running as i32
+                } else {
+                    controller_proto::VmDesiredState::Stopped as i32
+                },
             }
         });
 
@@ -1828,6 +2066,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     node_id: vm_resp.node_id,
                     vm_state: vm_resp.state,
                     container_state: controller_proto::ContainerState::Unknown as i32,
+                    action: vm_resp.action,
+                    changed_fields: vm_resp.changed_fields,
                 }))
             }
             controller_proto::WorkloadKind::Container => {
@@ -1839,6 +2079,102 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         "container_spec.name and container_spec.image are required",
                     ));
                 }
+
+                // Upsert: if a container workload with this name already exists,
+                // diff it and apply desired_state changes (or reject immutable
+                // field changes).
+                if let Some(existing) = self
+                    .db
+                    .get_workload(spec.name.trim())
+                    .map_err(|e| Status::internal(format!("fetching workload: {e}")))?
+                    .filter(|w| w.kind == "container")
+                {
+                    let storage_backend_str = if req.storage_backend == 0 {
+                        String::new()
+                    } else {
+                        normalize_storage_backend(req.storage_backend, false)?
+                    };
+                    let extras = crate::grpc::diff::StoredContainerExtras {
+                        image: existing.container_image.clone(),
+                        command: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        ports: Vec::new(),
+                        mount_target: String::new(),
+                    };
+                    let apply = crate::grpc::diff::ContainerApply {
+                        spec: &spec,
+                        storage_backend: &storage_backend_str,
+                        storage_size_bytes: req.storage_size_bytes,
+                    };
+                    let d = crate::grpc::diff::diff_container(&existing, &extras, &apply);
+
+                    if !d.immutable.is_empty() {
+                        return Err(Status::invalid_argument(format!(
+                            "cannot change immutable field(s) on container '{}': {} \
+                             (delete the container and recreate)",
+                            existing.name,
+                            d.immutable.join(", ")
+                        )));
+                    }
+
+                    let current_state_enum = match existing.runtime_state.as_str() {
+                        "running" => controller_proto::ContainerState::Running as i32,
+                        "stopped" => controller_proto::ContainerState::Stopped as i32,
+                        "created" => controller_proto::ContainerState::Created as i32,
+                        "error" => controller_proto::ContainerState::Error as i32,
+                        _ => controller_proto::ContainerState::Unknown as i32,
+                    };
+
+                    if d.mutable.is_empty() {
+                        return Ok(Response::new(controller_proto::CreateWorkloadResponse {
+                            kind: controller_proto::WorkloadKind::Container as i32,
+                            workload_id: existing.id,
+                            node_id: existing.node_id,
+                            vm_state: controller_proto::VmState::Unknown as i32,
+                            container_state: current_state_enum,
+                            action: controller_proto::ApplyAction::Unchanged as i32,
+                            changed_fields: Vec::new(),
+                        }));
+                    }
+
+                    let mut changed_fields: Vec<String> = Vec::new();
+                    let mut final_state_enum = current_state_enum;
+                    if d.mutable.iter().any(|f| f == "desired_state") {
+                        let want_running = matches!(
+                            controller_proto::WorkloadDesiredState::try_from(spec.desired_state)
+                                .unwrap_or(controller_proto::WorkloadDesiredState::Unspecified),
+                            controller_proto::WorkloadDesiredState::Running,
+                        );
+                        let resp = self
+                            .set_workload_desired_state(Request::new(
+                                controller_proto::SetWorkloadDesiredStateRequest {
+                                    kind: controller_proto::WorkloadKind::Container as i32,
+                                    workload_id: existing.id.clone(),
+                                    desired_state: if want_running {
+                                        controller_proto::WorkloadDesiredState::Running as i32
+                                    } else {
+                                        controller_proto::WorkloadDesiredState::Stopped as i32
+                                    },
+                                    target_node: String::new(),
+                                },
+                            ))
+                            .await?
+                            .into_inner();
+                        final_state_enum = resp.container_state;
+                        changed_fields.push("desired_state".into());
+                    }
+
+                    return Ok(Response::new(controller_proto::CreateWorkloadResponse {
+                        kind: controller_proto::WorkloadKind::Container as i32,
+                        workload_id: existing.id,
+                        node_id: existing.node_id,
+                        vm_state: controller_proto::VmState::Unknown as i32,
+                        container_state: final_state_enum,
+                        action: controller_proto::ApplyAction::Updated as i32,
+                        changed_fields,
+                    }));
+                }
+
                 let node = if !req.target_node.is_empty() {
                     self.db
                         .get_node_by_address(&req.target_node)
@@ -1885,14 +2221,57 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 } else {
                     created.id.clone()
                 };
+
+                // Honor declarative desired_state; default to running.
+                let desired_running = !matches!(
+                    controller_proto::WorkloadDesiredState::try_from(spec.desired_state)
+                        .unwrap_or(controller_proto::WorkloadDesiredState::Unspecified),
+                    controller_proto::WorkloadDesiredState::Stopped,
+                );
+
+                // For declarative desired_state=stopped: try to stop the
+                // container BEFORE persisting the row so that the persisted
+                // runtime_state and the response state never claim "stopped"
+                // while the container is actually still running on the node.
+                // The desired_state is recorded unconditionally so the
+                // reconciler keeps trying if the immediate stop attempt fails.
+                let mut runtime_state_str = "running".to_string();
+                let mut final_state = created.state;
+                if !desired_running {
+                    let mut stop_client = container.clone();
+                    match stop_client
+                        .stop_container(node_proto::StopContainerRequest {
+                            name: created.name.clone(),
+                        })
+                        .await
+                    {
+                        Ok(_) => {
+                            runtime_state_str = "stopped".to_string();
+                            final_state = controller_proto::ContainerState::Stopped as i32;
+                        }
+                        Err(e) => {
+                            warn!(
+                                name = %created.name,
+                                node_id = %node.id,
+                                error = %e,
+                                "failed to stop container after create for desired_state=stopped; reconciler will retry"
+                            );
+                        }
+                    }
+                }
+
                 self.db
                     .upsert_workload(&WorkloadRow {
                         id: workload_id.clone(),
                         name: created.name.clone(),
                         kind: "container".to_string(),
                         node_id: node.id.clone(),
-                        runtime_state: "running".to_string(),
-                        desired_state: "running".to_string(),
+                        runtime_state: runtime_state_str,
+                        desired_state: if desired_running {
+                            "running".to_string()
+                        } else {
+                            "stopped".to_string()
+                        },
                         vm_id: String::new(),
                         container_image: created.image.clone(),
                         network: spec.network.clone(),
@@ -1907,7 +2286,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     workload_id,
                     node_id: node.id,
                     vm_state: controller_proto::VmState::Unknown as i32,
-                    container_state: created.state,
+                    container_state: final_state,
+                    action: controller_proto::ApplyAction::Created as i32,
+                    changed_fields: Vec::new(),
                 }))
             }
             controller_proto::WorkloadKind::Unspecified => {
@@ -2162,6 +2543,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         storage_backend: wl.storage_backend.clone(),
                         storage_size_bytes: wl.storage_size_bytes,
                         mount_target: "/data".to_string(),
+                        desired_state: match wl.desired_state.as_str() {
+                            "running" => controller_proto::WorkloadDesiredState::Running as i32,
+                            "stopped" => controller_proto::WorkloadDesiredState::Stopped as i32,
+                            _ => controller_proto::WorkloadDesiredState::Unspecified as i32,
+                        },
                     }),
                     vm_status: None,
                     container_info: Some(controller_proto::ContainerInfo {
@@ -2280,19 +2666,54 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .ok_or_else(|| Status::unavailable("no ready nodes"))?
         };
 
-        if self
+        let network_type = validate_network_type(&req.network_type)?;
+
+        // Upsert: if the network already exists on this node, the request is
+        // idempotent: equal spec → UNCHANGED; any other change is rejected
+        // because every network field is immutable in v1.
+        if let Some(existing) = self
             .db
             .get_network_for_node(&node.id, &name)
             .map_err(|e| Status::internal(format!("checking existing network: {e}")))?
-            .is_some()
         {
-            return Err(Status::already_exists(format!(
-                "network '{}' already exists on node '{}'",
-                name, node.id
-            )));
+            let enable_outbound_nat_expected = match network_type.as_str() {
+                "bridge" => false,
+                "nat" => true,
+                "vxlan" => req.enable_outbound_nat,
+                _ => true,
+            };
+            let apply = crate::grpc::diff::NetworkApply {
+                external_ip: req.external_ip.trim(),
+                gateway_ip: req.gateway_ip.trim(),
+                internal_netmask: if req.internal_netmask.trim().is_empty() {
+                    "255.255.255.0"
+                } else {
+                    req.internal_netmask.trim()
+                },
+                allowed_tcp_ports: req.allowed_tcp_ports.clone(),
+                allowed_udp_ports: req.allowed_udp_ports.clone(),
+                vlan_id: req.vlan_id,
+                network_type: &network_type,
+                enable_outbound_nat: enable_outbound_nat_expected,
+            };
+            let diff = crate::grpc::diff::diff_network(&existing, &apply);
+            if !diff.immutable.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "cannot change immutable field(s) on network '{}' on node '{}': {} \
+                     (delete the network and recreate)",
+                    name,
+                    node.id,
+                    diff.immutable.join(", ")
+                )));
+            }
+            return Ok(Response::new(controller_proto::CreateNetworkResponse {
+                success: true,
+                message: format!("network '{name}' on node '{}' unchanged", node.id),
+                node_id: node.id,
+                action: controller_proto::ApplyAction::Unchanged as i32,
+                changed_fields: Vec::new(),
+            }));
         }
-
-        let network_type = validate_network_type(&req.network_type)?;
 
         if network_type == "bridge" && req.vlan_id == 0 {
             return Err(Status::failed_precondition(
@@ -2379,6 +2800,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             success: true,
             message: format!("created network '{name}' on node '{}'", node.id),
             node_id: node.id,
+            action: controller_proto::ApplyAction::Created as i32,
+            changed_fields: Vec::new(),
         }))
     }
 
@@ -2529,17 +2952,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .security_group
             .ok_or_else(|| Status::invalid_argument("security_group is required"))?;
         let name = validate_network_name(&sg.name)?;
-        let row = SecurityGroupRow {
-            name: name.clone(),
-            description: sg.description.trim().to_string(),
-            created_at: String::new(),
-        };
-        self.db
-            .upsert_security_group(&row)
-            .map_err(|e| Status::internal(format!("upserting security group: {e}")))?;
 
+        // Build the normalized incoming rule set (with ids + validations). We
+        // need these whether this is a create or an upsert so diffing can
+        // compare apples to apples.
         let mut rules = Vec::new();
-        for r in sg.rules {
+        for r in &sg.rules {
             let id = if r.id.trim().is_empty() {
                 Uuid::new_v4().to_string()
             } else {
@@ -2563,6 +2981,89 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 enable_dnat: r.enable_dnat,
             });
         }
+        let normalized_proto_rules: Vec<controller_proto::SecurityGroupRule> = rules
+            .iter()
+            .map(|r| controller_proto::SecurityGroupRule {
+                id: r.id.clone(),
+                protocol: r.protocol.clone(),
+                host_port: r.host_port,
+                target_port: r.target_port,
+                source_cidr: r.source_cidr.clone(),
+                target_vm: r.target_vm.clone(),
+                enable_dnat: r.enable_dnat,
+            })
+            .collect();
+
+        // Upsert: if a security group with this name already exists, run a
+        // diff and either no-op (UNCHANGED) or replace mutable fields
+        // (description/rules) and return UPDATED.
+        let existing_sg = self
+            .db
+            .get_security_group(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let incoming_description = sg.description.trim().to_string();
+
+        let (action, changed_fields) = if let Some(existing) = existing_sg {
+            let stored_rules = self
+                .db
+                .list_security_group_rules(&name)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let apply = crate::grpc::diff::SecurityGroupApply {
+                description: &incoming_description,
+                rules: &normalized_proto_rules,
+            };
+            let d = crate::grpc::diff::diff_security_group(&existing, &stored_rules, &apply);
+            if !d.immutable.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "cannot change immutable field(s) on security group '{name}': {} \
+                     (delete the security group and recreate)",
+                    d.immutable.join(", ")
+                )));
+            }
+            if d.mutable.is_empty() {
+                let rules_resp: Vec<controller_proto::SecurityGroupRule> = stored_rules
+                    .into_iter()
+                    .map(|r| controller_proto::SecurityGroupRule {
+                        id: r.id,
+                        protocol: r.protocol,
+                        host_port: r.host_port,
+                        target_port: r.target_port,
+                        source_cidr: r.source_cidr,
+                        target_vm: r.target_vm,
+                        enable_dnat: r.enable_dnat,
+                    })
+                    .collect();
+                return Ok(Response::new(
+                    controller_proto::CreateSecurityGroupResponse {
+                        success: true,
+                        security_group: Some(controller_proto::SecurityGroup {
+                            name: existing.name,
+                            description: existing.description,
+                            rules: rules_resp,
+                            created_at: parse_datetime_to_timestamp(&existing.created_at),
+                        }),
+                        action: controller_proto::ApplyAction::Unchanged as i32,
+                        changed_fields: Vec::new(),
+                    },
+                ));
+            }
+            (
+                controller_proto::ApplyAction::Updated as i32,
+                d.mutable.clone(),
+            )
+        } else {
+            (controller_proto::ApplyAction::Created as i32, Vec::new())
+        };
+
+        let row = SecurityGroupRow {
+            name: name.clone(),
+            description: incoming_description.clone(),
+            created_at: String::new(),
+        };
+        self.db
+            .upsert_security_group(&row)
+            .map_err(|e| Status::internal(format!("upserting security group: {e}")))?;
+
         self.db
             .replace_security_group_rules(&name, &rules)
             .map_err(|e| Status::internal(format!("storing security group rules: {e}")))?;
@@ -2582,6 +3083,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     "targetVm": r.target_vm,
                     "enableDnat": r.enable_dnat,
                 })).collect::<Vec<_>>(),
+                "action": match action {
+                    x if x == controller_proto::ApplyAction::Created as i32 => "created",
+                    x if x == controller_proto::ApplyAction::Updated as i32 => "updated",
+                    _ => "unchanged",
+                },
+                "changedFields": changed_fields,
             }),
         );
 
@@ -2615,6 +3122,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         .collect(),
                     created_at: parse_datetime_to_timestamp(&created.created_at),
                 }),
+                action,
+                changed_fields,
             },
         ))
     }
@@ -3042,29 +3551,52 @@ impl controller_proto::controller_server::Controller for ControllerService {
             ));
         }
 
+        let name = req.name.trim();
+        let public_key = req.public_key.trim();
+
+        // Upsert: if an SSH key with this name exists, compare public keys.
+        // public_key is immutable in v1 — any change is rejected so the user
+        // explicitly deletes and recreates (which invalidates old workloads).
+        if let Some((_, stored_pk, _)) = self
+            .db
+            .get_ssh_key(name)
+            .map_err(|e| Status::internal(format!("fetching ssh key: {e}")))?
+        {
+            let diff = crate::grpc::diff::diff_ssh_key(&stored_pk, public_key);
+            if !diff.immutable.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "cannot change immutable field(s) on SSH key '{name}': {} \
+                     (delete the key and recreate)",
+                    diff.immutable.join(", ")
+                )));
+            }
+            return Ok(Response::new(controller_proto::CreateSshKeyResponse {
+                success: true,
+                message: format!("SSH key '{name}' unchanged"),
+                action: controller_proto::ApplyAction::Unchanged as i32,
+                changed_fields: Vec::new(),
+            }));
+        }
+
         self.db
-            .insert_ssh_key(req.name.trim(), req.public_key.trim())
-            .map_err(|e| {
-                if e.to_string().contains("UNIQUE constraint") {
-                    Status::already_exists(format!("SSH key '{}' already exists", req.name))
-                } else {
-                    Status::internal(format!("storing ssh key: {e}"))
-                }
-            })?;
+            .insert_ssh_key(name, public_key)
+            .map_err(|e| Status::internal(format!("storing ssh key: {e}")))?;
 
         info!(name = %req.name, "created SSH key");
         self.log_replication_event(
             EVT_SSH_KEY_CREATE,
-            &format!("ssh-key/{}", req.name.trim()),
+            &format!("ssh-key/{name}"),
             serde_json::json!({
-                "name": req.name.trim(),
-                "publicKey": req.public_key.trim(),
+                "name": name,
+                "publicKey": public_key,
             }),
         );
 
         Ok(Response::new(controller_proto::CreateSshKeyResponse {
             success: true,
             message: format!("SSH key '{}' created", req.name),
+            action: controller_proto::ApplyAction::Created as i32,
+            changed_fields: Vec::new(),
         }))
     }
 
@@ -4334,6 +4866,7 @@ mod tests {
                 nics: vec![],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -4384,6 +4917,7 @@ mod tests {
                 nics: vec![],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             image_url: "https://example.com/debian.raw".to_string(),
             image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -4440,6 +4974,7 @@ mod tests {
                 nics: vec![],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -4490,6 +5025,7 @@ mod tests {
                 nics: vec![],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -4547,6 +5083,7 @@ mod tests {
                 nics: vec![],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -4598,6 +5135,7 @@ mod tests {
                 nics: vec![],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -4655,6 +5193,7 @@ mod tests {
                 nics: vec![],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -4705,6 +5244,7 @@ mod tests {
                 nics: vec![],
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -4945,6 +5485,7 @@ mod tests {
                         }],
                         storage_backend: String::new(),
                         storage_size_bytes: 0,
+                        desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                     }),
                     image_url: "https://example.com/img.raw".to_string(),
                     image_sha256:

@@ -1,10 +1,62 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde::Deserialize;
 
 use crate::config::{self, Context};
 use crate::pki;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+
+#[derive(Debug, Deserialize)]
+struct ClusterManifest {
+    metadata: ClusterMetadata,
+    spec: ClusterSpec,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterMetadata {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterSpec {
+    controller: String,
+    #[serde(alias = "certs_dir")]
+    certs_dir: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+pub fn create_from_manifest(file: &str, config_path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    let manifest: ClusterManifest = serde_yaml::from_str(&content)
+        .with_context(|| format!("parsing Cluster manifest {file}"))?;
+
+    let context_name = manifest.metadata.name;
+    let controller = &manifest.spec.controller;
+    let certs_dir = manifest
+        .spec
+        .certs_dir
+        .map(|p| {
+            if let Some(rest) = p.strip_prefix("~/") {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(rest)
+            } else {
+                PathBuf::from(&p)
+            }
+        })
+        .unwrap_or_else(|| config::default_cluster_certs_dir(&context_name));
+
+    create(
+        config_path,
+        controller,
+        &certs_dir,
+        &context_name,
+        manifest.spec.force,
+    )
+}
 
 pub fn create(
     config_path: &Path,
@@ -168,5 +220,73 @@ mod tests {
         let cfg = config::load_config(&config_path).expect("load config");
         let ctx = cfg.contexts.get("prod").expect("context");
         assert_eq!(ctx.controller, "10.0.0.1:9090");
+    }
+
+    #[test]
+    fn create_from_manifest_parses_yaml() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.yaml");
+        let manifest_path = temp.path().join("cluster.yaml");
+        let certs_dir = temp.path().join("my-certs");
+
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "kind: Cluster\nmetadata:\n  name: staging\nspec:\n  controller: 127.0.0.1:9090\n  certsDir: {}\n",
+                certs_dir.display()
+            ),
+        )
+        .expect("write manifest");
+
+        create_from_manifest(manifest_path.to_str().unwrap(), &config_path)
+            .expect("create_from_manifest");
+
+        let cfg = config::load_config(&config_path).expect("load config");
+        let ctx = cfg.contexts.get("staging").expect("context");
+        assert_eq!(ctx.controller, "127.0.0.1:9090");
+        assert!(ctx.ca_data.is_some());
+        assert!(certs_dir.join("controller.crt").exists());
+    }
+
+    #[test]
+    fn create_from_manifest_defaults_certs_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.yaml");
+        let manifest_path = temp.path().join("cluster.yaml");
+
+        std::fs::write(
+            &manifest_path,
+            "kind: Cluster\nmetadata:\n  name: testctx\nspec:\n  controller: 127.0.0.1:9090\n  force: true\n",
+        )
+        .expect("write manifest");
+
+        create_from_manifest(manifest_path.to_str().unwrap(), &config_path)
+            .expect("create_from_manifest");
+
+        let cfg = config::load_config(&config_path).expect("load config");
+        assert!(cfg.contexts.contains_key("testctx"));
+    }
+
+    #[test]
+    fn create_from_manifest_supports_snake_case() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.yaml");
+        let manifest_path = temp.path().join("cluster.yaml");
+        let certs_dir = temp.path().join("snake-certs");
+
+        std::fs::write(
+            &manifest_path,
+            format!(
+                "kind: Cluster\nmetadata:\n  name: snaketest\nspec:\n  controller: 127.0.0.1:9090\n  certs_dir: {}\n",
+                certs_dir.display()
+            ),
+        )
+        .expect("write manifest");
+
+        create_from_manifest(manifest_path.to_str().unwrap(), &config_path)
+            .expect("create_from_manifest with snake_case");
+
+        let cfg = config::load_config(&config_path).expect("load config");
+        assert!(cfg.contexts.contains_key("snaketest"));
     }
 }
