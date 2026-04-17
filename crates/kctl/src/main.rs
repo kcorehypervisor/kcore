@@ -1456,8 +1456,17 @@ async fn main() {
                     }
                 }
                 None => {
-                    let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-                    commands::apply::apply(&info, file, *dry_run).await
+                    if *dry_run {
+                        // Remote manifests: dry-run only prints YAML; do not
+                        // resolve the controller (bootstrap may not have one yet).
+                        println!("--- dry run ---");
+                        print!("{}", classified.content);
+                        println!("--- end ---");
+                        Ok(())
+                    } else {
+                        let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+                        commands::apply::apply(&info, file, false).await
+                    }
                 }
             }
         }

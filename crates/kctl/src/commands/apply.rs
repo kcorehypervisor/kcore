@@ -66,6 +66,12 @@ fn local_manifest_kind(kind: &str) -> Option<LocalManifestKind> {
 pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<()> {
     let classified = classify_manifest(file)?;
 
+    if let Some(local) = classified.local {
+        anyhow::bail!(
+            "internal error: manifest kind {local:?} must be handled locally; do not route through apply()"
+        );
+    }
+
     if dry_run {
         println!("--- dry run ---");
         print!("{}", classified.content);
@@ -197,7 +203,10 @@ metadata:
         let manifest = "kind: VM\n  bad: : :";
         let err = detect_manifest_kind(manifest).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("YAML"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("invalid YAML in manifest"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

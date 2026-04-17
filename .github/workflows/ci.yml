@@ -13,6 +13,7 @@ env:
 jobs:
   rust-checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,7 +38,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Check formatting
         run: cargo fmt --check
@@ -48,11 +51,22 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      # Speeds up `cargo audit` by reusing the cloned rustsec/advisory-db; the
+      # tool still fetches updates on each run when the remote has new commits.
+      - name: Cache RustSec advisory-db
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/advisory-db
+          key: rustsec-advisory-db-${{ runner.os }}-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            rustsec-advisory-db-${{ runner.os }}-v1-
+
       - name: Security audit
         run: cargo audit
 
   nix-checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
