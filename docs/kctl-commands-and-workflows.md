@@ -231,13 +231,13 @@ unchanged VM 'web-01'
 
 ### Mutable vs. immutable fields (v1)
 
-| Kind              | Mutable                                   | Immutable (rejects with `InvalidArgument`)                                                                                 |
-| ----------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| **VM**            | `cpu`, `memoryBytes`, `desiredState`      | `disks`, `nics`, `storageBackend`, `storageSizeBytes`, `targetNode`, `sshKeys`, `cloudInitUserData`, `image_*`             |
-| **Container**     | `desiredState`                            | `image`, `command`, `network`, `env`, `ports`, `storageBackend`, `storageSizeBytes`, `mountTarget`                         |
-| **Network**       | — (all immutable in v1)                   | all fields                                                                                                                 |
-| **SshKey**        | — (public key immutable)                  | `publicKey`                                                                                                                |
-| **SecurityGroup** | `description`, `rules`, attachments       | `name`                                                                                                                     |
+| Kind              | Mutable                                   | Immutable (rejects with `InvalidArgument`)                                                                                 | Notes |
+| ----------------- | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ----- |
+| **VM**            | `cpu`, `memoryBytes`, `desiredState`      | `disks`, `nics`, `storageBackend`, `storageSizeBytes`, `targetNode`*, `sshKeys`, `cloudInitUserData`, `image_*`              | *`targetDc` is not diff-rejected (see below). |
+| **Container**     | `desiredState`                            | `image`, `command`, `network`, `env`, `ports`, `storageBackend`, `storageSizeBytes`, `mountTarget`                         | — |
+| **Network**       | — (all immutable in v1)                   | all fields                                                                                                                 | — |
+| **SshKey**        | — (public key immutable)                  | `publicKey`                                                                                                                | — |
+| **SecurityGroup** | `description`, `rules`, attachments       | `name`                                                                                                                     | — |
 
 Rationale: v1 rejects any change that would require rebuilding or recreating
 the resource, so reconciliation stays predictable and safe. Future versions can
