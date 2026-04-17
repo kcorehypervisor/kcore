@@ -205,6 +205,18 @@ cargo kani -p kcore-kctl
 
 ### Phase 3: property-based testing on database invariants
 
+**Status:** shipped. Bounded `proptest` harnesses live in `crates/controller/src/db.rs` (`mod proptests`, ~256 randomised cases each, all running on `:memory:` SQLite).
+
+**Properties currently checked:**
+
+1. **Node CRUD round-trip** — `upsert_node` then `get_node` returns a structurally equal row across randomised id/hostname/address/cpu/memory/cert/dc fields.
+2. **Upsert idempotence** — two upserts of the same node produce a single `list_nodes` row.
+3. **Upsert updates fields in place** — two upserts with different `address` produce one row with the latest address.
+4. **Foreign-key integrity** — inserting a `VmRow` whose `node_id` does not exist in `nodes` MUST fail (relies on `PRAGMA foreign_keys=ON`).
+5. **VM CRUD round-trip** — `insert_vm` then `get_vm` returns matching scalar fields.
+6. **Delete consistency** — after `delete_vm_by_id_or_name`, the VM disappears from `get_vm`, `find_node_for_vm`, and `list_vms`.
+7. **Heartbeat idempotence (modulo timestamp)** — two `update_heartbeat` calls with identical args produce identical state in every field except `last_heartbeat`.
+
 **Target:** `crates/controller/src/db.rs`
 
 **Why third:** the database layer is the source of truth for the entire system. Subtle bugs here (a VM referencing a non-existent node, a heartbeat updating a deleted node) propagate silently and cause wrong Nix configs to be pushed.
@@ -224,6 +236,21 @@ cargo kani -p kcore-kctl
 **Effort estimate:** 2–3 days. Requires building `proptest` strategies for `NodeRow` and `VmRow` with constrained string fields.
 
 ### Phase 4: TLA+ model of controller–node reconciliation
+
+**Status:** shipped. Bounded TLC model checks run as a required CI gate in `.github/workflows/formal-checks.yml`. The specs live in `specs/tla/`:
+
+- `ControllerNodeReconcile.tla` — controller ↔ node reconciliation.
+- `ControllerReplication.tla` — single-DC replication protocol.
+- `CrossDcReplication.tla` — multi-DC replication with safety **and** liveness properties; the latest local run explored 206 280 distinct states across 3 941 400 generated states with no error found.
+
+Run locally:
+
+```bash
+make test-tla            # bounded TLC checks (requires java + tla2tools.jar)
+make test-tla-trace      # replication trace drift checker
+```
+
+The trace bridge in `make test-tla-trace` validates Rust runtime traces against the TLA+ invariants, closing the gap between the model and the code.
 
 **Target:** the distributed protocol between `kcore-controller` and `kcore-node-agent`.
 
@@ -273,11 +300,18 @@ Specifically, do not invest formal verification effort in:
 
 ## Summary
 
-| Phase | Technique | Target | Effort | Confidence gained |
+| Phase | Technique | Target | Status | Confidence gained |
 |-------|-----------|--------|--------|-------------------|
-| 1 | proptest | `nixgen.rs` escaping and generation | 1–2 days | High — catches injection edge cases |
-| 2 | Kani | `nixgen.rs`, disk path validation | 1–2 days | Very high — exhaustive within bounds |
-| 3 | proptest | `db.rs` CRUD invariants | 2–3 days | High — catches state consistency bugs |
-| 4 | TLA+ | Controller ↔ node reconciliation | 1–2 weeks | Highest — catches distributed protocol bugs |
+| 1 | proptest | `nixgen.rs` escaping and generation | **Shipped** | High — catches injection edge cases |
+| 2 | Kani | `nixgen.rs`, path-safety validators | **Shipped (first cut)** | Very high — exhaustive within bounds |
+| 3 | proptest | `db.rs` CRUD invariants | **Shipped** | High — catches state consistency bugs |
+| 4 | TLA+ | Controller ↔ node reconciliation | **Shipped** | Highest — catches distributed protocol bugs |
 
-Phases 1 and 2 can be done in a single iteration. Phase 3 follows naturally. Phase 4 should be started when the reconciliation loop gains retry logic, generation counters, or multi-node rollout sequencing — at that point the complexity will exceed what manual reasoning can reliably cover.
+All four phases are now landed. Each one is wired into CI (`make test`, `make kani`, `make test-tla`, `make test-tla-trace`) so a regression on any property fails the pull-request check.
+
+**Next-iteration follow-ups (not blockers):**
+
+- Raise the Kani `MAX_INPUT_LEN` bound once we've measured CI runtime cost.
+- Add Kani harnesses for `validate_safe_segment` / `validate_path_under_root` once `crates/node-agent/src/path_safety.rs` lands.
+- Extend Phase 3 proptests to cover replication outbox CRUD and security-group rule round-trips.
+- Add TLA+ invariants for the new compensation executor and replication reservations.

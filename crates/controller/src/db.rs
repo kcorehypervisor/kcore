@@ -3554,3 +3554,305 @@ mod tests {
         assert_eq!(peers[0].address, "10.0.2.1:9090");
     }
 }
+
+/// Property-based tests (Phase 3) — database CRUD invariants.
+///
+/// `db.rs` is the source of truth for the entire system: a subtle bug
+/// here (a VM that survives its node, an upsert that creates a duplicate,
+/// a heartbeat that flips approval state) propagates silently and can
+/// cause wrong Nix configs to be pushed. The example tests in
+/// `mod tests` cover one concrete row at a time; these proptests cover
+/// the same invariants over thousands of randomised rows.
+///
+/// Each test opens a fresh `:memory:` SQLite database so cases are
+/// independent. The `Database::open(":memory:")` call is cheap (~µs)
+/// because the in-memory file lives only for the duration of the test.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Build a `NodeRow` with caller-supplied identifying / quantitative
+    /// fields and sensible defaults for the rest. Centralised so each
+    /// test only has to randomise the fields it cares about.
+    fn make_node(
+        id: &str,
+        hostname: &str,
+        address: &str,
+        cpu_cores: i32,
+        memory_bytes: i64,
+        cpu_used: i32,
+        memory_used: i64,
+        disable_vxlan: bool,
+        cert_expiry_days: i32,
+        dc_id: &str,
+    ) -> NodeRow {
+        NodeRow {
+            id: id.to_string(),
+            hostname: hostname.to_string(),
+            address: address.to_string(),
+            cpu_cores,
+            memory_bytes,
+            status: "ready".to_string(),
+            last_heartbeat: String::new(),
+            gateway_interface: "eno1".to_string(),
+            cpu_used,
+            memory_used,
+            storage_backend: "filesystem".to_string(),
+            disable_vxlan,
+            approval_status: "approved".to_string(),
+            cert_expiry_days,
+            luks_method: String::new(),
+            dc_id: dc_id.to_string(),
+        }
+    }
+
+    /// Build a minimal `VmRow` for a given node, randomising only the
+    /// fields each test cares about.
+    #[allow(clippy::too_many_arguments)]
+    fn make_vm(
+        id: &str,
+        name: &str,
+        node_id: &str,
+        cpu: i32,
+        memory_bytes: i64,
+        auto_start: bool,
+    ) -> VmRow {
+        VmRow {
+            id: id.to_string(),
+            name: name.to_string(),
+            cpu,
+            memory_bytes,
+            image_path: format!("/var/lib/kcore/images/{name}.raw"),
+            image_url: String::new(),
+            image_sha256: String::new(),
+            image_format: "raw".to_string(),
+            image_size: 8192,
+            network: "default".to_string(),
+            auto_start,
+            node_id: node_id.to_string(),
+            created_at: String::new(),
+            runtime_state: "unknown".to_string(),
+            cloud_init_user_data: String::new(),
+            storage_backend: "filesystem".to_string(),
+            storage_size_bytes: 0,
+            vm_ip: String::new(),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // SQLite open + a handful of statements per case is fast
+            // enough for ~256 cases per test; 2 000 (the controller-
+            // pure proptest budget) would add noticeable wall time
+            // without finding new bugs.
+            cases: 256,
+            .. ProptestConfig::default()
+        })]
+
+        /// **Node CRUD round-trip**: for any randomised `NodeRow`,
+        /// `upsert_node` followed by `get_node` returns a row whose
+        /// scalar fields equal the inserted ones.
+        #[test]
+        fn node_upsert_then_get_returns_same_row(
+            id in "[a-z0-9-]{1,12}",
+            hostname in "[a-z0-9-]{1,12}",
+            address in "[a-z0-9.:-]{1,24}",
+            cpu_cores in 1i32..=128,
+            memory_bytes in 1i64..(1i64 << 40),
+            cpu_used in 0i32..=128,
+            memory_used in 0i64..(1i64 << 40),
+            disable_vxlan in any::<bool>(),
+            cert_expiry_days in -1i32..=3650,
+            dc_id in prop::sample::select(vec!["DC1", "DC2", "EU-W"]),
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            let node = make_node(
+                &id, &hostname, &address,
+                cpu_cores, memory_bytes,
+                cpu_used, memory_used,
+                disable_vxlan, cert_expiry_days,
+                dc_id,
+            );
+            db.upsert_node(&node).unwrap();
+
+            let got = db.get_node(&id).unwrap().expect("node exists after upsert");
+            prop_assert_eq!(&got.id, &node.id);
+            prop_assert_eq!(&got.hostname, &node.hostname);
+            prop_assert_eq!(&got.address, &node.address);
+            prop_assert_eq!(got.cpu_cores, node.cpu_cores);
+            prop_assert_eq!(got.memory_bytes, node.memory_bytes);
+            prop_assert_eq!(got.cpu_used, node.cpu_used);
+            prop_assert_eq!(got.memory_used, node.memory_used);
+            prop_assert_eq!(got.disable_vxlan, node.disable_vxlan);
+            prop_assert_eq!(got.cert_expiry_days, node.cert_expiry_days);
+            prop_assert_eq!(&got.dc_id, &node.dc_id);
+        }
+
+        /// **Upsert idempotence**: upserting the same node twice yields
+        /// a single row in `list_nodes` (no PK duplicate, no orphan).
+        #[test]
+        fn node_upsert_is_idempotent(
+            id in "[a-z0-9-]{1,12}",
+            cpu_cores in 1i32..=128,
+            memory_bytes in 1i64..(1i64 << 40),
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            let node = make_node(
+                &id, "h", "127.0.0.1:9091",
+                cpu_cores, memory_bytes,
+                0, 0, false, 0, "DC1",
+            );
+            db.upsert_node(&node).unwrap();
+            db.upsert_node(&node).unwrap();
+
+            let nodes = db.list_nodes().unwrap();
+            prop_assert_eq!(nodes.len(), 1);
+            prop_assert_eq!(&nodes[0].id, &id);
+            prop_assert_eq!(nodes[0].cpu_cores, cpu_cores);
+            prop_assert_eq!(nodes[0].memory_bytes, memory_bytes);
+        }
+
+        /// **Upsert updates fields in place**: upserting a node twice
+        /// with different `address` values yields exactly one row
+        /// whose address is the most recently provided one.
+        #[test]
+        fn node_upsert_updates_address_in_place(
+            id in "[a-z0-9-]{1,12}",
+            addr_a in "[a-z0-9.:-]{1,24}",
+            addr_b in "[a-z0-9.:-]{1,24}",
+        ) {
+            prop_assume!(addr_a != addr_b);
+            let db = Database::open(":memory:").expect("open db");
+            let mut node = make_node(
+                &id, "h", &addr_a, 1, 1024, 0, 0, false, 0, "DC1",
+            );
+            db.upsert_node(&node).unwrap();
+            node.address = addr_b.clone();
+            db.upsert_node(&node).unwrap();
+
+            let nodes = db.list_nodes().unwrap();
+            prop_assert_eq!(nodes.len(), 1);
+            prop_assert_eq!(&nodes[0].address, &addr_b);
+        }
+
+        /// **Foreign-key integrity on VMs**: inserting a `VmRow` whose
+        /// `node_id` does not exist in `nodes` MUST fail. SQLite's
+        /// `PRAGMA foreign_keys=ON` is enabled in `Database::open`, so
+        /// this is the property that protects the controller from
+        /// scheduling a workload onto a phantom node.
+        #[test]
+        fn vm_insert_rejects_unknown_node_id(
+            present_node in "[a-z0-9-]{1,8}",
+            missing_node in "[a-z0-9-]{1,8}",
+            vm_id in "[a-z0-9-]{1,8}",
+        ) {
+            prop_assume!(present_node != missing_node);
+            let db = Database::open(":memory:").expect("open db");
+            db.upsert_node(&make_node(
+                &present_node, "h", "127.0.0.1:9091",
+                1, 1024, 0, 0, false, 0, "DC1",
+            )).unwrap();
+
+            let vm = make_vm(&vm_id, &vm_id, &missing_node, 1, 1024, false);
+            let err = db.insert_vm(&vm).unwrap_err();
+            // SQLite reports FK violations as ConstraintViolation /
+            // SqliteFailure with extended code FOREIGN_KEY (787).
+            prop_assert!(
+                err.to_string().to_ascii_lowercase().contains("foreign"),
+                "expected FOREIGN KEY error for unknown node, got: {err}"
+            );
+        }
+
+        /// **VM CRUD round-trip**: insert + get_vm returns a row whose
+        /// scalar fields match the inserted ones.
+        #[test]
+        fn vm_insert_then_get_returns_same_row(
+            node_id in "[a-z0-9-]{1,8}",
+            vm_id in "[a-z0-9-]{1,8}",
+            name in "[a-z0-9-]{1,12}",
+            cpu in 1i32..=64,
+            memory_bytes in 1i64..(1i64 << 40),
+            auto_start in any::<bool>(),
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            db.upsert_node(&make_node(
+                &node_id, "h", "127.0.0.1:9091",
+                4, 1024, 0, 0, false, 0, "DC1",
+            )).unwrap();
+            let vm = make_vm(&vm_id, &name, &node_id, cpu, memory_bytes, auto_start);
+            db.insert_vm(&vm).unwrap();
+
+            let got = db.get_vm(&vm_id).unwrap().expect("vm exists");
+            prop_assert_eq!(&got.id, &vm.id);
+            prop_assert_eq!(&got.name, &vm.name);
+            prop_assert_eq!(got.cpu, vm.cpu);
+            prop_assert_eq!(got.memory_bytes, vm.memory_bytes);
+            prop_assert_eq!(got.auto_start, vm.auto_start);
+            prop_assert_eq!(&got.node_id, &vm.node_id);
+        }
+
+        /// **Delete consistency**: after `delete_vm_by_id_or_name`, the
+        /// VM disappears from every observable view.
+        #[test]
+        fn vm_delete_removes_from_all_views(
+            node_id in "[a-z0-9-]{1,8}",
+            vm_id in "[a-z0-9-]{1,8}",
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            db.upsert_node(&make_node(
+                &node_id, "h", "127.0.0.1:9091",
+                4, 1024, 0, 0, false, 0, "DC1",
+            )).unwrap();
+            // Use the same string for id and name so deletion by either
+            // matches the row.
+            let vm = make_vm(&vm_id, &vm_id, &node_id, 1, 1024, false);
+            db.insert_vm(&vm).unwrap();
+            prop_assert!(db.get_vm(&vm_id).unwrap().is_some());
+
+            let deleted = db.delete_vm_by_id_or_name(&vm_id).unwrap();
+            prop_assert!(deleted);
+            prop_assert!(db.get_vm(&vm_id).unwrap().is_none());
+            prop_assert!(db.find_node_for_vm(&vm_id).unwrap().is_none());
+            let listed = db.list_vms().unwrap();
+            prop_assert!(
+                !listed.iter().any(|v| v.id == vm_id),
+                "deleted vm {vm_id:?} still appears in list_vms()"
+            );
+        }
+
+        /// **Heartbeat idempotence (modulo timestamp)**: calling
+        /// `update_heartbeat` twice with identical arguments produces
+        /// the same node state in every field except `last_heartbeat`
+        /// (which is `datetime('now')` and may shift between calls).
+        ///
+        /// This is the invariant that protects the scheduler from
+        /// flapping resource reservations on a quiet, healthy node.
+        #[test]
+        fn heartbeat_is_idempotent_modulo_timestamp(
+            node_id in "[a-z0-9-]{1,8}",
+            cpu_used in 0i32..=64,
+            mem_used in 0i64..(1i64 << 36),
+            cert_days in -1i32..=3650,
+            luks in prop::sample::select(vec!["", "tpm", "passphrase"]),
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            db.upsert_node(&make_node(
+                &node_id, "h", "127.0.0.1:9091",
+                4, 1024, 0, 0, false, 0, "DC1",
+            )).unwrap();
+
+            db.update_heartbeat(&node_id, cpu_used, mem_used, cert_days, luks).unwrap();
+            let after_first = db.get_node(&node_id).unwrap().expect("node");
+            db.update_heartbeat(&node_id, cpu_used, mem_used, cert_days, luks).unwrap();
+            let after_second = db.get_node(&node_id).unwrap().expect("node");
+
+            prop_assert_eq!(after_first.cpu_used, after_second.cpu_used);
+            prop_assert_eq!(after_first.memory_used, after_second.memory_used);
+            prop_assert_eq!(after_first.cert_expiry_days, after_second.cert_expiry_days);
+            prop_assert_eq!(&after_first.luks_method, &after_second.luks_method);
+            prop_assert_eq!(&after_first.status, &after_second.status);
+            prop_assert_eq!(&after_first.approval_status, &after_second.approval_status);
+        }
+    }
+}
