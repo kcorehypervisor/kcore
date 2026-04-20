@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.102"
+kcore-sanitize = { path = "../kcore-sanitize" }
 clap = { version = "4", features = ["derive"] }
 pem = "3"
 prost = "0.13"

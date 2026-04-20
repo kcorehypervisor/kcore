@@ -1417,6 +1417,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "kcore-sanitize",
  "libc",
  "pem",
  "proptest",
@@ -1474,6 +1475,7 @@ dependencies = [
  "base64",
  "clap",
  "dirs",
+ "kcore-sanitize",
  "prost",
  "prost-types",
  "rcgen",
@@ -1501,6 +1503,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "hyperlocal",
+ "kcore-sanitize",
  "libc",
  "pem",
  "prost",
@@ -1520,6 +1523,10 @@ dependencies = [
  "tracing-subscriber",
  "x509-parser",
 ]
+
+[[package]]
+name = "kcore-sanitize"
+version = "0.1.0"
 
 [[package]]
 name = "lazy_static"
