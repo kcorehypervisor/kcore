@@ -88,14 +88,22 @@ jobs:
 
       # Caches the Kani toolchain itself (CBMC + symex binaries +
       # ~/.kani layout). Cold install of kani-verifier from crates.io
-      # takes ~8 min on a 4-vCPU GHA runner; cached install is ~30 s.
-      # The cache key is tied to `KANI_VERSION` so a version bump
-      # automatically invalidates the cache. `restore-keys` lets a
-      # newer version fall back to the most recent compatible cache
-      # for cargo registry warm-up.
-      - name: Cache Kani toolchain
+      # plus `cargo-kani setup` (which downloads a ~140 MB CBMC
+      # tarball) takes ~5-10 min on a 4-vCPU GHA runner; a cache hit
+      # is ~30 s.
+      #
+      # IMPORTANT: we split the cache into separate `restore` and
+      # `save` steps so the cache is written **even when the job
+      # fails** (`save` runs with `if: always()`). With the default
+      # combined `actions/cache@v4`, the cache is only persisted on
+      # job success — so a single failing proof or a timed-out step
+      # would force every retry to pay the full cold install cost
+      # again. With save-on-failure, the second iteration on the
+      # same `KANI_VERSION` hits the cache regardless of whether the
+      # previous run passed.
+      - name: Restore Kani toolchain cache
         id: kani-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/bin/cargo-kani
@@ -175,3 +183,21 @@ jobs:
           cargo kani -p kcore-sanitize \
             --jobs "$(nproc)" \
             --output-format terse
+
+      # Save the Kani toolchain cache regardless of whether the
+      # proofs above passed or failed. This is the entire point of
+      # using the split restore/save pair: a failing proof or a
+      # CBMC timeout no longer invalidates the (expensive)
+      # `cargo-kani` install + `cargo-kani setup` work that the
+      # next push would otherwise have to redo from scratch.
+      #
+      # Skipped on cache hit (no point re-uploading the same blob).
+      - name: Save Kani toolchain cache
+        if: always() && steps.kani-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: ${{ steps.kani-cache.outputs.cache-primary-key }}
