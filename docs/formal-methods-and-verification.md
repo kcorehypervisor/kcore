@@ -162,15 +162,19 @@ proptest! {
 ```bash
 cargo install --locked kani-verifier --version 0.67.0
 cargo kani setup
-make kani                 # cargo kani -p kcore-sanitize --jobs $(nproc) --output-format terse
+make kani                 # cargo kani -p kcore-sanitize --jobs 2 --output-format terse
+# locally, override parallelism with KANI_JOBS=4 make kani if you have memory headroom
 ```
 
-**CI:** the `kani` job in `.github/workflows/formal-checks.yml` pins `kani-verifier` to a known version (`KANI_VERSION` env var, currently `0.67.0`), installs it directly with that pin (cache key derived from the pin so version bumps invalidate `~/.kani` automatically), and runs the proofs in parallel with `cargo kani -p kcore-sanitize --jobs $(nproc) --output-format terse`. The 11 harnesses are independent, so on the standard 4-vCPU `ubuntu-latest` runner wall-clock is ~3–4 min, well under the step's 25-min budget.
+**CI:** the `kani` job in `.github/workflows/formal-checks.yml` pins `kani-verifier` to a known version (`KANI_VERSION` env var, currently `0.67.0`) and runs the proofs with `cargo kani -p kcore-sanitize --jobs 2 --output-format terse`. On a standard 4-vCPU / 16 GB `ubuntu-latest` runner this is ~5–6 min for all 11 harnesses, well under the step's 25-min budget.
 
-Two non-obvious requirements from `kani-verifier` 0.67's argument parser, both of which broke earlier CI attempts:
+Three non-obvious CI requirements, each of which has bitten this gate at least once:
 
-1. `--jobs` was stabilised in 0.63, so it no longer needs (and on newer Kani it actively rejects) `-Z unstable-options`.
+1. `--jobs` was stabilised in `kani-verifier` 0.63, so it no longer needs (and on newer Kani it actively rejects) `-Z unstable-options`.
 2. `--jobs N` with `N > 1` is rejected at argument validation unless `--output-format terse` is also supplied (`Conflicting options: --jobs requires '--output-format=terse'`). Without `terse`, the proof step fails within seconds of starting.
+3. `--jobs $(nproc)` (i.e. 4 on `ubuntu-latest`) has repeatedly OOM-killed the runner because each CBMC instance peaks at multiple GB on the larger harnesses. We cap at `--jobs 2` to stay safely under the 16 GB ceiling. GHA reports OOM cancellation as the unhelpful "The operation was canceled" — if that resurfaces, lower to `--jobs 1`.
+
+**Cache strategy:** the toolchain cache (`~/.cargo/bin/cargo-kani`, `~/.cargo/bin/kani`, `~/.kani/`) is saved **immediately after install completes**, before the proof step runs. GitHub Actions does not execute steps after a job-level cancellation (manual Cancel, OOM, or hard timeout) even when guarded with `if: always()`, so a trailing save step is unreliable. Saving post-install means every subsequent run on the same `KANI_VERSION` skips install entirely (~30 s vs ~5–10 min) regardless of whether prior proof attempts passed, failed, or were cancelled.
 
 **Follow-up work:**
 

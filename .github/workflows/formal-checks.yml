@@ -129,6 +129,7 @@ jobs:
       # payload (~1 min) every time it runs even when the layout is
       # already in place.
       - name: Install kani-verifier
+        id: kani-install
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -149,51 +150,29 @@ jobs:
             echo "kani toolchain restored from cache, skipping cargo-kani setup"
           fi
 
-      # All proofs live in `kcore-sanitize`, a leaf crate with **no
-      # non-std dependencies**, so Kani only has to compile that one
-      # crate (a few seconds) instead of the full controller dep
-      # graph (rusqlite-bundled SQLite, rcgen+aws-lc-rs, tonic, ...
-      # which takes >20 min on a 4-vCPU GHA runner).
+      # Save the Kani toolchain cache **immediately after install**,
+      # before the proof step (which can fail, time out, OOM, or be
+      # cancelled by the user). This is the only reliable way to
+      # warm the cache for subsequent runs:
       #
-      # The 11 #[kani::proof] harnesses in `crates/kcore-sanitize/src/
-      # lib.rs` are independent, so we run them in parallel with
-      # `--jobs $(nproc)`. On a 4-vCPU runner this brings wall-clock
-      # from ~10-12 min (sequential) down to ~3-4 min, well under the
-      # 25-min step budget.
+      #   - GitHub Actions does NOT execute steps after a job-level
+      #     cancellation, even those guarded with `if: always()`.
+      #     A trailing "save on always" step is therefore useless
+      #     when the user clicks Cancel or when the runner OOM-
+      #     kills the job (both of which we have hit on this PR).
       #
-      # Two things matter here that bit a previous attempt:
-      #   1. `--jobs` was stabilised in kani-verifier 0.63 (we pin
-      #      0.67.0), so it does NOT need `-Z unstable-options`.
-      #      Passing `-Z unstable-options` together with `--jobs` on
-      #      0.67 emits a "no effect" warning in some builds and a
-      #      hard error in newer ones, so the simplest portable
-      #      invocation just drops it.
-      #   2. `--jobs N` with N>1 is rejected at argument validation
-      #      with `Conflicting options: --jobs requires
-      #      \`--output-format=terse\`` unless `--output-format=terse`
-      #      is also supplied. See
-      #      kani-driver/src/args/mod.rs::VerificationArgs::validate
-      #      in kani-0.67.0. Without it, the step fails within
-      #      seconds of starting.
-      - name: Run bounded Kani proofs
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          cargo-kani --version
-          cargo kani -p kcore-sanitize \
-            --jobs "$(nproc)" \
-            --output-format terse
-
-      # Save the Kani toolchain cache regardless of whether the
-      # proofs above passed or failed. This is the entire point of
-      # using the split restore/save pair: a failing proof or a
-      # CBMC timeout no longer invalidates the (expensive)
-      # `cargo-kani` install + `cargo-kani setup` work that the
-      # next push would otherwise have to redo from scratch.
+      #   - Saving here means: the moment kani-verifier is installed
+      #     and ~/.kani is populated, the cache is uploaded. Any
+      #     future run on the same `KANI_VERSION` skips install
+      #     entirely (~30 s instead of ~5-10 min), regardless of
+      #     whether earlier attempts at the proof step succeeded,
+      #     failed, or were cancelled.
       #
-      # Skipped on cache hit (no point re-uploading the same blob).
-      - name: Save Kani toolchain cache
-        if: always() && steps.kani-cache.outputs.cache-hit != 'true'
+      # Skipped when we already restored a cache hit (the same key
+      # is already present, and `actions/cache/save` would otherwise
+      # log an error trying to overwrite it).
+      - name: Save Kani toolchain cache (post-install)
+        if: steps.kani-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -201,3 +180,41 @@ jobs:
             ~/.cargo/bin/kani
             ~/.kani
           key: ${{ steps.kani-cache.outputs.cache-primary-key }}
+
+      # All proofs live in `kcore-sanitize`, a leaf crate with **no
+      # non-std dependencies**, so Kani only has to compile that one
+      # crate (a few seconds) instead of the full controller dep
+      # graph (rusqlite-bundled SQLite, rcgen+aws-lc-rs, tonic, ...
+      # which takes >20 min on a 4-vCPU GHA runner).
+      #
+      # The 11 #[kani::proof] harnesses in `crates/kcore-sanitize/
+      # src/lib.rs` are independent. We deliberately run with
+      # `--jobs 2` (NOT `$(nproc)`):
+      #
+      #   - `ubuntu-latest` is 4 vCPU / 16 GB. Each CBMC instance
+      #     can peak at multiple GB during SAT solving on the
+      #     larger harnesses, so 4 parallel CBMC processes have
+      #     repeatedly exceeded the runner's memory budget on this
+      #     PR, leading to job-level OOM cancellation that GHA
+      #     reports as "The operation was canceled."
+      #
+      #   - `--jobs 2` keeps peak memory comfortably under the 16
+      #     GB ceiling. Wall-clock for 11 harnesses is ~5-6 min
+      #     instead of ~3 min, which is fine: the step has a
+      #     25-min timeout.
+      #
+      # Two argv requirements that bit earlier attempts:
+      #   1. `--jobs` was stabilised in kani-verifier 0.63 (we pin
+      #      0.67.0), so it does NOT need `-Z unstable-options`.
+      #   2. `--jobs N` with N>1 is rejected at argument validation
+      #      unless `--output-format=terse` is also supplied. See
+      #      kani-driver/src/args/mod.rs::VerificationArgs::validate
+      #      in kani-0.67.0.
+      - name: Run bounded Kani proofs
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          cargo-kani --version
+          cargo kani -p kcore-sanitize \
+            --jobs 2 \
+            --output-format terse
