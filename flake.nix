@@ -155,6 +155,7 @@
               pkgs.cargo-audit
               pkgs.protobuf
               pkgs.grpcurl
+              pkgs.gh
               pkgs.cmake
               pkgs.perl
               pkgs.statix
