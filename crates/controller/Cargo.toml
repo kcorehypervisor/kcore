@@ -30,7 +30,7 @@ libc = "0.2"
 tonic-build = "0.12"
 
 [dev-dependencies]
-proptest = "1"
+proptest = "1.11"
 
 [lints]
 workspace = true
