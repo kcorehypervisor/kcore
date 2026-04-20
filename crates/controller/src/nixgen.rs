@@ -25,39 +25,11 @@ fn netmask_to_cidr(mask: &str) -> u8 {
         .sum()
 }
 
-/// Escape a string for use inside a Nix double-quoted string literal.
-/// Handles `\` → `\\`, `"` → `\"`, and `${` → `\${` (prevents interpolation).
-fn nix_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => out.push_str("\\\\"),
-            b'"' => out.push_str("\\\""),
-            b'$' if bytes.get(i + 1) == Some(&b'{') => {
-                out.push_str("\\${");
-                i += 1;
-            }
-            _ => out.push(bytes[i] as char),
-        }
-        i += 1;
-    }
-    out
-}
-
-/// Strip a Nix attribute key to only safe characters (alphanumeric, dash, underscore).
-fn sanitize_nix_attr_key(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
+// `nix_escape` and `sanitize_nix_attr_key` live in the leaf
+// `kcore-sanitize` crate, where they are exhaustively verified
+// with Kani. Re-exported here so the rest of `nixgen.rs` keeps
+// using the unqualified names.
+use kcore_sanitize::{nix_escape, sanitize_nix_attr_key};
 
 pub fn generate_node_config(
     vms: &[VmRow],

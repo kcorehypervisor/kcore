@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+kcore-sanitize = { path = "../kcore-sanitize" }
 hostname = "0.4"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
@@ -34,3 +35,6 @@ tonic-build = "0.12"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "3"
 proptest = "1.11"
+
+[lints]
+workspace = true

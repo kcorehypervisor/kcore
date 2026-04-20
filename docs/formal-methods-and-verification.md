@@ -133,71 +133,100 @@ proptest! {
 
 ### Phase 2: Kani harnesses for critical pure functions
 
-**Target:** same `nixgen.rs` functions, plus disk path validation in `admin.rs`.
+**Status:** shipped. Every bounded model-checking proof lives in a single dedicated crate, [`crates/kcore-sanitize`](../crates/kcore-sanitize/src/lib.rs), which contains:
 
-**Why second:** Kani gives exhaustive guarantees within bounds, upgrading from "probably correct for random inputs" (proptest) to "provably correct for all inputs up to length N". This matters for security-sensitive escaping.
+- `nix_escape` and `sanitize_nix_attr_key` — Nix string-literal escaping.
+- `path_segments_include_dot_dot` and `assert_safe_path` — generic path-traversal guards used by `kcore-controller` and `kcore-kctl`.
+- `validate_safe_segment` and `validate_path_under_root` — node-agent-side guards for tenant-supplied path segments and absolute paths.
 
-**Harnesses to write:**
+`kcore-controller`, `kcore-kctl` and `kcore-node-agent` all delegate to this crate via thin wrappers in their own `path_safety.rs` / `nixgen.rs`, preserving their existing public APIs (which embed a `label` for human-readable error messages) without duplicating the validators.
 
-1. **`nix_escape` does not panic** — for all byte sequences up to length 32, `nix_escape` terminates without panic.
+**Why a separate crate?** Kani compiles every crate it analyses through its own `goto-c` `rustc` wrapper. Pointing `cargo kani` at `kcore-controller` (which transitively depends on rusqlite-bundled SQLite, rcgen+aws-lc-rs, tonic, rustls, x509-parser …) takes >20 minutes on the 4-vCPU GitHub Actions runner before any proof runs. `kcore-sanitize` has **zero non-std dependencies**, so the same proofs finish in seconds. All harnesses are gated behind `#[cfg(kani)]`, so they are excluded from `cargo build`, `cargo test`, and `cargo clippy` and have **zero impact on the stable rustc toolchain**.
 
-2. **`nix_escape` is idempotent on safe strings** — for ASCII alphanumeric input, `nix_escape(s) == s`.
+**Why this layer:** Kani gives exhaustive guarantees within bounds, upgrading from "probably correct for 2 000 random inputs" (proptest) to "provably correct for **all** ASCII inputs up to `MAX_INPUT_LEN` bytes" (currently 4). This matters for security-sensitive escaping where a single missed byte enables arbitrary Nix evaluation or directory traversal.
 
-3. **`sanitize_nix_attr_key` output length** — output length equals input length (every character maps to exactly one character).
+**Harnesses currently proven:**
 
-**Example (Kani):**
+1. **`nix_escape` never panics** — for all ASCII strings up to `MAX_INPUT_LEN` bytes.
+2. **`nix_escape` output is always safely escaped** — soundness of the security boundary.
+3. **`sanitize_nix_attr_key` preserves char count** — 1-to-1 mapping property.
+4. **`sanitize_nix_attr_key` charset** — output is in `[A-Za-z0-9_-]`.
+5. **`path_segments_include_dot_dot` never panics** — total function on bounded input.
+6. **`assert_safe_path` never panics** — total function on bounded input.
+7. **`assert_safe_path` acceptance is sound** — accepted inputs are non-empty, NUL-free, and contain no `..` segment under either separator.
+8. **`validate_safe_segment` never panics** — total function on bounded input.
+9. **`validate_safe_segment` acceptance is sound** — accepted segments are non-empty, NUL-free, separator-free, not `.`/`..`, no leading `-`.
 
-```rust
-#[cfg(kani)]
-mod verification {
-    use super::*;
+**How to run locally:**
 
-    #[kani::proof]
-    #[kani::unwind(34)]
-    fn nix_escape_no_panic() {
-        let len: usize = kani::any();
-        kani::assume(len <= 32);
-        let bytes: [u8; 32] = kani::any();
-        let s = String::from_utf8_lossy(&bytes[..len]);
-        let _ = nix_escape(&s);
-    }
-
-    #[kani::proof]
-    #[kani::unwind(34)]
-    fn sanitize_preserves_length() {
-        let len: usize = kani::any();
-        kani::assume(len <= 32);
-        let bytes: [u8; 32] = kani::any();
-        let s = String::from_utf8_lossy(&bytes[..len]);
-        let result = sanitize_nix_attr_key(&s);
-        assert!(result.len() == s.len());
-    }
-}
+```bash
+cargo install --locked kani-verifier --version 0.67.0
+cargo kani setup
+make kani                 # cargo kani -p kcore-sanitize --jobs 2 --output-format terse
+# locally, override parallelism with KANI_JOBS=4 make kani if you have memory headroom
 ```
 
-**Effort estimate:** 1–2 days. Requires `cargo kani` installed (available via `cargo install kani-verifier && cargo kani setup`). Kani harnesses live alongside the source in `nixgen.rs` behind `#[cfg(kani)]`.
+**CI:** the `kani-shard` matrix job in `.github/workflows/formal-checks.yml` pins `kani-verifier` to a known version (`KANI_VERSION` env var, currently `0.67.0`) and fans the 9 `#[kani::proof]` harnesses out across one runner per harness. The aggregator job `kani` (`needs: [kani-shard]`) keeps the stable `formal-checks / kani` status check green for branch-protection.
+
+Why per-harness sharding rather than a single job with `--jobs N`:
+
+1. Wall-clock parallelism is much higher (~9× vs sequential), so even the slowest harness no longer gates the rest.
+2. Each runner verifies exactly one harness, so the 4 vCPU / 16 GB `ubuntu-latest` budget is never threatened by multiple in-flight CBMC processes (peak RAM is the single harness's footprint, typically <4 GB).
+3. A regression in one harness fails just that shard rather than masking later harnesses behind it.
+
+Two non-obvious CI requirements that bit earlier single-job attempts:
+
+1. `--jobs` was stabilised in `kani-verifier` 0.63, so it no longer needs (and on newer Kani it actively rejects) `-Z unstable-options`. With per-harness sharding we no longer use `--jobs` in CI at all.
+2. `--jobs N` with `N > 1` previously needed `--output-format terse` (`Conflicting options: --jobs requires '--output-format=terse'`). We keep `--output-format terse` in the matrix step anyway because it produces parseable, line-oriented logs.
+
+**Cache strategy:** the toolchain cache (`~/.cargo/bin/cargo-kani`, `~/.cargo/bin/kani`, `~/.kani/`) is keyed only on `KANI_VERSION` (NOT on `matrix.harness`) so all 9 shards share the same cache slot. The cache is saved **immediately after install completes**, before the proof step runs, because GitHub Actions does not execute steps after a job-level cancellation (manual Cancel, OOM, or hard timeout) even when guarded with `if: always()`. On a cold cache, the 9 shards race to install and then race to save under the same key; GHA serialises the saves and the first one wins (the others log a no-op warning, masked with `continue-on-error`). Every subsequent run on the same `KANI_VERSION` skips install entirely (~30 s vs ~5–10 min).
+
+**Per-harness performance:** the slowest harness historically was `dot_dot_check_never_panics` (~9 min CBMC time) because `path_segments_include_dot_dot` used `path.split([…]).any(…)`, which forced Kani to symbolically execute Rust's `core::str::pattern` machinery. It was rewritten as a flat byte loop (functionally equivalent for the ASCII separators `/` and `\\`), bringing the harness back into the seconds range and making the matrix wall-clock budget realistic.
+
+**Follow-up work:**
+
+- Raise `MAX_INPUT_LEN` once we've measured the runtime cost on CI.
 
 ### Phase 3: property-based testing on database invariants
 
-**Target:** `crates/controller/src/db.rs`
+**Status:** shipped. Bounded `proptest` harnesses live in `crates/controller/src/db.rs` (`mod proptests`, ~256 randomised cases each, all running on `:memory:` SQLite).
+
+**Properties currently checked:**
+
+1. **Node CRUD round-trip** — `upsert_node` then `get_node` returns a structurally equal row across randomised id/hostname/address/cpu/memory/cert/dc fields.
+2. **Upsert idempotence** — two upserts of the same node produce a single `list_nodes` row.
+3. **Upsert updates fields in place** — two upserts with different `address` produce one row with the latest address.
+4. **Foreign-key integrity** — inserting a `VmRow` whose `node_id` does not exist in `nodes` MUST fail (relies on `PRAGMA foreign_keys=ON`).
+5. **VM CRUD round-trip** — `insert_vm` then `get_vm` returns matching scalar fields.
+6. **Delete consistency** — after `delete_vm_by_id_or_name`, the VM disappears from `get_vm`, `find_node_for_vm`, and `list_vms`.
+7. **Heartbeat idempotence (modulo timestamp)** — two `update_heartbeat` calls with identical args produce identical state in every field except `last_heartbeat`.
+
+**Target:** `crates/controller/src/db.rs` (`#[cfg(test)] mod proptests`).
 
 **Why third:** the database layer is the source of truth for the entire system. Subtle bugs here (a VM referencing a non-existent node, a heartbeat updating a deleted node) propagate silently and cause wrong Nix configs to be pushed.
 
-**Properties to verify:**
+**How to run locally:**
 
-1. **Foreign key integrity** — inserting a `VmRow` with a `node_id` that does not exist in `nodes` must fail.
-
-2. **CRUD round-trip** — for any valid `NodeRow`, `upsert_node` followed by `get_node` returns an identical row.
-
-3. **Delete consistency** — after `delete_vm`, `find_node_for_vm` returns `None` and `list_vms` no longer contains the deleted VM.
-
-4. **Heartbeat idempotence** — calling `update_heartbeat` twice with the same arguments produces the same node state.
-
-5. **Upsert semantics** — upserting a node twice with different addresses updates the address rather than creating a duplicate.
-
-**Effort estimate:** 2–3 days. Requires building `proptest` strategies for `NodeRow` and `VmRow` with constrained string fields.
+```bash
+cargo test -p kcore-controller proptests
+```
 
 ### Phase 4: TLA+ model of controller–node reconciliation
+
+**Status:** shipped. Bounded TLC model checks run as a required CI gate in `.github/workflows/formal-checks.yml`. The specs live in `specs/tla/`:
+
+- `ControllerNodeReconcile.tla` — controller ↔ node reconciliation.
+- `ControllerReplication.tla` — single-DC replication protocol.
+- `CrossDcReplication.tla` — multi-DC replication with safety **and** liveness properties; the latest local run explored 206 280 distinct states across 3 941 400 generated states with no error found.
+
+Run locally:
+
+```bash
+make test-tla            # bounded TLC checks (requires java + tla2tools.jar)
+make test-tla-trace      # replication trace drift checker
+```
+
+The trace bridge in `make test-tla-trace` validates Rust runtime traces against the TLA+ invariants, closing the gap between the model and the code.
 
 **Target:** the distributed protocol between `kcore-controller` and `kcore-node-agent`.
 
@@ -247,11 +276,18 @@ Specifically, do not invest formal verification effort in:
 
 ## Summary
 
-| Phase | Technique | Target | Effort | Confidence gained |
+| Phase | Technique | Target | Status | Confidence gained |
 |-------|-----------|--------|--------|-------------------|
-| 1 | proptest | `nixgen.rs` escaping and generation | 1–2 days | High — catches injection edge cases |
-| 2 | Kani | `nixgen.rs`, disk path validation | 1–2 days | Very high — exhaustive within bounds |
-| 3 | proptest | `db.rs` CRUD invariants | 2–3 days | High — catches state consistency bugs |
-| 4 | TLA+ | Controller ↔ node reconciliation | 1–2 weeks | Highest — catches distributed protocol bugs |
+| 1 | proptest | `nixgen.rs` escaping and generation | **Shipped** | High — catches injection edge cases |
+| 2 | Kani | `nixgen.rs`, path-safety validators | **Shipped (first cut)** | Very high — exhaustive within bounds |
+| 3 | proptest | `db.rs` CRUD invariants | **Shipped** | High — catches state consistency bugs |
+| 4 | TLA+ | Controller ↔ node reconciliation | **Shipped** | Highest — catches distributed protocol bugs |
 
-Phases 1 and 2 can be done in a single iteration. Phase 3 follows naturally. Phase 4 should be started when the reconciliation loop gains retry logic, generation counters, or multi-node rollout sequencing — at that point the complexity will exceed what manual reasoning can reliably cover.
+All four phases are now landed. Each one is wired into CI (`make test`, `make kani`, `make test-tla`, `make test-tla-trace`) so a regression on any property fails the pull-request check.
+
+**Next-iteration follow-ups (not blockers):**
+
+- Raise the Kani `MAX_INPUT_LEN` bound once we've measured CI runtime cost.
+- Add a Kani harness for `validate_path_under_root` (its sibling `validate_safe_segment` is already proved in `crates/kcore-sanitize/src/lib.rs::kani_proofs`).
+- Extend Phase 3 proptests to cover replication outbox CRUD and security-group rule round-trips.
+- Add TLA+ invariants for the new compensation executor and replication reservations.

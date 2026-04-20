@@ -1,24 +1,21 @@
-//! Guards for path strings before filesystem access (traversal via `..`, NUL injection).
+//! Guards for path strings before filesystem access (kctl side).
+//!
+//! Implementation + proofs live in the leaf `kcore-sanitize` crate.
 
 use anyhow::Result;
+use kcore_sanitize::SafePathError;
 
-/// Rejects `..` in both `/` and `\` splits so strings like `file:../../x` cannot bypass
-/// `std::path::Path` component parsing (which treats those as a single path segment).
-pub fn path_segments_include_dot_dot(path: &str) -> bool {
-    path.split(['/', '\\']).any(|segment| segment == "..")
-}
+#[cfg(test)]
+use kcore_sanitize::path_segments_include_dot_dot;
 
 pub fn assert_safe_path(path: &str, label: &str) -> Result<()> {
-    if path.is_empty() {
-        anyhow::bail!("{label} must not be empty");
-    }
-    if path.contains('\0') {
-        anyhow::bail!("{label} must not contain NUL bytes");
-    }
-    if path_segments_include_dot_dot(path) {
-        anyhow::bail!("{label} must not contain parent directory references ('..')");
-    }
-    Ok(())
+    kcore_sanitize::assert_safe_path(path).map_err(|e| match e {
+        SafePathError::Empty => anyhow::anyhow!("{label} must not be empty"),
+        SafePathError::ContainsNul => anyhow::anyhow!("{label} must not contain NUL bytes"),
+        SafePathError::ContainsParentDir => {
+            anyhow::anyhow!("{label} must not contain parent directory references ('..')")
+        }
+    })
 }
 
 #[cfg(test)]
@@ -35,8 +32,6 @@ mod tests {
 
     #[test]
     fn detects_dot_dot_in_windows_style_paths() {
-        // We split on both `/` and `\` so a string like `file:..\..\x`
-        // can't bypass the segment check by using backslashes.
         assert!(path_segments_include_dot_dot("foo\\..\\bar"));
         assert!(path_segments_include_dot_dot("..\\windows"));
     }
@@ -50,7 +45,7 @@ mod tests {
             "embedded .. is not a segment"
         );
         assert!(!path_segments_include_dot_dot("foo..bar"));
-        assert!(!path_segments_include_dot_dot("...")); // three dots is a single segment
+        assert!(!path_segments_include_dot_dot("..."));
     }
 
     #[test]

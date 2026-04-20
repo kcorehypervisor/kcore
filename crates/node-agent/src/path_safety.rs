@@ -1,91 +1,48 @@
-//! Path-traversal sanitization helpers for tenant-supplied path segments.
+//! Path-traversal sanitization helpers for tenant-supplied path
+//! segments (node-agent side).
 //!
-//! Rule of thumb: any path that comes from an RPC field — image name,
-//! container name, volume handle, network bridge — MUST be passed through
-//! one of these helpers before being joined with a trusted root or used
-//! as a filesystem operand. `Path::starts_with` is **purely lexical** in
-//! Rust; `/var/lib/kcore/images/../../etc/passwd` lexically begins with
-//! `/var/lib/kcore/images` even though it resolves to `/etc/passwd`.
-//!
-//! Both helpers reject:
-//!   * empty input,
-//!   * any `..` segment,
-//!   * leading `/` (for `validate_safe_segment`) — those are name-style
-//!     fields that must not impersonate an absolute path,
-//!   * `\0` bytes,
-//!   * Windows-style separators (`\\`) — names must not include them.
+//! Implementation + Kani proofs live in the leaf `kcore-sanitize`
+//! crate. This module wraps those validators so the existing
+//! `(input, label) -> Result<_, String>` contract used by RPC
+//! handlers stays unchanged — error messages keep mentioning the
+//! field that failed validation.
 
-/// Maximum length for a name-style segment (image name, container name,
-/// volume handle, bridge name). Long enough for realistic operator names,
-/// short enough to keep error messages and logs readable.
-pub const MAX_SAFE_SEGMENT_LEN: usize = 200;
+use kcore_sanitize::{SafeRootedPathError, SafeSegmentError};
 
-/// Validate a single path *segment* (no slashes, no `..`, no NULs). Returns
-/// the trimmed segment on success.
-///
-/// Use this for fields that become the *last component* of a path, e.g.
-/// image filename or container directory name. The caller is responsible
-/// for joining the segment under a trusted root.
+#[cfg(test)]
+use kcore_sanitize::MAX_SAFE_SEGMENT_LEN;
+
+/// Validate a single path *segment* (no slashes, no `..`, no NULs,
+/// no leading `-`). Returns the trimmed segment on success.
 pub fn validate_safe_segment<'a>(name: &'a str, label: &str) -> Result<&'a str, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{label} is required"));
-    }
-    if trimmed.len() > MAX_SAFE_SEGMENT_LEN {
-        return Err(format!(
-            "{label} is too long ({} bytes, max {})",
-            trimmed.len(),
-            MAX_SAFE_SEGMENT_LEN
-        ));
-    }
-    if trimmed.contains('\0') {
-        return Err(format!("{label} must not contain NUL bytes"));
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(format!("{label} must not contain path separators"));
-    }
-    if trimmed == "." || trimmed == ".." {
-        return Err(format!("{label} must not be '.' or '..'"));
-    }
-    if trimmed.starts_with('-') {
-        // Avoid being mistaken for a flag when forwarded to systemctl/zfs/etc.
-        return Err(format!("{label} must not start with '-'"));
-    }
-    Ok(trimmed)
+    kcore_sanitize::validate_safe_segment(name).map_err(|e| match e {
+        SafeSegmentError::Empty => format!("{label} is required"),
+        SafeSegmentError::TooLong { actual, max } => {
+            format!("{label} is too long ({actual} bytes, max {max})")
+        }
+        SafeSegmentError::ContainsNul => format!("{label} must not contain NUL bytes"),
+        SafeSegmentError::ContainsSeparator => format!("{label} must not contain path separators"),
+        SafeSegmentError::DotOrDotDot => format!("{label} must not be '.' or '..'"),
+        SafeSegmentError::LeadingDash => format!("{label} must not start with '-'"),
+    })
 }
 
-/// Validate that an absolute path (provided by an RPC caller) stays under
-/// `root`. Lexical `starts_with` is not enough — `..` segments inside the
-/// supplied path can escape `root` while still passing `starts_with`.
-///
-/// Returns the (untouched) `PathBuf` on success; rejects empty input,
-/// non-absolute paths, NUL bytes, any `..` segment, and any path that
-/// does not lexically begin with `root`.
+/// Validate that an absolute path (provided by an RPC caller)
+/// stays under `root`.
 pub fn validate_path_under_root(
     raw: &str,
     root: &std::path::Path,
     label: &str,
 ) -> Result<std::path::PathBuf, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{label} is required"));
-    }
-    if trimmed.contains('\0') {
-        return Err(format!("{label} must not contain NUL bytes"));
-    }
-    let p = std::path::PathBuf::from(trimmed);
-    if !p.is_absolute() {
-        return Err(format!("{label} must be an absolute path"));
-    }
-    if !p.starts_with(root) {
-        return Err(format!("{label} must be under {}", root.display()));
-    }
-    for component in p.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return Err(format!("{label} must not contain '..' segments"));
+    kcore_sanitize::validate_path_under_root(raw, root).map_err(|e| match e {
+        SafeRootedPathError::Empty => format!("{label} is required"),
+        SafeRootedPathError::ContainsNul => format!("{label} must not contain NUL bytes"),
+        SafeRootedPathError::NotAbsolute => format!("{label} must be an absolute path"),
+        SafeRootedPathError::NotUnderRoot => {
+            format!("{label} must be under {}", root.display())
         }
-    }
-    Ok(p)
+        SafeRootedPathError::ContainsParentDir => format!("{label} must not contain '..' segments"),
+    })
 }
 
 #[cfg(test)]
@@ -115,7 +72,6 @@ mod tests {
 
     #[test]
     fn segment_rejects_leading_dash() {
-        // Defends against `systemctl start -unit-that-looks-like-a-flag`.
         assert!(validate_safe_segment("-foo", "name").is_err());
     }
 

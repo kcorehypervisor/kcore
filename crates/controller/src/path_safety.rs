@@ -1,22 +1,20 @@
-//! Guards for path strings before filesystem access (traversal via `..`, NUL injection).
+//! Guards for path strings before filesystem access.
+//!
+//! The actual validators live (and are Kani-verified) in the leaf
+//! `kcore-sanitize` crate. This module is a thin wrapper that
+//! preserves the existing `(path, label) -> anyhow::Result<()>`
+//! contract used by the rest of the controller, so that error
+//! messages keep mentioning the field that failed validation.
 
 use anyhow::Result;
-
-/// Rejects `..` in both `/` and `\` splits so strings like `file:../../x` cannot bypass
-/// `std::path::Path` component parsing (which treats those as a single path segment).
-pub fn path_segments_include_dot_dot(path: &str) -> bool {
-    path.split(['/', '\\']).any(|segment| segment == "..")
-}
+use kcore_sanitize::SafePathError;
 
 pub fn assert_safe_path(path: &str, label: &str) -> Result<()> {
-    if path.is_empty() {
-        anyhow::bail!("{label} must not be empty");
-    }
-    if path.contains('\0') {
-        anyhow::bail!("{label} must not contain NUL bytes");
-    }
-    if path_segments_include_dot_dot(path) {
-        anyhow::bail!("{label} must not contain parent directory references ('..')");
-    }
-    Ok(())
+    kcore_sanitize::assert_safe_path(path).map_err(|e| match e {
+        SafePathError::Empty => anyhow::anyhow!("{label} must not be empty"),
+        SafePathError::ContainsNul => anyhow::anyhow!("{label} must not contain NUL bytes"),
+        SafePathError::ContainsParentDir => {
+            anyhow::anyhow!("{label} must not contain parent directory references ('..')")
+        }
+    })
 }

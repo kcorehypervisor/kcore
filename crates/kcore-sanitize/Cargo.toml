@@ -1,0 +1,15 @@
+[package]
+name = "kcore-sanitize"
+version = "0.1.0"
+edition = "2021"
+description = "Pure, std-only sanitizers for operator-supplied paths and Nix expression literals. Verified with Kani."
+
+# IMPORTANT: keep this crate dependency-free (std only). The whole
+# point of extracting these helpers is to give Kani a *tiny* compile
+# unit so `cargo kani -p kcore-sanitize` runs in seconds instead of
+# minutes. Adding a non-std dependency here will silently regress CI
+# wall-clock time.
+[dependencies]
+
+[lints]
+workspace = true
