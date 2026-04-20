@@ -59,7 +59,7 @@ kani:
 		exit 1; \
 	}
 	cargo kani -p kcore-sanitize \
-		--jobs "$$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" \
+		--jobs "$${KANI_JOBS:-2}" \
 		--output-format terse
 
 coverage:
