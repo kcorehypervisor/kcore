@@ -160,12 +160,17 @@ proptest! {
 **How to run locally:**
 
 ```bash
-cargo install --locked kani-verifier
+cargo install --locked kani-verifier --version 0.67.0
 cargo kani setup
-make kani                 # cargo kani -p kcore-sanitize -Z unstable-options --jobs $(nproc)
+make kani                 # cargo kani -p kcore-sanitize --jobs $(nproc) --output-format terse
 ```
 
-**CI:** the `kani` job in `.github/workflows/formal-checks.yml` installs `kani-verifier` directly (with toolchain + `~/.kani` caching) and runs the proofs in parallel with `--jobs $(nproc)`. The 11 harnesses are independent, so on the standard 4-vCPU `ubuntu-latest` runner this brings wall-clock from ~10–12 min (sequential) down to ~3–4 min, well under the step's 25-min budget.
+**CI:** the `kani` job in `.github/workflows/formal-checks.yml` pins `kani-verifier` to a known version (`KANI_VERSION` env var, currently `0.67.0`), installs it directly with that pin (cache key derived from the pin so version bumps invalidate `~/.kani` automatically), and runs the proofs in parallel with `cargo kani -p kcore-sanitize --jobs $(nproc) --output-format terse`. The 11 harnesses are independent, so on the standard 4-vCPU `ubuntu-latest` runner wall-clock is ~3–4 min, well under the step's 25-min budget.
+
+Two non-obvious requirements from `kani-verifier` 0.67's argument parser, both of which broke earlier CI attempts:
+
+1. `--jobs` was stabilised in 0.63, so it no longer needs (and on newer Kani it actively rejects) `-Z unstable-options`.
+2. `--jobs N` with `N > 1` is rejected at argument validation unless `--output-format terse` is also supplied (`Conflicting options: --jobs requires '--output-format=terse'`). Without `terse`, the proof step fails within seconds of starting.
 
 **Follow-up work:**
 
