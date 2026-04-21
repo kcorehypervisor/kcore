@@ -47,7 +47,7 @@ pub fn create_from_manifest(file: &str, config_path: &Path) -> Result<()> {
                 PathBuf::from(&p)
             }
         })
-        .unwrap_or_else(|| config::default_cluster_certs_dir(&context_name));
+        .unwrap_or_else(|| default_cluster_certs_dir_with_fallback(&context_name, config_path));
 
     create(
         config_path,
@@ -56,6 +56,20 @@ pub fn create_from_manifest(file: &str, config_path: &Path) -> Result<()> {
         &context_name,
         manifest.spec.force,
     )
+}
+
+fn default_cluster_certs_dir_with_fallback(context_name: &str, config_path: &Path) -> PathBuf {
+    let preferred = config::default_cluster_certs_dir(context_name);
+    if std::fs::create_dir_all(&preferred).is_ok() {
+        return preferred;
+    }
+
+    let fallback_root = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".kcore");
+    fallback_root.join(context_name)
 }
 
 pub fn create(
