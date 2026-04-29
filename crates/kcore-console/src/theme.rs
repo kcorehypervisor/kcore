@@ -1,4 +1,4 @@
-//! Color palette: dark background, cyan/blue accent, health colors.
+//! Color palette: dark background, kcore indigo accent, health colors.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -7,7 +7,8 @@ pub fn bg() -> Color {
 }
 
 pub fn accent() -> Color {
-    Color::Rgb(99, 180, 255)
+    // kcorehypervisor.com --accent-primary (#6366f1)
+    Color::Rgb(99, 102, 241)
 }
 
 pub fn text() -> Color {
