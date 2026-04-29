@@ -102,7 +102,8 @@ kcore-rust/
 │       └── CrossDcReplication.cfg        TLC configuration for cross-DC replication model
 │
 ├── scripts/
-│   └── build-iso-remote.sh          SSH helper to build the kcore ISO on a remote Linux host
+│   ├── build-iso-remote.sh          SSH helper to build the kcore ISO on a remote Linux host
+│   └── release.sh                   release helper: Nix-build ISO and kcore-kctl, package dist/ + SHA256SUMS, gh publish (see docs/release.md)
 │
 └── docs/
     ├── Architecture.md              high-level flow diagrams (Mermaid) and component responsibilities
@@ -119,6 +120,7 @@ kcore-rust/
     ├── nix-vm-config-generation.md      when/how Nix VM configs are generated and applied
     ├── mtls-bootstrap-and-auth.md       certificate creation, node bootstrap, runtime mTLS
     ├── formal-methods-and-verification.md   notes on formal verification approaches
+    ├── release.md                     release checklist: VERSION bump, tag, Nix build, GitHub assets via Make/gh
     └── file-structure.md            this file
 ```
 
@@ -250,6 +252,7 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `specs/tla/CrossDcReplication.tla` — multi-DC replication convergence model with link failures.
 - `specs/tla/CrossDcReplication.cfg` — TLC constants/properties for cross-DC replication model.
 - `scripts/build-iso-remote.sh` — remote build automation script; orchestrates ISO build steps on a remote Linux builder host.
+- `scripts/release.sh` — non-interactive release helper: Nix-build ISO and `kcore-kctl`, package `dist/` + `SHA256SUMS`, `gh release create` (see `docs/release.md`).
 
 ### Documentation
 
@@ -268,3 +271,4 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `docs/mtls-bootstrap-and-auth.md` — certificate lifecycle guide; bootstrapping, cert roles, and auth usage in runtime calls.
 - `docs/formal-methods-and-verification.md` — verification strategy notes; current checks and future formalization directions.
 - `docs/file-structure.md` — repository map and deep catalog; explains file responsibilities and runtime/operator relevance.
+- `docs/release.md` — release checklist: bump `VERSION`, tag, Nix build, GitHub Release assets via Make/`gh`.
