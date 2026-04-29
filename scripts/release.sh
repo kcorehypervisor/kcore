@@ -62,7 +62,7 @@ cmd_dist() {
 }
 
 cmd_publish() {
-	require_cmd gh
+	require_cmd nix
 	NOTES="${RELEASE_NOTES:-RELEASE_NOTES.md}"
 	[[ -f "${NOTES}" ]] || die "missing ${NOTES} - copy RELEASE_NOTES.template.md to RELEASE_NOTES.md and edit"
 	[[ -f "dist/${KCTL_ARCHIVE}" ]] || die "run '${0} dist' first"
@@ -71,14 +71,14 @@ cmd_publish() {
 
 	TAG="v${VERSION}"
 	echo "==> Creating GitHub release ${TAG} (verify-tag)..."
-	gh release create "${TAG}" \
+	nix develop --command gh release create "${TAG}" \
 		--verify-tag \
 		--title "kcore ${VERSION}" \
 		--notes-file "${NOTES}" \
 		"dist/${KCTL_ARCHIVE}" \
 		"dist/${ISO_NAME}" \
 		dist/SHA256SUMS
-	echo "==> Done: gh release view ${TAG}"
+	echo "==> Done: nix develop --command gh release view ${TAG}"
 }
 
 usage() {

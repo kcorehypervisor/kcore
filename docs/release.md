@@ -48,7 +48,7 @@ Releases are **operator-driven**: build artifacts locally with Nix, publish to G
    ```
 
    - `dist/kcore-kctl-$(VERSION)-linux-x86_64.tar.gz` (binary at archive root: `kcore-kctl`)  
-  - `dist/kcoreos-$(VERSION)-x86_64-linux.iso` (release asset name; copied from the single ISO produced under `result-iso/iso/`)  
+   - `dist/kcoreos-$(VERSION)-x86_64-linux.iso` (release asset name; copied from the single ISO produced under `result-iso/iso/`)  
    - `dist/SHA256SUMS` for both files  
 
    Or in one step after a successful build: `make release` (build + dist; does not publish).
@@ -69,7 +69,7 @@ Releases are **operator-driven**: build artifacts locally with Nix, publish to G
    make release-publish
    ```
 
-   This runs `gh release create v$(VERSION) --verify-tag` and uploads the tarball, ISO, and `SHA256SUMS`.
+   This runs `nix develop --command gh release create v$(VERSION) --verify-tag` (GitHub CLI from the dev shell) and uploads the tarball, ISO, and `SHA256SUMS`.
 
 ## Artifact notes
 
