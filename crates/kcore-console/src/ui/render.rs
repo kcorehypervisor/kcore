@@ -49,8 +49,14 @@ pub fn draw(f: &mut Frame<'_>, app: &AppState) {
     let foot = ch[3];
 
     let title = Line::from(vec![
-        Span::styled(" kcore ", theme::title_style().add_modifier(Modifier::BOLD)),
-        Span::styled(" hypervisor", Style::default().fg(theme::text())),
+        Span::styled(
+            " kcore hypervisor ",
+            theme::title_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("v{}", app.snapshot.meta.version),
+            Style::default().fg(theme::muted()),
+        ),
     ]);
     f.render_widget(
         Paragraph::new(title).block(Block::new().bg(theme::bg())),
@@ -81,12 +87,16 @@ pub fn draw(f: &mut Frame<'_>, app: &AppState) {
         tabbar,
     );
 
+    let (body, logo) = carve_logo_area(body);
     match app.page {
         Page::Overview => draw_overview(f, body, app),
         Page::Network => draw_network(f, app, body),
         Page::Storage => draw_storage(f, app, body),
         Page::Diagnostics => draw_diagnostics(f, body, app),
         Page::Help => draw_help(f, body, app.dev),
+    }
+    if let Some(logo) = logo {
+        draw_logo(f, logo);
     }
 
     let footer = Line::from(vec![
@@ -112,6 +122,53 @@ pub fn draw(f: &mut Frame<'_>, app: &AppState) {
             .style(Style::default().fg(theme::muted())),
         foot,
     );
+}
+
+fn carve_logo_area(area: Rect) -> (Rect, Option<Rect>) {
+    const LOGO_WIDTH: u16 = 52;
+    const LOGO_HEIGHT: u16 = 8;
+
+    if area.width < 64 || area.height < 20 {
+        return (area, None);
+    }
+
+    let logo = Rect {
+        x: area.x + area.width - LOGO_WIDTH,
+        y: area.y + area.height - LOGO_HEIGHT,
+        width: LOGO_WIDTH,
+        height: LOGO_HEIGHT,
+    };
+    let content = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height - LOGO_HEIGHT,
+    };
+    (content, Some(logo))
+}
+
+fn draw_logo(f: &mut Frame<'_>, area: Rect) {
+    const LOGO: &[&str] = &[
+        "██╗  ██╗ ██████╗  ██████╗ ██████╗ ███████╗",
+        "██║ ██╔╝██╔════╝ ██╔═══██╗██╔══██╗██╔════╝",
+        "█████╔╝ ██║      ██║   ██║██████╔╝█████╗  ",
+        "██╔═██╗ ██║      ██║   ██║██╔══██╗██╔══╝  ",
+        "██║  ██╗╚██████╗ ╚██████╔╝██║  ██║███████╗",
+        "╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝",
+    ];
+    let lines = LOGO
+        .iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                *line,
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_overview(f: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -411,4 +468,39 @@ fn draw_help(f: &mut Frame<'_>, area: Rect, _dev: bool) {
         ),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logo_area_is_reserved_at_bottom_right() {
+        let area = Rect::new(0, 0, 120, 32);
+
+        let (content, logo) = carve_logo_area(area);
+
+        assert_eq!(content, Rect::new(0, 0, 120, 24));
+        assert_eq!(logo, Some(Rect::new(68, 24, 52, 8)));
+    }
+
+    #[test]
+    fn logo_area_is_skipped_on_small_consoles() {
+        let area = Rect::new(0, 0, 63, 20);
+
+        let (content, logo) = carve_logo_area(area);
+
+        assert_eq!(content, area);
+        assert_eq!(logo, None);
+    }
+
+    #[test]
+    fn logo_area_is_available_on_standard_tty_size() {
+        let area = Rect::new(0, 0, 80, 22);
+
+        let (content, logo) = carve_logo_area(area);
+
+        assert_eq!(content, Rect::new(0, 0, 80, 14));
+        assert_eq!(logo, Some(Rect::new(28, 14, 52, 8)));
+    }
 }

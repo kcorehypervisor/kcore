@@ -95,10 +95,8 @@ pub fn run(opts: Options) -> io::Result<()> {
                         }
                     } else {
                         match key.code {
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                if opts.dev {
-                                    break;
-                                }
+                            KeyCode::Char('q') | KeyCode::Char('Q') if opts.dev => {
+                                break;
                             }
                             KeyCode::Char('r') | KeyCode::Char('R') => {
                                 let _ = refresh_tx.send(());
