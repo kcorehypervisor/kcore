@@ -76,7 +76,7 @@ jobs:
   # toolchain is identical), so the first shard to finish install
   # warms the cache for all the others on subsequent runs.
   kani-shard:
-    name: kani-shard / ${{ matrix.crate }} :: ${{ matrix.harness }}
+    name: "kani-shard / ${{ matrix.crate }} :: ${{ matrix.harness }}"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
