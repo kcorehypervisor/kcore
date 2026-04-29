@@ -1,4 +1,4 @@
-.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace test-replication-soak coverage test-controller test-node-agent test-kctl test-rust-filter loc iso iso-remote kctl clean install-hooks kani help release-build release-dist release-publish release
+.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace test-replication-soak coverage test-controller test-node-agent test-kctl test-rust-filter loc iso iso-remote kctl clean install-hooks kani help release-tag release-build release-dist release-publish release
 
 VERSION := $(shell cat VERSION)
 V ?= v$(VERSION)
@@ -101,8 +101,11 @@ iso-remote:
 kctl:
 	cargo build --release -p kcore-kctl
 
-# Release helpers. Normal releases are automated by .github/workflows/release.yml
-# when a v$(VERSION) tag is pushed; these targets reproduce the build/publish steps locally.
+# Local release flow (run from this machine): tag v$(VERSION), push the tag,
+# Nix-build ISO + kcore-kctl, package dist/, then publish GitHub Release assets.
+release-tag:
+	bash ./scripts/release.sh tag
+
 release-build:
 	bash ./scripts/release.sh build
 
@@ -112,10 +115,8 @@ release-dist:
 release-publish:
 	bash ./scripts/release.sh publish
 
-release: release-build release-dist
-	@echo ""
-	@echo "Artifacts are under dist/. Normal path: push tag v$(VERSION) and let GitHub Actions publish."
-	@echo "Break-glass local publish: GH_TOKEN=... make release-publish"
+release:
+	bash ./scripts/release.sh release
 
 install-hooks:
 	@for hook in scripts/hooks/*; do \
@@ -156,10 +157,11 @@ help:
 	@echo "  iso         Build NixOS ISO (Linux only)"
 	@echo "  iso-remote  Build NixOS ISO on remote Linux server (from macOS)"
 	@echo "  kctl        Build kctl CLI only"
+	@echo "  release-tag     Create/push annotated tag v$(VERSION)"
 	@echo "  release-build   Nix-build ISO + kcore-kctl (result-iso, result-kctl)"
 	@echo "  release-dist    Tarball + ISO under dist/ + SHA256SUMS"
-	@echo "  release-publish Create/update GitHub Release assets from tag (needs GH_TOKEN/gh)"
-	@echo "  release         release-build + release-dist (normally published by GitHub Actions)"
+	@echo "  release-publish Create/update GitHub Release assets from tag (needs gh/GH_TOKEN)"
+	@echo "  release         Local full release: tag + build + dist + GitHub Release publish"
 	@echo "  install-hooks  Install git pre-commit/pre-push hooks"
 	@echo "  clean       Remove build artifacts"
 	@echo "  help        Show this help"

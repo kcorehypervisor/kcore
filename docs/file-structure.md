@@ -18,8 +18,7 @@ kcore-rust/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                    pull request Rust/Nix/security checks
-│       ├── formal-checks.yml         TLA+ trace/TLC checks and sharded Kani proofs
-│       └── release.yml               tag-driven Nix artifact build and GitHub Release publish
+│       └── formal-checks.yml         TLA+ trace/TLC checks and sharded Kani proofs
 │
 ├── proto/
 │   ├── controller.proto             gRPC API for the controller (node reg+storage capability, heartbeats, VM CRUD)
@@ -126,7 +125,7 @@ kcore-rust/
     ├── nix-vm-config-generation.md      when/how Nix VM configs are generated and applied
     ├── mtls-bootstrap-and-auth.md       certificate creation, node bootstrap, runtime mTLS
     ├── formal-methods-and-verification.md   notes on formal verification approaches
-    ├── release.md                     automated release checklist: VERSION bump, tag, GitHub Actions publish
+    ├── release.md                     local release checklist: VERSION bump, make release, GitHub assets
     └── file-structure.md            this file
 ```
 
@@ -180,7 +179,6 @@ For each file: purpose + where it is used in runtime/operator flows.
 
 - `.github/workflows/ci.yml` — pull-request CI; runs Rust formatting, Clippy, workspace tests, cargo audit, and Nix lint/evaluation checks.
 - `.github/workflows/formal-checks.yml` — formal-methods CI; runs trace drift/TLC checks plus sharded Kani proofs and an aggregate status job.
-- `.github/workflows/release.yml` — release automation; on `vX.Y.Z` tags, validates the tag against `VERSION`, builds Nix artifacts, packages `dist/`, and publishes the GitHub Release.
 
 ### API Contracts
 
@@ -264,7 +262,7 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `specs/tla/CrossDcReplication.tla` — multi-DC replication convergence model with link failures.
 - `specs/tla/CrossDcReplication.cfg` — TLC constants/properties for cross-DC replication model.
 - `scripts/build-iso-remote.sh` — remote build automation script; orchestrates ISO build steps on a remote Linux builder host.
-- `scripts/release.sh` — non-interactive release helper: Nix-build ISO and `kcore-kctl`, package `dist/` + `SHA256SUMS`, and create/upload GitHub Release assets (see `docs/release.md`).
+- `scripts/release.sh` — non-interactive local release helper: create/push tag, Nix-build ISO and `kcore-kctl`, package `dist/` + `SHA256SUMS`, and create/upload GitHub Release assets (see `docs/release.md`).
 
 ### Documentation
 
@@ -283,4 +281,4 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `docs/mtls-bootstrap-and-auth.md` — certificate lifecycle guide; bootstrapping, cert roles, and auth usage in runtime calls.
 - `docs/formal-methods-and-verification.md` — verification strategy notes; current checks and future formalization directions.
 - `docs/file-structure.md` — repository map and deep catalog; explains file responsibilities and runtime/operator relevance.
-- `docs/release.md` — automated release checklist: bump `VERSION`, push tag, let GitHub Actions build/publish Nix release assets.
+- `docs/release.md` — local release checklist: bump `VERSION`, run `make release`, and publish Nix-built release assets from the operator machine.
