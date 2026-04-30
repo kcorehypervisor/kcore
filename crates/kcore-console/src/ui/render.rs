@@ -49,9 +49,18 @@ pub fn draw(f: &mut Frame<'_>, app: &AppState) {
     let foot = ch[3];
 
     let title = Line::from(vec![
+        Span::styled(" ", Style::default().bg(theme::bg())),
         Span::styled(
-            " kcore hypervisor ",
-            theme::title_style().add_modifier(Modifier::BOLD),
+            "KCORE",
+            Style::default()
+                .fg(theme::silver())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " hypervisor · console ",
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("v{}", app.snapshot.meta.version),
@@ -126,7 +135,7 @@ pub fn draw(f: &mut Frame<'_>, app: &AppState) {
 
 fn carve_logo_area(area: Rect) -> (Rect, Option<Rect>) {
     const LOGO_WIDTH: u16 = 52;
-    const LOGO_HEIGHT: u16 = 8;
+    const LOGO_HEIGHT: u16 = 6;
 
     if area.width < 64 || area.height < 20 {
         return (area, None);
@@ -148,27 +157,55 @@ fn carve_logo_area(area: Rect) -> (Rect, Option<Rect>) {
 }
 
 fn draw_logo(f: &mut Frame<'_>, area: Rect) {
-    const LOGO: &[&str] = &[
-        "██╗  ██╗ ██████╗  ██████╗ ██████╗ ███████╗",
-        "██║ ██╔╝██╔════╝ ██╔═══██╗██╔══██╗██╔════╝",
-        "█████╔╝ ██║      ██║   ██║██████╔╝█████╗  ",
-        "██╔═██╗ ██║      ██║   ██║██╔══██╗██╔══╝  ",
-        "██║  ██╗╚██████╗ ╚██████╔╝██║  ██║███████╗",
-        "╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝",
-    ];
-    let lines = LOGO
-        .iter()
-        .map(|line| {
-            Line::from(Span::styled(
-                *line,
-                Style::default()
-                    .fg(theme::accent())
-                    .add_modifier(Modifier::BOLD),
-            ))
-        })
-        .collect::<Vec<_>>();
+    /// Row inside a box: `│ … │` with centered word and black padding.
+    fn row_centered(word: &str, inner: usize, word_style: Style) -> Line<'_> {
+        let word: String = word.chars().take(inner).collect();
+        let wc = word.chars().count().min(inner);
+        let pad = inner.saturating_sub(wc);
+        let left = pad / 2;
+        let right = pad - left;
+        let pad_style = Style::default().bg(theme::bg()).fg(theme::bg());
+        Line::from(vec![
+            Span::styled("│", theme::accent()),
+            Span::styled(" ".repeat(left), pad_style),
+            Span::styled(word, word_style),
+            Span::styled(" ".repeat(right), pad_style),
+            Span::styled("│", theme::accent()),
+        ])
+    }
 
-    f.render_widget(Paragraph::new(lines), area);
+    let w = area.width as usize;
+    if w < 12 {
+        return;
+    }
+    let inner = w.saturating_sub(2);
+    let rule = "─".repeat(inner);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("╭", theme::accent()),
+            Span::styled(rule.clone(), theme::muted()),
+            Span::styled("╮", theme::accent()),
+        ]),
+        row_centered(
+            "KCORE",
+            inner,
+            Style::default()
+                .fg(theme::silver())
+                .add_modifier(Modifier::BOLD),
+        ),
+        row_centered(
+            "hypervisor · console",
+            inner,
+            Style::default().fg(theme::muted()),
+        ),
+        Line::from(vec![
+            Span::styled("╰", theme::accent()),
+            Span::styled(rule, theme::muted()),
+            Span::styled("╯", theme::accent()),
+        ]),
+    ];
+
+    f.render_widget(Paragraph::new(lines).bg(theme::bg()), area);
 }
 
 fn draw_overview(f: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -284,9 +321,7 @@ fn table_rows_net(app: &AppState) -> Vec<Row<'_>> {
         .enumerate()
         .map(|(i, n)| {
             let style = if i == app.network_sel {
-                Style::default()
-                    .fg(theme::text())
-                    .bg(Color::Rgb(26, 36, 58))
+                Style::default().fg(theme::text()).bg(theme::selection_bg())
             } else {
                 Style::default().fg(theme::text())
             };
@@ -373,9 +408,7 @@ fn table_rows_disk(app: &AppState) -> Vec<Row<'_>> {
         .enumerate()
         .map(|(i, d)| {
             let style = if i == app.storage_sel {
-                Style::default()
-                    .fg(theme::text())
-                    .bg(Color::Rgb(26, 36, 58))
+                Style::default().fg(theme::text()).bg(theme::selection_bg())
             } else {
                 Style::default().fg(theme::text())
             };
@@ -453,7 +486,7 @@ fn draw_diagnostics(f: &mut Frame<'_>, area: Rect, app: &AppState) {
 }
 
 fn draw_help(f: &mut Frame<'_>, area: Rect, _dev: bool) {
-    let t = "kcore hypervisor appliance — local display is read-only.\
+    let t = "KCORE hypervisor appliance — local display is read-only.\
         \nUse the management URL and kcorectl from a trusted machine.\
         \nReboot, shutdown, and root shell are intentionally unavailable here.\
         \n\nSecurity: protect boot (UEFI, GRUB), mask extra getty, prefer SSH.\
@@ -480,8 +513,8 @@ mod tests {
 
         let (content, logo) = carve_logo_area(area);
 
-        assert_eq!(content, Rect::new(0, 0, 120, 24));
-        assert_eq!(logo, Some(Rect::new(68, 24, 52, 8)));
+        assert_eq!(content, Rect::new(0, 0, 120, 26));
+        assert_eq!(logo, Some(Rect::new(68, 26, 52, 6)));
     }
 
     #[test]
@@ -500,7 +533,7 @@ mod tests {
 
         let (content, logo) = carve_logo_area(area);
 
-        assert_eq!(content, Rect::new(0, 0, 80, 14));
-        assert_eq!(logo, Some(Rect::new(28, 14, 52, 8)));
+        assert_eq!(content, Rect::new(0, 0, 80, 16));
+        assert_eq!(logo, Some(Rect::new(28, 16, 52, 6)));
     }
 }

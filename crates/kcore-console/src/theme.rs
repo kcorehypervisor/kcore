@@ -1,22 +1,32 @@
-//! Color palette: dark background, kcore indigo accent, health colors.
+//! Color palette aligned with `assets/kcore-logo.png`: black field, violet accent, silver text.
 
 use ratatui::style::{Color, Modifier, Style};
 
 pub fn bg() -> Color {
-    Color::Rgb(12, 18, 40)
+    Color::Rgb(0, 0, 0)
 }
 
 pub fn accent() -> Color {
-    // kcorehypervisor.com --accent-primary (#6366f1)
-    Color::Rgb(99, 102, 241)
+    // Dominant violet from the shipped README / console logo art (sampled from PNG)
+    Color::Rgb(83, 90, 244)
+}
+
+/// Highlight / metallic tone for wordmarks (logo silver).
+pub fn silver() -> Color {
+    Color::Rgb(210, 212, 220)
 }
 
 pub fn text() -> Color {
-    Color::Rgb(230, 233, 240)
+    Color::Rgb(228, 230, 235)
 }
 
 pub fn muted() -> Color {
-    Color::Rgb(140, 150, 170)
+    Color::Rgb(118, 120, 132)
+}
+
+/// Selected row background (tables).
+pub fn selection_bg() -> Color {
+    Color::Rgb(22, 22, 38)
 }
 
 pub fn good() -> Color {
