@@ -88,12 +88,12 @@
             }
           );
 
-          kcore-kctl = craneLib.buildPackage (
+          kctl = craneLib.buildPackage (
             commonArgs
             // {
               inherit cargoArtifacts;
-              pname = "kcore-kctl";
-              cargoExtraArgs = "-p kcore-kctl";
+              pname = "kctl";
+              cargoExtraArgs = "-p kctl";
             }
           );
 
@@ -124,7 +124,7 @@
             inherit
               kcore-node-agent
               kcore-controller
-              kcore-kctl
+              kctl
               kcore-dashboard
               kcore-console
               ;
@@ -134,7 +134,7 @@
             inherit
               kcore-node-agent
               kcore-controller
-              kcore-kctl
+              kctl
               kcore-dashboard
               kcore-console
               ;
@@ -223,7 +223,7 @@
                 let
                   nodeAgent = inputs.self.packages.x86_64-linux.kcore-node-agent;
                   controller = inputs.self.packages.x86_64-linux.kcore-controller;
-                  kctl = inputs.self.packages.x86_64-linux.kcore-kctl;
+                  kctl = inputs.self.packages.x86_64-linux.kctl;
                   dashboard = inputs.self.packages.x86_64-linux.kcore-dashboard;
                   kcoreConsole = inputs.self.packages.x86_64-linux.kcore-console;
                   diskoPackage = inputs.disko.packages.x86_64-linux.default;
@@ -847,12 +847,12 @@
                                                                 mkdir -p /mnt/opt/kcore/bin
                                                                 cp "${nodeAgent}/bin/kcore-node-agent" /mnt/opt/kcore/bin/kcore-node-agent
                                                                 cp "${controller}/bin/kcore-controller" /mnt/opt/kcore/bin/kcore-controller
-                                                                cp "${kctl}/bin/kcore-kctl" /mnt/opt/kcore/bin/kcore-kctl
+                                                                cp "${kctl}/bin/kctl" /mnt/opt/kcore/bin/kctl
                                                                 cp "${dashboard}/bin/kcore-dashboard" /mnt/opt/kcore/bin/kcore-dashboard
                                                                 cp "${kcoreConsole}/bin/kcore-console" /mnt/opt/kcore/bin/kcore-console
                                                                 chmod +x /mnt/opt/kcore/bin/kcore-node-agent
                                                                 chmod +x /mnt/opt/kcore/bin/kcore-controller
-                                                                chmod +x /mnt/opt/kcore/bin/kcore-kctl
+                                                                chmod +x /mnt/opt/kcore/bin/kctl
                                                                 chmod +x /mnt/opt/kcore/bin/kcore-dashboard
                                                                 chmod +x /mnt/opt/kcore/bin/kcore-console
 
@@ -1260,7 +1260,7 @@
                           disko
                         ];
 
-                        system.activationScripts.kcore-kctl-path.text = "mkdir -p /usr/local/bin\nln -sfn /opt/kcore/bin/kcore-kctl /usr/local/bin/kctl\nln -sfn /opt/kcore/bin/kcore-kctl /usr/local/bin/kcore-kctl\n";
+                        system.activationScripts.kctl-path.text = "mkdir -p /usr/local/bin\nln -sfn /opt/kcore/bin/kctl /usr/local/bin/kctl\n";
 
                         system.stateVersion = "25.05";
                       }

@@ -14,7 +14,7 @@ that go through an approval workflow.
 **kcore** uses a simpler single-operator model. Trust is rooted in a shared
 CA whose private key lives on the operator's machine. Certificates signed
 by that CA grant access; the Common Name (CN) in the certificate determines
-the role (`kcore-controller`, `kcore-kctl`, or `kcore-node-<host>`).
+the role (`kcore-controller`, `kctl`, or `kcore-node-<host>`).
 
 ---
 

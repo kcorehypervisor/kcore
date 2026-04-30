@@ -187,7 +187,7 @@ Each controller's replication ack frontier is tracked by its CN-derived peer ID.
 ```mermaid
 flowchart LR
   Operator[Operator]
-  Kctl["kctl<br/>CN=kcore-kctl"]
+  Kctl["kctl<br/>CN=kctl"]
   NodeAgent["nodeAgent<br/>CN=kcore-node-{host}"]
   CtrlA["controllerA_DC1<br/>CN=kcore-controller-10.0.0.10"]
   CtrlB["controllerB_DC1<br/>CN=kcore-controller-10.0.0.11"]
@@ -394,14 +394,14 @@ Status (incremental):
 When adding or recovering a controller, explicitly verify that `nodes` inventory converges across controllers.
 
 1. Compare node views:
-   - `kcore-kctl -s <controller-a>:9090 get nodes`
-   - `kcore-kctl -s <controller-b>:9090 get nodes`
+   - `kctl -s <controller-a>:9090 get nodes`
+   - `kctl -s <controller-b>:9090 get nodes`
 2. Force fresh replicated node snapshots by restarting active node agents:
    - `systemctl restart kcore-node-agent` on each active node.
 3. Wait for replication poll/materialization to settle and compare again.
 4. If approval status remains divergent for an already trusted node, reconcile on the lagging controller:
-   - `kcore-kctl -s <lagging-controller>:9090 node approve <node-id>`
-5. Confirm `kcore-kctl get replication-status` is healthy on all controllers.
+   - `kctl -s <lagging-controller>:9090 node approve <node-id>`
+5. Confirm `kctl get replication-status` is healthy on all controllers.
 
 Expected steady state:
 - both controllers return the same active node set with matching approval/state;

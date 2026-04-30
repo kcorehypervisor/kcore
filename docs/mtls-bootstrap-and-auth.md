@@ -10,7 +10,7 @@ flowchart TD
     subCA["Sub-CA<br/>CN=kcore-cluster-sub-ca<br/>5-year validity, pathlen:0"]
     ctrl105["Controller cert<br/>CN=kcore-controller-192.168.40.105<br/>SAN=192.168.40.105"]
     ctrl151["Controller cert<br/>CN=kcore-controller-192.168.40.151<br/>SAN=192.168.40.151"]
-    kctlCert["kctl cert<br/>CN=kcore-kctl<br/>client auth only"]
+    kctlCert["kctl cert<br/>CN=kctl<br/>client auth only"]
     node107["Node cert<br/>CN=kcore-node-192.168.40.107<br/>SAN=192.168.40.107"]
 
     rootCA -->|signs| subCA
@@ -35,7 +35,7 @@ The command creates:
 - `ca.crt` / `ca.key`: cluster root Certificate Authority (10-year validity)
 - `sub-ca.crt` / `sub-ca.key`: intermediate sub-CA for automatic node cert renewal (5-year, pathlen:0)
 - `controller.crt` / `controller.key`: controller identity with host-specific CN `kcore-controller-{host}` (server + client auth)
-- `kctl.crt` / `kctl.key`: CLI client identity with CN `kcore-kctl` (client auth only)
+- `kctl.crt` / `kctl.key`: CLI client identity with CN `kctl` (client auth only)
 
 Files are stored under `~/.kcore/<context-name>/` and the active context in `~/.kcore/config` is updated with **inline base64-encoded cert data**:
 
@@ -118,7 +118,7 @@ Components authenticate each other by Common Name (CN) extracted from the client
 
 | Component | CN pattern | Authorization check |
 |-----------|-----------|---------------------|
-| kctl | `kcore-kctl` | exact match |
+| kctl | `kctl` | exact match |
 | Controller | `kcore-controller-{host}` | prefix match `kcore-controller-` |
 | Node agent | `kcore-node-{host}` | prefix match `kcore-node-` |
 

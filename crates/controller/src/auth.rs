@@ -1,7 +1,7 @@
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::{Request, Status};
 
-pub const CN_KCTL: &str = "kcore-kctl";
+pub const CN_KCTL: &str = "kctl";
 pub const CN_NODE_PREFIX: &str = "kcore-node-";
 pub const CN_CONTROLLER_PREFIX: &str = "kcore-controller-";
 
@@ -68,20 +68,20 @@ mod tests {
         assert!(is_authorized("kcore-node-10.0.0.1", &[CN_NODE_PREFIX]));
         assert!(is_authorized("kcore-node-192.168.1.1", &[CN_NODE_PREFIX]));
         assert!(!is_authorized("kcore-controller", &[CN_NODE_PREFIX]));
-        assert!(!is_authorized("kcore-kctl", &[CN_NODE_PREFIX]));
+        assert!(!is_authorized("kctl", &[CN_NODE_PREFIX]));
     }
 
     #[test]
     fn exact_matching() {
-        assert!(is_authorized("kcore-kctl", &[CN_KCTL]));
-        assert!(!is_authorized("kcore-kctl-evil", &[CN_KCTL]));
+        assert!(is_authorized("kctl", &[CN_KCTL]));
+        assert!(!is_authorized("kctl-evil", &[CN_KCTL]));
         assert!(!is_authorized("kcore-controller", &[CN_KCTL]));
     }
 
     #[test]
     fn multiple_allowed_patterns() {
         let allowed = &[CN_KCTL, CN_NODE_PREFIX];
-        assert!(is_authorized("kcore-kctl", allowed));
+        assert!(is_authorized("kctl", allowed));
         assert!(is_authorized("kcore-node-10.0.0.1", allowed));
         assert!(!is_authorized("kcore-controller", allowed));
     }

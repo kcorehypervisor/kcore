@@ -72,7 +72,7 @@ test-node-agent:
 	cargo test -p kcore-node-agent
 
 test-kctl:
-	cargo test -p kcore-kctl
+	cargo test -p kctl
 
 test-rust-filter:
 	@if [ -z "$(TEST)" ]; then \
@@ -99,10 +99,10 @@ iso-remote:
 	./scripts/build-iso-remote.sh
 
 kctl:
-	cargo build --release -p kcore-kctl
+	cargo build --release -p kctl
 
 # Local release flow (run from this machine): tag v$(VERSION), push the tag,
-# Nix-build ISO + kcore-kctl, package dist/, then publish GitHub Release assets.
+# Nix-build ISO + kctl, package dist/, then publish GitHub Release assets.
 release-tag:
 	bash ./scripts/release.sh tag
 
@@ -158,7 +158,7 @@ help:
 	@echo "  iso-remote  Build NixOS ISO on remote Linux server (from macOS)"
 	@echo "  kctl        Build kctl CLI only"
 	@echo "  release-tag     Create/push annotated tag v$(VERSION)"
-	@echo "  release-build   Nix-build ISO + kcore-kctl (result-iso, result-kctl)"
+	@echo "  release-build   Nix-build ISO + kctl (result-iso, result-kctl)"
 	@echo "  release-dist    Tarball + ISO under dist/ + SHA256SUMS"
 	@echo "  release-publish Create/update GitHub Release assets from tag (needs gh/GH_TOKEN)"
 	@echo "  release         Local full release: tag + build + dist + GitHub Release publish"

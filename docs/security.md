@@ -12,7 +12,7 @@ All inter-component communication uses mutual TLS (mTLS). Certificates are gener
 |--------------------|---------------------------|----------------------|----------|
 | CA                 | `kcore-cluster-ca`        | CA                   | 10 years |
 | Controller         | `kcore-controller`        | ServerAuth, ClientAuth | 1 year   |
-| kctl (CLI)         | `kcore-kctl`              | ClientAuth           | 1 year   |
+| kctl (CLI)         | `kctl`              | ClientAuth           | 1 year   |
 | Node               | `kcore-node-<host>`       | ServerAuth, ClientAuth | 1 year   |
 
 Validity periods are defined in `crates/kctl/src/pki.rs` (`CA_VALIDITY_DAYS`, `CERT_VALIDITY_DAYS`).
@@ -52,21 +52,21 @@ Every gRPC method checks the caller's certificate Common Name before processing 
 | `RegisterNode`         | Nodes (`kcore-node-*`)    |
 | `Heartbeat`            | Nodes (`kcore-node-*`)    |
 | `SyncVmState`          | Nodes (`kcore-node-*`)    |
-| `CreateVm`             | kctl (`kcore-kctl`)       |
-| `DeleteVm`             | kctl (`kcore-kctl`)       |
-| `SetVmDesiredState`    | kctl (`kcore-kctl`)       |
-| `GetVm`                | kctl (`kcore-kctl`)       |
-| `ListVms`              | kctl (`kcore-kctl`)       |
-| `ListNodes`            | kctl (`kcore-kctl`)       |
-| `GetNode`              | kctl (`kcore-kctl`)       |
-| `ApplyNixConfig` (admin) | kctl (`kcore-kctl`)     |
+| `CreateVm`             | kctl (`kctl`)       |
+| `DeleteVm`             | kctl (`kctl`)       |
+| `SetVmDesiredState`    | kctl (`kctl`)       |
+| `GetVm`                | kctl (`kctl`)       |
+| `ListVms`              | kctl (`kctl`)       |
+| `ListNodes`            | kctl (`kctl`)       |
+| `GetNode`              | kctl (`kctl`)       |
+| `ApplyNixConfig` (admin) | kctl (`kctl`)     |
 
 ### Node-agent RPC authorization
 
 | RPC Method                | Allowed Callers                        |
 |----------------------------|----------------------------------------|
 | `ApplyNixConfig`           | Controller (`kcore-controller`)        |
-| `InstallToDisk`            | kctl (`kcore-kctl`)                    |
+| `InstallToDisk`            | kctl (`kctl`)                    |
 | `ListDisks`                | kctl or Controller                     |
 | `ListNetworkInterfaces`    | kctl or Controller                     |
 | `GetVm`                    | kctl or Controller                     |
@@ -168,7 +168,7 @@ cargo fmt --check
 # Run a specific crate's tests
 cargo test -p kcore-controller
 cargo test -p kcore-node-agent
-cargo test -p kcore-kctl
+cargo test -p kctl
 
 # Run tests matching a pattern
 cargo test -p kcore-controller -- nixgen

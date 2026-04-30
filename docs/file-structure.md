@@ -108,7 +108,7 @@ kcore-rust/
 │
 ├── scripts/
 │   ├── build-iso-remote.sh          SSH helper to build the kcore ISO on a remote Linux host
-│   └── release.sh                   release helper: Nix-build ISO and kcore-kctl, package dist/ + SHA256SUMS, gh publish (see docs/release.md)
+│   └── release.sh                   release helper: Nix-build ISO and kctl, package dist/ + SHA256SUMS, gh publish (see docs/release.md)
 │
 └── docs/
     ├── Architecture.md              high-level flow diagrams (Mermaid) and component responsibilities
@@ -262,7 +262,7 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `specs/tla/CrossDcReplication.tla` — multi-DC replication convergence model with link failures.
 - `specs/tla/CrossDcReplication.cfg` — TLC constants/properties for cross-DC replication model.
 - `scripts/build-iso-remote.sh` — remote build automation script; orchestrates ISO build steps on a remote Linux builder host.
-- `scripts/release.sh` — non-interactive local release helper: create/push tag, Nix-build ISO and `kcore-kctl`, package `dist/` + `SHA256SUMS`, and create/upload GitHub Release assets (see `docs/release.md`).
+- `scripts/release.sh` — non-interactive local release helper: create/push tag, Nix-build ISO and `kctl`, package `dist/` + `SHA256SUMS`, and create/upload GitHub Release assets (see `docs/release.md`).
 
 ### Documentation
 

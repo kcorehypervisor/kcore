@@ -1,7 +1,7 @@
 # Local Release Process (Make + Nix + GitHub Releases)
 
 Releases run from an operator machine, not GitHub Actions. One command creates
-and pushes the Git tag, builds the ISO and `kcore-kctl` with Nix, packages
+and pushes the Git tag, builds the ISO and `kctl` with Nix, packages
 `dist/`, then creates or updates the GitHub Release assets.
 
 ## Version sources (policy)
@@ -9,7 +9,7 @@ and pushes the Git tag, builds the ISO and `kcore-kctl` with Nix, packages
 | Source | Role |
 |--------|------|
 | [`VERSION`](../VERSION) (single line, e.g. `0.2.0`) | **Product / packaging version**: Nix `kcoreVersion`, ISO filename `kcoreos-$(VERSION)-x86_64-linux.iso`, Git tag `v$(VERSION)`, release assets. **Bump this for every release.** |
-| `crates/*/Cargo.toml` `version = "…"` | Rust crate semver. **Not automatically tied to `VERSION`.** This repo usually bumps crate versions in the same PR as `VERSION` so `kcore-kctl --version` matches the product version. |
+| `crates/*/Cargo.toml` `version = "…"` | Rust crate semver. **Not automatically tied to `VERSION`.** This repo usually bumps crate versions in the same PR as `VERSION` so `kctl --version` matches the product version. |
 
 ## Preconditions
 
@@ -42,7 +42,7 @@ and pushes the Git tag, builds the ISO and `kcore-kctl` with Nix, packages
    - creates annotated tag `v$(cat VERSION)` if missing,
    - verifies an existing local or remote tag points at the current commit,
    - pushes the tag to `origin`,
-   - builds the ISO and `kcore-kctl` with Nix,
+   - builds the ISO and `kctl` with Nix,
    - packages `dist/`,
    - creates the GitHub Release through `gh api`,
    - uploads release assets one by one with `gh release upload --clobber`.
@@ -58,7 +58,7 @@ make release-publish
 
 The release packaging step produces:
 
-- `dist/kcore-kctl-$(VERSION)-linux-x86_64.tar.gz` (binary at archive root: `kcore-kctl`)
+- `dist/kctl-$(VERSION)-linux-x86_64.tar.gz` (binary at archive root: `kctl`)
 - `dist/kcoreos-$(VERSION)-x86_64-linux.iso` (release asset name; copied from the single ISO produced under `result-iso/iso/`)
 - `dist/SHA256SUMS` for both files
 
@@ -71,7 +71,7 @@ RELEASE_NOTES=path/to/notes.md GH_TOKEN=... make release-publish
 
 ## Artifact notes
 
-- **kctl** in the tarball is the **Nix-built** `kcore-kctl` from `.#kcore-kctl` (same lineage as the ISO), not a raw `cargo build`.
+- **kctl** in the tarball is the **Nix-built** `kctl` from `.#kctl` (same lineage as the ISO), not a raw `cargo build`.
 - **Platform**: **linux x86_64** (glibc via Nix). No musl/static build in this flow.
 - **Large files**: ISOs are ~1–2 GiB; GitHub per-file limit is 2 GiB. Stay under that or split hosting for huge artifacts.
 
