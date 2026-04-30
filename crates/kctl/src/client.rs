@@ -79,6 +79,9 @@ fn resolve_tls_pems(info: &ConnectionInfo) -> Result<(String, String, String)> {
 /// Short SHA-256 fingerprint of the PEM-encoded CA for error messages.
 fn ca_fingerprint_short(ca_pem: &str) -> String {
     use std::fmt::Write;
+    #[cfg(target_os = "macos")]
+    let digest = ring::digest::digest(&ring::digest::SHA256, ca_pem.as_bytes());
+    #[cfg(not(target_os = "macos"))]
     let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, ca_pem.as_bytes());
     digest
         .as_ref()
@@ -674,6 +677,9 @@ mod tests {
     }
 
     fn ensure_crypto_provider() {
+        #[cfg(target_os = "macos")]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        #[cfg(not(target_os = "macos"))]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 
@@ -930,7 +936,7 @@ mod tests {
 
     #[test]
     fn preflight_accepts_chain_cert_via_sub_ca() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        ensure_crypto_provider();
         let temp = tempfile::tempdir().expect("tempdir");
         let certs_dir = temp.path().join("certs");
         pki::create_cluster_pki(&certs_dir, "127.0.0.1", false).expect("create pki");
@@ -962,7 +968,7 @@ mod tests {
 
     #[test]
     fn preflight_accepts_matching_ca_and_cert() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        ensure_crypto_provider();
         let temp = tempfile::tempdir().expect("tempdir");
         let certs_dir = temp.path().join("certs");
         pki::create_cluster_pki(&certs_dir, "127.0.0.1", false).expect("create pki");

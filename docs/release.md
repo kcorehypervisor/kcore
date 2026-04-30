@@ -1,8 +1,8 @@
 # Local Release Process (Make + Nix + GitHub Releases)
 
 Releases run from an operator machine, not GitHub Actions. One command creates
-and pushes the Git tag, builds the ISO and `kctl` with Nix, packages
-`dist/`, then creates or updates the GitHub Release assets.
+and pushes the Git tag, builds the ISO plus Linux/macOS `kctl` binaries,
+packages `dist/`, then creates or updates the GitHub Release assets.
 
 ## Version sources (policy)
 
@@ -15,7 +15,9 @@ and pushes the Git tag, builds the ISO and `kctl` with Nix, packages
 
 - The version bump PR is merged to `main`, including [`VERSION`](../VERSION)
   (and crate versions, when applicable).
-- Run on Linux **x86_64** with Nix/flakes working.
+- Run on Linux **x86_64** with Nix/flakes working. The release flow builds
+  Linux `kctl` with Nix and cross-compiles Intel macOS / Apple Silicon `kctl`
+  with `cargo-zigbuild` from the Nix dev shell.
 - `gh` is available and authenticated from the Nix dev shell. Use
   `nix develop --command gh auth status` to verify, or set `GH_TOKEN` for
   non-interactive use. If a local `.env` exists, `scripts/release.sh publish`
@@ -42,7 +44,8 @@ and pushes the Git tag, builds the ISO and `kctl` with Nix, packages
    - creates annotated tag `v$(cat VERSION)` if missing,
    - verifies an existing local or remote tag points at the current commit,
    - pushes the tag to `origin`,
-   - builds the ISO and `kctl` with Nix,
+   - builds the ISO and Linux `kctl` with Nix,
+   - cross-compiles `kctl` for Intel macOS and Apple Silicon,
    - packages `dist/`,
    - creates the GitHub Release through `gh api`,
    - uploads release assets one by one with `gh release upload --clobber`.
@@ -59,8 +62,10 @@ make release-publish
 The release packaging step produces:
 
 - `dist/kctl-$(VERSION)-linux-x86_64.tar.gz` (binary at archive root: `kctl`)
+- `dist/kctl-$(VERSION)-macos-x86_64.tar.gz` (Intel macOS binary at archive root: `kctl`)
+- `dist/kctl-$(VERSION)-macos-aarch64.tar.gz` (Apple Silicon binary at archive root: `kctl`)
 - `dist/kcoreos-$(VERSION)-x86_64-linux.iso` (release asset name; copied from the single ISO produced under `result-iso/iso/`)
-- `dist/SHA256SUMS` for both files
+- `dist/SHA256SUMS` for all assets
 
 By default publishing uses GitHub-generated release notes unless `RELEASE_NOTES.md`
 exists. To force custom notes:
@@ -71,8 +76,9 @@ RELEASE_NOTES=path/to/notes.md GH_TOKEN=... make release-publish
 
 ## Artifact notes
 
-- **kctl** in the tarball is the **Nix-built** `kctl` from `.#kctl` (same lineage as the ISO), not a raw `cargo build`.
-- **Platform**: **linux x86_64** (glibc via Nix). No musl/static build in this flow.
+- **Linux kctl** is the **Nix-built** `kctl` from `.#kctl` (same lineage as the ISO), not a raw `cargo build`.
+- **macOS kctl** is cross-compiled with `cargo zigbuild` for `x86_64-apple-darwin` and `aarch64-apple-darwin`.
+- **Platforms**: Linux x86_64 (glibc via Nix), Intel macOS, and Apple Silicon macOS. No musl/static Linux build in this flow.
 - **Large files**: ISOs are ~1–2 GiB; GitHub per-file limit is 2 GiB. Stay under that or split hosting for huge artifacts.
 
 ## Troubleshooting

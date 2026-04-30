@@ -43,6 +43,10 @@
               "rust-src"
               "rust-analyzer"
             ];
+            targets = [
+              "aarch64-apple-darwin"
+              "x86_64-apple-darwin"
+            ];
           };
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
@@ -176,6 +180,8 @@
               pkgs.statix
               pkgs.deadnix
               pkgs.nixfmt
+              pkgs.cargo-zigbuild
+              pkgs.zig
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.cloud-hypervisor
