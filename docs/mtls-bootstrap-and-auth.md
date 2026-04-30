@@ -215,12 +215,12 @@ Additional security measures:
 
 ### FIPS-compatible cryptography
 
-All TLS connections use **aws-lc-rs** as the rustls crypto backend. aws-lc-rs wraps AWS-LC, which holds FIPS 140-3 validation (certificate #4816). At process startup, each binary (controller, node-agent, kctl) installs a custom `CryptoProvider` that restricts:
+Controller, node-agent, and Linux `kctl` TLS connections use **aws-lc-rs** as the rustls crypto backend. aws-lc-rs wraps AWS-LC, which holds FIPS 140-3 validation (certificate #4816). At process startup, those binaries install a custom `CryptoProvider` that restricts:
 
 - **Cipher suites**: TLS 1.3 AES-128-GCM, AES-256-GCM; TLS 1.2 ECDHE-ECDSA/RSA with AES-128-GCM and AES-256-GCM. ChaCha20-Poly1305 is excluded.
 - **Key exchange groups**: secp256r1 (P-256) and secp384r1 (P-384) only. X25519 is excluded.
 
-Certificate generation (`rcgen`) also uses aws-lc-rs instead of ring.
+Certificate generation (`rcgen`) also uses aws-lc-rs instead of ring for those binaries. macOS `kctl` release binaries use rustls/ring so they can be cross-compiled locally for Intel macOS and Apple Silicon.
 
 Remaining gaps to track:
 

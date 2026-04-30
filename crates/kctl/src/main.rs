@@ -15,7 +15,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn install_fips_crypto_provider() {
+fn install_crypto_provider() {
+    #[cfg(target_os = "macos")]
+    let mut provider = rustls::crypto::ring::default_provider();
+    #[cfg(not(target_os = "macos"))]
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
 
     provider.cipher_suites.retain(|suite| {
@@ -39,7 +42,7 @@ fn install_fips_crypto_provider() {
 
     provider
         .install_default()
-        .expect("failed to install FIPS crypto provider");
+        .expect("failed to install crypto provider");
 }
 
 #[derive(Parser)]
@@ -891,7 +894,7 @@ fn resolve_node(cli: &Cli) -> Result<config::ConnectionInfo, String> {
 
 #[tokio::main]
 async fn main() {
-    install_fips_crypto_provider();
+    install_crypto_provider();
     let cli = Cli::parse();
 
     let result = match &cli.command {

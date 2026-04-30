@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build release artifacts (Nix ISO + kctl), package dist/, publish GitHub Release.
+# Build release artifacts (Nix ISO + Linux/macOS kctl), package dist/, publish GitHub Release.
 # Usage:
-#   ./scripts/release.sh build    # nix build ISO + kctl -> result-iso, result-kctl
+#   ./scripts/release.sh build    # nix build ISO + Linux kctl, cargo-zigbuild macOS kctl
 #   ./scripts/release.sh dist     # dist/*.tar.gz, ISO copy, dist/SHA256SUMS
 #   ./scripts/release.sh tag      # create/push v$(VERSION)
 #   ./scripts/release.sh publish  # gh release create/upload (needs tag on remote)
@@ -17,7 +17,14 @@ cd "${ROOT}"
 
 VERSION="$(tr -d '\n' < VERSION)"
 ISO_NAME="kcoreos-${VERSION}-x86_64-linux.iso"
-KCTL_ARCHIVE="kctl-${VERSION}-linux-x86_64.tar.gz"
+KCTL_LINUX_ARCHIVE="kctl-${VERSION}-linux-x86_64.tar.gz"
+KCTL_MACOS_X86_64_ARCHIVE="kctl-${VERSION}-macos-x86_64.tar.gz"
+KCTL_MACOS_AARCH64_ARCHIVE="kctl-${VERSION}-macos-aarch64.tar.gz"
+KCTL_ARCHIVES=(
+	"${KCTL_LINUX_ARCHIVE}"
+	"${KCTL_MACOS_X86_64_ARCHIVE}"
+	"${KCTL_MACOS_AARCH64_ARCHIVE}"
+)
 TAG="v${VERSION}"
 
 die() {
@@ -98,17 +105,25 @@ cmd_build() {
 	require_cmd nix
 	echo "==> Building ISO (${ISO_NAME})..."
 	nix build ".#nixosConfigurations.kcore-iso.config.system.build.isoImage" -o result-iso
-	echo "==> Building kctl..."
+	echo "==> Building kctl for linux-x86_64..."
 	nix build ".#kctl" -o result-kctl
+	echo "==> Cross-building kctl for macos-x86_64..."
+	nix develop --command cargo zigbuild -p kctl --release --target x86_64-apple-darwin
+	echo "==> Cross-building kctl for macos-aarch64..."
+	nix develop --command cargo zigbuild -p kctl --release --target aarch64-apple-darwin
 	echo "==> Build outputs:"
 	ls -lh result-iso/iso/*.iso
 	ls -lh result-kctl/bin/kctl
+	ls -lh target/x86_64-apple-darwin/release/kctl
+	ls -lh target/aarch64-apple-darwin/release/kctl
 }
 
 cmd_dist() {
 	require_cmd tar
 	require_cmd sha256sum
 	[[ -f result-kctl/bin/kctl ]] || die "run '${0} build' first (missing result-kctl/bin/kctl)"
+	[[ -f target/x86_64-apple-darwin/release/kctl ]] || die "run '${0} build' first (missing target/x86_64-apple-darwin/release/kctl)"
+	[[ -f target/aarch64-apple-darwin/release/kctl ]] || die "run '${0} build' first (missing target/aarch64-apple-darwin/release/kctl)"
 	shopt -s nullglob
 	iso_candidates=(result-iso/iso/*.iso)
 	shopt -u nullglob
@@ -116,14 +131,18 @@ cmd_dist() {
 	ISO_SRC="${iso_candidates[0]}"
 
 	mkdir -p dist
-	echo "==> Packaging ${KCTL_ARCHIVE}..."
-	tar -C result-kctl/bin -czf "dist/${KCTL_ARCHIVE}" kctl
+	echo "==> Packaging ${KCTL_LINUX_ARCHIVE}..."
+	tar -C result-kctl/bin -czf "dist/${KCTL_LINUX_ARCHIVE}" kctl
+	echo "==> Packaging ${KCTL_MACOS_X86_64_ARCHIVE}..."
+	tar -C target/x86_64-apple-darwin/release -czf "dist/${KCTL_MACOS_X86_64_ARCHIVE}" kctl
+	echo "==> Packaging ${KCTL_MACOS_AARCH64_ARCHIVE}..."
+	tar -C target/aarch64-apple-darwin/release -czf "dist/${KCTL_MACOS_AARCH64_ARCHIVE}" kctl
 	echo "==> Copying $(basename "${ISO_SRC}") to dist/${ISO_NAME}..."
 	cp -f "${ISO_SRC}" "dist/${ISO_NAME}"
 	echo "==> Writing dist/SHA256SUMS..."
 	(
 		cd dist
-		sha256sum "${ISO_NAME}" "${KCTL_ARCHIVE}" >SHA256SUMS
+		sha256sum "${ISO_NAME}" "${KCTL_ARCHIVES[@]}" >SHA256SUMS
 	)
 	echo "==> dist layout:"
 	ls -lh dist/
@@ -134,7 +153,9 @@ cmd_publish() {
 	require_cmd nix
 	require_cmd git
 	load_dotenv
-	[[ -f "dist/${KCTL_ARCHIVE}" ]] || die "run '${0} dist' first"
+	for archive in "${KCTL_ARCHIVES[@]}"; do
+		[[ -f "dist/${archive}" ]] || die "run '${0} dist' first (missing dist/${archive})"
+	done
 	[[ -f "dist/${ISO_NAME}" ]] || die "run '${0} dist' first"
 	[[ -f dist/SHA256SUMS ]] || die "run '${0} dist' first"
 
@@ -147,7 +168,11 @@ cmd_publish() {
 	[[ "${remote_tag_commit}" == "${target_commit}" ]] || die "remote tag ${TAG} points to ${remote_tag_commit}, not local tag target ${target_commit}"
 
 	repo="$(repo_slug)"
-	assets=("dist/${KCTL_ARCHIVE}" "dist/${ISO_NAME}" dist/SHA256SUMS)
+	assets=("dist/${ISO_NAME}")
+	for archive in "${KCTL_ARCHIVES[@]}"; do
+		assets+=("dist/${archive}")
+	done
+	assets+=(dist/SHA256SUMS)
 	create_args=(
 		api "repos/${repo}/releases"
 		-X POST
