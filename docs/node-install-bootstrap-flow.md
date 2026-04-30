@@ -223,11 +223,11 @@ flowchart TD
 2. If still installer-only, explicitly promote:
    - `echo controller-managed | sudo tee /etc/kcore/disko-management-mode`
 3. Validate layout first:
-   - `kcore-kctl --node <host:9091> node apply-disko -f ./day2-disko.nix`
+   - `kctl --node <host:9091> node apply-disko -f ./day2-disko.nix`
 4. Apply with bounded timeout:
-   - `kcore-kctl --node <host:9091> node apply-disko -f ./day2-disko.nix --apply --timeout-seconds 600`
+   - `kctl --node <host:9091> node apply-disko -f ./day2-disko.nix --apply --timeout-seconds 600`
 5. Reconcile Nix mounts/services:
-   - `kcore-kctl --node <host:9091> node apply-nix -f ./node-config.nix`
+   - `kctl --node <host:9091> node apply-nix -f ./node-config.nix`
 
 ## ISO-to-VM acceptance checklist (regression guard)
 

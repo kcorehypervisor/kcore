@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build release artifacts (Nix ISO + kcore-kctl), package dist/, publish GitHub Release.
+# Build release artifacts (Nix ISO + kctl), package dist/, publish GitHub Release.
 # Usage:
-#   ./scripts/release.sh build    # nix build ISO + kcore-kctl -> result-iso, result-kctl
+#   ./scripts/release.sh build    # nix build ISO + kctl -> result-iso, result-kctl
 #   ./scripts/release.sh dist     # dist/*.tar.gz, ISO copy, dist/SHA256SUMS
 #   ./scripts/release.sh tag      # create/push v$(VERSION)
 #   ./scripts/release.sh publish  # gh release create/upload (needs tag on remote)
@@ -17,7 +17,7 @@ cd "${ROOT}"
 
 VERSION="$(tr -d '\n' < VERSION)"
 ISO_NAME="kcoreos-${VERSION}-x86_64-linux.iso"
-KCTL_ARCHIVE="kcore-kctl-${VERSION}-linux-x86_64.tar.gz"
+KCTL_ARCHIVE="kctl-${VERSION}-linux-x86_64.tar.gz"
 TAG="v${VERSION}"
 
 die() {
@@ -98,17 +98,17 @@ cmd_build() {
 	require_cmd nix
 	echo "==> Building ISO (${ISO_NAME})..."
 	nix build ".#nixosConfigurations.kcore-iso.config.system.build.isoImage" -o result-iso
-	echo "==> Building kcore-kctl..."
-	nix build ".#kcore-kctl" -o result-kctl
+	echo "==> Building kctl..."
+	nix build ".#kctl" -o result-kctl
 	echo "==> Build outputs:"
 	ls -lh result-iso/iso/*.iso
-	ls -lh result-kctl/bin/kcore-kctl
+	ls -lh result-kctl/bin/kctl
 }
 
 cmd_dist() {
 	require_cmd tar
 	require_cmd sha256sum
-	[[ -f result-kctl/bin/kcore-kctl ]] || die "run '${0} build' first (missing result-kctl/bin/kcore-kctl)"
+	[[ -f result-kctl/bin/kctl ]] || die "run '${0} build' first (missing result-kctl/bin/kctl)"
 	shopt -s nullglob
 	iso_candidates=(result-iso/iso/*.iso)
 	shopt -u nullglob
@@ -117,7 +117,7 @@ cmd_dist() {
 
 	mkdir -p dist
 	echo "==> Packaging ${KCTL_ARCHIVE}..."
-	tar -C result-kctl/bin -czf "dist/${KCTL_ARCHIVE}" kcore-kctl
+	tar -C result-kctl/bin -czf "dist/${KCTL_ARCHIVE}" kctl
 	echo "==> Copying $(basename "${ISO_SRC}") to dist/${ISO_NAME}..."
 	cp -f "${ISO_SRC}" "dist/${ISO_NAME}"
 	echo "==> Writing dist/SHA256SUMS..."

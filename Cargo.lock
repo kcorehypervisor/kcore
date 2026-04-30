@@ -1863,34 +1863,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kcore-kctl"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "aws-lc-rs",
- "base64",
- "clap",
- "dirs",
- "kcore-disk-layout-yaml",
- "kcore-sanitize",
- "proptest",
- "prost",
- "prost-types",
- "rcgen",
- "rustls",
- "serde",
- "serde_yaml",
- "tempfile",
- "time",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tonic-health",
- "x509-parser",
-]
-
-[[package]]
 name = "kcore-node-agent"
 version = "0.2.0"
 dependencies = [
@@ -1927,6 +1899,34 @@ dependencies = [
 [[package]]
 name = "kcore-sanitize"
 version = "0.2.0"
+
+[[package]]
+name = "kctl"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "base64",
+ "clap",
+ "dirs",
+ "kcore-disk-layout-yaml",
+ "kcore-sanitize",
+ "proptest",
+ "prost",
+ "prost-types",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tonic-health",
+ "x509-parser",
+]
 
 [[package]]
 name = "lab"

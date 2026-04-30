@@ -171,7 +171,7 @@ pub fn create_cluster_pki(
 
     let (kctl_cert_pem, kctl_key_pem) = sign_cert(
         None,
-        "kcore-kctl",
+        "kctl",
         vec![ExtendedKeyUsagePurpose::ClientAuth],
         &ca_cert_pem,
         &ca_key_pem,

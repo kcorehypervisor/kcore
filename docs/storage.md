@@ -2,7 +2,7 @@
 
 This document explains how storage works end-to-end in kcore:
 
-- operator commands (`kcore-kctl`)
+- operator commands (`kctl`)
 - controller API and validation
 - node install-time storage configuration
 - generated Nix VM configuration fields
@@ -39,7 +39,7 @@ disk), omit `--data-disk`. The filesystem backend stores images and volumes
 under `/var/lib/kcore/` on the OS partition:
 
 ```bash
-kcore-kctl --node 192.168.40.105:9091 node install \
+kctl --node 192.168.40.105:9091 node install \
   --os-disk /dev/sda \
   --join-controller 192.168.40.105:9090 \
   --storage-backend filesystem
@@ -52,7 +52,7 @@ When dedicated data disk(s) are available, pass them with `--data-disk`:
 Filesystem:
 
 ```bash
-kcore-kctl --node 192.168.40.105:9091 node install \
+kctl --node 192.168.40.105:9091 node install \
   --os-disk /dev/sda \
   --data-disk /dev/nvme0n1 \
   --join-controller 192.168.40.105:9090 \
@@ -62,7 +62,7 @@ kcore-kctl --node 192.168.40.105:9091 node install \
 LVM:
 
 ```bash
-kcore-kctl --node 192.168.40.105:9091 node install \
+kctl --node 192.168.40.105:9091 node install \
   --os-disk /dev/sda \
   --data-disk /dev/nvme0n1 \
   --join-controller 192.168.40.105:9090 \
@@ -74,7 +74,7 @@ kcore-kctl --node 192.168.40.105:9091 node install \
 ZFS:
 
 ```bash
-kcore-kctl --node 192.168.40.105:9091 node install \
+kctl --node 192.168.40.105:9091 node install \
   --os-disk /dev/sda \
   --data-disk /dev/nvme0n1 \
   --join-controller 192.168.40.105:9090 \
@@ -141,7 +141,7 @@ echo controller-managed | sudo tee /etc/kcore/disk-management-mode
 
 ### Apply mode safety gate
 
-`kcore-kctl node apply-disk --apply` (alias `apply-disko` kept for one release)
+`kctl node apply-disk --apply` (alias `apply-disko` kept for one release)
 succeeds only in `controller-managed` mode. In `installer-only`, the RPC
 returns a clear rejection and reports the active mode.
 
@@ -195,10 +195,10 @@ or `content: { type: zfs, pool: tank0 }`, and list empty stubs as needed:
 when you need disko features not covered by the YAML schema yet.
 
 ```bash
-kcore-kctl diff   -f day2-disk-layout.yaml   # controller pre-flight, no writes
-kcore-kctl apply  -f day2-disk-layout.yaml   # creates/updates DiskLayout
-kcore-kctl get disk-layouts                  # see status (pending / applied / refused)
-kcore-kctl describe disk-layout prod-data-pool
+kctl diff   -f day2-disk-layout.yaml   # controller pre-flight, no writes
+kctl apply  -f day2-disk-layout.yaml   # creates/updates DiskLayout
+kctl get disk-layouts                  # see status (pending / applied / refused)
+kctl describe disk-layout prod-data-pool
 ```
 
 The node-agent classifier (live `lsblk` based) is the authoritative gate.
@@ -214,7 +214,7 @@ For one-off operator workflows (validation, manual apply), you can still push
 straight to a single node-agent:
 
 ```bash
-kcore-kctl --node 192.168.40.105:9091 node apply-disk \
+kctl --node 192.168.40.105:9091 node apply-disk \
   -f ./day2-disk.nix
 ```
 
@@ -223,7 +223,7 @@ Validation parses/evaluates layout input without partitioning disks.
 ### 3) Apply with bounded timeout (controller-managed mode only)
 
 ```bash
-kcore-kctl --node 192.168.40.105:9091 node apply-disk \
+kctl --node 192.168.40.105:9091 node apply-disk \
   -f ./day2-disk.nix \
   --apply \
   --timeout-seconds 600
@@ -260,7 +260,7 @@ This gives deterministic composition for fleet-wide storage profiles with explic
 Create a VM using a node-local image with filesystem backend request:
 
 ```bash
-kcore-kctl create vm app-fs-01 \
+kctl create vm app-fs-01 \
   --image-path /var/lib/kcore/images/ubuntu-24.04.raw \
   --image-format raw \
   --network default \
@@ -273,7 +273,7 @@ kcore-kctl create vm app-fs-01 \
 Create a VM with ZFS backend request:
 
 ```bash
-kcore-kctl create vm app-zfs-01 \
+kctl create vm app-zfs-01 \
   --image-path /var/lib/kcore/images/ubuntu-24.04.raw \
   --image-format raw \
   --network default \
@@ -288,8 +288,8 @@ If node/backend mismatch occurs, create fails with `FailedPrecondition`.
 ### 3) Verify node storage capability
 
 ```bash
-kcore-kctl get nodes
-kcore-kctl get nodes <node-id>
+kctl get nodes
+kctl get nodes <node-id>
 ```
 
 `kctl` output includes node storage backend information so operators can confirm placement expectations.

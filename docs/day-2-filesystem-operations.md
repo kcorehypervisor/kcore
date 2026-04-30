@@ -200,7 +200,7 @@ echo controller-managed | sudo tee /etc/kcore/disk-management-mode
 ### 2) Validate layout only
 
 ```bash
-kcore-kctl --node <node:9091> node apply-disk -f ./day2-layout.nix
+kctl --node <node:9091> node apply-disk -f ./day2-layout.nix
 ```
 
 Do not proceed until validation returns success.
@@ -208,7 +208,7 @@ Do not proceed until validation returns success.
 ### 3) Apply with bounded timeout
 
 ```bash
-kcore-kctl --node <node:9091> node apply-disk \
+kctl --node <node:9091> node apply-disk \
   -f ./day2-layout.nix \
   --apply \
   --timeout-seconds 600

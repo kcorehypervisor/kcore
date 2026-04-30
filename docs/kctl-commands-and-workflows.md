@@ -550,7 +550,7 @@ Day-2 operations:
 Install node with LVM data disk mode:
 
 ```bash
-kcore-kctl --node 192.168.40.105:9091 node install \
+kctl --node 192.168.40.105:9091 node install \
   --os-disk /dev/sda \
   --data-disk /dev/nvme0n1 \
   --join-controller 192.168.40.105:9090 \
@@ -560,7 +560,7 @@ kcore-kctl --node 192.168.40.105:9091 node install \
 Create VM with ZFS storage settings:
 
 ```bash
-kcore-kctl create vm app-zfs-01 \
+kctl create vm app-zfs-01 \
   --image-path /var/lib/kcore/images/ubuntu-24.04.raw \
   --image-format raw \
   --cpu 2 \

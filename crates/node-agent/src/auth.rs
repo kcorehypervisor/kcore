@@ -2,7 +2,7 @@ use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::{Request, Status};
 
 pub const CN_CONTROLLER_PREFIX: &str = "kcore-controller-";
-pub const CN_KCTL: &str = "kcore-kctl";
+pub const CN_KCTL: &str = "kctl";
 
 /// Extract the Common Name from the peer's TLS client certificate.
 /// Returns `None` when TLS is not in use or no client cert was presented.
@@ -92,7 +92,7 @@ mod tests {
             "kcore-controller-myhost",
             &[CN_CONTROLLER_PREFIX]
         ));
-        assert!(!is_authorized("kcore-kctl", &[CN_CONTROLLER_PREFIX]));
+        assert!(!is_authorized("kctl", &[CN_CONTROLLER_PREFIX]));
         assert!(!is_authorized(
             "kcore-node-10.0.0.1",
             &[CN_CONTROLLER_PREFIX]
@@ -101,15 +101,15 @@ mod tests {
 
     #[test]
     fn kctl_exact_match() {
-        assert!(is_authorized("kcore-kctl", &[CN_KCTL]));
-        assert!(!is_authorized("kcore-kctl-evil", &[CN_KCTL]));
+        assert!(is_authorized("kctl", &[CN_KCTL]));
+        assert!(!is_authorized("kctl-evil", &[CN_KCTL]));
     }
 
     #[test]
     fn multiple_allowed_patterns() {
         let allowed = &[CN_CONTROLLER_PREFIX, CN_KCTL];
         assert!(is_authorized("kcore-controller-10.0.0.1", allowed));
-        assert!(is_authorized("kcore-kctl", allowed));
+        assert!(is_authorized("kctl", allowed));
         assert!(!is_authorized("kcore-node-10.0.0.1", allowed));
     }
 

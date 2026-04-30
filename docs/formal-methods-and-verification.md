@@ -136,10 +136,10 @@ proptest! {
 **Status:** shipped. Every bounded model-checking proof lives in a single dedicated crate, [`crates/kcore-sanitize`](../crates/kcore-sanitize/src/lib.rs), which contains:
 
 - `nix_escape` and `sanitize_nix_attr_key` — Nix string-literal escaping.
-- `path_segments_include_dot_dot` and `assert_safe_path` — generic path-traversal guards used by `kcore-controller` and `kcore-kctl`.
+- `path_segments_include_dot_dot` and `assert_safe_path` — generic path-traversal guards used by `kcore-controller` and `kctl`.
 - `validate_safe_segment` and `validate_path_under_root` — node-agent-side guards for tenant-supplied path segments and absolute paths.
 
-`kcore-controller`, `kcore-kctl` and `kcore-node-agent` all delegate to this crate via thin wrappers in their own `path_safety.rs` / `nixgen.rs`, preserving their existing public APIs (which embed a `label` for human-readable error messages) without duplicating the validators.
+`kcore-controller`, `kctl` and `kcore-node-agent` all delegate to this crate via thin wrappers in their own `path_safety.rs` / `nixgen.rs`, preserving their existing public APIs (which embed a `label` for human-readable error messages) without duplicating the validators.
 
 **Why a separate crate?** Kani compiles every crate it analyses through its own `goto-c` `rustc` wrapper. Pointing `cargo kani` at `kcore-controller` (which transitively depends on rusqlite-bundled SQLite, rcgen+aws-lc-rs, tonic, rustls, x509-parser …) takes >20 minutes on the 4-vCPU GitHub Actions runner before any proof runs. `kcore-sanitize` has **zero non-std dependencies**, so the same proofs finish in seconds. All harnesses are gated behind `#[cfg(kani)]`, so they are excluded from `cargo build`, `cargo test`, and `cargo clippy` and have **zero impact on the stable rustc toolchain**.
 
