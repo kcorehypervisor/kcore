@@ -518,6 +518,7 @@ Top-level commands:
 - `kctl node apply-nix -f ... [--no-rebuild]`
 - `kctl node apply-disk -f ... [--apply] [--timeout-seconds N] [--no-rebuild]` (alias `apply-disko`)
 - `kctl apply -f <DiskLayout>.yaml`, `kctl diff -f <DiskLayout>.yaml`, `kctl get disk-layouts`, `kctl describe disk-layout <name>`, `kctl delete disk-layout <name>`
+- `kctl update cluster plan -f <ClusterUpdate>.yaml`, `kctl update cluster apply -f ...`, `kctl update cluster get <name>`, `kctl update cluster list`, `kctl update cluster approve <name>`, `kctl update cluster cancel <name>`, `kctl update cluster rollback <name>` (host OS rollouts; see [`cluster-and-node-upgrades.md`](./cluster-and-node-upgrades.md))
 - `kctl pull image <uri>` (legacy/manual path)
 - `kctl node approve <NODE_ID>`
 - `kctl node reject <NODE_ID>`
@@ -528,6 +529,20 @@ Top-level commands:
 
 ## 11) Common operator patterns
 
+### RBAC bootstrap (per-operator certificates)
+
+After `kctl create cluster`, the context still uses the legacy **`CN=kctl`** client material. That identity is accepted as **cluster-admin only until the first row appears in the controller `operators` table** (or forever if the controller sets `auth.bootstrap_kctl: true` — not recommended for production).
+
+Day-0 on a fresh cluster:
+
+1. `kctl operator create <name>`
+2. `kctl operator role grant <name> cluster-admin` (or `admin` / `read-only` as needed)
+3. `kctl operator issue-cert <name>` — writes `~/.kcore/operators/<name>/operator.crt` and `operator.key`
+4. Use `kctl --as <name> ...` for later commands, or add `operator: <name>` to the context in `~/.kcore/config`.
+
+Other subcommands: `kctl operator list`, `kctl operator get <name>`, `kctl operator delete <name>`, `kctl operator role revoke <name> <role>`.
+
+See [mTLS bootstrap and authentication](./mtls-bootstrap-and-auth.md) for the role lattice and compliance reporting.
 
 New environment:
 
@@ -542,8 +557,9 @@ Day-2 operations:
 3. adjust desired VM running state with `kctl set vm ... --state ...` (or `kctl start/stop vm ...`)
 4. update configs with `kctl node apply-nix ...` or `kctl apply ...`
 5. for day-2 disk layout changes, prefer declarative `kctl apply -f <DiskLayout>.yaml` (use `kctl diff -f` first); for one-off pushes, `kctl node apply-disk ...` (validate first, then `--apply`)
-6. rotate controller cert with `kctl rotate certs --controller <host:port>`
-7. rotate sub-CA with `kctl rotate sub-ca`
+6. for cluster or single-node **host OS** upgrades, use `kctl update cluster plan -f` / `apply -f` with a `kind: ClusterUpdate` manifest (narrow the selector to one node if needed); see [`cluster-and-node-upgrades.md`](./cluster-and-node-upgrades.md)
+7. rotate controller cert with `kctl rotate certs --controller <host:port>`
+8. rotate sub-CA with `kctl rotate sub-ca`
 
 ## 12) Storage backend examples
 
