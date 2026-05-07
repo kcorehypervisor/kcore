@@ -149,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     loop {
+        let bootstrap_kctl = cfg.auth.as_ref().map(|a| a.bootstrap_kctl).unwrap_or(false);
         let mut svc = grpc::ControllerService::new(
             database.clone(),
             clients.clone(),
@@ -156,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
             sub_ca.clone(),
             cfg.replication.clone(),
             cfg.require_manual_approval,
+            bootstrap_kctl,
         );
         if let Some(tls) = cfg.tls.as_ref() {
             svc = svc.with_tls_paths(grpc::TlsPaths {
@@ -170,6 +172,8 @@ async fn main() -> anyhow::Result<()> {
                 database.clone(),
                 cfg.replication.clone(),
                 addr.port(),
+                bootstrap_kctl,
+                cfg.tls.is_some(),
             ),
         );
 

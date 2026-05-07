@@ -2,6 +2,7 @@ mod admin;
 mod controller;
 pub(crate) mod diff;
 pub(crate) mod helpers;
+pub(crate) mod rbac_matrix;
 pub(crate) mod signing;
 pub(crate) mod validation;
 

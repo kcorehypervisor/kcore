@@ -415,6 +415,7 @@ impl Controller for MockController {
             access_control: vec![AccessControlEntry {
                 rpc_method: "ListVms".into(),
                 allowed_identities: "role:node".into(),
+                required_operator_role: "read-only".into(),
             }],
             total_nodes: 1,
             approved_nodes: 1,
@@ -527,6 +528,55 @@ impl Controller for MockController {
         _: Request<RollbackClusterUpdateRequest>,
     ) -> Result<Response<RollbackClusterUpdateResponse>, Status> {
         Err(unimp("rollback_cluster_update"))
+    }
+
+    async fn create_operator(
+        &self,
+        _: Request<CreateOperatorRequest>,
+    ) -> Result<Response<CreateOperatorResponse>, Status> {
+        Err(unimp("create_operator"))
+    }
+
+    async fn delete_operator(
+        &self,
+        _: Request<DeleteOperatorRequest>,
+    ) -> Result<Response<DeleteOperatorResponse>, Status> {
+        Err(unimp("delete_operator"))
+    }
+
+    async fn list_operators(
+        &self,
+        _: Request<ListOperatorsRequest>,
+    ) -> Result<Response<ListOperatorsResponse>, Status> {
+        Err(unimp("list_operators"))
+    }
+
+    async fn get_operator(
+        &self,
+        _: Request<GetOperatorRequest>,
+    ) -> Result<Response<GetOperatorResponse>, Status> {
+        Err(unimp("get_operator"))
+    }
+
+    async fn grant_operator_role(
+        &self,
+        _: Request<GrantOperatorRoleRequest>,
+    ) -> Result<Response<GrantOperatorRoleResponse>, Status> {
+        Err(unimp("grant_operator_role"))
+    }
+
+    async fn revoke_operator_role(
+        &self,
+        _: Request<RevokeOperatorRoleRequest>,
+    ) -> Result<Response<RevokeOperatorRoleResponse>, Status> {
+        Err(unimp("revoke_operator_role"))
+    }
+
+    async fn issue_operator_cert(
+        &self,
+        _: Request<IssueOperatorCertRequest>,
+    ) -> Result<Response<IssueOperatorCertResponse>, Status> {
+        Err(unimp("issue_operator_cert"))
     }
 }
 
