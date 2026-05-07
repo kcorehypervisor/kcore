@@ -366,6 +366,7 @@ mod tests {
             access_control: vec![controller_proto::AccessControlEntry {
                 rpc_method: "ListVms".into(),
                 allowed_identities: "kctl".into(),
+                required_operator_role: "read-only".into(),
             }],
             total_nodes: 2,
             approved_nodes: 1,

@@ -528,6 +528,20 @@ Top-level commands:
 
 ## 11) Common operator patterns
 
+### RBAC bootstrap (per-operator certificates)
+
+After `kctl create cluster`, the context still uses the legacy **`CN=kctl`** client material. That identity is accepted as **cluster-admin only until the first row appears in the controller `operators` table** (or forever if the controller sets `auth.bootstrap_kctl: true` — not recommended for production).
+
+Day-0 on a fresh cluster:
+
+1. `kctl operator create <name>`
+2. `kctl operator role grant <name> cluster-admin` (or `admin` / `read-only` as needed)
+3. `kctl operator issue-cert <name>` — writes `~/.kcore/operators/<name>/operator.crt` and `operator.key`
+4. Use `kctl --as <name> ...` for later commands, or add `operator: <name>` to the context in `~/.kcore/config`.
+
+Other subcommands: `kctl operator list`, `kctl operator get <name>`, `kctl operator delete <name>`, `kctl operator role revoke <name> <role>`.
+
+See [mTLS bootstrap and authentication](./mtls-bootstrap-and-auth.md) for the role lattice and compliance reporting.
 
 New environment:
 

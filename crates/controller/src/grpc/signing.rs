@@ -36,6 +36,35 @@ pub fn sign_node_cert(
     Ok((chain_pem, cert_key.serialize_pem()))
 }
 
+/// Sign an operator client certificate (`CN=kctl:<name>`) using the sub-CA.
+/// Leaf has ClientAuth only; chain_pem = leaf + sub-CA concatenated.
+pub fn sign_operator_cert(
+    sub_ca_cert_pem: &str,
+    sub_ca_key_pem: &str,
+    operator_name: &str,
+) -> Result<(String, String), String> {
+    let cn = format!("kctl:{operator_name}");
+    let san = format!("kctl.operator.{operator_name}");
+    let mut params = CertificateParams::new(vec![san]).map_err(|e| format!("invalid SAN: {e}"))?;
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.not_before = OffsetDateTime::now_utc();
+    params.not_after = OffsetDateTime::now_utc() + Duration::days(CERT_VALIDITY_DAYS);
+
+    let ca_key =
+        KeyPair::from_pem(sub_ca_key_pem).map_err(|e| format!("loading sub-CA key: {e}"))?;
+    let issuer = Issuer::from_ca_cert_pem(sub_ca_cert_pem, ca_key)
+        .map_err(|e| format!("loading sub-CA cert: {e}"))?;
+
+    let cert_key = KeyPair::generate().map_err(|e| format!("generating operator key: {e}"))?;
+    let cert = params
+        .signed_by(&cert_key, &issuer)
+        .map_err(|e| format!("signing operator cert: {e}"))?;
+
+    let chain_pem = format!("{}{}", cert.pem(), sub_ca_cert_pem);
+    Ok((chain_pem, cert_key.serialize_pem()))
+}
+
 /// Validate that a PEM string is a parseable X.509 certificate with CA
 /// basicConstraints.
 pub fn validate_sub_ca_cert(cert_pem: &str) -> Result<(), String> {
@@ -94,6 +123,31 @@ mod tests {
         let (chain, key) = sign_node_cert(&sub_cert, &sub_key, "10.0.0.50").unwrap();
         assert!(key.contains("BEGIN PRIVATE KEY"));
         assert_eq!(chain.matches("BEGIN CERTIFICATE").count(), 2);
+    }
+
+    #[test]
+    fn sign_operator_cert_uses_kctl_cn_and_client_auth() {
+        let (ca_cert, ca_key) = generate_test_ca();
+        let (sub_cert, sub_key) = generate_test_sub_ca(&ca_cert, &ca_key);
+        let (chain, key) = sign_operator_cert(&sub_cert, &sub_key, "alice").unwrap();
+        assert!(key.contains("BEGIN PRIVATE KEY"));
+        assert_eq!(chain.matches("BEGIN CERTIFICATE").count(), 2);
+        let end = chain
+            .find("-----END CERTIFICATE-----")
+            .expect("first cert end");
+        let first_pem = &chain[..end + "-----END CERTIFICATE-----".len()];
+        let pem = pem::parse(first_pem).expect("pem leaf");
+        use x509_parser::prelude::FromDer;
+        let (_, cert) =
+            x509_parser::certificate::X509Certificate::from_der(pem.contents()).expect("x509");
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(cn, "kctl:alice");
     }
 
     #[test]

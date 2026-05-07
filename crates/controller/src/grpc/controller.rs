@@ -26,13 +26,13 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::auth::{self, CN_CONTROLLER_PREFIX, CN_KCTL, CN_NODE_PREFIX};
+use crate::auth::{self, OperatorRole, CN_NODE_PREFIX};
 use crate::cluster_update_spec;
 use crate::config::{NetworkConfig, ReplicationConfig};
 use crate::controller_proto;
 use crate::db::{
     ClusterUpdateNodeRow, ClusterUpdateRow, Database, DiskLayoutRow, DiskLayoutStatusRow,
-    NetworkRow, NodeRow, SecurityGroupRow, SecurityGroupRuleRow, VmRow, WorkloadRow,
+    NetworkRow, NodeRow, OperatorRow, SecurityGroupRow, SecurityGroupRuleRow, VmRow, WorkloadRow,
 };
 use crate::node_proto;
 use crate::{nixgen, node_client::NodeClients, scheduler};
@@ -43,6 +43,7 @@ use super::helpers::{
     controller_state_from_node_state, parse_datetime_to_timestamp, parse_port_list,
     short_vm_id_seed, state_fallback_without_runtime, vm_backend_handle,
 };
+use super::rbac_matrix;
 use super::signing;
 use super::validation::{
     derive_image_format, derive_image_format_from_path, derive_local_image_path,
@@ -76,6 +77,10 @@ const EVT_CLUSTER_UPDATE_CREATE: &str = "cluster_update.create";
 const EVT_CLUSTER_UPDATE_APPROVE: &str = "cluster_update.approve";
 const EVT_CLUSTER_UPDATE_CANCEL: &str = "cluster_update.cancel";
 const EVT_CLUSTER_UPDATE_ROLLBACK: &str = "cluster_update.rollback";
+const EVT_OPERATOR_UPSERT: &str = "operator.upsert";
+const EVT_OPERATOR_DELETE: &str = "operator.delete";
+const EVT_OPERATOR_ROLE_GRANT: &str = "operator_role.grant";
+const EVT_OPERATOR_ROLE_REVOKE: &str = "operator_role.revoke";
 
 fn normalize_sg_protocol(protocol: &str) -> Result<String, Status> {
     let p = protocol.trim().to_ascii_lowercase();
@@ -148,6 +153,8 @@ pub struct ControllerService {
     replication: Option<ReplicationConfig>,
     tls_paths: Option<TlsPaths>,
     require_manual_approval: bool,
+    /// When true, legacy `CN=kctl` keeps cluster-admin after operators exist (escape hatch).
+    bootstrap_kctl: bool,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
 }
@@ -236,6 +243,7 @@ impl ControllerService {
         sub_ca: Arc<Mutex<SubCaState>>,
         replication: Option<ReplicationConfig>,
         require_manual_approval: bool,
+        bootstrap_kctl: bool,
     ) -> Self {
         Self {
             db,
@@ -245,6 +253,7 @@ impl ControllerService {
             replication,
             tls_paths: None,
             require_manual_approval,
+            bootstrap_kctl,
             #[cfg(test)]
             test_push_hook: None,
         }
@@ -261,6 +270,7 @@ impl ControllerService {
         clients: NodeClients,
         default_network: NetworkConfig,
         replication: Option<ReplicationConfig>,
+        bootstrap_kctl: bool,
         hook: PushHook,
     ) -> Self {
         Self {
@@ -271,8 +281,20 @@ impl ControllerService {
             replication,
             tls_paths: None,
             require_manual_approval: false,
+            bootstrap_kctl,
             test_push_hook: Some(hook),
         }
+    }
+
+    #[inline]
+    fn require_operator<T>(&self, request: &Request<T>, role: OperatorRole) -> Result<(), Status> {
+        auth::require_controller_operator(
+            request,
+            &self.db,
+            self.tls_paths.is_some(),
+            self.bootstrap_kctl,
+            role,
+        )
     }
 
     async fn push_config_to_node(&self, node: &NodeRow) -> Result<(), Status> {
@@ -1734,7 +1756,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateVmRequest>,
     ) -> Result<Response<controller_proto::CreateVmResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let mut req = request.into_inner();
         let spec = req
@@ -2115,7 +2137,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::UpdateVmRequest>,
     ) -> Result<Response<controller_proto::UpdateVmResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -2171,7 +2193,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteVmRequest>,
     ) -> Result<Response<controller_proto::DeleteVmResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
@@ -2207,7 +2229,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::SetVmDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetVmDesiredStateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let auto_start = match controller_proto::VmDesiredState::try_from(req.desired_state)
@@ -2245,7 +2267,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetVmRequest>,
     ) -> Result<Response<controller_proto::GetVmResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
         let db_vm = self
@@ -2527,7 +2549,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListVmsRequest>,
     ) -> Result<Response<controller_proto::ListVmsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
 
         let rows = if !req.target_node.is_empty() {
@@ -2629,7 +2651,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateWorkloadRequest>,
     ) -> Result<Response<controller_proto::CreateWorkloadResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
@@ -2928,7 +2950,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteWorkloadRequest>,
     ) -> Result<Response<controller_proto::DeleteWorkloadResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
@@ -3005,7 +3027,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::SetWorkloadDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetWorkloadDesiredStateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
@@ -3125,7 +3147,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetWorkloadRequest>,
     ) -> Result<Response<controller_proto::GetWorkloadResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -3216,7 +3238,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListWorkloadsRequest>,
     ) -> Result<Response<controller_proto::ListWorkloadsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -3282,7 +3304,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateNetworkRequest>,
     ) -> Result<Response<controller_proto::CreateNetworkResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = validate_network_name(&req.name)?;
@@ -3455,7 +3477,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteNetworkRequest>,
     ) -> Result<Response<controller_proto::DeleteNetworkResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = req.name.trim();
@@ -3554,7 +3576,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListNetworksRequest>,
     ) -> Result<Response<controller_proto::ListNetworksResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         let rows = if req.target_node.is_empty() {
             self.db
@@ -3595,7 +3617,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::CreateSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req
@@ -3784,7 +3806,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::GetSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         let name = req.name.trim();
         if name.is_empty() {
@@ -3851,7 +3873,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListSecurityGroupsRequest>,
     ) -> Result<Response<controller_proto::ListSecurityGroupsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let groups = self
             .db
             .list_security_groups()
@@ -3891,7 +3913,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::DeleteSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = req.name.trim();
@@ -3923,7 +3945,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::AttachSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::AttachSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req.security_group.trim();
@@ -4021,7 +4043,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DetachSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::DetachSecurityGroupResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req.security_group.trim();
@@ -4097,7 +4119,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListNodesRequest>,
     ) -> Result<Response<controller_proto::ListNodesResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let nodes = self
             .db
             .list_nodes()
@@ -4152,7 +4174,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetNodeRequest>,
     ) -> Result<Response<controller_proto::GetNodeResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         let node = self
             .db
@@ -4197,7 +4219,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateSshKeyRequest>,
     ) -> Result<Response<controller_proto::CreateSshKeyResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -4268,7 +4290,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteSshKeyRequest>,
     ) -> Result<Response<controller_proto::DeleteSshKeyResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::Admin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -4304,7 +4326,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListSshKeysRequest>,
     ) -> Result<Response<controller_proto::ListSshKeysResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
 
         let keys = self
             .db
@@ -4332,7 +4354,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetSshKeyRequest>,
     ) -> Result<Response<controller_proto::GetSshKeyResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
 
         let (name, public_key, created_at) = self
@@ -4356,7 +4378,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DrainNodeRequest>,
     ) -> Result<Response<controller_proto::DrainNodeResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -4501,7 +4523,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ApproveNodeRequest>,
     ) -> Result<Response<controller_proto::ApproveNodeResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -4552,7 +4574,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::RejectNodeRequest>,
     ) -> Result<Response<controller_proto::RejectNodeResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -4645,7 +4667,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::IssueNodeBootstrapCertRequest>,
     ) -> Result<Response<controller_proto::IssueNodeBootstrapCertResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let req = request.into_inner();
 
         let node_id = req.node_id.trim();
@@ -4689,7 +4711,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::RotateSubCaRequest>,
     ) -> Result<Response<controller_proto::RotateSubCaResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -4732,7 +4754,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ReloadTlsRequest>,
     ) -> Result<Response<controller_proto::ReloadTlsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -4778,7 +4800,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetNetworkOverviewRequest>,
     ) -> Result<Response<controller_proto::GetNetworkOverviewResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
 
         let node_rows = self
             .db
@@ -4847,7 +4869,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetStorageOverviewRequest>,
     ) -> Result<Response<controller_proto::GetStorageOverviewResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let _ = request.into_inner();
 
         let node_rows = self
@@ -5043,7 +5065,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListVolumesRequest>,
     ) -> Result<Response<controller_proto::ListVolumesResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let _ = request.into_inner();
 
         let vms = self
@@ -5121,12 +5143,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
-    // TODO(rbac): restrict to admin role when RBAC is implemented
     async fn get_compliance_report(
         &self,
         request: Request<controller_proto::GetComplianceReportRequest>,
     ) -> Result<Response<controller_proto::GetComplianceReportResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
 
         let (approved, pending, rejected) = self
             .db
@@ -5201,51 +5222,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             })
             .collect();
 
-        let access_control = vec![
-            acl("RegisterNode", CN_NODE_PREFIX),
-            acl("Heartbeat", CN_NODE_PREFIX),
-            acl("SyncVmState", CN_NODE_PREFIX),
-            acl("CreateVm", CN_KCTL),
-            acl("UpdateVm", CN_KCTL),
-            acl("DeleteVm", CN_KCTL),
-            acl("SetVmDesiredState", CN_KCTL),
-            acl("GetVm", CN_KCTL),
-            acl("ListVms", CN_KCTL),
-            acl("CreateNetwork", CN_KCTL),
-            acl("DeleteNetwork", CN_KCTL),
-            acl("ListNetworks", CN_KCTL),
-            acl("CreateSecurityGroup", CN_KCTL),
-            acl("GetSecurityGroup", CN_KCTL),
-            acl("ListSecurityGroups", CN_KCTL),
-            acl("DeleteSecurityGroup", CN_KCTL),
-            acl("AttachSecurityGroup", CN_KCTL),
-            acl("DetachSecurityGroup", CN_KCTL),
-            acl("ListNodes", CN_KCTL),
-            acl("GetNode", CN_KCTL),
-            acl("CreateSshKey", CN_KCTL),
-            acl("DeleteSshKey", CN_KCTL),
-            acl("ListSshKeys", CN_KCTL),
-            acl("GetSshKey", CN_KCTL),
-            acl("DrainNode", CN_KCTL),
-            acl("ApproveNode", CN_KCTL),
-            acl("RejectNode", CN_KCTL),
-            acl("RenewNodeCert", CN_NODE_PREFIX),
-            acl("IssueNodeBootstrapCert", CN_KCTL),
-            acl("RotateSubCa", CN_KCTL),
-            acl("ReloadTls", CN_KCTL),
-            acl("GetComplianceReport", CN_KCTL),
-            acl("ListAuditEvents", CN_KCTL),
-            acl("GetNetworkOverview", CN_KCTL),
-            acl("GetStorageOverview", CN_KCTL),
-            acl("ApplyNixConfig", CN_KCTL),
-            acl("CreateClusterUpdate", CN_KCTL),
-            acl("GetClusterUpdate", CN_KCTL),
-            acl("ListClusterUpdates", CN_KCTL),
-            acl("PlanClusterUpdate", CN_KCTL),
-            acl("ApproveClusterUpdate", CN_KCTL),
-            acl("CancelClusterUpdate", CN_KCTL),
-            acl("RollbackClusterUpdate", CN_KCTL),
-        ];
+        let access_control = rbac_matrix::compliance_access_control_entries();
 
         Ok(Response::new(
             controller_proto::GetComplianceReportResponse {
@@ -5292,12 +5269,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
         ))
     }
 
-    // TODO(rbac): restrict to admin role when RBAC is implemented
     async fn list_audit_events(
         &self,
         request: Request<controller_proto::ListAuditEventsRequest>,
     ) -> Result<Response<controller_proto::ListAuditEventsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         let since = {
             let s = req.since.trim();
@@ -5339,7 +5315,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateDiskLayoutRequest>,
     ) -> Result<Response<controller_proto::CreateDiskLayoutResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         self.create_disk_layout_impl(&actor, request.into_inner())
             .await
@@ -5349,7 +5325,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetDiskLayoutRequest>,
     ) -> Result<Response<controller_proto::GetDiskLayoutResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         self.get_disk_layout_impl(request.into_inner()).await
     }
 
@@ -5357,7 +5333,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListDiskLayoutsRequest>,
     ) -> Result<Response<controller_proto::ListDiskLayoutsResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         self.list_disk_layouts_impl(request.into_inner()).await
     }
 
@@ -5365,7 +5341,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteDiskLayoutRequest>,
     ) -> Result<Response<controller_proto::DeleteDiskLayoutResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         self.delete_disk_layout_impl(&actor, request.into_inner())
             .await
@@ -5375,7 +5351,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::CreateClusterUpdateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let spec = req
@@ -5516,7 +5492,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::GetClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::GetClusterUpdateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         if req.name.trim().is_empty() {
             return Err(Status::invalid_argument("name is required"));
@@ -5544,7 +5520,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ListClusterUpdatesRequest>,
     ) -> Result<Response<controller_proto::ListClusterUpdatesResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let _ = request.into_inner();
         let rows = self
             .db
@@ -5565,7 +5541,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::PlanClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::PlanClusterUpdateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
         let spec = req
             .spec
@@ -5601,7 +5577,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::ApproveClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::ApproveClusterUpdateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         if req.name.trim().is_empty() {
@@ -5647,7 +5623,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CancelClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::CancelClusterUpdateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         if req.name.trim().is_empty() {
@@ -5704,7 +5680,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::RollbackClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::RollbackClusterUpdateResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         if req.name.trim().is_empty() {
@@ -5763,24 +5739,311 @@ impl controller_proto::controller_server::Controller for ControllerService {
         ))
     }
 
+    async fn create_operator(
+        &self,
+        request: Request<controller_proto::CreateOperatorRequest>,
+    ) -> Result<Response<controller_proto::CreateOperatorResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let name = request.into_inner().name.trim().to_string();
+        auth::validate_operator_name(&name)?;
+        if self
+            .db
+            .get_operator_row(&name)
+            .map_err(internal_db)?
+            .is_some()
+        {
+            return Err(Status::already_exists(format!(
+                "operator '{name}' already exists"
+            )));
+        }
+        self.db.create_operator(&name).map_err(internal_db)?;
+        self.log_replication_event(
+            EVT_OPERATOR_UPSERT,
+            &format!("operator/{name}"),
+            serde_json::json!({ "name": name }),
+        );
+        let row = self
+            .db
+            .get_operator_row(&name)
+            .map_err(internal_db)?
+            .expect("just inserted");
+        let operator = operator_row_to_proto(&self.db, &row).map_err(internal_db)?;
+        Ok(Response::new(controller_proto::CreateOperatorResponse {
+            operator: Some(operator),
+        }))
+    }
+
+    async fn delete_operator(
+        &self,
+        request: Request<controller_proto::DeleteOperatorRequest>,
+    ) -> Result<Response<controller_proto::DeleteOperatorResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let name = request.into_inner().name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let ok = self.db.delete_operator(&name).map_err(internal_db)?;
+        if ok {
+            self.log_replication_event(
+                EVT_OPERATOR_DELETE,
+                &format!("operator/{name}"),
+                serde_json::json!({ "name": name }),
+            );
+        }
+        Ok(Response::new(controller_proto::DeleteOperatorResponse {
+            success: ok,
+        }))
+    }
+
+    async fn list_operators(
+        &self,
+        request: Request<controller_proto::ListOperatorsRequest>,
+    ) -> Result<Response<controller_proto::ListOperatorsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let _ = request.into_inner();
+        let rows = self.db.list_operator_rows().map_err(internal_db)?;
+        let mut operators = Vec::with_capacity(rows.len());
+        for row in rows {
+            operators.push(operator_row_to_proto(&self.db, &row).map_err(internal_db)?);
+        }
+        Ok(Response::new(controller_proto::ListOperatorsResponse {
+            operators,
+        }))
+    }
+
+    async fn get_operator(
+        &self,
+        request: Request<controller_proto::GetOperatorRequest>,
+    ) -> Result<Response<controller_proto::GetOperatorResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let name = request.into_inner().name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_operator_row(&name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found(format!("operator '{name}' not found")))?;
+        let operator = operator_row_to_proto(&self.db, &row).map_err(internal_db)?;
+        Ok(Response::new(controller_proto::GetOperatorResponse {
+            operator: Some(operator),
+        }))
+    }
+
+    async fn grant_operator_role(
+        &self,
+        request: Request<controller_proto::GrantOperatorRoleRequest>,
+    ) -> Result<Response<controller_proto::GrantOperatorRoleResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        let op_name = req.operator_name.trim();
+        if op_name.is_empty() {
+            return Err(Status::invalid_argument("operator_name is required"));
+        }
+        let role = operator_role_kind_to_auth(req.role)?;
+        if self
+            .db
+            .get_operator_row(op_name)
+            .map_err(internal_db)?
+            .is_none()
+        {
+            return Err(Status::not_found(format!("operator '{op_name}' not found")));
+        }
+        self.db
+            .grant_operator_role_str(op_name, role.as_db_str())
+            .map_err(internal_db)?;
+        self.db
+            .touch_operator_updated(op_name)
+            .map_err(internal_db)?;
+        self.log_replication_event(
+            EVT_OPERATOR_ROLE_GRANT,
+            &format!("operator-role/{op_name}/{}", role.as_db_str()),
+            serde_json::json!({
+                "operatorName": op_name,
+                "role": role.as_db_str(),
+            }),
+        );
+        let row = self
+            .db
+            .get_operator_row(op_name)
+            .map_err(internal_db)?
+            .expect("operator exists");
+        let operator = operator_row_to_proto(&self.db, &row).map_err(internal_db)?;
+        Ok(Response::new(controller_proto::GrantOperatorRoleResponse {
+            operator: Some(operator),
+        }))
+    }
+
+    async fn revoke_operator_role(
+        &self,
+        request: Request<controller_proto::RevokeOperatorRoleRequest>,
+    ) -> Result<Response<controller_proto::RevokeOperatorRoleResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        let op_name = req.operator_name.trim();
+        if op_name.is_empty() {
+            return Err(Status::invalid_argument("operator_name is required"));
+        }
+        let role = operator_role_kind_to_auth(req.role)?;
+        let _ = self
+            .db
+            .revoke_operator_role_str(op_name, role.as_db_str())
+            .map_err(internal_db)?;
+        self.db
+            .touch_operator_updated(op_name)
+            .map_err(internal_db)?;
+        self.log_replication_event(
+            EVT_OPERATOR_ROLE_REVOKE,
+            &format!("operator-role/{op_name}/{}", role.as_db_str()),
+            serde_json::json!({
+                "operatorName": op_name,
+                "role": role.as_db_str(),
+            }),
+        );
+        let row = self.db.get_operator_row(op_name).map_err(internal_db)?;
+        let operator = match row {
+            Some(r) => operator_row_to_proto(&self.db, &r).map_err(internal_db)?,
+            None => controller_proto::Operator {
+                name: op_name.to_string(),
+                ..Default::default()
+            },
+        };
+        Ok(Response::new(
+            controller_proto::RevokeOperatorRoleResponse {
+                operator: Some(operator),
+            },
+        ))
+    }
+
+    async fn issue_operator_cert(
+        &self,
+        request: Request<controller_proto::IssueOperatorCertRequest>,
+    ) -> Result<Response<controller_proto::IssueOperatorCertResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let op_name = request.into_inner().operator_name.trim().to_string();
+        if op_name.is_empty() {
+            return Err(Status::invalid_argument("operator_name is required"));
+        }
+        if self
+            .db
+            .get_operator_row(&op_name)
+            .map_err(internal_db)?
+            .is_none()
+        {
+            return Err(Status::not_found(format!("operator '{op_name}' not found")));
+        }
+
+        let sub_ca = self
+            .sub_ca
+            .lock()
+            .map_err(|_| Status::internal("sub-CA lock poisoned"))?
+            .clone();
+
+        if !sub_ca.is_available() {
+            return Err(Status::unavailable(
+                "sub-CA is not configured on this controller; operator certificate issuance is unavailable",
+            ));
+        }
+
+        let (chain_pem, key_pem) =
+            signing::sign_operator_cert(&sub_ca.cert_pem, &sub_ca.key_pem, &op_name)
+                .map_err(|e| Status::internal(format!("signing operator cert: {e}")))?;
+
+        let serial = leaf_serial_hex(&chain_pem)?;
+        self.db
+            .set_operator_cert_serial(&op_name, &serial)
+            .map_err(internal_db)?;
+        self.log_replication_event(
+            EVT_OPERATOR_UPSERT,
+            &format!("operator/{op_name}"),
+            serde_json::json!({
+                "name": op_name,
+                "certSerial": serial,
+            }),
+        );
+
+        info!(operator = %op_name, "issued operator client certificate via sub-CA");
+
+        Ok(Response::new(controller_proto::IssueOperatorCertResponse {
+            success: true,
+            cert_pem: chain_pem,
+            key_pem,
+            message: format!("operator certificate issued for '{op_name}'"),
+        }))
+    }
+
     async fn classify_disk_layout(
         &self,
         request: Request<controller_proto::ClassifyDiskLayoutRequest>,
     ) -> Result<Response<controller_proto::ClassifyDiskLayoutResponse>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
         self.classify_disk_layout_impl(request.into_inner()).await
     }
 }
 
-fn acl(method: &str, identity: &str) -> controller_proto::AccessControlEntry {
-    controller_proto::AccessControlEntry {
-        rpc_method: method.to_string(),
-        allowed_identities: if identity.ends_with('-') {
-            format!("{identity}*")
-        } else {
-            identity.to_string()
-        },
+fn internal_db(e: rusqlite::Error) -> Status {
+    Status::internal(format!("database error: {e}"))
+}
+
+fn operator_role_kind_to_auth(kind: i32) -> Result<OperatorRole, Status> {
+    let k = controller_proto::OperatorRoleKind::try_from(kind)
+        .unwrap_or(controller_proto::OperatorRoleKind::Unspecified);
+    match k {
+        controller_proto::OperatorRoleKind::ReadOnly => Ok(OperatorRole::ReadOnly),
+        controller_proto::OperatorRoleKind::Admin => Ok(OperatorRole::Admin),
+        controller_proto::OperatorRoleKind::ClusterAdmin => Ok(OperatorRole::ClusterAdmin),
+        controller_proto::OperatorRoleKind::Unspecified => Err(Status::invalid_argument(
+            "role must be read_only, admin, or cluster_admin",
+        )),
     }
+}
+
+fn operator_roles_to_proto_kinds(roles: &[String]) -> Vec<i32> {
+    roles
+        .iter()
+        .filter_map(|s| {
+            OperatorRole::from_db_str(s).map(|r| match r {
+                OperatorRole::ReadOnly => controller_proto::OperatorRoleKind::ReadOnly as i32,
+                OperatorRole::Admin => controller_proto::OperatorRoleKind::Admin as i32,
+                OperatorRole::ClusterAdmin => {
+                    controller_proto::OperatorRoleKind::ClusterAdmin as i32
+                }
+            })
+        })
+        .collect()
+}
+
+fn operator_row_to_proto(
+    db: &Database,
+    row: &OperatorRow,
+) -> Result<controller_proto::Operator, rusqlite::Error> {
+    let roles = db.list_operator_role_strings(&row.name)?;
+    Ok(controller_proto::Operator {
+        name: row.name.clone(),
+        cert_serial: row.cert_serial.clone(),
+        created_at: Some(prost_types::Timestamp {
+            seconds: row.created_at,
+            nanos: 0,
+        }),
+        updated_at: Some(prost_types::Timestamp {
+            seconds: row.updated_at,
+            nanos: 0,
+        }),
+        roles: operator_roles_to_proto_kinds(&roles),
+    })
+}
+
+fn leaf_serial_hex(chain_pem: &str) -> Result<String, Status> {
+    let first_end = chain_pem
+        .find("-----END CERTIFICATE-----")
+        .ok_or_else(|| Status::internal("malformed PEM chain"))?;
+    let first_block = chain_pem[..first_end + "-----END CERTIFICATE-----".len()].to_string();
+    let pem = pem::parse(first_block).map_err(|e| Status::internal(format!("PEM parse: {e}")))?;
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(pem.contents())
+        .map_err(|e| Status::internal(format!("X509 parse: {e}")))?;
+    Ok(format!("{:X}", cert.serial))
 }
 
 #[cfg(test)]
@@ -5871,6 +6134,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -5917,6 +6181,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6065,6 +6330,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6116,6 +6382,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6173,6 +6440,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6224,6 +6492,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6282,6 +6551,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6334,6 +6604,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6392,6 +6663,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6443,6 +6715,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6518,6 +6791,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6576,6 +6850,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6623,6 +6898,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6660,6 +6936,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6736,6 +7013,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6775,6 +7053,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -6810,6 +7089,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
             false,
         );
 
@@ -6854,6 +7134,7 @@ mod tests {
             empty_sub_ca(),
             None,
             true,
+            false,
         );
 
         let resp =
@@ -6902,6 +7183,7 @@ mod tests {
             empty_sub_ca(),
             replication,
             false,
+            false,
         );
 
         <ControllerService as controller_proto::controller_server::Controller>::register_node(
@@ -6947,6 +7229,7 @@ mod tests {
             empty_sub_ca(),
             replication,
             false,
+            false,
         );
         <ControllerService as controller_proto::controller_server::Controller>::heartbeat(
             &svc,
@@ -6983,6 +7266,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
             false,
         );
 
@@ -7032,6 +7316,7 @@ mod tests {
             empty_sub_ca(),
             None,
             false,
+            false,
         );
 
         let resp =
@@ -7066,6 +7351,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
             false,
         );
 
@@ -7165,6 +7451,7 @@ mod tests {
             test_sub_ca_state(),
             None,
             false,
+            false,
         );
 
         let resp =
@@ -7199,6 +7486,7 @@ mod tests {
             test_sub_ca_state(),
             None,
             false,
+            false,
         );
 
         let err =
@@ -7227,6 +7515,7 @@ mod tests {
             empty_sub_ca(),
             None,
             false,
+            false,
         );
 
         let err =
@@ -7253,6 +7542,7 @@ mod tests {
             test_network(),
             sub_ca.clone(),
             None,
+            false,
             false,
         );
 
@@ -7290,6 +7580,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
             false,
         );
 
@@ -7333,6 +7624,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -7375,6 +7667,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
 
@@ -7475,6 +7768,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
         (db, svc)
@@ -7554,6 +7848,7 @@ mod tests {
             NodeClients::new(None),
             test_network(),
             None,
+            false,
             hook,
         );
         let mut spec = make_cluster_update_spec();
