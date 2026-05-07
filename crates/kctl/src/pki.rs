@@ -94,6 +94,36 @@ fn sign_cert(
     Ok((cert_pem, key_pem))
 }
 
+fn validate_operator_name_local(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("operator name must be 1–64 characters".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("operator name must be ASCII alphanumeric, '_' or '-'".to_string());
+    }
+    Ok(())
+}
+
+/// Write `operator.crt` / `operator.key` under `~/.kcore/operators/<name>/`.
+pub fn write_operator_tls_material(
+    operator_name: &str,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<PathBuf, String> {
+    validate_operator_name_local(operator_name)?;
+    let dir = crate::config::default_kcore_dir()
+        .join("operators")
+        .join(operator_name);
+    let cert_path = dir.join("operator.crt");
+    let key_path = dir.join("operator.key");
+    write_file(&cert_path, cert_pem, 0o644)?;
+    write_file(&key_path, key_pem, 0o600)?;
+    Ok(dir)
+}
+
 fn write_file(path: &Path, content: &str, mode: u32) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

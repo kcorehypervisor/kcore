@@ -65,6 +65,10 @@ struct Cli {
     #[arg(long = "tls-server-name", global = true)]
     tls_server_name: Option<String>,
 
+    /// Use per-operator client certificate `~/.kcore/operators/<OPERATOR>/operator.{crt,key}` (overrides `operator:` in config context).
+    #[arg(long = "as", global = true, value_name = "OPERATOR")]
+    operator_as: Option<String>,
+
     /// Node address for direct node commands (host:port)
     #[arg(long, global = true)]
     node: Option<String>,
@@ -129,6 +133,11 @@ enum Command {
     SshKey {
         #[command(subcommand)]
         action: SshKeyAction,
+    },
+    /// Manage RBAC operators (per-operator client certificates)
+    Operator {
+        #[command(subcommand)]
+        action: OperatorAction,
     },
     /// Drain a node (migrate all VMs to other nodes)
     Drain {
@@ -704,6 +713,47 @@ enum PullResource {
 }
 
 #[derive(Subcommand)]
+enum OperatorAction {
+    /// Register an operator identity (CN=kctl:<name>) — initial bootstrap uses legacy `kctl` cert
+    Create {
+        /// Operator name (ASCII alphanumeric, `_`, `-`)
+        name: String,
+    },
+    /// Delete an operator and all role assignments
+    Delete { name: String },
+    /// List operators
+    List,
+    /// Show one operator
+    Get { name: String },
+    /// Issue a client certificate from the controller sub-CA and write `~/.kcore/operators/<name>/operator.{crt,key}`
+    #[command(name = "issue-cert")]
+    IssueCert { name: String },
+    /// Grant a role to an operator
+    #[command(name = "grant-role")]
+    GrantRole {
+        name: String,
+        #[arg(long)]
+        role: OperatorRoleArg,
+    },
+    /// Revoke a role from an operator
+    #[command(name = "revoke-role")]
+    RevokeRole {
+        name: String,
+        #[arg(long)]
+        role: OperatorRoleArg,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum OperatorRoleArg {
+    #[value(name = "read-only")]
+    ReadOnly,
+    Admin,
+    #[value(name = "cluster-admin")]
+    ClusterAdmin,
+}
+
+#[derive(Subcommand)]
 enum SshKeyAction {
     /// Create an SSH key
     Create {
@@ -906,6 +956,7 @@ fn resolve_controller(cli: &Cli) -> Result<config::ConnectionInfo, String> {
         &cli.controller,
         cli.insecure,
         cli.tls_server_name.as_deref(),
+        cli.operator_as.as_deref(),
     )
 }
 
@@ -919,6 +970,7 @@ fn resolve_node(cli: &Cli) -> Result<config::ConnectionInfo, String> {
         &cli.node,
         cli.insecure,
         cli.tls_server_name.clone(),
+        cli.operator_as.as_deref(),
     )
 }
 
@@ -1353,6 +1405,7 @@ async fn main() {
                 &cli.controller,
                 false,
                 cli.tls_server_name.as_deref(),
+                cli.operator_as.as_deref(),
             )
             .ok();
             let certs_dir = config::resolve_install_certs_dir(&config_path).unwrap_or_else(|e| {
@@ -1454,6 +1507,49 @@ async fn main() {
             commands::ssh_key::get(&info, name).await
         }
 
+        Command::Operator {
+            action: OperatorAction::Create { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::create(&info, name).await
+        }
+        Command::Operator {
+            action: OperatorAction::Delete { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::delete(&info, name).await
+        }
+        Command::Operator {
+            action: OperatorAction::List,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::list(&info).await
+        }
+        Command::Operator {
+            action: OperatorAction::Get { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::get(&info, name).await
+        }
+        Command::Operator {
+            action: OperatorAction::IssueCert { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::issue_cert(&info, name).await
+        }
+        Command::Operator {
+            action: OperatorAction::GrantRole { name, role },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::grant_role(&info, name, *role).await
+        }
+        Command::Operator {
+            action: OperatorAction::RevokeRole { name, role },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::revoke_role(&info, name, *role).await
+        }
+
         Command::Drain {
             resource:
                 DrainResource::Node {
@@ -1506,6 +1602,7 @@ async fn main() {
                 &[],
                 cli.insecure,
                 cli.tls_server_name.as_deref(),
+                cli.operator_as.as_deref(),
             )
             .ok();
             commands::certs::rotate(&certs_path, controller, info.as_ref()).await

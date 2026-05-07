@@ -136,6 +136,7 @@ pub fn create(
             cert: None,
             key: None,
             ca: None,
+            operator: None,
         },
     );
     cfg.current_context = Some(context_name.to_string());
