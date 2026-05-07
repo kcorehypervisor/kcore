@@ -634,6 +634,10 @@ fn apply_replication_event(
         | "security_group.detach"
         | "ssh_key.create"
         | "ssh_key.delete"
+        | "operator.upsert"
+        | "operator.delete"
+        | "operator_role.grant"
+        | "operator_role.revoke"
         | "disk_layout.create"
         | "disk_layout.delete"
         | "controller.register" => {
@@ -926,6 +930,23 @@ fn apply_domain_compensation(
                 let _ = db
                     .delete_ssh_key(name)
                     .map_err(|e| format!("compensate ssh_key.create delete {name}: {e}"))?;
+            }
+        }
+        "operator.upsert" => {
+            if let Some(name) = loser_body.get("name").and_then(Value::as_str) {
+                let _ = db
+                    .delete_operator(name)
+                    .map_err(|e| format!("compensate operator.upsert delete {name}: {e}"))?;
+            }
+        }
+        "operator_role.grant" => {
+            if let (Some(op), Some(role)) = (
+                loser_body.get("operatorName").and_then(Value::as_str),
+                loser_body.get("role").and_then(Value::as_str),
+            ) {
+                let _ = db.revoke_operator_role_str(op, role).map_err(|e| {
+                    format!("compensate operator_role.grant revoke {op}/{role}: {e}")
+                })?;
             }
         }
         "disk_layout.create" => {
@@ -1569,6 +1590,57 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 .ok_or_else(|| format!("missing name for {}", head.resource_key))?;
             db.delete_ssh_key(name)
                 .map_err(|e| format!("delete ssh key {name}: {e}"))?;
+            Ok(())
+        }
+        "operator.upsert" => {
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let cert_serial = body.get("certSerial").and_then(Value::as_str).unwrap_or("");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let row = crate::db::OperatorRow {
+                name: name.to_string(),
+                cert_serial: cert_serial.to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            db.upsert_operator_row(&row)
+                .map_err(|e| format!("upsert operator {name}: {e}"))?;
+            Ok(())
+        }
+        "operator.delete" => {
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let _ = db
+                .delete_operator(name)
+                .map_err(|e| format!("delete operator {name}: {e}"))?;
+            Ok(())
+        }
+        "operator_role.grant" => {
+            let op = body
+                .get("operatorName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("missing operatorName for {}", head.resource_key))?;
+            let role = body
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("missing role for {}", head.resource_key))?;
+            db.grant_operator_role_str(op, role)
+                .map_err(|e| format!("grant operator role {op}/{role}: {e}"))?;
+            Ok(())
+        }
+        "operator_role.revoke" => {
+            let op = body
+                .get("operatorName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("missing operatorName for {}", head.resource_key))?;
+            let role = body
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("missing role for {}", head.resource_key))?;
+            let _ = db
+                .revoke_operator_role_str(op, role)
+                .map_err(|e| format!("revoke operator role {op}/{role}: {e}"))?;
             Ok(())
         }
         "controller.register" => {
@@ -2419,6 +2491,104 @@ mod tests {
     }
 
     #[test]
+    fn apply_head_to_domain_upserts_operator_and_grant() {
+        let db = Database::open(":memory:").expect("open db");
+        let head = ReplicationResourceHeadRow {
+            resource_key: "operator/alice".to_string(),
+            last_op_id: "op-op-1".to_string(),
+            last_logical_ts_unix_ms: 1,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 1,
+            last_event_type: "operator.upsert".to_string(),
+            last_body_json: r#"{"name":"alice"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &head).expect("apply operator");
+        assert!(db.get_operator_row("alice").expect("db").is_some());
+
+        let head_grant = ReplicationResourceHeadRow {
+            resource_key: "operator-role/alice/admin".to_string(),
+            last_op_id: "op-op-2".to_string(),
+            last_logical_ts_unix_ms: 2,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 2,
+            last_event_type: "operator_role.grant".to_string(),
+            last_body_json: r#"{"operatorName":"alice","role":"admin"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &head_grant).expect("apply grant");
+        let roles = db.list_operator_role_strings("alice").expect("roles");
+        assert!(roles.iter().any(|r| r == "admin"));
+    }
+
+    /// Simulates a secondary controller DB converging operator grants authored elsewhere:
+    /// before materialization the replica would have no roles for the identity; after applying
+    /// replicated heads it exposes the same role rows as the primary (multi-role grants stack).
+    #[test]
+    fn cross_dc_operator_roles_converge_via_materialization() {
+        let db = Database::open(":memory:").expect("open db");
+        assert_eq!(db.count_operators().expect("count"), 0);
+
+        let head_op = ReplicationResourceHeadRow {
+            resource_key: "operator/dc-user".to_string(),
+            last_op_id: "op-dc-1".to_string(),
+            last_logical_ts_unix_ms: 100,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-dc1".to_string(),
+            last_event_id: 1,
+            last_event_type: "operator.upsert".to_string(),
+            last_body_json: r#"{"name":"dc-user"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &head_op).expect("apply operator upsert");
+
+        let head_ro = ReplicationResourceHeadRow {
+            resource_key: "operator-role/dc-user/read-only".to_string(),
+            last_op_id: "op-dc-2".to_string(),
+            last_logical_ts_unix_ms: 101,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-dc1".to_string(),
+            last_event_id: 2,
+            last_event_type: "operator_role.grant".to_string(),
+            last_body_json: r#"{"operatorName":"dc-user","role":"read-only"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &head_ro).expect("apply read-only grant");
+
+        let roles = db.list_operator_role_strings("dc-user").expect("roles");
+        assert!(roles.iter().any(|r| r == "read-only"));
+
+        let head_admin = ReplicationResourceHeadRow {
+            resource_key: "operator-role/dc-user/admin".to_string(),
+            last_op_id: "op-dc-3".to_string(),
+            last_logical_ts_unix_ms: 200,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-dc2".to_string(),
+            last_event_id: 3,
+            last_event_type: "operator_role.grant".to_string(),
+            last_body_json: r#"{"operatorName":"dc-user","role":"admin"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &head_admin).expect("apply admin grant");
+
+        let roles = db.list_operator_role_strings("dc-user").expect("roles");
+        assert!(roles.iter().any(|r| r == "read-only"));
+        assert!(roles.iter().any(|r| r == "admin"));
+    }
+
+    #[test]
     fn apply_head_to_domain_deletes_ssh_key_and_vm_associations() {
         let db = Database::open(":memory:").expect("open db");
         db.upsert_node(&test_node("node-1"))
@@ -2698,6 +2868,7 @@ mod tests {
             listen_addr: "0.0.0.0:9090".to_string(),
             db_path: ":memory:".to_string(),
             tls: None,
+            auth: None,
             default_network: crate::config::NetworkConfig {
                 gateway_interface: "eth0".to_string(),
                 external_ip: "192.168.40.105".to_string(),
@@ -2734,6 +2905,7 @@ mod tests {
             listen_addr: "0.0.0.0:9090".to_string(),
             db_path: ":memory:".to_string(),
             tls: None,
+            auth: None,
             default_network: crate::config::NetworkConfig {
                 gateway_interface: "eth0".to_string(),
                 external_ip: "192.168.40.105".to_string(),

@@ -99,6 +99,15 @@ service Controller {
   rpc ApproveClusterUpdate(ApproveClusterUpdateRequest) returns (ApproveClusterUpdateResponse);
   rpc CancelClusterUpdate(CancelClusterUpdateRequest) returns (CancelClusterUpdateResponse);
   rpc RollbackClusterUpdate(RollbackClusterUpdateRequest) returns (RollbackClusterUpdateResponse);
+
+  // RBAC: operators identified by client cert CN=kctl:<name>. Legacy CN=kctl is bootstrap-only.
+  rpc CreateOperator(CreateOperatorRequest) returns (CreateOperatorResponse);
+  rpc DeleteOperator(DeleteOperatorRequest) returns (DeleteOperatorResponse);
+  rpc ListOperators(ListOperatorsRequest) returns (ListOperatorsResponse);
+  rpc GetOperator(GetOperatorRequest) returns (GetOperatorResponse);
+  rpc GrantOperatorRole(GrantOperatorRoleRequest) returns (GrantOperatorRoleResponse);
+  rpc RevokeOperatorRole(RevokeOperatorRoleRequest) returns (RevokeOperatorRoleResponse);
+  rpc IssueOperatorCert(IssueOperatorCertRequest) returns (IssueOperatorCertResponse);
 }
 
 message RegisterNodeRequest {
@@ -877,6 +886,84 @@ message ListAuditEventsResponse {
 message AccessControlEntry {
   string rpc_method = 1;
   string allowed_identities = 2;
+  // Minimum operator role when using per-operator certs (CN=kctl:<name>). Empty when the RPC
+  // uses machine identities only (node/controller prefixes) or legacy bootstrap CN=kctl.
+  string required_operator_role = 3;
+}
+
+// Operator RBAC roles (flat cluster-wide).
+enum OperatorRoleKind {
+  OPERATOR_ROLE_KIND_UNSPECIFIED = 0;
+  OPERATOR_ROLE_KIND_READ_ONLY = 1;
+  OPERATOR_ROLE_KIND_ADMIN = 2;
+  OPERATOR_ROLE_KIND_CLUSTER_ADMIN = 3;
+}
+
+message Operator {
+  string name = 1;
+  string cert_serial = 2;
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp updated_at = 4;
+  repeated OperatorRoleKind roles = 5;
+}
+
+message CreateOperatorRequest {
+  string name = 1;
+}
+
+message CreateOperatorResponse {
+  Operator operator = 1;
+}
+
+message DeleteOperatorRequest {
+  string name = 1;
+}
+
+message DeleteOperatorResponse {
+  bool success = 1;
+}
+
+message ListOperatorsRequest {}
+
+message ListOperatorsResponse {
+  repeated Operator operators = 1;
+}
+
+message GetOperatorRequest {
+  string name = 1;
+}
+
+message GetOperatorResponse {
+  Operator operator = 1;
+}
+
+message GrantOperatorRoleRequest {
+  string operator_name = 1;
+  OperatorRoleKind role = 2;
+}
+
+message GrantOperatorRoleResponse {
+  Operator operator = 1;
+}
+
+message RevokeOperatorRoleRequest {
+  string operator_name = 1;
+  OperatorRoleKind role = 2;
+}
+
+message RevokeOperatorRoleResponse {
+  Operator operator = 1;
+}
+
+message IssueOperatorCertRequest {
+  string operator_name = 1;
+}
+
+message IssueOperatorCertResponse {
+  bool success = 1;
+  string cert_pem = 2;
+  string key_pem = 3;
+  string message = 4;
 }
 
 message GetComplianceReportResponse {

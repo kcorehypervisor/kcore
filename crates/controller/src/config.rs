@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default = "default_db_path")]
     pub db_path: String,
     pub tls: Option<TlsConfig>,
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
     pub default_network: NetworkConfig,
     /// When set, mutating RPCs append JSON envelopes to `replication_outbox` for future peer sync.
     #[serde(default)]
@@ -33,6 +35,15 @@ pub struct ReplicationConfig {
 
 fn default_dc_id() -> String {
     "DC1".to_string()
+}
+
+/// Optional auth overrides (RBAC / bootstrap).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfig {
+    /// When true, legacy `CN=kctl` keeps cluster-admin even after operators exist.
+    #[serde(default)]
+    pub bootstrap_kctl: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

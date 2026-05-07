@@ -455,6 +455,48 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<RollbackClusterUpdateResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn create_operator(
+        &self,
+        _: TRequest<CreateOperatorRequest>,
+    ) -> Result<Response<CreateOperatorResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn delete_operator(
+        &self,
+        _: TRequest<DeleteOperatorRequest>,
+    ) -> Result<Response<DeleteOperatorResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_operators(
+        &self,
+        _: TRequest<ListOperatorsRequest>,
+    ) -> Result<Response<ListOperatorsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_operator(
+        &self,
+        _: TRequest<GetOperatorRequest>,
+    ) -> Result<Response<GetOperatorResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn grant_operator_role(
+        &self,
+        _: TRequest<GrantOperatorRoleRequest>,
+    ) -> Result<Response<GrantOperatorRoleResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn revoke_operator_role(
+        &self,
+        _: TRequest<RevokeOperatorRoleRequest>,
+    ) -> Result<Response<RevokeOperatorRoleResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn issue_operator_cert(
+        &self,
+        _: TRequest<IssueOperatorCertRequest>,
+    ) -> Result<Response<IssueOperatorCertResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
 }
 
 async fn spawn_many_vms_controller() -> SocketAddr {

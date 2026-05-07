@@ -47,6 +47,9 @@ pub struct Context {
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca: Option<String>,
+    /// Per-operator client identity: use `~/.kcore/operators/<name>/operator.{crt,key}` instead of the cluster `kctl.crt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
 }
 
 /// Resolved TLS material: either decoded inline PEM or a file path to read at connect time.
@@ -120,6 +123,46 @@ pub fn default_kcore_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".kcore")
+}
+
+/// Switch client TLS certificate/key to a per-operator identity under `~/.kcore/operators/<name>/`.
+pub fn apply_operator_client_cert(
+    info: &mut ConnectionInfo,
+    operator_name: &str,
+) -> Result<(), String> {
+    let name = operator_name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    if info.insecure {
+        return Ok(());
+    }
+    if info.cert_pem.is_some() || info.key_pem.is_some() {
+        return Err(
+            "per-operator identity (--as / context.operator) cannot be used with inline cert-data/key-data in config"
+                .to_string(),
+        );
+    }
+    let dir = default_kcore_dir().join("operators").join(name);
+    let cert = dir.join("operator.crt");
+    let key = dir.join("operator.key");
+    if !cert.is_file() || !key.is_file() {
+        return Err(format!(
+            "operator TLS material not found.\nExpected:\n  {}\n  {}\nRun: kctl operator issue-cert {}",
+            cert.display(),
+            key.display(),
+            name
+        ));
+    }
+    let cs = cert.to_string_lossy().to_string();
+    let ks = key.to_string_lossy().to_string();
+    crate::path_safety::assert_safe_path(&cs, "operator TLS certificate path")
+        .map_err(|e| format!("{e:#}"))?;
+    crate::path_safety::assert_safe_path(&ks, "operator TLS key path")
+        .map_err(|e| format!("{e:#}"))?;
+    info.cert = Some(cs);
+    info.key = Some(ks);
+    Ok(())
 }
 
 pub fn default_certs_dir() -> PathBuf {
@@ -233,6 +276,21 @@ fn normalize_addresses(addrs: &[String], default_port: u16) -> Vec<String> {
         .collect()
 }
 
+fn pick_operator_name(operator_as: Option<&str>, ctx: Option<&Context>) -> Option<String> {
+    operator_as
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            ctx.and_then(|c| {
+                c.operator
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+        })
+}
+
 /// Resolve a controller address from CLI flags and config file.
 /// Priority: flag > config > error.
 ///
@@ -244,6 +302,7 @@ pub fn resolve_controller(
     controller_flags: &[String],
     insecure_flag: bool,
     tls_server_name_flag: Option<&str>,
+    operator_as: Option<&str>,
 ) -> Result<ConnectionInfo, String> {
     let tls_from_cli = tls_server_name_flag
         .map(str::trim)
@@ -288,7 +347,7 @@ pub fn resolve_controller(
                 "no TLS credentials available — run `kctl create cluster` first or use -k for insecure mode".to_string(),
             );
         }
-        return Ok(ConnectionInfo {
+        let mut info = ConnectionInfo {
             address: addresses[0].clone(),
             addresses,
             insecure: false,
@@ -299,7 +358,11 @@ pub fn resolve_controller(
             cert,
             key,
             ca,
-        });
+        };
+        if let Some(op) = pick_operator_name(operator_as, ctx) {
+            apply_operator_client_cert(&mut info, &op)?;
+        }
+        return Ok(info);
     }
 
     let config = load_config(config_path).map_err(|e| format!("loading config: {e}"))?;
@@ -360,7 +423,7 @@ pub fn resolve_controller(
         ));
     }
 
-    Ok(ConnectionInfo {
+    let mut info = ConnectionInfo {
         address: addresses[0].clone(),
         addresses,
         insecure: false,
@@ -371,7 +434,11 @@ pub fn resolve_controller(
         cert,
         key,
         ca,
-    })
+    };
+    if let Some(op) = pick_operator_name(operator_as, Some(ctx)) {
+        apply_operator_client_cert(&mut info, &op)?;
+    }
+    Ok(info)
 }
 
 /// Extract TLS material from a `Context`: inline data (decoded) or file paths.
@@ -416,6 +483,7 @@ pub fn resolve_node(
     node_flag: &Option<String>,
     insecure_flag: bool,
     tls_server_name_flag: Option<String>,
+    operator_as: Option<&str>,
 ) -> Result<ConnectionInfo, String> {
     let addr = node_flag
         .as_deref()
@@ -464,7 +532,7 @@ pub fn resolve_node(
         (None, None, None, None, None, None)
     };
 
-    Ok(ConnectionInfo {
+    let mut info = ConnectionInfo {
         address: normalize_address(addr, 9091),
         addresses: vec![normalize_address(addr, 9091)],
         insecure: false,
@@ -475,7 +543,11 @@ pub fn resolve_node(
         cert,
         key,
         ca,
-    })
+    };
+    if let Some(op) = pick_operator_name(operator_as, ctx) {
+        apply_operator_client_cert(&mut info, &op)?;
+    }
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -484,8 +556,14 @@ mod tests {
 
     #[test]
     fn resolve_controller_uses_flag_and_defaults_port() {
-        let info = resolve_controller(Path::new("/nonexistent"), &["10.0.0.10".into()], true, None)
-            .expect("resolve controller");
+        let info = resolve_controller(
+            Path::new("/nonexistent"),
+            &["10.0.0.10".into()],
+            true,
+            None,
+            None,
+        )
+        .expect("resolve controller");
         assert_eq!(info.address, "10.0.0.10:9090");
         assert_eq!(info.addresses, vec!["10.0.0.10:9090"]);
         assert!(info.insecure);
@@ -500,7 +578,7 @@ mod tests {
 
     #[test]
     fn resolve_node_requires_node_flag() {
-        let result = resolve_node(Path::new("/nonexistent"), &None, true, None);
+        let result = resolve_node(Path::new("/nonexistent"), &None, true, None, None);
         match result {
             Ok(_) => panic!("expected missing --node error"),
             Err(err) => assert!(err.contains("--node flag is required")),
@@ -522,6 +600,7 @@ mod tests {
             &Some("10.0.0.21".into()),
             true, // even with insecure flag, we still must reject a corrupt config
             None,
+            None,
         )
         .expect_err("must surface parse error");
         assert!(
@@ -536,7 +615,7 @@ mod tests {
         let config_path = temp.path().join("config.yaml");
         std::fs::write(&config_path, "}{this is not yaml").expect("write broken config");
 
-        let err = resolve_controller(&config_path, &["192.168.1.1".into()], false, None)
+        let err = resolve_controller(&config_path, &["192.168.1.1".into()], false, None, None)
             .expect_err("must surface parse error");
         assert!(
             err.contains("loading config"),
@@ -550,6 +629,7 @@ mod tests {
             Path::new("/nonexistent"),
             &Some("10.0.0.21".into()),
             true,
+            None,
             None,
         )
         .expect("resolve node");
@@ -568,6 +648,7 @@ mod tests {
             Path::new("/nonexistent"),
             &["10.0.0.10".into(), "10.0.0.11:9090".into()],
             true,
+            None,
             None,
         )
         .expect("resolve controller");
@@ -605,6 +686,7 @@ mod tests {
             &["192.168.1.1".into()],
             false,
             Some("controller.example.com"),
+            None,
         )
         .expect("resolve");
         assert_eq!(
@@ -642,7 +724,7 @@ mod tests {
             },
         };
         save_config(&config_path, &cfg).expect("save");
-        let info = resolve_controller(&config_path, &[], false, None).expect("resolve");
+        let info = resolve_controller(&config_path, &[], false, None, None).expect("resolve");
         assert_eq!(info.ca_pem.as_deref(), Some("---CA PEM---"));
         assert_eq!(info.cert_pem.as_deref(), Some("---CERT PEM---"));
         assert_eq!(info.key_pem.as_deref(), Some("---KEY PEM---"));
@@ -674,7 +756,8 @@ mod tests {
             },
         };
         save_config(&config_path, &cfg).expect("save");
-        let err = resolve_controller(&config_path, &[], false, None).expect_err("should fail");
+        let err =
+            resolve_controller(&config_path, &[], false, None, None).expect_err("should fail");
         assert!(
             err.contains("no TLS credentials"),
             "unexpected error: {err}"
@@ -704,7 +787,7 @@ mod tests {
             },
         };
         save_config(&config_path, &cfg).expect("save");
-        let info = resolve_controller(&config_path, &[], false, None).expect("resolve");
+        let info = resolve_controller(&config_path, &[], false, None, None).expect("resolve");
         assert!(info.cert_pem.is_none());
         assert_eq!(info.cert.as_deref(), Some("/path/to/kctl.crt"));
         assert_eq!(info.key.as_deref(), Some("/path/to/kctl.key"));

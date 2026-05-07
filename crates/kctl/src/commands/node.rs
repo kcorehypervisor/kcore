@@ -386,7 +386,7 @@ pub async fn install_from_manifest(file: &str, config_path: &Path) -> Result<()>
         ca: None,
     };
 
-    let controller_info = config::resolve_controller(config_path, &[], false, None).ok();
+    let controller_info = config::resolve_controller(config_path, &[], false, None, None).ok();
 
     let certs_dir = config::resolve_install_certs_dir(config_path)
         .unwrap_or_else(|_| config::default_cluster_certs_dir("default"));

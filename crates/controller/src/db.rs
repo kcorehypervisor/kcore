@@ -163,6 +163,14 @@ pub struct ClusterUpdateRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct OperatorRow {
+    pub name: String,
+    pub cert_serial: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ClusterUpdateNodeRow {
     pub update_name: String,
     pub node_id: String,
@@ -892,7 +900,24 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 29;
+        if version < 30 {
+            let _ = conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS operators (
+                    name TEXT PRIMARY KEY,
+                    cert_serial TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS operator_roles (
+                    operator_name TEXT NOT NULL REFERENCES operators(name) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    granted_at INTEGER NOT NULL,
+                    PRIMARY KEY (operator_name, role)
+                );",
+            );
+        }
+
+        const CURRENT_VERSION: i32 = 30;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -3008,6 +3033,144 @@ impl Database {
         Ok(rows > 0)
     }
 
+    fn unix_now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    pub fn count_operators(&self) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row("SELECT COUNT(*) FROM operators", [], |row| row.get(0))
+    }
+
+    pub fn create_operator(&self, name: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let now = Self::unix_now_secs();
+        conn.execute(
+            "INSERT INTO operators (name, cert_serial, created_at, updated_at) VALUES (?1, '', ?2, ?2)",
+            params![name, now],
+        )?;
+        Ok(())
+    }
+
+    /// Upsert operator row (replication / materialization).
+    pub fn upsert_operator_row(&self, row: &OperatorRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO operators (name, cert_serial, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+               cert_serial = excluded.cert_serial,
+               updated_at = excluded.updated_at",
+            params![row.name, row.cert_serial, row.created_at, row.updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_operator(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let n = conn.execute("DELETE FROM operators WHERE name = ?1", params![name])?;
+        Ok(n > 0)
+    }
+
+    pub fn get_operator_row(&self, name: &str) -> Result<Option<OperatorRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, cert_serial, created_at, updated_at FROM operators WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |row| {
+            Ok(OperatorRow {
+                name: row.get(0)?,
+                cert_serial: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_operator_rows(&self) -> Result<Vec<OperatorRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, cert_serial, created_at, updated_at FROM operators ORDER BY name ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(OperatorRow {
+                name: row.get(0)?,
+                cert_serial: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn list_operator_role_strings(
+        &self,
+        operator_name: &str,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT role FROM operator_roles WHERE operator_name = ?1 ORDER BY role ASC",
+        )?;
+        let rows = stmt.query_map(params![operator_name], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    pub fn grant_operator_role_str(
+        &self,
+        operator_name: &str,
+        role: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let now = Self::unix_now_secs();
+        conn.execute(
+            "INSERT INTO operator_roles (operator_name, role, granted_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(operator_name, role) DO UPDATE SET granted_at = excluded.granted_at",
+            params![operator_name, role, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_operator_role_str(
+        &self,
+        operator_name: &str,
+        role: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let n = conn.execute(
+            "DELETE FROM operator_roles WHERE operator_name = ?1 AND role = ?2",
+            params![operator_name, role],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn touch_operator_updated(&self, name: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let now = Self::unix_now_secs();
+        conn.execute(
+            "UPDATE operators SET updated_at = ?2 WHERE name = ?1",
+            params![name, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_operator_cert_serial(
+        &self,
+        name: &str,
+        serial: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let now = Self::unix_now_secs();
+        conn.execute(
+            "UPDATE operators SET cert_serial = ?2, updated_at = ?3 WHERE name = ?1",
+            params![name, serial, now],
+        )?;
+        Ok(())
+    }
+
     pub fn associate_vm_ssh_keys(
         &self,
         vm_id: &str,
@@ -4812,6 +4975,44 @@ mod proptests {
             let bumped = db.list_disk_layouts_needing_reconcile().unwrap();
             prop_assert!(bumped.iter().any(|l| l.name == name),
                 "layout whose generation moved past observed_generation must be re-queued");
+        }
+
+        /// **Operator create/list**: `create_operator` + `list_operator_rows` round-trip.
+        #[test]
+        fn operator_create_then_list_contains_row(
+            name in "[a-z][a-z0-9_-]{0,31}",
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            db.create_operator(&name).unwrap();
+            let rows = db.list_operator_rows().unwrap();
+            prop_assert!(rows.iter().any(|r| r.name == name));
+            prop_assert_eq!(db.count_operators().unwrap(), 1);
+        }
+
+        /// **`grant_operator_role_str` idempotence**: repeated grants keep a single logical row.
+        #[test]
+        fn grant_operator_role_str_is_idempotent(
+            name in "[a-z][a-z0-9_-]{0,31}",
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            db.create_operator(&name).unwrap();
+            db.grant_operator_role_str(&name, "admin").unwrap();
+            db.grant_operator_role_str(&name, "admin").unwrap();
+            let roles = db.list_operator_role_strings(&name).unwrap();
+            prop_assert_eq!(roles.iter().filter(|r| *r == "admin").count(), 1);
+        }
+
+        /// **`delete_operator` cascades** roles (no orphan role rows).
+        #[test]
+        fn delete_operator_cascades_roles(
+            name in "[a-z][a-z0-9_-]{0,31}",
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            db.create_operator(&name).unwrap();
+            db.grant_operator_role_str(&name, "read-only").unwrap();
+            prop_assert!(db.delete_operator(&name).unwrap());
+            prop_assert!(db.list_operator_role_strings(&name).unwrap().is_empty());
+            prop_assert!(db.get_operator_row(&name).unwrap().is_none());
         }
     }
 }
