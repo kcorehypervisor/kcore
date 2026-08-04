@@ -5744,6 +5744,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateOperatorRequest>,
     ) -> Result<Response<controller_proto::CreateOperatorResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
         let name = request.into_inner().name.trim().to_string();
         auth::validate_operator_name(&name)?;
         if self
@@ -5758,6 +5759,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
         self.db.create_operator(&name).map_err(internal_db)?;
         self.log_replication_event(
+            &actor,
+            Some("CreateOperator"),
             EVT_OPERATOR_UPSERT,
             &format!("operator/{name}"),
             serde_json::json!({ "name": name }),
@@ -5778,6 +5781,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DeleteOperatorRequest>,
     ) -> Result<Response<controller_proto::DeleteOperatorResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
         let name = request.into_inner().name.trim().to_string();
         if name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
@@ -5785,6 +5789,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let ok = self.db.delete_operator(&name).map_err(internal_db)?;
         if ok {
             self.log_replication_event(
+                &actor,
+                Some("DeleteOperator"),
                 EVT_OPERATOR_DELETE,
                 &format!("operator/{name}"),
                 serde_json::json!({ "name": name }),
@@ -5836,6 +5842,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::GrantOperatorRoleRequest>,
     ) -> Result<Response<controller_proto::GrantOperatorRoleResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let op_name = req.operator_name.trim();
         if op_name.is_empty() {
@@ -5857,6 +5864,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .touch_operator_updated(op_name)
             .map_err(internal_db)?;
         self.log_replication_event(
+            &actor,
+            Some("GrantOperatorRole"),
             EVT_OPERATOR_ROLE_GRANT,
             &format!("operator-role/{op_name}/{}", role.as_db_str()),
             serde_json::json!({
@@ -5880,6 +5889,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::RevokeOperatorRoleRequest>,
     ) -> Result<Response<controller_proto::RevokeOperatorRoleResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let op_name = req.operator_name.trim();
         if op_name.is_empty() {
@@ -5894,6 +5904,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .touch_operator_updated(op_name)
             .map_err(internal_db)?;
         self.log_replication_event(
+            &actor,
+            Some("RevokeOperatorRole"),
             EVT_OPERATOR_ROLE_REVOKE,
             &format!("operator-role/{op_name}/{}", role.as_db_str()),
             serde_json::json!({
@@ -5921,6 +5933,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::IssueOperatorCertRequest>,
     ) -> Result<Response<controller_proto::IssueOperatorCertResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
         let op_name = request.into_inner().operator_name.trim().to_string();
         if op_name.is_empty() {
             return Err(Status::invalid_argument("operator_name is required"));
@@ -5955,6 +5968,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .set_operator_cert_serial(&op_name, &serial)
             .map_err(internal_db)?;
         self.log_replication_event(
+            &actor,
+            Some("IssueOperatorCert"),
             EVT_OPERATOR_UPSERT,
             &format!("operator/{op_name}"),
             serde_json::json!({
@@ -6216,6 +6231,7 @@ mod tests {
             test_network(),
             empty_sub_ca(),
             None,
+            false,
             false,
         );
 
