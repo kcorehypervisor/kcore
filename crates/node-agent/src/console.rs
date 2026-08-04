@@ -18,6 +18,7 @@ pub type ConsoleOutboundStream =
     Pin<Box<dyn Stream<Item = Result<proto::ConsoleMessage, Status>> + Send + 'static>>;
 
 /// Validate `vm_name` and resolve `/run/kcore/<vm>.serial.sock` (or configured dir).
+#[allow(clippy::result_large_err)]
 pub fn serial_socket_path(socket_dir: &Path, vm_name: &str) -> Result<PathBuf, Status> {
     let safe = path_safety::validate_safe_segment(vm_name.trim(), "vm_name")
         .map_err(Status::invalid_argument)?;
@@ -25,6 +26,7 @@ pub fn serial_socket_path(socket_dir: &Path, vm_name: &str) -> Result<PathBuf, S
 }
 
 /// Connect to the VM serial socket, returning typed gRPC statuses on failure.
+#[allow(clippy::result_large_err)]
 pub async fn connect_serial_socket(path: &Path) -> Result<UnixStream, Status> {
     match UnixStream::connect(path).await {
         Ok(s) => Ok(s),
@@ -49,6 +51,7 @@ pub async fn connect_serial_socket(path: &Path) -> Result<UnixStream, Status> {
 ///
 /// `first` is the already-read opening message (must carry `vm_name`; may carry data).
 /// Remaining client messages are read from `inbound`.
+#[allow(clippy::result_large_err)]
 pub async fn bridge_console_session(
     socket_dir: &Path,
     first: proto::ConsoleMessage,
