@@ -2510,7 +2510,7 @@ mod tests {
         assert!(db.get_operator_row("alice").expect("db").is_some());
 
         let head_grant = ReplicationResourceHeadRow {
-            resource_key: "operator-role/alice/admin".to_string(),
+            resource_key: "operator-role/alice/vm-admin".to_string(),
             last_op_id: "op-op-2".to_string(),
             last_logical_ts_unix_ms: 2,
             last_policy_priority: 0,
@@ -2520,11 +2520,11 @@ mod tests {
             last_controller_id: "ctrl-a".to_string(),
             last_event_id: 2,
             last_event_type: "operator_role.grant".to_string(),
-            last_body_json: r#"{"operatorName":"alice","role":"admin"}"#.to_string(),
+            last_body_json: r#"{"operatorName":"alice","role":"vm-admin"}"#.to_string(),
         };
         apply_head_to_domain(&db, &head_grant).expect("apply grant");
         let roles = db.list_operator_role_strings("alice").expect("roles");
-        assert!(roles.iter().any(|r| r == "admin"));
+        assert!(roles.iter().any(|r| r == "vm-admin"));
     }
 
     /// Simulates a secondary controller DB converging operator grants authored elsewhere:
@@ -2569,7 +2569,7 @@ mod tests {
         assert!(roles.iter().any(|r| r == "read-only"));
 
         let head_admin = ReplicationResourceHeadRow {
-            resource_key: "operator-role/dc-user/admin".to_string(),
+            resource_key: "operator-role/dc-user/vm-admin".to_string(),
             last_op_id: "op-dc-3".to_string(),
             last_logical_ts_unix_ms: 200,
             last_policy_priority: 0,
@@ -2579,13 +2579,13 @@ mod tests {
             last_controller_id: "ctrl-dc2".to_string(),
             last_event_id: 3,
             last_event_type: "operator_role.grant".to_string(),
-            last_body_json: r#"{"operatorName":"dc-user","role":"admin"}"#.to_string(),
+            last_body_json: r#"{"operatorName":"dc-user","role":"vm-admin"}"#.to_string(),
         };
         apply_head_to_domain(&db, &head_admin).expect("apply admin grant");
 
         let roles = db.list_operator_role_strings("dc-user").expect("roles");
         assert!(roles.iter().any(|r| r == "read-only"));
-        assert!(roles.iter().any(|r| r == "admin"));
+        assert!(roles.iter().any(|r| r == "vm-admin"));
     }
 
     #[test]

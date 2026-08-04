@@ -1,4 +1,4 @@
-// TODO(rbac): when RBAC is implemented, this command should require the admin role
+// Compliance report is allowed for read-only operators (enforced on the controller).
 
 use anyhow::Result;
 

@@ -25,7 +25,7 @@ the role (`kcore-controller`, `kctl`, or `kcore-node-<host>`).
 | Bootstrap | TLS Bootstrap with short-lived tokens (24h default). Node submits a CSR; the control plane signs it. Token expires automatically. | Operator pushes a CA-signed cert directly to the node during `kctl node install`. No bootstrap token. |
 | Cert rotation | kubelet auto-renews its certificate before expiry. Built into the kubelet. | Automatic renewal via sub-CA: node-agent checks expiry daily, renews within 30 days of expiry via `RenewNodeCert` RPC. Controller cert can be rotated with `kctl rotate certs`. Sub-CA rotatable with `kctl rotate sub-ca`. |
 | Revocation | Can deny CSR renewals, delete the node object, or rotate the CA. RBAC blocks access immediately. | Sub-CA can be revoked by rotating it (`kctl rotate sub-ca`). Only approved nodes can renew. The root CA can be regenerated as a last resort. |
-| Identity granularity | Each component has a distinct service account with RBAC bindings. Least-privilege by default. | Three CN-based roles: controller, kctl, and node. No fine-grained permissions within a role. |
+| Identity granularity | Each component has a distinct service account with RBAC bindings. Least-privilege by default. | Machine CNs (controller / node) plus per-operator certs `kctl:<name>` with flat roles `read-only`, `vm-admin`, `cluster-admin`. |
 
 ### How kcore bootstrap works
 
@@ -58,7 +58,7 @@ cluster.
 
 | Area | Kubernetes | kcore |
 |------|-----------|-------|
-| Authorization | RBAC with Roles, ClusterRoles, and bindings. Per-resource, per-verb granularity (e.g., "this service account can only list pods in namespace X"). | CN-based: a connection is either kctl (full access), a node (node-level operations), or the controller. No middle ground. |
+| Authorization | RBAC with Roles, ClusterRoles, and bindings. Per-resource, per-verb granularity (e.g., "this service account can only list pods in namespace X"). | Flat operator RBAC on controller management RPCs (`read-only` < `vm-admin` < `cluster-admin`). Node and peer-controller machine identities remain CN-prefix based. |
 | Audit logging | Built-in audit log pipeline recording request metadata, response codes, and actor identity. Configurable verbosity levels. | Structured `tracing` logs exist but there is no dedicated audit trail of who performed which mutating action. |
 | Admission control | Validating and mutating admission webhooks that can intercept any API request before persistence. | Validation happens inside gRPC handlers. No pluggable admission mechanism. |
 | API versioning | Strict versioning (v1, v1beta1) with deprecation policy and conversion webhooks. | Protobuf fields are added in a backward-compatible way but there is no formal version negotiation or compatibility contract. |
@@ -87,8 +87,10 @@ threat model and practical priorities are different.
   controller) requires mutual TLS authentication.
 - **CA key stays local**: the CA private key never leaves the operator's
   machine. Only signed certificates are transmitted to nodes.
-- **CN-based authorization**: the controller checks the certificate Common
-  Name to enforce role separation (kctl vs node vs controller).
+- **CN-based authorization**: machine peers use certificate Common Names
+  (`kctl`, `kcore-node-*`, `kcore-controller-*`); human operators use
+  `kctl:<name>` with flat RBAC roles (`read-only`, `vm-admin`,
+  `cluster-admin`).
 - **Node approval queue**: new nodes register as `pending` and must be
   approved by the operator (`kctl node approve <id>`) before they can
   participate in scheduling or heartbeats.
@@ -113,8 +115,6 @@ threat model and practical priorities are different.
 1. **Audit log** -- structured log of all mutating API calls recording
    actor identity, action, resource, and timestamp. Essential for
    debugging and compliance.
-2. **RBAC** -- multiple operator roles such as read-only, vm-admin, and
-   cluster-admin with fine-grained permission control.
 
 ### Not planned (Kubernetes-specific complexity)
 

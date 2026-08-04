@@ -82,7 +82,7 @@ See: [Architecture](docs/Architecture.md)
 - mTLS is the default production posture; insecure mode is opt-in via `--allow-insecure` / `--insecure`.
 - Cluster PKI is created by `kctl create cluster`.
 - Node install flow sends only required cert/key material to target nodes; private key files are written with restricted permissions.
-- **RBAC**: controller APIs enforce flat roles (`read-only`, `admin`, `cluster-admin`) keyed off operator client cert CN `kctl:<name>` (see [mTLS bootstrap and authentication](docs/mtls-bootstrap-and-auth.md)); legacy `CN=kctl` is bootstrap-only once operators exist.
+- **RBAC**: controller APIs enforce flat roles (`read-only`, `vm-admin`, `cluster-admin`) keyed off operator client cert CN `kctl:<name>` (see [mTLS bootstrap and authentication](docs/mtls-bootstrap-and-auth.md)); legacy `CN=kctl` is bootstrap-only once operators exist.
 - Known security work still pending: certificate rotation workflows and revocation checks (CRL/OCSP).
 
 See: [Security model](docs/security.md)
@@ -92,7 +92,7 @@ See: [Security model](docs/security.md)
 - Initialize cluster PKI/context: `kctl create cluster --controller <host:9090>`
 - **RBAC bootstrap** (after PKI exists): create at least one named operator and grant `cluster-admin`, issue a per-operator cert, then use `kctl --as <name> ...`:
   - `kctl operator create <name>`
-  - `kctl operator role grant <name> cluster-admin` (or `admin` / `read-only`)
+  - `kctl operator grant-role <name> --role cluster-admin` (or `vm-admin` / `read-only`)
   - `kctl operator issue-cert <name>` → writes `~/.kcore/operators/<name>/operator.{crt,key}`
   - Optional default in `~/.kcore/config`: set `operator: <name>` on the context so you do not need `--as` every time.
 - Install nodes from live ISO: `kctl --node <host:9091> node install ...`

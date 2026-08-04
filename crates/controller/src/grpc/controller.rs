@@ -1756,7 +1756,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateVmRequest>,
     ) -> Result<Response<controller_proto::CreateVmResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let mut req = request.into_inner();
         let spec = req
@@ -2137,7 +2137,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::UpdateVmRequest>,
     ) -> Result<Response<controller_proto::UpdateVmResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -2193,7 +2193,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteVmRequest>,
     ) -> Result<Response<controller_proto::DeleteVmResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
@@ -2229,7 +2229,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::SetVmDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetVmDesiredStateResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let auto_start = match controller_proto::VmDesiredState::try_from(req.desired_state)
@@ -2453,7 +2453,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<tonic::Streaming<controller_proto::ConsoleMessage>>,
     ) -> Result<Response<Self::AttachVmConsoleStream>, Status> {
-        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let mut inbound = request.into_inner();
         let first = inbound
             .message()
@@ -2651,7 +2651,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateWorkloadRequest>,
     ) -> Result<Response<controller_proto::CreateWorkloadResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
@@ -2950,7 +2950,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteWorkloadRequest>,
     ) -> Result<Response<controller_proto::DeleteWorkloadResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
@@ -3027,7 +3027,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::SetWorkloadDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetWorkloadDesiredStateResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
@@ -3304,7 +3304,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateNetworkRequest>,
     ) -> Result<Response<controller_proto::CreateNetworkResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = validate_network_name(&req.name)?;
@@ -3477,7 +3477,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteNetworkRequest>,
     ) -> Result<Response<controller_proto::DeleteNetworkResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = req.name.trim();
@@ -3617,7 +3617,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::CreateSecurityGroupResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req
@@ -3913,7 +3913,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::DeleteSecurityGroupResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = req.name.trim();
@@ -3945,7 +3945,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::AttachSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::AttachSecurityGroupResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req.security_group.trim();
@@ -4043,7 +4043,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DetachSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::DetachSecurityGroupResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req.security_group.trim();
@@ -4219,7 +4219,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateSshKeyRequest>,
     ) -> Result<Response<controller_proto::CreateSshKeyResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -4290,7 +4290,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteSshKeyRequest>,
     ) -> Result<Response<controller_proto::DeleteSshKeyResponse>, Status> {
-        self.require_operator(&request, OperatorRole::Admin)?;
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
@@ -5991,10 +5991,10 @@ fn operator_role_kind_to_auth(kind: i32) -> Result<OperatorRole, Status> {
         .unwrap_or(controller_proto::OperatorRoleKind::Unspecified);
     match k {
         controller_proto::OperatorRoleKind::ReadOnly => Ok(OperatorRole::ReadOnly),
-        controller_proto::OperatorRoleKind::Admin => Ok(OperatorRole::Admin),
+        controller_proto::OperatorRoleKind::VmAdmin => Ok(OperatorRole::VmAdmin),
         controller_proto::OperatorRoleKind::ClusterAdmin => Ok(OperatorRole::ClusterAdmin),
         controller_proto::OperatorRoleKind::Unspecified => Err(Status::invalid_argument(
-            "role must be read_only, admin, or cluster_admin",
+            "role must be read_only, vm_admin, or cluster_admin",
         )),
     }
 }
@@ -6005,7 +6005,7 @@ fn operator_roles_to_proto_kinds(roles: &[String]) -> Vec<i32> {
         .filter_map(|s| {
             OperatorRole::from_db_str(s).map(|r| match r {
                 OperatorRole::ReadOnly => controller_proto::OperatorRoleKind::ReadOnly as i32,
-                OperatorRole::Admin => controller_proto::OperatorRoleKind::Admin as i32,
+                OperatorRole::VmAdmin => controller_proto::OperatorRoleKind::VmAdmin as i32,
                 OperatorRole::ClusterAdmin => {
                     controller_proto::OperatorRoleKind::ClusterAdmin as i32
                 }

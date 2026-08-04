@@ -766,7 +766,8 @@ enum OperatorAction {
 pub enum OperatorRoleArg {
     #[value(name = "read-only")]
     ReadOnly,
-    Admin,
+    #[value(name = "vm-admin")]
+    VmAdmin,
     #[value(name = "cluster-admin")]
     ClusterAdmin,
 }
