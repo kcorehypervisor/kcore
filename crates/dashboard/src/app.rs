@@ -478,6 +478,7 @@ fn vms_table(data: VmsPageDto) -> impl IntoView {
                         <th>"Node"</th>
                         <th>"vCPU"</th>
                         <th>"Memory"</th>
+                        <th></th>
                     </tr>
                 </thead>
                 <tbody>
@@ -509,6 +510,13 @@ fn vm_row(vm: VmRowDto) -> impl IntoView {
         "Paused" => "badge badge-warn",
         _ => "badge badge-stop",
     };
+    // Prefer name for the serial socket path; fall back to id.
+    let console_target = if !vm.name.is_empty() {
+        vm.name.clone()
+    } else {
+        vm.id.clone()
+    };
+    let console_href = format!("/vms/{}/console", urlencoding_path(&console_target));
     view! {
         <tr>
             <td>
@@ -521,8 +529,22 @@ fn vm_row(vm: VmRowDto) -> impl IntoView {
             <td><code class="inline">{vm.node_id.clone()}</code></td>
             <td>{vm.cpu}</td>
             <td>{vm.memory.clone()}</td>
+            <td><a href=console_href>"Console"</a></td>
         </tr>
     }
+}
+
+fn urlencoding_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[component]

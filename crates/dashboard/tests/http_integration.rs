@@ -148,6 +148,28 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(vms.contains("node-mock-a"), "VMs must show node ID");
     assert!(vms.contains("Running"), "VMs must show VM state badge");
     assert!(vms.contains("512 MiB"), "VMs must show formatted memory");
+    assert!(
+        vms.contains(r#"/vms/mock-vm-alpha/console"#),
+        "VMs must link to serial console"
+    );
+    assert!(vms.contains(">Console<"), "VMs must show Console action");
+
+    // ── Serial console page ──────────────────────────────────────────
+    let (status, console) = fetch(&app, "/vms/mock-vm-alpha/console").await;
+    assert_eq!(status, StatusCode::OK, "/vms/.../console status");
+    assert!(console.contains("xterm"), "console page must load xterm.js");
+    assert!(
+        console.contains("/api/vms/") && console.contains("/console"),
+        "console page must open WebSocket to API path"
+    );
+    assert!(
+        console.contains("encodeURIComponent"),
+        "console page must URL-encode the VM id for WebSocket"
+    );
+    assert!(
+        console.contains("Serial console"),
+        "console page must show title"
+    );
 
     // ── VMs pagination (page=2 with single VM returns page 1) ────────
     let (status, vms_p2) = fetch(&app, "/vms?page=2").await;

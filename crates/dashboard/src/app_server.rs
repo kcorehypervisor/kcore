@@ -8,12 +8,13 @@ use leptos_axum::{generate_route_list, LeptosRoutes};
 use tower_http::trace::TraceLayer;
 
 use crate::app::{shell, App};
+use crate::console;
 
 /// Full dashboard HTTP stack (CSS, Leptos routes, server functions). Axum state is applied here, so
 /// the result is `Router<()>` and can be used with [`axum::serve`].
 pub fn dashboard_router(leptos_options: LeptosOptions) -> Router<()> {
     let routes = generate_route_list(App);
-    Router::new()
+    let leptos_app = Router::new()
         .route(
             "/dashboard.css",
             get(|| async {
@@ -29,5 +30,9 @@ pub fn dashboard_router(leptos_options: LeptosOptions) -> Router<()> {
         })
         .fallback(leptos_axum::file_and_error_handler(shell))
         .layer(TraceLayer::new_for_http())
-        .with_state(leptos_options)
+        .with_state(leptos_options);
+
+    Router::new()
+        .merge(console::console_routes())
+        .merge(leptos_app)
 }

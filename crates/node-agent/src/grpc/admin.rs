@@ -1485,6 +1485,28 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }
     }
 
+    type AttachVmConsoleStream = crate::console::ConsoleOutboundStream;
+
+    async fn attach_vm_console(
+        &self,
+        request: Request<tonic::Streaming<proto::ConsoleMessage>>,
+    ) -> Result<Response<Self::AttachVmConsoleStream>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("console stream is empty"))?;
+        if first.vm_name.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_name is required on the first console message",
+            ));
+        }
+        let outbound =
+            crate::console::bridge_console_session(&self.vm_socket_dir, first, inbound).await?;
+        Ok(Response::new(outbound))
+    }
+
     async fn install_to_disk(
         &self,
         request: Request<proto::InstallToDiskRequest>,

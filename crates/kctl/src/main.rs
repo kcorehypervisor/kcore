@@ -160,6 +160,11 @@ enum Command {
     },
     /// Show version
     Version,
+    /// Attach to a VM serial console (Ctrl-] to detach)
+    Console {
+        /// VM name or id
+        name: String,
+    },
     /// Unified workload operations via controller API
     Workload {
         #[command(subcommand)]
@@ -1600,6 +1605,10 @@ async fn main() {
         Command::Version => {
             println!("kctl {VERSION}");
             Ok(())
+        }
+        Command::Console { name } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::vm::console(&info, name).await
         }
         Command::Workload { action } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));

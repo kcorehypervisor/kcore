@@ -4,6 +4,7 @@
 
 mod auth;
 mod config;
+mod console;
 mod discovery;
 mod disk;
 mod grpc;

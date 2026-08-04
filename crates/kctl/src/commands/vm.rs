@@ -1773,3 +1773,121 @@ mod proptests {
         }
     }
 }
+
+/// Attach to a VM serial console via the controller (`Ctrl-]` to detach).
+pub async fn console(info: &ConnectionInfo, vm_name: &str) -> Result<()> {
+    let vm_name = vm_name.trim();
+    if vm_name.is_empty() {
+        bail!("vm name is required");
+    }
+
+    let mut client = client::controller_client(info).await?;
+    let (to_ctrl_tx, to_ctrl_rx) = tokio::sync::mpsc::channel::<proto::ConsoleMessage>(64);
+    // Opening message must be queued before the RPC await.
+    to_ctrl_tx
+        .send(proto::ConsoleMessage {
+            vm_name: vm_name.to_string(),
+            data: Vec::new(),
+        })
+        .await
+        .context("opening console stream")?;
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(to_ctrl_rx);
+
+    let mut from_ctrl = client
+        .attach_vm_console(outbound)
+        .await
+        .with_context(|| format!("AttachVmConsole for {vm_name}"))?
+        .into_inner();
+
+    eprintln!("Connected to serial console for {vm_name}. Press Ctrl-] then Enter to detach.");
+
+    let _raw = RawMode::enter().ok();
+
+    let stdin_task = {
+        let tx = to_ctrl_tx.clone();
+        tokio::spawn(async move {
+            use tokio::io::{stdin, AsyncReadExt};
+            let mut stdin = stdin();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stdin.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        // Ctrl-] (0x1d) detaches, like telnet.
+                        if buf[..n].contains(&0x1d) {
+                            break;
+                        }
+                        if tx
+                            .send(proto::ConsoleMessage {
+                                vm_name: String::new(),
+                                data: buf[..n].to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    let stdout_task = tokio::spawn(async move {
+        use tokio::io::{stdout, AsyncWriteExt};
+        let mut stdout = stdout();
+        loop {
+            match from_ctrl.message().await {
+                Ok(Some(msg)) => {
+                    if !msg.data.is_empty() {
+                        if stdout.write_all(&msg.data).await.is_err() {
+                            break;
+                        }
+                        let _ = stdout.flush().await;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let _ = stdin_task.await;
+    drop(to_ctrl_tx);
+    let _ = stdout_task.await;
+    eprintln!("\nDetached.");
+    Ok(())
+}
+
+/// Best-effort terminal raw mode for interactive console sessions.
+struct RawMode {
+    fd: i32,
+    original: libc::termios,
+}
+
+impl RawMode {
+    fn enter() -> Result<Self> {
+        let fd = libc::STDIN_FILENO;
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        let rc = unsafe { libc::tcgetattr(fd, &mut original) };
+        if rc != 0 {
+            bail!("tcgetattr failed");
+        }
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
+        if rc != 0 {
+            bail!("tcsetattr failed");
+        }
+        Ok(Self { fd, original })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
