@@ -635,22 +635,20 @@ pub async fn describe(
                         .join(", ")
                 }
             );
-        } else {
-            if nic.network == "default" {
-                if let Some(overview) = &default_network_overview {
-                    println!("    network_type:   nat");
-                    println!("    gateway_ip:     {}", overview.default_gateway_ip);
-                    println!("    netmask:        {}", overview.default_internal_netmask);
-                    println!("    external_ip:    {}", overview.default_external_ip);
-                    println!("    outbound_nat:   enabled");
-                    println!("    allowed_tcp:    (cluster defaults)");
-                    println!("    allowed_udp:    (cluster defaults)");
-                } else {
-                    println!("    details:        default network overview unavailable");
-                }
+        } else if nic.network == "default" {
+            if let Some(overview) = &default_network_overview {
+                println!("    network_type:   nat");
+                println!("    gateway_ip:     {}", overview.default_gateway_ip);
+                println!("    netmask:        {}", overview.default_internal_netmask);
+                println!("    external_ip:    {}", overview.default_external_ip);
+                println!("    outbound_nat:   enabled");
+                println!("    allowed_tcp:    (cluster defaults)");
+                println!("    allowed_udp:    (cluster defaults)");
             } else {
-                println!("    details:        not found in controller network inventory");
+                println!("    details:        default network overview unavailable");
             }
+        } else {
+            println!("    details:        not found in controller network inventory");
         }
     }
 
