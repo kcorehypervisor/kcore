@@ -796,6 +796,8 @@ fn prepare_cloud_init_user_data(vm_name: &str, args: &CreateArgs) -> Result<Stri
         out.push_str("ssh_pwauth: true\n");
     }
     if !password.is_empty() {
+        // cloud-init's chpasswd.users list defaults to type=hash; plaintext
+        // passwords must set type: text or login fails with the literal string.
         out.push_str("chpasswd:\n");
         out.push_str("  expire: false\n");
         out.push_str("  users:\n");
@@ -804,6 +806,7 @@ fn prepare_cloud_init_user_data(vm_name: &str, args: &CreateArgs) -> Result<Stri
             "      password: \"{}\"\n",
             yaml_escape_double_quoted(password)
         ));
+        out.push_str("      type: text\n");
     }
 
     Ok(out)
@@ -1342,6 +1345,20 @@ mod tests {
         assert!(data.contains("ssh_authorized_keys"));
         assert!(data.contains("lock_passwd: true"));
         assert!(data.contains("ssh_pwauth: false"));
+    }
+
+    #[test]
+    fn prepare_cloud_init_marks_plaintext_passwords() {
+        let mut args = base_create_args();
+        args.username = Some("alice".into());
+        args.password = Some("secret".into());
+        args.compliant = false;
+        let data = prepare_cloud_init_user_data("vm-a", &args).expect("cloud-init");
+        assert!(data.contains("name: alice"));
+        assert!(data.contains("lock_passwd: false"));
+        assert!(data.contains("ssh_pwauth: true"));
+        assert!(data.contains("password: \"secret\""));
+        assert!(data.contains("type: text"));
     }
 
     #[test]

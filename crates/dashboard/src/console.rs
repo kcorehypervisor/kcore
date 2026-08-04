@@ -69,15 +69,21 @@ async fn console_page(Path(id): Path<String>) -> impl IntoResponse {
       }});
       const fit = new FitAddon.FitAddon();
       term.loadAddon(fit);
-      term.open(document.getElementById('term'));
+      const termEl = document.getElementById('term');
+      term.open(termEl);
       fit.fit();
+      term.focus();
+      termEl.addEventListener('click', () => term.focus());
       window.addEventListener('resize', () => fit.fit());
 
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(proto + '//' + location.host + '/api/vms/' + encodeURIComponent(vmId) + '/console');
       ws.binaryType = 'arraybuffer';
 
-      ws.onopen = () => {{ statusEl.textContent = 'Connected'; }};
+      ws.onopen = () => {{
+        statusEl.textContent = 'Connected';
+        term.focus();
+      }};
       ws.onclose = () => {{ statusEl.textContent = 'Disconnected'; }};
       ws.onerror = () => {{ statusEl.textContent = 'Error'; }};
       ws.onmessage = (ev) => {{
