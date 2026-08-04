@@ -892,10 +892,11 @@ message AccessControlEntry {
 }
 
 // Operator RBAC roles (flat cluster-wide).
+// Lattice: read-only < vm-admin < cluster-admin.
 enum OperatorRoleKind {
   OPERATOR_ROLE_KIND_UNSPECIFIED = 0;
   OPERATOR_ROLE_KIND_READ_ONLY = 1;
-  OPERATOR_ROLE_KIND_ADMIN = 2;
+  OPERATOR_ROLE_KIND_VM_ADMIN = 2;
   OPERATOR_ROLE_KIND_CLUSTER_ADMIN = 3;
 }
 

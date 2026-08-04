@@ -535,11 +535,11 @@ After `kctl create cluster`, the context still uses the legacy **`CN=kctl`** cli
 Day-0 on a fresh cluster:
 
 1. `kctl operator create <name>`
-2. `kctl operator role grant <name> cluster-admin` (or `admin` / `read-only` as needed)
+2. `kctl operator grant-role <name> --role cluster-admin` (or `vm-admin` / `read-only` as needed)
 3. `kctl operator issue-cert <name>` — writes `~/.kcore/operators/<name>/operator.crt` and `operator.key`
 4. Use `kctl --as <name> ...` for later commands, or add `operator: <name>` to the context in `~/.kcore/config`.
 
-Other subcommands: `kctl operator list`, `kctl operator get <name>`, `kctl operator delete <name>`, `kctl operator role revoke <name> <role>`.
+Other subcommands: `kctl operator list`, `kctl operator get <name>`, `kctl operator delete <name>`, `kctl operator revoke-role <name> --role <role>`.
 
 See [mTLS bootstrap and authentication](./mtls-bootstrap-and-auth.md) for the role lattice and compliance reporting.
 

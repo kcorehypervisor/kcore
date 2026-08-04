@@ -873,7 +873,9 @@ impl Database {
             );
         }
 
-        if version < 29 {
+        // Schema 29 is reserved for append-only audit_events (separate change).
+        // Operator RBAC tables land at 30 so the two features can merge cleanly.
+        if version < 30 {
             let _ = conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4996,10 +4998,10 @@ mod proptests {
         ) {
             let db = Database::open(":memory:").expect("open db");
             db.create_operator(&name).unwrap();
-            db.grant_operator_role_str(&name, "admin").unwrap();
-            db.grant_operator_role_str(&name, "admin").unwrap();
+            db.grant_operator_role_str(&name, "vm-admin").unwrap();
+            db.grant_operator_role_str(&name, "vm-admin").unwrap();
             let roles = db.list_operator_role_strings(&name).unwrap();
-            prop_assert_eq!(roles.iter().filter(|r| *r == "admin").count(), 1);
+            prop_assert_eq!(roles.iter().filter(|r| *r == "vm-admin").count(), 1);
         }
 
         /// **`delete_operator` cascades** roles (no orphan role rows).

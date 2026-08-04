@@ -9,10 +9,12 @@ pub const CN_CONTROLLER_PREFIX: &str = "kcore-controller-";
 pub const CN_KCTL_PREFIX: &str = "kctl:";
 
 /// Minimum operator capability for management RPCs (human operators and bootstrap).
+///
+/// Roadmap roles: `read-only` < `vm-admin` < `cluster-admin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OperatorRole {
     ReadOnly = 1,
-    Admin = 2,
+    VmAdmin = 2,
     ClusterAdmin = 3,
 }
 
@@ -24,7 +26,7 @@ impl OperatorRole {
     pub fn as_db_str(self) -> &'static str {
         match self {
             OperatorRole::ReadOnly => "read-only",
-            OperatorRole::Admin => "admin",
+            OperatorRole::VmAdmin => "vm-admin",
             OperatorRole::ClusterAdmin => "cluster-admin",
         }
     }
@@ -32,7 +34,8 @@ impl OperatorRole {
     pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "read-only" => Some(OperatorRole::ReadOnly),
-            "admin" => Some(OperatorRole::Admin),
+            // Canonical name; accept legacy "admin" from earlier branch drafts.
+            "vm-admin" | "admin" => Some(OperatorRole::VmAdmin),
             "cluster-admin" => Some(OperatorRole::ClusterAdmin),
             _ => None,
         }
@@ -116,16 +119,6 @@ pub fn peer_cn<T>(request: &Request<T>) -> Option<String> {
     cn
 }
 
-/// gRPC path e.g. `/kcore.controller.Controller/CreateVm`.
-pub fn grpc_method<T>(request: &Request<T>) -> String {
-    request
-        .metadata()
-        .get(":path")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "<unknown-grpc-path>".to_string())
-}
-
 fn effective_operator_role(
     db: &Database,
     peer: &ManagementPeer,
@@ -178,13 +171,14 @@ pub fn require_controller_operator<T>(
     bootstrap_kctl: bool,
     required: OperatorRole,
 ) -> Result<(), Status> {
-    let path = grpc_method(request);
     let cn = match peer_cn(request) {
         Some(cn) => cn,
         None => {
             if !tls_active {
                 return Ok(());
             }
+            // TLS is configured but no client cert was presented — allow only when
+            // the transport layer already accepted the connection (rare).
             return Ok(());
         }
     };
@@ -196,8 +190,7 @@ pub fn require_controller_operator<T>(
         Ok(())
     } else {
         Err(Status::permission_denied(format!(
-            "identity '{}' lacks required role {:?} (effective {:?})",
-            cn, required, effective
+            "identity '{cn}' lacks required role {required:?} (effective {effective:?})"
         )))
     }
 }
@@ -211,7 +204,6 @@ pub fn require_admin_operator<T>(
     bootstrap_kctl: bool,
     required: OperatorRole,
 ) -> Result<(), Status> {
-    let path = grpc_method(request);
     let cn = match peer_cn(request) {
         Some(cn) => cn,
         None => {
@@ -250,8 +242,7 @@ pub fn require_admin_operator<T>(
         Ok(())
     } else {
         Err(Status::permission_denied(format!(
-            "identity '{}' lacks required role {:?} (effective {:?})",
-            cn, required, effective
+            "identity '{cn}' lacks required role {required:?} (effective {effective:?})"
         )))
     }
 }
@@ -333,7 +324,22 @@ mod tests {
     #[test]
     fn role_lattice() {
         assert!(OperatorRole::ClusterAdmin.satisfies(OperatorRole::ReadOnly));
-        assert!(OperatorRole::Admin.satisfies(OperatorRole::ReadOnly));
-        assert!(!OperatorRole::ReadOnly.satisfies(OperatorRole::Admin));
+        assert!(OperatorRole::VmAdmin.satisfies(OperatorRole::ReadOnly));
+        assert!(!OperatorRole::ReadOnly.satisfies(OperatorRole::VmAdmin));
+        assert!(OperatorRole::ClusterAdmin.satisfies(OperatorRole::VmAdmin));
+        assert!(!OperatorRole::VmAdmin.satisfies(OperatorRole::ClusterAdmin));
+    }
+
+    #[test]
+    fn role_db_strings() {
+        assert_eq!(OperatorRole::VmAdmin.as_db_str(), "vm-admin");
+        assert_eq!(
+            OperatorRole::from_db_str("vm-admin"),
+            Some(OperatorRole::VmAdmin)
+        );
+        assert_eq!(
+            OperatorRole::from_db_str("admin"),
+            Some(OperatorRole::VmAdmin)
+        );
     }
 }

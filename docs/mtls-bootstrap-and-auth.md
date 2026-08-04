@@ -119,7 +119,7 @@ Components authenticate each other by Common Name (CN) extracted from the client
 | Component | CN pattern | Authorization check |
 |-----------|-----------|---------------------|
 | kctl (legacy bootstrap) | `kctl` | exact match; treated as **cluster-admin** only while the `operators` table is empty, or when `auth.bootstrap_kctl: true` in controller config — otherwise denied |
-| kctl (named operator) | `kctl:<name>` | must exist in `operators` with at least one role; effective capability is the highest of assigned roles (`read-only` < `admin` < `cluster-admin`) |
+| kctl (named operator) | `kctl:<name>` | must exist in `operators` with at least one role; effective capability is the highest of assigned roles (`read-only` < `vm-admin` < `cluster-admin`) |
 | Controller | `kcore-controller-{host}` | prefix match `kcore-controller-` |
 | Node agent | `kcore-node-{host}` | prefix match `kcore-node-` |
 
@@ -130,7 +130,7 @@ Prefix matching allows any controller in the cluster to call any node-agent, and
 Human-facing controller RPCs (anything that used to allow `CN=kctl` together with peer controllers) now require a **minimum role**:
 
 - **read-only** — `Get*` / `List*` / `Classify*` / `Plan*` style calls and reports.
-- **admin** — read-only plus VM/workload/network/security-group/SSH-key writes and desired-state changes.
+- **vm-admin** — read-only plus VM/workload/network/security-group/SSH-key writes, desired-state changes, and serial console (`AttachVmConsole`).
 - **cluster-admin** — full access including node lifecycle, PKI (`RotateSubCa`, `ReloadTls`, node bootstrap cert), disk layouts, cluster updates, operator administration, and `IssueOperatorCert`.
 
 Peer controller certificates (`kcore-controller-*`) still authenticate as **cluster-admin** on the shared `Controller` service (for replication pull/apply and similar). They are **not** accepted on the separate `ControllerAdmin` service (`ApplyNixConfig`, replication introspection RPCs used from `kctl`): those require a human operator cert (`kctl` or `kctl:<name>`).
@@ -140,7 +140,7 @@ Roles are stored in SQLite (`operators`, `operator_roles`) and replicate across 
 **Bootstrap flow**
 
 1. `kctl create cluster` still produces the legacy client cert `CN=kctl` (often embedded in context config).
-2. While no operators exist, that cert acts as cluster-admin so you can run `kctl operator create alice`, `kctl operator role grant alice cluster-admin`, and `kctl operator issue-cert alice`.
+2. While no operators exist, that cert acts as cluster-admin so you can run `kctl operator create alice`, `kctl operator grant-role alice --role cluster-admin`, and `kctl operator issue-cert alice`.
 3. Material lands under `~/.kcore/operators/alice/operator.{crt,key}`; use `kctl --as alice ...` (or `operator:` in the context) for subsequent calls.
 4. After the first operator exists, legacy `CN=kctl` is rejected unless you set `auth.bootstrap_kctl: true` on the controller (escape hatch only).
 
