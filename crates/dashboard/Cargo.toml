@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 http = "1"
 leptos = { version = "0.8", features = ["ssr"] }
 leptos_axum = "0.8"
@@ -25,6 +25,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["tls", "transport"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
@@ -33,6 +34,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
 proptest = "1.11"
 
 [build-dependencies]

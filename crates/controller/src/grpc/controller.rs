@@ -1,6 +1,10 @@
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -2329,6 +2333,106 @@ impl controller_proto::controller_server::Controller for ControllerService {
             node_id: node.id,
             assigned_ip: db_vm.vm_ip,
         }))
+    }
+
+    type AttachVmConsoleStream = Pin<
+        Box<dyn Stream<Item = Result<controller_proto::ConsoleMessage, Status>> + Send + 'static>,
+    >;
+
+    async fn attach_vm_console(
+        &self,
+        request: Request<tonic::Streaming<controller_proto::ConsoleMessage>>,
+    ) -> Result<Response<Self::AttachVmConsoleStream>, Status> {
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("console stream is empty"))?;
+        let vm_key = first.vm_name.trim();
+        if vm_key.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_name is required on the first console message",
+            ));
+        }
+
+        let node = self.resolve_node_for_vm(vm_key, "")?;
+        let db_vm = self
+            .db
+            .get_vm(vm_key)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or_else(|| {
+                self.db
+                    .list_vms_for_node(&node.id)
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|vm| vm.name == vm_key))
+            })
+            .ok_or_else(|| Status::not_found(format!("VM {vm_key} not found")))?;
+        let vm_name = db_vm.name.clone();
+
+        let mut admin = self.ensure_admin_client_for_node(&node).await?;
+
+        let (to_node_tx, to_node_rx) = mpsc::channel::<node_proto::ConsoleMessage>(64);
+        // Opening message must be queued before the RPC await — the node
+        // handler blocks on the first stream message before returning.
+        to_node_tx
+            .send(node_proto::ConsoleMessage {
+                vm_name: vm_name.clone(),
+                data: first.data,
+            })
+            .await
+            .map_err(|_| Status::unavailable("failed to open console stream to node"))?;
+
+        let node_outbound = ReceiverStream::new(to_node_rx);
+        let mut from_node = admin
+            .attach_vm_console(node_outbound)
+            .await
+            .map_err(|e| Status::unavailable(format!("node AttachVmConsole: {e}")))?
+            .into_inner();
+
+        let (out_tx, out_rx) =
+            mpsc::channel::<Result<controller_proto::ConsoleMessage, Status>>(64);
+        let out_tx_node = out_tx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match from_node.message().await {
+                    Ok(Some(msg)) => {
+                        let mapped = controller_proto::ConsoleMessage {
+                            vm_name: msg.vm_name,
+                            data: msg.data,
+                        };
+                        if out_tx_node.send(Ok(mapped)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = out_tx_node.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = inbound.message().await {
+                if to_node_tx
+                    .send(node_proto::ConsoleMessage {
+                        vm_name: String::new(),
+                        data: msg.data,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(out_rx)) as Self::AttachVmConsoleStream
+        ))
     }
 
     async fn list_vms(

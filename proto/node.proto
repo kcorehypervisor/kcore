@@ -78,6 +78,11 @@ service NodeAdmin {
   // CheckVmSshReady resolves VM IP from DHCP leases and probes SSH port.
   rpc CheckVmSshReady(CheckVmSshReadyRequest) returns (CheckVmSshReadyResponse);
 
+  // AttachVmConsole bridges raw bytes to the Cloud Hypervisor serial Unix
+  // socket (/run/kcore/<vm_name>.serial.sock). The first client message must
+  // set vm_name; subsequent messages carry data only.
+  rpc AttachVmConsole(stream ConsoleMessage) returns (stream ConsoleMessage);
+
   // ListDisks returns block devices available on the node.
   rpc ListDisks(ListDisksRequest) returns (ListDisksResponse);
 
@@ -534,6 +539,12 @@ message CheckVmSshReadyResponse {
   int32 port = 3;
   string reason = 4;
   bool fatal = 5;
+}
+
+// Bidirectional console payload between controller/dashboard and node-agent.
+message ConsoleMessage {
+  string vm_name = 1; // required on the first client → server message
+  bytes data = 2;     // raw serial bytes
 }
 
 message ListDisksRequest {}

@@ -78,6 +78,16 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    type AttachVmConsoleStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ConsoleMessage, Status>>;
+
+    async fn attach_vm_console(
+        &self,
+        _: TRequest<tonic::Streaming<ConsoleMessage>>,
+    ) -> Result<Response<Self::AttachVmConsoleStream>, Status> {
+        Err(Status::unimplemented("attach_vm_console"))
+    }
+
     async fn list_vms(
         &self,
         _: TRequest<ListVmsRequest>,

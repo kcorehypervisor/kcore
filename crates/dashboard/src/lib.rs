@@ -4,6 +4,7 @@ pub mod api;
 pub mod app;
 pub mod app_server;
 pub mod config;
+pub mod console;
 pub mod controller_client;
 pub mod dto;
 pub mod format;

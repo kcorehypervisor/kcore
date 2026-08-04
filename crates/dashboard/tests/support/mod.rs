@@ -82,6 +82,47 @@ impl Controller for MockController {
         Err(unimp("get_vm"))
     }
 
+    type AttachVmConsoleStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ConsoleMessage, Status>>;
+
+    async fn attach_vm_console(
+        &self,
+        request: Request<tonic::Streaming<ConsoleMessage>>,
+    ) -> Result<Response<Self::AttachVmConsoleStream>, Status> {
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty"))?;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // Echo first payload (if any) then echo subsequent client data.
+        if !first.data.is_empty() {
+            let _ = tx
+                .send(Ok(ConsoleMessage {
+                    vm_name: String::new(),
+                    data: first.data.clone(),
+                }))
+                .await;
+        }
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = inbound.message().await {
+                if tx
+                    .send(Ok(ConsoleMessage {
+                        vm_name: String::new(),
+                        data: msg.data,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
     async fn list_vms(
         &self,
         _: Request<ListVmsRequest>,

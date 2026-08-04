@@ -21,6 +21,9 @@ service Controller {
   rpc SetVmDesiredState(SetVmDesiredStateRequest) returns (SetVmDesiredStateResponse);
   rpc GetVm(GetVmRequest) returns (GetVmResponse);
   rpc ListVms(ListVmsRequest) returns (ListVmsResponse);
+  // AttachVmConsole proxies a bidirectional serial console session to the
+  // node hosting the VM (see NodeAdmin.AttachVmConsole).
+  rpc AttachVmConsole(stream ConsoleMessage) returns (stream ConsoleMessage);
   rpc CreateWorkload(CreateWorkloadRequest) returns (CreateWorkloadResponse);
   rpc DeleteWorkload(DeleteWorkloadRequest) returns (DeleteWorkloadResponse);
   rpc SetWorkloadDesiredState(SetWorkloadDesiredStateRequest) returns (SetWorkloadDesiredStateResponse);
@@ -299,6 +302,12 @@ message ListVmsRequest {
 
 message ListVmsResponse {
   repeated VmInfo vms = 1;
+}
+
+// Bidirectional console payload (proxied to NodeAdmin.AttachVmConsole).
+message ConsoleMessage {
+  string vm_name = 1; // required on the first client → server message
+  bytes data = 2;     // raw serial bytes
 }
 
 message CreateWorkloadRequest {
