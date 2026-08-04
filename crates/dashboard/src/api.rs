@@ -4,12 +4,13 @@ use leptos::prelude::*;
 
 use crate::controller_client;
 use crate::dto::{
-    ComplianceDto, NetworkOverviewDto, NetworkRowDto, ReplicationConflictDto, ReplicationStatusDto,
-    StorageOverviewDto, VmsPageDto,
+    AuditEventDto, ComplianceDto, NetworkOverviewDto, NetworkRowDto, ReplicationConflictDto,
+    ReplicationStatusDto, StorageOverviewDto, VmsPageDto,
 };
 use crate::mappers::{
-    compliance_from_proto, conflicts_from_proto, network_overview_from_proto, networks_from_proto,
-    replication_status_from_proto, storage_overview_from_proto, vms_page_from_proto,
+    audit_events_from_proto, compliance_from_proto, conflicts_from_proto,
+    network_overview_from_proto, networks_from_proto, replication_status_from_proto,
+    storage_overview_from_proto, vms_page_from_proto,
 };
 use crate::state::dashboard_config;
 
@@ -77,4 +78,13 @@ pub async fn list_replication_conflicts_dto() -> Result<Vec<ReplicationConflictD
         .await
         .map_err(map_err)?;
     Ok(conflicts_from_proto(resp))
+}
+
+#[server(ListAuditEvents, "/api")]
+pub async fn list_audit_events_dto() -> Result<Vec<AuditEventDto>, ServerFnError> {
+    let cfg = dashboard_config();
+    let events = controller_client::list_audit_events(cfg, 50)
+        .await
+        .map_err(map_err)?;
+    Ok(audit_events_from_proto(events))
 }

@@ -522,6 +522,19 @@ enum GetResource {
     /// Show compliance report
     #[command(alias = "compliance")]
     ComplianceReport,
+    /// List recent audit events
+    #[command(name = "audit-events", alias = "audit")]
+    AuditEvents {
+        /// Max events to return (default 100, max 1000)
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Filter by exact action name (e.g. CreateVm)
+        #[arg(long)]
+        action: Option<String>,
+        /// Only events at or after this RFC3339 timestamp
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// List unresolved replication conflicts
     Conflicts {
         /// Max conflicts to return
@@ -1238,6 +1251,17 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::compliance::report(&info).await
+        }
+        Command::Get {
+            resource:
+                GetResource::AuditEvents {
+                    limit,
+                    action,
+                    since,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::audit::list(&info, *limit, action.clone(), since.clone()).await
         }
         Command::Get {
             resource: GetResource::Conflicts { limit },

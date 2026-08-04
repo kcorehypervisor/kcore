@@ -267,6 +267,16 @@ pub struct ControllerPeerRow {
     pub last_seen_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEventRow {
+    pub id: i64,
+    pub actor: String,
+    pub action: String,
+    pub resource: String,
+    pub created_at: String,
+    pub detail: String,
+}
+
 impl Database {
     pub fn open(path: &str) -> Result<Self> {
         validate_database_path(path)?;
@@ -855,7 +865,34 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 28;
+        if version < 29 {
+            let _ = conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    resource TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    detail TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_events_created
+                  ON audit_events(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_audit_events_action
+                  ON audit_events(action);
+                CREATE TRIGGER IF NOT EXISTS audit_events_no_update
+                  BEFORE UPDATE ON audit_events
+                  BEGIN
+                    SELECT RAISE(ABORT, 'audit_events is append-only');
+                  END;
+                CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+                  BEFORE DELETE ON audit_events
+                  BEGIN
+                    SELECT RAISE(ABORT, 'audit_events is append-only');
+                  END;",
+            );
+        }
+
+        const CURRENT_VERSION: i32 = 29;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -884,6 +921,92 @@ impl Database {
             params![event_type, resource_key, payload],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn append_audit_event(
+        &self,
+        actor: &str,
+        action: &str,
+        resource: &str,
+        detail: &str,
+    ) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO audit_events (actor, action, resource, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![actor, action, resource, detail],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Newest-first. `limit` is clamped to 1..=1000 (callers may pass 0 for default 100).
+    pub fn list_audit_events(
+        &self,
+        limit: u32,
+        since: Option<&str>,
+        action: Option<&str>,
+    ) -> Result<Vec<AuditEventRow>, rusqlite::Error> {
+        let limit = match limit {
+            0 => 100u32,
+            n => n.min(1000),
+        };
+        let conn = self.lock_conn()?;
+        let since = since.map(str::trim).filter(|s| !s.is_empty());
+        let action = action.map(str::trim).filter(|s| !s.is_empty());
+        let mut rows = Vec::new();
+        match (since, action) {
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, actor, action, resource, created_at, detail
+                     FROM audit_events
+                     ORDER BY id DESC
+                     LIMIT ?1",
+                )?;
+                let iter = stmt.query_map(params![limit], map_audit_event_row)?;
+                for row in iter {
+                    rows.push(row?);
+                }
+            }
+            (Some(since), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, actor, action, resource, created_at, detail
+                     FROM audit_events
+                     WHERE created_at >= ?1
+                     ORDER BY id DESC
+                     LIMIT ?2",
+                )?;
+                let iter = stmt.query_map(params![since, limit], map_audit_event_row)?;
+                for row in iter {
+                    rows.push(row?);
+                }
+            }
+            (None, Some(action)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, actor, action, resource, created_at, detail
+                     FROM audit_events
+                     WHERE action = ?1
+                     ORDER BY id DESC
+                     LIMIT ?2",
+                )?;
+                let iter = stmt.query_map(params![action, limit], map_audit_event_row)?;
+                for row in iter {
+                    rows.push(row?);
+                }
+            }
+            (Some(since), Some(action)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, actor, action, resource, created_at, detail
+                     FROM audit_events
+                     WHERE created_at >= ?1 AND action = ?2
+                     ORDER BY id DESC
+                     LIMIT ?3",
+                )?;
+                let iter = stmt.query_map(params![since, action, limit], map_audit_event_row)?;
+                for row in iter {
+                    rows.push(row?);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     pub fn replication_outbox_len(&self) -> Result<i64, rusqlite::Error> {
@@ -3106,6 +3229,17 @@ fn row_to_workload(row: &rusqlite::Row) -> Result<WorkloadRow, rusqlite::Error> 
     })
 }
 
+fn map_audit_event_row(row: &rusqlite::Row<'_>) -> Result<AuditEventRow, rusqlite::Error> {
+    Ok(AuditEventRow {
+        id: row.get(0)?,
+        actor: row.get(1)?,
+        action: row.get(2)?,
+        resource: row.get(3)?,
+        created_at: row.get(4)?,
+        detail: row.get(5)?,
+    })
+}
+
 fn normalize_image_format(format: &str, image_path: &str, image_url: &str) -> String {
     let normalized = format.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -3634,6 +3768,49 @@ mod tests {
             .expect("append");
         assert!(id >= 1);
         assert_eq!(db.replication_outbox_len().expect("count"), 1);
+    }
+
+    #[test]
+    fn audit_events_append_list_and_filters() {
+        let db = Database::open(":memory:").expect("open db");
+        let id1 = db
+            .append_audit_event("kctl", "CreateVm", "vm/web-01", "")
+            .expect("append 1");
+        let id2 = db
+            .append_audit_event("kctl", "DeleteVm", "vm/web-01", r#"{"ok":true}"#)
+            .expect("append 2");
+        assert!(id2 > id1);
+
+        let all = db.list_audit_events(0, None, None).expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].action, "DeleteVm");
+        assert_eq!(all[1].action, "CreateVm");
+
+        let filtered = db
+            .list_audit_events(10, None, Some("CreateVm"))
+            .expect("filter");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].resource, "vm/web-01");
+
+        let limited = db.list_audit_events(1, None, None).expect("limit");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, id2);
+    }
+
+    #[test]
+    fn audit_events_reject_update_and_delete() {
+        let db = Database::open(":memory:").expect("open db");
+        let id = db
+            .append_audit_event("kctl", "ApproveNode", "node/n1", "")
+            .expect("append");
+        let conn = db.lock_conn().expect("lock");
+        let upd = conn.execute(
+            "UPDATE audit_events SET actor = 'x' WHERE id = ?1",
+            params![id],
+        );
+        assert!(upd.is_err(), "update must be rejected");
+        let del = conn.execute("DELETE FROM audit_events WHERE id = ?1", params![id]);
+        assert!(del.is_err(), "delete must be rejected");
     }
 
     #[test]

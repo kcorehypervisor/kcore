@@ -1,12 +1,13 @@
 use crate::api::{
     get_compliance_dto, get_network_overview_dto, get_replication_status_dto,
-    get_storage_overview_dto, list_networks_dto, list_replication_conflicts_dto, list_vms_page,
+    get_storage_overview_dto, list_audit_events_dto, list_networks_dto,
+    list_replication_conflicts_dto, list_vms_page,
 };
 use crate::dto::{
-    ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto,
-    NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto,
-    ReplicationConflictDto, ReplicationStatusDto, StorageDiskRowDto, StorageOverviewDto, VmRowDto,
-    VmsPageDto,
+    AuditEventDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
+    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
+    NodeSummaryDto, ReplicationConflictDto, ReplicationStatusDto, StorageDiskRowDto,
+    StorageOverviewDto, VmRowDto, VmsPageDto,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};
@@ -114,6 +115,7 @@ fn CompliancePage() -> impl IntoView {
     let res = Resource::new(|| (), |_| get_compliance_dto());
     let replication_res = Resource::new(|| (), |_| get_replication_status_dto());
     let conflicts_res = Resource::new(|| (), |_| list_replication_conflicts_dto());
+    let audit_res = Resource::new(|| (), |_| list_audit_events_dto());
     view! {
         <section class="hero">
             <h1>"Compliance report"</h1>
@@ -127,6 +129,17 @@ fn CompliancePage() -> impl IntoView {
                 }
             })}
         </Suspense>
+        <section class="card" style="margin-top: 1rem;">
+            <h2>"Recent audit events"</h2>
+            <Suspense fallback=move || view! { <p class="muted">"Loading audit events…"</p> }>
+                {move || Suspend::new(async move {
+                    match audit_res.await {
+                        Ok(data) => audit_events_view(data).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })}
+            </Suspense>
+        </section>
         <section class="card" style="margin-top: 1rem;">
             <h2>"Replication resilience"</h2>
             <Suspense fallback=move || view! { <p class="muted">"Loading replication status…"</p> }>
@@ -150,6 +163,48 @@ fn CompliancePage() -> impl IntoView {
             </Suspense>
         </section>
     }
+}
+
+fn audit_events_view(events: Vec<AuditEventDto>) -> impl IntoView {
+    if events.is_empty() {
+        return view! { <p class="muted">"No audit events yet."</p> }.into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Time"</th>
+                        <th>"Actor"</th>
+                        <th>"Action"</th>
+                        <th>"Resource"</th>
+                        <th>"Detail"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {events.into_iter().map(|e| {
+                        let detail = if e.detail.chars().count() > 48 {
+                            let mut t: String = e.detail.chars().take(47).collect();
+                            t.push('…');
+                            t
+                        } else {
+                            e.detail.clone()
+                        };
+                        view! {
+                            <tr>
+                                <td>{e.created_at.clone()}</td>
+                                <td>{e.actor.clone()}</td>
+                                <td><code class="inline">{e.action.clone()}</code></td>
+                                <td><code class="inline">{e.resource.clone()}</code></td>
+                                <td class="muted">{detail}</td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
 }
 
 fn replication_status_view(data: ReplicationStatusDto) -> impl IntoView {

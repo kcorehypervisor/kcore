@@ -347,6 +347,7 @@ impl controller_proto::controller_admin_server::ControllerAdmin for ControllerAd
         request: Request<controller_proto::ResolveReplicationConflictRequest>,
     ) -> Result<Response<controller_proto::ResolveReplicationConflictResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = auth::peer_cn(&request).unwrap_or_else(|| "insecure".to_string());
         let req = request.into_inner();
         if req.id <= 0 {
             return Err(Status::invalid_argument("id must be > 0"));
@@ -360,6 +361,18 @@ impl controller_proto::controller_admin_server::ControllerAdmin for ControllerAd
                 "replication conflict {} not found or already resolved",
                 req.id
             )));
+        }
+        if let Err(e) = self.db.append_audit_event(
+            &actor,
+            "ResolveReplicationConflict",
+            &format!("replication-conflict/{}", req.id),
+            "",
+        ) {
+            error!(
+                error = %e,
+                actor = %actor,
+                "failed to append audit_events row"
+            );
         }
         Ok(Response::new(
             controller_proto::ResolveReplicationConflictResponse { success: true },

@@ -63,6 +63,8 @@ service Controller {
 
   // Compliance
   rpc GetComplianceReport(GetComplianceReportRequest) returns (GetComplianceReportResponse);
+  // Append-only audit trail (actor = mTLS peer CN until RBAC).
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
 
   // Network overview: host interfaces from each node + default network config
   rpc GetNetworkOverview(GetNetworkOverviewRequest) returns (GetNetworkOverviewResponse);
@@ -849,6 +851,28 @@ message ReloadTlsResponse {
 // Compliance Report
 
 message GetComplianceReportRequest {}
+
+message ListAuditEventsRequest {
+  // Max rows to return (default 100, max 1000).
+  uint32 limit = 1;
+  // Optional RFC3339 lower bound on created_at (inclusive).
+  string since = 2;
+  // Optional exact action filter (e.g. CreateVm).
+  string action = 3;
+}
+
+message AuditEvent {
+  int64 id = 1;
+  string actor = 2;
+  string action = 3;
+  string resource = 4;
+  string created_at = 5;
+  string detail = 6;
+}
+
+message ListAuditEventsResponse {
+  repeated AuditEvent events = 1;
+}
 
 message AccessControlEntry {
   string rpc_method = 1;

@@ -364,6 +364,13 @@ impl Controller for ManyVmsController {
         }))
     }
 
+    async fn list_audit_events(
+        &self,
+        _: TRequest<ListAuditEventsRequest>,
+    ) -> Result<Response<ListAuditEventsResponse>, Status> {
+        Ok(Response::new(ListAuditEventsResponse::default()))
+    }
+
     async fn list_volumes(
         &self,
         _: TRequest<ListVolumesRequest>,
