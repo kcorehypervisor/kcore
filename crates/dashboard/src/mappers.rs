@@ -2,7 +2,7 @@
 
 use crate::controller_client::controller_proto;
 use crate::dto::{
-    AccessControlEntryDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto,
+    AccessControlEntryDto, AuditEventDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto,
     LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
     NodeStorageDto, NodeSummaryDto, ReplicationConflictDto, ReplicationIncomingDto,
     ReplicationOutgoingDto, ReplicationStatusDto, StorageDiskRowDto, StorageOverviewDto, VmRowDto,
@@ -331,6 +331,20 @@ pub fn conflicts_from_proto(
             incumbent_controller_id: c.incumbent_controller_id,
             challenger_controller_id: c.challenger_controller_id,
             reason: c.reason,
+        })
+        .collect()
+}
+
+pub fn audit_events_from_proto(events: Vec<controller_proto::AuditEvent>) -> Vec<AuditEventDto> {
+    events
+        .into_iter()
+        .map(|e| AuditEventDto {
+            id: e.id,
+            actor: e.actor,
+            action: e.action,
+            resource: e.resource,
+            created_at: e.created_at,
+            detail: e.detail,
         })
         .collect()
 }

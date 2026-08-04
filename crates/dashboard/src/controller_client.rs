@@ -137,6 +137,23 @@ pub async fn list_replication_conflicts(
     Ok(resp.into_inner())
 }
 
+pub async fn list_audit_events(
+    cfg: &DashboardConfig,
+    limit: u32,
+) -> Result<Vec<controller_proto::AuditEvent>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_audit_events(controller_proto::ListAuditEventsRequest {
+            limit,
+            since: String::new(),
+            action: String::new(),
+        })
+        .await
+        .context("ListAuditEvents RPC")?;
+    Ok(resp.into_inner().events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

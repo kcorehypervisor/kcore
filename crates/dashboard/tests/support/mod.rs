@@ -479,6 +479,22 @@ impl Controller for MockController {
         }))
     }
 
+    async fn list_audit_events(
+        &self,
+        _: Request<ListAuditEventsRequest>,
+    ) -> Result<Response<ListAuditEventsResponse>, Status> {
+        Ok(Response::new(ListAuditEventsResponse {
+            events: vec![AuditEvent {
+                id: 1,
+                actor: "kctl".into(),
+                action: "CreateVm".into(),
+                resource: "vm/web-01".into(),
+                created_at: "2026-08-04T12:00:00.000Z".into(),
+                detail: String::new(),
+            }],
+        }))
+    }
+
     async fn list_volumes(
         &self,
         _: Request<ListVolumesRequest>,

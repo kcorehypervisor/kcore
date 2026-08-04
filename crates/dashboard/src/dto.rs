@@ -197,6 +197,16 @@ pub struct ReplicationConflictDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEventDto {
+    pub id: i64,
+    pub actor: String,
+    pub action: String,
+    pub resource: String,
+    pub created_at: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LvmVolumeGroupDto {
     pub name: String,
     pub size: String,

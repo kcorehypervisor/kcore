@@ -1,7 +1,24 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+thread_local! {
+    // Nested RPC helpers (CreateWorkload → CreateVm) lose mTLS extensions on
+    // Request::new; propagate the outer peer CN for audit attribution.
+    static AUDIT_ACTOR_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+struct AuditActorGuard;
+
+impl Drop for AuditActorGuard {
+    fn drop(&mut self) {
+        AUDIT_ACTOR_OVERRIDE.with(|c| {
+            *c.borrow_mut() = None;
+        });
+    }
+}
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
@@ -695,6 +712,7 @@ impl ControllerService {
     /// or `UNCHANGED` when the incoming spec already matches storage.
     async fn upsert_existing_vm(
         &self,
+        actor: &str,
         req: controller_proto::CreateVmRequest,
         spec: controller_proto::VmSpec,
         stored: VmRow,
@@ -850,6 +868,8 @@ impl ControllerService {
             }
 
             self.log_replication_event(
+                actor,
+                Some("UpdateVm"),
                 EVT_VM_UPDATE,
                 &format!("vm/{}", stored.id),
                 serde_json::json!({
@@ -873,6 +893,8 @@ impl ControllerService {
                 .await?;
             changed_fields.push("desired_state".into());
             self.log_replication_event(
+                actor,
+                Some("SetVmDesiredState"),
                 EVT_VM_DESIRED_STATE_SET,
                 &format!("vm/{}", stored.id),
                 serde_json::json!({
@@ -944,7 +966,17 @@ impl ControllerService {
             .ok_or_else(|| Status::unavailable(format!("no connection to node {address}")))
     }
 
-    fn log_replication_event(&self, event_type: &str, resource_key: &str, body: serde_json::Value) {
+    fn log_replication_event(
+        &self,
+        actor: &str,
+        audit_action: Option<&str>,
+        event_type: &str,
+        resource_key: &str,
+        body: serde_json::Value,
+    ) {
+        if let Some(action) = audit_action {
+            self.record_audit(actor, action, resource_key, "");
+        }
         let Some(rep) = &self.replication else {
             return;
         };
@@ -987,12 +1019,44 @@ impl ControllerService {
         }
     }
 
+    fn audit_actor<T>(request: &Request<T>) -> String {
+        if let Some(actor) = AUDIT_ACTOR_OVERRIDE.with(|c| c.borrow().clone()) {
+            return actor;
+        }
+        auth::peer_cn(request).unwrap_or_else(|| "insecure".to_string())
+    }
+
+    fn push_audit_actor(actor: &str) -> AuditActorGuard {
+        AUDIT_ACTOR_OVERRIDE.with(|c| {
+            *c.borrow_mut() = Some(actor.to_string());
+        });
+        AuditActorGuard
+    }
+
+    fn record_audit(&self, actor: &str, action: &str, resource: &str, detail: impl Into<String>) {
+        let detail = detail.into();
+        if let Err(e) = self.db.append_audit_event(actor, action, resource, &detail) {
+            error!(
+                error = %e,
+                actor = %actor,
+                action = %action,
+                resource = %resource,
+                "failed to append audit_events row"
+            );
+        }
+    }
+
     fn log_replication_event_required(
         &self,
+        actor: &str,
+        audit_action: Option<&str>,
         event_type: &str,
         resource_key: &str,
         body: serde_json::Value,
     ) -> Result<(), Status> {
+        if let Some(action) = audit_action {
+            self.record_audit(actor, action, resource_key, "");
+        }
         let Some(rep) = &self.replication else {
             return Ok(());
         };
@@ -1022,6 +1086,7 @@ impl ControllerService {
 
     async fn create_disk_layout_impl(
         &self,
+        actor: &str,
         req: controller_proto::CreateDiskLayoutRequest,
     ) -> Result<Response<controller_proto::CreateDiskLayoutResponse>, Status> {
         let incoming = req
@@ -1132,6 +1197,8 @@ impl ControllerService {
             .map_err(|e| Status::internal(format!("resetting disk layout status: {e}")))?;
 
         self.log_replication_event(
+            actor,
+            Some("CreateDiskLayout"),
             EVT_DISK_LAYOUT_CREATE,
             &format!("disk-layout/{name}"),
             serde_json::json!({
@@ -1212,6 +1279,7 @@ impl ControllerService {
 
     async fn delete_disk_layout_impl(
         &self,
+        actor: &str,
         req: controller_proto::DeleteDiskLayoutRequest,
     ) -> Result<Response<controller_proto::DeleteDiskLayoutResponse>, Status> {
         let name = req.name.trim().to_string();
@@ -1224,6 +1292,8 @@ impl ControllerService {
             .map_err(|e| Status::internal(format!("deleting disk layout: {e}")))?;
         if existed {
             self.log_replication_event(
+                actor,
+                Some("DeleteDiskLayout"),
                 EVT_DISK_LAYOUT_DELETE,
                 &format!("disk-layout/{name}"),
                 serde_json::json!({"name": name}),
@@ -1393,6 +1463,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::RegisterNodeRequest>,
     ) -> Result<Response<controller_proto::RegisterNodeResponse>, Status> {
         auth::require_peer(&request, &[CN_NODE_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let (cpu, mem) = req
             .capacity
@@ -1459,6 +1530,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         self.log_replication_event_required(
+            &actor,
+            Some("RegisterNode"),
             EVT_NODE_REGISTER,
             &format!("node/{}", req.node_id),
             serde_json::json!({
@@ -1506,6 +1579,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::HeartbeatRequest>,
     ) -> Result<Response<controller_proto::HeartbeatResponse>, Status> {
         auth::require_peer(&request, &[CN_NODE_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let (cpu_used, mem_used) = req
             .usage
@@ -1533,6 +1607,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         if let Ok(Some(node)) = self.db.get_node(&req.node_id) {
             let labels = self.db.get_node_labels(&req.node_id).unwrap_or_default();
             self.log_replication_event_required(
+                &actor,
+                None,
                 EVT_NODE_HEARTBEAT,
                 &format!("node/{}", req.node_id),
                 serde_json::json!({
@@ -1659,6 +1735,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateVmRequest>,
     ) -> Result<Response<controller_proto::CreateVmResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let mut req = request.into_inner();
         let spec = req
             .spec
@@ -1678,7 +1755,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .into_iter()
                 .find(|v| v.name == name_key)
             {
-                return self.upsert_existing_vm(req, spec, existing).await;
+                return self.upsert_existing_vm(&actor, req, spec, existing).await;
             }
         }
 
@@ -1999,6 +2076,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(format!("listing VM SSH keys for replication: {e}")))?;
 
         self.log_replication_event(
+            &actor,
+            Some("CreateVm"),
             EVT_VM_CREATE,
             &format!("vm/{vm_id}"),
             serde_json::json!({
@@ -2037,6 +2116,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::UpdateVmRequest>,
     ) -> Result<Response<controller_proto::UpdateVmResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         if req.vm_id.is_empty() {
@@ -2069,6 +2149,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         info!(vm_id = %req.vm_id, cpu = ?cpu, memory_bytes = ?mem, "updated VM spec, pushing config");
         self.push_config_to_node(&node).await?;
         self.log_replication_event(
+            &actor,
+            Some("UpdateVm"),
             EVT_VM_UPDATE,
             &format!("vm/{}", req.vm_id),
             serde_json::json!({
@@ -2090,6 +2172,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DeleteVmRequest>,
     ) -> Result<Response<controller_proto::DeleteVmResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
 
@@ -2105,6 +2188,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         self.push_config_to_node(&node).await?;
         self.log_replication_event(
+            &actor,
+            Some("DeleteVm"),
             EVT_VM_DELETE,
             &format!("vm/{}", req.vm_id),
             serde_json::json!({
@@ -2123,6 +2208,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::SetVmDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetVmDesiredStateResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let auto_start = match controller_proto::VmDesiredState::try_from(req.desired_state)
             .unwrap_or(controller_proto::VmDesiredState::Unspecified)
@@ -2139,6 +2225,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .set_vm_desired_state_internal(&req.vm_id, &req.target_node, auto_start)
             .await?;
         self.log_replication_event(
+            &actor,
+            Some("SetVmDesiredState"),
             EVT_VM_DESIRED_STATE_SET,
             &format!("vm/{}", req.vm_id),
             serde_json::json!({
@@ -2542,6 +2630,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateWorkloadRequest>,
     ) -> Result<Response<controller_proto::CreateWorkloadResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
+        let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -2811,6 +2901,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     })
                     .map_err(|e| Status::internal(format!("storing workload row: {e}")))?;
 
+                self.record_audit(
+                    &actor,
+                    "CreateWorkload",
+                    &format!("workload/{workload_id}"),
+                    "",
+                );
+
                 Ok(Response::new(controller_proto::CreateWorkloadResponse {
                     kind: controller_proto::WorkloadKind::Container as i32,
                     workload_id,
@@ -2832,6 +2929,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DeleteWorkloadRequest>,
     ) -> Result<Response<controller_proto::DeleteWorkloadResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
+        let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -2886,6 +2985,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     .await
                     .map_err(|e| Status::internal(format!("deleting container on node: {e}")))?;
                 let _ = self.db.delete_workload_by_id_or_name(&req.workload_id);
+                self.record_audit(
+                    &actor,
+                    "DeleteWorkload",
+                    &format!("workload/{}", req.workload_id),
+                    "",
+                );
                 Ok(Response::new(controller_proto::DeleteWorkloadResponse {
                     success: true,
                 }))
@@ -2901,6 +3006,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::SetWorkloadDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetWorkloadDesiredStateResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
+        let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
         let desired = controller_proto::WorkloadDesiredState::try_from(req.desired_state)
             .unwrap_or(controller_proto::WorkloadDesiredState::Unspecified);
@@ -2994,6 +3101,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         return Err(Status::invalid_argument("desired_state is required"));
                     }
                 };
+                self.record_audit(
+                    &actor,
+                    "SetWorkloadDesiredState",
+                    &format!("workload/{}", req.workload_id),
+                    "",
+                );
                 Ok(Response::new(
                     controller_proto::SetWorkloadDesiredStateResponse {
                         kind: controller_proto::WorkloadKind::Container as i32,
@@ -3170,6 +3283,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateNetworkRequest>,
     ) -> Result<Response<controller_proto::CreateNetworkResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = validate_network_name(&req.name)?;
         let external_ip = validate_ipv4(&req.external_ip, "external_ip")?;
@@ -3308,6 +3422,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         self.log_replication_event(
+            &actor,
+            Some("CreateNetwork"),
             EVT_NETWORK_CREATE,
             &format!("network/{}/{}", node.id, name),
             serde_json::json!({
@@ -3340,6 +3456,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DeleteNetworkRequest>,
     ) -> Result<Response<controller_proto::DeleteNetworkResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = req.name.trim();
         if name.is_empty() {
@@ -3419,6 +3536,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         self.log_replication_event(
+            &actor,
+            Some("DeleteNetwork"),
             EVT_NETWORK_DELETE,
             &format!("network/{}/{}", node.id, name),
             serde_json::json!({
@@ -3477,6 +3596,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::CreateSecurityGroupResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req
             .security_group
@@ -3599,6 +3719,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(format!("storing security group rules: {e}")))?;
 
         self.log_replication_event(
+            &actor,
+            Some("CreateSecurityGroup"),
             EVT_SECURITY_GROUP_CREATE,
             &format!("security-group/{name}"),
             serde_json::json!({
@@ -3770,6 +3892,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DeleteSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::DeleteSecurityGroupResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = req.name.trim();
         if name.is_empty() {
@@ -3785,6 +3908,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )));
         }
         self.log_replication_event(
+            &actor,
+            Some("DeleteSecurityGroup"),
             EVT_SECURITY_GROUP_DELETE,
             &format!("security-group/{name}"),
             serde_json::json!({ "name": name }),
@@ -3799,6 +3924,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::AttachSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::AttachSecurityGroupResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req.security_group.trim();
         if sg.is_empty() {
@@ -3875,6 +4001,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             controller_proto::SecurityGroupTargetKind::Unspecified => unreachable!(),
         }
         self.log_replication_event(
+            &actor,
+            Some("AttachSecurityGroup"),
             EVT_SECURITY_GROUP_ATTACH,
             &format!("security-group/{sg}"),
             serde_json::json!({
@@ -3894,6 +4022,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DetachSecurityGroupRequest>,
     ) -> Result<Response<controller_proto::DetachSecurityGroupResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let sg = req.security_group.trim();
         if sg.is_empty() {
@@ -3948,6 +4077,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             controller_proto::SecurityGroupTargetKind::Unspecified => unreachable!(),
         }
         self.log_replication_event(
+            &actor,
+            Some("DetachSecurityGroup"),
             EVT_SECURITY_GROUP_DETACH,
             &format!("security-group/{sg}"),
             serde_json::json!({
@@ -4067,6 +4198,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateSshKeyRequest>,
     ) -> Result<Response<controller_proto::CreateSshKeyResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         if req.name.trim().is_empty() {
@@ -4114,6 +4246,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         info!(name = %req.name, "created SSH key");
         self.log_replication_event(
+            &actor,
+            Some("CreateSshKey"),
             EVT_SSH_KEY_CREATE,
             &format!("ssh-key/{name}"),
             serde_json::json!({
@@ -4135,6 +4269,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DeleteSshKeyRequest>,
     ) -> Result<Response<controller_proto::DeleteSshKeyResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         let deleted = self
@@ -4151,6 +4286,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         info!(name = %req.name, "deleted SSH key");
         self.log_replication_event(
+            &actor,
+            Some("DeleteSshKey"),
             EVT_SSH_KEY_DELETE,
             &format!("ssh-key/{}", req.name.trim()),
             serde_json::json!({
@@ -4220,6 +4357,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DrainNodeRequest>,
     ) -> Result<Response<controller_proto::DrainNodeResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         let source_node = self
@@ -4340,6 +4478,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )
         };
         self.log_replication_event_required(
+            &actor,
+            Some("DrainNode"),
             EVT_NODE_DRAIN,
             &format!("node/{}", req.node_id),
             serde_json::json!({
@@ -4362,6 +4502,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::ApproveNodeRequest>,
     ) -> Result<Response<controller_proto::ApproveNodeResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         let node = self
@@ -4389,6 +4530,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         self.log_replication_event_required(
+            &actor,
+            Some("ApproveNode"),
             EVT_NODE_APPROVE,
             &format!("node/{}", req.node_id),
             serde_json::json!({
@@ -4410,6 +4553,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::RejectNodeRequest>,
     ) -> Result<Response<controller_proto::RejectNodeResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         let _node = self
@@ -4426,6 +4570,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
 
         self.log_replication_event_required(
+            &actor,
+            Some("RejectNode"),
             EVT_NODE_REJECT,
             &format!("node/{}", req.node_id),
             serde_json::json!({
@@ -4544,6 +4690,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::RotateSubCaRequest>,
     ) -> Result<Response<controller_proto::RotateSubCaResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         if req.sub_ca_cert_pem.trim().is_empty() || req.sub_ca_key_pem.trim().is_empty() {
@@ -4573,6 +4720,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         sub_ca.key_pem = req.sub_ca_key_pem;
 
         info!("sub-CA rotated via kctl");
+        self.record_audit(&actor, "RotateSubCa", "sub-ca", "");
 
         Ok(Response::new(controller_proto::RotateSubCaResponse {
             success: true,
@@ -4585,6 +4733,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::ReloadTlsRequest>,
     ) -> Result<Response<controller_proto::ReloadTlsResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         if req.cert_pem.trim().is_empty() || req.key_pem.trim().is_empty() {
@@ -4616,6 +4765,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
             info!("SIGHUP sent to self, TLS reload in progress");
         }
+
+        self.record_audit(&actor, "ReloadTls", "controller-tls", "");
 
         Ok(Response::new(controller_proto::ReloadTlsResponse {
             success: true,
@@ -5083,6 +5234,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             acl("RotateSubCa", CN_KCTL),
             acl("ReloadTls", CN_KCTL),
             acl("GetComplianceReport", CN_KCTL),
+            acl("ListAuditEvents", CN_KCTL),
             acl("GetNetworkOverview", CN_KCTL),
             acl("GetStorageOverview", CN_KCTL),
             acl("ApplyNixConfig", CN_KCTL),
@@ -5140,12 +5292,57 @@ impl controller_proto::controller_server::Controller for ControllerService {
         ))
     }
 
+    // TODO(rbac): restrict to admin role when RBAC is implemented
+    async fn list_audit_events(
+        &self,
+        request: Request<controller_proto::ListAuditEventsRequest>,
+    ) -> Result<Response<controller_proto::ListAuditEventsResponse>, Status> {
+        auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let since = {
+            let s = req.since.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        };
+        let action = {
+            let a = req.action.trim();
+            if a.is_empty() {
+                None
+            } else {
+                Some(a.to_string())
+            }
+        };
+        let rows = self
+            .db
+            .list_audit_events(req.limit, since.as_deref(), action.as_deref())
+            .map_err(|e| Status::internal(format!("listing audit events: {e}")))?;
+        let events = rows
+            .into_iter()
+            .map(|r| controller_proto::AuditEvent {
+                id: r.id,
+                actor: r.actor,
+                action: r.action,
+                resource: r.resource,
+                created_at: r.created_at,
+                detail: r.detail,
+            })
+            .collect();
+        Ok(Response::new(controller_proto::ListAuditEventsResponse {
+            events,
+        }))
+    }
+
     async fn create_disk_layout(
         &self,
         request: Request<controller_proto::CreateDiskLayoutRequest>,
     ) -> Result<Response<controller_proto::CreateDiskLayoutResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
-        self.create_disk_layout_impl(request.into_inner()).await
+        let actor = Self::audit_actor(&request);
+        self.create_disk_layout_impl(&actor, request.into_inner())
+            .await
     }
 
     async fn get_disk_layout(
@@ -5169,7 +5366,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DeleteDiskLayoutRequest>,
     ) -> Result<Response<controller_proto::DeleteDiskLayoutResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
-        self.delete_disk_layout_impl(request.into_inner()).await
+        let actor = Self::audit_actor(&request);
+        self.delete_disk_layout_impl(&actor, request.into_inner())
+            .await
     }
 
     async fn create_cluster_update(
@@ -5177,6 +5376,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::CreateClusterUpdateResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let spec = req
             .spec
@@ -5295,6 +5495,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(format!("decode spec: {e}")))?;
 
         let _ = self.log_replication_event_required(
+            &actor,
+            Some("CreateClusterUpdate"),
             EVT_CLUSTER_UPDATE_CREATE,
             &name,
             serde_json::json!({ "generation": generation }),
@@ -5400,6 +5602,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::ApproveClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::ApproveClusterUpdateResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         if req.name.trim().is_empty() {
             return Err(Status::invalid_argument("name is required"));
@@ -5426,6 +5629,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let parsed = cluster_update_spec::spec_from_json(&stored.spec_json)
             .map_err(|e| Status::internal(format!("decode spec: {e}")))?;
         let _ = self.log_replication_event_required(
+            &actor,
+            Some("ApproveClusterUpdate"),
             EVT_CLUSTER_UPDATE_APPROVE,
             &name,
             serde_json::json!({}),
@@ -5443,6 +5648,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CancelClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::CancelClusterUpdateResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         if req.name.trim().is_empty() {
             return Err(Status::invalid_argument("name is required"));
@@ -5480,6 +5686,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let parsed = cluster_update_spec::spec_from_json(&stored.spec_json)
             .map_err(|e| Status::internal(format!("decode spec: {e}")))?;
         let _ = self.log_replication_event_required(
+            &actor,
+            Some("CancelClusterUpdate"),
             EVT_CLUSTER_UPDATE_CANCEL,
             &name,
             serde_json::json!({}),
@@ -5497,6 +5705,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::RollbackClusterUpdateRequest>,
     ) -> Result<Response<controller_proto::RollbackClusterUpdateResponse>, Status> {
         auth::require_peer(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         if req.name.trim().is_empty() {
             return Err(Status::invalid_argument("name is required"));
@@ -5540,6 +5749,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let parsed = cluster_update_spec::spec_from_json(&stored.spec_json)
             .map_err(|e| Status::internal(format!("decode spec: {e}")))?;
         let _ = self.log_replication_event_required(
+            &actor,
+            Some("RollbackClusterUpdate"),
             EVT_CLUSTER_UPDATE_ROLLBACK,
             &name,
             serde_json::json!({}),
@@ -5729,6 +5940,51 @@ mod tests {
             "invalid request should not mutate desired state"
         );
         assert_eq!(push_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn create_ssh_key_appends_audit_event_and_list_returns_it() {
+        let db = Database::open(":memory:").expect("open db");
+        let svc = ControllerService::new(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            empty_sub_ca(),
+            None,
+            false,
+        );
+
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::create_ssh_key(
+                &svc,
+                Request::new(controller_proto::CreateSshKeyRequest {
+                    name: "ops".into(),
+                    public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey ops@kcore".into(),
+                }),
+            )
+            .await
+            .expect("create ssh key")
+            .into_inner();
+        assert!(resp.success);
+
+        let listed =
+            <ControllerService as controller_proto::controller_server::Controller>::list_audit_events(
+                &svc,
+                Request::new(controller_proto::ListAuditEventsRequest {
+                    limit: 10,
+                    since: String::new(),
+                    action: "CreateSshKey".into(),
+                }),
+            )
+            .await
+            .expect("list audit events")
+            .into_inner();
+
+        assert_eq!(listed.events.len(), 1);
+        let ev = &listed.events[0];
+        assert_eq!(ev.actor, "insecure");
+        assert_eq!(ev.action, "CreateSshKey");
+        assert_eq!(ev.resource, "ssh-key/ops");
     }
 
     #[test]

@@ -98,6 +98,18 @@ async fn all_dashboard_pages_against_mock_controller() {
         compliance.contains("Compliance report"),
         "compliance must have page title"
     );
+    assert!(
+        compliance.contains("Recent audit events"),
+        "compliance must have audit section"
+    );
+    assert!(
+        compliance.contains("CreateVm"),
+        "compliance must show mock audit action"
+    );
+    assert!(
+        compliance.contains("vm/web-01"),
+        "compliance must show mock audit resource"
+    );
 
     // Replication section (now from ControllerAdmin mock)
     assert!(
