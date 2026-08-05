@@ -2454,6 +2454,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<tonic::Streaming<controller_proto::ConsoleMessage>>,
     ) -> Result<Response<Self::AttachVmConsoleStream>, Status> {
         self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
         let mut inbound = request.into_inner();
         let first = inbound
             .message()
@@ -2499,6 +2500,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .await
             .map_err(|e| Status::unavailable(format!("node AttachVmConsole: {e}")))?
             .into_inner();
+
+        // Session established: who opened which console, and when (created_at).
+        self.record_audit(
+            &actor,
+            "AttachVmConsole",
+            &format!("vm/{vm_name}"),
+            serde_json::json!({ "nodeId": node.id }).to_string(),
+        );
 
         let (out_tx, out_rx) =
             mpsc::channel::<Result<controller_proto::ConsoleMessage, Status>>(64);
@@ -6266,6 +6275,51 @@ mod tests {
         assert_eq!(ev.actor, "insecure");
         assert_eq!(ev.action, "CreateSshKey");
         assert_eq!(ev.resource, "ssh-key/ops");
+    }
+
+    #[tokio::test]
+    async fn console_session_open_audit_lists_actor_vm_and_time() {
+        let db = Database::open(":memory:").expect("open db");
+        let svc = ControllerService::new(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            empty_sub_ca(),
+            None,
+            false,
+            false,
+        );
+
+        svc.record_audit(
+            "kctl:alice",
+            "AttachVmConsole",
+            "vm/web-01",
+            r#"{"nodeId":"node-a"}"#,
+        );
+
+        let listed =
+            <ControllerService as controller_proto::controller_server::Controller>::list_audit_events(
+                &svc,
+                Request::new(controller_proto::ListAuditEventsRequest {
+                    limit: 10,
+                    since: String::new(),
+                    action: "AttachVmConsole".into(),
+                }),
+            )
+            .await
+            .expect("list audit events")
+            .into_inner();
+
+        assert_eq!(listed.events.len(), 1);
+        let ev = &listed.events[0];
+        assert_eq!(ev.actor, "kctl:alice");
+        assert_eq!(ev.action, "AttachVmConsole");
+        assert_eq!(ev.resource, "vm/web-01");
+        assert!(
+            !ev.created_at.is_empty(),
+            "session open must record a timestamp"
+        );
+        assert!(ev.detail.contains("node-a"));
     }
 
     #[test]

@@ -59,7 +59,7 @@ cluster.
 | Area | Kubernetes | kcore |
 |------|-----------|-------|
 | Authorization | RBAC with Roles, ClusterRoles, and bindings. Per-resource, per-verb granularity (e.g., "this service account can only list pods in namespace X"). | Flat operator RBAC on controller management RPCs (`read-only` < `vm-admin` < `cluster-admin`). Node and peer-controller machine identities remain CN-prefix based. |
-| Audit logging | Built-in audit log pipeline recording request metadata, response codes, and actor identity. Configurable verbosity levels. | Structured `tracing` logs exist but there is no dedicated audit trail of who performed which mutating action. |
+| Audit logging | Built-in audit log pipeline recording request metadata, response codes, and actor identity. Configurable verbosity levels. | Append-only `audit_events` for mutating controller RPCs and console session opens (`AttachVmConsole`), with actor, action, resource, and timestamp; query via `ListAuditEvents` / `kctl audit`. |
 | Admission control | Validating and mutating admission webhooks that can intercept any API request before persistence. | Validation happens inside gRPC handlers. No pluggable admission mechanism. |
 | API versioning | Strict versioning (v1, v1beta1) with deprecation policy and conversion webhooks. | Protobuf fields are added in a backward-compatible way but there is no formal version negotiation or compatibility contract. |
 
@@ -112,9 +112,9 @@ threat model and practical priorities are different.
 
 ### Planned improvements
 
-1. **Audit log** -- structured log of all mutating API calls recording
-   actor identity, action, resource, and timestamp. Essential for
-   debugging and compliance.
+1. **CRL/OCSP** -- certificate revocation checks beyond sub-CA rotation.
+2. **SBOM and signed releases** -- `ExportSbom` / `GetCryptoConfig` and
+   signed release artifacts for regulated environments.
 
 ### Not planned (Kubernetes-specific complexity)
 
