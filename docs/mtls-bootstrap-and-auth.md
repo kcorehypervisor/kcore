@@ -130,7 +130,7 @@ Prefix matching allows any controller in the cluster to call any node-agent, and
 Human-facing controller RPCs (anything that used to allow `CN=kctl` together with peer controllers) now require a **minimum role**:
 
 - **read-only** — `Get*` / `List*` / `Classify*` / `Plan*` style calls and reports.
-- **vm-admin** — read-only plus VM/workload/network/security-group/SSH-key writes, desired-state changes, and serial console (`AttachVmConsole`).
+- **vm-admin** — read-only plus VM/workload/network/security-group/SSH-key writes, desired-state changes, and serial console (`AttachVmConsole`). Successful console attaches are recorded in the append-only audit log (`AttachVmConsole` / `vm/<name>`).
 - **cluster-admin** — full access including node lifecycle, PKI (`RotateSubCa`, `ReloadTls`, node bootstrap cert), disk layouts, cluster updates, operator administration, and `IssueOperatorCert`.
 
 Peer controller certificates (`kcore-controller-*`) still authenticate as **cluster-admin** on the shared `Controller` service (for replication pull/apply and similar). They are **not** accepted on the separate `ControllerAdmin` service (`ApplyNixConfig`, replication introspection RPCs used from `kctl`): those require a human operator cert (`kctl` or `kctl:<name>`).
