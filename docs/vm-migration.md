@@ -159,8 +159,8 @@ First boot seeds the RBD with `qemu-img convert` and sets Ceph image-meta `kcore
 
 ### Networking
 
-- Migration stream uses an **ephemeral TCP port** on the destination.
-- Allow that traffic between Ceph member hosts (public/client fabric is fine). Fixed port ranges are not implemented yet.
+- Migration stream uses a TCP port on the destination from the fixed range **18000–18127** (`MIGRATE_PORT_BASE`/`MIGRATE_PORT_COUNT` in `crates/node-agent/src/live_migrate.rs`). The range sits deliberately **below** the kernel's default ephemeral range (32768–60999), so the kernel never hands one of these ports to an unrelated outbound connection while Cloud Hypervisor is starting up. The node-agent holds a listener on the port it picked until Cloud Hypervisor is about to bind it, so nothing else can win the race in between.
+- Allow that traffic between Ceph member hosts on 18000–18127 (public/client fabric is fine).
 
 ### RBD features
 

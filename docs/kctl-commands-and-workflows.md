@@ -15,6 +15,7 @@ Connection defaults:
 
 - Controller default port: `9090`
 - Node-agent default port: `9091`
+- Controller PKI HTTP listener (CRL and OCSP, plain HTTP): `9092`
 - Default cert dir: `~/.kcore/certs`
 
 ## 2) Initialize cluster PKI and context
@@ -526,6 +527,11 @@ Top-level commands:
 - `kctl node reject <NODE_ID>`
 - `kctl rotate certs --controller <host:port>` (rotate controller cert and push to controller)
 - `kctl rotate sub-ca` (generate and push new sub-CA to controller)
+- `kctl rotate node-certs --node <NODE_ID> | --all` (force CSR-based node cert rotation; the node keypair never leaves the node)
+- `kctl get certificates [--node <id>] [--status active|rotated|revoked|all] [--expiring-within-days N]` (aliases `certs`, `certificate`)
+- `kctl get pki-status` (alias `pki`; inventory counts, rotation thresholds, CRL number and window, revocation fail mode, soonest expiries)
+- `kctl get crl [-o <file>]` (`.der` writes DER, any other name writes PEM)
+- `kctl revoke cert --serial <hex> | --node <id> | --subject <cn> [--reason <rfc5280-reason>]`
 - `kctl apply -f ... [--dry-run]`
 - `kctl version`
 
@@ -561,6 +567,12 @@ Day-2 operations:
 5. for day-2 disk layout changes, prefer declarative `kctl apply -f <DiskLayout>.yaml` (use `kctl diff -f` first); for one-off pushes, `kctl node apply-disk ...` (validate first, then `--apply`)
 6. rotate controller cert with `kctl rotate certs --controller <host:port>`
 7. rotate sub-CA with `kctl rotate sub-ca`
+8. audit the certificate inventory with `kctl get pki-status` and
+   `kctl get certificates --expiring-within-days 45`; node certificates rotate
+   on their own, so this should normally report nothing to do
+9. revoke a compromised identity with `kctl revoke cert --node <id> --reason
+   key-compromise` (or `--serial` / `--subject`), then confirm it landed on the
+   CRL with `kctl get crl`
 
 ## 12) Storage backend examples
 
