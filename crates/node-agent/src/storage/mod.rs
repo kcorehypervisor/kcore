@@ -146,6 +146,7 @@ pub fn from_config(cfg: &StorageConfig) -> Result<Arc<dyn StorageAdapter>, Stora
         )),
         StorageBackendKind::Lvm => Arc::new(LvmAdapter::new(cfg)?),
         StorageBackendKind::Zfs => Arc::new(ZfsAdapter::new(cfg)?),
+        StorageBackendKind::Ceph => Arc::new(CephAdapter::new(cfg)),
     };
     Ok(adapter)
 }
@@ -477,11 +478,97 @@ impl StorageAdapter for ZfsAdapter {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CephAdapter {
+    pool: String,
+    image_cache_dir: PathBuf,
+}
+
+impl CephAdapter {
+    fn new(cfg: &StorageConfig) -> Self {
+        Self {
+            pool: cfg
+                .ceph
+                .as_ref()
+                .map(|c| c.pool.clone())
+                .unwrap_or_else(|| "kcore-vms".to_string()),
+            image_cache_dir: PathBuf::from(&cfg.image_cache_dir),
+        }
+    }
+
+    fn image<'a>(&self, handle: &'a str) -> Result<&'a str, StorageError> {
+        handle
+            .strip_prefix(&format!("{}/", self.pool))
+            .ok_or_else(|| {
+                StorageError::new(
+                    ErrorKind::InvalidArgument,
+                    format!("Ceph handle must be {}/<image>", self.pool),
+                )
+            })
+    }
+}
+
+impl StorageAdapter for CephAdapter {
+    fn create_volume(&self, req: CreateVolumeRequest) -> Result<String, StorageError> {
+        validate_volume_create_inputs(&req)?;
+        let image = sanitize_volume_name(&req.volume_id);
+        run_cmd(
+            "rbd",
+            &[
+                "create",
+                &format!("{}/{}", self.pool, image),
+                "--size",
+                &req.size_bytes.to_string(),
+                "--image-feature",
+                "layering",
+            ],
+            ErrorKind::Internal,
+        )?;
+        Ok(format!("{}/{}", self.pool, image))
+    }
+
+    fn delete_volume(&self, backend_handle: &str) -> Result<(), StorageError> {
+        self.image(backend_handle)?;
+        run_cmd("rbd", &["rm", backend_handle], ErrorKind::Internal)
+    }
+
+    fn attach_volume(&self, req: AttachVolumeRequest) -> Result<(), StorageError> {
+        validate_attach_request(&req)?;
+        self.image(&req.backend_handle)?;
+        run_cmd("rbd", &["map", &req.backend_handle], ErrorKind::Internal)
+    }
+
+    fn detach_volume(&self, req: DetachVolumeRequest) -> Result<(), StorageError> {
+        validate_detach_request(&req)?;
+        let image = self.image(&req.backend_handle)?;
+        run_cmd(
+            "rbd",
+            &["unmap", &format!("/dev/rbd/{}/{image}", self.pool)],
+            ErrorKind::Internal,
+        )
+    }
+
+    fn ensure_image(&self, req: EnsureImageRequest) -> Result<EnsureImageResult, StorageError> {
+        ensure_image_cached(&self.image_cache_dir, req)
+    }
+    fn upload_image(&self, req: UploadImageRequest) -> Result<UploadImageResult, StorageError> {
+        upload_image_to_cache(&self.image_cache_dir, req)
+    }
+    fn upload_image_from_path(
+        &self,
+        req: UploadImageFromPathRequest,
+    ) -> Result<UploadImageResult, StorageError> {
+        upload_image_file_to_cache(&self.image_cache_dir, req)
+    }
+}
+
 fn run_cmd(program: &str, args: &[&str], err_kind: ErrorKind) -> Result<(), StorageError> {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| StorageError::new(err_kind, format!("running {program}: {e}")))?;
+    let out = Command::new(program).args(args).output().map_err(|e| {
+        StorageError::new(
+            err_kind,
+            format!("running {program}: {e}; ensure the required storage tools are installed"),
+        )
+    })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(StorageError::new(

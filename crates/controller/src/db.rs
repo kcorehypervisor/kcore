@@ -149,6 +149,35 @@ pub struct DiskLayoutStatusRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct CephClusterRow {
+    pub name: String,
+    pub generation: i64,
+    pub spec_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CephClusterStatusRow {
+    pub name: String,
+    pub observed_generation: i64,
+    pub phase: String,
+    pub health_message: String,
+    pub ceph_status_json: String,
+    pub last_transition_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct VolumeRow {
+    pub id: String,
+    pub vm_id: String,
+    pub pool: String,
+    pub image: String,
+    pub size_bytes: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ClusterUpdateRow {
     pub name: String,
     pub generation: i64,
@@ -919,7 +948,36 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 30;
+        if version < 31 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ceph_clusters (
+                    name TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    spec_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS ceph_cluster_status (
+                    name TEXT PRIMARY KEY REFERENCES ceph_clusters(name) ON DELETE CASCADE,
+                    observed_generation INTEGER NOT NULL DEFAULT 0,
+                    phase TEXT NOT NULL DEFAULT 'pending',
+                    health_message TEXT NOT NULL DEFAULT '',
+                    ceph_status_json TEXT NOT NULL DEFAULT '',
+                    last_transition_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS volumes (
+                    id TEXT PRIMARY KEY,
+                    vm_id TEXT NOT NULL UNIQUE,
+                    pool TEXT NOT NULL,
+                    image TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_volumes_vm ON volumes(vm_id);",
+            )?;
+        }
+
+        const CURRENT_VERSION: i32 = 31;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -2418,6 +2476,179 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    pub fn upsert_ceph_cluster(&self, row: &CephClusterRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ceph_clusters (name, generation, spec_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, COALESCE(NULLIF(?4, ''), datetime('now')), datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,
+               spec_json=excluded.spec_json, updated_at=datetime('now')",
+            params![row.name, row.generation, row.spec_json, row.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_ceph_cluster(&self, name: &str) -> Result<Option<CephClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, spec_json, created_at, updated_at
+             FROM ceph_clusters WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(CephClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_ceph_clusters(&self) -> Result<Vec<CephClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, spec_json, created_at, updated_at
+             FROM ceph_clusters ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CephClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_ceph_cluster(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM ceph_clusters WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn upsert_ceph_cluster_status(
+        &self,
+        row: &CephClusterStatusRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ceph_cluster_status
+             (name, observed_generation, phase, health_message, ceph_status_json, last_transition_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET observed_generation=excluded.observed_generation,
+               phase=excluded.phase, health_message=excluded.health_message,
+               ceph_status_json=excluded.ceph_status_json, last_transition_at=datetime('now')",
+            params![row.name, row.observed_generation, row.phase, row.health_message, row.ceph_status_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_ceph_cluster_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<CephClusterStatusRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, observed_generation, phase, health_message, ceph_status_json,
+                    last_transition_at FROM ceph_cluster_status WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(CephClusterStatusRow {
+                name: r.get(0)?,
+                observed_generation: r.get(1)?,
+                phase: r.get(2)?,
+                health_message: r.get(3)?,
+                ceph_status_json: r.get(4)?,
+                last_transition_at: r.get(5)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_ceph_clusters_needing_reconcile(
+        &self,
+    ) -> Result<Vec<CephClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT c.name, c.generation, c.spec_json, c.created_at, c.updated_at
+             FROM ceph_clusters c LEFT JOIN ceph_cluster_status s ON s.name=c.name
+             WHERE s.name IS NULL OR s.observed_generation < c.generation ORDER BY c.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CephClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn upsert_volume(&self, row: &VolumeRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO volumes (id, vm_id, pool, image, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(NULLIF(?6, ''), datetime('now')))
+             ON CONFLICT(vm_id) DO UPDATE SET pool=excluded.pool, image=excluded.image,
+               size_bytes=excluded.size_bytes",
+            params![
+                row.id,
+                row.vm_id,
+                row.pool,
+                row.image,
+                row.size_bytes,
+                row.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_volume_by_vm(&self, vm_id: &str) -> Result<Option<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, vm_id, pool, image, size_bytes, created_at FROM volumes WHERE vm_id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![vm_id], |r| {
+            Ok(VolumeRow {
+                id: r.get(0)?,
+                vm_id: r.get(1)?,
+                pool: r.get(2)?,
+                image: r.get(3)?,
+                size_bytes: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_volumes(&self) -> Result<Vec<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, vm_id, pool, image, size_bytes, created_at FROM volumes ORDER BY vm_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(VolumeRow {
+                id: r.get(0)?,
+                vm_id: r.get(1)?,
+                pool: r.get(2)?,
+                image: r.get(3)?,
+                size_bytes: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_volume_by_vm(&self, vm_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM volumes WHERE vm_id=?1", params![vm_id])? > 0)
     }
 
     pub fn upsert_cluster_update(&self, row: &ClusterUpdateRow) -> Result<(), rusqlite::Error> {

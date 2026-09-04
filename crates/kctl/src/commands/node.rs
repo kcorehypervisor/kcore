@@ -657,6 +657,7 @@ fn storage_backend_to_proto(value: &str) -> i32 {
         "filesystem" => node_proto::StorageBackendType::Filesystem as i32,
         "lvm" => node_proto::StorageBackendType::Lvm as i32,
         "zfs" => node_proto::StorageBackendType::Zfs as i32,
+        "ceph" => node_proto::StorageBackendType::Ceph as i32,
         _ => node_proto::StorageBackendType::Unspecified as i32,
     }
 }

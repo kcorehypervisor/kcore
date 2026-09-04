@@ -220,6 +220,18 @@ pub fn generate_node_config_with_security_groups(
             "      storageSizeBytes = {};\n",
             vm.storage_size_bytes
         ));
+        if vm.storage_backend == "ceph" {
+            out.push_str(&format!(
+                "      rbdImage = \"kcore-{}\";\n",
+                nix_escape(&vm.id)
+            ));
+        }
+        if vm.storage_backend == "ceph" {
+            out.push_str(&format!(
+                "      rbdImage = \"kcore-{}\";\n",
+                nix_escape(&vm.id)
+            ));
+        }
         out.push_str(&format!("      imageSize = {};\n", vm.image_size));
         out.push_str(&format!("      cores = {};\n", vm.cpu));
         out.push_str(&format!(

@@ -63,6 +63,9 @@ pub async fn register_with_controller(cfg: &Config) {
         }
         crate::config::StorageBackendKind::Lvm => controller_proto::StorageBackendType::Lvm as i32,
         crate::config::StorageBackendKind::Zfs => controller_proto::StorageBackendType::Zfs as i32,
+        crate::config::StorageBackendKind::Ceph => {
+            controller_proto::StorageBackendType::Ceph as i32
+        }
     };
 
     let endpoints = controller_endpoints(cfg);

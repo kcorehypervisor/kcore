@@ -411,6 +411,9 @@ enum DeleteResource {
         /// DiskLayout name
         name: String,
     },
+    /// Delete a CephCluster resource (does not wipe OSDs)
+    #[command(name = "ceph-cluster", alias = "cephcluster")]
+    CephCluster { name: String },
 }
 
 #[derive(Subcommand)]
@@ -564,6 +567,9 @@ enum GetResource {
         #[arg(long = "target-node")]
         target_node: Option<String>,
     },
+    /// List CephCluster resources
+    #[command(name = "ceph-clusters", alias = "ceph-cluster", alias = "cephcluster")]
+    CephClusters,
 }
 
 #[derive(Subcommand)]
@@ -613,6 +619,9 @@ enum DescribeResource {
         /// DiskLayout name
         name: String,
     },
+    /// Describe a CephCluster
+    #[command(name = "ceph-cluster", alias = "cephcluster")]
+    CephCluster { name: String },
 }
 
 #[derive(Subcommand)]
@@ -963,6 +972,7 @@ enum StorageBackend {
     Filesystem,
     Lvm,
     Zfs,
+    Ceph,
 }
 
 fn resolve_controller(cli: &Cli) -> Result<config::ConnectionInfo, String> {
@@ -1057,6 +1067,7 @@ async fn main() {
                         StorageBackend::Filesystem => "filesystem".to_string(),
                         StorageBackend::Lvm => "lvm".to_string(),
                         StorageBackend::Zfs => "zfs".to_string(),
+                        StorageBackend::Ceph => "ceph".to_string(),
                     }),
                     storage_size_bytes: *storage_size_bytes,
                     target_dc: target_dc.clone(),
@@ -1165,6 +1176,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::disk_layout::delete(&info, name).await
+        }
+        Command::Delete {
+            resource: DeleteResource::CephCluster { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::delete(&info, name).await
         }
 
         Command::Start {
@@ -1334,6 +1351,12 @@ async fn main() {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::disk_layout::list(&info, target_node.as_deref()).await
         }
+        Command::Get {
+            resource: GetResource::CephClusters,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::list(&info).await
+        }
 
         Command::Describe {
             resource: DescribeResource::Vm { name, target_node },
@@ -1376,6 +1399,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::disk_layout::get(&info, name).await
+        }
+        Command::Describe {
+            resource: DescribeResource::CephCluster { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::get(&info, name).await
         }
 
         Command::Node {
@@ -1453,6 +1482,7 @@ async fn main() {
                     StorageBackend::Filesystem => "filesystem",
                     StorageBackend::Lvm => "lvm",
                     StorageBackend::Zfs => "zfs",
+                    StorageBackend::Ceph => "ceph",
                 }),
                 lvm_vg_name.as_deref(),
                 lvm_lv_prefix.as_deref(),
@@ -1759,6 +1789,9 @@ async fn main() {
                         }
                         StorageBackend::Zfs => {
                             client::controller_proto::StorageBackendType::Zfs as i32
+                        }
+                        StorageBackend::Ceph => {
+                            client::controller_proto::StorageBackendType::Ceph as i32
                         }
                     };
                     commands::workload::create(

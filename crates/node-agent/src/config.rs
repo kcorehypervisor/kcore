@@ -44,6 +44,8 @@ pub struct StorageConfig {
     pub lvm: Option<LvmConfig>,
     #[serde(default)]
     pub zfs: Option<ZfsConfig>,
+    #[serde(default)]
+    pub ceph: Option<CephConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -53,6 +55,7 @@ pub enum StorageBackendKind {
     Filesystem,
     Lvm,
     Zfs,
+    Ceph,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,6 +72,13 @@ pub struct ZfsConfig {
     pub pool_name: String,
     #[serde(default = "default_zfs_dataset_prefix")]
     pub dataset_prefix: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CephConfig {
+    #[serde(default = "default_ceph_pool")]
+    pub pool: String,
 }
 
 fn default_listen_addr() -> String {
@@ -103,6 +113,10 @@ fn default_zfs_dataset_prefix() -> String {
     "kcore-".to_string()
 }
 
+fn default_ceph_pool() -> String {
+    "kcore-vms".to_string()
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -111,6 +125,7 @@ impl Default for StorageConfig {
             filesystem_volume_dir: default_filesystem_volume_dir(),
             lvm: None,
             zfs: None,
+            ceph: None,
         }
     }
 }
@@ -157,6 +172,7 @@ impl Config {
                 }
             }
             StorageBackendKind::Filesystem => {}
+            StorageBackendKind::Ceph => {}
         }
         Ok(())
     }
