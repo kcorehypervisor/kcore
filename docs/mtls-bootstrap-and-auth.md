@@ -190,22 +190,251 @@ Controller uses the same configured CA + identity to open outbound connections t
 
 Controllers authenticate to each other using their host-specific controller certificates. The replication peer identity is derived from the connecting controller's CN (e.g., `kcore-controller-192.168.40.105`), which is used to track per-peer replication ack frontiers.
 
-## 4) Automatic certificate renewal
+## 4) Certificate lifecycle: inventory, rotation and revocation
 
-Node certificates are valid for 1 year. The node-agent includes an automatic renewal client:
+Node certificates are valid for 1 year by default (`certRotation.certValidityDays`). The controller owns the whole lifecycle: it records every certificate it issues, rotates them ahead of expiry, and publishes revocations as a signed CRL and over OCSP.
 
-1. At startup and once daily, the node-agent reads its certificate from disk and checks the expiry date.
-2. If the certificate expires in more than 30 days, no action is taken.
-3. If within 30 days of expiry, the node-agent calls `RenewNodeCert` on the controller over the existing mTLS connection.
-4. The controller verifies the node is approved, then signs a new certificate using its **sub-CA** (intermediate CA). It returns the new leaf cert + sub-CA chain PEM and a new private key.
-5. The node-agent writes the renewed cert and key to disk. The new certificate takes effect on the next service restart.
+### 4.1 Certificate inventory
 
-The trust chain works as follows:
+Every certificate the controller signs — node bootstrap certs, CSR-based rotations, operator certs — is recorded in the `issued_certificates` table (DB schema version 33):
+
+| Column | Meaning |
+|--------|---------|
+| `serial_hex` | uppercase hex of the DER serial integer, matching `openssl x509 -serial` |
+| `subject_cn`, `identity_kind` | subject CN and one of `node` / `operator` / `controller` / `sub-ca` |
+| `node_id` | node this identity belongs to, empty for operators |
+| `issuer_cn`, `fingerprint_sha256` | issuing CA CN, and lowercase hex SHA-256 of the DER certificate |
+| `not_before`, `not_after`, `issued_at` | RFC3339 UTC, second precision |
+| `status` | `active` / `rotated` / `revoked` |
+| `revocation_reason`, `revoked_at` | RFC 5280 reason code and time; `-1` / empty when not revoked |
+
+Issuing a new certificate for an identity demotes the previous `active` row to `rotated`. A `rotated` certificate is still cryptographically valid until its `not_after` — it is superseded, not revoked. Only `revoked` rows appear on the CRL.
+
+The inventory is the single source of truth for both the CRL and the OCSP responder, so there is no second store to keep in sync.
+
+```bash
+kctl get certificates
+kctl get certificates --node dell-1 --status active
+kctl get certificates --expiring-within-days 30
+```
+
+### 4.2 Automated rotation (CSR-based, keys stay on the node)
+
+The controller runs a **certificate rotation reconciler** (`crates/controller/src/cert_rotation_reconciler.rs`), in the same style as the Ceph and cluster-update reconcilers. On every tick (`certRotation.checkIntervalSecs`, default 1 h) it:
+
+1. refreshes the in-memory revoked-serial set used by the authorization path;
+2. regenerates and republishes the CRL if it is due;
+3. logs a warning for each active certificate inside `certRotation.warnBeforeDays`;
+4. calls `NodeAdmin.RotateNodeCert` on every node whose certificate is inside the renewal window.
+
+A certificate is **due for renewal** when *either* fewer than `certRotation.renewBeforeDays` remain *or* less than `certRotation.renewAtLifetimeFraction` of its total lifetime remains. The absolute floor is what operators think in; the fraction rule is what makes short-lived certificates rotate sanely. Both the controller and the node-agent evaluate the identical rule, so a controller-driven rotation and the node's own timer never disagree.
+
+Rotation itself is driven by the node, and the private key never leaves it:
+
+```mermaid
+sequenceDiagram
+    participant C as controller
+    participant N as node-agent
+    C->>N: NodeAdmin.RotateNodeCert (over existing mTLS)
+    N->>N: generate keypair in memory + PKCS#10 CSR<br/>for its current CN and SANs
+    N->>C: Controller.SignNodeCsr (old cert still valid)
+    C->>C: verify node is approved, author CN/SAN/EKU itself,<br/>sign with sub-CA, record in inventory
+    C-->>N: leaf + sub-CA chain PEM
+    N->>N: validate chain against the generated key,<br/>expected CN and the clock
+    N->>N: install key then cert (temp + fsync + rename)
+    N->>N: re-read and verify the installed pair
+    N->>N: request in-process TLS reload
+    N-->>C: success, new serial, days until expiry
+```
+
+The ordering is what makes this non-disruptive:
+
+- The CSR is submitted while the **old** certificate is still valid and trusted, so the call authenticates normally.
+- The signed chain is validated **before** anything is written: it must parse, carry the expected CN, not be expired, and its SubjectPublicKeyInfo must equal the key the node just generated. A controller that returns junk cannot break a working node.
+- Both files are written with write-temp-in-the-same-directory + `fsync` + `rename`, and the directory is fsynced afterwards. A reader never sees a partial file; a crash mid-install leaves either the old or the new bytes.
+- The key is written before the cert, so the only window where the two disagree is the one where the *old* certificate is still the one being served.
+- After installing, the node re-reads what it wrote and checks the serial and key match. If that fails it **rolls back** to the previous bytes and reports failure.
+- Only then is a TLS reload requested.
+
+Any failure at any step leaves the node serving on its existing certificate, and the reconciler retries on the next tick. A failed rotation is never worse than no rotation.
+
+The controller also authors the CN, SANs and extended key usages itself when signing a CSR. The CSR contributes **only** its public key (whose possession `rcgen` proves via the CSR self-signature). A CSR that requests a CN or SAN for a different host is rejected outright rather than silently rewritten.
+
+`RenewNodeCert` — the older RPC that generated the key on the controller and returned it over the wire — still exists for compatibility with pre-rotation node-agents, but the node-agent no longer calls it.
+
+**Operator-triggered rotation**
+
+```bash
+kctl rotate node-certs --node dell-1
+kctl rotate node-certs --all
+```
+
+Per-node results are printed with the new serial. Partial failure exits non-zero; the nodes that did not rotate keep working on their existing certificates.
+
+### 4.3 In-process TLS reload
+
+`tonic` 0.12 bakes the `rustls` `ServerConfig` into the `Server` when `tls_config` is called and offers no way to swap the certificate on a live server. Both the controller and the node-agent therefore reload by **rebuilding the listener inside the same process**: the serve loop runs `serve_with_shutdown` with a future that completes on a reload request, then loops round and re-reads the TLS material from disk.
+
+This is a process-preserving reload — no `exec`, no `systemctl restart`, no lost in-memory state (live-migration bookkeeping, VMM sockets, storage handles). It does close established gRPC connections, which all KCore clients already retry, and `serve_with_shutdown` drains in-flight requests before returning.
+
+The controller additionally reloads on `SIGHUP`. Neither component SIGTERMs itself after a rotation any more.
+
+### 4.4 Revocation
+
+```bash
+kctl revoke cert --serial 0A1B2C3D --reason key-compromise
+kctl revoke cert --node dell-1  --reason cessation-of-operation
+kctl revoke cert --subject kctl:alice --reason privilege-withdrawn
+```
+
+`--reason` takes the RFC 5280 §5.3.1 names (`unspecified`, `key-compromise`, `ca-compromise`, `affiliation-changed`, `superseded`, `cessation-of-operation`, `certificate-hold`, `remove-from-crl`, `privilege-withdrawn`, `aa-compromise`) or the bare numeric code. Code 7 is unused by the RFC and is rejected.
+
+Revoking marks the inventory row `revoked`, adds the serial to the controller's in-memory set immediately (so it takes effect on the very next RPC, not on the next refresh tick), and regenerates the CRL straight away.
+
+**Enforcement.** `tonic::transport::ServerTlsConfig` builds its rustls config internally and accepts no custom `ClientCertVerifier`, so rustls' own CRL support (`WebPkiClientVerifier::with_crls`) is unreachable. Enforcement happens one layer up instead: a `tonic` interceptor on every service checks the serial of the presented client certificate against the revocation set before any handler runs. One wiring point covers every RPC.
+
+- On the **controller**, the set comes straight from `issued_certificates`, so it is authoritative and always fresh.
+- On the **node-agent**, the set comes from a CRL fetched over the existing mTLS gRPC channel (`Controller.GetCrl`) every `revocation.fetchIntervalSecs`. The CRL signature is verified against the configured trust bundle (`ca.crt` plus the sub-CA shipped in the node's own chain) before it is trusted — an unverified CRL would let anyone who can answer `GetCrl` decide which certificates the node rejects. Nodes need no extra network path and no extra credential.
+
+A revoked serial is rejected with `PermissionDenied` regardless of how stale the data is: stale data can miss new revocations, it can never invent them.
+
+**Failure modes.** When revocation data cannot be refreshed within `revocation.maxStalenessSecs`:
+
+| Mode | Behaviour | When to use |
+|------|-----------|-------------|
+| `soft-fail` (**default**) | Keep accepting peers absent from the last known set, and log a warning per rejected-freshness check. | Everywhere by default. A controller outage or a transient fetch failure must not lock every node out of its own cluster. |
+| `hard-fail` | Reject every peer with `Unavailable` until fresh data arrives. | High-assurance environments where availability is subordinate to revocation certainty. Understand that a controller outage will stop the cluster. |
+
+Stale data under `hard-fail` returns `Unavailable`, not `PermissionDenied`: it is an availability problem, not an authorization decision, and callers should retry.
+
+### 4.5 CRL and OCSP endpoints
+
+The controller serves plain-HTTP PKI endpoints on `pki.httpListenAddr` (default `0.0.0.0:9092`):
+
+| Endpoint | Content type | Purpose |
+|----------|--------------|---------|
+| `GET /pki/crl.der` | `application/pkix-crl` | DER CRL, for `openssl crl -inform DER` and web servers |
+| `GET /pki/crl.pem` | `application/x-pem-file` | PEM CRL |
+| `POST /pki/ocsp` | `application/ocsp-response` | RFC 6960 OCSP request/response |
+| `GET /pki/ocsp/{base64}` | `application/ocsp-response` | RFC 6960 §A.1 GET form, both base64 alphabets accepted |
+| `GET /pki/healthz` | `text/plain` | liveness |
+
+These are **plain HTTP on purpose**: both a CRL and an OCSP response are signed objects, RFC 5280 §4.2.1.13 and RFC 6960 §5 do not require transport security for them, and requiring mTLS here would mean a node whose certificate has just expired could not fetch the data it needs to recover. Set `pki.httpEnabled: false` to disable the listener entirely; nodes then use `Controller.GetCrl` over gRPC, which they prefer anyway.
+
+The CRL is signed by the **sub-CA** (the certificate that issued the leaves) with correct `thisUpdate`/`nextUpdate` and a monotonically increasing `crlNumber`. It is regenerated when `nextUpdate` comes within `pki.crlRefreshBeforeHours`, when the revoked set changes, or when the sub-CA is rotated. The current CRL is persisted in `crl_state` so a controller restart serves the same list rather than a gap.
+
+The OCSP responder is **CA-signed** (RFC 6960 §4.2.2.2, first bullet): responses are signed directly with the sub-CA key, so there is no delegated responder certificate to distribute or rotate. It answers `good` only for serials in our inventory, `revoked` with reason and time for revoked serials, and `unknown` for anything else — including serials issued by a different CA, which is what RFC 6960 §2.2 requires. Requests it cannot parse get a `malformedRequest` shell; requests that arrive before a sub-CA is configured get `tryLater`.
+
+```bash
+kctl get crl                       # print PEM plus the update window
+kctl get crl -o /tmp/kcore.crl.der # DER when the filename ends in .der, PEM otherwise
+openssl crl -inform DER -in /tmp/kcore.crl.der -noout -text
+```
+
+### 4.6 What is not supported: OCSP stapling
+
+**OCSP stapling is not implemented, and cannot be with the current TLS stack.** `tonic` 0.12 constructs its rustls configuration from `ServerTlsConfig` / `ClientTlsConfig`, and neither type exposes:
+
+- a `rustls::sign::CertifiedKey`, which is where a server would attach the stapled `ocsp` bytes to its handshake; or
+- a `rustls::client::danger::ServerCertVerifier`, which is where a client would consume and validate a stapled response.
+
+So no stapled response is produced or consumed during a KCore handshake. Instead:
+
+- the controller runs a full OCSP **responder**, so any external tool (`openssl ocsp`, a monitoring probe, a reverse proxy in front of the controller) can query certificate status;
+- the node-agent implements a **direct OCSP client** (`crates/node-agent/src/pki/ocsp_client.rs`) that builds an RFC 6960 request, POSTs it to `revocation.ocspUrl`, verifies the response signature against the issuing CA with aws-lc-rs, and reads the status. It is used as an escape hatch when the CRL has gone stale: a live answer about the one serial in front of us beats failing the whole connection closed;
+- bulk enforcement uses the CRL, which is the right shape for it — one signed fetch covers every serial.
+
+Lifting this would require either upstream `tonic` support for supplying a rustls `ServerConfig` / `ClientConfig` directly, or dropping to `hyper` + `tokio-rustls` for the gRPC transport. Neither is in scope here.
+
+### 4.7 Observability
+
+```bash
+kctl get pki-status
+```
+
+reports inventory counts by status, how many active certificates are inside the warning window, the rotation thresholds in force, sub-CA availability, the CRL number and update window, the revocation fail mode, the CRL/OCSP URLs, and the twenty soonest-expiring active certificates. It prints an explicit `WARNING` line when anything is inside the warning window.
+
+`kctl get nodes` continues to show the `CERT EXPIRY` column with a `⚠` inside 30 days. The rotation reconciler logs a warning per certificate inside `certRotation.warnBeforeDays`, and logs every rotation with the old and new serials.
+
+### 4.8 Trust chain
+
 - `ca.crt` on each node contains only the root CA (trust anchor)
-- After renewal, `node.crt` contains the leaf cert + sub-CA cert (concatenated PEM). rustls resolves the chain automatically.
-- Existing root-CA-signed certs continue working. Renewals transition to sub-CA-signed certs.
+- After rotation, `node.crt` contains the leaf cert + sub-CA cert (concatenated PEM). rustls resolves the chain automatically.
+- Existing root-CA-signed certs continue working. Rotations transition to sub-CA-signed certs.
 
-### Sub-CA rotation
+### 4.9 Configuration
+
+Controller (`controller.yaml`), all sections optional with the defaults shown:
+
+```yaml
+certRotation:
+  enabled: true                  # run the rotation reconciler
+  checkIntervalSecs: 3600        # reconcile tick
+  renewBeforeDays: 30            # absolute renewal floor
+  renewAtLifetimeFraction: 0.25  # renew once less than 25% of the lifetime remains
+  warnBeforeDays: 45             # expiry warning window
+  certValidityDays: 365          # lifetime of certificates the controller signs
+
+revocation:
+  enabled: true                  # enforce revocation on inbound peers
+  failMode: soft-fail            # soft-fail | hard-fail
+  maxStalenessSecs: 3600         # how old revocation data may get
+  refreshIntervalSecs: 60        # in-memory revoked-set refresh
+
+pki:
+  httpEnabled: true              # serve /pki/crl.* and /pki/ocsp
+  httpListenAddr: 0.0.0.0:9092
+  publicBaseUrl: ""              # advertised base URL; required when bound to a wildcard
+  crlValidityHours: 24           # nextUpdate - thisUpdate
+  crlRefreshBeforeHours: 6       # regenerate once nextUpdate is this close
+  ocspValidityHours: 1           # OCSP response nextUpdate window
+```
+
+Node-agent (`node-agent.yaml`):
+
+```yaml
+certRotation:
+  enabled: true                  # the node's own rotation safety net
+  checkIntervalSecs: 3600
+  renewBeforeDays: 30
+  renewAtLifetimeFraction: 0.25
+
+revocation:
+  enabled: true                  # enforce revocation on inbound peers
+  fetchIntervalSecs: 900         # CRL fetch via Controller.GetCrl
+  maxStalenessSecs: 21600        # 6h; must be >= fetchIntervalSecs
+  failMode: soft-fail            # soft-fail | hard-fail
+  ocspEnabled: true              # allow live OCSP point queries
+  ocspUrl: ""                    # e.g. http://192.168.40.105:9092
+```
+
+Validation rejects an unrecognised `failMode`, a `renewAtLifetimeFraction` outside `0.0..=1.0`, a `maxStalenessSecs` shorter than the fetch interval (the CRL would be stale the moment it arrived), and an `ocspUrl` without an `http://` or `https://` scheme.
+
+### 4.10 Runbook
+
+**A certificate is about to expire and rotation is not happening.**
+`kctl get pki-status` — check `Rotation: Enabled` and `Sub-CA: available`. Rotation and revocation both need `subCaCertFile` / `subCaKeyFile` on the controller. Then `kctl rotate node-certs --node <id>` and read the per-node message: it is the node's own error string.
+
+**A node's rotation keeps failing.**
+The node is still serving on its old certificate, so this is not an outage. Node-agent logs the reason at `WARN` with `rotation rolled back` if it got as far as writing files. Common causes: the node is not `approved`; the controller cannot derive a host from the node's registered address; the sub-CA is missing.
+
+**Compromised node or operator key.**
+`kctl revoke cert --node <id> --reason key-compromise` (or `--subject kctl:<name>`). The controller enforces it on the next RPC. Nodes pick it up within `revocation.fetchIntervalSecs` (15 min default). To force propagation faster, restart the node-agents or lower the interval. Then re-issue: `kctl rotate node-certs --node <id>` for a node, `kctl operator issue-cert <name>` for an operator.
+
+**Controller was down and nodes are logging stale revocation data.**
+Expected under `soft-fail`: nodes keep serving and warn. Once the controller is back, the next fetch clears it. Under `hard-fail` the nodes will have been rejecting peers with `Unavailable` — bring the controller back, or flip `revocation.failMode` to `soft-fail` and restart the node-agents.
+
+**Verify what a peer would see.**
+
+```bash
+kctl get crl -o /tmp/kcore.crl.der
+openssl crl -inform DER -in /tmp/kcore.crl.der -noout -text | head -40
+openssl ocsp -issuer /etc/kcore/certs/sub-ca.crt \
+             -cert /etc/kcore/certs/node.crt \
+             -url http://<controller>:9092/pki/ocsp -noverify
+```
+
+### 4.11 Sub-CA rotation
 
 The operator can rotate the sub-CA at any time:
 
@@ -215,7 +444,7 @@ kctl rotate sub-ca
 
 This generates a new sub-CA from the root CA, writes it locally, and pushes it to the controller via the `RotateSubCa` RPC. The controller hot-reloads the new sub-CA without restart. Future renewals use the new sub-CA while existing certs remain valid.
 
-### Controller certificate rotation
+### 4.12 Controller certificate rotation
 
 ```bash
 kctl rotate certs --controller <new-host:port>
@@ -231,7 +460,9 @@ Additional security measures:
 
 - **Node approval queue**: new nodes register as `pending` and must be approved before participating in the cluster.
 - **Sub-CA auto-rotation**: node certs are renewed automatically; the sub-CA is revocable by the operator without affecting the root CA.
-- **Certificate expiry visibility**: each node reports its certificate expiry at registration. `kctl get nodes` shows a `CERT EXPIRY` column with days remaining and a `⚠` warning when within 30 days of expiry.
+- **Certificate expiry visibility**: each node reports its certificate expiry at registration. `kctl get nodes` shows a `CERT EXPIRY` column with days remaining and a `⚠` warning when within 30 days of expiry; `kctl get certificates` and `kctl get pki-status` show the full inventory.
+- **Automated CSR-based rotation**: certificates are rotated ahead of expiry without private keys ever leaving the node, and without restarting either process (§4.2, §4.3).
+- **CRL and OCSP revocation**: revoked serials are enforced on every inbound RPC on both the controller and the node-agent, published as a signed CRL and answered over OCSP (§4.4, §4.5).
 - **Pre-flight TLS validation**: `kctl` detects CA mismatches, expired certs, and chain problems before the handshake, with actionable error messages.
 - **CA replacement guard**: `kctl create cluster` refuses to silently overwrite existing PKI credentials without `--force`.
 
@@ -246,7 +477,8 @@ Certificate generation (`rcgen`) also uses aws-lc-rs instead of ring for those b
 
 Remaining gaps to track:
 
-- no CRL/OCSP revocation checks (sub-CA rotation provides a partial mitigation)
+- **no OCSP stapling** — `tonic` 0.12 exposes neither a rustls `CertifiedKey` nor a `ServerCertVerifier`, so a stapled response can be neither produced nor consumed during a handshake. The controller runs a full OCSP responder and the node-agent queries it directly instead; see §4.6.
+- revocation is enforced at the application layer (a `tonic` interceptor), not inside the TLS handshake, for the same reason: `ServerTlsConfig` takes no custom `ClientCertVerifier`. A revoked peer completes the handshake and is then rejected before any handler runs.
 - RBAC is intentionally flat (no per-network / namespace scopes yet)
 
 ## 6) Verification checklist
@@ -261,6 +493,10 @@ Remaining gaps to track:
 - Ensure `controller.yaml` and `node-agent.yaml` include `tls` block
 - Ensure `controller.yaml` includes `subCaCertFile` and `subCaKeyFile`
 - Confirm secure traffic uses HTTPS and rejects untrusted client certificates
-- Confirm node-agent logs `certificate valid, no renewal needed` at startup
+- Confirm `kctl get pki-status` reports `Sub-CA: available` and a CRL number
+- Confirm `kctl get certificates` lists one `active` row per node and operator
+- Test node rotation: `kctl rotate node-certs --node <id>` and verify the node-agent logs `rotated node certificate; private key never left the node` followed by `reloading TLS material and restarting listener`
+- Test revocation: `kctl revoke cert --node <id> --reason superseded`, then confirm that node's RPCs are refused with `has been revoked` and that the serial appears in `kctl get crl`
+- Test the CRL endpoint: `curl -s http://<controller>:9092/pki/crl.der | openssl crl -inform DER -noout -text`
 - Test rotation: `kctl rotate sub-ca` and verify controller logs `sub-CA rotated via kctl`
 - Verify pre-flight catches deliberate mismatch (point at wrong CA): `kctl` fails with `"signed by a different CA"` before any network call
