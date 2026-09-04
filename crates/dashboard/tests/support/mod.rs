@@ -302,6 +302,13 @@ impl Controller for MockController {
         Err(unimp("drain_node"))
     }
 
+    async fn migrate_vm(
+        &self,
+        _: Request<MigrateVmRequest>,
+    ) -> Result<Response<MigrateVmResponse>, Status> {
+        Err(unimp("migrate_vm"))
+    }
+
     async fn approve_node(
         &self,
         _: Request<ApproveNodeRequest>,

@@ -9,19 +9,22 @@ use serde_json::Value as JsonValue;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::{self, CN_CONTROLLER_PREFIX, CN_KCTL};
 use crate::discovery;
 use crate::disk::classifier::{self, Verdict};
 use crate::disk::lsblk;
+use crate::live_migrate::{self, LiveMigrateState, ReceiveSession};
 use crate::proto;
 use crate::storage::{self, StorageAdapter};
+use crate::vmm;
 pub struct AdminService {
     nix_config_path: PathBuf,
     vm_socket_dir: PathBuf,
     storage: Arc<dyn StorageAdapter>,
     apply_lock: Arc<AsyncMutex<()>>,
+    live_migrate: LiveMigrateState,
 }
 
 const BOOTSTRAP_CERT_DIR: &str = "/etc/kcore/certs";
@@ -87,6 +90,7 @@ impl AdminService {
             nix_config_path,
             "/run/kcore".to_string(),
             storage::default_adapter(),
+            LiveMigrateState::new(),
         )
     }
 
@@ -94,12 +98,14 @@ impl AdminService {
         nix_config_path: String,
         vm_socket_dir: String,
         storage: Arc<dyn StorageAdapter>,
+        live_migrate: LiveMigrateState,
     ) -> Self {
         Self {
             nix_config_path: PathBuf::from(nix_config_path),
             vm_socket_dir: PathBuf::from(vm_socket_dir),
             storage,
             apply_lock: Arc::new(AsyncMutex::new(())),
+            live_migrate,
         }
     }
 }
@@ -135,6 +141,15 @@ fn validate_bootstrap_osd_device(osd_device: &str) -> Result<(), Status> {
         return Err(Status::invalid_argument("osd_device must be absolute"));
     }
     Ok(())
+}
+
+fn nix_kill(pid: u32) -> Result<(), String> {
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
 }
 
 fn normalize_disk_management_mode(raw: &str) -> &'static str {
@@ -1465,6 +1480,227 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             } else {
                 format!("pool {pool} already present")
             },
+        }))
+    }
+
+    async fn prepare_live_migrate_receive(
+        &self,
+        request: Request<proto::PrepareLiveMigrateReceiveRequest>,
+    ) -> Result<Response<proto::PrepareLiveMigrateReceiveResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        let pool = req.rbd_pool.trim();
+        let image = req.rbd_image.trim();
+        if vm_name.is_empty() || pool.is_empty() || image.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_name, rbd_pool, and rbd_image are required",
+            ));
+        }
+        if self.live_migrate.get_port(vm_name).await.is_some() {
+            return Err(Status::already_exists(format!(
+                "live migrate receive already prepared for {vm_name}"
+            )));
+        }
+
+        let port = if req.listen_port > 0 {
+            req.listen_port as u16
+        } else {
+            live_migrate::pick_free_tcp_port().map_err(|e| Status::internal(e))?
+        };
+
+        live_migrate::ensure_rbd_mapped(pool, image)
+            .map_err(|e| Status::internal(format!("map RBD for receive: {e}")))?;
+
+        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        let ch_bin = live_migrate::resolve_ch_bin();
+        let ch_pid = live_migrate::spawn_receive_vmm(&client, vm_name, &ch_bin)
+            .await
+            .map_err(|e| Status::internal(e))?;
+        let receive_task =
+            live_migrate::start_receive_task(client, vm_name.to_string(), port).await;
+        self.live_migrate
+            .insert(
+                vm_name,
+                ReceiveSession {
+                    port,
+                    ch_pid,
+                    receive_task,
+                },
+            )
+            .await;
+
+        Ok(Response::new(proto::PrepareLiveMigrateReceiveResponse {
+            success: true,
+            message: format!("listening for migration on tcp:0.0.0.0:{port}"),
+            listen_port: port as i32,
+            listen_addr: "0.0.0.0".into(),
+        }))
+    }
+
+    async fn wait_live_migrate_receive(
+        &self,
+        request: Request<proto::WaitLiveMigrateReceiveRequest>,
+    ) -> Result<Response<proto::WaitLiveMigrateReceiveResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let timeout = if req.timeout_seconds > 0 {
+            std::time::Duration::from_secs(req.timeout_seconds as u64)
+        } else {
+            std::time::Duration::from_secs(600)
+        };
+        let Some(session) = self.live_migrate.take(vm_name).await else {
+            // Receive may have already completed and been consumed; treat marker as success.
+            let marker = live_migrate::handoff_marker_path(&self.vm_socket_dir, vm_name);
+            if marker.exists() {
+                return Ok(Response::new(proto::WaitLiveMigrateReceiveResponse {
+                    success: true,
+                    message: "receive already completed".into(),
+                }));
+            }
+            return Err(Status::not_found(format!(
+                "no live migrate receive session for {vm_name}"
+            )));
+        };
+        let join = tokio::time::timeout(timeout, session.receive_task)
+            .await
+            .map_err(|_| Status::deadline_exceeded("timed out waiting for live migrate receive"))?
+            .map_err(|e| Status::internal(format!("receive task join: {e}")))?
+            .map_err(|e| Status::internal(e))?;
+        let _ = join;
+        Ok(Response::new(proto::WaitLiveMigrateReceiveResponse {
+            success: true,
+            message: "live migration receive completed".into(),
+        }))
+    }
+
+    async fn abort_live_migrate_receive(
+        &self,
+        request: Request<proto::AbortLiveMigrateReceiveRequest>,
+    ) -> Result<Response<proto::AbortLiveMigrateReceiveResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        if let Some(session) = self.live_migrate.take(vm_name).await {
+            session.receive_task.abort();
+            let _ = nix_kill(session.ch_pid);
+        }
+        let marker = live_migrate::handoff_marker_path(&self.vm_socket_dir, vm_name);
+        let pid_path = live_migrate::migrate_pid_path(&self.vm_socket_dir, vm_name);
+        let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_file(pid_path);
+        let socket = self.vm_socket_dir.join(format!("{vm_name}.sock"));
+        let _ = std::fs::remove_file(socket);
+        if !req.rbd_pool.trim().is_empty() && !req.rbd_image.trim().is_empty() {
+            if let Err(e) =
+                live_migrate::ensure_rbd_unmapped(req.rbd_pool.trim(), req.rbd_image.trim())
+            {
+                warn!(error = %e, "abort unmap RBD failed");
+            }
+        }
+        Ok(Response::new(proto::AbortLiveMigrateReceiveResponse {
+            success: true,
+            message: "aborted live migrate receive".into(),
+        }))
+    }
+
+    async fn send_live_migrate(
+        &self,
+        request: Request<proto::SendLiveMigrateRequest>,
+    ) -> Result<Response<proto::SendLiveMigrateResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        let dest = req.destination_url.trim();
+        if vm_name.is_empty() || dest.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_name and destination_url are required",
+            ));
+        }
+        if !dest.starts_with("tcp:") {
+            return Err(Status::invalid_argument(
+                "destination_url must start with tcp:",
+            ));
+        }
+        let unit = live_migrate::vm_unit_name(vm_name);
+        live_migrate::disable_unit_restart(&unit)
+            .await
+            .map_err(|e| Status::internal(e))?;
+        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        let timeout = if req.timeout_seconds > 0 {
+            std::time::Duration::from_secs(req.timeout_seconds as u64)
+        } else {
+            std::time::Duration::from_secs(600)
+        };
+        let send_fut = client.send_migration(vm_name, dest);
+        tokio::time::timeout(timeout, send_fut)
+            .await
+            .map_err(|_| Status::deadline_exceeded("timed out sending live migration"))?
+            .map_err(|e| Status::internal(e))?;
+        Ok(Response::new(proto::SendLiveMigrateResponse {
+            success: true,
+            message: format!("sent migration for {vm_name} to {dest}"),
+        }))
+    }
+
+    async fn finalize_live_migrate_source(
+        &self,
+        request: Request<proto::FinalizeLiveMigrateSourceRequest>,
+    ) -> Result<Response<proto::FinalizeLiveMigrateSourceResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let unit = live_migrate::vm_unit_name(vm_name);
+        let _ = live_migrate::disable_unit_restart(&unit).await;
+        if let Err(e) = live_migrate::stop_unit(&unit).await {
+            // Unit may already be inactive after CH exited on send.
+            warn!(error = %e, unit = %unit, "finalize source stop");
+        }
+        if !req.rbd_pool.trim().is_empty() && !req.rbd_image.trim().is_empty() {
+            live_migrate::ensure_rbd_unmapped(req.rbd_pool.trim(), req.rbd_image.trim())
+                .map_err(|e| Status::internal(format!("unmap RBD on source: {e}")))?;
+        }
+        Ok(Response::new(proto::FinalizeLiveMigrateSourceResponse {
+            success: true,
+            message: format!("finalized source after migrate of {vm_name}"),
+        }))
+    }
+
+    async fn finalize_live_migrate_dest(
+        &self,
+        request: Request<proto::FinalizeLiveMigrateDestRequest>,
+    ) -> Result<Response<proto::FinalizeLiveMigrateDestResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let unit = live_migrate::vm_unit_name(vm_name);
+        let out = Command::new("systemctl")
+            .args(["start", &unit])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("systemctl start: {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "systemctl start {unit} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(Response::new(proto::FinalizeLiveMigrateDestResponse {
+            success: true,
+            message: format!("adopted migrated VM via {unit}"),
         }))
     }
 

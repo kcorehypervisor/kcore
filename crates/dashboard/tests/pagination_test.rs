@@ -303,6 +303,12 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<DrainNodeResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn migrate_vm(
+        &self,
+        _: TRequest<MigrateVmRequest>,
+    ) -> Result<Response<MigrateVmResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
     async fn approve_node(
         &self,
         _: TRequest<ApproveNodeRequest>,

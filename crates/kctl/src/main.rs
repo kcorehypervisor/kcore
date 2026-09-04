@@ -149,6 +149,11 @@ enum Command {
         #[command(subcommand)]
         resource: DrainResource,
     },
+    /// Live-migrate a Ceph-backed VM to another CephCluster member
+    Migrate {
+        #[command(subcommand)]
+        resource: MigrateResource,
+    },
     /// Rotate certificates
     Rotate {
         #[command(subcommand)]
@@ -819,6 +824,21 @@ enum DrainResource {
         /// Target node to move VMs to (optional; auto-schedules if empty)
         #[arg(long = "target-node")]
         target_node: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigrateResource {
+    /// Live-migrate a VM (shared RBD / Ceph)
+    Vm {
+        /// VM id or name
+        vm_id: String,
+        /// Destination node id (or address)
+        #[arg(long = "target-node")]
+        target_node: String,
+        /// Fall back to cold reassignment if live migrate fails
+        #[arg(long = "allow-cold-fallback")]
+        allow_cold_fallback: bool,
     },
 }
 
@@ -1643,6 +1663,39 @@ async fn main() {
                     }
                 }
                 Err(e) => Err(anyhow::anyhow!("drain failed: {e}")),
+            }
+        }
+
+        Command::Migrate {
+            resource:
+                MigrateResource::Vm {
+                    vm_id,
+                    target_node,
+                    allow_cold_fallback,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            let mut client = client::controller_client(&info)
+                .await
+                .unwrap_or_else(|e| fatal(&format!("{e}")));
+            let resp = client
+                .migrate_vm(client::controller_proto::MigrateVmRequest {
+                    vm_id: vm_id.to_string(),
+                    target_node: target_node.to_string(),
+                    allow_cold_fallback: *allow_cold_fallback,
+                })
+                .await;
+            match resp {
+                Ok(r) => {
+                    let r = r.into_inner();
+                    println!("{} (mode={})", r.message, r.mode);
+                    if r.success {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("migrate had errors"))
+                    }
+                }
+                Err(e) => Err(anyhow::anyhow!("migrate failed: {e}")),
             }
         }
 

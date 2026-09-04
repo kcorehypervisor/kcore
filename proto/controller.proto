@@ -51,6 +51,8 @@ service Controller {
 
   // Node lifecycle
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
+  // Live-migrate a Ceph-backed VM to another CephCluster member (shared RBD).
+  rpc MigrateVm(MigrateVmRequest) returns (MigrateVmResponse);
   rpc ApproveNode(ApproveNodeRequest) returns (ApproveNodeResponse);
   rpc RejectNode(RejectNodeRequest) returns (RejectNodeResponse);
 
@@ -797,6 +799,24 @@ message DrainNodeResponse {
   bool success = 1;
   int32 vms_migrated = 2;
   string message = 3;
+}
+
+// Live migration (shared RBD / Ceph only)
+
+message MigrateVmRequest {
+  string vm_id = 1;
+  string target_node = 2;
+  // When true, fall back to cold reassignment (drain-style) if live migrate fails.
+  bool allow_cold_fallback = 3;
+}
+
+message MigrateVmResponse {
+  bool success = 1;
+  string message = 2;
+  // "live" or "cold"
+  string mode = 3;
+  string source_node = 4;
+  string target_node = 5;
 }
 
 // Node Approval

@@ -107,6 +107,19 @@ service NodeAdmin {
   rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
   rpc GetCephHealth(GetCephHealthRequest) returns (GetCephHealthResponse);
   rpc EnsureCephPool(EnsureCephPoolRequest) returns (EnsureCephPoolResponse);
+
+  // Live migration peer steps (controller orchestrates source + destination).
+  rpc PrepareLiveMigrateReceive(PrepareLiveMigrateReceiveRequest)
+      returns (PrepareLiveMigrateReceiveResponse);
+  rpc WaitLiveMigrateReceive(WaitLiveMigrateReceiveRequest)
+      returns (WaitLiveMigrateReceiveResponse);
+  rpc AbortLiveMigrateReceive(AbortLiveMigrateReceiveRequest)
+      returns (AbortLiveMigrateReceiveResponse);
+  rpc SendLiveMigrate(SendLiveMigrateRequest) returns (SendLiveMigrateResponse);
+  rpc FinalizeLiveMigrateSource(FinalizeLiveMigrateSourceRequest)
+      returns (FinalizeLiveMigrateSourceResponse);
+  rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
+      returns (FinalizeLiveMigrateDestResponse);
 }
 
 // VM specification
@@ -808,5 +821,73 @@ message EnsureCephPoolResponse {
   bool success = 1;
   bool created = 2;
   string message = 3;
+}
+
+message PrepareLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+  // Preferred listen port; 0 = pick an ephemeral free port.
+  int32 listen_port = 4;
+}
+
+message PrepareLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+  int32 listen_port = 3;
+  string listen_addr = 4;
+}
+
+message WaitLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  int32 timeout_seconds = 2;
+}
+
+message WaitLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message AbortLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+}
+
+message AbortLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SendLiveMigrateRequest {
+  string vm_name = 1;
+  // tcp:<dest-ip>:<port>
+  string destination_url = 2;
+  int32 timeout_seconds = 3;
+}
+
+message SendLiveMigrateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message FinalizeLiveMigrateSourceRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+}
+
+message FinalizeLiveMigrateSourceResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message FinalizeLiveMigrateDestRequest {
+  string vm_name = 1;
+}
+
+message FinalizeLiveMigrateDestResponse {
+  bool success = 1;
+  string message = 2;
 }
 

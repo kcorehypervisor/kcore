@@ -12,6 +12,7 @@ mod discovery;
 mod disk;
 mod grpc;
 mod issue_screen;
+mod live_migrate;
 mod path_safety;
 mod registration;
 mod runtime;
@@ -140,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.nix_config_path.clone(),
             cfg.vm_socket_dir.clone(),
             storage.clone(),
+            live_migrate::LiveMigrateState::new(),
         ))
         .max_decoding_message_size(1024 * 1024 * 1024)
         .max_encoding_message_size(64 * 1024 * 1024);
