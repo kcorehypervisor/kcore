@@ -126,7 +126,12 @@ Orchestrator: controller `MigrateVm` → node `NodeAdmin` peer RPCs.
 ### Failure and fallback
 
 - If live fails **before** a successful send, destination receive is aborted; with `--allow-cold-fallback` the controller cold-reassigns and pushes Nix.
-- After a **successful send**, the source VMM is gone — do not abort the destination process; recover by finalizing / fixing handoff on the dest.
+- After a **successful send**, cold fallback is **disabled** (would start a second VMM on the same RBD). Recover by finalizing / fixing handoff on the dest.
+- After a **successful send**, the source VMM is gone — do not abort the destination process.
+
+### Seeding (cold drain safety)
+
+First boot seeds the RBD with `qemu-img convert` and sets Ceph image-meta `kcore.seeded=1` (plus a local marker). Cold drain/migrate to another node must **not** re-seed; the shared meta flag prevents wiping guest data.
 
 ### Networking
 
