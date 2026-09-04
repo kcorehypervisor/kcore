@@ -125,6 +125,8 @@ See:
 - [mTLS bootstrap and authentication](docs/mtls-bootstrap-and-auth.md)
 - [Nix VM config generation](docs/nix-vm-config-generation.md)
 - [File structure](docs/file-structure.md)
+- [kcore SAN (Ceph)](docs/ceph.md)
+- [VM migration (cold / live)](docs/vm-migration.md)
 
 ## Developer Workflow
 

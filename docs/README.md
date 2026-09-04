@@ -28,6 +28,7 @@
 | k8s vs kcore security | [security-k8s-vs-kcore.md](./security-k8s-vs-kcore.md) |
 | Storage | [storage.md](./storage.md) |
 | kcore SAN (Ceph) | [ceph.md](./ceph.md) |
+| VM migration (cold / live) | [vm-migration.md](./vm-migration.md) |
 | Containerd support | [support-for-containerd.md](./support-for-containerd.md) |
 | Zero-external resolution | [zero-external-resolution-algorithm.md](./zero-external-resolution-algorithm.md) |
 

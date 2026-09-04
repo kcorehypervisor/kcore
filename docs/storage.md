@@ -14,7 +14,13 @@ For a deep operational runbook focused specifically on day-2 filesystem changes,
 
 For **kcore SAN** (shared Ceph / RBD), see:
 
-- `docs/ceph.md`
+- `docs/ceph.md` — fabric + RBD integration
+- `docs/vm-migration.md` — cold drain and Cloud Hypervisor live migration
+
+Operator guides on the product site:
+
+- [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html)
+- [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.html)
 
 ## Storage Model
 
