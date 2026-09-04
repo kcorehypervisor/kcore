@@ -1506,7 +1506,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let port = if req.listen_port > 0 {
             req.listen_port as u16
         } else {
-            live_migrate::pick_free_tcp_port().map_err(|e| Status::internal(e))?
+            live_migrate::pick_free_tcp_port().map_err(Status::internal)?
         };
 
         live_migrate::ensure_rbd_mapped(pool, image)
@@ -1516,7 +1516,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let ch_bin = live_migrate::resolve_ch_bin();
         let ch_pid = live_migrate::spawn_receive_vmm(&client, vm_name, &ch_bin)
             .await
-            .map_err(|e| Status::internal(e))?;
+            .map_err(Status::internal)?;
         let receive_task =
             live_migrate::start_receive_task(client, vm_name.to_string(), port).await;
         self.live_migrate
@@ -1570,7 +1570,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             .await
             .map_err(|_| Status::deadline_exceeded("timed out waiting for live migrate receive"))?
             .map_err(|e| Status::internal(format!("receive task join: {e}")))?
-            .map_err(|e| Status::internal(e))?;
+            .map_err(Status::internal)?;
         let _ = join;
         Ok(Response::new(proto::WaitLiveMigrateReceiveResponse {
             success: true,
@@ -1632,7 +1632,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let unit = live_migrate::vm_unit_name(vm_name);
         live_migrate::disable_unit_restart(&unit)
             .await
-            .map_err(|e| Status::internal(e))?;
+            .map_err(Status::internal)?;
         let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
         let timeout = if req.timeout_seconds > 0 {
             std::time::Duration::from_secs(req.timeout_seconds as u64)
@@ -1643,7 +1643,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         tokio::time::timeout(timeout, send_fut)
             .await
             .map_err(|_| Status::deadline_exceeded("timed out sending live migration"))?
-            .map_err(|e| Status::internal(e))?;
+            .map_err(Status::internal)?;
         Ok(Response::new(proto::SendLiveMigrateResponse {
             success: true,
             message: format!("sent migration for {vm_name} to {dest}"),
