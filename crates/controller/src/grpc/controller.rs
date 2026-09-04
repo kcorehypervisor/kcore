@@ -43,8 +43,8 @@ use std::collections::HashMap;
 
 use super::helpers::compute_vni;
 use super::helpers::{
-    controller_state_from_node_state, parse_datetime_to_timestamp, parse_port_list,
-    short_vm_id_seed, state_fallback_without_runtime, vm_backend_handle,
+    controller_state_from_node_state, grpc_address_host, parse_datetime_to_timestamp,
+    parse_port_list, short_vm_id_seed, state_fallback_without_runtime, vm_backend_handle,
 };
 use super::rbac_matrix;
 use super::signing;
@@ -57,6 +57,13 @@ use super::validation::{
 
 #[cfg(test)]
 type PushHook = std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + Sync + 'static>;
+
+/// Live migrate failed; `send_succeeded` means the guest may already run on dest
+/// and cold fallback must not start a second VMM on the shared RBD.
+struct LiveMigrateFailure {
+    send_succeeded: bool,
+    status: Status,
+}
 const EVT_NODE_REGISTER: &str = "node.register";
 const EVT_NODE_HEARTBEAT: &str = "node.heartbeat";
 const EVT_NODE_APPROVE: &str = "node.approve";
@@ -654,9 +661,21 @@ impl ControllerService {
         volume: &VolumeRow,
         runtime_name: &str,
         dest_host: &str,
-    ) -> Result<(), Status> {
-        let mut dest_admin = self.ensure_admin_client_for_node(target).await?;
-        let mut source_admin = self.ensure_admin_client_for_node(source).await?;
+    ) -> Result<(), LiveMigrateFailure> {
+        let mut dest_admin = self
+            .ensure_admin_client_for_node(target)
+            .await
+            .map_err(|status| LiveMigrateFailure {
+                send_succeeded: false,
+                status,
+            })?;
+        let mut source_admin =
+            self.ensure_admin_client_for_node(source)
+                .await
+                .map_err(|status| LiveMigrateFailure {
+                    send_succeeded: false,
+                    status,
+                })?;
 
         let prep = dest_admin
             .prepare_live_migrate_receive(node_proto::PrepareLiveMigrateReceiveRequest {
@@ -666,13 +685,16 @@ impl ControllerService {
                 listen_port: 0,
             })
             .await
-            .map_err(|e| Status::internal(format!("prepare receive on {}: {e}", target.id)))?
+            .map_err(|e| LiveMigrateFailure {
+                send_succeeded: false,
+                status: Status::internal(format!("prepare receive on {}: {e}", target.id)),
+            })?
             .into_inner();
         if !prep.success || prep.listen_port <= 0 {
-            return Err(Status::internal(format!(
-                "prepare receive failed: {}",
-                prep.message
-            )));
+            return Err(LiveMigrateFailure {
+                send_succeeded: false,
+                status: Status::internal(format!("prepare receive failed: {}", prep.message)),
+            });
         }
         let destination_url = format!("tcp:{dest_host}:{}", prep.listen_port);
 
@@ -692,10 +714,10 @@ impl ControllerService {
                     rbd_image: volume.image.clone(),
                 })
                 .await;
-            return Err(Status::internal(format!(
-                "send migration from {}: {e}",
-                source.id
-            )));
+            return Err(LiveMigrateFailure {
+                send_succeeded: false,
+                status: Status::internal(format!("send migration from {}: {e}", source.id)),
+            });
         }
 
         // After a successful send, the source VMM is gone — do not abort the
@@ -704,43 +726,58 @@ impl ControllerService {
         let wait = dest_admin
             .wait_live_migrate_receive(node_proto::WaitLiveMigrateReceiveRequest {
                 vm_name: runtime_name.to_string(),
-                timeout_seconds: 120,
+                // Match send timeout: receive may still be flushing after send returns.
+                timeout_seconds: 600,
             })
             .await
-            .map_err(|e| Status::internal(format!("wait receive on {}: {e}", target.id)))?
+            .map_err(|e| LiveMigrateFailure {
+                send_succeeded: true,
+                status: Status::internal(format!("wait receive on {}: {e}", target.id)),
+            })?
             .into_inner();
         if !wait.success {
-            return Err(Status::internal(format!(
-                "wait receive failed: {}",
-                wait.message
-            )));
+            return Err(LiveMigrateFailure {
+                send_succeeded: true,
+                status: Status::internal(format!("wait receive failed: {}", wait.message)),
+            });
         }
 
-        self.reassign_vm_node(vm, &target.id)?;
+        self.reassign_vm_node(vm, &target.id)
+            .map_err(|status| LiveMigrateFailure {
+                send_succeeded: true,
+                status,
+            })?;
 
         if let Err(e) = self.push_config_to_node(source).await {
             warn!(node = %source.id, error = %e, "push after live migrate (source)");
         }
-        self.push_config_to_node(target).await?;
+        self.push_config_to_node(target)
+            .await
+            .map_err(|status| LiveMigrateFailure {
+                send_succeeded: true,
+                status,
+            })?;
 
-        let _ = dest_admin
+        dest_admin
             .finalize_live_migrate_dest(node_proto::FinalizeLiveMigrateDestRequest {
                 vm_name: runtime_name.to_string(),
             })
             .await
-            .map_err(|e| Status::internal(format!("finalize dest: {e}")))?;
+            .map_err(|e| LiveMigrateFailure {
+                send_succeeded: true,
+                status: Status::internal(format!("finalize dest: {e}")),
+            })?;
 
-        let _ = source_admin
+        if let Err(e) = source_admin
             .finalize_live_migrate_source(node_proto::FinalizeLiveMigrateSourceRequest {
                 vm_name: runtime_name.to_string(),
                 rbd_pool: volume.pool.clone(),
                 rbd_image: volume.image.clone(),
             })
             .await
-            .map_err(|e| {
-                warn!(error = %e, "finalize source after live migrate");
-                e
-            });
+        {
+            warn!(error = %e, "finalize source after live migrate");
+        }
 
         Ok(())
     }
@@ -785,6 +822,32 @@ impl ControllerService {
             let _ = self.db.associate_vm_ssh_keys(&new_vm.id, &key_names);
         }
         Ok(())
+    }
+
+    /// Best-effort rollback after CreateVm partially succeeded (RBD + DB).
+    async fn rollback_created_vm(&self, node: &NodeRow, vm: &VmRow) {
+        if vm.storage_backend == "ceph" {
+            if self.clients.get_storage(&node.address).is_none() {
+                let _ = self.clients.connect(&node.address).await;
+            }
+            if let Some(mut storage) = self.clients.get_storage(&node.address) {
+                let handle = format!("kcore-vms/kcore-{}", vm.id);
+                if let Err(e) = storage
+                    .delete_volume(node_proto::DeleteVolumeRequest {
+                        backend_handle: handle,
+                    })
+                    .await
+                {
+                    warn!(vm_id = %vm.id, error = %e, "rollback: failed to delete RBD volume");
+                }
+            }
+            if let Err(e) = self.db.delete_volume_by_vm(&vm.id) {
+                warn!(vm_id = %vm.id, error = %e, "rollback: failed to delete volume row");
+            }
+        }
+        if let Err(e) = self.db.delete_vm_by_id_or_name(&vm.id) {
+            error!(vm_id = %vm.id, error = %e, "rollback: failed to delete VM row");
+        }
     }
 
     async fn set_vm_desired_state_internal(
@@ -2267,20 +2330,24 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .map_err(|e| Status::internal(format!("creating RBD volume: {e}")))?;
         }
 
-        self.db
-            .insert_vm(&vm)
-            .map_err(|e| Status::internal(format!("storing vm: {e}")))?;
+        if let Err(e) = self.db.insert_vm(&vm) {
+            if vm.storage_backend == "ceph" {
+                self.rollback_created_vm(&node, &vm).await;
+            }
+            return Err(Status::internal(format!("storing vm: {e}")));
+        }
         if vm.storage_backend == "ceph" {
-            self.db
-                .upsert_volume(&VolumeRow {
-                    id: Uuid::new_v4().to_string(),
-                    vm_id: vm.id.clone(),
-                    pool: "kcore-vms".into(),
-                    image: format!("kcore-{}", vm.id),
-                    size_bytes: vm.storage_size_bytes,
-                    created_at: String::new(),
-                })
-                .map_err(|e| Status::internal(format!("storing Ceph volume: {e}")))?;
+            if let Err(e) = self.db.upsert_volume(&VolumeRow {
+                id: Uuid::new_v4().to_string(),
+                vm_id: vm.id.clone(),
+                pool: "kcore-vms".into(),
+                image: format!("kcore-{}", vm.id),
+                size_bytes: vm.storage_size_bytes,
+                created_at: String::new(),
+            }) {
+                self.rollback_created_vm(&node, &vm).await;
+                return Err(Status::internal(format!("storing Ceph volume: {e}")));
+            }
         }
 
         if !req.ssh_key_names.is_empty() {
@@ -2291,19 +2358,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     .map_err(|e| Status::internal(format!("checking ssh key: {e}")))?
                     .is_none()
                 {
-                    self.db.delete_vm_by_id_or_name(&vm_id).ok();
+                    self.rollback_created_vm(&node, &vm).await;
                     return Err(Status::not_found(format!(
                         "SSH key '{}' not found",
                         key_name
                     )));
                 }
             }
-            self.db
-                .associate_vm_ssh_keys(&vm_id, &req.ssh_key_names)
-                .map_err(|e| {
-                    self.db.delete_vm_by_id_or_name(&vm_id).ok();
-                    Status::internal(format!("associating ssh keys: {e}"))
-                })?;
+            if let Err(e) = self.db.associate_vm_ssh_keys(&vm_id, &req.ssh_key_names) {
+                self.rollback_created_vm(&node, &vm).await;
+                return Err(Status::internal(format!("associating ssh keys: {e}")));
+            }
         }
 
         info!(vm_id = %vm_id, node_id = %node.id, "created VM, pushing config");
@@ -2315,20 +2380,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 error = %push_err,
                 "failed to push config after VM insert; rolling back VM row"
             );
-            if let Err(db_err) = self.db.delete_vm_by_id_or_name(&vm_id) {
-                error!(
-                    vm_id = %vm_id,
-                    node_id = %node.id,
-                    error = %db_err,
-                    "rollback failed after push error"
-                );
-                return Err(Status::internal(format!(
-                    "failed to apply VM config and rollback VM {}: push error: {}; rollback error: {}",
-                    vm_id,
-                    push_err.message(),
-                    db_err
-                )));
-            }
+            self.rollback_created_vm(&node, &vm).await;
             return Err(Status::aborted(format!(
                 "failed to apply VM {} on node {}: {}",
                 vm_id,
@@ -2442,14 +2494,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
+        let db_vm = self
+            .db
+            .get_vm(&req.vm_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or_else(|| {
+                self.db
+                    .list_vms()
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|v| v.name == req.vm_id))
+            })
+            .ok_or_else(|| Status::not_found(format!("VM '{}' not found", req.vm_id)))?;
         let volume = self
             .db
-            .get_volume_by_vm(&req.vm_id)
+            .get_volume_by_vm(&db_vm.id)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let deleted = self
             .db
-            .delete_vm_by_id_or_name(&req.vm_id)
+            .delete_vm_by_id_or_name(&db_vm.id)
             .map_err(|e| Status::internal(format!("deleting vm: {e}")))?;
         if !deleted {
             return Err(Status::not_found(format!("VM '{}' not found", req.vm_id)));
@@ -2466,24 +2529,24 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     })
                     .await
                 {
-                    warn!(vm_id = %req.vm_id, error = %e, "failed to delete RBD volume");
+                    warn!(vm_id = %db_vm.id, error = %e, "failed to delete RBD volume");
                 }
             }
             self.db
-                .delete_volume_by_vm(&req.vm_id)
+                .delete_volume_by_vm(&db_vm.id)
                 .map_err(|e| Status::internal(format!("deleting volume row: {e}")))?;
         }
 
-        info!(vm_id = %req.vm_id, node_id = %node.id, "deleted VM, pushing config");
+        info!(vm_id = %db_vm.id, node_id = %node.id, "deleted VM, pushing config");
 
         self.push_config_to_node(&node).await?;
         self.log_replication_event(
             &actor,
             Some("DeleteVm"),
             EVT_VM_DELETE,
-            &format!("vm/{}", req.vm_id),
+            &format!("vm/{}", db_vm.id),
             serde_json::json!({
-                "vmId": req.vm_id,
+                "vmId": db_vm.id,
                 "nodeId": node.id,
             }),
         );
@@ -4874,10 +4937,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
             })?;
 
         let runtime_name = sanitize_nix_attr_key(&vm.name);
-        let dest_host = target.address.split(':').next().unwrap_or(&target.address);
+        let dest_host = grpc_address_host(&target.address);
 
         match self
-            .live_migrate_vm(&vm, &source_node, target, &volume, &runtime_name, dest_host)
+            .live_migrate_vm(
+                &vm,
+                &source_node,
+                target,
+                &volume,
+                &runtime_name,
+                &dest_host,
+            )
             .await
         {
             Ok(()) => {
@@ -4908,11 +4978,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
             Err(live_err) => {
                 warn!(
                     vm = %vm.name,
-                    error = %live_err,
+                    send_succeeded = live_err.send_succeeded,
+                    error = %live_err.status,
                     "live migrate failed"
                 );
-                if !req.allow_cold_fallback {
-                    return Err(live_err);
+                // Never cold-start another CH after send succeeded — that dual-writes RBD.
+                if live_err.send_succeeded || !req.allow_cold_fallback {
+                    return Err(live_err.status);
                 }
                 self.cold_reassign_vm(&vm, &source_node, target).await?;
                 self.log_replication_event_required(
@@ -4926,14 +4998,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         "sourceNode": source_node.id,
                         "targetNode": target.id,
                         "mode": "cold",
-                        "liveError": live_err.to_string(),
+                        "liveError": live_err.status.to_string(),
                     }),
                 )?;
                 Ok(Response::new(controller_proto::MigrateVmResponse {
                     success: true,
                     message: format!(
-                        "cold-migrated '{}' from {} to {} after live failure: {live_err}",
-                        vm.name, source_node.id, target.id
+                        "cold-migrated '{}' from {} to {} after live failure: {}",
+                        vm.name, source_node.id, target.id, live_err.status
                     ),
                     mode: "cold".into(),
                     source_node: source_node.id,
@@ -7603,6 +7675,89 @@ mod tests {
         assert_eq!(resp.target_node, "node-b");
         let moved = db.get_vm(&vm.id).unwrap().unwrap();
         assert_eq!(moved.node_id, "node-b");
+    }
+
+    #[tokio::test]
+    async fn delete_vm_by_name_removes_ceph_volume_row() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).unwrap();
+        let mut vm = test_vm(&node.id);
+        vm.id = "vm-del-1".into();
+        vm.name = "del-by-name".into();
+        vm.storage_backend = "ceph".into();
+        db.insert_vm(&vm).unwrap();
+        db.upsert_volume(&VolumeRow {
+            id: "vol-del".into(),
+            vm_id: vm.id.clone(),
+            pool: "kcore-vms".into(),
+            image: format!("kcore-{}", vm.id),
+            size_bytes: 1024,
+            created_at: String::new(),
+        })
+        .unwrap();
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::delete_vm(
+                &svc,
+                Request::new(controller_proto::DeleteVmRequest {
+                    vm_id: "del-by-name".into(),
+                    target_node: String::new(),
+                }),
+            )
+            .await
+            .expect("delete by name")
+            .into_inner();
+        assert!(resp.success);
+        assert!(db.get_vm(&vm.id).unwrap().is_none());
+        assert!(
+            db.get_volume_by_vm(&vm.id).unwrap().is_none(),
+            "volume row must be deleted when VM is deleted by name"
+        );
+    }
+
+    #[test]
+    fn rollback_created_vm_clears_volume_row_without_node_rpc() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).unwrap();
+        let mut vm = test_vm(&node.id);
+        vm.id = "vm-rb".into();
+        vm.storage_backend = "ceph".into();
+        db.insert_vm(&vm).unwrap();
+        db.upsert_volume(&VolumeRow {
+            id: "vol-rb".into(),
+            vm_id: vm.id.clone(),
+            pool: "kcore-vms".into(),
+            image: format!("kcore-{}", vm.id),
+            size_bytes: 1024,
+            created_at: String::new(),
+        })
+        .unwrap();
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(svc.rollback_created_vm(&node, &vm));
+        assert!(db.get_vm(&vm.id).unwrap().is_none());
+        assert!(db.get_volume_by_vm(&vm.id).unwrap().is_none());
     }
 
     #[tokio::test]

@@ -111,15 +111,25 @@ let
           ${pkgs.ceph}/bin/rbd map "$IMAGE"
         fi
         test -b "$RBD_DEV"
-        MARKER="/var/lib/kcore/rbd-seeded/${rbdImage}"
-        if [ ! -f "$MARKER" ]; then
+        # Cluster-visible seed flag so cold drain/migrate to another node does
+        # not re-run qemu-img convert and wipe the shared RBD.
+        LOCAL_MARKER="/var/lib/kcore/rbd-seeded/${rbdImage}"
+        SEEDED=0
+        if ${pkgs.ceph}/bin/rbd image-meta get "$IMAGE" kcore.seeded >/dev/null 2>&1; then
+          SEEDED=1
+        elif [ -f "$LOCAL_MARKER" ]; then
+          SEEDED=1
+          ${pkgs.ceph}/bin/rbd image-meta set "$IMAGE" kcore.seeded 1 || true
+        fi
+        if [ "$SEEDED" -eq 0 ]; then
           test -e "$SOURCE" || { echo "missing source image: $SOURCE"; exit 1; }
           echo "Seeding RBD $IMAGE from $SOURCE..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
             -f ${vmCfg.imageFormat} -O raw \
             "$SOURCE" "$RBD_DEV"
-          mkdir -p "$(dirname "$MARKER")"
-          touch "$MARKER"
+          ${pkgs.ceph}/bin/rbd image-meta set "$IMAGE" kcore.seeded 1
+          mkdir -p "$(dirname "$LOCAL_MARKER")"
+          touch "$LOCAL_MARKER"
         fi
       '';
 
@@ -179,11 +189,11 @@ let
             exit 1
           fi
           pid="$(${pkgs.coreutils}/bin/cat "${migratePidFile}")"
-          ${pkgs.coreutils}/bin/rm -f "${liveMigratedMarker}" "${migratePidFile}"
           if ! ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null; then
             echo "ERROR: live-migrated cloud-hypervisor pid $pid is not running"
             exit 1
           fi
+          ${pkgs.coreutils}/bin/rm -f "${liveMigratedMarker}" "${migratePidFile}"
           echo "Adopting live-migrated cloud-hypervisor pid $pid"
           exec ${pkgs.coreutils}/bin/tail --pid="$pid" -f /dev/null
         fi

@@ -91,6 +91,23 @@ pub fn vm_backend_handle(vm: &crate::db::VmRow) -> String {
     }
 }
 
+/// Host portion of a node gRPC `address` (`host:port` or `[ipv6]:port`) for
+/// dialing live-migration TCP (never include the gRPC port).
+pub fn grpc_address_host(address: &str) -> String {
+    let address = address.trim();
+    if let Some(rest) = address.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    if let Some((host, port)) = address.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) {
+            return host.to_string();
+        }
+    }
+    address.to_string()
+}
+
 /// Deterministic VNI from network name. Range 10000–15999.
 pub fn compute_vni(name: &str) -> i32 {
     let mut hash: u32 = 5381;
@@ -166,6 +183,14 @@ mod tests {
             vm_backend_handle(&vm),
             format!("/dev/rbd/kcore-vms/kcore-{}", vm.id)
         );
+    }
+
+    #[test]
+    fn grpc_address_host_strips_ipv4_and_bracketed_ipv6_ports() {
+        assert_eq!(grpc_address_host("10.0.0.2:9091"), "10.0.0.2");
+        assert_eq!(grpc_address_host("node-b.local:9091"), "node-b.local");
+        assert_eq!(grpc_address_host("[2001:db8::1]:9091"), "2001:db8::1");
+        assert_eq!(grpc_address_host("2001:db8::1"), "2001:db8::1");
     }
 }
 

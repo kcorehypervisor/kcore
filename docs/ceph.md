@@ -16,7 +16,7 @@ Status: **Phases 1–2 + live migration shipped**.
 | Pool / RBD init | Node-agent (reconciler-driven) | `EnsureCephPool` → pool `kcore-vms` |
 | Health / phase | Controller reconciler | `GetCephHealth` until `HEALTH_OK` |
 | VM RBD create/delete | Node storage adapter | `rbd create` / `rbd rm` (`layering` only) |
-| Map + one-time seed | Node systemd `ExecStartPre` | `rbd map` + `qemu-img convert` |
+| Map + one-time seed | Node systemd `ExecStartPre` | `rbd map` + `qemu-img convert`; image-meta `kcore.seeded=1` |
 | Guest VMM | Cloud Hypervisor | `ch-vm` unit; Ceph VMs use `memory …,shared=on` |
 
 KCore does **not** use cephadm or Rook. The reconciler pushes declarative Nix and fills the imperative gaps NixOS cannot express.
@@ -92,7 +92,7 @@ Create path (controller → node):
 1. Gate: target node must be in a **healthy** `CephCluster`.
 2. Storage RPC creates `kcore-<vm-id>` in pool `kcore-vms` with `--image-feature layering` (no exclusive-lock — required for dual-map during live migrate).
 3. Upsert `volumes` row; insert `vms` with `node_id`.
-4. Push Nix; node unit `ExecStartPre` maps `/dev/rbd/kcore-vms/kcore-<vm-id>` and seeds once from the guest image (`qemu-img convert`), then Cloud Hypervisor boots with that block device.
+4. Push Nix; node unit `ExecStartPre` maps `/dev/rbd/kcore-vms/kcore-<vm-id>` and seeds once from the guest image (`qemu-img convert` + RBD image-meta `kcore.seeded=1`), then Cloud Hypervisor boots with that block device.
 
 Delete best-effort `rbd rm`s the image.
 

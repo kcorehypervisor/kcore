@@ -174,12 +174,10 @@ pub async fn disable_unit_restart(unit: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("systemctl set-property: {e}"))?;
     if !out.status.success() {
-        // Non-fatal on hosts without the unit yet.
-        warn!(
-            unit,
-            stderr = %String::from_utf8_lossy(&out.stderr),
-            "systemctl set-property Restart=no failed"
-        );
+        return Err(format!(
+            "systemctl set-property Restart=no failed for {unit}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(())
 }
