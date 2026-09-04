@@ -670,6 +670,7 @@ pub async fn apply_nix(info: &ConnectionInfo, file: &str, rebuild: bool) -> Resu
         .apply_nix_config(node_proto::ApplyNixConfigRequest {
             configuration_nix: content,
             rebuild,
+            apply_id: String::new(),
         })
         .await?
         .into_inner();

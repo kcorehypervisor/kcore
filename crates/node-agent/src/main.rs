@@ -14,6 +14,7 @@ mod grpc;
 mod issue_screen;
 mod live_migrate;
 mod path_safety;
+mod pki;
 mod registration;
 mod runtime;
 mod storage;
@@ -129,66 +130,139 @@ async fn main() -> anyhow::Result<()> {
     let vm_client = vmm::Client::new(&cfg.vm_socket_dir);
     let storage = storage::from_config(&cfg.storage).map_err(anyhow::Error::new)?;
 
-    let compute_svc = proto::node_compute_server::NodeComputeServer::new(
-        grpc::ComputeService::new(vm_client.clone()),
-    );
-    let info_svc =
-        proto::node_info_server::NodeInfoServer::new(grpc::InfoService::new(cfg.node_id.clone()));
-    let container_svc =
-        proto::node_container_server::NodeContainerServer::new(grpc::ContainerService::new());
-    let admin_svc =
-        proto::node_admin_server::NodeAdminServer::new(grpc::AdminService::new_with_storage(
-            cfg.nix_config_path.clone(),
-            cfg.vm_socket_dir.clone(),
-            storage.clone(),
-            live_migrate::LiveMigrateState::new(),
-        ))
-        .max_decoding_message_size(1024 * 1024 * 1024)
-        .max_encoding_message_size(64 * 1024 * 1024);
-    let storage_svc = proto::node_storage_server::NodeStorageServer::new(
-        grpc::StorageService::new_with_storage(storage),
-    );
-
-    let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<proto::node_compute_server::NodeComputeServer<grpc::ComputeService>>()
-        .await;
-    health_reporter
-        .set_serving::<proto::node_container_server::NodeContainerServer<grpc::ContainerService>>()
-        .await;
+    // Reload handle and revocation set are created once and shared: rebuilding
+    // the listener must not lose the CRL we already fetched.
+    let reload = pki::reload::ReloadHandle::new();
+    let revocation = pki::revocation::RevocationState::from_config(&cfg.revocation);
 
     if !cfg.controller_endpoints().is_empty() {
         let reg_cfg = cfg.clone();
         let registered = registration::register_with_controller_tracked(reg_cfg);
         registration::start_heartbeat_loop(cfg.clone(), registered.clone());
-        registration::start_cert_renewal_loop(cfg.clone());
+        pki::rotate::spawn_rotation_loop(cfg.clone(), reload.clone());
+        pki::revocation::spawn_crl_refresh_loop(cfg.clone(), revocation.clone());
     }
 
-    let mut server = Server::builder();
-    if let Some(tls) = cfg.tls.as_ref() {
-        let cert_pem = std::fs::read_to_string(&tls.cert_file)?;
-        let key_pem = std::fs::read_to_string(&tls.key_file)?;
-        let ca_pem = std::fs::read_to_string(&tls.ca_file)?;
-        let server_tls = ServerTlsConfig::new()
-            .identity(Identity::from_pem(cert_pem, key_pem))
-            .client_ca_root(Certificate::from_pem(ca_pem));
-        server = server.tls_config(server_tls)?;
-        info!(addr = %addr, node_id = %cfg.node_id, "starting node-agent with mTLS");
-    } else {
-        warn!(addr = %addr, node_id = %cfg.node_id, "starting node-agent WITHOUT TLS (--allow-insecure) — all RPCs are unauthenticated");
-    }
+    loop {
+        let compute_svc = proto::node_compute_server::NodeComputeServer::with_interceptor(
+            grpc::ComputeService::new(vm_client.clone()),
+            pki::revocation::interceptor(revocation.clone()),
+        );
+        let info_svc = proto::node_info_server::NodeInfoServer::with_interceptor(
+            grpc::InfoService::new(cfg.node_id.clone()),
+            pki::revocation::interceptor(revocation.clone()),
+        );
+        let container_svc = proto::node_container_server::NodeContainerServer::with_interceptor(
+            grpc::ContainerService::new(),
+            pki::revocation::interceptor(revocation.clone()),
+        );
+        // Message-size overrides live on the generated server, so it is built
+        // first and wrapped in the interceptor afterwards.
+        let admin_svc = tonic::service::interceptor::InterceptedService::new(
+            proto::node_admin_server::NodeAdminServer::new(
+                grpc::AdminService::new_with_storage(
+                    cfg.nix_config_path.clone(),
+                    cfg.vm_socket_dir.clone(),
+                    storage.clone(),
+                    live_migrate::LiveMigrateState::new(),
+                )
+                .with_pki(cfg.clone(), reload.clone()),
+            )
+            .max_decoding_message_size(1024 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024),
+            pki::revocation::interceptor(revocation.clone()),
+        );
+        let storage_svc = proto::node_storage_server::NodeStorageServer::with_interceptor(
+            grpc::StorageService::new_with_storage(storage.clone()),
+            pki::revocation::interceptor(revocation.clone()),
+        );
 
-    server
-        .add_service(health_svc)
-        .add_service(compute_svc)
-        .add_service(container_svc)
-        .add_service(info_svc)
-        .add_service(admin_svc)
-        .add_service(storage_svc)
-        .serve_with_shutdown(addr, shutdown_signal())
+        let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
+        health_reporter
+            .set_serving::<proto::node_compute_server::NodeComputeServer<grpc::ComputeService>>()
+            .await;
+        health_reporter
+            .set_serving::<proto::node_container_server::NodeContainerServer<grpc::ContainerService>>()
+            .await;
+
+        let mut server = Server::builder();
+        if let Some(tls) = cfg.tls.as_ref() {
+            // Read from disk on every iteration: that is what makes a reload
+            // pick up a rotated certificate.
+            let cert_pem = std::fs::read_to_string(&tls.cert_file)?;
+            let key_pem = std::fs::read_to_string(&tls.key_file)?;
+            let ca_pem = std::fs::read_to_string(&tls.ca_file)?;
+            let server_tls = ServerTlsConfig::new()
+                .identity(Identity::from_pem(cert_pem, key_pem))
+                .client_ca_root(Certificate::from_pem(ca_pem));
+            server = server.tls_config(server_tls)?;
+            info!(addr = %addr, node_id = %cfg.node_id, "starting node-agent with mTLS");
+        } else {
+            warn!(addr = %addr, node_id = %cfg.node_id, "starting node-agent WITHOUT TLS (--allow-insecure) — all RPCs are unauthenticated");
+        }
+
+        let exit = serve_until(
+            server
+                .add_service(health_svc)
+                .add_service(compute_svc)
+                .add_service(container_svc)
+                .add_service(info_svc)
+                .add_service(admin_svc)
+                .add_service(storage_svc),
+            addr,
+            reload.clone(),
+        )
         .await?;
 
+        if exit == pki::reload::ServeExit::Shutdown {
+            break;
+        }
+        info!("reloading TLS material and restarting listener");
+    }
+
     Ok(())
+}
+
+/// Serve until either a shutdown signal or a TLS reload request arrives.
+///
+/// `serve_with_shutdown` drains in-flight requests before returning, so a
+/// reload is graceful: the listener closes, the loop rebuilds it from the new
+/// files, and callers reconnect. The process, and everything it holds in
+/// memory, survives.
+async fn serve_until(
+    router: tonic::transport::server::Router,
+    addr: std::net::SocketAddr,
+    reload: pki::reload::ReloadHandle,
+) -> anyhow::Result<pki::reload::ServeExit> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<pki::reload::ServeExit>();
+    let waiter = reload.clone();
+    tokio::spawn(async move {
+        let exit = tokio::select! {
+            () = shutdown_signal() => pki::reload::ServeExit::Shutdown,
+            () = waiter.wait() => {
+                info!("certificate rotation requested a TLS reload");
+                pki::reload::ServeExit::Reload
+            }
+        };
+        let _ = tx.send(exit);
+    });
+
+    let reload_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = reload_requested.clone();
+    router
+        .serve_with_shutdown(addr, async move {
+            if let Ok(pki::reload::ServeExit::Reload) = rx.await {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+        .await?;
+    Ok(
+        if reload_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            pki::reload::ServeExit::Reload
+        } else {
+            pki::reload::ServeExit::Shutdown
+        },
+    )
 }
 
 async fn shutdown_signal() {
