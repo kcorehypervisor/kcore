@@ -134,6 +134,10 @@ async fn main() -> anyhow::Result<()> {
     // the listener must not lose the CRL we already fetched.
     let reload = pki::reload::ReloadHandle::new();
     let revocation = pki::revocation::RevocationState::from_config(&cfg.revocation);
+    // In-flight live-migration receive sessions live here. Built once, outside
+    // the listener loop: a certificate reload rebuilds the gRPC server, and a
+    // fresh state would strand the receive session of a migration in progress.
+    let live_migrate_state = live_migrate::LiveMigrateState::new();
 
     if !cfg.controller_endpoints().is_empty() {
         let reg_cfg = cfg.clone();
@@ -164,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
                     cfg.nix_config_path.clone(),
                     cfg.vm_socket_dir.clone(),
                     storage.clone(),
-                    live_migrate::LiveMigrateState::new(),
+                    live_migrate_state.clone(),
                 )
                 .with_pki(cfg.clone(), reload.clone()),
             )

@@ -57,9 +57,18 @@ const CEPH_NIX_PATH: &str = "/etc/nixos/kcore-ceph.nix";
 /// `nixos-rebuild switch` performs, but not a reboot (after which there is
 /// nothing in flight to report on anyway).
 const NIX_APPLY_STATE_DIR: &str = "/run/kcore/nix-apply";
+/// How long to wait for a freshly spawned receive-mode Cloud Hypervisor to
+/// bind its migration port. Only covers process start plus one API call.
+const RECEIVE_LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long the destination waits for its `nixos-rebuild` to make the migrated
+/// VM's unit known to systemd before giving up on adopting the guest.
+const UNIT_LOADED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const NIX_APPLY_RUNNING: &str = "running";
 const NIX_APPLY_SUCCEEDED: &str = "succeeded";
 const NIX_APPLY_FAILED: &str = "failed";
+/// A newer apply killed this one's rebuild before it reached a verdict. Maps to
+/// `NIX_APPLY_PHASE_UNKNOWN`: there is nothing left to wait for.
+const NIX_APPLY_SUPERSEDED: &str = "superseded";
 const KCORE_VOLUME_ROOTS: &[&str] = &["/var/lib/kcore/volumes", "/var/lib/kcore/images"];
 
 async fn resolve_nixpkgs_path() -> Option<String> {
@@ -141,6 +150,67 @@ impl AdminService {
     ) -> Self {
         self.pki = Some(PkiRuntime { cfg, reload });
         self
+    }
+
+    /// Map the shared image, start a receive-mode Cloud Hypervisor and wait
+    /// until it is really listening on `port`.
+    ///
+    /// Split out of `prepare_live_migrate_receive` so a failure anywhere in
+    /// here releases the port reservation on the way out. Reporting success
+    /// before the listener exists would have the source dial a closed port.
+    async fn prepare_receive_session(
+        &self,
+        vm_name: &str,
+        pool: &str,
+        image: &str,
+        port: u16,
+    ) -> Result<Response<proto::PrepareLiveMigrateReceiveResponse>, Status> {
+        live_migrate::ensure_rbd_mapped(pool, image)
+            .map_err(|e| Status::internal(format!("map RBD {pool}/{image} for receive: {e}")))?;
+
+        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        let ch_bin = live_migrate::resolve_ch_bin();
+        let ch_pid = live_migrate::spawn_receive_vmm(&client, vm_name, &ch_bin)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "starting receive-mode cloud-hypervisor for {vm_name}: {e}"
+                ))
+            })?;
+        // Cloud Hypervisor binds the port from inside the receive task, so the
+        // listener must be handed over first.
+        self.live_migrate.release_listener(port).await;
+        let receive_task =
+            live_migrate::start_receive_task(client, vm_name.to_string(), port).await;
+        if let Err(e) = live_migrate::wait_for_port_listening(port, RECEIVE_LISTEN_TIMEOUT).await {
+            receive_task.abort();
+            live_migrate::kill_pid(ch_pid);
+            if let Err(unmap) = live_migrate::ensure_rbd_unmapped(pool, image) {
+                warn!(error = %unmap, "unmap RBD after failed receive prepare");
+            }
+            return Err(Status::internal(format!(
+                "receive-mode cloud-hypervisor for {vm_name}: {e}"
+            )));
+        }
+        self.live_migrate
+            .insert(
+                vm_name,
+                ReceiveSession {
+                    port,
+                    ch_pid,
+                    receive_task,
+                },
+            )
+            .await;
+
+        Ok(Response::new(proto::PrepareLiveMigrateReceiveResponse {
+            success: true,
+            message: format!("listening for migration on tcp:0.0.0.0:{port}"),
+            listen_port: port as i32,
+            // Bound on every interface: the controller knows better than this
+            // node which of its addresses the source can reach.
+            listen_addr: "0.0.0.0".into(),
+        }))
     }
 }
 
@@ -369,14 +439,45 @@ fn latest_apply_id() -> Option<String> {
         .and_then(|s| sanitize_apply_id(&s))
 }
 
+fn record_apply_state(apply_id: &str, phase: &str, message: &str) {
+    if let Err(e) = std::fs::write(apply_state_path(apply_id), format!("{phase}\n{message}\n")) {
+        error!(error = %e, apply_id, "failed to record nix apply state");
+    }
+}
+
+/// Retire the previous apply when a new one starts.
+///
+/// `run_test_then_switch` stops any in-flight `kcore-nix-rebuild` unit before
+/// launching its own, so the older apply's rebuild is killed without ever
+/// writing a verdict. Left alone its state file would read `running` forever
+/// and a controller polling it would block until its own timeout.
+fn supersede_running_applies(new_apply_id: &str) {
+    let Some(previous) = latest_apply_id() else {
+        return;
+    };
+    if previous == new_apply_id {
+        return;
+    }
+    if let Some((phase, _)) = read_apply_state(&previous) {
+        if phase == NIX_APPLY_RUNNING {
+            record_apply_state(
+                &previous,
+                NIX_APPLY_SUPERSEDED,
+                &format!("superseded by apply {new_apply_id}"),
+            );
+        }
+    }
+}
+
 fn write_apply_state(apply_id: &str, phase: &str, message: &str) {
     if let Err(e) = std::fs::create_dir_all(NIX_APPLY_STATE_DIR) {
         error!(error = %e, dir = NIX_APPLY_STATE_DIR, "failed to create nix apply state dir");
         return;
     }
-    if let Err(e) = std::fs::write(apply_state_path(apply_id), format!("{phase}\n{message}\n")) {
-        error!(error = %e, apply_id, "failed to record nix apply state");
+    if phase == NIX_APPLY_RUNNING {
+        supersede_running_applies(apply_id);
     }
+    record_apply_state(apply_id, phase, message);
     let _ = std::fs::write(
         PathBuf::from(NIX_APPLY_STATE_DIR).join("latest"),
         apply_id.as_bytes(),
@@ -1665,40 +1766,40 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 "live migrate receive already prepared for {vm_name}"
             )));
         }
+        // The handoff writes a marker and a pid file that the generated VM unit
+        // reads. If the two disagree about where those live, the destination
+        // unit cold-starts a second Cloud Hypervisor instead of adopting the
+        // migrated one, so refuse the migration rather than corrupt the guest.
+        live_migrate::check_socket_dir_matches_nix(&self.vm_socket_dir)
+            .map_err(Status::failed_precondition)?;
 
+        if req.listen_port > u16::MAX as i32 || req.listen_port < 0 {
+            return Err(Status::invalid_argument(format!(
+                "listen_port {} is not a TCP port",
+                req.listen_port
+            )));
+        }
+        // Hold a listener on the port until Cloud Hypervisor is about to bind
+        // it, so nothing can win the race in between.
         let port = if req.listen_port > 0 {
-            req.listen_port as u16
+            self.live_migrate
+                .reserve_explicit_port(req.listen_port as u16)
+                .await
+                .map_err(Status::failed_precondition)?
         } else {
-            live_migrate::pick_free_tcp_port().map_err(Status::internal)?
+            self.live_migrate
+                .reserve_port()
+                .await
+                .map_err(Status::resource_exhausted)?
         };
 
-        live_migrate::ensure_rbd_mapped(pool, image)
-            .map_err(|e| Status::internal(format!("map RBD for receive: {e}")))?;
-
-        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
-        let ch_bin = live_migrate::resolve_ch_bin();
-        let ch_pid = live_migrate::spawn_receive_vmm(&client, vm_name, &ch_bin)
-            .await
-            .map_err(Status::internal)?;
-        let receive_task =
-            live_migrate::start_receive_task(client, vm_name.to_string(), port).await;
-        self.live_migrate
-            .insert(
-                vm_name,
-                ReceiveSession {
-                    port,
-                    ch_pid,
-                    receive_task,
-                },
-            )
+        let prepared = self
+            .prepare_receive_session(vm_name, pool, image, port)
             .await;
-
-        Ok(Response::new(proto::PrepareLiveMigrateReceiveResponse {
-            success: true,
-            message: format!("listening for migration on tcp:0.0.0.0:{port}"),
-            listen_port: port as i32,
-            listen_addr: "0.0.0.0".into(),
-        }))
+        if prepared.is_err() {
+            self.live_migrate.release_port(port).await;
+        }
+        prepared
     }
 
     async fn wait_live_migrate_receive(
@@ -1729,12 +1830,22 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 "no live migrate receive session for {vm_name}"
             )));
         };
-        let join = tokio::time::timeout(timeout, session.receive_task)
-            .await
-            .map_err(|_| Status::deadline_exceeded("timed out waiting for live migrate receive"))?
-            .map_err(|e| Status::internal(format!("receive task join: {e}")))?
-            .map_err(Status::internal)?;
-        let _ = join;
+        let port = session.port;
+        let outcome = tokio::time::timeout(timeout, session.receive_task).await;
+        // Either way the port is no longer ours to hold: Cloud Hypervisor owns
+        // it on success, and on failure it must go back to the pool.
+        self.live_migrate.release_port(port).await;
+        outcome
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "timed out after {}s waiting for {vm_name} to finish arriving",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| Status::internal(format!("receive task for {vm_name} panicked: {e}")))?
+            .map_err(|e| {
+                Status::internal(format!("receiving live migration for {vm_name}: {e}"))
+            })?;
         Ok(Response::new(proto::WaitLiveMigrateReceiveResponse {
             success: true,
             message: "live migration receive completed".into(),
@@ -1754,6 +1865,18 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if let Some(session) = self.live_migrate.take(vm_name).await {
             session.receive_task.abort();
             let _ = nix_kill(session.ch_pid);
+            self.live_migrate.release_port(session.port).await;
+        } else if let Some(pid) = live_migrate::read_migrate_pid(&self.vm_socket_dir, vm_name) {
+            // No session in memory: this agent restarted after spawning the
+            // receive VMM. The pid file is the only remaining handle on it, and
+            // without this the orphan keeps the API socket and the RBD mapping
+            // alive forever.
+            warn!(
+                %vm_name,
+                pid,
+                "no receive session in memory; killing the receive VMM recorded on disk"
+            );
+            live_migrate::kill_pid(pid);
         }
         let marker = live_migrate::handoff_marker_path(&self.vm_socket_dir, vm_name);
         let pid_path = live_migrate::migrate_pid_path(&self.vm_socket_dir, vm_name);
@@ -1795,7 +1918,11 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let unit = live_migrate::vm_unit_name(vm_name);
         live_migrate::disable_unit_restart(&unit)
             .await
-            .map_err(Status::internal)?;
+            .map_err(|e| {
+                Status::internal(format!(
+                    "disabling systemd restart for {unit} before sending: {e}"
+                ))
+            })?;
         let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
         let timeout = if req.timeout_seconds > 0 {
             std::time::Duration::from_secs(req.timeout_seconds as u64)
@@ -1805,8 +1932,17 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let send_fut = client.send_migration(vm_name, dest);
         tokio::time::timeout(timeout, send_fut)
             .await
-            .map_err(|_| Status::deadline_exceeded("timed out sending live migration"))?
-            .map_err(Status::internal)?;
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "timed out after {}s sending {vm_name} to {dest}",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                Status::internal(format!(
+                    "cloud-hypervisor refused to send {vm_name} to {dest}: {e}"
+                ))
+            })?;
         Ok(Response::new(proto::SendLiveMigrateResponse {
             success: true,
             message: format!("sent migration for {vm_name} to {dest}"),
@@ -1867,11 +2003,17 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             return Err(Status::invalid_argument("vm_name is required"));
         }
         let unit = live_migrate::vm_unit_name(vm_name);
+        // The unit only exists once the destination's nixos-rebuild activated,
+        // and that runs asynchronously. Starting a unit systemd has never heard
+        // of would fail the migration for a reason that fixes itself.
+        live_migrate::wait_for_unit_loaded(&unit, UNIT_LOADED_TIMEOUT)
+            .await
+            .map_err(Status::failed_precondition)?;
         let out = Command::new("systemctl")
             .args(["start", &unit])
             .output()
             .await
-            .map_err(|e| Status::internal(format!("systemctl start: {e}")))?;
+            .map_err(|e| Status::internal(format!("systemctl start {unit}: {e}")))?;
         if !out.status.success() {
             return Err(Status::internal(format!(
                 "systemctl start {unit} failed: {}",
@@ -3057,6 +3199,33 @@ mod tests {
         .into_inner();
         assert!(resp.success);
         assert!(resp.message.contains("test mode"));
+    }
+
+    /// A superseded apply must not read as `running` forever: the controller
+    /// polls until it gets a verdict, and `running` would make it wait out its
+    /// whole timeout for a rebuild that was already killed.
+    #[test]
+    fn apply_phase_to_proto_reports_a_superseded_apply_as_unknown() {
+        assert_eq!(
+            apply_phase_to_proto(NIX_APPLY_SUPERSEDED),
+            proto::NixApplyPhase::Unknown as i32
+        );
+        assert_eq!(
+            apply_phase_to_proto(NIX_APPLY_RUNNING),
+            proto::NixApplyPhase::Running as i32
+        );
+        assert_eq!(
+            apply_phase_to_proto(NIX_APPLY_SUCCEEDED),
+            proto::NixApplyPhase::Succeeded as i32
+        );
+        assert_eq!(
+            apply_phase_to_proto(NIX_APPLY_FAILED),
+            proto::NixApplyPhase::Failed as i32
+        );
+        assert_eq!(
+            apply_phase_to_proto("something-else"),
+            proto::NixApplyPhase::Unknown as i32
+        );
     }
 
     #[tokio::test]
