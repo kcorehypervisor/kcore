@@ -413,6 +413,34 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    async fn create_ceph_cluster(
+        &self,
+        _: TRequest<CreateCephClusterRequest>,
+    ) -> Result<Response<CreateCephClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_ceph_cluster(
+        &self,
+        _: TRequest<GetCephClusterRequest>,
+    ) -> Result<Response<GetCephClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn list_ceph_clusters(
+        &self,
+        _: TRequest<ListCephClustersRequest>,
+    ) -> Result<Response<ListCephClustersResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn delete_ceph_cluster(
+        &self,
+        _: TRequest<DeleteCephClusterRequest>,
+    ) -> Result<Response<DeleteCephClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
     async fn create_cluster_update(
         &self,
         _: TRequest<CreateClusterUpdateRequest>,

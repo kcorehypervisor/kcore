@@ -538,6 +538,34 @@ impl Controller for MockController {
         Err(unimp("classify_disk_layout"))
     }
 
+    async fn create_ceph_cluster(
+        &self,
+        _: Request<CreateCephClusterRequest>,
+    ) -> Result<Response<CreateCephClusterResponse>, Status> {
+        Err(unimp("create_ceph_cluster"))
+    }
+
+    async fn get_ceph_cluster(
+        &self,
+        _: Request<GetCephClusterRequest>,
+    ) -> Result<Response<GetCephClusterResponse>, Status> {
+        Err(unimp("get_ceph_cluster"))
+    }
+
+    async fn list_ceph_clusters(
+        &self,
+        _: Request<ListCephClustersRequest>,
+    ) -> Result<Response<ListCephClustersResponse>, Status> {
+        Err(unimp("list_ceph_clusters"))
+    }
+
+    async fn delete_ceph_cluster(
+        &self,
+        _: Request<DeleteCephClusterRequest>,
+    ) -> Result<Response<DeleteCephClusterResponse>, Status> {
+        Err(unimp("delete_ceph_cluster"))
+    }
+
     async fn create_cluster_update(
         &self,
         _: Request<CreateClusterUpdateRequest>,
