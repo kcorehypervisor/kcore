@@ -496,7 +496,7 @@ kctl apply -f ./controller-config.nix --dry-run
 
 Top-level commands:
 
-- `kctl create vm ... --storage-backend <filesystem|lvm|zfs> --storage-size-bytes <bytes>`
+- `kctl create vm ... --storage-backend <filesystem|lvm|zfs|ceph> --storage-size-bytes <bytes>`
 - `kctl create cluster ...`
 - `kctl create network <name> --external-ip ... --gateway-ip ... [--type nat|bridge|vxlan] [--no-outbound-nat] [--vlan-id ...] [--target-node ...]`
 - `kctl create ssh-key <name> --public-key "ssh-rsa ..."`
@@ -507,10 +507,13 @@ Top-level commands:
 - `kctl set vm ... --state <running|stopped>`
 - `kctl start vm ...`
 - `kctl stop vm ...`
+- `kctl migrate vm <id|name> --target-node <node> [--allow-cold-fallback]` (Ceph / shared RBD live migrate)
+- `kctl drain node <node-id> [--target-node <node>]` (cold-reassign all VMs off a node)
 - `kctl get vms [name]`
 - `kctl get nodes [name]`
 - `kctl get networks [--target-node ...]`
 - `kctl get ssh-keys`
+- `kctl get ceph-cluster` / `kctl describe ceph-cluster <name>`
 - `kctl get compliance-report` (full compliance report with per-node breakdown)
 - `kctl node disks`
 - `kctl node nics`
@@ -584,3 +587,20 @@ kctl create vm app-zfs-01 \
   --storage-size-bytes 42949672960 \
   --target-node 192.168.40.105:9091
 ```
+
+### Ceph VM + migration
+
+After a healthy `CephCluster` (see [`ceph.md`](./ceph.md)):
+
+```bash
+kctl create vm app-ceph-01 \
+  --storage-backend ceph \
+  --storage-size-bytes 42949672960 \
+  --image <https-url> \
+  --image-sha256 <sha256>
+
+kctl migrate vm app-ceph-01 --target-node node-b
+kctl drain node node-a --target-node node-b
+```
+
+Details: [`vm-migration.md`](./vm-migration.md).

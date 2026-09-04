@@ -1,23 +1,36 @@
-# kcore SAN (Ceph)
+# kcore SAN (Ceph) — integration
 
-kcore SAN is the cluster’s distributed shared block storage fabric. It is powered by **Ceph** on NixOS; the controller fills the gaps that NixOS does not declare (FSID/keyrings, `ceph-volume` OSD prepare, pools, health, and later RBD lifecycle).
+kcore SAN is the cluster’s **shared block storage** fabric. Guests use **Ceph RBD** images so a VM’s disk is not tied to one node’s local filesystem/LVM/ZFS. That is what makes **cold drain** and **Cloud Hypervisor live migration** possible without copying disk bytes.
 
-Public product docs: [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html). Roadmap status: **Phases 1–2 + live migration shipped**.
+Operator-facing overview: [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html) · migration runbook: [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.html) · deep migration notes in-repo: [`vm-migration.md`](./vm-migration.md).
 
-## Lab topology (3 Dell towers)
+Status: **Phases 1–2 + live migration shipped**.
 
-| Role | Disk | Notes |
-|------|------|--------|
-| OS + MON/MGR state | Disk 1 (SSD) | Existing `kctl node install --os-disk …` |
-| One OSD | Disk 2 (~500 GB SSD) | Whole device for `ceph-volume`; **not** a local LVM/ZFS VM data disk |
+## Design split: NixOS vs KCore
 
-- **Daemons:** each of the three nodes runs MON + MGR + 1 OSD.
-- **Network:** dedicate the MikroTik 10Gb fiber fabric as Ceph **cluster/replication** (`clusterNetwork`). Use the existing server 10Gb (or another VLAN) as **public/client** (`publicNetwork`).
-- **Capacity:** ~1.5 TiB raw; with `size=3` / `minSize=2`, usable capacity is about **~0.5 TiB**. Budget a small number of 40–80 GB VM disks for this lab.
+| Concern | Owned by | Mechanism |
+|---------|----------|-----------|
+| Ceph packages / units | NixOS | `services.ceph` via [`modules/kcore-ceph.nix`](../modules/kcore-ceph.nix) |
+| FSID, keyrings, monmap | Controller + node-agent | Bootstrap package redistributed to members |
+| OSD prepare / activate | Node-agent | `BootstrapCephOsd` → `ceph-volume lvm create` (+ systemd activate) |
+| Pool / RBD init | Node-agent (reconciler-driven) | `EnsureCephPool` → pool `kcore-vms` |
+| Health / phase | Controller reconciler | `GetCephHealth` until `HEALTH_OK` |
+| VM RBD create/delete | Node storage adapter | `rbd create` / `rbd rm` (`layering` only) |
+| Map + one-time seed | Node systemd `ExecStartPre` | `rbd map` + `qemu-img convert` |
+| Guest VMM | Cloud Hypervisor | `ch-vm` unit; Ceph VMs use `memory …,shared=on` |
 
-## Phase 1 — Declarative `CephCluster` (fabric)
+KCore does **not** use cephadm or Rook. The reconciler pushes declarative Nix and fills the imperative gaps NixOS cannot express.
 
-VMs still use `filesystem` / `lvm` / `zfs`. Phase 1 only brings Ceph to `HEALTH_OK`.
+## Control-plane data model
+
+- **`ceph_clusters`** — desired `CephCluster` spec (FSID, networks, nodes, size/minSize) + bootstrap JSON (keys).
+- **`ceph_cluster_status`** — reconciled phase (`bootstrapping` / `healthy` / `degraded` / …).
+- **`volumes`** — cluster-scoped RBD identity (`pool`, `image`, `size_bytes`) keyed by `vm_id`. The volume does **not** move when the VM’s `node_id` changes.
+- **`vms.storage_backend = ceph`** — schedule only onto nodes that are members of a healthy `CephCluster` (membership via `CephCluster.spec.nodes`, not only `nodes.storage_backend`).
+
+Runtime Nix for a Ceph VM includes `storageBackend = "ceph"` and `rbdImage = "kcore-<vm-id>"` (see `crates/controller/src/nixgen.rs`).
+
+## Phase 1 — fabric bootstrap
 
 ### Manifest
 
@@ -28,11 +41,10 @@ metadata:
 spec:
   fsid: "2f3f204e-65ca-4b69-a86c-bf8408f5c792"
   publicNetwork: "10.10.0.0/24"
-  clusterNetwork: "10.20.0.0/24"   # MikroTik 10Gb
+  clusterNetwork: "10.20.0.0/24"
   replication:
     size: 3
     minSize: 2
-  # forceWipe: false   # set true only to erase an OSD disk with existing signatures
   nodes:
     - nodeId: dell-1
       monAddr: "10.10.0.11:6789"
@@ -40,56 +52,32 @@ spec:
       publicIface: eth1
       clusterIface: eth2
       osdDevice: /dev/nvme0n1
-    - nodeId: dell-2
-      monAddr: "10.10.0.12:6789"
-      clusterAddr: "10.20.0.12"
-      publicIface: eth1
-      clusterIface: eth2
-      osdDevice: /dev/nvme0n1
-    - nodeId: dell-3
-      monAddr: "10.10.0.13:6789"
-      clusterAddr: "10.20.0.13"
-      publicIface: eth1
-      clusterIface: eth2
-      osdDevice: /dev/nvme0n1
+    # … additional members
 ```
-
-### Operator commands
 
 ```bash
 kctl apply -f lab-san-ceph.yaml
 kctl get ceph-cluster
 kctl describe ceph-cluster lab-san
-kctl delete ceph-cluster lab-san   # does not automatically wipe OSDs
 ```
 
-Discover NICs and disks before writing the manifest:
+### Reconciler sequence
+
+1. Persist spec + generation.
+2. `ApplyCephConfig` — write `/etc/nixos/kcore-ceph.nix`, rebuild; cluster name is always `ceph`; `mon_host` lists every member.
+3. First eligible node builds mon/admin/bootstrap-osd keyrings (`ceph-authtool`); controller redistributes the package; peers run `ceph-mon --mkfs` / mgr auth.
+4. `BootstrapCephOsd` — `ceph-volume lvm create` on `osdDevice` (refuses non-empty disks unless `forceWipe: true`), activate units (no `--no-systemd`).
+5. `EnsureCephPool` for `kcore-vms` (size/min_size, RBD application, `rbd pool init`).
+6. Poll health until `HEALTH_OK`; otherwise requeue.
+
+Discover hardware before writing the manifest:
 
 ```bash
 kctl --node <addr>:9091 node nics
 kctl --node <addr>:9091 node disks
 ```
 
-### What the control plane does
-
-1. Persist desired state (`ceph_clusters` + generation + bootstrap secrets).
-2. Reconciler pushes per-node Nix (`kcore-ceph` / `services.ceph`, cluster name always `ceph`, full `mon_host` list) via node `ApplyCephConfig`.
-3. First node generates mon/admin/bootstrap-osd keyrings with `ceph-authtool`; the controller redistributes that package to every member, then each node runs `ceph-mon --mkfs` / mgr auth.
-4. Bootstraps OSD disks with `BootstrapCephOsd` (`ceph-volume lvm create`, activates systemd units), refusing non-empty devices unless `forceWipe: true`.
-5. Ensures RBD pool `kcore-vms` (`EnsureCephPool`) and polls `GetCephHealth` until `HEALTH_OK` (degraded/failed stays queued).
-
-NixOS module: [`modules/kcore-ceph.nix`](../modules/kcore-ceph.nix). Runtime packages come from nixpkgs Ceph; KCore owns bootstrap RPCs in the node-agent.
-
 ## Phase 2 — RBD VM disks
-
-Once the fabric is healthy:
-
-- Create VMs with `--storage-backend ceph --storage-size-bytes …` (rejected until a healthy `CephCluster` includes the target node).
-- Controller allocates a cluster-scoped RBD image in pool `kcore-vms` (volume row independent of node); size is passed to `rbd create` in **MiB**.
-- Node-agent maps RBD and seeds the guest image once (`qemu-img convert`) before Cloud Hypervisor starts; any Ceph member node can run the VM.
-- `kctl drain <node>` reassigns Ceph VMs to other members without copying disks (cold stop/start).
-- `kctl migrate vm <id> --target-node <node>` live-migrates a running Ceph VM over TCP using Cloud Hypervisor (`shared=on` guest RAM + dual-mapped RBD). Pass `--allow-cold-fallback` to fall back to cold reassignment if live migrate fails.
-- Deleting a Ceph VM best-effort removes the RBD image.
 
 ```bash
 kctl create vm app-1 \
@@ -97,26 +85,43 @@ kctl create vm app-1 \
   --storage-size-bytes 42949672960 \
   --image <https-url> \
   --image-sha256 <sha256>
-
-kctl migrate vm app-1 --target-node node-b
 ```
 
-Local backends remain available for latency-sensitive workloads on a single node.
+Create path (controller → node):
 
-## Live migration notes
+1. Gate: target node must be in a **healthy** `CephCluster`.
+2. Storage RPC creates `kcore-<vm-id>` in pool `kcore-vms` with `--image-feature layering` (no exclusive-lock — required for dual-map during live migrate).
+3. Upsert `volumes` row; insert `vms` with `node_id`.
+4. Push Nix; node unit `ExecStartPre` maps `/dev/rbd/kcore-vms/kcore-<vm-id>` and seeds once from the guest image (`qemu-img convert`), then Cloud Hypervisor boots with that block device.
 
-- Requires both nodes to be members of the same healthy `CephCluster` and the VM to use `storage_backend: ceph`.
-- Destination starts an empty Cloud Hypervisor API process, receives the migration stream (`tcp:<dest-ip>:<port>`), then the systemd unit adopts the process via a live-migrated marker.
-- Nodes must allow ephemeral TCP between members for the migration stream (same fabric as Ceph public/client is fine).
-- RBD images are created with `layering` only (no exclusive-lock) so source and destination can map the same image during cutover.
+Delete best-effort `rbd rm`s the image.
 
-## Later
+Local backends (`filesystem` / `lvm` / `zfs`) remain for single-node latency-sensitive workloads.
 
-- Drain policies that prefer live migrate for Ceph VMs.
-- Fixed migration port ranges / firewall helpers.
+## Lab topology (reference)
+
+| Role | Disk | Notes |
+|------|------|--------|
+| OS + MON/MGR state | Disk 1 | `kctl node install --os-disk …` |
+| One OSD | Disk 2 | Whole device for `ceph-volume`; **not** the local LVM/ZFS data disk |
+
+Prefer a dedicated fabric for `clusterNetwork` (replication) and a separate `publicNetwork` for client/MON traffic.
 
 ## Safety
 
-- Do not point `osdDevice` at the OS disk.
-- Default `forceWipe: false` refuses OSD prepare when the device has partitions/filesystems/LVM signatures.
-- Keep Ceph traffic on the dedicated fabric; do not rely on a congested management NIC for replication.
+- Never point `osdDevice` at the OS disk.
+- Default `forceWipe: false` refuses OSD prepare when signatures exist.
+- Keep Ceph replication off a congested management NIC.
+- Live migration needs ephemeral TCP between members (see [`vm-migration.md`](./vm-migration.md)).
+
+## Source map
+
+| Area | Paths |
+|------|--------|
+| Proto | `proto/controller.proto` (`CephCluster*`, `MigrateVm`), `proto/node.proto` (Ceph + live-migrate peer RPCs) |
+| Reconciler / spec | `crates/controller/src/ceph_cluster_*.rs` |
+| DB | `crates/controller/src/db.rs` (`ceph_clusters`, `volumes`, …) |
+| Nixgen | `crates/controller/src/nixgen.rs` |
+| Node Ceph / RBD | `crates/node-agent/src/ceph_bootstrap.rs`, `storage/mod.rs` (`CephAdapter`) |
+| Live migrate | `crates/node-agent/src/live_migrate.rs`, `vmm/client.rs`, `grpc/admin.rs` |
+| Units | `modules/kcore-ceph.nix`, `modules/ch-vm/vm-service.nix` |
