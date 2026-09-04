@@ -92,9 +92,9 @@ Create path (controller → node):
 1. Gate: target node must be in a **healthy** `CephCluster`.
 2. Storage RPC creates `kcore-<vm-id>` in pool `kcore-vms` with `--image-feature layering` (no exclusive-lock — required for dual-map during live migrate).
 3. Upsert `volumes` row; insert `vms` with `node_id`.
-4. Push Nix; node unit `ExecStartPre` maps `/dev/rbd/kcore-vms/kcore-<vm-id>` and seeds once from the guest image (`qemu-img convert` + RBD image-meta `kcore.seeded=1`), then Cloud Hypervisor boots with that block device.
+4. Push Nix **and wait for the node's `nixos-rebuild` to activate** (see [`vm-migration.md`](./vm-migration.md#waiting-for-the-nix-apply)); node unit `ExecStartPre` maps `/dev/rbd/kcore-vms/kcore-<vm-id>` and seeds once from the guest image (`qemu-img convert` + RBD image-meta `kcore.seeded=1`), then Cloud Hypervisor boots with that block device. Without the wait, a failed rebuild left the database claiming a VM the node never built.
 
-Delete resolves the VM by id **or name** first, then uses the resolved id for the `volumes` row and the best-effort `rbd rm` — deleting by name used to leave the image and row orphaned.
+Delete resolves the VM by id **or name** first, then uses the resolved id for the `volumes` row and the best-effort `rbd rm` — deleting by name used to leave the image and row orphaned. It also releases the image on the owning node (stop unit + `rbd unmap`) **before** the `rbd rm`: the config push that stops the guest only happens at the end of the RPC, so removing the image first always failed on the still-mapped device and orphaned it in the pool.
 
 `DeleteCephCluster` is refused with `FAILED_PRECONDITION` while any `ceph`-backed VM still lives on one of the cluster's member nodes, and names the blocking VMs. Removing the record first would strand those VMs: the reconciler stops managing the cluster and their nodes stop counting as Ceph-capable, so they can no longer be created, migrated, or drained. VMs on local backends do not block deletion.
 

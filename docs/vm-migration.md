@@ -36,12 +36,12 @@ kctl migrate vm app-1 --target-node node-b --allow-cold-fallback
 
 1. Mark source `draining` (drain only).
 2. For each VM (or the one VM on cold fallback):
-   - Pick a target with capacity and compatible backend (`ceph` membership counts). For `ceph` VMs the target must also belong to a **healthy** `CephCluster` — a node in a degraded cluster may not be able to map the image at all.
+   - Pick a target with capacity and compatible backend (`ceph` membership counts). The target must be `approved` and not itself `draining`/`drained` — that holds for an operator-supplied `--target-node` too, not just for scheduler picks. For `ceph` VMs the target must also belong to a **healthy** `CephCluster` — a node in a degraded cluster may not be able to map the image at all.
    - **Release the shared RBD on the source** (see below). A VM whose image cannot be released is skipped and left where it is.
-   - **Reassign ownership**: delete + re-insert the `vms` row with the new `node_id` (preserve SSH key associations). The `volumes` row is unchanged — the RBD image stays put.
+   - **Reassign ownership**: `UPDATE vms SET node_id` in place. Never delete-and-reinsert — `vm_ssh_keys` and `security_group_vm_attachments` both reference `vms(id) ON DELETE CASCADE`, so a delete silently destroys the VM's SSH keys and security group attachments. The `volumes` row is unchanged: the RBD image stays put.
 3. `push_config_to_node` on source (VM disappears from Nix → unit stops / disk unmapped).
-4. `push_config_to_node` on destination (unit appears → map RBD, start CH if `autoStart`).
-5. Drain marks source `drained` **only if every VM moved**; otherwise the node stays `draining` and `DrainNode` returns `success = false` with a per-VM error list.
+4. `push_config_to_node` on destination, **waiting for the apply** (unit appears → map RBD, start CH if `autoStart`).
+5. Drain marks source `drained` **only if every VM moved and every config push applied**; otherwise the node stays `draining` and `DrainNode` returns `success = false` with a per-VM error list. Nothing in the per-VM loop aborts the RPC: VMs earlier in the loop have already been reassigned in the database and no config has been pushed yet, so an early return would leave the cluster disagreeing with the database.
 
 There is **no** Cloud Hypervisor migration API on the cold path. The guest is stopped on the source (via systemd/Nix removal) and started fresh on the destination against the same RBD device path once mapped.
 
@@ -51,10 +51,22 @@ There is **no** Cloud Hypervisor migration API on the cold path. The guest is st
 
 Before reassigning a `ceph` VM, the controller therefore calls `FinalizeLiveMigrateSource` on the node that currently owns it, which stops the VM unit and runs `rbd unmap`. `rbd unmap` **cannot succeed while a local VMM still holds the device open**, so a successful call is positive proof that the source has let go — it is the barrier, not just a request.
 
+The node answers with the post-conditions it **observed** (`vmm_stopped`, `rbd_unmapped`), not with the fact that it issued the calls, and the controller checks both.
+
 Failure handling:
 
 - **Source unreachable** (`UNAVAILABLE`): tolerated with a warning. This is the node-failure drain case, where the source VMM died with its node.
-- **Any other failure**: hard `FAILED_PRECONDITION`. The VM is left on the source rather than risking a second writer.
+- **Any other failure, or a reply with either post-condition false**: hard `FAILED_PRECONDITION`. The VM is left on the source rather than risking a second writer.
+
+`DeleteVm` uses the same barrier before destroying a Ceph VM's RBD image: `rbd rm` cannot remove an image the owning node still has mapped, so deleting first left the image orphaned in the pool with its `volumes` row already gone.
+
+### Waiting for the Nix apply
+
+`ApplyNixConfig` returns as soon as the configuration file is written; the `nixos-rebuild` it starts runs in a transient `kcore-nix-rebuild` unit, because `nixos-rebuild switch` restarts the node agent and no in-process watcher would survive it. That unit records the verdict, and `GetNixApplyStatus` reports it.
+
+Any step that assumes the generated unit already exists therefore polls that verdict first: the live-migration destination push (`FinalizeLiveMigrateDest` runs `systemctl start` on the unit), the cold-move destination push, `CreateVm`, `SetVmDesiredState`, and both legs of `DrainNode`. The wait is bounded (10 minutes) and reports `DEADLINE_EXCEEDED` with the node's last message.
+
+A node agent that predates apply tracking returns an empty `apply_id`, and a node whose `/run` state was discarded (or whose apply was superseded by a newer one) reports `NIX_APPLY_PHASE_UNKNOWN`. Both mean "there is no verdict coming": the controller logs it and proceeds rather than failing an operation that may well have worked.
 
 ### Why Ceph makes cold cheap
 
