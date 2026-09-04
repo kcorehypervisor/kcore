@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-console"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-controller"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1823,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-dashboard"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-disk-layout-yaml"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1860,14 +1860,14 @@ dependencies = [
 
 [[package]]
 name = "kcore-disko-types"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "kcore-node-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1902,11 +1902,11 @@ dependencies = [
 
 [[package]]
 name = "kcore-sanitize"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "kctl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
