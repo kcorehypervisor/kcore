@@ -158,6 +158,15 @@ mod tests {
         let vm = test_vm_row("my-vm", "filesystem");
         assert_eq!(vm_backend_handle(&vm), "/var/lib/kcore/images/test.qcow2");
     }
+
+    #[test]
+    fn vm_backend_handle_ceph() {
+        let vm = test_vm_row("my-vm", "ceph");
+        assert_eq!(
+            vm_backend_handle(&vm),
+            format!("/dev/rbd/kcore-vms/kcore-{}", vm.id)
+        );
+    }
 }
 
 /// Property-based tests (Phase 2) for the small pure helpers.

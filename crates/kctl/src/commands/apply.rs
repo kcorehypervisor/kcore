@@ -236,6 +236,21 @@ metadata:
     }
 
     #[test]
+    fn detect_manifest_kind_reads_cephcluster() {
+        assert_eq!(
+            unwrap_kind("kind: CephCluster\nmetadata:\n  name: lab\n").as_deref(),
+            Some("CephCluster")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ceph.yaml");
+        std::fs::write(&path, "kind: CephCluster\nmetadata:\n  name: lab\n").unwrap();
+        assert!(
+            !is_local_manifest_kind(path.to_str().unwrap()).unwrap(),
+            "CephCluster is a controller resource, not a local bootstrap kind"
+        );
+    }
+
+    #[test]
     fn is_local_manifest_kind_missing_file_is_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.yaml");

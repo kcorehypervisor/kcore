@@ -226,12 +226,6 @@ pub fn generate_node_config_with_security_groups(
                 nix_escape(&vm.id)
             ));
         }
-        if vm.storage_backend == "ceph" {
-            out.push_str(&format!(
-                "      rbdImage = \"kcore-{}\";\n",
-                nix_escape(&vm.id)
-            ));
-        }
         out.push_str(&format!("      imageSize = {};\n", vm.image_size));
         out.push_str(&format!("      cores = {};\n", vm.cpu));
         out.push_str(&format!(
@@ -753,6 +747,42 @@ mod tests {
             !config.contains("lvmVgName"),
             "ZFS VM should not contain lvmVgName"
         );
+    }
+
+    #[test]
+    fn emits_single_rbd_image_when_vm_uses_ceph() {
+        let mut v = vm(true, "ceph-vm");
+        v.id = "vm-42".into();
+        v.storage_backend = "ceph".into();
+        let config = generate_node_config(
+            &[v],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(config.contains("storageBackend = \"ceph\";"));
+        let needle = "rbdImage = \"kcore-vm-42\";";
+        assert!(config.contains(needle), "missing rbdImage in:\n{config}");
+        assert_eq!(
+            config.matches(needle).count(),
+            1,
+            "rbdImage must be emitted exactly once"
+        );
+    }
+
+    #[test]
+    fn omits_rbd_image_for_filesystem_backend() {
+        let config = generate_node_config(
+            &[vm(true, "fs-vm")],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(!config.contains("rbdImage"));
     }
 
     #[test]

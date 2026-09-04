@@ -29,6 +29,17 @@ in
     monAddress = lib.mkOption {
       type = lib.types.str;
       default = "";
+      description = "Comma-separated public mon IPs (mon_host).";
+    };
+    publicAddr = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "This node's public/client address.";
+    };
+    clusterAddr = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "This node's cluster/replication address.";
     };
     daemonId = lib.mkOption {
       type = lib.types.str;
@@ -99,6 +110,7 @@ in
         daemons = lib.optionals cfg.enableMgr [ cfg.daemonId ];
       };
       osd = {
+        # OSD systemd units are installed by ceph-volume create (not listed here).
         enable = cfg.enableOsd;
         daemons = [ ];
       };

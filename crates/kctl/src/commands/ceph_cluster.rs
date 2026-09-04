@@ -30,6 +30,11 @@ struct ManifestSpec {
     cluster_network: String,
     #[serde(default)]
     replication: ManifestReplication,
+    /// Optional top-level aliases (docs sometimes omit the `replication` nest).
+    #[serde(default)]
+    size: Option<i32>,
+    #[serde(default)]
+    min_size: Option<i32>,
     #[serde(default)]
     force_wipe: bool,
     nodes: Vec<ManifestNode>,
@@ -83,12 +88,14 @@ fn parse_manifest(file: &str) -> Result<CephClusterManifest> {
 }
 
 fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::CephClusterSpec {
+    let size = spec.size.unwrap_or(spec.replication.size);
+    let min_size = spec.min_size.unwrap_or(spec.replication.min_size);
     controller_proto::CephClusterSpec {
         fsid: spec.fsid.clone(),
         public_network: spec.public_network.clone(),
         cluster_network: spec.cluster_network.clone(),
-        size: spec.replication.size,
-        min_size: spec.replication.min_size,
+        size,
+        min_size,
         force_wipe: spec.force_wipe,
         nodes: spec
             .nodes
@@ -206,4 +213,129 @@ pub async fn delete(info: &ConnectionInfo, name: &str) -> Result<()> {
         bail!("failed to delete Ceph cluster '{name}'");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_manifest(body: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ceph.yaml");
+        std::fs::write(&path, body).unwrap();
+        let s = path.to_str().unwrap().to_string();
+        (dir, s)
+    }
+
+    #[test]
+    fn parse_manifest_accepts_cephcluster_kinds_and_defaults_replication() {
+        let yaml = r#"
+kind: CephCluster
+metadata:
+  name: lab
+spec:
+  publicNetwork: 10.10.0.0/24
+  clusterNetwork: 10.20.0.0/24
+  nodes:
+    - nodeId: dell-1
+      monAddr: 10.10.0.11:6789
+      clusterAddr: 10.20.0.11
+      publicIface: eth1
+      clusterIface: eth2
+      osdDevice: /dev/nvme0n1
+"#;
+        let (_dir, path) = write_manifest(yaml);
+        let m = parse_manifest(&path).expect("parse");
+        assert_eq!(m.metadata.name, "lab");
+        assert_eq!(m.spec.replication.size, 3);
+        assert_eq!(m.spec.replication.min_size, 2);
+        let proto = to_proto_spec(&m.spec);
+        assert_eq!(proto.size, 3);
+        assert_eq!(proto.min_size, 2);
+        assert_eq!(proto.nodes.len(), 1);
+        assert_eq!(proto.nodes[0].osd_device, "/dev/nvme0n1");
+
+        for kind in ["ceph-cluster", "ceph_cluster", "CephCluster"] {
+            let body = yaml.replacen("CephCluster", kind, 1);
+            let (_dir, path) = write_manifest(&body);
+            parse_manifest(&path).unwrap_or_else(|e| panic!("kind {kind}: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn parse_manifest_reads_nested_replication_and_fsid() {
+        let yaml = r#"
+kind: CephCluster
+metadata:
+  name: lab
+spec:
+  fsid: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+  publicNetwork: 10.10.0.0/24
+  clusterNetwork: 10.20.0.0/24
+  forceWipe: true
+  replication:
+    size: 2
+    minSize: 1
+  nodes:
+    - nodeId: n1
+      monAddr: a
+      clusterAddr: b
+      publicIface: e1
+      clusterIface: e2
+      osdDevice: /dev/sda
+"#;
+        let (_dir, path) = write_manifest(yaml);
+        let m = parse_manifest(&path).unwrap();
+        let proto = to_proto_spec(&m.spec);
+        assert_eq!(proto.fsid, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert!(proto.force_wipe);
+        assert_eq!(proto.size, 2);
+        assert_eq!(proto.min_size, 1);
+    }
+
+    #[test]
+    fn parse_manifest_rejects_wrong_kind() {
+        let (_dir, path) = write_manifest(
+            r#"
+kind: VM
+metadata:
+  name: x
+spec:
+  publicNetwork: 10.10.0.0/24
+  clusterNetwork: 10.20.0.0/24
+  nodes: []
+"#,
+        );
+        let err = parse_manifest(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expected kind") || msg.contains("CephCluster"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn top_level_size_min_size_override_replication_defaults() {
+        let yaml = r#"
+kind: CephCluster
+metadata:
+  name: lab
+spec:
+  publicNetwork: 10.10.0.0/24
+  clusterNetwork: 10.20.0.0/24
+  size: 9
+  minSize: 8
+  nodes:
+    - nodeId: n1
+      monAddr: a
+      clusterAddr: b
+      publicIface: e1
+      clusterIface: e2
+      osdDevice: /dev/sda
+"#;
+        let (_dir, path) = write_manifest(yaml);
+        let proto = to_proto_spec(&parse_manifest(&path).unwrap().spec);
+        assert_eq!(proto.size, 9);
+        assert_eq!(proto.min_size, 8);
+    }
 }

@@ -153,6 +153,7 @@ pub struct CephClusterRow {
     pub name: String,
     pub generation: i64,
     pub spec_json: String,
+    pub bootstrap_json: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -977,7 +978,14 @@ impl Database {
             )?;
         }
 
-        const CURRENT_VERSION: i32 = 31;
+        if version < 32 {
+            let _ = conn.execute(
+                "ALTER TABLE ceph_clusters ADD COLUMN bootstrap_json TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+        }
+
+        const CURRENT_VERSION: i32 = 32;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -2481,11 +2489,22 @@ impl Database {
     pub fn upsert_ceph_cluster(&self, row: &CephClusterRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO ceph_clusters (name, generation, spec_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, COALESCE(NULLIF(?4, ''), datetime('now')), datetime('now'))
+            "INSERT INTO ceph_clusters (name, generation, spec_json, bootstrap_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5, ''), datetime('now')), datetime('now'))
              ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,
-               spec_json=excluded.spec_json, updated_at=datetime('now')",
-            params![row.name, row.generation, row.spec_json, row.created_at],
+               spec_json=excluded.spec_json,
+               bootstrap_json=CASE
+                 WHEN excluded.bootstrap_json != '' THEN excluded.bootstrap_json
+                 ELSE ceph_clusters.bootstrap_json
+               END,
+               updated_at=datetime('now')",
+            params![
+                row.name,
+                row.generation,
+                row.spec_json,
+                row.bootstrap_json,
+                row.created_at
+            ],
         )?;
         Ok(())
     }
@@ -2493,7 +2512,7 @@ impl Database {
     pub fn get_ceph_cluster(&self, name: &str) -> Result<Option<CephClusterRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT name, generation, spec_json, created_at, updated_at
+            "SELECT name, generation, spec_json, COALESCE(bootstrap_json, ''), created_at, updated_at
              FROM ceph_clusters WHERE name=?1",
         )?;
         let mut rows = stmt.query_map(params![name], |r| {
@@ -2501,8 +2520,9 @@ impl Database {
                 name: r.get(0)?,
                 generation: r.get(1)?,
                 spec_json: r.get(2)?,
-                created_at: r.get(3)?,
-                updated_at: r.get(4)?,
+                bootstrap_json: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
             })
         })?;
         rows.next().transpose()
@@ -2511,7 +2531,7 @@ impl Database {
     pub fn list_ceph_clusters(&self) -> Result<Vec<CephClusterRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT name, generation, spec_json, created_at, updated_at
+            "SELECT name, generation, spec_json, COALESCE(bootstrap_json, ''), created_at, updated_at
              FROM ceph_clusters ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -2519,11 +2539,25 @@ impl Database {
                 name: r.get(0)?,
                 generation: r.get(1)?,
                 spec_json: r.get(2)?,
-                created_at: r.get(3)?,
-                updated_at: r.get(4)?,
+                bootstrap_json: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
             })
         })?;
         rows.collect()
+    }
+
+    pub fn set_ceph_cluster_bootstrap(
+        &self,
+        name: &str,
+        bootstrap_json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE ceph_clusters SET bootstrap_json=?2, updated_at=datetime('now') WHERE name=?1",
+            params![name, bootstrap_json],
+        )?;
+        Ok(())
     }
 
     pub fn delete_ceph_cluster(&self, name: &str) -> Result<bool, rusqlite::Error> {
@@ -2574,18 +2608,24 @@ impl Database {
         &self,
     ) -> Result<Vec<CephClusterRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
+        // Requeue until healthy: lagging observed_generation OR non-terminal phase.
         let mut stmt = conn.prepare(
-            "SELECT c.name, c.generation, c.spec_json, c.created_at, c.updated_at
+            "SELECT c.name, c.generation, c.spec_json, COALESCE(c.bootstrap_json, ''),
+                    c.created_at, c.updated_at
              FROM ceph_clusters c LEFT JOIN ceph_cluster_status s ON s.name=c.name
-             WHERE s.name IS NULL OR s.observed_generation < c.generation ORDER BY c.name",
+             WHERE s.name IS NULL
+                OR s.observed_generation < c.generation
+                OR s.phase IN ('pending', 'bootstrapping', 'degraded')
+             ORDER BY c.name",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(CephClusterRow {
                 name: r.get(0)?,
                 generation: r.get(1)?,
                 spec_json: r.get(2)?,
-                created_at: r.get(3)?,
-                updated_at: r.get(4)?,
+                bootstrap_json: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
             })
         })?;
         rows.collect()
@@ -4698,6 +4738,136 @@ mod tests {
         assert_eq!(peers[0].dc_id, "DC1");
         assert_eq!(peers[0].address, "10.0.2.1:9090");
     }
+
+    #[test]
+    fn ceph_cluster_crud_and_status_cascade() {
+        let db = Database::open(":memory:").expect("open db");
+        let row = CephClusterRow {
+            name: "lab".into(),
+            generation: 1,
+            spec_json: r#"{"fsid":"f","publicNetwork":"10.0.0.0/24","clusterNetwork":"10.1.0.0/24","size":3,"minSize":2,"nodes":[]}"#.into(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        db.upsert_ceph_cluster(&row).expect("upsert cluster");
+        let got = db.get_ceph_cluster("lab").expect("get").expect("exists");
+        assert_eq!(got.generation, 1);
+        assert_eq!(db.list_ceph_clusters().unwrap().len(), 1);
+
+        db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+            name: "lab".into(),
+            observed_generation: 0,
+            phase: "pending".into(),
+            health_message: String::new(),
+            ceph_status_json: String::new(),
+            last_transition_at: String::new(),
+        })
+        .expect("status");
+        assert!(db.get_ceph_cluster_status("lab").unwrap().is_some());
+
+        assert!(db.delete_ceph_cluster("lab").unwrap());
+        assert!(db.get_ceph_cluster("lab").unwrap().is_none());
+        assert!(
+            db.get_ceph_cluster_status("lab").unwrap().is_none(),
+            "status must cascade-delete with cluster"
+        );
+        assert!(!db.delete_ceph_cluster("lab").unwrap());
+    }
+
+    #[test]
+    fn ceph_cluster_reconcile_queue_tracks_observed_generation() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "lab".into(),
+            generation: 2,
+            spec_json: "{}".into(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        assert!(
+            db.list_ceph_clusters_needing_reconcile()
+                .unwrap()
+                .iter()
+                .any(|c| c.name == "lab"),
+            "fresh cluster must be queued"
+        );
+
+        db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+            name: "lab".into(),
+            observed_generation: 2,
+            phase: "healthy".into(),
+            health_message: "HEALTH_OK".into(),
+            ceph_status_json: String::new(),
+            last_transition_at: String::new(),
+        })
+        .unwrap();
+        assert!(
+            !db.list_ceph_clusters_needing_reconcile()
+                .unwrap()
+                .iter()
+                .any(|c| c.name == "lab"),
+            "caught-up status must leave queue"
+        );
+
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "lab".into(),
+            generation: 3,
+            spec_json: "{\"bumped\":true}".into(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        assert!(
+            db.list_ceph_clusters_needing_reconcile()
+                .unwrap()
+                .iter()
+                .any(|c| c.name == "lab"),
+            "generation bump must re-queue"
+        );
+    }
+
+    #[test]
+    fn volume_upsert_get_list_delete_by_vm() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).unwrap();
+        db.insert_vm(&test_vm("n1")).unwrap();
+
+        db.upsert_volume(&VolumeRow {
+            id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            pool: "kcore-vms".into(),
+            image: "kcore-vm-1".into(),
+            size_bytes: 10 * 1024 * 1024 * 1024,
+            created_at: String::new(),
+        })
+        .unwrap();
+        let got = db.get_volume_by_vm("vm-1").unwrap().expect("volume");
+        assert_eq!(got.pool, "kcore-vms");
+        assert_eq!(got.image, "kcore-vm-1");
+        assert_eq!(db.list_volumes().unwrap().len(), 1);
+
+        db.upsert_volume(&VolumeRow {
+            id: "vol-1b".into(),
+            vm_id: "vm-1".into(),
+            pool: "kcore-vms".into(),
+            image: "kcore-vm-1-resized".into(),
+            size_bytes: 20 * 1024 * 1024 * 1024,
+            created_at: String::new(),
+        })
+        .unwrap();
+        let updated = db.get_volume_by_vm("vm-1").unwrap().unwrap();
+        assert_eq!(updated.image, "kcore-vm-1-resized");
+        assert_eq!(updated.size_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(db.list_volumes().unwrap().len(), 1, "unique on vm_id");
+
+        assert!(db.delete_volume_by_vm("vm-1").unwrap());
+        assert!(db.get_volume_by_vm("vm-1").unwrap().is_none());
+        assert!(!db.delete_volume_by_vm("vm-1").unwrap());
+    }
 }
 
 /// Property-based tests (Phase 3) — database CRUD invariants.
@@ -5208,6 +5378,53 @@ mod proptests {
             let bumped = db.list_disk_layouts_needing_reconcile().unwrap();
             prop_assert!(bumped.iter().any(|l| l.name == name),
                 "layout whose generation moved past observed_generation must be re-queued");
+        }
+
+        /// **CephCluster reconciler queue**: same observed_generation
+        /// invariant as disk layouts — null status or lagging generation
+        /// must appear in `list_ceph_clusters_needing_reconcile`.
+        #[test]
+        fn ceph_cluster_reconcile_queue_tracks_observed_generation(
+            name in "[a-z0-9-]{1,12}",
+            generation in 1i64..=64,
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            db.upsert_ceph_cluster(&CephClusterRow {
+                name: name.clone(),
+                generation,
+                spec_json: "{}".to_string(),
+                bootstrap_json: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }).unwrap();
+
+            let pending = db.list_ceph_clusters_needing_reconcile().unwrap();
+            prop_assert!(pending.iter().any(|c| c.name == name),
+                "fresh CephCluster must be queued for reconcile");
+
+            db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+                name: name.clone(),
+                observed_generation: generation,
+                phase: "healthy".to_string(),
+                health_message: String::new(),
+                ceph_status_json: String::new(),
+                last_transition_at: String::new(),
+            }).unwrap();
+            let after = db.list_ceph_clusters_needing_reconcile().unwrap();
+            prop_assert!(!after.iter().any(|c| c.name == name),
+                "caught-up CephCluster must NOT be queued");
+
+            db.upsert_ceph_cluster(&CephClusterRow {
+                name: name.clone(),
+                generation: generation + 1,
+                spec_json: "{\"updated\":true}".to_string(),
+                bootstrap_json: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }).unwrap();
+            let bumped = db.list_ceph_clusters_needing_reconcile().unwrap();
+            prop_assert!(bumped.iter().any(|c| c.name == name),
+                "CephCluster whose generation moved past observed_generation must be re-queued");
         }
 
         /// **Operator create/list**: `create_operator` + `list_operator_rows` round-trip.

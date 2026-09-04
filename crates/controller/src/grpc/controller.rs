@@ -629,7 +629,7 @@ impl ControllerService {
             .collect()
     }
 
-    fn ceph_member_ids(&self) -> HashSet<String> {
+    pub(crate) fn ceph_member_ids(&self) -> HashSet<String> {
         self.db
             .list_ceph_clusters()
             .unwrap_or_default()
@@ -639,7 +639,7 @@ impl ControllerService {
             .collect()
     }
 
-    fn node_supports_backend(&self, node: &NodeRow, backend: &str) -> bool {
+    pub(crate) fn node_supports_backend(&self, node: &NodeRow, backend: &str) -> bool {
         node.storage_backend == backend
             || (backend == "ceph" && self.ceph_member_ids().contains(&node.id))
     }
@@ -2084,6 +2084,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
         };
 
         if vm.storage_backend == "ceph" {
+            let healthy_member = self
+                .db
+                .list_ceph_clusters()
+                .map_err(|e| Status::internal(e.to_string()))?
+                .into_iter()
+                .any(|c| {
+                    let Ok(Some(st)) = self.db.get_ceph_cluster_status(&c.name) else {
+                        return false;
+                    };
+                    st.phase == "healthy"
+                        && ceph_cluster_spec::spec_from_json(&c.spec_json)
+                            .map(|s| s.nodes.iter().any(|n| n.node_id == node.id))
+                            .unwrap_or(false)
+                });
+            if !healthy_member {
+                return Err(Status::failed_precondition(
+                    "storage_backend ceph requires a healthy CephCluster that includes the target node",
+                ));
+            }
             if self.clients.get_storage(&node.address).is_none() {
                 self.clients
                     .connect(&node.address)
@@ -2280,6 +2299,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
+        let volume = self
+            .db
+            .get_volume_by_vm(&req.vm_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let deleted = self
             .db
@@ -2288,9 +2311,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
         if !deleted {
             return Err(Status::not_found(format!("VM '{}' not found", req.vm_id)));
         }
-        self.db
-            .delete_volume_by_vm(&req.vm_id)
-            .map_err(|e| Status::internal(format!("deleting volume row: {e}")))?;
+        if let Some(vol) = volume {
+            if self.clients.get_storage(&node.address).is_none() {
+                let _ = self.clients.connect(&node.address).await;
+            }
+            if let Some(mut storage) = self.clients.get_storage(&node.address) {
+                let handle = format!("{}/{}", vol.pool, vol.image);
+                if let Err(e) = storage
+                    .delete_volume(node_proto::DeleteVolumeRequest {
+                        backend_handle: handle,
+                    })
+                    .await
+                {
+                    warn!(vm_id = %req.vm_id, error = %e, "failed to delete RBD volume");
+                }
+            }
+            self.db
+                .delete_volume_by_vm(&req.vm_id)
+                .map_err(|e| Status::internal(format!("deleting volume row: {e}")))?;
+        }
 
         info!(vm_id = %req.vm_id, node_id = %node.id, "deleted VM, pushing config");
 
@@ -5535,6 +5574,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 name: name.clone(),
                 generation,
                 spec_json,
+                bootstrap_json: existing
+                    .as_ref()
+                    .map(|e| e.bootstrap_json.clone())
+                    .unwrap_or_default(),
                 created_at: existing
                     .as_ref()
                     .map(|e| e.created_at.clone())
@@ -8400,5 +8443,308 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["node-1".to_string(), "node-2".to_string()]);
         assert!(resp.issues.is_empty());
+    }
+
+    fn make_ceph_spec(node_ids: &[&str]) -> controller_proto::CephClusterSpec {
+        controller_proto::CephClusterSpec {
+            fsid: String::new(),
+            public_network: "10.10.0.0/24".into(),
+            cluster_network: "10.20.0.0/24".into(),
+            size: 3,
+            min_size: 2,
+            force_wipe: false,
+            nodes: node_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| controller_proto::CephClusterNodeSpec {
+                    node_id: (*id).into(),
+                    mon_addr: format!("10.10.0.{}:6789", 11 + i),
+                    cluster_addr: format!("10.20.0.{}", 11 + i),
+                    public_iface: "eth1".into(),
+                    cluster_iface: "eth2".into(),
+                    osd_device: "/dev/nvme0n1".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_ceph_cluster_creates_then_unchanged_then_updated() {
+        let (db, svc) = cluster_svc();
+        let mut spec = make_ceph_spec(&["node-1", "node-2"]);
+        spec.fsid = "11111111-2222-3333-4444-555555555555".into();
+
+        let created = <ControllerService as controller_proto::controller_server::Controller>::create_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::CreateCephClusterRequest {
+                ceph_cluster: Some(controller_proto::CephCluster {
+                    name: "lab".into(),
+                    generation: 0,
+                    spec: Some(spec.clone()),
+                    status: None,
+                    created_at: None,
+                    updated_at: None,
+                }),
+            }),
+        )
+        .await
+        .expect("create")
+        .into_inner();
+        assert_eq!(
+            created.action,
+            controller_proto::ApplyAction::Created as i32
+        );
+        let cluster = created.ceph_cluster.expect("cluster");
+        assert_eq!(cluster.generation, 1);
+        assert_eq!(
+            cluster.spec.as_ref().unwrap().fsid,
+            "11111111-2222-3333-4444-555555555555"
+        );
+        let status = cluster.status.expect("status");
+        assert_eq!(
+            status.phase,
+            controller_proto::CephClusterPhase::Pending as i32
+        );
+        assert!(db
+            .list_ceph_clusters_needing_reconcile()
+            .unwrap()
+            .iter()
+            .any(|c| c.name == "lab"));
+
+        let same = <ControllerService as controller_proto::controller_server::Controller>::create_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::CreateCephClusterRequest {
+                ceph_cluster: Some(controller_proto::CephCluster {
+                    name: "lab".into(),
+                    generation: 0,
+                    spec: Some(spec.clone()),
+                    status: None,
+                    created_at: None,
+                    updated_at: None,
+                }),
+            }),
+        )
+        .await
+        .expect("unchanged")
+        .into_inner();
+        assert_eq!(same.action, controller_proto::ApplyAction::Unchanged as i32);
+        assert!(same.changed_fields.is_empty());
+
+        spec.force_wipe = true;
+        let updated = <ControllerService as controller_proto::controller_server::Controller>::create_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::CreateCephClusterRequest {
+                ceph_cluster: Some(controller_proto::CephCluster {
+                    name: "lab".into(),
+                    generation: 0,
+                    spec: Some(spec),
+                    status: None,
+                    created_at: None,
+                    updated_at: None,
+                }),
+            }),
+        )
+        .await
+        .expect("updated")
+        .into_inner();
+        assert_eq!(
+            updated.action,
+            controller_proto::ApplyAction::Updated as i32
+        );
+        assert_eq!(updated.changed_fields, vec!["spec".to_string()]);
+        assert_eq!(updated.ceph_cluster.unwrap().generation, 2);
+    }
+
+    #[tokio::test]
+    async fn create_ceph_cluster_auto_generates_and_preserves_fsid() {
+        let (_db, svc) = cluster_svc();
+        let mut spec = make_ceph_spec(&["node-1"]);
+        spec.fsid.clear();
+
+        let created = <ControllerService as controller_proto::controller_server::Controller>::create_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::CreateCephClusterRequest {
+                ceph_cluster: Some(controller_proto::CephCluster {
+                    name: "auto-fsid".into(),
+                    generation: 0,
+                    spec: Some(spec.clone()),
+                    status: None,
+                    created_at: None,
+                    updated_at: None,
+                }),
+            }),
+        )
+        .await
+        .expect("create")
+        .into_inner();
+        let fsid = created
+            .ceph_cluster
+            .as_ref()
+            .and_then(|c| c.spec.as_ref())
+            .map(|s| s.fsid.clone())
+            .expect("fsid");
+        assert!(!fsid.is_empty(), "empty fsid must be auto-generated");
+        assert!(Uuid::parse_str(&fsid).is_ok());
+
+        spec.force_wipe = true;
+        spec.fsid.clear();
+        let updated = <ControllerService as controller_proto::controller_server::Controller>::create_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::CreateCephClusterRequest {
+                ceph_cluster: Some(controller_proto::CephCluster {
+                    name: "auto-fsid".into(),
+                    generation: 0,
+                    spec: Some(spec),
+                    status: None,
+                    created_at: None,
+                    updated_at: None,
+                }),
+            }),
+        )
+        .await
+        .expect("update")
+        .into_inner();
+        assert_eq!(
+            updated.ceph_cluster.unwrap().spec.unwrap().fsid,
+            fsid,
+            "re-apply with empty fsid must preserve prior fsid"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_ceph_cluster_rejects_unregistered_node() {
+        let (_db, svc) = cluster_svc();
+        let spec = make_ceph_spec(&["node-1", "ghost-node"]);
+        let err = <ControllerService as controller_proto::controller_server::Controller>::create_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::CreateCephClusterRequest {
+                ceph_cluster: Some(controller_proto::CephCluster {
+                    name: "bad".into(),
+                    generation: 0,
+                    spec: Some(spec),
+                    status: None,
+                    created_at: None,
+                    updated_at: None,
+                }),
+            }),
+        )
+        .await
+        .expect_err("unknown node");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(err.message().contains("ghost-node"));
+    }
+
+    #[tokio::test]
+    async fn get_list_delete_ceph_cluster() {
+        let (_db, svc) = cluster_svc();
+        let mut spec = make_ceph_spec(&["node-1"]);
+        spec.fsid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into();
+        <ControllerService as controller_proto::controller_server::Controller>::create_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::CreateCephClusterRequest {
+                ceph_cluster: Some(controller_proto::CephCluster {
+                    name: "lab".into(),
+                    generation: 0,
+                    spec: Some(spec),
+                    status: None,
+                    created_at: None,
+                    updated_at: None,
+                }),
+            }),
+        )
+        .await
+        .expect("create");
+
+        let got = <ControllerService as controller_proto::controller_server::Controller>::get_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::GetCephClusterRequest {
+                name: "lab".into(),
+            }),
+        )
+        .await
+        .expect("get")
+        .into_inner();
+        assert_eq!(got.ceph_cluster.unwrap().name, "lab");
+
+        let missing = <ControllerService as controller_proto::controller_server::Controller>::get_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::GetCephClusterRequest {
+                name: "nope".into(),
+            }),
+        )
+        .await
+        .expect_err("missing");
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        let listed = <ControllerService as controller_proto::controller_server::Controller>::list_ceph_clusters(
+            &svc,
+            Request::new(controller_proto::ListCephClustersRequest {}),
+        )
+        .await
+        .expect("list")
+        .into_inner();
+        assert_eq!(listed.ceph_clusters.len(), 1);
+
+        let deleted = <ControllerService as controller_proto::controller_server::Controller>::delete_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::DeleteCephClusterRequest {
+                name: "lab".into(),
+            }),
+        )
+        .await
+        .expect("delete")
+        .into_inner();
+        assert!(deleted.success);
+
+        let again = <ControllerService as controller_proto::controller_server::Controller>::delete_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::DeleteCephClusterRequest {
+                name: "lab".into(),
+            }),
+        )
+        .await
+        .expect("second delete")
+        .into_inner();
+        assert!(!again.success);
+
+        let empty = <ControllerService as controller_proto::controller_server::Controller>::list_ceph_clusters(
+            &svc,
+            Request::new(controller_proto::ListCephClustersRequest {}),
+        )
+        .await
+        .expect("list empty")
+        .into_inner();
+        assert!(empty.ceph_clusters.is_empty());
+    }
+
+    #[test]
+    fn node_supports_backend_treats_ceph_cluster_members_as_eligible() {
+        let (db, svc) = cluster_svc();
+        let mut node = test_node();
+        node.storage_backend = "filesystem".into();
+        assert!(
+            !svc.node_supports_backend(&node, "ceph"),
+            "filesystem-only node must not support ceph without membership"
+        );
+
+        let mut spec = make_ceph_spec(&["node-1"]);
+        spec.fsid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into();
+        let spec_json = crate::ceph_cluster_spec::spec_to_json(&spec).unwrap();
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "lab".into(),
+            generation: 1,
+            spec_json,
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+
+        assert!(svc.ceph_member_ids().contains("node-1"));
+        assert!(
+            svc.node_supports_backend(&node, "ceph"),
+            "CephCluster member must schedule ceph VMs even if node.storage_backend is filesystem"
+        );
+        assert!(!svc.node_supports_backend(&node, "zfs"));
     }
 }

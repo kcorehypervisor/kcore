@@ -106,6 +106,7 @@ service NodeAdmin {
   rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
   rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
   rpc GetCephHealth(GetCephHealthRequest) returns (GetCephHealthResponse);
+  rpc EnsureCephPool(EnsureCephPoolRequest) returns (EnsureCephPoolResponse);
 }
 
 // VM specification
@@ -759,12 +760,20 @@ message ApplyCephConfigRequest {
   bool mgr = 5;
   bool osd = 6;
   string daemon_id = 7;
+  // JSON bootstrap package (UTF-8): admin/mon/bootstrap-osd keyrings + mon map.
+  // Empty on first apply; node generates and returns it in the response.
   bytes keyring = 8;
+  // Comma-separated "daemonId=ip" pairs for monmap (public mon IPs, no ports).
+  string mon_map = 9;
+  string public_addr = 10;
+  string cluster_addr = 11;
 }
 
 message ApplyCephConfigResponse {
   bool success = 1;
   string message = 2;
+  // Populated when this node generated the cluster bootstrap package.
+  bytes keyring = 3;
 }
 
 message BootstrapCephOsdRequest {
@@ -777,6 +786,7 @@ message BootstrapCephOsdResponse {
   bool success = 1;
   bool already_prepared = 2;
   string message = 3;
+  string osd_id = 4;
 }
 
 message GetCephHealthRequest { string cluster_name = 1; }
@@ -786,5 +796,17 @@ message GetCephHealthResponse {
   string raw_status = 2;
   int32 osd_up = 3;
   int32 osd_in = 4;
+}
+
+message EnsureCephPoolRequest {
+  string pool = 1;
+  int32 size = 2;
+  int32 min_size = 3;
+}
+
+message EnsureCephPoolResponse {
+  bool success = 1;
+  bool created = 2;
+  string message = 3;
 }
 

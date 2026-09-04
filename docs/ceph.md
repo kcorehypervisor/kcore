@@ -2,7 +2,7 @@
 
 kcore SAN is the cluster’s distributed shared block storage fabric. It is powered by **Ceph** on NixOS; the controller fills the gaps that NixOS does not declare (FSID/keyrings, `ceph-volume` OSD prepare, pools, health, and later RBD lifecycle).
 
-Public product docs: [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html). Roadmap status: **In Progress**.
+Public product docs: [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html). Roadmap status: **Phases 1–2 shipped** (live migration still planned).
 
 ## Lab topology (3 Dell towers)
 
@@ -29,8 +29,9 @@ spec:
   fsid: "2f3f204e-65ca-4b69-a86c-bf8408f5c792"
   publicNetwork: "10.10.0.0/24"
   clusterNetwork: "10.20.0.0/24"   # MikroTik 10Gb
-  size: 3
-  minSize: 2
+  replication:
+    size: 3
+    minSize: 2
   # forceWipe: false   # set true only to erase an OSD disk with existing signatures
   nodes:
     - nodeId: dell-1
@@ -71,10 +72,11 @@ kctl --node <addr>:9091 node disks
 
 ### What the control plane does
 
-1. Persist desired state (`ceph_clusters` + generation).
-2. Reconciler pushes per-node Nix (`kcore-ceph` / `services.ceph`) via node `ApplyCephConfig`.
-3. Bootstraps OSD disks with `BootstrapCephOsd` (`ceph-volume`), refusing non-empty devices unless `forceWipe: true`.
-4. Polls `GetCephHealth` until status is healthy (or records degraded/failed).
+1. Persist desired state (`ceph_clusters` + generation + bootstrap secrets).
+2. Reconciler pushes per-node Nix (`kcore-ceph` / `services.ceph`, cluster name always `ceph`, full `mon_host` list) via node `ApplyCephConfig`.
+3. First node generates mon/admin/bootstrap-osd keyrings with `ceph-authtool`; the controller redistributes that package to every member, then each node runs `ceph-mon --mkfs` / mgr auth.
+4. Bootstraps OSD disks with `BootstrapCephOsd` (`ceph-volume lvm create`, activates systemd units), refusing non-empty devices unless `forceWipe: true`.
+5. Ensures RBD pool `kcore-vms` (`EnsureCephPool`) and polls `GetCephHealth` until `HEALTH_OK` (degraded/failed stays queued).
 
 NixOS module: [`modules/kcore-ceph.nix`](../modules/kcore-ceph.nix). Runtime packages come from nixpkgs Ceph; KCore owns bootstrap RPCs in the node-agent.
 
@@ -82,10 +84,11 @@ NixOS module: [`modules/kcore-ceph.nix`](../modules/kcore-ceph.nix). Runtime pac
 
 Once the fabric is healthy:
 
-- Create VMs with `--storage-backend ceph --storage-size-bytes …`.
-- Controller allocates a cluster-scoped RBD image in pool `kcore-vms` (volume row independent of node).
-- Node-agent maps RBD before Cloud Hypervisor starts; any Ceph member node can run the VM.
-- Drain / reassignment of `ceph` VMs does **not** require copying local disks (still cold stop/start until live migration).
+- Create VMs with `--storage-backend ceph --storage-size-bytes …` (rejected until a healthy `CephCluster` includes the target node).
+- Controller allocates a cluster-scoped RBD image in pool `kcore-vms` (volume row independent of node); size is passed to `rbd create` in **MiB**.
+- Node-agent maps RBD and seeds the guest image once (`qemu-img convert`) before Cloud Hypervisor starts; any Ceph member node can run the VM.
+- `kctl drain <node>` reassigns Ceph VMs to other members without copying disks (cold stop/start until live migration).
+- Deleting a Ceph VM best-effort removes the RBD image.
 
 ```bash
 kctl create vm app-1 \
