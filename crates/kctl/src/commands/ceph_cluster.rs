@@ -141,10 +141,7 @@ pub async fn list(info: &ConnectionInfo) -> Result<()> {
         println!("No Ceph clusters found");
         return Ok(());
     }
-    println!(
-        "{:<24}  {:>4}  {:<14}  {}",
-        "NAME", "GEN", "PHASE", "HEALTH"
-    );
+    println!("{:<24}  {:>4}  {:<14}  HEALTH", "NAME", "GEN", "PHASE");
     for cluster in resp.ceph_clusters {
         let status = cluster.status.unwrap_or_default();
         let phase = controller_proto::CephClusterPhase::try_from(status.phase)
