@@ -57,11 +57,25 @@ service Controller {
   rpc RejectNode(RejectNodeRequest) returns (RejectNodeResponse);
 
   // Certificate rotation
+  // DEPRECATED: ships a controller-generated private key over the wire. Use
+  // SignNodeCsr, which keeps the node private key on the node. Kept so older
+  // node-agents keep renewing until they are upgraded.
   rpc RenewNodeCert(RenewNodeCertRequest) returns (RenewNodeCertResponse);
   // Bootstrap a node cert/key pair signed by controller sub-CA for fresh installs.
   rpc IssueNodeBootstrapCert(IssueNodeBootstrapCertRequest) returns (IssueNodeBootstrapCertResponse);
   rpc RotateSubCa(RotateSubCaRequest) returns (RotateSubCaResponse);
   rpc ReloadTls(ReloadTlsRequest) returns (ReloadTlsResponse);
+
+  // PKI lifecycle: CSR-based rotation, inventory, revocation, CRL/OCSP.
+  // The node generates its own keypair and submits a CSR; the private key
+  // never leaves the node.
+  rpc SignNodeCsr(SignNodeCsrRequest) returns (SignNodeCsrResponse);
+  // Operator-triggered rotation for one node or the whole cluster.
+  rpc RotateNodeCerts(RotateNodeCertsRequest) returns (RotateNodeCertsResponse);
+  rpc ListCertificates(ListCertificatesRequest) returns (ListCertificatesResponse);
+  rpc RevokeCertificate(RevokeCertificateRequest) returns (RevokeCertificateResponse);
+  rpc GetCrl(GetCrlRequest) returns (GetCrlResponse);
+  rpc GetPkiStatus(GetPkiStatusRequest) returns (GetPkiStatusResponse);
 
   // Compliance
   rpc GetComplianceReport(GetComplianceReportRequest) returns (GetComplianceReportResponse);
@@ -1489,3 +1503,158 @@ message ListCephClustersRequest {}
 message ListCephClustersResponse { repeated CephCluster ceph_clusters = 1; }
 message DeleteCephClusterRequest { string name = 1; }
 message DeleteCephClusterResponse { bool success = 1; }
+
+// ---------------------------------------------------------------------------
+// PKI: certificate inventory, CSR-based rotation, revocation, CRL and OCSP.
+// See docs/mtls-bootstrap-and-auth.md section 4 and docs/security.md.
+// ---------------------------------------------------------------------------
+
+// RFC 5280 §5.3.1 CRL reason codes. Value 7 is unused by the RFC.
+enum RevocationReason {
+  REVOCATION_REASON_UNSPECIFIED = 0;
+  REVOCATION_REASON_KEY_COMPROMISE = 1;
+  REVOCATION_REASON_CA_COMPROMISE = 2;
+  REVOCATION_REASON_AFFILIATION_CHANGED = 3;
+  REVOCATION_REASON_SUPERSEDED = 4;
+  REVOCATION_REASON_CESSATION_OF_OPERATION = 5;
+  REVOCATION_REASON_CERTIFICATE_HOLD = 6;
+  REVOCATION_REASON_REMOVE_FROM_CRL = 8;
+  REVOCATION_REASON_PRIVILEGE_WITHDRAWN = 9;
+  REVOCATION_REASON_AA_COMPROMISE = 10;
+}
+
+enum CertificateStatus {
+  CERTIFICATE_STATUS_UNSPECIFIED = 0;
+  // Current identity for its subject.
+  CERTIFICATE_STATUS_ACTIVE = 1;
+  // Superseded by a newer certificate for the same subject; still valid until
+  // not_after unless it is also revoked.
+  CERTIFICATE_STATUS_ROTATED = 2;
+  CERTIFICATE_STATUS_REVOKED = 3;
+}
+
+// One row of the controller certificate inventory.
+message CertificateInfo {
+  // Uppercase hex, no separators (matches `openssl x509 -serial` output).
+  string serial_hex = 1;
+  string subject_cn = 2;
+  // "node" | "operator" | "controller" | "sub-ca"
+  string identity_kind = 3;
+  // Empty for identities that are not tied to a node.
+  string node_id = 4;
+  string issuer_cn = 5;
+  // Lowercase hex SHA-256 of the DER certificate.
+  string fingerprint_sha256 = 6;
+  google.protobuf.Timestamp not_before = 7;
+  google.protobuf.Timestamp not_after = 8;
+  google.protobuf.Timestamp issued_at = 9;
+  CertificateStatus status = 10;
+  RevocationReason revocation_reason = 11;
+  google.protobuf.Timestamp revoked_at = 12;
+  // Whole days until not_after; negative when already expired.
+  int32 days_until_expiry = 13;
+}
+
+message SignNodeCsrRequest {
+  string node_id = 1;
+  // PEM PKCS#10 certificate signing request generated on the node.
+  string csr_pem = 2;
+}
+
+message SignNodeCsrResponse {
+  bool success = 1;
+  // Leaf certificate + sub-CA certificate, concatenated PEM.
+  string cert_chain_pem = 2;
+  string serial_hex = 3;
+  google.protobuf.Timestamp not_after = 4;
+  string message = 5;
+}
+
+message RotateNodeCertsRequest {
+  // Rotate a single node. Ignored when all_nodes is true.
+  string node_id = 1;
+  bool all_nodes = 2;
+}
+
+message NodeCertRotationResult {
+  string node_id = 1;
+  bool success = 2;
+  string serial_hex = 3;
+  string message = 4;
+}
+
+message RotateNodeCertsResponse {
+  bool success = 1;
+  repeated NodeCertRotationResult results = 2;
+  string message = 3;
+}
+
+message ListCertificatesRequest {
+  // Optional filter; unspecified returns every inventory row.
+  CertificateStatus status = 1;
+  // Optional node id filter.
+  string node_id = 2;
+  // When > 0, only certificates whose not_after is within this many days.
+  int32 expiring_within_days = 3;
+}
+
+message ListCertificatesResponse {
+  repeated CertificateInfo certificates = 1;
+}
+
+message RevokeCertificateRequest {
+  // Either serial_hex, or subject_cn/node_id to revoke the active certificate
+  // of that identity. serial_hex wins when both are supplied.
+  string serial_hex = 1;
+  string subject_cn = 2;
+  string node_id = 3;
+  RevocationReason reason = 4;
+}
+
+message RevokeCertificateResponse {
+  bool success = 1;
+  repeated CertificateInfo revoked = 2;
+  // CRL number of the regenerated list, 0 when regeneration was skipped.
+  int64 crl_number = 3;
+  string message = 4;
+}
+
+message GetCrlRequest {}
+
+message GetCrlResponse {
+  bool success = 1;
+  string crl_pem = 2;
+  bytes crl_der = 3;
+  int64 crl_number = 4;
+  google.protobuf.Timestamp this_update = 5;
+  google.protobuf.Timestamp next_update = 6;
+  int32 revoked_count = 7;
+  string message = 8;
+}
+
+message GetPkiStatusRequest {}
+
+message GetPkiStatusResponse {
+  int32 active_count = 1;
+  int32 rotated_count = 2;
+  int32 revoked_count = 3;
+  int32 expired_count = 4;
+  // Active certificates inside the configured warning window.
+  int32 expiring_soon_count = 5;
+  int32 warn_before_days = 6;
+  int32 renew_before_days = 7;
+  bool rotation_enabled = 8;
+  int64 crl_number = 9;
+  google.protobuf.Timestamp crl_this_update = 10;
+  google.protobuf.Timestamp crl_next_update = 11;
+  bool crl_available = 12;
+  bool sub_ca_available = 13;
+  google.protobuf.Timestamp sub_ca_not_after = 14;
+  // "soft-fail" or "hard-fail".
+  string revocation_fail_mode = 15;
+  // Base URL serving /pki/crl.der, /pki/crl.pem and /pki/ocsp; empty when the
+  // PKI HTTP responder is disabled.
+  string pki_http_base_url = 16;
+  // Active certificates sorted by soonest not_after (at most 20 rows).
+  repeated CertificateInfo soonest_expiring = 17;
+}

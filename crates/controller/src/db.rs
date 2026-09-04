@@ -315,6 +315,43 @@ pub struct AuditEventRow {
     pub detail: String,
 }
 
+pub const CERT_STATUS_ACTIVE: &str = "active";
+pub const CERT_STATUS_ROTATED: &str = "rotated";
+pub const CERT_STATUS_REVOKED: &str = "revoked";
+
+/// One certificate the controller has issued (`issued_certificates`).
+///
+/// Timestamps are RFC3339 `%Y-%m-%dT%H:%M:%SZ` strings so lexicographic
+/// comparison in SQL matches chronological order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuedCertRow {
+    pub serial_hex: String,
+    pub subject_cn: String,
+    pub identity_kind: String,
+    pub node_id: String,
+    pub issuer_cn: String,
+    pub fingerprint_sha256: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub issued_at: String,
+    pub status: String,
+    /// RFC 5280 reason code, or -1 when the certificate is not revoked.
+    pub revocation_reason: i32,
+    pub revoked_at: String,
+}
+
+/// Last CRL the controller signed (`crl_state`, single row).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrlStateRow {
+    pub crl_number: i64,
+    pub this_update: String,
+    pub next_update: String,
+    pub crl_pem: String,
+    pub crl_der: Vec<u8>,
+    pub revoked_count: i32,
+    pub issuer_fingerprint: String,
+}
+
 impl Database {
     pub fn open(path: &str) -> Result<Self> {
         validate_database_path(path)?;
@@ -985,7 +1022,50 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 32;
+        // Certificate inventory + signed CRL state (docs/mtls-bootstrap-and-auth.md §4).
+        // `serial_hex` is uppercase hex without separators so it matches
+        // `openssl x509 -serial` output and can be compared to the serial
+        // extracted from a peer certificate without normalisation.
+        if version < 33 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS issued_certificates (
+                    serial_hex TEXT PRIMARY KEY,
+                    subject_cn TEXT NOT NULL,
+                    identity_kind TEXT NOT NULL DEFAULT 'node',
+                    node_id TEXT NOT NULL DEFAULT '',
+                    issuer_cn TEXT NOT NULL DEFAULT '',
+                    fingerprint_sha256 TEXT NOT NULL DEFAULT '',
+                    not_before TEXT NOT NULL,
+                    not_after TEXT NOT NULL,
+                    issued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                    status TEXT NOT NULL DEFAULT 'active',
+                    revocation_reason INTEGER NOT NULL DEFAULT -1,
+                    revoked_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_issued_certs_status
+                  ON issued_certificates(status);
+                CREATE INDEX IF NOT EXISTS idx_issued_certs_not_after
+                  ON issued_certificates(not_after);
+                CREATE INDEX IF NOT EXISTS idx_issued_certs_node
+                  ON issued_certificates(node_id);
+                CREATE INDEX IF NOT EXISTS idx_issued_certs_subject
+                  ON issued_certificates(subject_cn);
+                -- Single row (id = 1) holding the last signed CRL so crl_number
+                -- stays monotonic across controller restarts.
+                CREATE TABLE IF NOT EXISTS crl_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    crl_number INTEGER NOT NULL DEFAULT 0,
+                    this_update TEXT NOT NULL DEFAULT '',
+                    next_update TEXT NOT NULL DEFAULT '',
+                    crl_pem TEXT NOT NULL DEFAULT '',
+                    crl_der BLOB NOT NULL DEFAULT x'',
+                    revoked_count INTEGER NOT NULL DEFAULT 0,
+                    issuer_fingerprint TEXT NOT NULL DEFAULT ''
+                );",
+            )?;
+        }
+
+        const CURRENT_VERSION: i32 = 33;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -3581,6 +3661,319 @@ impl Database {
         )?;
         Ok((tpm2, keyfile, unknown))
     }
+
+    // --- Certificate inventory (issued_certificates) -----------------------
+
+    /// Record a newly signed certificate. Re-recording the same serial is a
+    /// no-op on the revocation columns so a replayed insert cannot resurrect a
+    /// revoked serial as active.
+    pub fn record_issued_certificate(&self, row: &IssuedCertRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO issued_certificates
+                (serial_hex, subject_cn, identity_kind, node_id, issuer_cn,
+                 fingerprint_sha256, not_before, not_after, issued_at, status,
+                 revocation_reason, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(serial_hex) DO UPDATE SET
+                subject_cn=excluded.subject_cn,
+                identity_kind=excluded.identity_kind,
+                node_id=excluded.node_id,
+                issuer_cn=excluded.issuer_cn,
+                fingerprint_sha256=excluded.fingerprint_sha256,
+                not_before=excluded.not_before,
+                not_after=excluded.not_after",
+            params![
+                row.serial_hex,
+                row.subject_cn,
+                row.identity_kind,
+                row.node_id,
+                row.issuer_cn,
+                row.fingerprint_sha256,
+                row.not_before,
+                row.not_after,
+                row.issued_at,
+                row.status,
+                row.revocation_reason,
+                row.revoked_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark every `active` certificate for `subject_cn` (except `keep_serial`)
+    /// as `rotated`. Revoked rows are left alone.
+    pub fn mark_superseded_certificates(
+        &self,
+        subject_cn: &str,
+        keep_serial: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE issued_certificates SET status=?3
+             WHERE subject_cn=?1 AND serial_hex<>?2 AND status=?4",
+            params![
+                subject_cn,
+                keep_serial,
+                CERT_STATUS_ROTATED,
+                CERT_STATUS_ACTIVE
+            ],
+        )
+    }
+
+    pub fn get_issued_certificate(
+        &self,
+        serial_hex: &str,
+    ) -> Result<Option<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!("{ISSUED_CERT_SELECT} WHERE serial_hex=?1"))?;
+        let mut rows = stmt.query_map(params![serial_hex], map_issued_cert_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Inventory rows ordered by soonest expiry first.
+    ///
+    /// `status` filters on the status column when non-empty; `node_id` filters
+    /// on node when non-empty; `expiring_before` (RFC3339) keeps only rows with
+    /// `not_after` strictly before it when non-empty.
+    pub fn list_issued_certificates(
+        &self,
+        status: &str,
+        node_id: &str,
+        expiring_before: &str,
+    ) -> Result<Vec<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{ISSUED_CERT_SELECT}
+             WHERE (?1 = '' OR status = ?1)
+               AND (?2 = '' OR node_id = ?2)
+               AND (?3 = '' OR not_after < ?3)
+             ORDER BY not_after ASC, serial_hex ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![status, node_id, expiring_before],
+            map_issued_cert_row,
+        )?;
+        rows.collect()
+    }
+
+    /// Active, unexpired certificates whose `not_after` is at or before
+    /// `threshold` (RFC3339) — the rotation reconciler's work queue.
+    pub fn list_certificates_needing_rotation(
+        &self,
+        threshold: &str,
+        now: &str,
+    ) -> Result<Vec<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{ISSUED_CERT_SELECT}
+             WHERE status = ?3 AND not_after <= ?1 AND not_after > ?2
+             ORDER BY not_after ASC, serial_hex ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![threshold, now, CERT_STATUS_ACTIVE],
+            map_issued_cert_row,
+        )?;
+        rows.collect()
+    }
+
+    /// Newest active certificate for a node, if the node has one on record.
+    pub fn get_active_certificate_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{ISSUED_CERT_SELECT}
+             WHERE node_id=?1 AND status=?2
+             ORDER BY not_after DESC, serial_hex ASC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map(params![node_id, CERT_STATUS_ACTIVE], map_issued_cert_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Revoke by serial. Returns the updated row, or `None` when the serial is
+    /// unknown. Already-revoked serials keep their original reason and time so
+    /// the CRL entry stays stable.
+    pub fn revoke_certificate_by_serial(
+        &self,
+        serial_hex: &str,
+        reason: i32,
+        revoked_at: &str,
+    ) -> Result<Option<IssuedCertRow>, rusqlite::Error> {
+        {
+            let conn = self.lock_conn()?;
+            conn.execute(
+                "UPDATE issued_certificates
+                 SET status=?2, revocation_reason=?3, revoked_at=?4
+                 WHERE serial_hex=?1 AND status<>?2",
+                params![serial_hex, CERT_STATUS_REVOKED, reason, revoked_at],
+            )?;
+        }
+        self.get_issued_certificate(serial_hex)
+    }
+
+    /// Serials to revoke for an identity: every non-revoked row matching
+    /// `subject_cn` (when non-empty) or `node_id` (when non-empty).
+    pub fn find_revocable_serials(
+        &self,
+        subject_cn: &str,
+        node_id: &str,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT serial_hex FROM issued_certificates
+             WHERE status <> ?3
+               AND ((?1 <> '' AND subject_cn = ?1) OR (?2 <> '' AND node_id = ?2))
+             ORDER BY not_after DESC, serial_hex ASC",
+        )?;
+        let rows = stmt.query_map(params![subject_cn, node_id, CERT_STATUS_REVOKED], |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.collect()
+    }
+
+    /// `(serial_hex, revocation_reason, revoked_at)` for every revoked row —
+    /// the CRL contents.
+    pub fn list_revoked_certificates(&self) -> Result<Vec<(String, i32, String)>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT serial_hex, revocation_reason, revoked_at
+             FROM issued_certificates WHERE status = ?1
+             ORDER BY serial_hex ASC",
+        )?;
+        let rows = stmt.query_map(params![CERT_STATUS_REVOKED], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Just the revoked serial set, for the hot enforcement path.
+    pub fn revoked_serial_set(&self) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt =
+            conn.prepare("SELECT serial_hex FROM issued_certificates WHERE status = ?1")?;
+        let rows = stmt.query_map(params![CERT_STATUS_REVOKED], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// `(active, rotated, revoked, expired, expiring_soon)` inventory counts.
+    /// `expired` counts non-revoked rows already past `not_after`; a row is
+    /// counted once, with `expired` taking precedence over `active`.
+    pub fn count_certificates(
+        &self,
+        now: &str,
+        warn_threshold: &str,
+    ) -> Result<(i32, i32, i32, i32, i32), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i32, rusqlite::Error> {
+            conn.query_row(sql, p, |row| row.get(0))
+        };
+        let active = count(
+            "SELECT COUNT(*) FROM issued_certificates WHERE status=?1 AND not_after > ?2",
+            &[&CERT_STATUS_ACTIVE, &now],
+        )?;
+        let rotated = count(
+            "SELECT COUNT(*) FROM issued_certificates WHERE status=?1 AND not_after > ?2",
+            &[&CERT_STATUS_ROTATED, &now],
+        )?;
+        let revoked = count(
+            "SELECT COUNT(*) FROM issued_certificates WHERE status=?1",
+            &[&CERT_STATUS_REVOKED],
+        )?;
+        let expired = count(
+            "SELECT COUNT(*) FROM issued_certificates WHERE status<>?1 AND not_after <= ?2",
+            &[&CERT_STATUS_REVOKED, &now],
+        )?;
+        let expiring_soon = count(
+            "SELECT COUNT(*) FROM issued_certificates
+             WHERE status=?1 AND not_after > ?2 AND not_after <= ?3",
+            &[&CERT_STATUS_ACTIVE, &now, &warn_threshold],
+        )?;
+        Ok((active, rotated, revoked, expired, expiring_soon))
+    }
+
+    // --- CRL state (crl_state, single row) ---------------------------------
+
+    pub fn get_crl_state(&self) -> Result<Option<CrlStateRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT crl_number, this_update, next_update, crl_pem, crl_der,
+                    revoked_count, issuer_fingerprint
+             FROM crl_state WHERE id = 1",
+        )?;
+        let mut rows = stmt.query_map([], |r| {
+            Ok(CrlStateRow {
+                crl_number: r.get(0)?,
+                this_update: r.get(1)?,
+                next_update: r.get(2)?,
+                crl_pem: r.get(3)?,
+                crl_der: r.get(4)?,
+                revoked_count: r.get(5)?,
+                issuer_fingerprint: r.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_crl_state(&self, row: &CrlStateRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO crl_state
+                (id, crl_number, this_update, next_update, crl_pem, crl_der,
+                 revoked_count, issuer_fingerprint)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                crl_number=excluded.crl_number,
+                this_update=excluded.this_update,
+                next_update=excluded.next_update,
+                crl_pem=excluded.crl_pem,
+                crl_der=excluded.crl_der,
+                revoked_count=excluded.revoked_count,
+                issuer_fingerprint=excluded.issuer_fingerprint",
+            params![
+                row.crl_number,
+                row.this_update,
+                row.next_update,
+                row.crl_pem,
+                row.crl_der,
+                row.revoked_count,
+                row.issuer_fingerprint,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+const ISSUED_CERT_SELECT: &str = "SELECT serial_hex, subject_cn, identity_kind, node_id, issuer_cn,
+            fingerprint_sha256, not_before, not_after, issued_at, status,
+            revocation_reason, revoked_at
+     FROM issued_certificates";
+
+fn map_issued_cert_row(row: &rusqlite::Row<'_>) -> Result<IssuedCertRow, rusqlite::Error> {
+    Ok(IssuedCertRow {
+        serial_hex: row.get(0)?,
+        subject_cn: row.get(1)?,
+        identity_kind: row.get(2)?,
+        node_id: row.get(3)?,
+        issuer_cn: row.get(4)?,
+        fingerprint_sha256: row.get(5)?,
+        not_before: row.get(6)?,
+        not_after: row.get(7)?,
+        issued_at: row.get(8)?,
+        status: row.get(9)?,
+        revocation_reason: row.get(10)?,
+        revoked_at: row.get(11)?,
+    })
 }
 
 fn row_to_node(row: &rusqlite::Row) -> Result<NodeRow, rusqlite::Error> {
