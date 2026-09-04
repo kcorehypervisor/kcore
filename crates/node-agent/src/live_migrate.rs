@@ -67,6 +67,16 @@ impl LiveMigrateState {
         self.inner.lock().await.sessions.get(vm).map(|s| s.port)
     }
 
+    /// `(port, ch_pid)` of the tracked session, for reporting without taking it.
+    pub async fn session_facts(&self, vm: &str) -> Option<(u16, u32)> {
+        self.inner
+            .lock()
+            .await
+            .sessions
+            .get(vm)
+            .map(|s| (s.port, s.ch_pid))
+    }
+
     /// Claim a migration port from the reserved range and hold a listener on
     /// it so nothing else can bind it before Cloud Hypervisor does.
     pub async fn reserve_port(&self) -> Result<u16, String> {
@@ -256,6 +266,170 @@ pub fn kill_pid(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
+}
+
+/// True when `pid` names a live process.
+///
+/// Signal 0 performs the permission and existence checks without delivering
+/// anything. The node agent runs as root, so `EPERM` is not a case we have to
+/// disambiguate: a failure means the process is gone.
+pub fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// True when `pid`'s command line mentions `needle`.
+///
+/// Guards against PID reuse. A `.migrate.pid` file can outlive the process it
+/// names, and by the time an operator clears the session the kernel may have
+/// handed that number to something unrelated — killing it would be a far worse
+/// outcome than leaving a stale file behind. The receive VMM is always spawned
+/// as `<ch-bin> --api-socket=<socket>`, so the VM's own socket path identifies
+/// it unambiguously.
+pub fn pid_cmdline_contains(pid: u32, needle: &str) -> bool {
+    if pid == 0 || needle.is_empty() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    // cmdline is NUL-separated; a plain lossy conversion is enough to look for
+    // a substring inside one of the arguments.
+    String::from_utf8_lossy(&raw).contains(needle)
+}
+
+/// Everything the node can observe about a receive session without disturbing
+/// it. Produced by [`observe_receive`] and reported verbatim to operators.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReceiveObservation {
+    pub has_session: bool,
+    pub port: u16,
+    pub session_pid: u32,
+    pub pid_file_pid: u32,
+    pub pid_file_present: bool,
+    pub vmm_alive: bool,
+    pub vmm_pid_matches_vm: bool,
+    pub port_listening: bool,
+    pub marker_present: bool,
+    pub api_socket_present: bool,
+}
+
+impl ReceiveObservation {
+    /// The pid a caller should act on: the in-memory session's if we have one,
+    /// otherwise whatever the pid file recorded.
+    pub fn effective_pid(&self) -> u32 {
+        if self.session_pid != 0 {
+            self.session_pid
+        } else {
+            self.pid_file_pid
+        }
+    }
+
+    /// Nothing of this session is left on the node.
+    pub fn is_empty(&self) -> bool {
+        !self.has_session
+            && !self.pid_file_present
+            && !self.marker_present
+            && !self.api_socket_present
+    }
+
+    /// Whether a receive is plausibly still running here.
+    ///
+    /// Deliberately *not* used to reap anything automatically: it is the line
+    /// shown to an operator so they can make the call themselves. A recycled
+    /// pid does not count as live.
+    pub fn receive_looks_live(&self) -> bool {
+        (self.vmm_alive && self.vmm_pid_matches_vm) || self.port_listening
+    }
+
+    /// One-line reading of the fields, written for someone deciding whether it
+    /// is safe to clear this session.
+    pub fn summary(&self) -> String {
+        if self.is_empty() {
+            return "no receive session, pid file, marker or API socket on this node".to_string();
+        }
+        let mut parts = Vec::new();
+        if self.has_session {
+            parts.push(format!(
+                "session tracked in memory on port {} (pid {})",
+                self.port, self.session_pid
+            ));
+        } else {
+            parts.push("no session tracked in memory".to_string());
+        }
+        if self.pid_file_present {
+            parts.push(format!("pid file records {}", self.pid_file_pid));
+        }
+        let pid = self.effective_pid();
+        if pid != 0 {
+            if !self.vmm_alive {
+                parts.push(format!("pid {pid} is not running"));
+            } else if self.vmm_pid_matches_vm {
+                parts.push(format!("pid {pid} is alive and is this VM's receive VMM"));
+            } else {
+                parts.push(format!(
+                    "pid {pid} is alive but is NOT this VM's VMM (recycled pid)"
+                ));
+            }
+        }
+        if self.port != 0 {
+            parts.push(format!(
+                "port {} is {}",
+                self.port,
+                if self.port_listening {
+                    "listening"
+                } else {
+                    "not listening"
+                }
+            ));
+        }
+        if self.marker_present {
+            parts.push("handoff marker present (receive completed)".to_string());
+        }
+        if self.api_socket_present {
+            parts.push("API socket present".to_string());
+        }
+        parts.push(
+            if self.receive_looks_live() {
+                "VERDICT: a receive may still be in flight; clearing would kill it"
+            } else {
+                "VERDICT: nothing is receiving; the session looks stranded"
+            }
+            .to_string(),
+        );
+        parts.join("; ")
+    }
+}
+
+/// Collect the observable state of `vm_name`'s receive session on this node.
+pub async fn observe_receive(
+    state: &LiveMigrateState,
+    socket_dir: &Path,
+    vm_name: &str,
+) -> ReceiveObservation {
+    let session = state.session_facts(vm_name).await;
+    let pid_file = migrate_pid_path(socket_dir, vm_name);
+    let pid_file_pid = read_migrate_pid(socket_dir, vm_name).unwrap_or(0);
+    let api_socket = socket_dir.join(format!("{vm_name}.sock"));
+
+    let mut obs = ReceiveObservation {
+        has_session: session.is_some(),
+        port: session.map(|(port, _)| port).unwrap_or(0),
+        session_pid: session.map(|(_, pid)| pid).unwrap_or(0),
+        pid_file_pid,
+        pid_file_present: pid_file.exists(),
+        marker_present: handoff_marker_path(socket_dir, vm_name).exists(),
+        api_socket_present: api_socket.exists(),
+        ..Default::default()
+    };
+    let pid = obs.effective_pid();
+    obs.vmm_alive = pid_is_alive(pid);
+    obs.vmm_pid_matches_vm =
+        obs.vmm_alive && pid_cmdline_contains(pid, &api_socket.display().to_string());
+    obs.port_listening = obs.port != 0 && port_is_listening(obs.port);
+    obs
 }
 
 pub async fn spawn_receive_vmm(
@@ -576,6 +750,287 @@ mod tests {
     fn check_socket_dir_matches_nix_passes_without_published_dir() {
         if nix_vm_socket_dir().is_none() {
             assert!(check_socket_dir_matches_nix(Path::new("/run/kcore")).is_ok());
+        }
+    }
+
+    /// A pid that has been waited on is gone; our own pid is not.
+    #[test]
+    fn pid_is_alive_separates_our_own_pid_from_a_reaped_child() {
+        assert!(pid_is_alive(std::process::id()));
+        assert!(!pid_is_alive(0), "pid 0 is never a process we can act on");
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let dead = child.id();
+        child.wait().expect("reap");
+        assert!(
+            !pid_is_alive(dead),
+            "a reaped child must not look alive; pid {dead}"
+        );
+    }
+
+    /// A long-lived process whose argv contains `path`, standing in for the
+    /// receive-mode `cloud-hypervisor --api-socket=<path>`.
+    ///
+    /// `tail -f` is used rather than a shell one-liner because `sh -c` execs
+    /// away a single simple command, replacing the argv we are looking for.
+    fn spawn_holding(path: &Path) -> std::process::Child {
+        std::fs::write(path, b"").expect("create file to hold open");
+        let child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn tail");
+        // Wait for the kernel to have the argv readable before asserting on it.
+        for _ in 0..100 {
+            if pid_cmdline_contains(child.id(), &path.display().to_string()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
+    }
+
+    #[test]
+    fn pid_cmdline_contains_matches_only_the_real_argv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let needle = dir.path().join("kcore-cmdline-needle.sock");
+        let mut child = spawn_holding(&needle);
+        let pid = child.id();
+
+        assert!(pid_cmdline_contains(pid, &needle.display().to_string()));
+        assert!(!pid_cmdline_contains(pid, "/tmp/some-other-vm.sock"));
+        assert!(
+            !pid_cmdline_contains(pid, ""),
+            "an empty needle must never match"
+        );
+        assert!(
+            !pid_cmdline_contains(0, &needle.display().to_string()),
+            "pid 0 is never a process we can inspect"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"x").expect("write");
+    }
+
+    #[tokio::test]
+    async fn observe_receive_reports_nothing_on_a_clean_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = LiveMigrateState::new();
+        let obs = observe_receive(&state, dir.path(), "vm-clean").await;
+        assert!(obs.is_empty());
+        assert!(!obs.receive_looks_live());
+        assert_eq!(obs.effective_pid(), 0);
+        assert!(
+            obs.summary().contains("no receive session"),
+            "unexpected summary: {}",
+            obs.summary()
+        );
+    }
+
+    /// The decisive distinction for an operator: a pid file naming a process
+    /// that has exited is a corpse, not an in-flight receive.
+    #[tokio::test]
+    async fn observe_receive_reports_a_dead_receive_vmm_as_stranded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let dead = child.id();
+        child.wait().expect("reap");
+
+        std::fs::write(migrate_pid_path(dir.path(), "vm-dead"), dead.to_string()).expect("pid");
+        touch(&handoff_marker_path(dir.path(), "vm-dead"));
+
+        let state = LiveMigrateState::new();
+        let obs = observe_receive(&state, dir.path(), "vm-dead").await;
+        assert!(obs.pid_file_present);
+        assert_eq!(obs.pid_file_pid, dead);
+        assert!(!obs.vmm_alive, "a reaped pid must not read as alive");
+        assert!(!obs.receive_looks_live());
+        assert!(
+            !obs.is_empty(),
+            "marker and pid file are leftovers to clear"
+        );
+        assert!(
+            obs.summary().contains("looks stranded"),
+            "unexpected summary: {}",
+            obs.summary()
+        );
+    }
+
+    /// The other half: a receive VMM that really is running must be reported
+    /// as live, so an operator does not clear an in-flight migration.
+    #[tokio::test]
+    async fn observe_receive_reports_a_live_receive_vmm_as_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vm = "vm-live";
+        // The observation identifies the VMM by the API socket in its argv,
+        // which is how `spawn_receive_vmm` invokes cloud-hypervisor.
+        let socket = dir.path().join(format!("{vm}.sock"));
+        let mut child = spawn_holding(&socket);
+        let pid = child.id();
+        std::fs::write(migrate_pid_path(dir.path(), vm), pid.to_string()).expect("pid");
+
+        let state = LiveMigrateState::new();
+        let obs = observe_receive(&state, dir.path(), vm).await;
+        assert!(obs.vmm_alive);
+        assert!(obs.vmm_pid_matches_vm);
+        assert!(obs.receive_looks_live());
+        assert!(
+            obs.summary().contains("may still be in flight"),
+            "unexpected summary: {}",
+            obs.summary()
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// PID reuse must not be mistaken for a live receive, or clearing would
+    /// signal an unrelated process.
+    #[tokio::test]
+    async fn observe_receive_flags_a_recycled_pid_instead_of_calling_it_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Our own pid is certainly alive and certainly not this VM's VMM.
+        std::fs::write(
+            migrate_pid_path(dir.path(), "vm-recycled"),
+            std::process::id().to_string(),
+        )
+        .expect("pid");
+
+        let state = LiveMigrateState::new();
+        let obs = observe_receive(&state, dir.path(), "vm-recycled").await;
+        assert!(obs.vmm_alive, "the pid really is running");
+        assert!(
+            !obs.vmm_pid_matches_vm,
+            "but it is not this VM's receive VMM"
+        );
+        assert!(!obs.receive_looks_live());
+        assert!(
+            obs.summary().contains("recycled pid"),
+            "the operator must be told why: {}",
+            obs.summary()
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_receive_reports_the_in_memory_session_and_its_port() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = LiveMigrateState::new();
+        let port = state.reserve_port().await.expect("reserve");
+        state
+            .insert(
+                "vm-session",
+                ReceiveSession {
+                    port,
+                    ch_pid: 4242,
+                    receive_task: tokio::spawn(async { Ok(()) }),
+                },
+            )
+            .await;
+
+        let obs = observe_receive(&state, dir.path(), "vm-session").await;
+        assert!(obs.has_session);
+        assert_eq!(obs.port, port);
+        assert_eq!(obs.session_pid, 4242);
+        assert_eq!(
+            obs.effective_pid(),
+            4242,
+            "the in-memory pid wins over the pid file"
+        );
+        // The reservation still holds the socket, so the port reads as taken.
+        assert!(obs.port_listening);
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use super::ReceiveObservation;
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn any_observation()(
+            has_session in any::<bool>(),
+            port in any::<u16>(),
+            session_pid in any::<u32>(),
+            pid_file_pid in any::<u32>(),
+            pid_file_present in any::<bool>(),
+            vmm_alive in any::<bool>(),
+            vmm_pid_matches_vm in any::<bool>(),
+            port_listening in any::<bool>(),
+            marker_present in any::<bool>(),
+            api_socket_present in any::<bool>(),
+        ) -> ReceiveObservation {
+            ReceiveObservation {
+                has_session,
+                port,
+                session_pid,
+                pid_file_pid,
+                pid_file_present,
+                vmm_alive,
+                vmm_pid_matches_vm,
+                port_listening,
+                marker_present,
+                api_socket_present,
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, .. ProptestConfig::default() })]
+
+        /// The summary is what an operator reads mid-incident before deciding
+        /// to destroy something, so it must always render.
+        #[test]
+        fn summary_always_renders(obs in any_observation()) {
+            prop_assert!(!obs.summary().is_empty());
+        }
+
+        /// The verdict in the summary must agree with `receive_looks_live`:
+        /// the operator's reading and the code's own predicate cannot diverge.
+        #[test]
+        fn summary_verdict_matches_the_liveness_predicate(obs in any_observation()) {
+            let live = (obs.vmm_alive && obs.vmm_pid_matches_vm) || obs.port_listening;
+            prop_assert_eq!(obs.receive_looks_live(), live);
+            prop_assume!(!obs.is_empty());
+            prop_assert_eq!(obs.summary().contains("may still be in flight"), live);
+        }
+
+        /// A pid that is alive but is not this VM's VMM is a recycled number.
+        /// It must never on its own make a session look like a live receive,
+        /// because clearing would then signal an unrelated process. Built
+        /// rather than filtered so every case exercises the rule.
+        #[test]
+        fn a_recycled_pid_alone_never_reads_as_live(obs in any_observation()) {
+            let recycled = ReceiveObservation {
+                vmm_alive: true,
+                vmm_pid_matches_vm: false,
+                port_listening: false,
+                ..obs
+            };
+            prop_assert!(!recycled.receive_looks_live());
+            prop_assert!(
+                !recycled.summary().contains("may still be in flight"),
+                "summary: {}", recycled.summary()
+            );
+        }
+
+        /// `effective_pid` prefers the session's pid and only falls back to
+        /// the file, so a stale file can never redirect a kill.
+        #[test]
+        fn effective_pid_prefers_the_session(obs in any_observation()) {
+            let expected = if obs.session_pid != 0 { obs.session_pid } else { obs.pid_file_pid };
+            prop_assert_eq!(obs.effective_pid(), expected);
         }
     }
 }

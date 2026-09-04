@@ -640,6 +640,15 @@ enum GetResource {
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
     },
+    /// Show live-migrate receive session state for a VM (read-only)
+    #[command(name = "migrate-session", alias = "migrate-sessions")]
+    MigrateSession {
+        /// VM id or name
+        vm_id: String,
+        /// Only query this node (default: every CephCluster member)
+        #[arg(long)]
+        node: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -899,6 +908,22 @@ enum MigrateResource {
         /// Fall back to cold reassignment if live migrate fails
         #[arg(long = "allow-cold-fallback")]
         allow_cold_fallback: bool,
+    },
+    /// Clear a stranded live-migrate receive session on a node.
+    ///
+    /// Reports what it would clear and does nothing unless --force is given.
+    /// Clearing a session whose receive VMM is still alive kills an in-flight
+    /// migration; inspect with `kctl get migrate-session <vm>` first.
+    #[command(name = "reset-session")]
+    ResetSession {
+        /// VM id or name
+        vm_id: String,
+        /// Node holding the stranded session
+        #[arg(long)]
+        node: String,
+        /// Actually clear it. Without this the command only reports.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1759,6 +1784,13 @@ async fn main() {
             }
         }
 
+        Command::Migrate {
+            resource: MigrateResource::ResetSession { vm_id, node, force },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::migrate_session::reset(&info, vm_id, node, *force).await
+        }
+
         Command::Rotate {
             resource:
                 RotateResource::Certs {
@@ -1838,6 +1870,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::pki::get_crl(&info, output.as_deref()).await
+        }
+        Command::Get {
+            resource: GetResource::MigrateSession { vm_id, node },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::migrate_session::status(&info, vm_id, node.as_deref()).await
         }
         Command::Rotate {
             resource: RotateResource::SubCa { certs_dir },

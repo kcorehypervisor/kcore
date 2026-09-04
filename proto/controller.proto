@@ -53,6 +53,16 @@ service Controller {
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
   // Live-migrate a Ceph-backed VM to another CephCluster member (shared RBD).
   rpc MigrateVm(MigrateVmRequest) returns (MigrateVmResponse);
+  // Report each node's live-migrate receive bookkeeping for a VM. Read-only,
+  // and the thing to run first when a migration keeps failing with
+  // ALREADY_EXISTS. See docs/vm-migration.md.
+  rpc GetLiveMigrateReceiveStatus(GetLiveMigrateReceiveStatusRequest)
+      returns (GetLiveMigrateReceiveStatusResponse);
+  // Clear a stranded receive session on one node. Destructive and refused
+  // unless `force` is set, so the default answer is a report of what would be
+  // cleared rather than the clearing itself.
+  rpc ResetLiveMigrateReceive(ResetLiveMigrateReceiveRequest)
+      returns (ResetLiveMigrateReceiveResponse);
   rpc ApproveNode(ApproveNodeRequest) returns (ApproveNodeResponse);
   rpc RejectNode(RejectNodeRequest) returns (RejectNodeResponse);
 
@@ -831,6 +841,80 @@ message MigrateVmResponse {
   string mode = 3;
   string source_node = 4;
   string target_node = 5;
+}
+
+// Live-migrate receive session inspection and repair
+
+message GetLiveMigrateReceiveStatusRequest {
+  // VM id or name.
+  string vm_id = 1;
+  // Node to query. Empty asks every CephCluster member, which is what an
+  // operator wants when they do not yet know where the session is stranded.
+  string node_id = 2;
+}
+
+// Mirrors kcore.node.LiveMigrateReceiveState; see node.proto for the meaning
+// of each field. Duplicated rather than imported because the controller and
+// node protos are independent packages.
+message LiveMigrateReceiveState {
+  bool has_session = 1;
+  int32 port = 2;
+  uint32 session_pid = 3;
+  uint32 pid_file_pid = 4;
+  bool vmm_alive = 5;
+  bool vmm_pid_matches_vm = 6;
+  bool port_listening = 7;
+  bool pid_file_present = 8;
+  bool marker_present = 9;
+  bool api_socket_present = 10;
+  string summary = 11;
+}
+
+message NodeLiveMigrateReceiveStatus {
+  string node_id = 1;
+  string node_address = 2;
+  // False when the node could not be reached or refused the RPC; `error` says
+  // why. An unreachable node is reported, not fatal: the point of this RPC is
+  // to find out where a session is, and one bad node must not hide the rest.
+  bool reachable = 3;
+  string error = 4;
+  LiveMigrateReceiveState state = 5;
+  // True when this node currently owns the VM. Sessions here cannot be reset:
+  // the VM is running, and clearing would kill it.
+  bool owns_vm = 6;
+}
+
+message GetLiveMigrateReceiveStatusResponse {
+  bool success = 1;
+  string message = 2;
+  string vm_id = 3;
+  string vm_name = 4;
+  // Name the node agents key the session by (the sanitized VM name).
+  string runtime_name = 5;
+  string current_node = 6;
+  repeated NodeLiveMigrateReceiveStatus nodes = 7;
+}
+
+message ResetLiveMigrateReceiveRequest {
+  // VM id or name.
+  string vm_id = 1;
+  // Required: an operator must name the node whose session they are
+  // destroying. There is no "wherever you find one" mode on purpose.
+  string node_id = 2;
+  // Explicit operator intent. Without it the RPC reports what it would clear
+  // and clears nothing.
+  bool force = 3;
+}
+
+message ResetLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+  // False when `force` was not set, or when there was nothing to clear.
+  bool cleared = 3;
+  string node_id = 4;
+  string runtime_name = 5;
+  // State observed on the node before clearing.
+  LiveMigrateReceiveState observed = 6;
 }
 
 // Node Approval

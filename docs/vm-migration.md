@@ -168,6 +168,95 @@ Images are created with **`layering` only**. Exclusive-lock is omitted so source
 
 ---
 
+## Runbook: a stranded receive session
+
+### Symptom
+
+A live migration that used to work now fails immediately, and the error names the destination:
+
+```
+migrate failed: status: AlreadyExists, message: "preparing node <dest> to receive VM '<vm>':
+live migrate receive already prepared for <vm>"
+```
+
+Nothing is actually receiving. What happened is that the destination node still holds the receive session it created in `PrepareLiveMigrateReceive`, because the controller died (or lost the node) between preparing the receive and aborting it. The session outlives the migration it belonged to, and `PrepareLiveMigrateReceive` will keep answering `ALREADY_EXISTS` for that VM on that node until an operator clears it.
+
+The same state can also survive on disk without an in-memory session, if the **node agent** restarted after spawning the receive VMM: the `.migrate.pid` file is then the only remaining handle on an orphaned Cloud Hypervisor that still holds the API socket and the RBD mapping.
+
+### There is no automatic reaping — on purpose
+
+Nothing in kcore reaps a receive session on a timer or on the next prepare. Reaping requires deciding that a session is *provably* dead, and the cost of getting that wrong is asymmetric: clearing a session whose receive VMM is still running kills an in-flight migration and can leave the guest destroyed on both sides. So kcore surfaces the evidence and an operator makes the call.
+
+### 1. Look before acting
+
+```bash
+# Every CephCluster member (the only nodes a receive is ever prepared on)
+kctl get migrate-session <vm>
+
+# Or one node, e.g. the destination named in the error
+kctl get migrate-session <vm> --node <node-id>
+```
+
+Read-only: it touches no processes and no files. Per node it reports
+
+| Field | Meaning |
+|-------|---------|
+| `session tracked` | A prepare ran here and the session is still in memory. This is what returns `ALREADY_EXISTS`. |
+| `port` | The migration port held for the session, and whether anything is **listening** on it. |
+| `session pid` / `pid file` | The receive-mode Cloud Hypervisor pid, from memory and from `<socket-dir>/<vm>.migrate.pid`. |
+| `receive VMM` | Whether that pid is a live process — and whether it really is *this VM's* VMM, checked against its `/proc` cmdline. An alive pid that is not our VMM is a **recycled pid**, and clearing will not signal it. |
+| `handoff marker` | `<socket-dir>/<vm>.live-migrated` exists, i.e. the receive already completed. |
+| `verdict` | `stranded - nothing is receiving`, or `LIVE - a receive may be in flight; clearing would kill it`. |
+
+The verdict is a summary of the fields above, not a decision. **Do not clear a node whose verdict is `LIVE`** unless you know the migration it belongs to is already lost.
+
+### 2. Clear it
+
+```bash
+# Reports what it would clear, and clears nothing
+kctl migrate reset-session <vm> --node <node-id>
+
+# Actually clear it
+kctl migrate reset-session <vm> --node <node-id> --force
+```
+
+Without `--force` the command prints the state above and exits non-zero, so running it by accident — or before reading the state — cannot destroy anything. `--force` is the explicit operator intent, matching the other destructive `kctl` commands.
+
+Clearing runs the same cleanup as the abort that ends a failed migration, so the two cannot drift:
+
+- the in-memory session and its **port reservation** (returned to the 18000–18127 pool),
+- the spawned **receive VMM** — from the tracked session, or from the pid file when the agent restarted; a recycled pid is reported and *not* signalled,
+- the **marker**, **pid** and **API socket** files under the VM socket directory,
+- the destination's **RBD mapping** for the VM's volume.
+
+It is **idempotent**: clearing a node with no session is a success, so a repeated runbook step needs no special casing.
+
+Two guards make it hard to use destructively by mistake:
+
+- The node must be named explicitly with `--node`; there is no "wherever you find one" mode.
+- The RPC **refuses the node that currently owns the VM** (`FAILED_PRECONDITION`). A receive session only strands on a node that does not own the VM — reassignment is the last step of a successful migration — and on the owner the same cleanup would stop a VM that is running perfectly well.
+
+Every successful clear is recorded in the audit log as `ResetLiveMigrateReceive`, including whether the session still looked live.
+
+### Retry
+
+Once the session is gone, retry the migration normally:
+
+```bash
+kctl migrate vm <vm> --target-node <node-id>
+```
+
+### RPCs behind it
+
+| RPC | Service | Role | Notes |
+|-----|---------|------|-------|
+| `GetLiveMigrateReceiveStatus` | `Controller` | `read-only` | Fans out to the nodes; an unreachable node is reported, not fatal. |
+| `ResetLiveMigrateReceive` | `Controller` | `cluster-admin` | Same bar as `DrainNode`, not `MigrateVm`. |
+| `GetLiveMigrateReceiveStatus` | `NodeAdmin` | controller cert | Read-only observation on one node. |
+| `AbortLiveMigrateReceive` | `NodeAdmin` | controller cert | The shared cleanup; now also reports the state it observed before tearing down. |
+
+---
+
 ## Comparison with other stacks
 
 | Stack | Shared disk | Memory path |
@@ -187,4 +276,5 @@ Images are created with **`layering` only**. Exclusive-lock is omitted so source
 | CH HTTP client | `crates/node-agent/src/vmm/client.rs` |
 | Helpers | `crates/node-agent/src/live_migrate.rs` |
 | Unit handoff | `modules/ch-vm/vm-service.nix` |
-| CLI | `kctl migrate vm`, `kctl drain node` |
+| Receive-session escape hatch | `crates/kctl/src/commands/migrate_session.rs` |
+| CLI | `kctl migrate vm`, `kctl drain node`, `kctl get migrate-session`, `kctl migrate reset-session` |

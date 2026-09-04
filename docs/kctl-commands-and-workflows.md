@@ -509,7 +509,9 @@ Top-level commands:
 - `kctl start vm ...`
 - `kctl stop vm ...`
 - `kctl migrate vm <id|name> --target-node <node> [--allow-cold-fallback]` (Ceph / shared RBD live migrate)
+- `kctl migrate reset-session <id|name> --node <node> [--force]` (clear a stranded live-migrate receive session; reports only without `--force`)
 - `kctl drain node <node-id> [--target-node <node>]` (cold-reassign all VMs off a node)
+- `kctl get migrate-session <id|name> [--node <node>]` (read-only live-migrate receive session state)
 - `kctl get vms [name]`
 - `kctl get nodes [name]`
 - `kctl get networks [--target-node ...]`
@@ -615,4 +617,14 @@ kctl migrate vm app-ceph-01 --target-node node-b
 kctl drain node node-a --target-node node-b
 ```
 
-Details: [`vm-migration.md`](./vm-migration.md).
+If a retried migration fails with `ALREADY_EXISTS`, the destination is holding a stranded
+receive session. Inspect it before clearing it — clearing one whose receive VMM is still
+alive kills an in-flight migration:
+
+```bash
+kctl get migrate-session app-ceph-01
+kctl migrate reset-session app-ceph-01 --node node-b --force
+```
+
+Details: [`vm-migration.md`](./vm-migration.md), including the
+[stranded receive session runbook](./vm-migration.md#runbook-a-stranded-receive-session).

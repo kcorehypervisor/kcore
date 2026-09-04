@@ -114,7 +114,8 @@ Prefer a dedicated fabric for `clusterNetwork` (replication) and a separate `pub
 - Never point `osdDevice` at the OS disk.
 - Default `forceWipe: false` refuses OSD prepare when signatures exist.
 - Keep Ceph replication off a congested management NIC.
-- Live migration needs ephemeral TCP between members (see [`vm-migration.md`](./vm-migration.md)).
+- Live migration needs TCP 18000–18127 open between members (see [`vm-migration.md`](./vm-migration.md)).
+- A migration that fails with `ALREADY_EXISTS` usually means a **stranded receive session** on the destination, left behind when the controller died mid-migration. There is no automatic reaping — a wrong liveness guess would destroy a live receive — so inspect with `kctl get migrate-session <vm>` and clear with `kctl migrate reset-session <vm> --node <id> --force`. See [Runbook: a stranded receive session](./vm-migration.md#runbook-a-stranded-receive-session).
 
 ## Source map
 

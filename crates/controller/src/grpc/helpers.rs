@@ -21,6 +21,28 @@ pub fn controller_state_from_node_state(state: i32) -> i32 {
     }
 }
 
+/// Carry a node's receive-session report across into the controller's own
+/// message. The two protos are independent packages, so the fields are copied
+/// rather than shared; keeping the translation in one place means a new field
+/// on either side shows up as a compile error here.
+pub fn receive_state_from_node(
+    state: &node_proto::LiveMigrateReceiveState,
+) -> controller_proto::LiveMigrateReceiveState {
+    controller_proto::LiveMigrateReceiveState {
+        has_session: state.has_session,
+        port: state.port,
+        session_pid: state.session_pid,
+        pid_file_pid: state.pid_file_pid,
+        vmm_alive: state.vmm_alive,
+        vmm_pid_matches_vm: state.vmm_pid_matches_vm,
+        port_listening: state.port_listening,
+        pid_file_present: state.pid_file_present,
+        marker_present: state.marker_present,
+        api_socket_present: state.api_socket_present,
+        summary: state.summary.clone(),
+    }
+}
+
 pub fn state_fallback_without_runtime(auto_start: bool) -> i32 {
     if auto_start {
         controller_proto::VmState::Unknown as i32
