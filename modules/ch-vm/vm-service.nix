@@ -123,11 +123,18 @@ let
         fi
       '';
 
+      # Live migration requires MAP_SHARED guest RAM (`shared=on`).
+      memoryArg =
+        if isCeph then
+          "--memory size=${toString vmCfg.memorySize}M,shared=on"
+        else
+          "--memory size=${toString vmCfg.memorySize}M";
+
       chArgs = lib.concatStringsSep " " (
         [
           "--api-socket ${socketPath}"
           "--cpus boot=${toString vmCfg.cores}"
-          "--memory size=${toString vmCfg.memorySize}M"
+          memoryArg
           "--firmware ${firmwarePath}"
           "--serial socket=${serialSocket}"
           "--disk ${vmDiskArg} ${seedDiskArg}"
@@ -136,49 +143,67 @@ let
         ++ vmCfg.extraArgs
       );
 
-      basePreChecks = [
-        "${pkgs.coreutils}/bin/rm -f ${socketPath} ${serialSocket}"
-        "${pkgs.bash}/bin/bash -euc 'test -f ${seedIso} || { echo \"missing cloud-init seed: ${seedIso}\"; exit 1; }'"
-        "${pkgs.bash}/bin/bash -euc 'test -f ${firmwarePath} || { echo \"missing firmware: ${firmwarePath}\"; exit 1; }'"
-      ];
+      liveMigratedMarker = "${cfg.socketDir}/${vmName}.live-migrated";
+      migratePidFile = "${cfg.socketDir}/${vmName}.migrate.pid";
 
-      sourceImageCheck = "${pkgs.bash}/bin/bash -euc 'test -e ${toString vmCfg.image} || { echo \"missing source image: ${toString vmCfg.image}\"; exit 1; }'";
+      # After a live receive, CH is already running outside systemd. Skip
+      # destructive socket cleanup so the handoff ExecStart can adopt it.
+      startPreScript = pkgs.writeShellScript "kcore-vm-${vmName}-pre" ''
+        set -e
+        if [ -f "${liveMigratedMarker}" ]; then
+          echo "live-migrated marker present; skipping socket wipe / cold provision"
+          exit 0
+        fi
+        ${pkgs.coreutils}/bin/rm -f ${socketPath} ${serialSocket}
+        ${pkgs.bash}/bin/bash -euc 'test -f ${seedIso} || { echo "missing cloud-init seed: ${seedIso}"; exit 1; }'
+        ${pkgs.bash}/bin/bash -euc 'test -f ${firmwarePath} || { echo "missing firmware: ${firmwarePath}"; exit 1; }'
+        ${pkgs.bash}/bin/bash -euc 'test -e ${toString vmCfg.image} || { echo "missing source image: ${toString vmCfg.image}"; exit 1; }'
+        ${
+          if isLvm then
+            "${lvmProvisionScript}"
+          else if isZfs then
+            "${zfsProvisionScript}"
+          else if isCeph then
+            "${cephMapScript}"
+          else
+            "true"
+        }
+      '';
 
-      lvmPreChecks = [
-        sourceImageCheck
-        "${lvmProvisionScript}"
-      ];
-      zfsPreChecks = [
-        sourceImageCheck
-        "${zfsProvisionScript}"
-      ];
-      cephPreChecks = [
-        sourceImageCheck
-        "${cephMapScript}"
-      ];
-      fsPreChecks = [ sourceImageCheck ];
-
-      storagePreChecks =
-        if isLvm then
-          lvmPreChecks
-        else if isZfs then
-          zfsPreChecks
-        else if isCeph then
-          cephPreChecks
-        else
-          fsPreChecks;
+      # Adopt an in-flight receive-mode CH (tail --pid) or cold-start CH.
+      startScript = pkgs.writeShellScript "kcore-vm-${vmName}-start" ''
+        set -e
+        if [ -f "${liveMigratedMarker}" ]; then
+          if [ ! -f "${migratePidFile}" ]; then
+            echo "ERROR: ${liveMigratedMarker} present but ${migratePidFile} missing"
+            exit 1
+          fi
+          pid="$(${pkgs.coreutils}/bin/cat "${migratePidFile}")"
+          ${pkgs.coreutils}/bin/rm -f "${liveMigratedMarker}" "${migratePidFile}"
+          if ! ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null; then
+            echo "ERROR: live-migrated cloud-hypervisor pid $pid is not running"
+            exit 1
+          fi
+          echo "Adopting live-migrated cloud-hypervisor pid $pid"
+          exec ${pkgs.coreutils}/bin/tail --pid="$pid" -f /dev/null
+        fi
+        exec ${chBin} ${chArgs}
+      '';
     in
     {
       description = "kcore VM ${vmName}";
       requires = [ "kcore-tap-${vmName}.service" ];
       after = [ "kcore-tap-${vmName}.service" ];
       wantedBy = lib.optionals vmCfg.autoStart [ "multi-user.target" ];
-      stopIfChanged = true;
+      # Keep a live-migrated CH alive across the nixos-rebuild that first
+      # installs this unit on the destination node.
+      stopIfChanged = !isCeph;
+      restartIfChanged = !isCeph;
 
       serviceConfig = {
         Type = "simple";
-        ExecStartPre = basePreChecks ++ storagePreChecks;
-        ExecStart = "${chBin} ${chArgs}";
+        ExecStartPre = [ "${startPreScript}" ];
+        ExecStart = "${startScript}";
         ExecStop = "${pkgs.curl}/bin/curl --unix-socket ${socketPath} -s -X PUT http://localhost/api/v1/vm.power-button";
         ExecStopPost = lib.optionalString isCeph "-${pkgs.ceph}/bin/rbd unmap ${rbdDevice}";
         TimeoutStopSec = 30;

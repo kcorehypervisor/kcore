@@ -38,6 +38,7 @@ use crate::db::{
 };
 use crate::node_proto;
 use crate::{nixgen, node_client::NodeClients, scheduler};
+use kcore_sanitize::sanitize_nix_attr_key;
 use std::collections::HashMap;
 
 use super::helpers::compute_vni;
@@ -71,6 +72,7 @@ const EVT_SECURITY_GROUP_DELETE: &str = "security_group.delete";
 const EVT_SECURITY_GROUP_ATTACH: &str = "security_group.attach";
 const EVT_SECURITY_GROUP_DETACH: &str = "security_group.detach";
 const EVT_NODE_DRAIN: &str = "node.drain";
+const EVT_VM_MIGRATE: &str = "vm.migrate";
 const EVT_SSH_KEY_CREATE: &str = "ssh_key.create";
 const EVT_SSH_KEY_DELETE: &str = "ssh_key.delete";
 const EVT_DISK_LAYOUT_CREATE: &str = "disk_layout.create";
@@ -642,6 +644,147 @@ impl ControllerService {
     pub(crate) fn node_supports_backend(&self, node: &NodeRow, backend: &str) -> bool {
         node.storage_backend == backend
             || (backend == "ceph" && self.ceph_member_ids().contains(&node.id))
+    }
+
+    async fn live_migrate_vm(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        volume: &VolumeRow,
+        runtime_name: &str,
+        dest_host: &str,
+    ) -> Result<(), Status> {
+        let mut dest_admin = self.ensure_admin_client_for_node(target).await?;
+        let mut source_admin = self.ensure_admin_client_for_node(source).await?;
+
+        let prep = dest_admin
+            .prepare_live_migrate_receive(node_proto::PrepareLiveMigrateReceiveRequest {
+                vm_name: runtime_name.to_string(),
+                rbd_pool: volume.pool.clone(),
+                rbd_image: volume.image.clone(),
+                listen_port: 0,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("prepare receive on {}: {e}", target.id)))?
+            .into_inner();
+        if !prep.success || prep.listen_port <= 0 {
+            return Err(Status::internal(format!(
+                "prepare receive failed: {}",
+                prep.message
+            )));
+        }
+        let destination_url = format!("tcp:{dest_host}:{}", prep.listen_port);
+
+        let send_result = source_admin
+            .send_live_migrate(node_proto::SendLiveMigrateRequest {
+                vm_name: runtime_name.to_string(),
+                destination_url: destination_url.clone(),
+                timeout_seconds: 600,
+            })
+            .await;
+
+        if let Err(e) = send_result {
+            let _ = dest_admin
+                .abort_live_migrate_receive(node_proto::AbortLiveMigrateReceiveRequest {
+                    vm_name: runtime_name.to_string(),
+                    rbd_pool: volume.pool.clone(),
+                    rbd_image: volume.image.clone(),
+                })
+                .await;
+            return Err(Status::internal(format!(
+                "send migration from {}: {e}",
+                source.id
+            )));
+        }
+
+        // After a successful send, the source VMM is gone — do not abort the
+        // destination receive session on wait errors (that would kill the only
+        // remaining guest process).
+        let wait = dest_admin
+            .wait_live_migrate_receive(node_proto::WaitLiveMigrateReceiveRequest {
+                vm_name: runtime_name.to_string(),
+                timeout_seconds: 120,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("wait receive on {}: {e}", target.id)))?
+            .into_inner();
+        if !wait.success {
+            return Err(Status::internal(format!(
+                "wait receive failed: {}",
+                wait.message
+            )));
+        }
+
+        self.reassign_vm_node(vm, &target.id)?;
+
+        if let Err(e) = self.push_config_to_node(source).await {
+            warn!(node = %source.id, error = %e, "push after live migrate (source)");
+        }
+        self.push_config_to_node(target).await?;
+
+        let _ = dest_admin
+            .finalize_live_migrate_dest(node_proto::FinalizeLiveMigrateDestRequest {
+                vm_name: runtime_name.to_string(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("finalize dest: {e}")))?;
+
+        let _ = source_admin
+            .finalize_live_migrate_source(node_proto::FinalizeLiveMigrateSourceRequest {
+                vm_name: runtime_name.to_string(),
+                rbd_pool: volume.pool.clone(),
+                rbd_image: volume.image.clone(),
+            })
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "finalize source after live migrate");
+                e
+            });
+
+        Ok(())
+    }
+
+    async fn cold_reassign_vm(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+    ) -> Result<(), Status> {
+        self.reassign_vm_node(vm, &target.id)?;
+        if let Err(e) = self.push_config_to_node(source).await {
+            warn!(node = %source.id, error = %e, "push after cold migrate (source)");
+        }
+        self.push_config_to_node(target).await?;
+        Ok(())
+    }
+
+    fn reassign_vm_node(&self, vm: &VmRow, target_node_id: &str) -> Result<(), Status> {
+        let ssh_keys = self.db.get_vm_ssh_keys(&vm.id).unwrap_or_default();
+        let deleted = self
+            .db
+            .delete_vm_by_id_or_name(&vm.id)
+            .map_err(|e| Status::internal(format!("deleting vm for reassignment: {e}")))?;
+        if !deleted {
+            return Err(Status::internal("failed to delete VM during reassignment"));
+        }
+        let mut new_vm = vm.clone();
+        new_vm.node_id = target_node_id.to_string();
+        self.db
+            .insert_vm(&new_vm)
+            .map_err(|e| Status::internal(format!("re-inserting VM: {e}")))?;
+        if !ssh_keys.is_empty() {
+            let key_names: Vec<String> = self
+                .db
+                .list_ssh_keys()
+                .unwrap_or_default()
+                .iter()
+                .filter(|(_, pk, _)| ssh_keys.contains(pk))
+                .map(|(name, _, _)| name.clone())
+                .collect();
+            let _ = self.db.associate_vm_ssh_keys(&new_vm.id, &key_names);
+        }
+        Ok(())
     }
 
     async fn set_vm_desired_state_internal(
@@ -4664,6 +4807,142 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
+    async fn migrate_vm(
+        &self,
+        request: Request<controller_proto::MigrateVmRequest>,
+    ) -> Result<Response<controller_proto::MigrateVmResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if req.vm_id.trim().is_empty() || req.target_node.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_id and target_node are required",
+            ));
+        }
+
+        let vm = self
+            .db
+            .get_vm(&req.vm_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or_else(|| {
+                self.db
+                    .list_vms()
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|v| v.name == req.vm_id))
+            })
+            .ok_or_else(|| Status::not_found(format!("VM '{}' not found", req.vm_id)))?;
+
+        if vm.storage_backend != "ceph" {
+            return Err(Status::failed_precondition(
+                "live migrate requires storage_backend=ceph (shared RBD)",
+            ));
+        }
+
+        let source_node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("source node '{}' not found", vm.node_id)))?;
+
+        let all_nodes = self
+            .db
+            .list_nodes()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let target = all_nodes
+            .iter()
+            .find(|n| n.id == req.target_node || n.address == req.target_node)
+            .ok_or_else(|| {
+                Status::not_found(format!("target node '{}' not found", req.target_node))
+            })?;
+        if target.id == source_node.id {
+            return Err(Status::invalid_argument(
+                "target_node must differ from the VM's current node",
+            ));
+        }
+        if !self.node_supports_backend(target, "ceph") {
+            return Err(Status::failed_precondition(
+                "target node is not a CephCluster member",
+            ));
+        }
+
+        let volume = self
+            .db
+            .get_volume_by_vm(&vm.id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!("no Ceph volume row for VM '{}'", vm.name))
+            })?;
+
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        let dest_host = target.address.split(':').next().unwrap_or(&target.address);
+
+        match self
+            .live_migrate_vm(&vm, &source_node, target, &volume, &runtime_name, dest_host)
+            .await
+        {
+            Ok(()) => {
+                self.log_replication_event_required(
+                    &actor,
+                    Some("MigrateVm"),
+                    EVT_VM_MIGRATE,
+                    &format!("vm/{}", vm.id),
+                    serde_json::json!({
+                        "vmId": vm.id,
+                        "vmName": vm.name,
+                        "sourceNode": source_node.id,
+                        "targetNode": target.id,
+                        "mode": "live",
+                    }),
+                )?;
+                return Ok(Response::new(controller_proto::MigrateVmResponse {
+                    success: true,
+                    message: format!(
+                        "live-migrated '{}' from {} to {}",
+                        vm.name, source_node.id, target.id
+                    ),
+                    mode: "live".into(),
+                    source_node: source_node.id,
+                    target_node: target.id.clone(),
+                }));
+            }
+            Err(live_err) => {
+                warn!(
+                    vm = %vm.name,
+                    error = %live_err,
+                    "live migrate failed"
+                );
+                if !req.allow_cold_fallback {
+                    return Err(live_err);
+                }
+                self.cold_reassign_vm(&vm, &source_node, target).await?;
+                self.log_replication_event_required(
+                    &actor,
+                    Some("MigrateVm"),
+                    EVT_VM_MIGRATE,
+                    &format!("vm/{}", vm.id),
+                    serde_json::json!({
+                        "vmId": vm.id,
+                        "vmName": vm.name,
+                        "sourceNode": source_node.id,
+                        "targetNode": target.id,
+                        "mode": "cold",
+                        "liveError": live_err.to_string(),
+                    }),
+                )?;
+                Ok(Response::new(controller_proto::MigrateVmResponse {
+                    success: true,
+                    message: format!(
+                        "cold-migrated '{}' from {} to {} after live failure: {live_err}",
+                        vm.name, source_node.id, target.id
+                    ),
+                    mode: "cold".into(),
+                    source_node: source_node.id,
+                    target_node: target.id.clone(),
+                }))
+            }
+        }
+    }
+
     async fn approve_node(
         &self,
         request: Request<controller_proto::ApproveNodeRequest>,
@@ -7221,6 +7500,109 @@ mod tests {
             .expect("get node-a")
             .expect("node-a exists");
         assert_eq!(node_a_status.status, "drained");
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_rejects_non_ceph_backend() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".into();
+        db.upsert_node(&node_a).unwrap();
+        let mut node_b = test_node();
+        node_b.id = "node-b".into();
+        node_b.address = "127.0.0.2:9091".into();
+        db.upsert_node(&node_b).unwrap();
+        let mut vm = test_vm("node-a");
+        vm.storage_backend = "filesystem".into();
+        db.insert_vm(&vm).unwrap();
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db,
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let err =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id,
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: false,
+                }),
+            )
+            .await
+            .expect_err("non-ceph should fail");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_cold_fallback_reassigns_node() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".into();
+        db.upsert_node(&node_a).unwrap();
+        let mut node_b = test_node();
+        node_b.id = "node-b".into();
+        node_b.address = "127.0.0.2:9091".into();
+        db.upsert_node(&node_b).unwrap();
+
+        let mut spec = make_ceph_spec(&["node-a", "node-b"]);
+        spec.fsid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into();
+        let spec_json = crate::ceph_cluster_spec::spec_to_json(&spec).unwrap();
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "lab".into(),
+            generation: 1,
+            spec_json,
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+
+        let mut vm = test_vm("node-a");
+        vm.id = "vm-mig-1".into();
+        vm.name = "mig-1".into();
+        vm.storage_backend = "ceph".into();
+        db.insert_vm(&vm).unwrap();
+        db.upsert_volume(&VolumeRow {
+            id: "vol-1".into(),
+            vm_id: vm.id.clone(),
+            pool: "kcore-vms".into(),
+            image: format!("kcore-{}", vm.id),
+            size_bytes: 8 * 1024 * 1024 * 1024,
+            created_at: String::new(),
+        })
+        .unwrap();
+
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id.clone(),
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: true,
+                }),
+            )
+            .await
+            .expect("cold fallback should succeed")
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.mode, "cold");
+        assert_eq!(resp.target_node, "node-b");
+        let moved = db.get_vm(&vm.id).unwrap().unwrap();
+        assert_eq!(moved.node_id, "node-b");
     }
 
     #[tokio::test]

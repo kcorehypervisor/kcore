@@ -59,6 +59,7 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_BEFORE_RENEW: &[(&str, &str)] = &[
     ("ListSshKeys", "read-only"),
     ("GetSshKey", "read-only"),
     ("DrainNode", "cluster-admin"),
+    ("MigrateVm", "vm-admin"),
     ("ApproveNode", "cluster-admin"),
     ("RejectNode", "cluster-admin"),
 ];

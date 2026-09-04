@@ -2,7 +2,7 @@
 
 kcore SAN is the cluster’s distributed shared block storage fabric. It is powered by **Ceph** on NixOS; the controller fills the gaps that NixOS does not declare (FSID/keyrings, `ceph-volume` OSD prepare, pools, health, and later RBD lifecycle).
 
-Public product docs: [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html). Roadmap status: **Phases 1–2 shipped** (live migration still planned).
+Public product docs: [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html). Roadmap status: **Phases 1–2 + live migration shipped**.
 
 ## Lab topology (3 Dell towers)
 
@@ -87,7 +87,8 @@ Once the fabric is healthy:
 - Create VMs with `--storage-backend ceph --storage-size-bytes …` (rejected until a healthy `CephCluster` includes the target node).
 - Controller allocates a cluster-scoped RBD image in pool `kcore-vms` (volume row independent of node); size is passed to `rbd create` in **MiB**.
 - Node-agent maps RBD and seeds the guest image once (`qemu-img convert`) before Cloud Hypervisor starts; any Ceph member node can run the VM.
-- `kctl drain <node>` reassigns Ceph VMs to other members without copying disks (cold stop/start until live migration).
+- `kctl drain <node>` reassigns Ceph VMs to other members without copying disks (cold stop/start).
+- `kctl migrate vm <id> --target-node <node>` live-migrates a running Ceph VM over TCP using Cloud Hypervisor (`shared=on` guest RAM + dual-mapped RBD). Pass `--allow-cold-fallback` to fall back to cold reassignment if live migrate fails.
 - Deleting a Ceph VM best-effort removes the RBD image.
 
 ```bash
@@ -96,14 +97,23 @@ kctl create vm app-1 \
   --storage-size-bytes 42949672960 \
   --image <https-url> \
   --image-sha256 <sha256>
+
+kctl migrate vm app-1 --target-node node-b
 ```
 
 Local backends remain available for latency-sensitive workloads on a single node.
 
+## Live migration notes
+
+- Requires both nodes to be members of the same healthy `CephCluster` and the VM to use `storage_backend: ceph`.
+- Destination starts an empty Cloud Hypervisor API process, receives the migration stream (`tcp:<dest-ip>:<port>`), then the systemd unit adopts the process via a live-migrated marker.
+- Nodes must allow ephemeral TCP between members for the migration stream (same fabric as Ceph public/client is fine).
+- RBD images are created with `layering` only (no exclusive-lock) so source and destination can map the same image during cutover.
+
 ## Later
 
-- Cold migrate UX (`kctl migrate`) and drain policies tuned for Ceph.
-- Cloud Hypervisor **live** migration over the 10Gb path with shared RBD.
+- Drain policies that prefer live migrate for Ceph VMs.
+- Fixed migration port ranges / firewall helpers.
 
 ## Safety
 
