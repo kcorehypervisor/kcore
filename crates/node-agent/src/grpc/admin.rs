@@ -25,6 +25,21 @@ pub struct AdminService {
     storage: Arc<dyn StorageAdapter>,
     apply_lock: Arc<AsyncMutex<()>>,
     live_migrate: LiveMigrateState,
+    /// Set by [`AdminService::with_pki`]; `None` leaves `RotateNodeCert`
+    /// answering `unimplemented`, which is what the live-ISO/installer builds
+    /// want since they have no enrolled identity to rotate.
+    pki: Option<PkiRuntime>,
+    /// Serialises rotation so two concurrent RotateNodeCert calls cannot
+    /// interleave their installs.
+    rotate_lock: Arc<AsyncMutex<()>>,
+}
+
+/// Everything `RotateNodeCert` needs: the node config (paths, controller
+/// endpoints, thresholds) and the handle that rebuilds the TLS listener.
+#[derive(Clone)]
+struct PkiRuntime {
+    cfg: crate::config::Config,
+    reload: crate::pki::reload::ReloadHandle,
 }
 
 const BOOTSTRAP_CERT_DIR: &str = "/etc/kcore/certs";
@@ -38,6 +53,13 @@ const DISK_MODE_CONTROLLER_MANAGED: &str = "controller-managed";
 const DISK_LAYOUT_DIR: &str = "/etc/kcore/disk";
 const DISK_LAYOUT_CURRENT_PATH: &str = "/etc/kcore/disk/current.nix";
 const CEPH_NIX_PATH: &str = "/etc/nixos/kcore-ceph.nix";
+/// Rebuild verdicts live on tmpfs so they survive the node-agent restart that
+/// `nixos-rebuild switch` performs, but not a reboot (after which there is
+/// nothing in flight to report on anyway).
+const NIX_APPLY_STATE_DIR: &str = "/run/kcore/nix-apply";
+const NIX_APPLY_RUNNING: &str = "running";
+const NIX_APPLY_SUCCEEDED: &str = "succeeded";
+const NIX_APPLY_FAILED: &str = "failed";
 const KCORE_VOLUME_ROOTS: &[&str] = &["/var/lib/kcore/volumes", "/var/lib/kcore/images"];
 
 async fn resolve_nixpkgs_path() -> Option<String> {
@@ -106,7 +128,19 @@ impl AdminService {
             storage,
             apply_lock: Arc::new(AsyncMutex::new(())),
             live_migrate,
+            pki: None,
+            rotate_lock: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    /// Enable `RotateNodeCert` on this service.
+    pub fn with_pki(
+        mut self,
+        cfg: crate::config::Config,
+        reload: crate::pki::reload::ReloadHandle,
+    ) -> Self {
+        self.pki = Some(PkiRuntime { cfg, reload });
+        self
     }
 }
 
@@ -300,20 +334,101 @@ async fn enforce_stopped_vm_units(stopped_vms: &[String]) {
     }
 }
 
-async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>) {
+/// Sanitize a caller-supplied apply id into something safe to use as a file
+/// name under [`NIX_APPLY_STATE_DIR`].
+fn sanitize_apply_id(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Fallback apply id for callers (older controllers) that do not supply one.
+fn uuid_like_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos:x}")
+}
+
+fn apply_state_path(apply_id: &str) -> PathBuf {
+    PathBuf::from(NIX_APPLY_STATE_DIR).join(format!("{apply_id}.state"))
+}
+
+fn latest_apply_id() -> Option<String> {
+    std::fs::read_to_string(PathBuf::from(NIX_APPLY_STATE_DIR).join("latest"))
+        .ok()
+        .and_then(|s| sanitize_apply_id(&s))
+}
+
+fn write_apply_state(apply_id: &str, phase: &str, message: &str) {
+    if let Err(e) = std::fs::create_dir_all(NIX_APPLY_STATE_DIR) {
+        error!(error = %e, dir = NIX_APPLY_STATE_DIR, "failed to create nix apply state dir");
+        return;
+    }
+    if let Err(e) = std::fs::write(apply_state_path(apply_id), format!("{phase}\n{message}\n")) {
+        error!(error = %e, apply_id, "failed to record nix apply state");
+    }
+    let _ = std::fs::write(
+        PathBuf::from(NIX_APPLY_STATE_DIR).join("latest"),
+        apply_id.as_bytes(),
+    );
+}
+
+/// `(phase, message)` for a recorded apply, or `None` when the node has no
+/// record of it.
+fn read_apply_state(apply_id: &str) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(apply_state_path(apply_id)).ok()?;
+    let mut lines = raw.lines();
+    let phase = lines.next()?.trim().to_string();
+    let message = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    Some((phase, message))
+}
+
+fn apply_phase_to_proto(phase: &str) -> i32 {
+    match phase {
+        NIX_APPLY_RUNNING => proto::NixApplyPhase::Running as i32,
+        NIX_APPLY_SUCCEEDED => proto::NixApplyPhase::Succeeded as i32,
+        NIX_APPLY_FAILED => proto::NixApplyPhase::Failed as i32,
+        _ => proto::NixApplyPhase::Unknown as i32,
+    }
+}
+
+async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>, apply_id: String) {
     let nixpkgs_path = resolve_nixpkgs_path().await;
     let nix_path_val = nixpkgs_path
         .as_deref()
         .map(|p| format!("nixos-config={NIXOS_CONFIG_PATH}:nixpkgs={p}"))
         .unwrap_or_default();
 
+    // `nixos-rebuild switch` restarts kcore-node-agent, so the rebuild must
+    // outlive this process and the *script* — not a task in this process — has
+    // to record the verdict. Callers poll GetNixApplyStatus for that verdict.
+    let state_file = apply_state_path(&apply_id);
+    let state_display = state_file.display().to_string();
     let script = format!(
-        "set -e; export PATH=\"/run/current-system/sw/bin:$PATH\"; \
+        "export PATH=\"/run/current-system/sw/bin:$PATH\"; \
          export NIX_PATH='{nix_path_val}'; \
-         nixos-rebuild test && nixos-rebuild switch"
+         if nixos-rebuild test && nixos-rebuild switch; then \
+           printf '{succeeded}\\nnixos-rebuild test+switch completed\\n' > '{state}.tmp'; \
+         else \
+           printf '{failed}\\nnixos-rebuild test+switch failed (exit %s)\\n' \"$?\" > '{state}.tmp'; \
+         fi; \
+         mv -f '{state}.tmp' '{state}'",
+        succeeded = NIX_APPLY_SUCCEEDED,
+        failed = NIX_APPLY_FAILED,
+        state = state_display,
     );
 
-    info!(path = %path.display(), "launching nixos-rebuild test+switch via transient systemd unit");
+    info!(path = %path.display(), %apply_id, "launching nixos-rebuild test+switch via transient systemd unit");
 
     let _ = Command::new("systemctl")
         .args(["stop", "kcore-nix-rebuild.service"])
@@ -342,11 +457,21 @@ async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>) 
             info!("kcore-nix-rebuild transient unit launched successfully");
         }
         Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
             error!(stderr = %stderr, "failed to launch kcore-nix-rebuild transient unit");
+            write_apply_state(
+                &apply_id,
+                NIX_APPLY_FAILED,
+                &format!("systemd-run failed: {stderr}"),
+            );
         }
         Err(e) => {
             error!(error = %e, "failed to spawn systemd-run for nix rebuild");
+            write_apply_state(
+                &apply_id,
+                NIX_APPLY_FAILED,
+                &format!("spawning systemd-run failed: {e}"),
+            );
         }
     }
 }
@@ -1099,7 +1224,9 @@ async fn apply_disk_layout_impl(
     if req.apply && req.rebuild {
         if let Some(persisted_path) = persisted.clone() {
             tokio::spawn(async move {
-                run_test_then_switch(persisted_path, Vec::new()).await;
+                let apply_id = format!("disk-layout-{}", uuid_like_suffix());
+                write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+                run_test_then_switch(persisted_path, Vec::new(), apply_id).await;
             });
             rebuild_scheduled = true;
         }
@@ -1187,17 +1314,23 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             return Ok(Response::new(proto::ApplyNixConfigResponse {
                 success: true,
                 message: format!("config written to {}", path.display()),
+                apply_id: String::new(),
             }));
         }
 
+        let apply_id = sanitize_apply_id(&req.apply_id)
+            .unwrap_or_else(|| format!("apply-{}", uuid_like_suffix()));
+        write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+
         let planned_steps = rebuild_sequence(true).join(" -> ");
-        info!(path = %path.display(), steps = %planned_steps, "starting background nix apply flow");
+        info!(path = %path.display(), steps = %planned_steps, %apply_id, "starting background nix apply flow");
         let rebuild_path = path.clone();
         let desired_stopped_vms = parse_stopped_vms_from_nix(&req.configuration_nix);
         let apply_lock = Arc::clone(&self.apply_lock);
+        let spawned_id = apply_id.clone();
         tokio::spawn(async move {
             let _guard = apply_lock.lock().await;
-            run_test_then_switch(rebuild_path, desired_stopped_vms).await;
+            run_test_then_switch(rebuild_path, desired_stopped_vms, spawned_id).await;
         });
 
         Ok(Response::new(proto::ApplyNixConfigResponse {
@@ -1206,6 +1339,36 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 "config written to {}; nixos-rebuild test+switch started",
                 path.display()
             ),
+            apply_id,
+        }))
+    }
+
+    async fn get_nix_apply_status(
+        &self,
+        request: Request<proto::GetNixApplyStatusRequest>,
+    ) -> Result<Response<proto::GetNixApplyStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let apply_id = match sanitize_apply_id(&req.apply_id).or_else(latest_apply_id) {
+            Some(id) => id,
+            None => {
+                return Ok(Response::new(proto::GetNixApplyStatusResponse {
+                    apply_id: String::new(),
+                    phase: proto::NixApplyPhase::Unknown as i32,
+                    message: "no nix apply has run on this node".into(),
+                }))
+            }
+        };
+        let (phase, message) = read_apply_state(&apply_id).unwrap_or_else(|| {
+            (
+                String::new(),
+                format!("no record of nix apply '{apply_id}'"),
+            )
+        });
+        Ok(Response::new(proto::GetNixApplyStatusResponse {
+            apply_id,
+            phase: apply_phase_to_proto(&phase),
+            message,
         }))
     }
 
@@ -1666,13 +1829,30 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             // Unit may already be inactive after CH exited on send.
             warn!(error = %e, unit = %unit, "finalize source stop");
         }
-        if !req.rbd_pool.trim().is_empty() && !req.rbd_image.trim().is_empty() {
-            live_migrate::ensure_rbd_unmapped(req.rbd_pool.trim(), req.rbd_image.trim())
+        let pool = req.rbd_pool.trim();
+        let image = req.rbd_image.trim();
+        let has_rbd = !pool.is_empty() && !image.is_empty();
+        if has_rbd {
+            live_migrate::ensure_rbd_unmapped(pool, image)
                 .map_err(|e| Status::internal(format!("unmap RBD on source: {e}")))?;
         }
+        // Report observed state, not the fact that we asked: the controller
+        // uses these to decide whether it is safe to start the VM elsewhere.
+        let vmm_stopped = live_migrate::unit_is_stopped(&unit)
+            .await
+            .map_err(Status::internal)?;
+        let rbd_unmapped = !has_rbd || !live_migrate::rbd_is_mapped(pool, image);
         Ok(Response::new(proto::FinalizeLiveMigrateSourceResponse {
-            success: true,
-            message: format!("finalized source after migrate of {vm_name}"),
+            success: vmm_stopped && rbd_unmapped,
+            message: if vmm_stopped && rbd_unmapped {
+                format!("finalized source after migrate of {vm_name}")
+            } else {
+                format!(
+                    "source not fully released for {vm_name} (vmm_stopped={vmm_stopped}, rbd_unmapped={rbd_unmapped})"
+                )
+            },
+            vmm_stopped,
+            rbd_unmapped,
         }))
     }
 
@@ -2282,6 +2462,54 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             })),
         }
     }
+
+    async fn rotate_node_cert(
+        &self,
+        request: Request<proto::RotateNodeCertRequest>,
+    ) -> Result<Response<proto::RotateNodeCertResponse>, Status> {
+        // Only the controller may drive rotation; kctl goes through the
+        // controller's RotateNodeCerts RPC so the inventory stays authoritative.
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+
+        let pki = self.pki.as_ref().ok_or_else(|| {
+            Status::unimplemented(
+                "this node-agent has no enrolled TLS identity; certificate rotation is unavailable",
+            )
+        })?;
+
+        let _guard = self.rotate_lock.lock().await;
+        match crate::pki::rotate::rotate_once(
+            &pki.cfg,
+            &pki.cfg.cert_rotation,
+            req.force,
+            &req.reason,
+            &pki.reload,
+        )
+        .await
+        {
+            Ok(outcome) => Ok(Response::new(proto::RotateNodeCertResponse {
+                success: true,
+                message: outcome.message,
+                serial_hex: outcome.serial_hex,
+                skipped: outcome.skipped,
+                days_until_expiry: outcome.days_until_expiry,
+            })),
+            // A failed rotation is reported in-band rather than as a Status:
+            // the node is still healthy on its previous certificate, and the
+            // controller's reconciler logs the message and retries next tick.
+            Err(error) => {
+                warn!(%error, node_id = %pki.cfg.node_id, "certificate rotation failed; keeping the existing certificate");
+                Ok(Response::new(proto::RotateNodeCertResponse {
+                    success: false,
+                    message: error,
+                    serial_hex: String::new(),
+                    skipped: false,
+                    days_until_expiry: 0,
+                }))
+            }
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2839,6 +3067,7 @@ mod tests {
         let req = proto::ApplyNixConfigRequest {
             configuration_nix: "{ ... }: { test = true; }\n".to_string(),
             rebuild: false,
+            apply_id: String::new(),
         };
 
         let status = <AdminService as proto::node_admin_server::NodeAdmin>::apply_nix_config(
@@ -2863,6 +3092,7 @@ mod tests {
             Request::new(proto::ApplyNixConfigRequest {
                 configuration_nix: "{ ... }: {}\n".to_string(),
                 rebuild: false,
+                apply_id: String::new(),
             }),
         )
         .await
