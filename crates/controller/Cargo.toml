@@ -7,8 +7,16 @@ edition = "2021"
 anyhow = "1.0.102"
 kcore-sanitize = { path = "../kcore-sanitize" }
 kcore-disko-types = { path = "../kcore-disko-types" }
+aws-lc-rs = "1.16.2"
+axum = "0.8"
+base64 = "0.22.1"
 clap = { version = "4", features = ["derive"] }
+const-oid = { version = "0.9.5", features = ["db"] }
+der = { version = "0.7.8", features = ["alloc", "oid"] }
 pem = "3"
+spki = { version = "0.7.2", features = ["alloc"] }
+x509-cert = "0.2.5"
+x509-ocsp = { version = "0.2.1", features = ["std"] }
 prost = "0.13"
 prost-types = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -25,7 +33,8 @@ uuid = { version = "1.22.0", features = ["v4"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 time = "0.3"
-x509-parser = "0.18"
+# verify-aws: CRL and OCSP signature verification through aws-lc-rs, not ring.
+x509-parser = { version = "0.18", features = ["verify-aws"] }
 libc = "0.2"
 
 [build-dependencies]
@@ -33,6 +42,7 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 proptest = "1.11"
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

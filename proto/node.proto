@@ -55,6 +55,11 @@ service NodeAdmin {
   // provided content and (optionally) triggers a nixos-rebuild.
   rpc ApplyNixConfig(ApplyNixConfigRequest) returns (ApplyNixConfigResponse);
 
+  // GetNixApplyStatus reports whether the rebuild started by a previous
+  // ApplyNixConfig has finished activating. Callers that must observe the new
+  // configuration (live migration handoff, drain) poll this before continuing.
+  rpc GetNixApplyStatus(GetNixApplyStatusRequest) returns (GetNixApplyStatusResponse);
+
   // ApplyDiskLayout validates/applies a disk layout (implemented via disko)
   // for day-2 disk operations. Apply mode is only allowed when node disk
   // management mode is controller-managed.
@@ -120,6 +125,13 @@ service NodeAdmin {
       returns (FinalizeLiveMigrateSourceResponse);
   rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
       returns (FinalizeLiveMigrateDestResponse);
+
+  // RotateNodeCert asks the node-agent to rotate its own TLS identity: the
+  // node generates a fresh keypair, submits a CSR to the controller
+  // (Controller.SignNodeCsr), installs the signed chain atomically and
+  // reloads its listener. The private key never leaves the node. A failure
+  // leaves the previous certificate in place and serving.
+  rpc RotateNodeCert(RotateNodeCertRequest) returns (RotateNodeCertResponse);
 }
 
 // VM specification
@@ -459,11 +471,42 @@ message ApplyNixConfigRequest {
   // When true, run `nixos-rebuild switch` after writing the file.
   // When false, only write the file.
   bool rebuild = 2;
+
+  // Caller-generated token identifying this apply. Echoed back in the response
+  // and accepted by GetNixApplyStatus. Empty means the node picks its own.
+  string apply_id = 3;
 }
 
 message ApplyNixConfigResponse {
   bool success = 1;
   string message = 2;
+
+  // Token to poll with GetNixApplyStatus. Empty when the node agent predates
+  // apply tracking, in which case callers must not wait for activation.
+  string apply_id = 3;
+}
+
+enum NixApplyPhase {
+  NIX_APPLY_PHASE_UNSPECIFIED = 0;
+  // Rebuild is still running (or queued behind another apply).
+  NIX_APPLY_PHASE_RUNNING = 1;
+  // `nixos-rebuild test && nixos-rebuild switch` activated successfully.
+  NIX_APPLY_PHASE_SUCCEEDED = 2;
+  NIX_APPLY_PHASE_FAILED = 3;
+  // The node has no record of this apply_id (agent restart, or a newer apply
+  // superseded it).
+  NIX_APPLY_PHASE_UNKNOWN = 4;
+}
+
+message GetNixApplyStatusRequest {
+  // Empty returns the most recent apply on the node.
+  string apply_id = 1;
+}
+
+message GetNixApplyStatusResponse {
+  string apply_id = 1;
+  NixApplyPhase phase = 2;
+  string message = 3;
 }
 
 message ApplyDiskLayoutRequest {
@@ -835,6 +878,9 @@ message PrepareLiveMigrateReceiveResponse {
   bool success = 1;
   string message = 2;
   int32 listen_port = 3;
+  // Address the source should dial. Empty or a wildcard ("0.0.0.0", "::")
+  // means the destination has no opinion and the caller should fall back to
+  // the host part of the destination node's gRPC address.
   string listen_addr = 4;
 }
 
@@ -880,6 +926,11 @@ message FinalizeLiveMigrateSourceRequest {
 message FinalizeLiveMigrateSourceResponse {
   bool success = 1;
   string message = 2;
+  // Verified (not merely requested) post-conditions. The controller refuses to
+  // start the VM on the destination unless both are true, so a cold move can
+  // never have two VMMs writing the same RBD image.
+  bool vmm_stopped = 3;
+  bool rbd_unmapped = 4;
 }
 
 message FinalizeLiveMigrateDestRequest {
@@ -891,3 +942,21 @@ message FinalizeLiveMigrateDestResponse {
   string message = 2;
 }
 
+
+message RotateNodeCertRequest {
+  // Rotate even when the certificate is not yet inside the renewal window.
+  bool force = 1;
+  // Correlation id for controller-driven rotations (audit/log only).
+  string reason = 2;
+}
+
+message RotateNodeCertResponse {
+  bool success = 1;
+  string message = 2;
+  // Serial of the newly installed certificate, empty when no rotation happened.
+  string serial_hex = 3;
+  // True when the certificate was already outside the renewal window and
+  // force was not set, so nothing was changed.
+  bool skipped = 4;
+  int32 days_until_expiry = 5;
+}
