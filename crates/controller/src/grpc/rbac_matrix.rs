@@ -97,6 +97,13 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_AFTER_RENEW: &[(&str, &str)] = &[
     ("GrantOperatorRole", "cluster-admin"),
     ("RevokeOperatorRole", "cluster-admin"),
     ("IssueOperatorCert", "cluster-admin"),
+    ("RotateNodeCerts", "cluster-admin"),
+    ("ListCertificates", "read-only"),
+    ("RevokeCertificate", "cluster-admin"),
+    ("GetPkiStatus", "read-only"),
+    // GetCrl also accepts node certificates so agents can fetch revocation
+    // data over their existing channel; the operator floor is read-only.
+    ("GetCrl", "read-only"),
 ];
 
 /// `ControllerAdmin` service RPCs (separate tonic service; listed at end of compliance output).
@@ -143,6 +150,7 @@ pub(crate) fn compliance_access_control_entries() -> Vec<controller_proto::Acces
             .map(|(m, r)| acl_entry(m, ACL_OPERATOR_AND_PEER_CTRL, r)),
     );
     v.push(acl_entry("RenewNodeCert", CN_NODE_PREFIX, ""));
+    v.push(acl_entry("SignNodeCsr", CN_NODE_PREFIX, ""));
     v.extend(
         CONTROLLER_OPERATOR_RPC_AFTER_RENEW
             .iter()

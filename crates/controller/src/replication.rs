@@ -2882,6 +2882,9 @@ mod tests {
                 peers: vec![],
             }),
             require_manual_approval: false,
+            cert_rotation: Default::default(),
+            revocation: Default::default(),
+            pki: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 
@@ -2915,6 +2918,9 @@ mod tests {
             },
             replication: None,
             require_manual_approval: false,
+            cert_rotation: Default::default(),
+            revocation: Default::default(),
+            pki: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 
