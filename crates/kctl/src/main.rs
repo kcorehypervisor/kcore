@@ -1,4 +1,9 @@
-#![allow(dead_code, clippy::too_many_arguments, clippy::enum_variant_names)]
+#![allow(
+    dead_code,
+    clippy::too_many_arguments,
+    clippy::enum_variant_names,
+    clippy::result_large_err
+)]
 
 mod apply_summary;
 mod client;

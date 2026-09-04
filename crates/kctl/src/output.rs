@@ -335,7 +335,7 @@ pub fn print_compliance_report(r: &controller_proto::GetComplianceReportResponse
                 n.node_id,
                 n.hostname,
                 n.address,
-                &n.approval_status,
+                n.approval_status,
                 format_cert_expiry(n.cert_expiry_days),
                 format_luks_method(&n.luks_method),
             );

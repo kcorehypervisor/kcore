@@ -82,7 +82,7 @@ in
     environment.systemPackages = [ pkgs.ceph ];
     services.ceph = {
       global = {
-        fsid = cfg.fsid;
+        inherit (cfg) fsid;
         cluster = cfg.clusterName;
         public_network = cfg.publicNetwork;
         cluster_network = cfg.clusterNetwork;

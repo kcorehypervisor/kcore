@@ -855,15 +855,7 @@ fn resolve_create_image_source(
     }
 
     let path = cli_image_path
-        .or_else(|| {
-            manifest_image.and_then(|img| {
-                if img.starts_with("https://") {
-                    None
-                } else {
-                    Some(img)
-                }
-            })
-        })
+        .or_else(|| manifest_image.filter(|img| !img.starts_with("https://")))
         .unwrap_or("")
         .trim();
     if path.is_empty() {
