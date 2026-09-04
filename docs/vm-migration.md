@@ -12,7 +12,7 @@ Product docs: [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.
 ## Prerequisites (both modes)
 
 - VM `storage_backend = ceph`.
-- Source and destination are members of the same `CephCluster` (destination must be schedulable for `ceph`).
+- Source and destination are members of the same `CephCluster`, and that cluster's reconciled status is `healthy`. `MigrateVm` rejects a destination outside a healthy cluster with `FAILED_PRECONDITION`, and `DrainNode` will not pick one as a target.
 - RBD image exists in pool `kcore-vms` as `kcore-<vm-id>` (controller `volumes` row).
 - Live only: Cloud Hypervisor on both nodes; guest memory configured with `shared=on` (Ceph VM units in `modules/ch-vm/vm-service.nix`); TCP allowed between node data IPs for an ephemeral migration port.
 
@@ -36,13 +36,25 @@ kctl migrate vm app-1 --target-node node-b --allow-cold-fallback
 
 1. Mark source `draining` (drain only).
 2. For each VM (or the one VM on cold fallback):
-   - Pick a target with capacity and compatible backend (`ceph` membership counts).
+   - Pick a target with capacity and compatible backend (`ceph` membership counts). For `ceph` VMs the target must also belong to a **healthy** `CephCluster` — a node in a degraded cluster may not be able to map the image at all.
+   - **Release the shared RBD on the source** (see below). A VM whose image cannot be released is skipped and left where it is.
    - **Reassign ownership**: delete + re-insert the `vms` row with the new `node_id` (preserve SSH key associations). The `volumes` row is unchanged — the RBD image stays put.
 3. `push_config_to_node` on source (VM disappears from Nix → unit stops / disk unmapped).
 4. `push_config_to_node` on destination (unit appears → map RBD, start CH if `autoStart`).
-5. Drain marks source `drained`.
+5. Drain marks source `drained` **only if every VM moved**; otherwise the node stays `draining` and `DrainNode` returns `success = false` with a per-VM error list.
 
 There is **no** Cloud Hypervisor migration API on the cold path. The guest is stopped on the source (via systemd/Nix removal) and started fresh on the destination against the same RBD device path once mapped.
+
+### The exclusivity barrier (why a cold move is not just two config pushes)
+
+`ApplyNixConfig` starts `nixos-rebuild` **asynchronously** and returns as soon as the file is written, so the two pushes in steps 3 and 4 race: the destination can map and boot from the shared image while the source VMM is still writing to it. Two writers on one RBD image corrupts the guest filesystem.
+
+Before reassigning a `ceph` VM, the controller therefore calls `FinalizeLiveMigrateSource` on the node that currently owns it, which stops the VM unit and runs `rbd unmap`. `rbd unmap` **cannot succeed while a local VMM still holds the device open**, so a successful call is positive proof that the source has let go — it is the barrier, not just a request.
+
+Failure handling:
+
+- **Source unreachable** (`UNAVAILABLE`): tolerated with a warning. This is the node-failure drain case, where the source VMM died with its node.
+- **Any other failure**: hard `FAILED_PRECONDITION`. The VM is left on the source rather than risking a second writer.
 
 ### Why Ceph makes cold cheap
 
@@ -112,7 +124,7 @@ Orchestrator: controller `MigrateVm` → node `NodeAdmin` peer RPCs.
 **Handoff (destination systemd)** — `modules/ch-vm/vm-service.nix`
 
 - Ceph VMs: `--memory size=…M,shared=on` (CH live-migrate requirement).
-- `stopIfChanged` / `restartIfChanged` off for Ceph so nixos-rebuild that installs the unit does not kill the receive process.
+- `stopIfChanged` / `restartIfChanged` keep their NixOS defaults. `switch-to-configuration` only consults them for units that **already existed and changed**; the destination unit is brand new, so it is simply started and adopts the receive process. (Overriding them for Ceph would also have quietly stopped `cpu`/`memory`/`extraArgs` updates from ever taking effect.)
 - `ExecStartPre`: if `.live-migrated` exists, skip wiping the API socket and skip cold provision.
 - `ExecStart`: if marker present, `tail --pid=<migrate.pid> -f /dev/null` so systemd’s MainPID waits on the already-running CH; else cold-start the full CH CLI.
 

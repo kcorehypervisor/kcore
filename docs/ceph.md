@@ -94,7 +94,9 @@ Create path (controller → node):
 3. Upsert `volumes` row; insert `vms` with `node_id`.
 4. Push Nix; node unit `ExecStartPre` maps `/dev/rbd/kcore-vms/kcore-<vm-id>` and seeds once from the guest image (`qemu-img convert` + RBD image-meta `kcore.seeded=1`), then Cloud Hypervisor boots with that block device.
 
-Delete best-effort `rbd rm`s the image.
+Delete resolves the VM by id **or name** first, then uses the resolved id for the `volumes` row and the best-effort `rbd rm` — deleting by name used to leave the image and row orphaned.
+
+`DeleteCephCluster` is refused with `FAILED_PRECONDITION` while any `ceph`-backed VM still lives on one of the cluster's member nodes, and names the blocking VMs. Removing the record first would strand those VMs: the reconciler stops managing the cluster and their nodes stop counting as Ceph-capable, so they can no longer be created, migrated, or drained. VMs on local backends do not block deletion.
 
 Local backends (`filesystem` / `lvm` / `zfs`) remain for single-node latency-sensitive workloads.
 
