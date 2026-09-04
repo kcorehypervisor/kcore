@@ -43,8 +43,9 @@ use std::collections::HashMap;
 
 use super::helpers::compute_vni;
 use super::helpers::{
-    controller_state_from_node_state, grpc_address_host, parse_datetime_to_timestamp,
-    parse_port_list, short_vm_id_seed, state_fallback_without_runtime, vm_backend_handle,
+    controller_state_from_node_state, grpc_address_host, migration_dial_host,
+    parse_datetime_to_timestamp, parse_port_list, short_vm_id_seed, state_fallback_without_runtime,
+    status_with_context, vm_backend_handle,
 };
 use super::rbac_matrix;
 use super::signing;
@@ -64,6 +65,85 @@ struct LiveMigrateFailure {
     send_succeeded: bool,
     status: Status,
 }
+
+/// Whether a node may be handed a VM that is moving off another node.
+///
+/// `scheduler::select_node_for_vm` applies these rules when it picks a target,
+/// but an operator-supplied `target_node` used to bypass them entirely — so
+/// `MigrateVm` and `DrainNode` would happily move a guest onto a node that was
+/// itself being evacuated, or one that has not been approved into the cluster.
+#[allow(clippy::result_large_err)]
+fn accepts_migrated_vms(node: &NodeRow) -> Result<(), Status> {
+    if node.approval_status != "approved" {
+        return Err(Status::failed_precondition(format!(
+            "node '{}' is not approved ({}); it cannot be given VMs",
+            node.id, node.approval_status
+        )));
+    }
+    if matches!(node.status.as_str(), "draining" | "drained") {
+        return Err(Status::failed_precondition(format!(
+            "node '{}' is being evacuated (status {}); moving a VM onto it would undo the drain",
+            node.id, node.status
+        )));
+    }
+    Ok(())
+}
+
+/// Decide whether a node's `FinalizeLiveMigrateSource` reply proves the source
+/// has really let go of the shared RBD image.
+///
+/// The node answers with what it *observed* — the unit is inactive, the device
+/// is no longer mapped — rather than with the fact that it issued the calls. A
+/// reply whose post-conditions are false means the guest or the mapping is
+/// still there, so whatever was going to touch that image next must not.
+#[allow(clippy::result_large_err)]
+fn check_release_barrier(
+    vm_name: &str,
+    node_id: &str,
+    resp: &node_proto::FinalizeLiveMigrateSourceResponse,
+) -> Result<(), Status> {
+    if resp.vmm_stopped && resp.rbd_unmapped {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "node {node_id} did not release VM '{vm_name}' (vmm_stopped={}, rbd_unmapped={}): {}; \
+         refusing to touch the shared image while the source may still be writing",
+        resp.vmm_stopped, resp.rbd_unmapped, resp.message
+    )))
+}
+
+/// What a single `GetNixApplyStatus` poll tells the caller to do next.
+#[derive(Debug, PartialEq, Eq)]
+enum NixApplyProgress {
+    /// The rebuild activated; the new configuration is live.
+    Activated,
+    /// Still building. Poll again.
+    Pending,
+    /// The rebuild failed; the node is running its previous configuration.
+    Failed,
+    /// The node cannot answer for this apply (its `/run` state was discarded,
+    /// or a newer apply superseded it). Polling longer cannot help.
+    NoVerdict,
+}
+
+fn nix_apply_progress(phase: i32) -> NixApplyProgress {
+    match node_proto::NixApplyPhase::try_from(phase) {
+        Ok(node_proto::NixApplyPhase::Succeeded) => NixApplyProgress::Activated,
+        Ok(node_proto::NixApplyPhase::Failed) => NixApplyProgress::Failed,
+        Ok(node_proto::NixApplyPhase::Running) => NixApplyProgress::Pending,
+        Ok(node_proto::NixApplyPhase::Unknown) => NixApplyProgress::NoVerdict,
+        // An unset phase is a node that has not written its first state yet.
+        Ok(node_proto::NixApplyPhase::Unspecified) | Err(_) => NixApplyProgress::Pending,
+    }
+}
+
+/// Upper bound on how long a caller waits for a node's `nixos-rebuild` to
+/// activate. Matched to the live-migration send/receive timeouts so a migration
+/// cannot be bounded by one leg and unbounded by the other. It exists to fail
+/// with a clear error rather than hang; a warm node activates in well under a
+/// minute.
+const NIX_APPLY_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+const NIX_APPLY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const EVT_NODE_REGISTER: &str = "node.register";
 const EVT_NODE_HEARTBEAT: &str = "node.heartbeat";
 const EVT_NODE_APPROVE: &str = "node.approve";
@@ -416,9 +496,37 @@ impl ControllerService {
         )
     }
 
+    /// Generate and push this node's Nix configuration, returning as soon as
+    /// the node has accepted it. The `nixos-rebuild` it triggers is still
+    /// running; use [`Self::push_config_and_await_apply`] when the next step
+    /// depends on the new configuration being live.
     async fn push_config_to_node(&self, node: &NodeRow) -> Result<(), Status> {
+        self.push_config_to_node_inner(node, false).await
+    }
+
+    /// Push this node's Nix configuration and block until the node reports the
+    /// rebuild activated.
+    ///
+    /// `ApplyNixConfig` only *starts* `nixos-rebuild`, so anything that assumes
+    /// the generated systemd unit already exists — starting a migrated VM on
+    /// its destination, booting a freshly created one, believing a drained node
+    /// has really let go of its VMs — has to wait for the verdict first.
+    ///
+    /// A node agent that predates apply tracking answers with an empty
+    /// `apply_id`. There is nothing to poll then, so the caller carries on with
+    /// the old fire-and-forget behaviour rather than failing the operation.
+    async fn push_config_and_await_apply(&self, node: &NodeRow) -> Result<(), Status> {
+        self.push_config_to_node_inner(node, true).await
+    }
+
+    async fn push_config_to_node_inner(
+        &self,
+        node: &NodeRow,
+        await_apply: bool,
+    ) -> Result<(), Status> {
         #[cfg(test)]
         if let Some(hook) = &self.test_push_hook {
+            let _ = await_apply;
             return hook(node);
         }
 
@@ -584,11 +692,12 @@ impl ControllerService {
             );
         }
 
+        let apply_id = Uuid::new_v4().to_string();
         let apply = admin
             .apply_nix_config(node_proto::ApplyNixConfigRequest {
                 configuration_nix: nix_config,
                 rebuild: true,
-                apply_id: String::new(),
+                apply_id: apply_id.clone(),
             })
             .await
             .map_err(|e| {
@@ -615,7 +724,105 @@ impl ControllerService {
         );
 
         info!(node = %node.id, "pushed config and triggered rebuild");
+
+        if await_apply {
+            self.await_nix_apply(node, &apply.apply_id, &mut admin)
+                .await?;
+        }
         Ok(())
+    }
+
+    /// Poll `GetNixApplyStatus` until the node's rebuild reaches a verdict.
+    ///
+    /// `nixos-rebuild switch` restarts the node agent, so the node records the
+    /// verdict from a transient unit that outlives the agent and a dropped
+    /// connection mid-rebuild is normal — transport errors are retried until
+    /// the deadline rather than reported.
+    async fn await_nix_apply(
+        &self,
+        node: &NodeRow,
+        apply_id: &str,
+        admin: &mut node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>,
+    ) -> Result<(), Status> {
+        if apply_id.is_empty() {
+            warn!(
+                node = %node.id,
+                "node agent returned no apply_id; cannot wait for the rebuild to activate"
+            );
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + NIX_APPLY_WAIT_TIMEOUT;
+        let mut last_message;
+        loop {
+            match admin
+                .get_nix_apply_status(node_proto::GetNixApplyStatusRequest {
+                    apply_id: apply_id.to_string(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let resp = resp.into_inner();
+                    last_message = resp.message;
+                    match nix_apply_progress(resp.phase) {
+                        NixApplyProgress::Activated => {
+                            info!(node = %node.id, %apply_id, "node activated the pushed configuration");
+                            return Ok(());
+                        }
+                        NixApplyProgress::Failed => {
+                            return Err(Status::internal(format!(
+                                "nixos-rebuild for apply {apply_id} failed on node {}: {last_message}",
+                                node.id
+                            )));
+                        }
+                        // Degrade to the old unsynchronised behaviour: there is
+                        // no answer coming, and failing the operation over a
+                        // missing verdict would be worse than proceeding.
+                        NixApplyProgress::NoVerdict => {
+                            warn!(
+                                node = %node.id,
+                                %apply_id,
+                                message = %last_message,
+                                "node has no verdict for this nix apply; continuing without the barrier"
+                            );
+                            return Ok(());
+                        }
+                        NixApplyProgress::Pending => {}
+                    }
+                }
+                // An agent without apply tracking cannot be waited on.
+                Err(e) if e.code() == tonic::Code::Unimplemented => {
+                    warn!(
+                        node = %node.id,
+                        %apply_id,
+                        "node agent does not implement GetNixApplyStatus; continuing without the barrier"
+                    );
+                    return Ok(());
+                }
+                Err(e) if e.code() == tonic::Code::Unavailable => {
+                    debug!(
+                        node = %node.id,
+                        %apply_id,
+                        error = %e,
+                        "node unreachable while its rebuild runs; retrying"
+                    );
+                    last_message = e.message().to_string();
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "polling nix apply {apply_id} on node {}: {e}",
+                        node.id
+                    )));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "node {} did not finish activating apply {apply_id} within {}s: {last_message}",
+                    node.id,
+                    NIX_APPLY_WAIT_TIMEOUT.as_secs()
+                )));
+            }
+            tokio::time::sleep(NIX_APPLY_POLL_INTERVAL).await;
+        }
     }
 
     /// Re-push config to all other nodes sharing a VXLAN network so their
@@ -817,6 +1024,17 @@ impl ControllerService {
         Ok(false)
     }
 
+    /// Keep only the nodes that belong to a healthy CephCluster.
+    fn healthy_ceph_members(&self, nodes: &[NodeRow]) -> Result<Vec<NodeRow>, Status> {
+        let mut healthy = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if self.is_healthy_ceph_member(&node.id)? {
+                healthy.push(node.clone());
+            }
+        }
+        Ok(healthy)
+    }
+
     async fn live_migrate_vm(
         &self,
         vm: &VmRow,
@@ -851,7 +1069,10 @@ impl ControllerService {
             .await
             .map_err(|e| LiveMigrateFailure {
                 send_succeeded: false,
-                status: Status::internal(format!("prepare receive on {}: {e}", target.id)),
+                status: status_with_context(
+                    &e,
+                    &format!("preparing node {} to receive VM '{}'", target.id, vm.name),
+                ),
             })?
             .into_inner();
         if !prep.success || prep.listen_port <= 0 {
@@ -860,7 +1081,11 @@ impl ControllerService {
                 status: Status::internal(format!("prepare receive failed: {}", prep.message)),
             });
         }
-        let destination_url = format!("tcp:{dest_host}:{}", prep.listen_port);
+        // The destination knows which of its addresses the migration listener
+        // is reachable on; only fall back to the host part of its gRPC address
+        // when it declines to say (empty or a wildcard bind).
+        let dial_host = migration_dial_host(&prep.listen_addr, dest_host);
+        let destination_url = format!("tcp:{dial_host}:{}", prep.listen_port);
 
         let send_result = source_admin
             .send_live_migrate(node_proto::SendLiveMigrateRequest {
@@ -880,7 +1105,13 @@ impl ControllerService {
                 .await;
             return Err(LiveMigrateFailure {
                 send_succeeded: false,
-                status: Status::internal(format!("send migration from {}: {e}", source.id)),
+                status: status_with_context(
+                    &e,
+                    &format!(
+                        "sending VM '{}' from node {} to {destination_url}",
+                        vm.name, source.id
+                    ),
+                ),
             });
         }
 
@@ -896,13 +1127,22 @@ impl ControllerService {
             .await
             .map_err(|e| LiveMigrateFailure {
                 send_succeeded: true,
-                status: Status::internal(format!("wait receive on {}: {e}", target.id)),
+                status: status_with_context(
+                    &e,
+                    &format!(
+                        "waiting for VM '{}' to finish arriving on node {}",
+                        vm.name, target.id
+                    ),
+                ),
             })?
             .into_inner();
         if !wait.success {
             return Err(LiveMigrateFailure {
                 send_succeeded: true,
-                status: Status::internal(format!("wait receive failed: {}", wait.message)),
+                status: Status::internal(format!(
+                    "node {} did not complete the receive for VM '{}': {}",
+                    target.id, vm.name, wait.message
+                )),
             });
         }
 
@@ -915,7 +1155,9 @@ impl ControllerService {
         if let Err(e) = self.push_config_to_node(source).await {
             warn!(node = %source.id, error = %e, "push after live migrate (source)");
         }
-        self.push_config_to_node(target)
+        // `finalize_live_migrate_dest` starts the generated VM unit, so the
+        // destination rebuild has to have activated before we ask for it.
+        self.push_config_and_await_apply(target)
             .await
             .map_err(|status| LiveMigrateFailure {
                 send_succeeded: true,
@@ -929,10 +1171,19 @@ impl ControllerService {
             .await
             .map_err(|e| LiveMigrateFailure {
                 send_succeeded: true,
-                status: Status::internal(format!("finalize dest: {e}")),
+                status: status_with_context(
+                    &e,
+                    &format!(
+                        "adopting migrated VM '{}' into systemd on node {}",
+                        vm.name, target.id
+                    ),
+                ),
             })?;
 
-        if let Err(e) = source_admin
+        // The guest already runs on the destination, so a source that has not
+        // fully let go is a leak to clean up later, not a reason to fail the
+        // migration — but it must be visible.
+        match source_admin
             .finalize_live_migrate_source(node_proto::FinalizeLiveMigrateSourceRequest {
                 vm_name: runtime_name.to_string(),
                 rbd_pool: volume.pool.clone(),
@@ -940,25 +1191,42 @@ impl ControllerService {
             })
             .await
         {
-            warn!(error = %e, "finalize source after live migrate");
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if !resp.vmm_stopped || !resp.rbd_unmapped {
+                    warn!(
+                        node = %source.id,
+                        vm = %vm.name,
+                        vmm_stopped = resp.vmm_stopped,
+                        rbd_unmapped = resp.rbd_unmapped,
+                        message = %resp.message,
+                        "source node did not fully release the migrated VM"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(node = %source.id, error = %e, "finalize source after live migrate");
+            }
         }
 
         Ok(())
     }
 
     /// Stop a Ceph-backed VM and unmap its RBD image on the node that owns it
-    /// *before* another node is allowed to map the same image.
+    /// *before* anything else touches that image — another node mapping it
+    /// (cold move) or the pool deleting it (`DeleteVm`).
     ///
     /// Config pushes trigger an asynchronous `nixos-rebuild` on each node, so a
     /// cold move that only rewrote configs would let the destination map and
     /// boot from the shared RBD while the source VMM was still writing to it.
-    /// A successful `finalize_live_migrate_source` means `rbd unmap` succeeded,
-    /// which cannot happen while a local VMM still holds the device open — so
-    /// it doubles as the exclusivity barrier.
+    /// `rbd unmap` cannot succeed while a local VMM holds the device open, so
+    /// the node's *observed* `rbd_unmapped` is positive proof the source has
+    /// let go — the call is the exclusivity barrier, not just a request.
     ///
     /// An unreachable source node is tolerated (that is the node-failure drain
-    /// case, where the source VMM is gone with the node); anything else is a
-    /// hard error rather than a risk of two writers.
+    /// case, where the source VMM is gone with the node); anything else — a
+    /// failed call, or a success whose post-conditions are false — is a hard
+    /// error rather than a risk of two writers.
     async fn cold_release_ceph_vm(&self, vm: &VmRow, source: &NodeRow) -> Result<(), Status> {
         if vm.storage_backend != "ceph" {
             return Ok(());
@@ -969,7 +1237,18 @@ impl ControllerService {
             .map_err(|e| Status::internal(e.to_string()))?;
         let (pool, image) = match volume {
             Some(v) => (v.pool, v.image),
-            None => (String::new(), String::new()),
+            None => {
+                // Without an image name the node cannot report `rbd unmapped`
+                // for anything specific, so the barrier degrades to "the VM
+                // unit is stopped" — which does still run the unit's
+                // `ExecStopPost` unmap. Say so rather than hide it.
+                warn!(
+                    vm = %vm.name,
+                    node = %source.id,
+                    "Ceph VM has no volume row; RBD release can only be verified via the stopped unit"
+                );
+                (String::new(), String::new())
+            }
         };
         let runtime_name = sanitize_nix_attr_key(&vm.name);
         let mut admin = match self.ensure_admin_client_for_node(source).await {
@@ -993,7 +1272,7 @@ impl ControllerService {
             })
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(resp) => check_release_barrier(&vm.name, &source.id, &resp.into_inner()),
             Err(e) if e.code() == tonic::Code::Unavailable => {
                 warn!(
                     node = %source.id,
@@ -1004,8 +1283,8 @@ impl ControllerService {
                 Ok(())
             }
             Err(e) => Err(Status::failed_precondition(format!(
-                "could not release shared RBD for VM '{}' on node {}: {e}; refusing to start it \
-                 elsewhere while the source may still be writing",
+                "could not release shared RBD for VM '{}' on node {}: {e}; refusing to touch the \
+                 shared image while the source may still be writing",
                 vm.name, source.id
             ))),
         }
@@ -1019,37 +1298,37 @@ impl ControllerService {
     ) -> Result<(), Status> {
         self.cold_release_ceph_vm(vm, source).await?;
         self.reassign_vm_node(vm, &target.id)?;
+        // The source has already provably released the image, so its rebuild
+        // is bookkeeping and need not be waited on. The destination's is not:
+        // the caller reports the move as done, which is only true once the new
+        // unit exists there.
         if let Err(e) = self.push_config_to_node(source).await {
             warn!(node = %source.id, error = %e, "push after cold migrate (source)");
         }
-        self.push_config_to_node(target).await?;
+        self.push_config_and_await_apply(target).await?;
         Ok(())
     }
 
+    /// Hand a VM's ownership to another node.
+    ///
+    /// A single `UPDATE` of `node_id`, not delete-then-reinsert. Every table
+    /// keyed on `vms(id)` cascades on delete, so the old implementation quietly
+    /// destroyed each migrated VM's `security_group_vm_attachments` rows (SSH
+    /// keys were restored by hand; security groups were not). Updating in place
+    /// removes the whole class of bug — and keeps `created_at`, which a
+    /// reassignment has no business resetting.
     fn reassign_vm_node(&self, vm: &VmRow, target_node_id: &str) -> Result<(), Status> {
-        let ssh_keys = self.db.get_vm_ssh_keys(&vm.id).unwrap_or_default();
-        let deleted = self
-            .db
-            .delete_vm_by_id_or_name(&vm.id)
-            .map_err(|e| Status::internal(format!("deleting vm for reassignment: {e}")))?;
-        if !deleted {
-            return Err(Status::internal("failed to delete VM during reassignment"));
-        }
-        let mut new_vm = vm.clone();
-        new_vm.node_id = target_node_id.to_string();
-        self.db
-            .insert_vm(&new_vm)
-            .map_err(|e| Status::internal(format!("re-inserting VM: {e}")))?;
-        if !ssh_keys.is_empty() {
-            let key_names: Vec<String> = self
-                .db
-                .list_ssh_keys()
-                .unwrap_or_default()
-                .iter()
-                .filter(|(_, pk, _)| ssh_keys.contains(pk))
-                .map(|(name, _, _)| name.clone())
-                .collect();
-            let _ = self.db.associate_vm_ssh_keys(&new_vm.id, &key_names);
+        let moved = self.db.set_vm_node(&vm.id, target_node_id).map_err(|e| {
+            Status::internal(format!(
+                "reassigning VM '{}' to node {target_node_id}: {e}",
+                vm.name
+            ))
+        })?;
+        if !moved {
+            return Err(Status::not_found(format!(
+                "VM '{}' no longer exists; cannot reassign it to node {target_node_id}",
+                vm.name
+            )));
         }
         Ok(())
     }
@@ -1112,7 +1391,11 @@ impl ControllerService {
         if !updated {
             return Err(Status::not_found(format!("VM {vm_id} not found")));
         }
-        if let Err(e) = self.push_config_to_node(&node).await {
+        // Await the rebuild: the whole point of the rollback below is that a
+        // stored desired state the node never reconciled is worse than an
+        // error, and a config push that only wrote a file cannot tell the
+        // difference.
+        if let Err(e) = self.push_config_and_await_apply(&node).await {
             // Roll back the desired_state mutation so retries see the stale
             // spec and re-trigger the reconcile on the next CreateVm/Apply.
             // Use compare-and-swap so a concurrent successful update is not
@@ -2589,12 +2872,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         info!(vm_id = %vm_id, node_id = %node.id, "created VM, pushing config");
 
-        if let Err(push_err) = self.push_config_to_node(&node).await {
+        // Wait for the rebuild: without the barrier a failing `nixos-rebuild`
+        // left the DB claiming a VM the node never built, and the rollback
+        // below could never fire.
+        if let Err(push_err) = self.push_config_and_await_apply(&node).await {
             warn!(
                 vm_id = %vm_id,
                 node_id = %node.id,
                 error = %push_err,
-                "failed to push config after VM insert; rolling back VM row"
+                "failed to apply config after VM insert; rolling back VM row"
             );
             self.rollback_created_vm(&node, &vm).await;
             return Err(Status::aborted(format!(
@@ -2725,6 +3011,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .db
             .get_volume_by_vm(&db_vm.id)
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        // `rbd rm` cannot remove an image the owning node still has mapped, and
+        // the config push that stops the guest only happens at the end of this
+        // RPC. Deleting the volume first therefore left the RBD image behind in
+        // the pool with its bookkeeping row already gone. Stop the guest and
+        // unmap first; an unreachable node is tolerated so a dead host can
+        // still be cleaned up.
+        self.cold_release_ceph_vm(&db_vm, &node).await?;
 
         let deleted = self
             .db
@@ -4984,27 +5278,36 @@ impl controller_proto::controller_server::Controller for ControllerService {
             let mut backend_eligible: Vec<NodeRow> = eligible_nodes
                 .iter()
                 .filter(|n| self.node_supports_backend(n, &vm.storage_backend))
+                .filter(|n| accepts_migrated_vms(n).is_ok())
                 .cloned()
                 .collect();
             if vm.storage_backend == "ceph" {
-                let mut healthy = Vec::with_capacity(backend_eligible.len());
-                for node in backend_eligible {
-                    if self.is_healthy_ceph_member(&node.id)? {
-                        healthy.push(node);
+                match self.healthy_ceph_members(&backend_eligible) {
+                    Ok(healthy) => backend_eligible = healthy,
+                    Err(e) => {
+                        errors.push(format!("VM '{}': {e}", vm.name));
+                        continue;
                     }
                 }
-                backend_eligible = healthy;
             }
+            // Every failure below has to be recorded and skipped rather than
+            // returned: VMs earlier in the loop have already been reassigned in
+            // the DB and no config has been pushed yet, so bailing out here
+            // would leave the cluster disagreeing with the database.
             let target = if !req.target_node.is_empty() {
-                backend_eligible
+                match backend_eligible
                     .iter()
                     .find(|n| n.id == req.target_node || n.address == req.target_node)
-                    .ok_or_else(|| {
-                        Status::not_found(format!(
-                            "target node '{}' not found or incompatible with VM '{}' storage backend '{}'",
+                {
+                    Some(n) => n,
+                    None => {
+                        errors.push(format!(
+                            "target node '{}' cannot take VM '{}' (storage backend '{}')",
                             req.target_node, vm.name, vm.storage_backend
-                        ))
-                    })?
+                        ));
+                        continue;
+                    }
+                }
             } else {
                 match scheduler::select_node_for_vm(&backend_eligible, vm.cpu, vm.memory_bytes) {
                     Some(n) => n,
@@ -5026,47 +5329,40 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 continue;
             }
 
-            let deleted = self
-                .db
-                .delete_vm_by_id_or_name(&vm.id)
-                .map_err(|e| Status::internal(format!("deleting vm: {e}")))?;
-            if !deleted {
+            if let Err(e) = self.reassign_vm_node(vm, &target.id) {
+                errors.push(format!("VM '{}': {e}", vm.name));
                 continue;
-            }
-
-            let mut new_vm = vm.clone();
-            new_vm.node_id = target.id.clone();
-            if let Err(e) = self.db.insert_vm(&new_vm) {
-                errors.push(format!("re-inserting VM '{}': {e}", vm.name));
-                continue;
-            }
-
-            let ssh_keys = self.db.get_vm_ssh_keys(&vm.id).unwrap_or_default();
-            if !ssh_keys.is_empty() {
-                let key_names: Vec<String> = self
-                    .db
-                    .list_ssh_keys()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|(_, pk, _)| ssh_keys.contains(pk))
-                    .map(|(name, _, _)| name.clone())
-                    .collect();
-                let _ = self.db.associate_vm_ssh_keys(&new_vm.id, &key_names);
             }
 
             migrated += 1;
             destination_node_ids.insert(target.id.clone());
         }
 
-        if let Err(e) = self.push_config_to_node(&source_node).await {
-            warn!(node = %req.node_id, error = %e, "failed to push config to drained node");
+        // A node is only drained once its own rebuild has actually removed the
+        // VM units, so wait for the verdict and treat a failure as an
+        // incomplete evacuation rather than logging it and claiming success.
+        if let Err(e) = self.push_config_and_await_apply(&source_node).await {
+            warn!(node = %req.node_id, error = %e, "failed to apply config on drained node");
+            errors.push(format!(
+                "node {} did not apply its post-drain configuration: {e}",
+                req.node_id
+            ));
         }
 
         for target_id in &destination_node_ids {
-            if let Ok(Some(target_node)) = self.db.get_node(target_id) {
-                if let Err(e) = self.push_config_to_node(&target_node).await {
-                    warn!(node = %target_id, error = %e, "failed to push config to target node");
+            match self.db.get_node(target_id) {
+                Ok(Some(target_node)) => {
+                    if let Err(e) = self.push_config_and_await_apply(&target_node).await {
+                        warn!(node = %target_id, error = %e, "failed to apply config on target node");
+                        errors.push(format!(
+                            "target node {target_id} did not apply the migrated VM configuration: {e}"
+                        ));
+                    }
                 }
+                Ok(None) => errors.push(format!(
+                    "target node {target_id} disappeared before its configuration was applied"
+                )),
+                Err(e) => errors.push(format!("looking up target node {target_id}: {e}")),
             }
         }
 
@@ -5163,6 +5459,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "target_node must differ from the VM's current node",
             ));
         }
+        accepts_migrated_vms(target)?;
         if !self.node_supports_backend(target, "ceph") {
             return Err(Status::failed_precondition(
                 "target node is not a CephCluster member",
@@ -5235,7 +5532,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 if live_err.send_succeeded || !req.allow_cold_fallback {
                     return Err(live_err.status);
                 }
-                self.cold_reassign_vm(&vm, &source_node, target).await?;
+                // Surface both failures: an operator debugging a refused
+                // fallback needs to know what the live attempt hit first.
+                self.cold_reassign_vm(&vm, &source_node, target)
+                    .await
+                    .map_err(|cold_err| {
+                        status_with_context(
+                            &cold_err,
+                            &format!(
+                                "cold fallback for VM '{}' after live migrate failed ({})",
+                                vm.name, live_err.status
+                            ),
+                        )
+                    })?;
                 self.log_replication_event_required(
                     &actor,
                     Some("MigrateVm"),
@@ -8454,6 +8763,281 @@ mod tests {
         assert_eq!(resp.vms_migrated, 1);
         assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-b");
         assert_eq!(db.get_node("node-a").unwrap().unwrap().status, "drained");
+    }
+
+    /// Attach `web` to `vm_id` so a test can assert the attachment survives an
+    /// operation that rewrites the VM's ownership.
+    fn attach_web_security_group(db: &Database, vm_id: &str) {
+        db.upsert_security_group(&SecurityGroupRow {
+            name: "web".into(),
+            description: "web ingress".into(),
+            created_at: String::new(),
+        })
+        .expect("create security group");
+        db.attach_security_group_to_vm("web", vm_id)
+            .expect("attach security group");
+    }
+
+    fn attach_ops_ssh_key(db: &Database, vm_id: &str) {
+        db.insert_ssh_key("ops", "ssh-ed25519 AAAAtest ops@kcore")
+            .expect("create ssh key");
+        db.associate_vm_ssh_keys(vm_id, &["ops".to_string()])
+            .expect("associate ssh key");
+    }
+
+    /// Regression: reassignment used to delete and re-insert the `vms` row,
+    /// which cascaded `security_group_vm_attachments` away. A migrated VM
+    /// silently lost its firewall rules.
+    #[tokio::test]
+    async fn migrate_vm_preserves_security_group_attachments() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        attach_web_security_group(&db, &vm.id);
+        attach_ops_ssh_key(&db, &vm.id);
+
+        let svc = svc_for(&db);
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id.clone(),
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: true,
+                }),
+            )
+            .await
+            .expect("cold fallback should succeed")
+            .into_inner();
+        assert!(resp.success, "{}", resp.message);
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-b");
+        assert_eq!(
+            db.list_security_groups_for_vm(&vm.id).unwrap(),
+            vec!["web".to_string()],
+            "a migrated VM must keep its security group attachments"
+        );
+        assert_eq!(
+            db.get_vm_ssh_key_names(&vm.id).unwrap(),
+            vec!["ops".to_string()],
+            "a migrated VM must keep its SSH key associations"
+        );
+    }
+
+    /// Regression: `DrainNode` had the same delete-then-reinsert, and read the
+    /// SSH keys back *after* the delete had already cascaded them, so it lost
+    /// both attachments and keys.
+    #[tokio::test]
+    async fn drain_node_preserves_security_groups_and_ssh_keys() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        attach_web_security_group(&db, &vm.id);
+        attach_ops_ssh_key(&db, &vm.id);
+
+        let svc = svc_for(&db);
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::drain_node(
+                &svc,
+                Request::new(controller_proto::DrainNodeRequest {
+                    node_id: "node-a".into(),
+                    target_node: "node-b".into(),
+                }),
+            )
+            .await
+            .expect("drain should succeed")
+            .into_inner();
+        assert!(resp.success, "{}", resp.message);
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-b");
+        assert_eq!(
+            db.list_security_groups_for_vm(&vm.id).unwrap(),
+            vec!["web".to_string()],
+            "a drained VM must keep its security group attachments"
+        );
+        assert_eq!(
+            db.get_vm_ssh_key_names(&vm.id).unwrap(),
+            vec!["ops".to_string()],
+            "a drained VM must keep its SSH key associations"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_rejects_a_target_that_is_being_drained() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-b", "draining").unwrap();
+        let svc = svc_for(&db);
+        let err =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id.clone(),
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: true,
+                }),
+            )
+            .await
+            .expect_err("a draining node must not be a migration target");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("evacuated"),
+            "unexpected message: {}",
+            err.message()
+        );
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_rejects_an_unapproved_target_node() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.set_node_approval("node-b", "pending").unwrap();
+        let svc = svc_for(&db);
+        let err =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id.clone(),
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: true,
+                }),
+            )
+            .await
+            .expect_err("an unapproved node must not be a migration target");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("not approved"),
+            "unexpected message: {}",
+            err.message()
+        );
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-a");
+    }
+
+    /// An unusable explicit target used to abort the whole RPC mid-loop, after
+    /// earlier VMs had already been reassigned and before any config was
+    /// pushed. Now it is a per-VM error and the node stays `draining`.
+    #[tokio::test]
+    async fn drain_node_reports_an_unusable_target_instead_of_aborting() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-b", "draining").unwrap();
+        let svc = svc_for(&db);
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::drain_node(
+                &svc,
+                Request::new(controller_proto::DrainNodeRequest {
+                    node_id: "node-a".into(),
+                    target_node: "node-b".into(),
+                }),
+            )
+            .await
+            .expect("drain reports per-VM errors rather than failing outright")
+            .into_inner();
+        assert!(!resp.success, "{}", resp.message);
+        assert_eq!(resp.vms_migrated, 0);
+        assert!(
+            resp.message.contains(&vm.name),
+            "message should name the stranded VM: {}",
+            resp.message
+        );
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-a");
+        assert_eq!(db.get_node("node-a").unwrap().unwrap().status, "draining");
+    }
+
+    /// The drain is not finished until the source node has actually applied the
+    /// configuration that removes the VM units.
+    #[tokio::test]
+    async fn drain_node_stays_draining_when_the_config_push_fails() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        let hook: PushHook = Arc::new(|n: &NodeRow| {
+            if n.id == "node-a" {
+                Err(Status::deadline_exceeded("rebuild never activated"))
+            } else {
+                Ok(())
+            }
+        });
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::drain_node(
+                &svc,
+                Request::new(controller_proto::DrainNodeRequest {
+                    node_id: "node-a".into(),
+                    target_node: "node-b".into(),
+                }),
+            )
+            .await
+            .expect("drain surfaces push failures in its response")
+            .into_inner();
+        assert!(
+            !resp.success,
+            "a node whose rebuild failed is not drained: {}",
+            resp.message
+        );
+        assert!(
+            resp.message.contains("post-drain configuration"),
+            "unexpected message: {}",
+            resp.message
+        );
+        assert_eq!(
+            db.get_node("node-a").unwrap().unwrap().status,
+            "draining",
+            "a node that never applied its post-drain config must not be marked drained"
+        );
+        // The VM itself did move; only the source's apply is outstanding.
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-b");
+    }
+
+    #[test]
+    fn release_barrier_only_passes_when_both_post_conditions_hold() {
+        let resp = |vmm_stopped, rbd_unmapped| node_proto::FinalizeLiveMigrateSourceResponse {
+            success: vmm_stopped && rbd_unmapped,
+            message: "observed".into(),
+            vmm_stopped,
+            rbd_unmapped,
+        };
+        assert!(check_release_barrier("web-1", "node-a", &resp(true, true)).is_ok());
+        for (vmm_stopped, rbd_unmapped) in [(false, true), (true, false), (false, false)] {
+            let err = check_release_barrier("web-1", "node-a", &resp(vmm_stopped, rbd_unmapped))
+                .expect_err("an unreleased source must be a hard failure");
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                err.message().contains("web-1") && err.message().contains("node-a"),
+                "unexpected message: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn nix_apply_progress_maps_every_phase() {
+        assert_eq!(
+            nix_apply_progress(node_proto::NixApplyPhase::Succeeded as i32),
+            NixApplyProgress::Activated
+        );
+        assert_eq!(
+            nix_apply_progress(node_proto::NixApplyPhase::Failed as i32),
+            NixApplyProgress::Failed
+        );
+        assert_eq!(
+            nix_apply_progress(node_proto::NixApplyPhase::Running as i32),
+            NixApplyProgress::Pending
+        );
+        assert_eq!(
+            nix_apply_progress(node_proto::NixApplyPhase::Unknown as i32),
+            NixApplyProgress::NoVerdict
+        );
+        // Unset, and anything a newer node agent invents, must keep the caller
+        // polling rather than silently declaring success.
+        assert_eq!(
+            nix_apply_progress(node_proto::NixApplyPhase::Unspecified as i32),
+            NixApplyProgress::Pending
+        );
+        assert_eq!(nix_apply_progress(9999), NixApplyProgress::Pending);
     }
 
     #[tokio::test]

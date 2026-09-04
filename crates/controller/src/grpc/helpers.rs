@@ -108,6 +108,35 @@ pub fn grpc_address_host(address: &str) -> String {
     address.to_string()
 }
 
+/// Host the live-migration source should dial, given what the destination
+/// advertised in `PrepareLiveMigrateReceiveResponse.listen_addr`.
+///
+/// The destination is the authority on which of its addresses the migration
+/// listener is reachable on — a node whose data-plane NIC differs from the one
+/// carrying gRPC can only be reached on the address it names. A wildcard bind
+/// or an empty string means it has no opinion, in which case the host part of
+/// its gRPC address is the best available guess.
+pub fn migration_dial_host(listen_addr: &str, fallback_host: &str) -> String {
+    // Strip any port first: a node that advertises `0.0.0.0:18000` is just as
+    // undialable as one that advertises `0.0.0.0`.
+    let host = grpc_address_host(listen_addr.trim());
+    if matches!(host.as_str(), "" | "0.0.0.0" | "::" | "[::]" | "*") {
+        return fallback_host.to_string();
+    }
+    host
+}
+
+/// Wrap a failed downstream RPC in a message saying what the controller was
+/// doing, without flattening every failure into `INTERNAL`.
+///
+/// A bare `Status::internal(e.to_string())` loses the peer's code, so a node
+/// that answered `DEADLINE_EXCEEDED` or `FAILED_PRECONDITION` becomes
+/// indistinguishable from a controller bug. Keeping the code lets `kctl` and
+/// the reconciler tell "retry later" apart from "this can never work".
+pub fn status_with_context(source: &tonic::Status, doing: &str) -> tonic::Status {
+    tonic::Status::new(source.code(), format!("{doing}: {}", source.message()))
+}
+
 /// Deterministic VNI from network name. Range 10000–15999.
 pub fn compute_vni(name: &str) -> i32 {
     let mut hash: u32 = 5381;
@@ -192,6 +221,42 @@ mod tests {
         assert_eq!(grpc_address_host("[2001:db8::1]:9091"), "2001:db8::1");
         assert_eq!(grpc_address_host("2001:db8::1"), "2001:db8::1");
     }
+
+    #[test]
+    fn migration_dial_host_prefers_the_address_the_destination_advertised() {
+        assert_eq!(
+            migration_dial_host("10.99.0.7", "10.0.0.2"),
+            "10.99.0.7",
+            "a destination naming its data-plane address must be dialled there"
+        );
+        assert_eq!(migration_dial_host(" 10.99.0.7 ", "10.0.0.2"), "10.99.0.7");
+        assert_eq!(
+            migration_dial_host("[2001:db8::5]:18000", "10.0.0.2"),
+            "2001:db8::5"
+        );
+    }
+
+    #[test]
+    fn migration_dial_host_falls_back_when_the_destination_has_no_opinion() {
+        for wildcard in ["", "   ", "0.0.0.0", "::", "[::]", "*"] {
+            assert_eq!(
+                migration_dial_host(wildcard, "10.0.0.2"),
+                "10.0.0.2",
+                "wildcard bind {wildcard:?} must fall back to the gRPC host"
+            );
+        }
+    }
+
+    #[test]
+    fn status_with_context_keeps_the_peers_code() {
+        let source = tonic::Status::deadline_exceeded("cloud-hypervisor stopped responding");
+        let wrapped = status_with_context(&source, "sending VM 'web-1' to node-b");
+        assert_eq!(wrapped.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(
+            wrapped.message(),
+            "sending VM 'web-1' to node-b: cloud-hypervisor stopped responding"
+        );
+    }
 }
 
 /// Property-based tests (Phase 2) for the small pure helpers.
@@ -254,6 +319,18 @@ mod proptests {
                 .join(",");
             let parsed = parse_port_list(&s);
             prop_assert_eq!(parsed, ports);
+        }
+
+        /// A live migration always needs *some* concrete host to dial. For any
+        /// `listen_addr` a destination might send — including junk from a
+        /// buggy or hostile agent — `migration_dial_host` must never hand the
+        /// caller a wildcard, which would build a `tcp:0.0.0.0:<port>` URL that
+        /// the source cannot connect to.
+        #[test]
+        fn migration_dial_host_never_yields_a_wildcard(listen_addr in ".{0,48}") {
+            let host = migration_dial_host(&listen_addr, "10.0.0.2");
+            prop_assert!(!host.is_empty());
+            prop_assert!(!matches!(host.as_str(), "0.0.0.0" | "::" | "[::]" | "*"));
         }
 
         /// `controller_state_from_node_state` must:

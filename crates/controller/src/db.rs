@@ -2035,6 +2035,58 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a VM row, or update it in place when the id already exists.
+    ///
+    /// Replication materialization replays `vm.create` for VMs a peer may
+    /// already hold. Emulating that with delete-then-insert would cascade the
+    /// VM's `vm_ssh_keys` and `security_group_vm_attachments` rows away, so the
+    /// conflict is resolved with an `UPDATE` instead. `created_at` is left
+    /// alone: the VM is not being recreated.
+    pub fn upsert_vm(&self, vm: &VmRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                cpu=excluded.cpu,
+                memory_bytes=excluded.memory_bytes,
+                image_path=excluded.image_path,
+                image_url=excluded.image_url,
+                image_sha256=excluded.image_sha256,
+                image_format=excluded.image_format,
+                image_size=excluded.image_size,
+                network=excluded.network,
+                auto_start=excluded.auto_start,
+                node_id=excluded.node_id,
+                runtime_state=excluded.runtime_state,
+                cloud_init_user_data=excluded.cloud_init_user_data,
+                storage_backend=excluded.storage_backend,
+                storage_size_bytes=excluded.storage_size_bytes,
+                vm_ip=excluded.vm_ip",
+            params![
+                vm.id,
+                vm.name,
+                vm.cpu,
+                vm.memory_bytes,
+                vm.image_path,
+                vm.image_url,
+                vm.image_sha256,
+                vm.image_format,
+                vm.image_size,
+                vm.network,
+                vm.auto_start as i32,
+                vm.node_id,
+                vm.runtime_state,
+                vm.cloud_init_user_data,
+                vm.storage_backend,
+                vm.storage_size_bytes,
+                vm.vm_ip,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_workload(&self, workload: &WorkloadRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
@@ -3253,6 +3305,22 @@ impl Database {
         let rows = conn.execute(
             "DELETE FROM vms WHERE id = ?1 OR name = ?1",
             params![id_or_name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Move a VM to another node in place.
+    ///
+    /// Every table keyed on `vms(id)` cascades on delete under
+    /// `PRAGMA foreign_keys=ON` (`vm_ssh_keys`,
+    /// `security_group_vm_attachments`), so reassignment must never be
+    /// expressed as delete-then-reinsert. Returns `false` when no such VM
+    /// exists; a missing target node is rejected by the `node_id` foreign key.
+    pub fn set_vm_node(&self, vm_id: &str, node_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE vms SET node_id = ?2 WHERE id = ?1",
+            params![vm_id, node_id],
         )?;
         Ok(rows > 0)
     }
@@ -5025,6 +5093,108 @@ mod tests {
         assert_eq!(rules[0].protocol, "tcp");
         assert_eq!(rules[0].host_port, 443);
         assert!(rules[0].enable_dnat);
+    }
+
+    /// Regression: node reassignment used to delete and re-insert the `vms`
+    /// row. Both child tables keyed on `vms(id)` cascade on delete, so every
+    /// migrate and drain silently dropped the VM's security groups.
+    #[test]
+    fn set_vm_node_moves_a_vm_without_dropping_its_child_rows() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".to_string();
+        db.upsert_node(&node_a).expect("node-a");
+        let mut node_b = test_node();
+        node_b.id = "node-b".to_string();
+        node_b.address = "10.0.0.2:9091".to_string();
+        db.upsert_node(&node_b).expect("node-b");
+
+        let vm = test_vm("node-a");
+        db.insert_vm(&vm).expect("insert vm");
+        db.insert_ssh_key("ops", "ssh-ed25519 AAAAtest ops@kcore")
+            .expect("ssh key");
+        db.associate_vm_ssh_keys(&vm.id, &["ops".to_string()])
+            .expect("associate key");
+        db.upsert_security_group(&SecurityGroupRow {
+            name: "web".to_string(),
+            description: String::new(),
+            created_at: String::new(),
+        })
+        .expect("security group");
+        db.attach_security_group_to_vm("web", &vm.id)
+            .expect("attach");
+
+        assert!(db.set_vm_node(&vm.id, "node-b").expect("reassign"));
+
+        let moved = db.get_vm(&vm.id).expect("get vm").expect("vm exists");
+        assert_eq!(moved.node_id, "node-b");
+        assert_eq!(
+            db.list_security_groups_for_vm(&vm.id).expect("groups"),
+            vec!["web".to_string()]
+        );
+        assert_eq!(
+            db.get_vm_ssh_key_names(&vm.id).expect("keys"),
+            vec!["ops".to_string()]
+        );
+        assert!(db.list_vms_for_node("node-a").expect("node-a").is_empty());
+        assert_eq!(db.list_vms_for_node("node-b").expect("node-b").len(), 1);
+    }
+
+    #[test]
+    fn set_vm_node_reports_a_missing_vm_rather_than_creating_one() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("node");
+        assert!(!db.set_vm_node("vm-nope", &node.id).expect("update"));
+    }
+
+    #[test]
+    fn set_vm_node_rejects_an_unknown_target_node() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("node");
+        let vm = test_vm(&node.id);
+        db.insert_vm(&vm).expect("insert vm");
+        db.set_vm_node(&vm.id, "node-does-not-exist")
+            .expect_err("the node_id foreign key must reject an unknown node");
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get vm").expect("vm").node_id,
+            node.id
+        );
+    }
+
+    /// Replication replays `vm.create` for VMs a peer already holds; emulating
+    /// that with delete-then-insert would cascade the child rows away.
+    #[test]
+    fn upsert_vm_updates_in_place_and_keeps_child_rows() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("node");
+        let vm = test_vm(&node.id);
+        db.insert_vm(&vm).expect("insert vm");
+        db.upsert_security_group(&SecurityGroupRow {
+            name: "web".to_string(),
+            description: String::new(),
+            created_at: String::new(),
+        })
+        .expect("security group");
+        db.attach_security_group_to_vm("web", &vm.id)
+            .expect("attach");
+
+        let mut updated = vm.clone();
+        updated.cpu = 8;
+        updated.vm_ip = "10.240.0.9".to_string();
+        db.upsert_vm(&updated).expect("upsert existing vm");
+
+        let stored = db.get_vm(&vm.id).expect("get vm").expect("vm exists");
+        assert_eq!(stored.cpu, 8);
+        assert_eq!(stored.vm_ip, "10.240.0.9");
+        assert_eq!(
+            db.list_security_groups_for_vm(&vm.id).expect("groups"),
+            vec!["web".to_string()],
+            "an upsert must not cascade the VM's attachments away"
+        );
+        assert_eq!(db.list_vms().expect("list").len(), 1);
     }
 
     #[test]
