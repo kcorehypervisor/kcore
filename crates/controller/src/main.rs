@@ -57,10 +57,12 @@ fn install_fips_crypto_provider() {
 }
 
 pub mod controller_proto {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("kcore.controller");
 }
 
 pub mod node_proto {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("kcore.node");
 }
 

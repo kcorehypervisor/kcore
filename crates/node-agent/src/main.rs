@@ -1,6 +1,8 @@
 // TODO(tech-debt): Crate-wide `dead_code` suppression is temporary. Audit unused
 // items and either remove them or narrow to item-level `#[allow(dead_code)]`.
 #![allow(dead_code)]
+// tonic::Status Err variants in generated gRPC stubs exceed clippy's size lint.
+#![allow(clippy::result_large_err)]
 
 mod auth;
 mod config;
@@ -48,10 +50,12 @@ fn install_fips_crypto_provider() {
 }
 
 pub mod proto {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("kcore.node");
 }
 
 pub mod controller_proto {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("kcore.controller");
 }
 

@@ -1,5 +1,8 @@
 //! kcore web dashboard (Leptos SSR, controller gRPC).
 
+// tonic::Status Err variants in generated gRPC stubs exceed clippy's size lint.
+#![allow(clippy::result_large_err)]
+
 pub mod api;
 pub mod app;
 pub mod app_server;
