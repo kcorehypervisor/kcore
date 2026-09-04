@@ -117,22 +117,6 @@ impl LiveMigrateState {
     }
 }
 
-/// Ask the kernel for a free ephemeral port and immediately give it back.
-///
-/// Inherently racy — the port can be taken between this call and the moment
-/// Cloud Hypervisor binds it. Prefer [`LiveMigrateState::reserve_port`], which
-/// holds the socket until the handoff.
-pub fn pick_free_tcp_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind("0.0.0.0:0")
-        .map_err(|e| format!("bind ephemeral port: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("local_addr: {e}"))?
-        .port();
-    drop(listener);
-    Ok(port)
-}
-
 /// True when some process holds a listening TCP socket on `port`.
 ///
 /// Read from `/proc/net/tcp{,6}` rather than probed with `bind`/`connect`:
@@ -375,17 +359,6 @@ pub fn unit_state_is_stopped(is_active_stdout: &str) -> bool {
     )
 }
 
-pub async fn unit_is_active(unit: &str) -> bool {
-    let Ok(out) = Command::new("systemctl")
-        .args(["is-active", unit])
-        .output()
-        .await
-    else {
-        return false;
-    };
-    !unit_state_is_stopped(&String::from_utf8_lossy(&out.stdout))
-}
-
 pub async fn unit_is_stopped(unit: &str) -> Result<bool, String> {
     let out = Command::new("systemctl")
         .args(["is-active", unit])
@@ -556,6 +529,29 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         assert!(port_is_listening(port));
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn wait_for_port_listening_returns_at_once_for_a_live_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        wait_for_port_listening(port, Duration::from_secs(5))
+            .await
+            .expect("an already-bound port must be seen immediately");
+    }
+
+    /// The prepare RPC must not claim to be listening when Cloud Hypervisor
+    /// never bound the port; the source would dial a closed socket.
+    #[tokio::test]
+    async fn wait_for_port_listening_reports_a_timeout_rather_than_hanging() {
+        // Bind and drop, so the port is almost certainly free and unused.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let err = wait_for_port_listening(port, Duration::from_millis(300))
+            .await
+            .expect_err("an unbound port must time out");
+        assert!(err.contains(&port.to_string()), "unexpected error: {err}");
     }
 
     #[test]
