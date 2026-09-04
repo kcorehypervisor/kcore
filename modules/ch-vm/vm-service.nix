@@ -205,10 +205,12 @@ let
       requires = [ "kcore-tap-${vmName}.service" ];
       after = [ "kcore-tap-${vmName}.service" ];
       wantedBy = lib.optionals vmCfg.autoStart [ "multi-user.target" ];
-      # Keep a live-migrated CH alive across the nixos-rebuild that first
-      # installs this unit on the destination node.
-      stopIfChanged = !isCeph;
-      restartIfChanged = !isCeph;
+      # A live-migrated CH survives the destination rebuild because the unit is
+      # *new* there: switch-to-configuration only consults
+      # stopIfChanged/restartIfChanged for units that already existed and
+      # changed, so the handoff needs no override here. Leaving the defaults on
+      # keeps VM spec updates (cpu/memory/extraArgs) actually taking effect for
+      # Ceph-backed VMs.
 
       serviceConfig = {
         Type = "simple";
