@@ -149,7 +149,9 @@ pub fn port_is_listening(port: u16) -> bool {
             let Some(local) = fields.nth(1) else {
                 continue;
             };
-            let Some(state) = fields.next() else {
+            // Fields are: sl local_address rem_address st. `local` consumed
+            // index 1, so the state column is two further on, not one.
+            let Some(state) = fields.nth(1) else {
                 continue;
             };
             if state != TCP_LISTEN {
