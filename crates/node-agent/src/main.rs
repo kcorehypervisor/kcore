@@ -5,6 +5,7 @@
 #![allow(clippy::result_large_err)]
 
 mod auth;
+mod ceph_bootstrap;
 mod config;
 mod console;
 mod discovery;

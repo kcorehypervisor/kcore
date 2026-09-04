@@ -238,6 +238,11 @@ mod tests {
                 .expect("lvm"),
             "lvm"
         );
+        assert_eq!(
+            normalize_storage_backend(controller_proto::StorageBackendType::Ceph as i32, true)
+                .expect("ceph"),
+            "ceph"
+        );
         assert!(normalize_storage_backend(0, true).is_err());
         assert_eq!(
             normalize_storage_backend(0, false).expect("default"),

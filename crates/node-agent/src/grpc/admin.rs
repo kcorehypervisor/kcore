@@ -123,6 +123,20 @@ fn validate_disk_path(path: &str, field: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn validate_apply_ceph_config_args(ceph_nix: &str, fsid: &str) -> Result<(), Status> {
+    if ceph_nix.trim().is_empty() || fsid.trim().is_empty() {
+        return Err(Status::invalid_argument("ceph_nix and fsid are required"));
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_osd_device(osd_device: &str) -> Result<(), Status> {
+    if !Path::new(osd_device.trim()).is_absolute() {
+        return Err(Status::invalid_argument("osd_device must be absolute"));
+    }
+    Ok(())
+}
+
 fn normalize_disk_management_mode(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
         DISK_MODE_CONTROLLER_MANAGED => DISK_MODE_CONTROLLER_MANAGED,
@@ -1186,12 +1200,25 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
     ) -> Result<Response<proto::ApplyCephConfigResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
-        if req.ceph_nix.trim().is_empty() || req.fsid.trim().is_empty() {
-            return Err(Status::invalid_argument("ceph_nix and fsid are required"));
-        }
+        validate_apply_ceph_config_args(&req.ceph_nix, &req.fsid)?;
         tokio::fs::write(CEPH_NIX_PATH, req.ceph_nix.as_bytes())
             .await
             .map_err(|e| Status::internal(format!("writing {CEPH_NIX_PATH}: {e}")))?;
+
+        let generated = req.keyring.is_empty();
+        let pkg = if generated {
+            crate::ceph_bootstrap::generate_bootstrap_package(&req.fsid)
+                .map_err(Status::internal)?
+        } else {
+            crate::ceph_bootstrap::decode_package(&req.keyring).map_err(Status::invalid_argument)?
+        };
+        if pkg.fsid != req.fsid {
+            return Err(Status::invalid_argument(
+                "bootstrap package fsid does not match request fsid",
+            ));
+        }
+        crate::ceph_bootstrap::write_keyring_files(&pkg).map_err(Status::internal)?;
+
         if req.rebuild {
             let out = Command::new("nixos-rebuild")
                 .args(["test"])
@@ -1216,9 +1243,38 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 )));
             }
         }
+
+        if req.mon {
+            let mons = crate::ceph_bootstrap::parse_mon_map(&req.mon_map)
+                .map_err(Status::invalid_argument)?;
+            crate::ceph_bootstrap::mkfs_mon(&pkg, &req.daemon_id, &mons)
+                .map_err(Status::internal)?;
+            let _ = Command::new("systemctl")
+                .args(["start", &format!("ceph-mon-{}", req.daemon_id)])
+                .output()
+                .await;
+        }
+        if req.mgr {
+            let daemon = req.daemon_id.clone();
+            tokio::task::spawn_blocking(move || crate::ceph_bootstrap::ensure_mgr_keyring(&daemon))
+                .await
+                .map_err(|e| Status::internal(format!("mgr keyring task: {e}")))?
+                .map_err(Status::internal)?;
+            let _ = Command::new("systemctl")
+                .args(["start", &format!("ceph-mgr-{}", req.daemon_id)])
+                .output()
+                .await;
+        }
+
+        let keyring = if generated {
+            crate::ceph_bootstrap::encode_package(&pkg).map_err(Status::internal)?
+        } else {
+            Vec::new()
+        };
         Ok(Response::new(proto::ApplyCephConfigResponse {
             success: true,
-            message: format!("Ceph config written to {CEPH_NIX_PATH}"),
+            message: format!("Ceph config written to {CEPH_NIX_PATH}; mon/mgr bootstrapped"),
+            keyring,
         }))
     }
 
@@ -1228,23 +1284,24 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
     ) -> Result<Response<proto::BootstrapCephOsdResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
-        let device = Path::new(req.osd_device.trim());
-        if !device.is_absolute() {
-            return Err(Status::invalid_argument("osd_device must be absolute"));
-        }
+        validate_bootstrap_osd_device(&req.osd_device)?;
         let listed = Command::new("ceph-volume")
-            .args(["lvm", "list", req.osd_device.as_str()])
+            .args(["lvm", "list", "--format", "json"])
             .output()
             .await
             .map_err(|e| {
                 Status::internal(format!("starting ceph-volume (is Ceph installed?): {e}"))
             })?;
-        if listed.status.success() && !listed.stdout.is_empty() {
-            return Ok(Response::new(proto::BootstrapCephOsdResponse {
-                success: true,
-                already_prepared: true,
-                message: "OSD already prepared".into(),
-            }));
+        if listed.status.success() {
+            let stdout = String::from_utf8_lossy(&listed.stdout);
+            if stdout.contains(req.osd_device.trim()) {
+                return Ok(Response::new(proto::BootstrapCephOsdResponse {
+                    success: true,
+                    already_prepared: true,
+                    message: "OSD already prepared".into(),
+                    osd_id: String::new(),
+                }));
+            }
         }
         let signatures = Command::new("wipefs")
             .args(["--no-act", req.osd_device.as_str()])
@@ -1268,14 +1325,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 ));
             }
         }
+        // Let ceph-volume install/activate systemd units (do not pass --no-systemd).
         let out = Command::new("ceph-volume")
-            .args([
-                "lvm",
-                "create",
-                "--data",
-                req.osd_device.as_str(),
-                "--no-systemd",
-            ])
+            .args(["lvm", "create", "--data", req.osd_device.as_str()])
             .output()
             .await
             .map_err(|e| {
@@ -1290,7 +1342,8 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         Ok(Response::new(proto::BootstrapCephOsdResponse {
             success: true,
             already_prepared: false,
-            message: "OSD prepared".into(),
+            message: "OSD prepared and activated".into(),
+            osd_id: String::new(),
         }))
     }
 
@@ -1299,6 +1352,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         request: Request<proto::GetCephHealthRequest>,
     ) -> Result<Response<proto::GetCephHealthResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let _ = request.into_inner();
         let out = Command::new("ceph")
             .args(["-s", "--format", "json"])
             .output()
@@ -1318,19 +1372,99 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             .and_then(JsonValue::as_str)
             .unwrap_or("HEALTH_ERR")
             .to_string();
-        let osd_up = json
-            .pointer("/osdmap/osdmap/num_up_osds")
-            .and_then(JsonValue::as_i64)
-            .unwrap_or(0) as i32;
-        let osd_in = json
-            .pointer("/osdmap/osdmap/num_in_osds")
-            .and_then(JsonValue::as_i64)
-            .unwrap_or(0) as i32;
+        let (osd_up, osd_in) = crate::ceph_bootstrap::parse_osd_counters(&json);
         Ok(Response::new(proto::GetCephHealthResponse {
             health_status,
             raw_status,
             osd_up,
             osd_in,
+        }))
+    }
+
+    async fn ensure_ceph_pool(
+        &self,
+        request: Request<proto::EnsureCephPoolRequest>,
+    ) -> Result<Response<proto::EnsureCephPoolResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let pool = req.pool.trim();
+        if pool.is_empty() {
+            return Err(Status::invalid_argument("pool is required"));
+        }
+        let listed = Command::new("ceph")
+            .args(["osd", "pool", "ls"])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("ceph osd pool ls: {e}")))?;
+        if !listed.status.success() {
+            return Err(Status::internal(format!(
+                "ceph osd pool ls failed: {}",
+                String::from_utf8_lossy(&listed.stderr).trim()
+            )));
+        }
+        let exists = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .any(|l| l.trim() == pool);
+        let mut created = false;
+        if !exists {
+            let out = Command::new("ceph")
+                .args(["osd", "pool", "create", pool, "32"])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("ceph osd pool create: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "ceph osd pool create failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            created = true;
+        }
+        if req.size > 0 {
+            let _ = Command::new("ceph")
+                .args(["osd", "pool", "set", pool, "size", &req.size.to_string()])
+                .output()
+                .await;
+        }
+        if req.min_size > 0 {
+            let _ = Command::new("ceph")
+                .args([
+                    "osd",
+                    "pool",
+                    "set",
+                    pool,
+                    "min_size",
+                    &req.min_size.to_string(),
+                ])
+                .output()
+                .await;
+        }
+        let _ = Command::new("ceph")
+            .args(["osd", "pool", "application", "enable", pool, "rbd"])
+            .output()
+            .await;
+        let init = Command::new("rbd")
+            .args(["pool", "init", pool])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("rbd pool init: {e}")))?;
+        if !init.status.success() {
+            let err = String::from_utf8_lossy(&init.stderr);
+            if !err.contains("already initialized") && !err.is_empty() {
+                return Err(Status::internal(format!(
+                    "rbd pool init failed: {}",
+                    err.trim()
+                )));
+            }
+        }
+        Ok(Response::new(proto::EnsureCephPoolResponse {
+            success: true,
+            created,
+            message: if created {
+                format!("created and initialized pool {pool}")
+            } else {
+                format!("pool {pool} already present")
+            },
         }))
     }
 
@@ -2169,6 +2303,21 @@ fn rollback_blocking(rollback_dir: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use tonic::Request;
+
+    #[test]
+    fn validate_apply_ceph_config_args_requires_nix_and_fsid() {
+        assert!(validate_apply_ceph_config_args("{ }", "fsid").is_ok());
+        assert!(validate_apply_ceph_config_args("", "fsid").is_err());
+        assert!(validate_apply_ceph_config_args("{ }", "  ").is_err());
+        assert!(validate_apply_ceph_config_args("  ", "").is_err());
+    }
+
+    #[test]
+    fn validate_bootstrap_osd_device_requires_absolute_path() {
+        assert!(validate_bootstrap_osd_device("/dev/nvme0n1").is_ok());
+        assert!(validate_bootstrap_osd_device("nvme0n1").is_err());
+        assert!(validate_bootstrap_osd_device("  ").is_err());
+    }
 
     #[test]
     fn bootstrap_pki_writes_supplied_materials_with_correct_permissions() {

@@ -237,6 +237,37 @@ storage:
     }
 
     #[test]
+    fn parses_ceph_storage_config_with_default_and_custom_pool() {
+        let defaulted: Config = serde_yaml::from_str(
+            r#"
+nodeId: node-1
+storage:
+  backend: ceph
+"#,
+        )
+        .expect("parse ceph");
+        assert!(matches!(
+            defaulted.storage.backend,
+            StorageBackendKind::Ceph
+        ));
+        defaulted.validate().expect("ceph needs no extra block");
+        assert!(defaulted.storage.ceph.is_none());
+
+        let custom: Config = serde_yaml::from_str(
+            r#"
+nodeId: node-1
+storage:
+  backend: ceph
+  ceph:
+    pool: custom-vms
+"#,
+        )
+        .expect("parse custom pool");
+        assert_eq!(custom.storage.ceph.as_ref().unwrap().pool, "custom-vms");
+        custom.validate().expect("valid");
+    }
+
+    #[test]
     fn validate_rejects_lvm_without_config() {
         let cfg: Config = serde_yaml::from_str(
             r#"

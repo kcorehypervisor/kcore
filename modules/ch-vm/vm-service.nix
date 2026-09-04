@@ -99,13 +99,28 @@ let
       cephMapScript = pkgs.writeShellScript "ceph-map-${vmName}" ''
         set -e
         IMAGE="${cfg.rbdPool}/${rbdImage}"
+        RBD_DEV="${rbdDevice}"
+        SOURCE="${toString vmCfg.image}"
+        # Controller/CephAdapter owns rbd create; this script only maps and
+        # seeds the guest image once onto the block device (like LVM/ZFS).
         if ! ${pkgs.ceph}/bin/rbd info "$IMAGE" >/dev/null 2>&1; then
-          ${pkgs.ceph}/bin/rbd create "$IMAGE" --size $(( ${toString vmCfg.storageSizeBytes} / 1024 / 1024 ))
+          echo "ERROR: RBD image $IMAGE does not exist; create the VM via kctl first"
+          exit 1
         fi
-        if [ ! -b "${rbdDevice}" ]; then
+        if [ ! -b "$RBD_DEV" ]; then
           ${pkgs.ceph}/bin/rbd map "$IMAGE"
         fi
-        test -b "${rbdDevice}"
+        test -b "$RBD_DEV"
+        MARKER="/var/lib/kcore/rbd-seeded/${rbdImage}"
+        if [ ! -f "$MARKER" ]; then
+          test -e "$SOURCE" || { echo "missing source image: $SOURCE"; exit 1; }
+          echo "Seeding RBD $IMAGE from $SOURCE..."
+          ${pkgs.qemu-utils}/bin/qemu-img convert \
+            -f ${vmCfg.imageFormat} -O raw \
+            "$SOURCE" "$RBD_DEV"
+          mkdir -p "$(dirname "$MARKER")"
+          touch "$MARKER"
+        fi
       '';
 
       chArgs = lib.concatStringsSep " " (
@@ -137,7 +152,10 @@ let
         sourceImageCheck
         "${zfsProvisionScript}"
       ];
-      cephPreChecks = [ "${cephMapScript}" ];
+      cephPreChecks = [
+        sourceImageCheck
+        "${cephMapScript}"
+      ];
       fsPreChecks = [ sourceImageCheck ];
 
       storagePreChecks =
