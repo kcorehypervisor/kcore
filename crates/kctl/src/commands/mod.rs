@@ -9,6 +9,7 @@ pub mod conflict;
 pub mod container;
 pub mod disk_layout;
 pub mod image;
+pub mod migrate_session;
 pub mod network;
 pub mod node;
 pub mod operator;

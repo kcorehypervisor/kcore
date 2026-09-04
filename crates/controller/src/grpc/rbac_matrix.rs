@@ -60,6 +60,10 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_BEFORE_RENEW: &[(&str, &str)] = &[
     ("GetSshKey", "read-only"),
     ("DrainNode", "cluster-admin"),
     ("MigrateVm", "vm-admin"),
+    ("GetLiveMigrateReceiveStatus", "read-only"),
+    // Clearing a receive session can kill an in-flight migration, so it sits
+    // with DrainNode rather than with MigrateVm.
+    ("ResetLiveMigrateReceive", "cluster-admin"),
     ("ApproveNode", "cluster-admin"),
     ("RejectNode", "cluster-admin"),
 ];

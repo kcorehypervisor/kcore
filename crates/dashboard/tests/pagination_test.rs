@@ -309,6 +309,18 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<MigrateVmResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn get_live_migrate_receive_status(
+        &self,
+        _: TRequest<GetLiveMigrateReceiveStatusRequest>,
+    ) -> Result<Response<GetLiveMigrateReceiveStatusResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn reset_live_migrate_receive(
+        &self,
+        _: TRequest<ResetLiveMigrateReceiveRequest>,
+    ) -> Result<Response<ResetLiveMigrateReceiveResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
     async fn approve_node(
         &self,
         _: TRequest<ApproveNodeRequest>,

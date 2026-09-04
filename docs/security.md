@@ -120,6 +120,8 @@ Every gRPC method checks the caller's certificate Common Name before processing 
 | `ListCertificates`     | Operators, `read-only`    |
 | `GetPkiStatus`         | Operators, `read-only`    |
 | `GetCrl`               | Operators (`read-only`) and nodes |
+| `GetLiveMigrateReceiveStatus` | Operators, `read-only`    |
+| `ResetLiveMigrateReceive` | Operators, `cluster-admin` |
 
 ### Node-agent RPC authorization
 
@@ -133,6 +135,8 @@ Every gRPC method checks the caller's certificate Common Name before processing 
 | `ListVms`                  | kctl or Controller                     |
 | `GetNodeInfo`              | kctl or Controller                     |
 | `RotateNodeCert`           | Controller only (`kcore-controller-*`) |
+| `GetLiveMigrateReceiveStatus` | Controller only (`kcore-controller-*`) |
+| `AbortLiveMigrateReceive`  | Controller only (`kcore-controller-*`) |
 
 In addition to the per-method CN check, both services run a revocation interceptor ahead of every handler; see "Revocation enforcement" above.
 

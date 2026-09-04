@@ -212,6 +212,90 @@ impl AdminService {
             listen_addr: "0.0.0.0".into(),
         }))
     }
+
+    /// Tear down everything a receive session owns and report what was there.
+    ///
+    /// The single implementation behind both the abort that ends a failed
+    /// migration and the operator escape hatch for a stranded session, so the
+    /// two can never drift over what "cleaned up" means. Returns the state
+    /// observed *before* the teardown, which is the only chance to record
+    /// whether a live receive was killed.
+    ///
+    /// Best-effort throughout: a missing marker or an already-unmapped image
+    /// is the normal case when this runs twice, and must not turn a repeated
+    /// runbook step into an error.
+    async fn clear_receive_session(
+        &self,
+        vm_name: &str,
+        rbd_pool: &str,
+        rbd_image: &str,
+    ) -> live_migrate::ReceiveObservation {
+        // Snapshot before touching anything, so the caller can be told what
+        // was destroyed rather than only that something was.
+        let observed =
+            live_migrate::observe_receive(&self.live_migrate, &self.vm_socket_dir, vm_name).await;
+
+        if let Some(session) = self.live_migrate.take(vm_name).await {
+            session.receive_task.abort();
+            let _ = nix_kill(session.ch_pid);
+            self.live_migrate.release_port(session.port).await;
+        } else if observed.pid_file_pid != 0 {
+            // No session in memory: this agent restarted after spawning the
+            // receive VMM. The pid file is the only remaining handle on it, and
+            // without this the orphan keeps the API socket and the RBD mapping
+            // alive forever.
+            let pid = observed.pid_file_pid;
+            if observed.vmm_alive && !observed.vmm_pid_matches_vm {
+                // The number was recycled onto an unrelated process. The stale
+                // file still goes below, but we do not signal a stranger.
+                warn!(
+                    %vm_name,
+                    pid,
+                    "pid file names a live process that is not this VM's receive VMM; \
+                     refusing to kill it and discarding the stale pid file"
+                );
+            } else {
+                warn!(
+                    %vm_name,
+                    pid,
+                    "no receive session in memory; killing the receive VMM recorded on disk"
+                );
+                live_migrate::kill_pid(pid);
+            }
+        }
+
+        let _ = std::fs::remove_file(live_migrate::handoff_marker_path(
+            &self.vm_socket_dir,
+            vm_name,
+        ));
+        let _ = std::fs::remove_file(live_migrate::migrate_pid_path(&self.vm_socket_dir, vm_name));
+        let _ = std::fs::remove_file(self.vm_socket_dir.join(format!("{vm_name}.sock")));
+
+        if !rbd_pool.is_empty() && !rbd_image.is_empty() {
+            if let Err(e) = live_migrate::ensure_rbd_unmapped(rbd_pool, rbd_image) {
+                warn!(error = %e, "abort unmap RBD failed");
+            }
+        }
+        observed
+    }
+}
+
+fn receive_state_to_proto(
+    obs: &live_migrate::ReceiveObservation,
+) -> proto::LiveMigrateReceiveState {
+    proto::LiveMigrateReceiveState {
+        has_session: obs.has_session,
+        port: obs.port as i32,
+        session_pid: obs.session_pid,
+        pid_file_pid: obs.pid_file_pid,
+        vmm_alive: obs.vmm_alive,
+        vmm_pid_matches_vm: obs.vmm_pid_matches_vm,
+        port_listening: obs.port_listening,
+        pid_file_present: obs.pid_file_present,
+        marker_present: obs.marker_present,
+        api_socket_present: obs.api_socket_present,
+        summary: obs.summary(),
+    }
 }
 
 fn validate_disk_path(path: &str, field: &str) -> Result<(), Status> {
@@ -247,7 +331,16 @@ fn validate_bootstrap_osd_device(osd_device: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// SIGTERM one process.
+///
+/// Pid 0 is refused: `kill(0, ...)` signals *every process in the caller's
+/// process group*, which for the node agent means itself and every VMM it
+/// shares a group with. A zero pid here only ever means "we never learned the
+/// real one", so there is nothing legitimate to signal.
 fn nix_kill(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("refusing to signal pid 0 (would target the whole process group)".to_string());
+    }
     let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     if rc == 0 {
         Ok(())
@@ -1862,38 +1955,32 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if vm_name.is_empty() {
             return Err(Status::invalid_argument("vm_name is required"));
         }
-        if let Some(session) = self.live_migrate.take(vm_name).await {
-            session.receive_task.abort();
-            let _ = nix_kill(session.ch_pid);
-            self.live_migrate.release_port(session.port).await;
-        } else if let Some(pid) = live_migrate::read_migrate_pid(&self.vm_socket_dir, vm_name) {
-            // No session in memory: this agent restarted after spawning the
-            // receive VMM. The pid file is the only remaining handle on it, and
-            // without this the orphan keeps the API socket and the RBD mapping
-            // alive forever.
-            warn!(
-                %vm_name,
-                pid,
-                "no receive session in memory; killing the receive VMM recorded on disk"
-            );
-            live_migrate::kill_pid(pid);
-        }
-        let marker = live_migrate::handoff_marker_path(&self.vm_socket_dir, vm_name);
-        let pid_path = live_migrate::migrate_pid_path(&self.vm_socket_dir, vm_name);
-        let _ = std::fs::remove_file(marker);
-        let _ = std::fs::remove_file(pid_path);
-        let socket = self.vm_socket_dir.join(format!("{vm_name}.sock"));
-        let _ = std::fs::remove_file(socket);
-        if !req.rbd_pool.trim().is_empty() && !req.rbd_image.trim().is_empty() {
-            if let Err(e) =
-                live_migrate::ensure_rbd_unmapped(req.rbd_pool.trim(), req.rbd_image.trim())
-            {
-                warn!(error = %e, "abort unmap RBD failed");
-            }
-        }
+        let observed = self
+            .clear_receive_session(vm_name, req.rbd_pool.trim(), req.rbd_image.trim())
+            .await;
         Ok(Response::new(proto::AbortLiveMigrateReceiveResponse {
             success: true,
             message: "aborted live migrate receive".into(),
+            observed: Some(receive_state_to_proto(&observed)),
+        }))
+    }
+
+    async fn get_live_migrate_receive_status(
+        &self,
+        request: Request<proto::GetLiveMigrateReceiveStatusRequest>,
+    ) -> Result<Response<proto::GetLiveMigrateReceiveStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let observed =
+            live_migrate::observe_receive(&self.live_migrate, &self.vm_socket_dir, vm_name).await;
+        Ok(Response::new(proto::GetLiveMigrateReceiveStatusResponse {
+            success: true,
+            message: observed.summary(),
+            state: Some(receive_state_to_proto(&observed)),
         }))
     }
 
@@ -3199,6 +3286,203 @@ mod tests {
         .into_inner();
         assert!(resp.success);
         assert!(resp.message.contains("test mode"));
+    }
+
+    /// Build a service whose socket dir is a tempdir, so the receive-session
+    /// tests can create and assert on marker / pid / socket files.
+    fn receive_svc(socket_dir: &std::path::Path, state: LiveMigrateState) -> AdminService {
+        AdminService::new_with_storage(
+            socket_dir.join("kcore-vms.nix").display().to_string(),
+            socket_dir.display().to_string(),
+            storage::default_adapter(),
+            state,
+        )
+    }
+
+    /// The cleanup behind both `AbortLiveMigrateReceive` and the operator
+    /// reset. Called directly because the handlers require a real mTLS peer
+    /// certificate, which a unit test has no way to present.
+    async fn clear(svc: &AdminService, vm: &str) -> live_migrate::ReceiveObservation {
+        svc.clear_receive_session(vm, "", "").await
+    }
+
+    /// A pid that is certainly not running: spawned and reaped.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    }
+
+    /// `kill(0, SIGTERM)` signals the caller's whole process group, so a
+    /// session that never learned its VMM's pid must not reach `kill` at all.
+    /// Without this guard the node agent would SIGTERM itself.
+    #[test]
+    fn nix_kill_refuses_pid_zero() {
+        let err = nix_kill(0).expect_err("pid 0 must be refused");
+        assert!(err.contains("process group"), "unexpected message: {err}");
+    }
+
+    /// The operator escape hatch: a stranded session must be cleared along
+    /// with everything it owns — the port reservation, the marker and the pid
+    /// file — so a retried migration can prepare a fresh receive.
+    #[tokio::test]
+    async fn clearing_a_stranded_session_releases_the_port_marker_and_pid_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = LiveMigrateState::new();
+        let port = state.reserve_port().await.expect("reserve");
+        let vm = "vm-stranded";
+        let ch_pid = dead_pid();
+        state
+            .insert(
+                vm,
+                ReceiveSession {
+                    port,
+                    ch_pid,
+                    receive_task: tokio::spawn(async { Ok(()) }),
+                },
+            )
+            .await;
+
+        let marker = live_migrate::handoff_marker_path(temp.path(), vm);
+        let pid_file = live_migrate::migrate_pid_path(temp.path(), vm);
+        let socket = temp.path().join(format!("{vm}.sock"));
+        std::fs::write(&marker, b"1").expect("marker");
+        std::fs::write(&pid_file, ch_pid.to_string()).expect("pid");
+        std::fs::write(&socket, b"").expect("socket");
+
+        let svc = receive_svc(temp.path(), state.clone());
+        let observed = clear(&svc, vm).await;
+
+        assert!(
+            observed.has_session,
+            "the session was there before clearing"
+        );
+        assert_eq!(observed.port, port);
+
+        assert!(!marker.exists(), "handoff marker must be removed");
+        assert!(!pid_file.exists(), "pid file must be removed");
+        assert!(!socket.exists(), "API socket must be removed");
+        assert!(
+            state.get_port(vm).await.is_none(),
+            "the session must no longer be tracked"
+        );
+        // The freed port must be reservable again, otherwise the next
+        // migration to this node loses a slot in the fixed range for good.
+        assert_eq!(
+            state.reserve_explicit_port(port).await.expect("re-reserve"),
+            port
+        );
+    }
+
+    /// Idempotent by design: a runbook step an operator repeats, or runs on
+    /// the wrong node first, must not turn into an error to reason about.
+    #[tokio::test]
+    async fn clearing_a_node_with_no_session_is_a_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let svc = receive_svc(temp.path(), LiveMigrateState::new());
+
+        let observed = clear(&svc, "vm-absent").await;
+        assert!(observed.is_empty(), "nothing was there to begin with");
+        assert!(!observed.vmm_alive);
+
+        // Twice, for good measure: repeating it changes nothing and is still
+        // reported as an empty node rather than an error.
+        assert!(clear(&svc, "vm-absent").await.is_empty());
+    }
+
+    /// A stale pid file whose number has been recycled must not get an
+    /// unrelated process killed. The reported state has to say so, and the
+    /// file still has to be cleaned up.
+    #[tokio::test]
+    async fn clearing_does_not_kill_a_recycled_pid_but_still_clears_the_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vm = "vm-recycled";
+        let pid_file = live_migrate::migrate_pid_path(temp.path(), vm);
+        // The test process itself: alive, and definitely not this VM's VMM.
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("pid");
+
+        let svc = receive_svc(temp.path(), LiveMigrateState::new());
+        let observed = clear(&svc, vm).await;
+
+        assert!(observed.vmm_alive);
+        assert!(!observed.vmm_pid_matches_vm);
+        assert!(!pid_file.exists(), "the stale pid file must be discarded");
+        // If the guard had failed we would have SIGTERMed the test process.
+        assert!(live_migrate::pid_is_alive(std::process::id()));
+    }
+
+    /// The state the operator sees comes from the same snapshot the cleanup
+    /// uses, and taking it must not disturb the session.
+    #[tokio::test]
+    async fn observing_a_prepared_session_leaves_it_intact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = LiveMigrateState::new();
+        let port = state.reserve_port().await.expect("reserve");
+        let vm = "vm-inspect";
+        let ch_pid = dead_pid();
+        state
+            .insert(
+                vm,
+                ReceiveSession {
+                    port,
+                    ch_pid,
+                    receive_task: tokio::spawn(async { Ok(()) }),
+                },
+            )
+            .await;
+        let marker = live_migrate::handoff_marker_path(temp.path(), vm);
+        std::fs::write(&marker, b"1").expect("marker");
+
+        let svc = receive_svc(temp.path(), state.clone());
+        let observed =
+            live_migrate::observe_receive(&svc.live_migrate, &svc.vm_socket_dir, vm).await;
+        let wire = receive_state_to_proto(&observed);
+
+        assert!(wire.has_session);
+        assert_eq!(wire.port, port as i32);
+        assert_eq!(wire.session_pid, ch_pid);
+        assert!(wire.marker_present);
+        assert!(!wire.summary.is_empty());
+
+        // Read-only: inspecting must not disturb the session or its files.
+        assert!(marker.exists(), "inspection must not delete the marker");
+        assert_eq!(state.get_port(vm).await, Some(port));
+    }
+
+    /// Both handlers are behind the controller's client certificate, so an
+    /// unauthenticated caller can neither read nor clear session state.
+    #[tokio::test]
+    async fn receive_session_rpcs_require_a_peer_certificate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let svc = receive_svc(temp.path(), LiveMigrateState::new());
+
+        let err =
+            <AdminService as proto::node_admin_server::NodeAdmin>::get_live_migrate_receive_status(
+                &svc,
+                Request::new(proto::GetLiveMigrateReceiveStatusRequest {
+                    vm_name: "vm-1".into(),
+                }),
+            )
+            .await
+            .expect_err("status must require mTLS");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let err =
+            <AdminService as proto::node_admin_server::NodeAdmin>::abort_live_migrate_receive(
+                &svc,
+                Request::new(proto::AbortLiveMigrateReceiveRequest {
+                    vm_name: "vm-1".into(),
+                    rbd_pool: String::new(),
+                    rbd_image: String::new(),
+                }),
+            )
+            .await
+            .expect_err("abort must require mTLS");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     /// A superseded apply must not read as `running` forever: the controller

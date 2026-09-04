@@ -44,8 +44,8 @@ use std::collections::HashMap;
 use super::helpers::compute_vni;
 use super::helpers::{
     controller_state_from_node_state, grpc_address_host, migration_dial_host,
-    parse_datetime_to_timestamp, parse_port_list, short_vm_id_seed, state_fallback_without_runtime,
-    status_with_context, vm_backend_handle,
+    parse_datetime_to_timestamp, parse_port_list, receive_state_from_node, short_vm_id_seed,
+    state_fallback_without_runtime, status_with_context, vm_backend_handle,
 };
 use super::rbac_matrix;
 use super::signing;
@@ -87,6 +87,50 @@ fn accepts_migrated_vms(node: &NodeRow) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+/// Whether a node's receive-session report describes something that may still
+/// be receiving a migration.
+///
+/// A pid that is alive but does not belong to this VM is a recycled number, not
+/// a live receive, so it deliberately does not count. This is only ever used to
+/// *tell the operator* — nothing in the controller reaps a session on the
+/// strength of it, because a wrong guess would destroy a live migration.
+fn receive_looks_live(state: &controller_proto::LiveMigrateReceiveState) -> bool {
+    (state.vmm_alive && state.vmm_pid_matches_vm) || state.port_listening
+}
+
+/// What `ResetLiveMigrateReceive` should do about a node's observed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetPlan {
+    /// Nothing of the session is left; report success and touch nothing.
+    NothingToClear,
+    /// Something is there but `force` was not given: describe it and stop.
+    ReportOnly,
+    /// Go ahead and run the cleanup.
+    Clear,
+}
+
+/// Gate the destructive path on explicit intent.
+///
+/// Reporting is the default so that running the command by accident, or before
+/// reading the state, cannot destroy anything. A node that reports no state at
+/// all is treated as having something to clear: the conservative reading is
+/// that leftovers exist, and the operator has already asked for `force`.
+fn plan_reset(
+    observed: Option<&controller_proto::LiveMigrateReceiveState>,
+    force: bool,
+) -> ResetPlan {
+    let nothing_to_clear = observed.is_some_and(|s| {
+        !s.has_session && !s.pid_file_present && !s.marker_present && !s.api_socket_present
+    });
+    if nothing_to_clear {
+        ResetPlan::NothingToClear
+    } else if force {
+        ResetPlan::Clear
+    } else {
+        ResetPlan::ReportOnly
+    }
 }
 
 /// Decide whether a node's `FinalizeLiveMigrateSource` reply proves the source
@@ -1022,6 +1066,103 @@ impl ControllerService {
             }
         }
         Ok(false)
+    }
+
+    /// Look a VM up by id, falling back to its name the way the other
+    /// operator-facing RPCs do.
+    fn resolve_vm(&self, vm_id: &str) -> Result<VmRow, Status> {
+        let key = vm_id.trim();
+        if key.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+        self.db
+            .get_vm(key)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or_else(|| {
+                self.db
+                    .list_vms()
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|v| v.name == key))
+            })
+            .ok_or_else(|| Status::not_found(format!("VM '{key}' not found")))
+    }
+
+    /// Nodes to ask about a receive session.
+    ///
+    /// An explicit `node_id` wins. Otherwise every CephCluster member is
+    /// queried, because live migrate only ever prepares a receive on one of
+    /// those, and an operator chasing an `ALREADY_EXISTS` does not necessarily
+    /// know yet which node is holding it.
+    fn receive_status_targets(&self, node_id: &str) -> Result<Vec<NodeRow>, Status> {
+        let all = self
+            .db
+            .list_nodes()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let key = node_id.trim();
+        if !key.is_empty() {
+            let node = all
+                .into_iter()
+                .find(|n| n.id == key || n.address == key)
+                .ok_or_else(|| Status::not_found(format!("node '{key}' not found")))?;
+            return Ok(vec![node]);
+        }
+        Ok(all
+            .into_iter()
+            .filter(|n| self.node_supports_backend(n, "ceph"))
+            .collect())
+    }
+
+    /// Ask one node for its receive bookkeeping. `None` when the node could
+    /// not be reached, which the caller reports rather than treats as fatal.
+    async fn fetch_receive_state(
+        &self,
+        node: &NodeRow,
+        runtime_name: &str,
+    ) -> Result<Option<controller_proto::LiveMigrateReceiveState>, Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let resp = admin
+            .get_live_migrate_receive_status(node_proto::GetLiveMigrateReceiveStatusRequest {
+                vm_name: runtime_name.to_string(),
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!(
+                        "reading live-migrate receive state for '{runtime_name}' on node {}",
+                        node.id
+                    ),
+                )
+            })?
+            .into_inner();
+        Ok(resp.state.as_ref().map(receive_state_from_node))
+    }
+
+    /// Per-node row for `GetLiveMigrateReceiveStatus`, with an unreachable
+    /// node recorded as an error instead of failing the whole report.
+    async fn receive_status_for_node(
+        &self,
+        node: &NodeRow,
+        vm: &VmRow,
+        runtime_name: &str,
+    ) -> controller_proto::NodeLiveMigrateReceiveStatus {
+        let mut row = controller_proto::NodeLiveMigrateReceiveStatus {
+            node_id: node.id.clone(),
+            node_address: node.address.clone(),
+            owns_vm: node.id == vm.node_id,
+            ..Default::default()
+        };
+        match self.fetch_receive_state(node, runtime_name).await {
+            Ok(state) => {
+                row.reachable = true;
+                row.state = state;
+            }
+            Err(e) => {
+                row.reachable = false;
+                row.error = e.message().to_string();
+            }
+        }
+        row
     }
 
     /// Keep only the nodes that belong to a healthy CephCluster.
@@ -5573,6 +5714,208 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
     }
 
+    async fn get_live_migrate_receive_status(
+        &self,
+        request: Request<controller_proto::GetLiveMigrateReceiveStatusRequest>,
+    ) -> Result<Response<controller_proto::GetLiveMigrateReceiveStatusResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        let vm = self.resolve_vm(&req.vm_id)?;
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        let targets = self.receive_status_targets(&req.node_id)?;
+
+        let mut nodes = Vec::with_capacity(targets.len());
+        for node in &targets {
+            nodes.push(self.receive_status_for_node(node, &vm, &runtime_name).await);
+        }
+        let with_session = nodes
+            .iter()
+            .filter(|n| n.state.as_ref().is_some_and(|s| s.has_session))
+            .count();
+        Ok(Response::new(
+            controller_proto::GetLiveMigrateReceiveStatusResponse {
+                success: true,
+                message: format!(
+                    "queried {} node(s); {} report a prepared receive session for '{}'",
+                    nodes.len(),
+                    with_session,
+                    vm.name
+                ),
+                vm_id: vm.id,
+                vm_name: vm.name,
+                runtime_name,
+                current_node: vm.node_id,
+                nodes,
+            },
+        ))
+    }
+
+    async fn reset_live_migrate_receive(
+        &self,
+        request: Request<controller_proto::ResetLiveMigrateReceiveRequest>,
+    ) -> Result<Response<controller_proto::ResetLiveMigrateReceiveResponse>, Status> {
+        // Clearing can kill an in-flight receive, so it sits at the same bar as
+        // draining a node rather than at `vm-admin` like MigrateVm.
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if req.node_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "node_id is required; name the node whose session you are clearing",
+            ));
+        }
+        let vm = self.resolve_vm(&req.vm_id)?;
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        let node = self
+            .db
+            .get_node(req.node_id.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or_else(|| {
+                self.db
+                    .list_nodes()
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|n| n.address == req.node_id.trim()))
+            })
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
+
+        // A *receive* session only strands on a node that does not own the VM:
+        // reassignment is the last step of a successful migration. On the
+        // owning node the same cleanup would stop the VMM, delete the API
+        // socket and unmap the RBD out from under a VM that is running fine.
+        if node.id == vm.node_id {
+            return Err(Status::failed_precondition(format!(
+                "node '{}' currently owns VM '{}'; clearing a receive session there would stop \
+                 the running VM. Inspect with `kctl get migrate-session {}` and reset only a \
+                 node that does not own the VM",
+                node.id, vm.name, vm.name
+            )));
+        }
+
+        let observed = self.fetch_receive_state(&node, &runtime_name).await?;
+        let summary = observed
+            .as_ref()
+            .map(|s| s.summary.clone())
+            .unwrap_or_default();
+
+        match plan_reset(observed.as_ref(), req.force) {
+            // Idempotent: clearing an already-clean node is a success, so a
+            // retried runbook step never turns into an error an operator has
+            // to reason about.
+            ResetPlan::NothingToClear => {
+                return Ok(Response::new(
+                    controller_proto::ResetLiveMigrateReceiveResponse {
+                        success: true,
+                        cleared: false,
+                        message: format!(
+                            "node {} has no receive session for '{}'; nothing to clear",
+                            node.id, vm.name
+                        ),
+                        node_id: node.id,
+                        runtime_name,
+                        observed,
+                    },
+                ));
+            }
+            ResetPlan::ReportOnly => {
+                return Ok(Response::new(
+                    controller_proto::ResetLiveMigrateReceiveResponse {
+                        success: true,
+                        cleared: false,
+                        message: format!(
+                            "refusing to clear without force. Node {} reports: {summary}",
+                            node.id
+                        ),
+                        node_id: node.id,
+                        runtime_name,
+                        observed,
+                    },
+                ));
+            }
+            ResetPlan::Clear => {}
+        }
+
+        // Reuse the abort path so the cleanup (receive task, VMM pid, port
+        // reservation, marker, pid file, API socket, RBD unmap) lives in one
+        // place, including its orphan reaping for a session lost to an agent
+        // restart. The volume row is what lets the node unmap the image; a VM
+        // without one simply skips that step.
+        let volume = self
+            .db
+            .get_volume_by_vm(&vm.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut admin = self.ensure_admin_client_for_node(&node).await?;
+        let aborted = admin
+            .abort_live_migrate_receive(node_proto::AbortLiveMigrateReceiveRequest {
+                vm_name: runtime_name.clone(),
+                rbd_pool: volume.as_ref().map(|v| v.pool.clone()).unwrap_or_default(),
+                rbd_image: volume.as_ref().map(|v| v.image.clone()).unwrap_or_default(),
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!(
+                        "clearing live-migrate receive session for '{}' on node {}",
+                        vm.name, node.id
+                    ),
+                )
+            })?
+            .into_inner();
+
+        // The node snapshots the session again inside the abort, immediately
+        // before tearing it down. Prefer that over the read taken a moment
+        // earlier: it is what was actually destroyed, and a receive can start
+        // or die in between.
+        let observed = aborted
+            .observed
+            .as_ref()
+            .map(receive_state_from_node)
+            .or(observed);
+        let summary = observed
+            .as_ref()
+            .map(|s| s.summary.clone())
+            .unwrap_or(summary);
+
+        let killed_live_receive = observed.as_ref().is_some_and(receive_looks_live);
+        if killed_live_receive {
+            warn!(
+                vm = %vm.name,
+                node = %node.id,
+                "cleared a live-migrate receive session that still looked active"
+            );
+        }
+        self.record_audit(
+            &actor,
+            "ResetLiveMigrateReceive",
+            &format!("vm/{}", vm.id),
+            format!(
+                "node={} live={} observed={}",
+                node.id, killed_live_receive, summary
+            ),
+        );
+
+        Ok(Response::new(
+            controller_proto::ResetLiveMigrateReceiveResponse {
+                success: true,
+                cleared: true,
+                message: format!(
+                    "cleared live-migrate receive session for '{}' on node {}{} ({})",
+                    vm.name,
+                    node.id,
+                    if killed_live_receive {
+                        " -- WARNING: it still looked active, so an in-flight migration was killed"
+                    } else {
+                        ""
+                    },
+                    aborted.message
+                ),
+                node_id: node.id,
+                runtime_name,
+                observed,
+            },
+        ))
+    }
+
     async fn approve_node(
         &self,
         request: Request<controller_proto::ApproveNodeRequest>,
@@ -8882,6 +9225,228 @@ mod tests {
             err.message()
         );
         assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-a");
+    }
+
+    fn receive_state(
+        f: impl FnOnce(&mut controller_proto::LiveMigrateReceiveState),
+    ) -> controller_proto::LiveMigrateReceiveState {
+        let mut s = controller_proto::LiveMigrateReceiveState::default();
+        f(&mut s);
+        s
+    }
+
+    /// The gate that makes the escape hatch safe to run by accident: without
+    /// force it reports and clears nothing.
+    #[test]
+    fn plan_reset_only_clears_with_explicit_force() {
+        let stranded = receive_state(|s| {
+            s.has_session = true;
+            s.port = 18000;
+        });
+        assert_eq!(plan_reset(Some(&stranded), false), ResetPlan::ReportOnly);
+        assert_eq!(plan_reset(Some(&stranded), true), ResetPlan::Clear);
+    }
+
+    /// Idempotent: a clean node is a success under either flag, never an
+    /// error a retried runbook step has to special-case.
+    #[test]
+    fn plan_reset_treats_a_clean_node_as_nothing_to_clear() {
+        let clean = controller_proto::LiveMigrateReceiveState::default();
+        assert_eq!(plan_reset(Some(&clean), false), ResetPlan::NothingToClear);
+        assert_eq!(plan_reset(Some(&clean), true), ResetPlan::NothingToClear);
+    }
+
+    /// A live receive is still clearable — the operator decides — but only
+    /// with force, and the leftovers must be visible either way.
+    #[test]
+    fn plan_reset_reports_a_live_receive_before_clearing_it() {
+        let live = receive_state(|s| {
+            s.has_session = true;
+            s.port = 18000;
+            s.port_listening = true;
+            s.vmm_alive = true;
+            s.vmm_pid_matches_vm = true;
+        });
+        assert!(receive_looks_live(&live));
+        assert_eq!(plan_reset(Some(&live), false), ResetPlan::ReportOnly);
+        assert_eq!(plan_reset(Some(&live), true), ResetPlan::Clear);
+    }
+
+    /// Files left behind without an in-memory session are exactly the
+    /// node-agent-restarted case, and still need clearing.
+    #[test]
+    fn plan_reset_counts_leftover_files_as_something_to_clear() {
+        let orphan = receive_state(|s| s.pid_file_present = true);
+        assert_eq!(plan_reset(Some(&orphan), true), ResetPlan::Clear);
+        let marker = receive_state(|s| s.marker_present = true);
+        assert_eq!(plan_reset(Some(&marker), true), ResetPlan::Clear);
+    }
+
+    /// A pid that is alive but belongs to something else was recycled; it must
+    /// not be reported to the operator as an in-flight migration.
+    #[test]
+    fn receive_looks_live_ignores_a_recycled_pid() {
+        let recycled = receive_state(|s| {
+            s.has_session = true;
+            s.vmm_alive = true;
+            s.vmm_pid_matches_vm = false;
+        });
+        assert!(!receive_looks_live(&recycled));
+    }
+
+    #[tokio::test]
+    async fn reset_live_migrate_receive_requires_an_explicit_node() {
+        let (db, vm) = ceph_two_node_fixture();
+        let svc = svc_for(&db);
+        let err = <ControllerService as controller_proto::controller_server::Controller>::
+            reset_live_migrate_receive(
+                &svc,
+                Request::new(controller_proto::ResetLiveMigrateReceiveRequest {
+                    vm_id: vm.id.clone(),
+                    node_id: "  ".into(),
+                    force: true,
+                }),
+            )
+            .await
+            .expect_err("clearing must name the node it destroys state on");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("node_id is required"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    /// The dangerous case. A receive session only strands on a node that does
+    /// not own the VM, so a request against the owner is a mistake — and the
+    /// cleanup there would stop a VM that is running perfectly well.
+    #[tokio::test]
+    async fn reset_live_migrate_receive_refuses_the_node_that_owns_the_vm() {
+        let (db, vm) = ceph_two_node_fixture();
+        let svc = svc_for(&db);
+        let err = <ControllerService as controller_proto::controller_server::Controller>::
+            reset_live_migrate_receive(
+                &svc,
+                Request::new(controller_proto::ResetLiveMigrateReceiveRequest {
+                    vm_id: vm.id.clone(),
+                    // node-a is where ceph_two_node_fixture puts the VM.
+                    node_id: "node-a".into(),
+                    force: true,
+                }),
+            )
+            .await
+            .expect_err("the owning node must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("currently owns"),
+            "unexpected message: {}",
+            err.message()
+        );
+        // Nothing moved: the VM is still where it was.
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn reset_live_migrate_receive_reports_an_unknown_vm_and_node() {
+        let (db, vm) = ceph_two_node_fixture();
+        let svc = svc_for(&db);
+
+        let err = <ControllerService as controller_proto::controller_server::Controller>::
+            reset_live_migrate_receive(
+                &svc,
+                Request::new(controller_proto::ResetLiveMigrateReceiveRequest {
+                    vm_id: "no-such-vm".into(),
+                    node_id: "node-b".into(),
+                    force: true,
+                }),
+            )
+            .await
+            .expect_err("unknown VM");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let err = <ControllerService as controller_proto::controller_server::Controller>::
+            reset_live_migrate_receive(
+                &svc,
+                Request::new(controller_proto::ResetLiveMigrateReceiveRequest {
+                    vm_id: vm.name.clone(),
+                    node_id: "no-such-node".into(),
+                    force: true,
+                }),
+            )
+            .await
+            .expect_err("unknown node");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// With no node named, the report covers every CephCluster member, since
+    /// those are the only nodes live migrate ever prepares a receive on.
+    #[tokio::test]
+    async fn receive_status_reports_every_ceph_member_and_marks_the_owner() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        let svc = svc_for(&db);
+        let resp = <ControllerService as controller_proto::controller_server::Controller>::
+            get_live_migrate_receive_status(
+                &svc,
+                Request::new(controller_proto::GetLiveMigrateReceiveStatusRequest {
+                    vm_id: vm.name.clone(),
+                    node_id: String::new(),
+                }),
+            )
+            .await
+            .expect("status must not fail just because nodes are unreachable")
+            .into_inner();
+
+        assert!(resp.success);
+        assert_eq!(resp.vm_id, vm.id);
+        assert_eq!(resp.current_node, "node-a");
+        assert_eq!(resp.runtime_name, sanitize_nix_attr_key(&vm.name));
+        let ids: Vec<_> = resp.nodes.iter().map(|n| n.node_id.as_str()).collect();
+        assert!(
+            ids.contains(&"node-a") && ids.contains(&"node-b"),
+            "{ids:?}"
+        );
+
+        let owner = resp
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "node-a")
+            .expect("owner row");
+        assert!(owner.owns_vm, "the owning node must be flagged as such");
+        assert!(
+            !resp
+                .nodes
+                .iter()
+                .find(|n| n.node_id == "node-b")
+                .expect("node-b row")
+                .owns_vm
+        );
+
+        // No node agent is listening in tests, so every row records why it
+        // could not be read rather than failing the whole report.
+        for node in &resp.nodes {
+            assert!(!node.reachable);
+            assert!(!node.error.is_empty(), "an unreachable node must say why");
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_status_accepts_an_explicit_node() {
+        let (db, vm) = ceph_two_node_fixture();
+        let svc = svc_for(&db);
+        let resp = <ControllerService as controller_proto::controller_server::Controller>::
+            get_live_migrate_receive_status(
+                &svc,
+                Request::new(controller_proto::GetLiveMigrateReceiveStatusRequest {
+                    vm_id: vm.id.clone(),
+                    node_id: "node-b".into(),
+                }),
+            )
+            .await
+            .expect("status")
+            .into_inner();
+        assert_eq!(resp.nodes.len(), 1);
+        assert_eq!(resp.nodes[0].node_id, "node-b");
     }
 
     #[tokio::test]

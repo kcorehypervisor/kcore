@@ -120,6 +120,13 @@ service NodeAdmin {
       returns (WaitLiveMigrateReceiveResponse);
   rpc AbortLiveMigrateReceive(AbortLiveMigrateReceiveRequest)
       returns (AbortLiveMigrateReceiveResponse);
+  // Read-only view of this node's live-migrate receive bookkeeping for a VM.
+  // Nothing is cleaned up. It exists so an operator can tell a stranded
+  // session from an in-flight receive *before* clearing anything: there is
+  // deliberately no automatic reaping, because a wrong liveness guess would
+  // destroy a live migration. See docs/vm-migration.md.
+  rpc GetLiveMigrateReceiveStatus(GetLiveMigrateReceiveStatusRequest)
+      returns (GetLiveMigrateReceiveStatusResponse);
   rpc SendLiveMigrate(SendLiveMigrateRequest) returns (SendLiveMigrateResponse);
   rpc FinalizeLiveMigrateSource(FinalizeLiveMigrateSourceRequest)
       returns (FinalizeLiveMigrateSourceResponse);
@@ -903,6 +910,50 @@ message AbortLiveMigrateReceiveRequest {
 message AbortLiveMigrateReceiveResponse {
   bool success = 1;
   string message = 2;
+  // What the node saw immediately before cleaning up. Recorded so an operator
+  // clearing a session can see afterwards whether they killed a live receive
+  // or collected a corpse.
+  LiveMigrateReceiveState observed = 3;
+}
+
+message GetLiveMigrateReceiveStatusRequest {
+  string vm_name = 1;
+}
+
+// Everything the node can observe about a receive session without touching it.
+message LiveMigrateReceiveState {
+  // A prepare ran here and the session is still tracked in memory. This is
+  // what makes a retried PrepareLiveMigrateReceive answer ALREADY_EXISTS.
+  bool has_session = 1;
+  // Migration port the session holds; 0 when there is no in-memory session.
+  int32 port = 2;
+  // Receive-mode cloud-hypervisor pid from the in-memory session, 0 if none.
+  uint32 session_pid = 3;
+  // Pid recorded in <socket_dir>/<vm>.migrate.pid, 0 when the file is absent.
+  // Survives a node-agent restart, so it can be set while has_session is not.
+  uint32 pid_file_pid = 4;
+  // Whether that pid is a live process. The decisive field: false means
+  // nothing is receiving and the session is safe to clear.
+  bool vmm_alive = 5;
+  // Whether the live pid really is this VM's receive VMM, checked against its
+  // /proc cmdline. False with vmm_alive true means the pid was recycled and
+  // clearing must not kill it.
+  bool vmm_pid_matches_vm = 6;
+  // Whether any process holds a listening socket on `port`.
+  bool port_listening = 7;
+  bool pid_file_present = 8;
+  // <socket_dir>/<vm>.live-migrated: the receive completed and the generated
+  // unit should adopt the running VMM rather than cold-start one.
+  bool marker_present = 9;
+  bool api_socket_present = 10;
+  // One-line operator-facing reading of the fields above.
+  string summary = 11;
+}
+
+message GetLiveMigrateReceiveStatusResponse {
+  bool success = 1;
+  string message = 2;
+  LiveMigrateReceiveState state = 3;
 }
 
 message SendLiveMigrateRequest {

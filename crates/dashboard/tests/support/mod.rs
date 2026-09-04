@@ -309,6 +309,20 @@ impl Controller for MockController {
         Err(unimp("migrate_vm"))
     }
 
+    async fn get_live_migrate_receive_status(
+        &self,
+        _: Request<GetLiveMigrateReceiveStatusRequest>,
+    ) -> Result<Response<GetLiveMigrateReceiveStatusResponse>, Status> {
+        Err(unimp("get_live_migrate_receive_status"))
+    }
+
+    async fn reset_live_migrate_receive(
+        &self,
+        _: Request<ResetLiveMigrateReceiveRequest>,
+    ) -> Result<Response<ResetLiveMigrateReceiveResponse>, Status> {
+        Err(unimp("reset_live_migrate_receive"))
+    }
+
     async fn approve_node(
         &self,
         _: Request<ApproveNodeRequest>,
