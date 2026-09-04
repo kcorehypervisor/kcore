@@ -7,6 +7,8 @@
 )]
 
 mod auth;
+mod ceph_cluster_reconciler;
+mod ceph_cluster_spec;
 mod cluster_update_reconciler;
 mod cluster_update_spec;
 mod config;
@@ -118,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
     replication::spawn_head_materializer(database.clone());
     replication::spawn_reservation_retry_executor(database.clone());
     disk_reconciler::spawn_disk_layout_reconciler(database.clone(), clients.clone());
+    ceph_cluster_reconciler::spawn_ceph_cluster_reconciler(database.clone(), clients.clone());
     cluster_update_reconciler::spawn_cluster_update_reconciler(database.clone(), clients.clone());
 
     let staleness_db = database.clone();

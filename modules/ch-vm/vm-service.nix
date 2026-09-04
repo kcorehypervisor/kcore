@@ -23,19 +23,24 @@ let
 
       isLvm = vmCfg.storageBackend == "lvm";
       isZfs = vmCfg.storageBackend == "zfs";
-      isBlockBackend = isLvm || isZfs;
+      isCeph = vmCfg.storageBackend == "ceph";
+      isBlockBackend = isLvm || isZfs || isCeph;
 
       lvName = "kcore-${vmName}";
       lvDevice = "/dev/${cfg.lvmVgName}/${lvName}";
 
       zvolDataset = "${cfg.zfsPoolName}/kcore-${vmName}";
       zvolDevice = "/dev/zvol/${zvolDataset}";
+      rbdImage = if vmCfg.rbdImage != "" then vmCfg.rbdImage else "kcore-${vmName}";
+      rbdDevice = "/dev/rbd/${cfg.rbdPool}/${rbdImage}";
 
       actualDisk =
         if isLvm then
           lvDevice
         else if isZfs then
           zvolDevice
+        else if isCeph then
+          rbdDevice
         else
           toString vmCfg.image;
       actualFormat = if isBlockBackend then "raw" else vmCfg.imageFormat;
@@ -91,6 +96,18 @@ let
         fi
       '';
 
+      cephMapScript = pkgs.writeShellScript "ceph-map-${vmName}" ''
+        set -e
+        IMAGE="${cfg.rbdPool}/${rbdImage}"
+        if ! ${pkgs.ceph}/bin/rbd info "$IMAGE" >/dev/null 2>&1; then
+          ${pkgs.ceph}/bin/rbd create "$IMAGE" --size $(( ${toString vmCfg.storageSizeBytes} / 1024 / 1024 ))
+        fi
+        if [ ! -b "${rbdDevice}" ]; then
+          ${pkgs.ceph}/bin/rbd map "$IMAGE"
+        fi
+        test -b "${rbdDevice}"
+      '';
+
       chArgs = lib.concatStringsSep " " (
         [
           "--api-socket ${socketPath}"
@@ -120,6 +137,7 @@ let
         sourceImageCheck
         "${zfsProvisionScript}"
       ];
+      cephPreChecks = [ "${cephMapScript}" ];
       fsPreChecks = [ sourceImageCheck ];
 
       storagePreChecks =
@@ -127,6 +145,8 @@ let
           lvmPreChecks
         else if isZfs then
           zfsPreChecks
+        else if isCeph then
+          cephPreChecks
         else
           fsPreChecks;
     in
@@ -142,6 +162,7 @@ let
         ExecStartPre = basePreChecks ++ storagePreChecks;
         ExecStart = "${chBin} ${chArgs}";
         ExecStop = "${pkgs.curl}/bin/curl --unix-socket ${socketPath} -s -X PUT http://localhost/api/v1/vm.power-button";
+        ExecStopPost = lib.optionalString isCeph "-${pkgs.ceph}/bin/rbd unmap ${rbdDevice}";
         TimeoutStopSec = 30;
         Restart = if vmCfg.autoStart then "always" else "no";
         RestartSec = 5;

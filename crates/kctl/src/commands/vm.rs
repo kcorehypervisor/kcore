@@ -935,8 +935,8 @@ fn normalize_image_format(format: &str) -> Result<String> {
 fn normalize_storage_backend_arg(value: &str) -> Result<String> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "filesystem" | "lvm" | "zfs" => Ok(normalized),
-        _ => bail!("storage backend must be one of: filesystem, lvm, zfs"),
+        "filesystem" | "lvm" | "zfs" | "ceph" => Ok(normalized),
+        _ => bail!("storage backend must be one of: filesystem, lvm, zfs, ceph"),
     }
 }
 
@@ -945,6 +945,7 @@ fn storage_backend_to_proto(value: &str) -> i32 {
         "filesystem" => proto::StorageBackendType::Filesystem as i32,
         "lvm" => proto::StorageBackendType::Lvm as i32,
         "zfs" => proto::StorageBackendType::Zfs as i32,
+        "ceph" => proto::StorageBackendType::Ceph as i32,
         _ => proto::StorageBackendType::Unspecified as i32,
     }
 }
@@ -1292,7 +1293,7 @@ mod tests {
         );
         assert_eq!(normalize_storage_backend_arg("LVM").expect("lvm"), "lvm");
         assert_eq!(normalize_storage_backend_arg("zfs").expect("zfs"), "zfs");
-        assert!(normalize_storage_backend_arg("ceph").is_err());
+        assert_eq!(normalize_storage_backend_arg("ceph").expect("ceph"), "ceph");
     }
 
     fn base_create_args() -> CreateArgs {
@@ -1733,7 +1734,7 @@ mod proptests {
         #[test]
         fn normalize_storage_backend_arg_acceptance(s in ".{0,16}") {
             let normalized = s.trim().to_ascii_lowercase();
-            let predicate = matches!(normalized.as_str(), "filesystem" | "lvm" | "zfs");
+            let predicate = matches!(normalized.as_str(), "filesystem" | "lvm" | "zfs" | "ceph");
             prop_assert_eq!(normalize_storage_backend_arg(&s).is_ok(), predicate);
         }
 
@@ -1742,7 +1743,7 @@ mod proptests {
         /// proto value.
         #[test]
         fn storage_backend_round_trip(s in prop::sample::select(vec![
-            "filesystem", "lvm", "zfs", "FILESYSTEM", "LVM", "ZFS", " lvm  ",
+            "filesystem", "lvm", "zfs", "ceph", "FILESYSTEM", "LVM", "ZFS", "CEPH", " lvm  ",
         ])) {
             let normalized = normalize_storage_backend_arg(s).expect("known backend");
             let p = storage_backend_to_proto(&normalized);
@@ -1758,6 +1759,7 @@ mod proptests {
                 v == proto::StorageBackendType::Filesystem as i32
                     || v == proto::StorageBackendType::Lvm as i32
                     || v == proto::StorageBackendType::Zfs as i32
+                    || v == proto::StorageBackendType::Ceph as i32
                     || v == proto::StorageBackendType::Unspecified as i32
             );
         }

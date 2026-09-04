@@ -1742,6 +1742,7 @@ fn storage_backend_from_i32(raw: i32) -> &'static str {
     match kind {
         controller_proto::StorageBackendType::Lvm => "lvm",
         controller_proto::StorageBackendType::Zfs => "zfs",
+        controller_proto::StorageBackendType::Ceph => "ceph",
         controller_proto::StorageBackendType::Filesystem
         | controller_proto::StorageBackendType::Unspecified => "filesystem",
     }

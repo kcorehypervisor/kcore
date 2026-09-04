@@ -140,6 +140,7 @@ let
           "filesystem"
           "lvm"
           "zfs"
+          "ceph"
         ];
         default = "filesystem";
         description = "Storage backend requested for VM data volume provisioning.";
@@ -149,6 +150,12 @@ let
         type = lib.types.ints.positive;
         default = 10737418240;
         description = "Requested VM storage size in bytes for backend provisioning metadata.";
+      };
+
+      rbdImage = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "RBD image name; defaults to kcore-<VM name>.";
       };
 
       cores = lib.mkOption {
@@ -256,6 +263,12 @@ in
       type = lib.types.str;
       default = "tank0";
       description = "ZFS pool used for VM zvol volumes when storageBackend = zfs.";
+    };
+
+    rbdPool = lib.mkOption {
+      type = lib.types.str;
+      default = "kcore-vms";
+      description = "Ceph RBD pool used for VM disks when storageBackend = ceph.";
     };
 
     virtualMachines = lib.mkOption {

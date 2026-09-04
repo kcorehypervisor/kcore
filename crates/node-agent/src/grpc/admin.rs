@@ -34,6 +34,7 @@ const DISK_MODE_INSTALLER_ONLY: &str = "installer-only";
 const DISK_MODE_CONTROLLER_MANAGED: &str = "controller-managed";
 const DISK_LAYOUT_DIR: &str = "/etc/kcore/disk";
 const DISK_LAYOUT_CURRENT_PATH: &str = "/etc/kcore/disk/current.nix";
+const CEPH_NIX_PATH: &str = "/etc/nixos/kcore-ceph.nix";
 const KCORE_VOLUME_ROOTS: &[&str] = &["/var/lib/kcore/volumes", "/var/lib/kcore/images"];
 
 async fn resolve_nixpkgs_path() -> Option<String> {
@@ -860,6 +861,7 @@ fn build_install_command_args(req: &proto::InstallToDiskRequest) -> Result<Vec<S
         proto::StorageBackendType::Filesystem => "filesystem",
         proto::StorageBackendType::Lvm => "lvm",
         proto::StorageBackendType::Zfs => "zfs",
+        proto::StorageBackendType::Ceph => "ceph",
         proto::StorageBackendType::Unspecified => "",
     };
     let mode = if typed_mode.is_empty() {
@@ -1175,6 +1177,160 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 "config written to {}; nixos-rebuild test+switch started",
                 path.display()
             ),
+        }))
+    }
+
+    async fn apply_ceph_config(
+        &self,
+        request: Request<proto::ApplyCephConfigRequest>,
+    ) -> Result<Response<proto::ApplyCephConfigResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if req.ceph_nix.trim().is_empty() || req.fsid.trim().is_empty() {
+            return Err(Status::invalid_argument("ceph_nix and fsid are required"));
+        }
+        tokio::fs::write(CEPH_NIX_PATH, req.ceph_nix.as_bytes())
+            .await
+            .map_err(|e| Status::internal(format!("writing {CEPH_NIX_PATH}: {e}")))?;
+        if req.rebuild {
+            let out = Command::new("nixos-rebuild")
+                .args(["test"])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("starting nixos-rebuild: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "nixos-rebuild test failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            let out = Command::new("nixos-rebuild")
+                .args(["switch"])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("starting nixos-rebuild: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "nixos-rebuild switch failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        Ok(Response::new(proto::ApplyCephConfigResponse {
+            success: true,
+            message: format!("Ceph config written to {CEPH_NIX_PATH}"),
+        }))
+    }
+
+    async fn bootstrap_ceph_osd(
+        &self,
+        request: Request<proto::BootstrapCephOsdRequest>,
+    ) -> Result<Response<proto::BootstrapCephOsdResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let device = Path::new(req.osd_device.trim());
+        if !device.is_absolute() {
+            return Err(Status::invalid_argument("osd_device must be absolute"));
+        }
+        let listed = Command::new("ceph-volume")
+            .args(["lvm", "list", req.osd_device.as_str()])
+            .output()
+            .await
+            .map_err(|e| {
+                Status::internal(format!("starting ceph-volume (is Ceph installed?): {e}"))
+            })?;
+        if listed.status.success() && !listed.stdout.is_empty() {
+            return Ok(Response::new(proto::BootstrapCephOsdResponse {
+                success: true,
+                already_prepared: true,
+                message: "OSD already prepared".into(),
+            }));
+        }
+        let signatures = Command::new("wipefs")
+            .args(["--no-act", req.osd_device.as_str()])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("running wipefs: {e}")))?;
+        if !req.force_wipe && !signatures.stdout.is_empty() {
+            return Err(Status::failed_precondition(
+                "OSD device has signatures; set forceWipe only after verifying the device",
+            ));
+        }
+        if req.force_wipe {
+            let out = Command::new("wipefs")
+                .args(["--all", req.osd_device.as_str()])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("running wipefs: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(
+                    String::from_utf8_lossy(&out.stderr).to_string(),
+                ));
+            }
+        }
+        let out = Command::new("ceph-volume")
+            .args([
+                "lvm",
+                "create",
+                "--data",
+                req.osd_device.as_str(),
+                "--no-systemd",
+            ])
+            .output()
+            .await
+            .map_err(|e| {
+                Status::internal(format!("starting ceph-volume (is Ceph installed?): {e}"))
+            })?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "ceph-volume failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(Response::new(proto::BootstrapCephOsdResponse {
+            success: true,
+            already_prepared: false,
+            message: "OSD prepared".into(),
+        }))
+    }
+
+    async fn get_ceph_health(
+        &self,
+        request: Request<proto::GetCephHealthRequest>,
+    ) -> Result<Response<proto::GetCephHealthResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let out = Command::new("ceph")
+            .args(["-s", "--format", "json"])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("starting ceph (is Ceph installed?): {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "ceph status failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let raw_status = String::from_utf8_lossy(&out.stdout).to_string();
+        let json: JsonValue = serde_json::from_str(&raw_status)
+            .map_err(|e| Status::internal(format!("invalid ceph status JSON: {e}")))?;
+        let health_status = json
+            .pointer("/health/status")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("HEALTH_ERR")
+            .to_string();
+        let osd_up = json
+            .pointer("/osdmap/osdmap/num_up_osds")
+            .and_then(JsonValue::as_i64)
+            .unwrap_or(0) as i32;
+        let osd_in = json
+            .pointer("/osdmap/osdmap/num_in_osds")
+            .and_then(JsonValue::as_i64)
+            .unwrap_or(0) as i32;
+        Ok(Response::new(proto::GetCephHealthResponse {
+            health_status,
+            raw_status,
+            osd_up,
+            osd_in,
         }))
     }
 

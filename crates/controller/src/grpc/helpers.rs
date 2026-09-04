@@ -86,6 +86,7 @@ pub fn vm_backend_handle(vm: &crate::db::VmRow) -> String {
     match vm.storage_backend.as_str() {
         "lvm" => format!("/dev/vg_kcore/kcore-{}", sanitized()),
         "zfs" => format!("/dev/zvol/tank0/kcore-{}", sanitized()),
+        "ceph" => format!("/dev/rbd/kcore-vms/kcore-{}", vm.id),
         _ => vm.image_path.clone(),
     }
 }

@@ -101,6 +101,11 @@ service NodeAdmin {
   rpc ActivateSystemUpdate(ActivateSystemUpdateRequest) returns (ActivateSystemUpdateResponse);
   rpc GetSystemUpdateStatus(GetSystemUpdateStatusRequest) returns (GetSystemUpdateStatusResponse);
   rpc RollbackSystemUpdate(RollbackSystemUpdateRequest) returns (RollbackSystemUpdateResponse);
+
+  // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
+  rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
+  rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
+  rpc GetCephHealth(GetCephHealthRequest) returns (GetCephHealthResponse);
 }
 
 // VM specification
@@ -645,6 +650,7 @@ enum StorageBackendType {
   STORAGE_BACKEND_TYPE_FILESYSTEM = 1;
   STORAGE_BACKEND_TYPE_LVM = 2;
   STORAGE_BACKEND_TYPE_ZFS = 3;
+  STORAGE_BACKEND_TYPE_CEPH = 4;
 }
 
 message InstallToDiskResponse {
@@ -743,5 +749,42 @@ message RollbackSystemUpdateRequest {
 message RollbackSystemUpdateResponse {
   bool success = 1;
   string message = 2;
+}
+
+message ApplyCephConfigRequest {
+  string ceph_nix = 1;
+  bool rebuild = 2;
+  string fsid = 3;
+  bool mon = 4;
+  bool mgr = 5;
+  bool osd = 6;
+  string daemon_id = 7;
+  bytes keyring = 8;
+}
+
+message ApplyCephConfigResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message BootstrapCephOsdRequest {
+  string osd_device = 1;
+  bool force_wipe = 2;
+  string cluster_name = 3;
+}
+
+message BootstrapCephOsdResponse {
+  bool success = 1;
+  bool already_prepared = 2;
+  string message = 3;
+}
+
+message GetCephHealthRequest { string cluster_name = 1; }
+
+message GetCephHealthResponse {
+  string health_status = 1;
+  string raw_status = 2;
+  int32 osd_up = 3;
+  int32 osd_in = 4;
 }
 

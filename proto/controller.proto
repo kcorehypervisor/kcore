@@ -100,6 +100,12 @@ service Controller {
   rpc CancelClusterUpdate(CancelClusterUpdateRequest) returns (CancelClusterUpdateResponse);
   rpc RollbackClusterUpdate(RollbackClusterUpdateRequest) returns (RollbackClusterUpdateResponse);
 
+  // CephCluster — declarative cluster-scoped Ceph SAN configuration.
+  rpc CreateCephCluster(CreateCephClusterRequest) returns (CreateCephClusterResponse);
+  rpc GetCephCluster(GetCephClusterRequest) returns (GetCephClusterResponse);
+  rpc ListCephClusters(ListCephClustersRequest) returns (ListCephClustersResponse);
+  rpc DeleteCephCluster(DeleteCephClusterRequest) returns (DeleteCephClusterResponse);
+
   // RBAC: operators identified by client cert CN=kctl:<name>. Legacy CN=kctl is bootstrap-only.
   rpc CreateOperator(CreateOperatorRequest) returns (CreateOperatorResponse);
   rpc DeleteOperator(DeleteOperatorRequest) returns (DeleteOperatorResponse);
@@ -173,6 +179,7 @@ enum StorageBackendType {
   STORAGE_BACKEND_TYPE_FILESYSTEM = 1;
   STORAGE_BACKEND_TYPE_LVM = 2;
   STORAGE_BACKEND_TYPE_ZFS = 3;
+  STORAGE_BACKEND_TYPE_CEPH = 4;
 }
 
 enum WorkloadKind {
@@ -1401,3 +1408,64 @@ message RollbackClusterUpdateResponse {
   bool success = 1;
   ClusterUpdate cluster_update = 2;
 }
+
+// --- CephCluster ----------------------------------------------------------------------------
+
+enum CephClusterPhase {
+  CEPH_CLUSTER_PHASE_UNSPECIFIED = 0;
+  CEPH_CLUSTER_PHASE_PENDING = 1;
+  CEPH_CLUSTER_PHASE_BOOTSTRAPPING = 2;
+  CEPH_CLUSTER_PHASE_HEALTHY = 3;
+  CEPH_CLUSTER_PHASE_DEGRADED = 4;
+  CEPH_CLUSTER_PHASE_FAILED = 5;
+}
+
+message CephClusterNodeSpec {
+  string node_id = 1;
+  string mon_addr = 2;
+  string cluster_addr = 3;
+  string public_iface = 4;
+  string cluster_iface = 5;
+  string osd_device = 6;
+}
+
+message CephClusterSpec {
+  string fsid = 1;
+  string public_network = 2;
+  string cluster_network = 3;
+  int32 size = 4;
+  int32 min_size = 5;
+  bool force_wipe = 6;
+  repeated CephClusterNodeSpec nodes = 7;
+}
+
+message CephClusterStatus {
+  int64 observed_generation = 1;
+  CephClusterPhase phase = 2;
+  string health_message = 3;
+  string ceph_status_json = 4;
+  google.protobuf.Timestamp last_transition_at = 5;
+}
+
+message CephCluster {
+  string name = 1;
+  int64 generation = 2;
+  CephClusterSpec spec = 3;
+  CephClusterStatus status = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message CreateCephClusterRequest { CephCluster ceph_cluster = 1; }
+message CreateCephClusterResponse {
+  bool success = 1;
+  CephCluster ceph_cluster = 2;
+  ApplyAction action = 3;
+  repeated string changed_fields = 4;
+}
+message GetCephClusterRequest { string name = 1; }
+message GetCephClusterResponse { CephCluster ceph_cluster = 1; }
+message ListCephClustersRequest {}
+message ListCephClustersResponse { repeated CephCluster ceph_clusters = 1; }
+message DeleteCephClusterRequest { string name = 1; }
+message DeleteCephClusterResponse { bool success = 1; }
