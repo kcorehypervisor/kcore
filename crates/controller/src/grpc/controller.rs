@@ -156,6 +156,28 @@ pub struct TlsPaths {
     pub key_file: String,
 }
 
+/// PKI state and policy shared with the rotation reconciler and the HTTP
+/// responder. Defaults are inert so tests that do not care about PKI can
+/// construct the service unchanged.
+#[derive(Clone)]
+pub struct PkiRuntime {
+    pub crl_cache: crate::pki::crl::CrlCache,
+    pub revocation: crate::pki::revocation::RevocationState,
+    pub rotation: crate::config::CertRotationConfig,
+    pub pki: crate::config::PkiConfig,
+}
+
+impl Default for PkiRuntime {
+    fn default() -> Self {
+        Self {
+            crl_cache: crate::pki::crl::CrlCache::new(),
+            revocation: crate::pki::revocation::RevocationState::disabled(),
+            rotation: crate::config::CertRotationConfig::default(),
+            pki: crate::config::PkiConfig::default(),
+        }
+    }
+}
+
 pub struct ControllerService {
     db: Database,
     clients: NodeClients,
@@ -166,6 +188,7 @@ pub struct ControllerService {
     require_manual_approval: bool,
     /// When true, legacy `CN=kctl` keeps cluster-admin after operators exist (escape hatch).
     bootstrap_kctl: bool,
+    pki: PkiRuntime,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
 }
@@ -265,6 +288,7 @@ impl ControllerService {
             tls_paths: None,
             require_manual_approval,
             bootstrap_kctl,
+            pki: PkiRuntime::default(),
             #[cfg(test)]
             test_push_hook: None,
         }
@@ -273,6 +297,89 @@ impl ControllerService {
     pub fn with_tls_paths(mut self, paths: TlsPaths) -> Self {
         self.tls_paths = Some(paths);
         self
+    }
+
+    pub fn with_pki(mut self, pki: PkiRuntime) -> Self {
+        self.pki = pki;
+        self
+    }
+
+    fn sub_ca_snapshot(&self) -> Result<SubCaState, Status> {
+        Ok(self
+            .sub_ca
+            .lock()
+            .map_err(|_| Status::internal("sub-CA lock poisoned"))?
+            .clone())
+    }
+
+    /// Add a freshly signed chain to the certificate inventory.
+    ///
+    /// Best-effort on purpose: the certificate has already been issued and
+    /// returning an error here would make the caller believe issuance failed.
+    /// A missing inventory row degrades observability, not correctness — the
+    /// node still gets a working certificate and the next rotation re-records
+    /// it.
+    fn record_issued_cert(&self, chain_pem: &str, node_id: &str) {
+        if let Err(error) = crate::pki::inventory::record_signed_chain(&self.db, chain_pem, node_id)
+        {
+            warn!(%error, node_id = %node_id, "failed to record issued certificate in inventory");
+        }
+    }
+
+    /// Serials a revoke request refers to.
+    ///
+    /// `serial_hex` wins when present; otherwise every non-revoked
+    /// certificate belonging to the named subject or node is selected, so
+    /// revoking an identity does not leave an older still-valid certificate
+    /// for the same subject usable.
+    fn resolve_revocation_targets(
+        &self,
+        req: &controller_proto::RevokeCertificateRequest,
+    ) -> Result<Vec<String>, Status> {
+        let serial = crate::pki::normalize_serial(&req.serial_hex);
+        if !serial.is_empty() {
+            return match self.resolve_serial(&serial)? {
+                Some(found) => Ok(vec![found]),
+                None => Ok(Vec::new()),
+            };
+        }
+        let subject_cn = req.subject_cn.trim();
+        let node_id = req.node_id.trim();
+        if subject_cn.is_empty() && node_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "one of serial_hex, subject_cn or node_id is required",
+            ));
+        }
+        self.db
+            .find_revocable_serials(subject_cn, node_id)
+            .map_err(internal_db)
+    }
+
+    /// Match an operator-supplied serial against the inventory, tolerating the
+    /// leading-zero difference between DER integer bytes and the way some
+    /// tools print serials.
+    fn resolve_serial(&self, serial: &str) -> Result<Option<String>, Status> {
+        let mut candidates = vec![serial.to_string()];
+        let stripped = serial.trim_start_matches('0');
+        if !stripped.is_empty() && stripped != serial {
+            candidates.push(stripped.to_string());
+        }
+        if serial.len() % 2 == 1 {
+            candidates.push(format!("0{serial}"));
+        } else {
+            candidates.push(format!("00{serial}"));
+        }
+        for candidate in candidates {
+            if self
+                .db
+                .get_issued_certificate(&candidate)
+                .map_err(internal_db)?
+                .is_some()
+            {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -293,6 +400,7 @@ impl ControllerService {
             tls_paths: None,
             require_manual_approval: false,
             bootstrap_kctl,
+            pki: PkiRuntime::default(),
             test_push_hook: Some(hook),
         }
     }
@@ -480,6 +588,7 @@ impl ControllerService {
             .apply_nix_config(node_proto::ApplyNixConfigRequest {
                 configuration_nix: nix_config,
                 rebuild: true,
+                apply_id: String::new(),
             })
             .await
             .map_err(|e| {
@@ -653,6 +762,61 @@ impl ControllerService {
             || (backend == "ceph" && self.ceph_member_ids().contains(&node.id))
     }
 
+    /// Names of Ceph-backed VMs that still depend on the given CephCluster,
+    /// either because they sit on one of its member nodes or because they own a
+    /// `volumes` row in a pool the cluster serves.
+    pub(crate) fn ceph_cluster_vms_in_use(
+        &self,
+        cluster_name: &str,
+    ) -> Result<Vec<String>, Status> {
+        let Some(cluster) = self
+            .db
+            .get_ceph_cluster(cluster_name)
+            .map_err(|e| Status::internal(e.to_string()))?
+        else {
+            return Ok(Vec::new());
+        };
+        let spec = ceph_cluster_spec::spec_from_json(&cluster.spec_json)
+            .map_err(|e| Status::internal(format!("decode ceph cluster spec: {e}")))?;
+        let members: HashSet<String> = spec.nodes.into_iter().map(|n| n.node_id).collect();
+        let mut names: Vec<String> = self
+            .db
+            .list_vms()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .filter(|vm| vm.storage_backend == "ceph" && members.contains(&vm.node_id))
+            .map(|vm| vm.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// True when `node_id` belongs to a CephCluster whose reconciled status is
+    /// `healthy`. Placing a shared-RBD VM on a node outside a healthy cluster
+    /// gives a guest that cannot map its own disk.
+    pub(crate) fn is_healthy_ceph_member(&self, node_id: &str) -> Result<bool, Status> {
+        let clusters = self
+            .db
+            .list_ceph_clusters()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        for cluster in clusters {
+            let Ok(Some(status)) = self.db.get_ceph_cluster_status(&cluster.name) else {
+                continue;
+            };
+            if status.phase != "healthy" {
+                continue;
+            }
+            let member = ceph_cluster_spec::spec_from_json(&cluster.spec_json)
+                .map(|s| s.nodes.iter().any(|n| n.node_id == node_id))
+                .unwrap_or(false);
+            if member {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn live_migrate_vm(
         &self,
         vm: &VmRow,
@@ -782,12 +946,78 @@ impl ControllerService {
         Ok(())
     }
 
+    /// Stop a Ceph-backed VM and unmap its RBD image on the node that owns it
+    /// *before* another node is allowed to map the same image.
+    ///
+    /// Config pushes trigger an asynchronous `nixos-rebuild` on each node, so a
+    /// cold move that only rewrote configs would let the destination map and
+    /// boot from the shared RBD while the source VMM was still writing to it.
+    /// A successful `finalize_live_migrate_source` means `rbd unmap` succeeded,
+    /// which cannot happen while a local VMM still holds the device open — so
+    /// it doubles as the exclusivity barrier.
+    ///
+    /// An unreachable source node is tolerated (that is the node-failure drain
+    /// case, where the source VMM is gone with the node); anything else is a
+    /// hard error rather than a risk of two writers.
+    async fn cold_release_ceph_vm(&self, vm: &VmRow, source: &NodeRow) -> Result<(), Status> {
+        if vm.storage_backend != "ceph" {
+            return Ok(());
+        }
+        let volume = self
+            .db
+            .get_volume_by_vm(&vm.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let (pool, image) = match volume {
+            Some(v) => (v.pool, v.image),
+            None => (String::new(), String::new()),
+        };
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        let mut admin = match self.ensure_admin_client_for_node(source).await {
+            Ok(c) => c,
+            Err(status) if status.code() == tonic::Code::Unavailable => {
+                warn!(
+                    node = %source.id,
+                    vm = %vm.name,
+                    error = %status,
+                    "source node unreachable; skipping RBD release barrier"
+                );
+                return Ok(());
+            }
+            Err(status) => return Err(status),
+        };
+        match admin
+            .finalize_live_migrate_source(node_proto::FinalizeLiveMigrateSourceRequest {
+                vm_name: runtime_name,
+                rbd_pool: pool,
+                rbd_image: image,
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.code() == tonic::Code::Unavailable => {
+                warn!(
+                    node = %source.id,
+                    vm = %vm.name,
+                    error = %e,
+                    "source node unreachable during RBD release barrier"
+                );
+                Ok(())
+            }
+            Err(e) => Err(Status::failed_precondition(format!(
+                "could not release shared RBD for VM '{}' on node {}: {e}; refusing to start it \
+                 elsewhere while the source may still be writing",
+                vm.name, source.id
+            ))),
+        }
+    }
+
     async fn cold_reassign_vm(
         &self,
         vm: &VmRow,
         source: &NodeRow,
         target: &NodeRow,
     ) -> Result<(), Status> {
+        self.cold_release_ceph_vm(vm, source).await?;
         self.reassign_vm_node(vm, &target.id)?;
         if let Err(e) = self.push_config_to_node(source).await {
             warn!(node = %source.id, error = %e, "push after cold migrate (source)");
@@ -2290,21 +2520,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         };
 
         if vm.storage_backend == "ceph" {
-            let healthy_member = self
-                .db
-                .list_ceph_clusters()
-                .map_err(|e| Status::internal(e.to_string()))?
-                .into_iter()
-                .any(|c| {
-                    let Ok(Some(st)) = self.db.get_ceph_cluster_status(&c.name) else {
-                        return false;
-                    };
-                    st.phase == "healthy"
-                        && ceph_cluster_spec::spec_from_json(&c.spec_json)
-                            .map(|s| s.nodes.iter().any(|n| n.node_id == node.id))
-                            .unwrap_or(false)
-                });
-            if !healthy_member {
+            if !self.is_healthy_ceph_member(&node.id)? {
                 return Err(Status::failed_precondition(
                     "storage_backend ceph requires a healthy CephCluster that includes the target node",
                 ));
@@ -4765,11 +4981,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
             std::collections::HashSet::new();
 
         for vm in &vms {
-            let backend_eligible: Vec<NodeRow> = eligible_nodes
+            let mut backend_eligible: Vec<NodeRow> = eligible_nodes
                 .iter()
                 .filter(|n| self.node_supports_backend(n, &vm.storage_backend))
                 .cloned()
                 .collect();
+            if vm.storage_backend == "ceph" {
+                let mut healthy = Vec::with_capacity(backend_eligible.len());
+                for node in backend_eligible {
+                    if self.is_healthy_ceph_member(&node.id)? {
+                        healthy.push(node);
+                    }
+                }
+                backend_eligible = healthy;
+            }
             let target = if !req.target_node.is_empty() {
                 backend_eligible
                     .iter()
@@ -4792,6 +5017,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     }
                 }
             };
+
+            // Stop the guest and unmap the shared RBD on the source before the
+            // destination is allowed to map it. Skipping a VM here is far
+            // better than two nodes writing the same image.
+            if let Err(e) = self.cold_release_ceph_vm(vm, &source_node).await {
+                errors.push(format!("VM '{}' left on {}: {e}", vm.name, source_node.id));
+                continue;
+            }
 
             let deleted = self
                 .db
@@ -4837,8 +5070,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
         }
 
+        // Only claim the node is drained when nothing was left running on it;
+        // otherwise it stays `draining` so operators (and the reconciler) can
+        // see the evacuation is incomplete.
+        let final_status = if errors.is_empty() {
+            "drained"
+        } else {
+            "draining"
+        };
         self.db
-            .update_node_status(&req.node_id, "drained")
+            .update_node_status(&req.node_id, final_status)
             .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
 
         let msg = if errors.is_empty() {
@@ -4926,6 +5167,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
             return Err(Status::failed_precondition(
                 "target node is not a CephCluster member",
             ));
+        }
+        // Both ends must see the shared pool: an unhealthy cluster means the
+        // destination may not be able to map the RBD image we are handing it.
+        if !self.is_healthy_ceph_member(&target.id)? {
+            return Err(Status::failed_precondition(format!(
+                "target node '{}' is not part of a healthy CephCluster",
+                target.id
+            )));
         }
 
         let volume = self
@@ -5149,6 +5398,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             signing::sign_node_cert(&sub_ca.cert_pem, &sub_ca.key_pem, &node_host)
                 .map_err(|e| Status::internal(format!("signing node cert: {e}")))?;
 
+        self.record_issued_cert(&chain_pem, &req.node_id);
         info!(node_id = %req.node_id, host = %node_host, "renewed node certificate via sub-CA");
 
         Ok(Response::new(controller_proto::RenewNodeCertResponse {
@@ -5191,6 +5441,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             signing::sign_node_cert(&sub_ca.cert_pem, &sub_ca.key_pem, node_host)
                 .map_err(|e| Status::internal(format!("signing bootstrap node cert: {e}")))?;
 
+        self.record_issued_cert(&chain_pem, node_id);
         info!(node_id = %node_id, node_host = %node_host, "issued bootstrap node certificate via sub-CA");
 
         Ok(Response::new(
@@ -5289,6 +5540,366 @@ impl controller_proto::controller_server::Controller for ControllerService {
         Ok(Response::new(controller_proto::ReloadTlsResponse {
             success: true,
             message: "TLS certificate updated; server reloading".into(),
+        }))
+    }
+
+    async fn sign_node_csr(
+        &self,
+        request: Request<controller_proto::SignNodeCsrRequest>,
+    ) -> Result<Response<controller_proto::SignNodeCsrResponse>, Status> {
+        auth::require_peer(&request, &[CN_NODE_PREFIX])?;
+        let req = request.into_inner();
+
+        let node = self
+            .db
+            .get_node(&req.node_id)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
+        if node.approval_status != "approved" {
+            return Err(Status::permission_denied(format!(
+                "node '{}' is not approved (status: {})",
+                req.node_id, node.approval_status
+            )));
+        }
+        if req.csr_pem.trim().is_empty() {
+            return Err(Status::invalid_argument("csr_pem is required"));
+        }
+
+        let sub_ca = self.sub_ca_snapshot()?;
+        if !sub_ca.is_available() {
+            return Err(Status::unavailable(
+                "sub-CA is not configured on this controller; certificate rotation is unavailable",
+            ));
+        }
+
+        // The SAN and CN are derived from the address the node registered
+        // with, not from anything in the CSR.
+        let node_host = node.address.split(':').next().unwrap_or("").to_string();
+        if node_host.is_empty() {
+            return Err(Status::internal(format!(
+                "cannot determine host from node address '{}'",
+                node.address
+            )));
+        }
+
+        let chain_pem = signing::sign_node_csr(
+            &sub_ca.cert_pem,
+            &sub_ca.key_pem,
+            &req.csr_pem,
+            &node_host,
+            self.pki.rotation.cert_validity_days,
+        )
+        .map_err(|e| Status::invalid_argument(format!("signing node CSR: {e}")))?;
+
+        let meta = crate::pki::inventory::record_signed_chain(&self.db, &chain_pem, &req.node_id)
+            .map_err(|e| Status::internal(format!("recording issued certificate: {e}")))?;
+
+        info!(
+            node_id = %req.node_id,
+            host = %node_host,
+            serial = %meta.serial_hex,
+            "signed node CSR; private key stayed on the node"
+        );
+        self.record_audit(
+            &format!("{}{}", CN_NODE_PREFIX, node_host),
+            "SignNodeCsr",
+            &format!("node/{}", req.node_id),
+            &meta.serial_hex,
+        );
+
+        Ok(Response::new(controller_proto::SignNodeCsrResponse {
+            success: true,
+            cert_chain_pem: chain_pem,
+            serial_hex: meta.serial_hex,
+            not_after: Some(prost_timestamp(meta.not_after)),
+            message: format!("certificate issued for node '{}'", req.node_id),
+        }))
+    }
+
+    async fn rotate_node_certs(
+        &self,
+        request: Request<controller_proto::RotateNodeCertsRequest>,
+    ) -> Result<Response<controller_proto::RotateNodeCertsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+
+        let targets: Vec<String> = if req.all_nodes {
+            self.db
+                .list_nodes()
+                .map_err(internal_db)?
+                .into_iter()
+                .filter(|n| n.approval_status == "approved")
+                .map(|n| n.id)
+                .collect()
+        } else {
+            let node_id = req.node_id.trim();
+            if node_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "node_id is required unless all_nodes is set",
+                ));
+            }
+            vec![node_id.to_string()]
+        };
+        if targets.is_empty() {
+            return Ok(Response::new(controller_proto::RotateNodeCertsResponse {
+                success: true,
+                results: Vec::new(),
+                message: "no approved nodes to rotate".into(),
+            }));
+        }
+
+        let mut results = Vec::with_capacity(targets.len());
+        let mut failures = 0;
+        for node_id in targets {
+            // `force` so an on-demand rotation happens even outside the
+            // renewal window — that is the whole point of asking.
+            match crate::cert_rotation_reconciler::rotate_node(
+                &self.db,
+                &self.clients,
+                &node_id,
+                true,
+            )
+            .await
+            {
+                Ok(resp) => results.push(controller_proto::NodeCertRotationResult {
+                    node_id,
+                    success: true,
+                    serial_hex: resp.serial_hex,
+                    message: resp.message,
+                }),
+                Err(error) => {
+                    failures += 1;
+                    warn!(node_id = %node_id, %error, "operator-triggered rotation failed");
+                    results.push(controller_proto::NodeCertRotationResult {
+                        node_id,
+                        success: false,
+                        serial_hex: String::new(),
+                        message: error,
+                    })
+                }
+            }
+        }
+
+        let total = results.len();
+        self.record_audit(
+            &actor,
+            "RotateNodeCerts",
+            "certificates",
+            format!("{}/{} rotated", total - failures, total),
+        );
+        Ok(Response::new(controller_proto::RotateNodeCertsResponse {
+            success: failures == 0,
+            results,
+            message: format!("{} of {total} nodes rotated", total - failures),
+        }))
+    }
+
+    async fn list_certificates(
+        &self,
+        request: Request<controller_proto::ListCertificatesRequest>,
+    ) -> Result<Response<controller_proto::ListCertificatesResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+
+        let status = cert_status_to_db_str(req.status);
+        let expiring_before = if req.expiring_within_days > 0 {
+            crate::pki::format_ts(
+                time::OffsetDateTime::now_utc()
+                    + time::Duration::days(i64::from(req.expiring_within_days)),
+            )
+        } else {
+            String::new()
+        };
+
+        let rows = self
+            .db
+            .list_issued_certificates(status, req.node_id.trim(), &expiring_before)
+            .map_err(internal_db)?;
+        let now = time::OffsetDateTime::now_utc();
+        Ok(Response::new(controller_proto::ListCertificatesResponse {
+            certificates: rows.iter().map(|r| cert_info_from_row(r, now)).collect(),
+        }))
+    }
+
+    async fn revoke_certificate(
+        &self,
+        request: Request<controller_proto::RevokeCertificateRequest>,
+    ) -> Result<Response<controller_proto::RevokeCertificateResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+
+        let reason = req.reason;
+        if !crate::pki::is_valid_reason_code(reason) {
+            return Err(Status::invalid_argument(format!(
+                "revocation reason {reason} is not an RFC 5280 reason code"
+            )));
+        }
+
+        let serials = self.resolve_revocation_targets(&req)?;
+        if serials.is_empty() {
+            return Err(Status::not_found(
+                "no matching certificate found in the inventory",
+            ));
+        }
+
+        let revoked_at = crate::pki::format_ts(time::OffsetDateTime::now_utc());
+        let mut revoked = Vec::with_capacity(serials.len());
+        for serial in &serials {
+            let row = self
+                .db
+                .revoke_certificate_by_serial(serial, reason, &revoked_at)
+                .map_err(internal_db)?;
+            if let Some(row) = row {
+                // Take effect on the very next RPC rather than at the next
+                // reconciler tick.
+                self.pki.revocation.insert_revoked(&row.serial_hex);
+                revoked.push(row);
+            }
+        }
+
+        // Roll a new CRL immediately so nodes and external tooling observe the
+        // revocation without waiting for the periodic regeneration.
+        let sub_ca = self.sub_ca_snapshot()?;
+        let crl_number = match crate::pki::crl::ensure_current(
+            &self.db,
+            &sub_ca,
+            &self.pki.crl_cache,
+            time::Duration::hours(self.pki.pki.crl_validity_hours),
+            time::Duration::hours(self.pki.pki.crl_refresh_before_hours),
+            true,
+        ) {
+            Ok(Some(crl)) => crl.crl_number,
+            Ok(None) => 0,
+            Err(error) => {
+                warn!(%error, "revocation recorded but CRL regeneration failed");
+                0
+            }
+        };
+
+        for row in &revoked {
+            info!(
+                serial = %row.serial_hex,
+                subject = %row.subject_cn,
+                node_id = %row.node_id,
+                reason,
+                "certificate revoked"
+            );
+            self.record_audit(
+                &actor,
+                "RevokeCertificate",
+                &format!("certificate/{}", row.serial_hex),
+                format!("reason={reason}"),
+            );
+        }
+
+        let now = time::OffsetDateTime::now_utc();
+        let count = revoked.len();
+        Ok(Response::new(controller_proto::RevokeCertificateResponse {
+            success: true,
+            revoked: revoked.iter().map(|r| cert_info_from_row(r, now)).collect(),
+            crl_number,
+            message: format!("{count} certificate(s) revoked"),
+        }))
+    }
+
+    async fn get_crl(
+        &self,
+        request: Request<controller_proto::GetCrlRequest>,
+    ) -> Result<Response<controller_proto::GetCrlResponse>, Status> {
+        // Nodes fetch the CRL over their existing mTLS channel, so both node
+        // and operator identities are accepted here.
+        if auth::peer_cn(&request)
+            .map(|cn| cn.starts_with(CN_NODE_PREFIX))
+            .unwrap_or(false)
+        {
+            auth::require_peer(&request, &[CN_NODE_PREFIX])?;
+        } else {
+            self.require_operator(&request, OperatorRole::ReadOnly)?;
+        }
+
+        let sub_ca = self.sub_ca_snapshot()?;
+        let crl = crate::pki::crl::ensure_current(
+            &self.db,
+            &sub_ca,
+            &self.pki.crl_cache,
+            time::Duration::hours(self.pki.pki.crl_validity_hours),
+            time::Duration::hours(self.pki.pki.crl_refresh_before_hours),
+            false,
+        )
+        .map_err(|e| Status::internal(format!("generating CRL: {e}")))?;
+
+        match crl {
+            Some(crl) => Ok(Response::new(controller_proto::GetCrlResponse {
+                success: true,
+                crl_pem: crl.pem,
+                crl_der: crl.der,
+                crl_number: crl.crl_number,
+                this_update: Some(prost_timestamp(crl.this_update)),
+                next_update: Some(prost_timestamp(crl.next_update)),
+                revoked_count: crl.revoked_count,
+                message: String::new(),
+            })),
+            None => Ok(Response::new(controller_proto::GetCrlResponse {
+                success: false,
+                message: "no sub-CA is configured on this controller; no CRL can be signed".into(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn get_pki_status(
+        &self,
+        request: Request<controller_proto::GetPkiStatusRequest>,
+    ) -> Result<Response<controller_proto::GetPkiStatusResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+
+        let now = time::OffsetDateTime::now_utc();
+        let warn_threshold =
+            crate::pki::format_ts(now + time::Duration::days(self.pki.rotation.warn_before_days));
+        let (active, rotated, revoked, expired, expiring_soon) = self
+            .db
+            .count_certificates(&crate::pki::format_ts(now), &warn_threshold)
+            .map_err(internal_db)?;
+
+        let soonest = self
+            .db
+            .list_issued_certificates(crate::db::CERT_STATUS_ACTIVE, "", "")
+            .map_err(internal_db)?
+            .iter()
+            .take(20)
+            .map(|r| cert_info_from_row(r, now))
+            .collect();
+
+        let sub_ca = self.sub_ca_snapshot()?;
+        let sub_ca_not_after = if sub_ca.is_available() {
+            crate::pki::inventory::metadata_from_pem(&sub_ca.cert_pem)
+                .ok()
+                .map(|m| prost_timestamp(m.not_after))
+        } else {
+            None
+        };
+        let crl = self.pki.crl_cache.get();
+
+        Ok(Response::new(controller_proto::GetPkiStatusResponse {
+            active_count: active,
+            rotated_count: rotated,
+            revoked_count: revoked,
+            expired_count: expired,
+            expiring_soon_count: expiring_soon,
+            warn_before_days: self.pki.rotation.warn_before_days as i32,
+            renew_before_days: self.pki.rotation.renew_before_days as i32,
+            rotation_enabled: self.pki.rotation.enabled,
+            crl_number: crl.as_ref().map(|c| c.crl_number).unwrap_or(0),
+            crl_this_update: crl.as_ref().map(|c| prost_timestamp(c.this_update)),
+            crl_next_update: crl.as_ref().map(|c| prost_timestamp(c.next_update)),
+            crl_available: crl.is_some(),
+            sub_ca_available: sub_ca.is_available(),
+            sub_ca_not_after,
+            revocation_fail_mode: self.pki.revocation.fail_mode().as_str().to_string(),
+            pki_http_base_url: self.pki.pki.base_url(),
+            soonest_expiring: soonest,
         }))
     }
 
@@ -6013,9 +6624,22 @@ impl controller_proto::controller_server::Controller for ControllerService {
     ) -> Result<Response<controller_proto::DeleteCephClusterResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let name = request.into_inner().name;
+        let name = name.trim();
+        // Deleting the CephCluster record strands every RBD-backed VM that
+        // lives on its members: the reconciler stops managing the cluster, and
+        // `node_supports_backend` stops recognising those nodes as Ceph-capable
+        // so the VMs can no longer be created, migrated, or drained.
+        let in_use = self.ceph_cluster_vms_in_use(name)?;
+        if !in_use.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "CephCluster '{name}' still backs {} VM(s): {}. Delete those VMs first.",
+                in_use.len(),
+                in_use.join(", ")
+            )));
+        }
         let success = self
             .db
-            .delete_ceph_cluster(name.trim())
+            .delete_ceph_cluster(name)
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(controller_proto::DeleteCephClusterResponse {
             success,
@@ -6639,6 +7263,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .map_err(|e| Status::internal(format!("signing operator cert: {e}")))?;
 
         let serial = leaf_serial_hex(&chain_pem)?;
+        self.record_issued_cert(&chain_pem, "");
         self.db
             .set_operator_cert_serial(&op_name, &serial)
             .map_err(internal_db)?;
@@ -6722,6 +7347,59 @@ fn operator_row_to_proto(
         }),
         roles: operator_roles_to_proto_kinds(&roles),
     })
+}
+
+/// `prost_types::Timestamp` for a `time::OffsetDateTime`.
+fn prost_timestamp(t: time::OffsetDateTime) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: t.unix_timestamp(),
+        nanos: 0,
+    }
+}
+
+/// Inventory status column for a `CertificateStatus` filter value.
+/// `UNSPECIFIED` means "no filter", represented as the empty string.
+fn cert_status_to_db_str(status: i32) -> &'static str {
+    match controller_proto::CertificateStatus::try_from(status) {
+        Ok(controller_proto::CertificateStatus::Active) => crate::db::CERT_STATUS_ACTIVE,
+        Ok(controller_proto::CertificateStatus::Rotated) => crate::db::CERT_STATUS_ROTATED,
+        Ok(controller_proto::CertificateStatus::Revoked) => crate::db::CERT_STATUS_REVOKED,
+        _ => "",
+    }
+}
+
+fn cert_status_from_db_str(status: &str) -> i32 {
+    let value = match status {
+        crate::db::CERT_STATUS_ACTIVE => controller_proto::CertificateStatus::Active,
+        crate::db::CERT_STATUS_ROTATED => controller_proto::CertificateStatus::Rotated,
+        crate::db::CERT_STATUS_REVOKED => controller_proto::CertificateStatus::Revoked,
+        _ => controller_proto::CertificateStatus::Unspecified,
+    };
+    value as i32
+}
+
+fn cert_info_from_row(
+    row: &crate::db::IssuedCertRow,
+    now: time::OffsetDateTime,
+) -> controller_proto::CertificateInfo {
+    let not_after = crate::pki::parse_ts(&row.not_after);
+    controller_proto::CertificateInfo {
+        serial_hex: row.serial_hex.clone(),
+        subject_cn: row.subject_cn.clone(),
+        identity_kind: row.identity_kind.clone(),
+        node_id: row.node_id.clone(),
+        issuer_cn: row.issuer_cn.clone(),
+        fingerprint_sha256: row.fingerprint_sha256.clone(),
+        not_before: crate::pki::parse_ts(&row.not_before).map(prost_timestamp),
+        not_after: not_after.map(prost_timestamp),
+        issued_at: crate::pki::parse_ts(&row.issued_at).map(prost_timestamp),
+        status: cert_status_from_db_str(&row.status),
+        revocation_reason: row.revocation_reason.max(0),
+        revoked_at: crate::pki::parse_ts(&row.revoked_at).map(prost_timestamp),
+        days_until_expiry: not_after
+            .map(|na| crate::pki::days_until(na, now))
+            .unwrap_or(0),
+    }
 }
 
 fn leaf_serial_hex(chain_pem: &str) -> Result<String, Status> {
@@ -7610,6 +8288,230 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
+    fn mark_ceph_cluster_healthy(db: &Database, name: &str) {
+        db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+            name: name.to_string(),
+            observed_generation: 1,
+            phase: "healthy".into(),
+            health_message: "HEALTH_OK".into(),
+            ceph_status_json: String::new(),
+            last_transition_at: String::new(),
+        })
+        .expect("upsert ceph status");
+    }
+
+    /// Builds two Ceph-capable nodes plus one Ceph-backed VM with a volume row
+    /// on `node-a`. The CephCluster has no status row, so callers decide
+    /// whether it counts as healthy.
+    fn ceph_two_node_fixture() -> (Database, VmRow) {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".into();
+        db.upsert_node(&node_a).unwrap();
+        let mut node_b = test_node();
+        node_b.id = "node-b".into();
+        node_b.address = "127.0.0.2:9091".into();
+        db.upsert_node(&node_b).unwrap();
+
+        let mut spec = make_ceph_spec(&["node-a", "node-b"]);
+        spec.fsid = "abababab-cdcd-efef-0101-232323232323".into();
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "lab".into(),
+            generation: 1,
+            spec_json: crate::ceph_cluster_spec::spec_to_json(&spec).unwrap(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+
+        let mut vm = test_vm("node-a");
+        vm.id = "vm-ceph-1".into();
+        vm.name = "ceph-1".into();
+        vm.storage_backend = "ceph".into();
+        db.insert_vm(&vm).unwrap();
+        db.upsert_volume(&VolumeRow {
+            id: "vol-ceph-1".into(),
+            vm_id: vm.id.clone(),
+            pool: "kcore-vms".into(),
+            image: format!("kcore-{}", vm.id),
+            size_bytes: 8 * 1024 * 1024 * 1024,
+            created_at: String::new(),
+        })
+        .unwrap();
+        (db, vm)
+    }
+
+    fn svc_for(db: &Database) -> ControllerService {
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        )
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_rejects_target_outside_a_healthy_ceph_cluster() {
+        let (db, vm) = ceph_two_node_fixture();
+        // No status row at all: the cluster has never reconciled healthy.
+        let svc = svc_for(&db);
+        let err =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id.clone(),
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: true,
+                }),
+            )
+            .await
+            .expect_err("unhealthy cluster must not accept a migration");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("healthy CephCluster"),
+            "unexpected message: {}",
+            err.message()
+        );
+        assert_eq!(
+            db.get_vm(&vm.id).unwrap().unwrap().node_id,
+            "node-a",
+            "a rejected migration must leave ownership alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_accepts_target_in_a_healthy_ceph_cluster() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        let svc = svc_for(&db);
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id.clone(),
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: true,
+                }),
+            )
+            .await
+            .expect("healthy cluster should allow the cold fallback")
+            .into_inner();
+        assert_eq!(resp.mode, "cold");
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-b");
+    }
+
+    #[tokio::test]
+    async fn drain_node_leaves_ceph_vm_when_no_healthy_cluster_target() {
+        let (db, vm) = ceph_two_node_fixture();
+        // node-b is a cluster member but the cluster is not healthy.
+        let svc = svc_for(&db);
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::drain_node(
+                &svc,
+                Request::new(controller_proto::DrainNodeRequest {
+                    node_id: "node-a".into(),
+                    target_node: String::new(),
+                }),
+            )
+            .await
+            .expect("drain reports per-VM errors rather than failing outright")
+            .into_inner();
+        assert!(
+            !resp.success,
+            "drain must not claim success: {}",
+            resp.message
+        );
+        assert_eq!(resp.vms_migrated, 0);
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-a");
+        assert_eq!(
+            db.get_node("node-a").unwrap().unwrap().status,
+            "draining",
+            "a node that still hosts VMs must not be marked drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_node_marks_drained_only_when_every_vm_moved() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        let svc = svc_for(&db);
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::drain_node(
+                &svc,
+                Request::new(controller_proto::DrainNodeRequest {
+                    node_id: "node-a".into(),
+                    target_node: "node-b".into(),
+                }),
+            )
+            .await
+            .expect("drain should succeed")
+            .into_inner();
+        assert!(resp.success, "{}", resp.message);
+        assert_eq!(resp.vms_migrated, 1);
+        assert_eq!(db.get_vm(&vm.id).unwrap().unwrap().node_id, "node-b");
+        assert_eq!(db.get_node("node-a").unwrap().unwrap().status, "drained");
+    }
+
+    #[tokio::test]
+    async fn delete_ceph_cluster_refuses_while_ceph_vms_still_use_it() {
+        let (db, vm) = ceph_two_node_fixture();
+        let svc = svc_for(&db);
+        let err = <ControllerService as controller_proto::controller_server::Controller>::delete_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::DeleteCephClusterRequest { name: "lab".into() }),
+        )
+        .await
+        .expect_err("deleting a cluster under a live VM must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains(&vm.name),
+            "message should name the blocking VM: {}",
+            err.message()
+        );
+        assert!(db.get_ceph_cluster("lab").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_ceph_cluster_succeeds_once_ceph_vms_are_gone() {
+        let (db, vm) = ceph_two_node_fixture();
+        db.delete_vm_by_id_or_name(&vm.id).unwrap();
+        let svc = svc_for(&db);
+        let resp = <ControllerService as controller_proto::controller_server::Controller>::delete_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::DeleteCephClusterRequest { name: "lab".into() }),
+        )
+        .await
+        .expect("delete should succeed with no Ceph VMs")
+        .into_inner();
+        assert!(resp.success);
+        assert!(db.get_ceph_cluster("lab").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_ceph_cluster_ignores_non_ceph_vms_on_member_nodes() {
+        let (db, vm) = ceph_two_node_fixture();
+        db.delete_vm_by_id_or_name(&vm.id).unwrap();
+        let mut local = test_vm("node-a");
+        local.id = "vm-local-1".into();
+        local.name = "local-1".into();
+        local.storage_backend = "lvm".into();
+        db.insert_vm(&local).unwrap();
+
+        let svc = svc_for(&db);
+        let resp = <ControllerService as controller_proto::controller_server::Controller>::delete_ceph_cluster(
+            &svc,
+            Request::new(controller_proto::DeleteCephClusterRequest { name: "lab".into() }),
+        )
+        .await
+        .expect("an LVM VM must not block cluster deletion")
+        .into_inner();
+        assert!(resp.success);
+    }
+
     #[tokio::test]
     async fn migrate_vm_cold_fallback_reassigns_node() {
         let db = Database::open(":memory:").expect("open db");
@@ -7633,6 +8535,7 @@ mod tests {
             updated_at: String::new(),
         })
         .unwrap();
+        mark_ceph_cluster_healthy(&db, "lab");
 
         let mut vm = test_vm("node-a");
         vm.id = "vm-mig-1".into();
