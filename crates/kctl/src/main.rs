@@ -159,6 +159,11 @@ enum Command {
         #[command(subcommand)]
         resource: RotateResource,
     },
+    /// Revoke a certificate (adds it to the cluster CRL and OCSP responder)
+    Revoke {
+        #[command(subcommand)]
+        resource: RevokeResource,
+    },
     /// Apply a NixOS configuration to the controller
     Apply {
         /// Path to the NixOS configuration file
@@ -238,6 +243,39 @@ enum RotateResource {
         /// Certificate directory (defaults to active context's cert dir)
         #[arg(long)]
         certs_dir: Option<PathBuf>,
+    },
+    /// Rotate node certificates via CSR (private keys stay on the nodes)
+    #[command(name = "node-certs", alias = "node-cert")]
+    NodeCerts {
+        /// Node to rotate
+        #[arg(long)]
+        node: Option<String>,
+        /// Rotate every approved node
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RevokeResource {
+    /// Revoke an issued certificate by serial, subject CN or node id
+    #[command(name = "cert", alias = "certificate")]
+    Cert {
+        /// Serial number in hex (as shown by `kctl get certificates`)
+        #[arg(long)]
+        serial: Option<String>,
+        /// Subject common name, e.g. kctl:alice
+        #[arg(long)]
+        subject: Option<String>,
+        /// Node id whose active certificate should be revoked
+        #[arg(long)]
+        node: Option<String>,
+        /// RFC 5280 reason: unspecified, key-compromise, ca-compromise,
+        /// affiliation-changed, superseded, cessation-of-operation,
+        /// certificate-hold, remove-from-crl, privilege-withdrawn,
+        /// aa-compromise
+        #[arg(long, default_value = "unspecified")]
+        reason: String,
     },
 }
 
@@ -580,6 +618,28 @@ enum GetResource {
     /// List CephCluster resources
     #[command(name = "ceph-clusters", alias = "ceph-cluster", alias = "cephcluster")]
     CephClusters,
+    /// List the controller's certificate inventory
+    #[command(name = "certificates", alias = "certificate", alias = "certs")]
+    Certificates {
+        /// Only certificates issued to this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Filter by status: active, rotated, revoked or all
+        #[arg(long)]
+        status: Option<String>,
+        /// Only certificates expiring within this many days
+        #[arg(long = "expiring-within-days", default_value_t = 0)]
+        expiring_within_days: i32,
+    },
+    /// Show certificate rotation and revocation health
+    #[command(name = "pki-status", alias = "pki")]
+    PkiStatus,
+    /// Fetch the current certificate revocation list
+    Crl {
+        /// Write the CRL to this file (.der for DER, anything else for PEM)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1724,6 +1784,60 @@ async fn main() {
             )
             .ok();
             commands::certs::rotate(&certs_path, controller, info.as_ref()).await
+        }
+        Command::Rotate {
+            resource: RotateResource::NodeCerts { node, all },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::rotate_node_certs(&info, node.as_deref(), *all).await
+        }
+        Command::Revoke {
+            resource:
+                RevokeResource::Cert {
+                    serial,
+                    subject,
+                    node,
+                    reason,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::revoke_certificate(
+                &info,
+                serial.as_deref(),
+                subject.as_deref(),
+                node.as_deref(),
+                reason,
+            )
+            .await
+        }
+        Command::Get {
+            resource:
+                GetResource::Certificates {
+                    node,
+                    status,
+                    expiring_within_days,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::list_certificates(
+                &info,
+                node.as_deref(),
+                status.as_deref(),
+                *expiring_within_days,
+            )
+            .await
+        }
+        Command::Get {
+            resource: GetResource::PkiStatus,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::pki_status(&info).await
+        }
+        Command::Get {
+            resource: GetResource::Crl { output },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::get_crl(&info, output.as_deref()).await
         }
         Command::Rotate {
             resource: RotateResource::SubCa { certs_dir },

@@ -344,6 +344,45 @@ impl Controller for MockController {
         Err(unimp("rotate_sub_ca"))
     }
 
+    async fn sign_node_csr(
+        &self,
+        _: Request<SignNodeCsrRequest>,
+    ) -> Result<Response<SignNodeCsrResponse>, Status> {
+        Err(unimp("sign_node_csr"))
+    }
+
+    async fn rotate_node_certs(
+        &self,
+        _: Request<RotateNodeCertsRequest>,
+    ) -> Result<Response<RotateNodeCertsResponse>, Status> {
+        Err(unimp("rotate_node_certs"))
+    }
+
+    async fn list_certificates(
+        &self,
+        _: Request<ListCertificatesRequest>,
+    ) -> Result<Response<ListCertificatesResponse>, Status> {
+        Err(unimp("list_certificates"))
+    }
+
+    async fn revoke_certificate(
+        &self,
+        _: Request<RevokeCertificateRequest>,
+    ) -> Result<Response<RevokeCertificateResponse>, Status> {
+        Err(unimp("revoke_certificate"))
+    }
+
+    async fn get_crl(&self, _: Request<GetCrlRequest>) -> Result<Response<GetCrlResponse>, Status> {
+        Err(unimp("get_crl"))
+    }
+
+    async fn get_pki_status(
+        &self,
+        _: Request<GetPkiStatusRequest>,
+    ) -> Result<Response<GetPkiStatusResponse>, Status> {
+        Err(unimp("get_pki_status"))
+    }
+
     async fn reload_tls(
         &self,
         _: Request<ReloadTlsRequest>,

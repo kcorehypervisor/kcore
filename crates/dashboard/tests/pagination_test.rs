@@ -531,6 +531,42 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<IssueOperatorCertResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn sign_node_csr(
+        &self,
+        _: TRequest<SignNodeCsrRequest>,
+    ) -> Result<Response<SignNodeCsrResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn rotate_node_certs(
+        &self,
+        _: TRequest<RotateNodeCertsRequest>,
+    ) -> Result<Response<RotateNodeCertsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_certificates(
+        &self,
+        _: TRequest<ListCertificatesRequest>,
+    ) -> Result<Response<ListCertificatesResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn revoke_certificate(
+        &self,
+        _: TRequest<RevokeCertificateRequest>,
+    ) -> Result<Response<RevokeCertificateResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_crl(
+        &self,
+        _: TRequest<GetCrlRequest>,
+    ) -> Result<Response<GetCrlResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_pki_status(
+        &self,
+        _: TRequest<GetPkiStatusRequest>,
+    ) -> Result<Response<GetPkiStatusResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
 }
 
 async fn spawn_many_vms_controller() -> SocketAddr {
