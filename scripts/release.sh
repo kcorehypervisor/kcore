@@ -4,8 +4,12 @@
 #   ./scripts/release.sh build    # nix build ISO + Linux kctl, cargo-zigbuild macOS kctl
 #   ./scripts/release.sh dist     # dist/*.tar.gz, ISO copy, SBOMs, dist/SHA256SUMS
 #   ./scripts/release.sh tag      # create/push v$(VERSION)
-#   ./scripts/release.sh publish  # gh release create/upload (needs tag on remote)
+#   ./scripts/release.sh sign     # cosign sign-blob dist/SHA256SUMS (Sigstore keyless)
+#   ./scripts/release.sh publish  # sign + gh release create/upload (needs tag on remote)
 #   ./scripts/release.sh release  # tag + build + dist + publish
+# Options:
+#   --no-sign       Skip Sigstore signing. Explicit opt-out for a maintainer
+#                   without cosign configured; the release is then UNSIGNED.
 # Environment:
 #   RELEASE_NOTES   Optional path to release notes file (defaults to RELEASE_NOTES.md if present;
 #                   otherwise GitHub auto-generated release notes are used)
@@ -31,7 +35,15 @@ SBOM_FILES=(
 	"kcore-${VERSION}-iso-closure.cdx.json"
 	"kcore-${VERSION}-iso-closure.spdx.json"
 )
+# Signing dist/SHA256SUMS transitively covers every other asset, SBOMs
+# included, so this is the only signature a release carries.
+SIGSTORE_BUNDLE="SHA256SUMS.sigstore.json"
+# cosign 3.0.0-3.0.4 cannot verify Rekor v2 bundles without
+# --use-signed-timestamps; 3.0.5 handles it automatically and already
+# defaults --new-bundle-format=true, which is what writes .sigstore.json.
+COSIGN_MIN_VERSION="3.0.5"
 TAG="v${VERSION}"
+NO_SIGN=0
 
 die() {
 	echo "release.sh: $*" >&2
@@ -148,7 +160,7 @@ cmd_dist() {
 	cp -f "${ISO_SRC}" "dist/${ISO_NAME}"
 
 	# Generated here, before SHA256SUMS, so the SBOMs are covered by the
-	# checksums file.
+	# checksums file and therefore by the single signature over it.
 	echo "==> Generating SBOMs..."
 	nix develop --command bash ./scripts/sbom.sh all
 	for sbom in "${SBOM_FILES[@]}"; do
@@ -165,6 +177,50 @@ cmd_dist() {
 	cat dist/SHA256SUMS
 }
 
+# True when $1 is at least $2, both dotted versions. `sort -V` is fine here
+# because releases are cut on Linux x86_64 by policy; verify-release.sh and
+# get-kctl.sh also run on macOS, where BSD sort has no -V, and use awk.
+version_ge() {
+	[[ "$(printf '%s\n%s\n' "${2}" "${1}" | sort -V | head -n 1)" == "${2}" ]]
+}
+
+cmd_sign() {
+	[[ -f dist/SHA256SUMS ]] || die "run '${0} dist' first (missing dist/SHA256SUMS)"
+
+	if [[ "${NO_SIGN}" -eq 1 ]]; then
+		echo "==> --no-sign given: skipping Sigstore signing."
+		echo "    This release will be UNSIGNED; scripts/verify-release.sh"
+		echo "    will fail for it. Drop --no-sign to sign."
+		# A stale bundle from an earlier run would be worse than none:
+		# it would verify against different bytes.
+		rm -f "dist/${SIGSTORE_BUNDLE}"
+		return 0
+	fi
+
+	require_cmd nix
+	local cosign_version
+	cosign_version="$(nix develop --command cosign version 2>/dev/null | awk '/^GitVersion:/ {print $2}')"
+	cosign_version="${cosign_version#v}"
+	[[ -n "${cosign_version}" ]] ||
+		die "could not determine cosign version from 'nix develop --command cosign version'"
+	version_ge "${cosign_version}" "${COSIGN_MIN_VERSION}" ||
+		die "cosign ${cosign_version} is too old; need >= ${COSIGN_MIN_VERSION} for Rekor v2 (see docs/release-verification.md)"
+
+	echo "==> Signing dist/SHA256SUMS with Sigstore (cosign ${cosign_version}, keyless)..."
+	echo "    A browser window opens for OIDC login. Sign in with the"
+	echo "    identity published in docs/release-verification.md; the"
+	echo "    certificate and its identity go into the public Rekor log."
+	# --yes accepts that transparency-log entry non-interactively, which
+	# would otherwise block the release on a prompt.
+	nix develop --command cosign sign-blob \
+		--yes \
+		--bundle "dist/${SIGSTORE_BUNDLE}" \
+		dist/SHA256SUMS
+	[[ -s "dist/${SIGSTORE_BUNDLE}" ]] ||
+		die "cosign wrote no dist/${SIGSTORE_BUNDLE}"
+	echo "==> Wrote dist/${SIGSTORE_BUNDLE}"
+}
+
 cmd_publish() {
 	require_cmd nix
 	require_cmd git
@@ -177,6 +233,8 @@ cmd_publish() {
 		[[ -f "dist/${sbom}" ]] || die "run '${0} dist' first (missing dist/${sbom})"
 	done
 	[[ -f dist/SHA256SUMS ]] || die "run '${0} dist' first"
+
+	cmd_sign
 
 	target_commit="$(git rev-parse "${TAG}^{commit}" 2>/dev/null)" || die "missing local tag ${TAG}; run '${0} tag' first"
 	remote_tag_commit="$(git ls-remote origin "refs/tags/${TAG}^{}" | awk '{print $1}')"
@@ -195,6 +253,10 @@ cmd_publish() {
 		assets+=("dist/${sbom}")
 	done
 	assets+=(dist/SHA256SUMS)
+	# Absent only under --no-sign, which cmd_sign already warned about.
+	if [[ -f "dist/${SIGSTORE_BUNDLE}" ]]; then
+		assets+=("dist/${SIGSTORE_BUNDLE}")
+	fi
 	create_args=(
 		api "repos/${repo}/releases"
 		-X POST
@@ -235,14 +297,29 @@ cmd_release() {
 }
 
 usage() {
-	echo "Usage: ${0} {build|dist|tag|publish|release}"
+	echo "Usage: ${0} [--no-sign] {build|dist|tag|sign|publish|release}"
 	exit 1
 }
 
-case "${1:-}" in
+subcommand=""
+while [[ "$#" -gt 0 ]]; do
+	case "${1}" in
+		--no-sign) NO_SIGN=1 ;;
+		-h | --help) usage ;;
+		-*) die "unknown option: ${1}" ;;
+		*)
+			[[ -z "${subcommand}" ]] || die "unexpected extra argument: ${1}"
+			subcommand="${1}"
+			;;
+	esac
+	shift
+done
+
+case "${subcommand}" in
 	build) cmd_build ;;
 	dist) cmd_dist ;;
 	tag) cmd_tag ;;
+	sign) cmd_sign ;;
 	publish) cmd_publish ;;
 	release) cmd_release ;;
 	*) usage ;;

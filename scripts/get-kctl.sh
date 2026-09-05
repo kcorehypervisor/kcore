@@ -8,12 +8,25 @@
 #   KCTL_VERSION        Exact semver without leading v (e.g. 0.2.0); default: latest release
 #   INSTALL_DIR         Directory for the kctl binary (default: /usr/local/bin if writable, else ~/.local/bin)
 #   GITHUB_TOKEN / GH_TOKEN  Optional bearer token for higher GitHub API rate limits
+#   KCTL_SIGNER_IDENTITY / KCTL_SIGNER_ISSUER  Override the expected Sigstore
+#                       signing identity used by the optional cosign check below
 #
 # This script only supports platforms we publish: Linux x86_64, macOS x86_64, macOS aarch64 (Apple Silicon).
 set -euo pipefail
 
 DEFAULT_REPO="kcorehypervisor/kcore"
 REPO="${KCORE_GITHUB_REPO:-${DEFAULT_REPO}}"
+
+# Expected Fulcio certificate identity for kcore releases. Empty until a
+# maintainer has signed one and published the value; see
+# docs/release-verification.md. While empty, the signature check below is
+# skipped -- there is no point verifying that "somebody" signed the bytes.
+DEFAULT_SIGNER_IDENTITY=""
+SIGNER_IDENTITY="${KCTL_SIGNER_IDENTITY:-${DEFAULT_SIGNER_IDENTITY}}"
+SIGNER_ISSUER="${KCTL_SIGNER_ISSUER:-https://oauth2.sigstore.dev/auth}"
+SUMS_BUNDLE_ASSET="SHA256SUMS.sigstore.json"
+# cosign 3.0.0-3.0.4 rejects Rekor v2 bundles without --use-signed-timestamps.
+COSIGN_MIN_VERSION="3.0.5"
 
 GET_KCTL_TMPDIR=""
 
@@ -48,6 +61,60 @@ verify_tarball_sha256() {
 		die "need openssl, sha256sum, or shasum to verify checksums"
 	fi
 	[[ "${expected}" == "${actual}" ]] || die "checksum mismatch for $(basename "${tarball}")"
+}
+
+# True when $1 is at least $2, both dotted versions. Deliberately awk rather
+# than `sort -V`: BSD sort on macOS has no -V.
+version_ge() {
+	awk -v have="${1}" -v need="${2}" 'BEGIN {
+		n = split(have, h, ".")
+		m = split(need, r, ".")
+		top = (n > m) ? n : m
+		for (i = 1; i <= top; i++) {
+			hv = (i <= n) ? h[i] + 0 : 0
+			rv = (i <= m) ? r[i] + 0 : 0
+			if (hv > rv) exit 0
+			if (hv < rv) exit 1
+		}
+		exit 0
+	}'
+}
+
+# Optional Sigstore verification of the release manifest. Checksums alone
+# catch corruption but not tampering, because SHA256SUMS is served from the
+# same host as the tarball; a signature over it closes that gap.
+#
+# This is opt-in by presence and must stay that way: `curl | bash` has to
+# keep working for the majority of users with no cosign installed. A missing
+# cosign, a cosign too old for Rekor v2, a release cut before signing
+# existed, or an unconfigured expected identity all skip the check quietly.
+# A signature that is present and *invalid* is a different matter and aborts.
+verify_sums_signature() {
+	local sums_file="${1}" tag="${2}" tmpdir="${3}"
+	have_cmd cosign || return 0
+	[[ -n "${SIGNER_IDENTITY}" ]] || return 0
+
+	local cosign_version
+	cosign_version="$(cosign version 2>/dev/null | awk '/^GitVersion:/ {print $2}')"
+	cosign_version="${cosign_version#v}"
+	if [[ -z "${cosign_version}" ]] || ! version_ge "${cosign_version}" "${COSIGN_MIN_VERSION}"; then
+		echo "==> cosign ${cosign_version:-unknown} predates ${COSIGN_MIN_VERSION}; skipping signature check"
+		return 0
+	fi
+
+	local bundle_url="https://github.com/${REPO}/releases/download/${tag}/${SUMS_BUNDLE_ASSET}"
+	if ! curl -fsSL -o "${tmpdir}/${SUMS_BUNDLE_ASSET}" "${bundle_url}" 2>/dev/null; then
+		echo "==> ${tag} publishes no ${SUMS_BUNDLE_ASSET}; skipping signature check"
+		return 0
+	fi
+
+	echo "==> Verifying SHA256SUMS signature with cosign ${cosign_version}"
+	cosign verify-blob \
+		--bundle "${tmpdir}/${SUMS_BUNDLE_ASSET}" \
+		--certificate-identity "${SIGNER_IDENTITY}" \
+		--certificate-oidc-issuer "${SIGNER_ISSUER}" \
+		"${sums_file}" ||
+		die "SHA256SUMS signature verification failed for ${tag}; refusing to install"
 }
 
 curl_github_api() {
@@ -175,6 +242,9 @@ main() {
 
 	echo "==> Downloading SHA256SUMS"
 	curl -fsSL -o "${tmpdir}/SHA256SUMS" "${sums_url}"
+
+	# Establish trust in the manifest before using any line from it.
+	verify_sums_signature "${tmpdir}/SHA256SUMS" "${tag}" "${tmpdir}"
 
 	sums_file="${tmpdir}/sums.chk"
 	grep -F "${archive}" "${tmpdir}/SHA256SUMS" >"${sums_file}" || die "SHA256SUMS has no entry for ${archive}"
