@@ -182,10 +182,13 @@
               pkgs.nixfmt
               pkgs.cargo-zigbuild
               pkgs.zig
-              # Crate SBOM generation for releases, pinned by flake.lock.
-              # See scripts/sbom.sh.
+              # Release supply-chain tooling (see docs/release-verification.md).
+              # Versions are pinned by flake.lock; sbomnix is deliberately
+              # absent -- its ~1.3 GB closure is fetched on demand by
+              # scripts/sbom.sh via `nix run --inputs-from .`.
               pkgs.cargo-cyclonedx
               pkgs.cyclonedx-cli
+              pkgs.cosign
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.cloud-hypervisor
