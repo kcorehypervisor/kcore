@@ -1,4 +1,4 @@
-.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace test-replication-soak coverage test-controller test-node-agent test-kctl test-rust-filter loc iso iso-remote kctl clean install-hooks kani help release-tag release-build release-dist release-publish release sbom
+.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace test-replication-soak coverage test-controller test-node-agent test-kctl test-rust-filter loc iso iso-remote kctl clean install-hooks kani help release-tag release-build release-dist release-publish release sbom sbom-iso sbom-all
 
 VERSION := $(shell cat VERSION)
 V ?= v$(VERSION)
@@ -119,11 +119,17 @@ release-publish:
 release:
 	bash ./scripts/release.sh release
 
-# The SBOM is generated at release time into dist/ and is never committed, so
-# there is nothing for CI to drift-check. `release-dist` runs this before
-# writing SHA256SUMS.
+# SBOMs are generated at release time into dist/ and are never committed, so
+# there is nothing for CI to drift-check. `release-dist` runs both targets
+# before writing SHA256SUMS.
 sbom:
 	bash ./scripts/sbom.sh crates
+
+sbom-iso:
+	bash ./scripts/sbom.sh iso
+
+sbom-all:
+	bash ./scripts/sbom.sh all
 
 install-hooks:
 	@for hook in scripts/hooks/*; do \
@@ -166,10 +172,12 @@ help:
 	@echo "  kctl        Build kctl CLI only"
 	@echo "  release-tag     Create/push annotated tag v$(VERSION)"
 	@echo "  release-build   Build ISO + Linux/macOS kctl release binaries"
-	@echo "  release-dist    Linux/macOS kctl tarballs + ISO + SBOM under dist/ + SHA256SUMS"
+	@echo "  release-dist    Linux/macOS kctl tarballs + ISO + SBOMs under dist/ + SHA256SUMS"
 	@echo "  release-publish Create/update GitHub Release assets from tag (needs gh/GH_TOKEN)"
 	@echo "  release         Local full release: tag + build + dist + GitHub Release publish"
-	@echo "  sbom            Crate (Cargo) CycloneDX SBOM under dist/ (run by release-dist)"
+	@echo "  sbom            Crate (Cargo) CycloneDX SBOM under dist/"
+	@echo "  sbom-iso        ISO Nix closure CycloneDX + SPDX SBOMs under dist/"
+	@echo "  sbom-all        Both SBOMs (run by release-dist)"
 	@echo "  install-hooks  Install git pre-commit/pre-push hooks"
 	@echo "  clean       Remove build artifacts"
 	@echo "  help        Show this help"

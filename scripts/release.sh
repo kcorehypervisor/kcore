@@ -2,7 +2,7 @@
 # Build release artifacts (Nix ISO + Linux/macOS kctl), package dist/, publish GitHub Release.
 # Usage:
 #   ./scripts/release.sh build    # nix build ISO + Linux kctl, cargo-zigbuild macOS kctl
-#   ./scripts/release.sh dist     # dist/*.tar.gz, ISO copy, crate SBOM, dist/SHA256SUMS
+#   ./scripts/release.sh dist     # dist/*.tar.gz, ISO copy, SBOMs, dist/SHA256SUMS
 #   ./scripts/release.sh tag      # create/push v$(VERSION)
 #   ./scripts/release.sh publish  # gh release create/upload (needs tag on remote)
 #   ./scripts/release.sh release  # tag + build + dist + publish
@@ -25,9 +25,11 @@ KCTL_ARCHIVES=(
 	"${KCTL_MACOS_X86_64_ARCHIVE}"
 	"${KCTL_MACOS_AARCH64_ARCHIVE}"
 )
-# The Rust dependency graph; see scripts/sbom.sh.
+# Two SBOMs describing different universes; see scripts/sbom.sh.
 SBOM_FILES=(
 	"kcore-${VERSION}-crates.cdx.json"
+	"kcore-${VERSION}-iso-closure.cdx.json"
+	"kcore-${VERSION}-iso-closure.spdx.json"
 )
 TAG="v${VERSION}"
 
@@ -145,10 +147,10 @@ cmd_dist() {
 	echo "==> Copying $(basename "${ISO_SRC}") to dist/${ISO_NAME}..."
 	cp -f "${ISO_SRC}" "dist/${ISO_NAME}"
 
-	# Generated here, before SHA256SUMS, so the SBOM is covered by the
+	# Generated here, before SHA256SUMS, so the SBOMs are covered by the
 	# checksums file.
-	echo "==> Generating crate SBOM..."
-	nix develop --command bash ./scripts/sbom.sh crates
+	echo "==> Generating SBOMs..."
+	nix develop --command bash ./scripts/sbom.sh all
 	for sbom in "${SBOM_FILES[@]}"; do
 		[[ -s "dist/${sbom}" ]] || die "scripts/sbom.sh produced no dist/${sbom}"
 	done
