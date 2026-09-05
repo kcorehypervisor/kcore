@@ -14,6 +14,7 @@
 | CRDT / HA replication | [ha-crdt-replication.md](./ha-crdt-replication.md) |
 | File layout | [file-structure.md](./file-structure.md) |
 | Releases (local Make + Nix + `gh`) | [release.md](./release.md) |
+| Release verification (SBOMs + Sigstore) | [release-verification.md](./release-verification.md) |
 | Formal methods | [formal-methods-and-verification.md](./formal-methods-and-verification.md) |
 | Heartbeat | [heartbeat.md](./heartbeat.md) |
 | kctl workflows | [kctl-commands-and-workflows.md](./kctl-commands-and-workflows.md) |
@@ -27,6 +28,8 @@
 | Security groups | [security-groups.md](./security-groups.md) |
 | k8s vs kcore security | [security-k8s-vs-kcore.md](./security-k8s-vs-kcore.md) |
 | Storage | [storage.md](./storage.md) |
+| kcore SAN (Ceph) | [ceph.md](./ceph.md) |
+| VM migration (cold / live) | [vm-migration.md](./vm-migration.md) |
 | Containerd support | [support-for-containerd.md](./support-for-containerd.md) |
 | Zero-external resolution | [zero-external-resolution-algorithm.md](./zero-external-resolution-algorithm.md) |
 

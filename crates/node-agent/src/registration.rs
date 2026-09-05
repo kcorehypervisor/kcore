@@ -12,8 +12,6 @@ const DISABLE_VXLAN_MARKER: &str = "/etc/kcore/disable-vxlan";
 const REGISTRATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_REGISTRATION_RETRIES: u32 = 12;
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-const RENEWAL_THRESHOLD_DAYS: i64 = 30;
-const RENEWAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(86400);
 
 /// Spawn registration in a background task and return a Notify that fires
 /// when registration completes (or exhausts retries). Heartbeat loop waits
@@ -63,6 +61,9 @@ pub async fn register_with_controller(cfg: &Config) {
         }
         crate::config::StorageBackendKind::Lvm => controller_proto::StorageBackendType::Lvm as i32,
         crate::config::StorageBackendKind::Zfs => controller_proto::StorageBackendType::Zfs as i32,
+        crate::config::StorageBackendKind::Ceph => {
+            controller_proto::StorageBackendType::Ceph as i32
+        }
     };
 
     let endpoints = controller_endpoints(cfg);
@@ -247,19 +248,6 @@ fn parse_first_ipv4_addr(addr_stdout: &str) -> Option<String> {
     None
 }
 
-/// Spawn a background task that checks cert expiry daily and renews via
-/// the controller's RenewNodeCert RPC when the cert is within 30 days of expiry.
-pub fn start_cert_renewal_loop(cfg: Config) {
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = check_and_renew_cert(&cfg).await {
-                warn!(error = %e, "cert renewal check failed");
-            }
-            tokio::time::sleep(RENEWAL_CHECK_INTERVAL).await;
-        }
-    });
-}
-
 pub fn start_heartbeat_loop(cfg: Config, registration_done: Arc<Notify>) {
     tokio::spawn(async move {
         registration_done.notified().await;
@@ -381,93 +369,6 @@ fn collect_local_workload_runtime() -> Vec<controller_proto::WorkloadRuntimeInfo
     workloads
 }
 
-async fn check_and_renew_cert(
-    cfg: &Config,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tls = match cfg.tls.as_ref() {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-
-    let cert_pem = std::fs::read_to_string(&tls.cert_file)?;
-    let days_remaining = cert_days_remaining(&cert_pem)?;
-
-    if days_remaining > RENEWAL_THRESHOLD_DAYS {
-        info!(days_remaining, "certificate valid, no renewal needed");
-        return Ok(());
-    }
-
-    info!(
-        days_remaining,
-        "certificate expires soon, requesting renewal"
-    );
-
-    let mut resp_opt = None;
-    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-    for endpoint in controller_endpoints(cfg) {
-        let channel = match connect_channel(cfg, &endpoint).await {
-            Ok(c) => c,
-            Err(e) => {
-                last_err = Some(e);
-                continue;
-            }
-        };
-
-        let mut client = controller_proto::controller_client::ControllerClient::new(channel);
-        match client
-            .renew_node_cert(controller_proto::RenewNodeCertRequest {
-                node_id: cfg.node_id.clone(),
-            })
-            .await
-        {
-            Ok(resp) => {
-                resp_opt = Some(resp.into_inner());
-                break;
-            }
-            Err(e) => {
-                last_err = Some(Box::new(e));
-            }
-        }
-    }
-    let resp = if let Some(resp) = resp_opt {
-        resp
-    } else {
-        return Err(last_err.unwrap_or_else(|| {
-            Box::new(std::io::Error::other(
-                "cert renewal failed on all controller endpoints",
-            ))
-        }));
-    };
-
-    if !resp.success {
-        return Err(format!("controller rejected renewal: {}", resp.message).into());
-    }
-
-    std::fs::write(&tls.cert_file, &resp.cert_pem)?;
-    std::fs::write(&tls.key_file, &resp.key_pem)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tls.key_file, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    info!(
-        node_id = %cfg.node_id,
-        "certificate renewed successfully; restarting to load new TLS identity"
-    );
-
-    #[cfg(unix)]
-    {
-        let pid = std::process::id();
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
-        }
-    }
-
-    Ok(())
-}
-
 fn cert_days_remaining(cert_pem: &str) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let pem = pem::parse(cert_pem)?;
     use x509_parser::prelude::FromDer;
@@ -494,7 +395,7 @@ fn endpoint_host(endpoint: &str) -> Option<&str> {
         .or(Some(without_scheme))
 }
 
-fn controller_endpoints(cfg: &Config) -> Vec<String> {
+pub(crate) fn controller_endpoints(cfg: &Config) -> Vec<String> {
     let default_scheme = if cfg.tls.is_some() { "https" } else { "http" };
     cfg.controller_endpoints()
         .into_iter()
@@ -508,7 +409,7 @@ fn controller_endpoints(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
-async fn connect_channel(
+pub(crate) async fn connect_channel(
     cfg: &Config,
     endpoint: &str,
 ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
@@ -610,6 +511,8 @@ mod tests {
             vm_socket_dir: "/run/kcore".to_string(),
             nix_config_path: "/etc/nixos/kcore-vms.nix".to_string(),
             storage: crate::config::StorageConfig::default(),
+            cert_rotation: crate::config::CertRotationConfig::default(),
+            revocation: crate::config::NodeRevocationConfig::default(),
         };
         let endpoints = super::controller_endpoints(&cfg);
         assert_eq!(

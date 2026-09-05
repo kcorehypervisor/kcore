@@ -73,8 +73,9 @@ fn normalize_storage_class(value: &str) -> Result<&'static str> {
         "filesystem" | "fs" => Ok("filesystem"),
         "lvm" => Ok("lvm"),
         "zfs" => Ok("zfs"),
+        "ceph" => Ok("ceph"),
         "unspecified" | "unknown" => Ok("unspecified"),
-        _ => bail!("storage-class must be one of: filesystem, lvm, zfs, unspecified"),
+        _ => bail!("storage-class must be one of: filesystem, lvm, zfs, ceph, unspecified"),
     }
 }
 
@@ -85,6 +86,7 @@ fn storage_class_name(value: i32) -> &'static str {
         controller_proto::StorageBackendType::Filesystem => "filesystem",
         controller_proto::StorageBackendType::Lvm => "lvm",
         controller_proto::StorageBackendType::Zfs => "zfs",
+        controller_proto::StorageBackendType::Ceph => "ceph",
         controller_proto::StorageBackendType::Unspecified => "unspecified",
     }
 }
@@ -106,6 +108,6 @@ mod tests {
             normalize_storage_class("unknown").expect("unknown"),
             "unspecified"
         );
-        assert!(normalize_storage_class("ceph").is_err());
+        assert_eq!(normalize_storage_class("ceph").expect("ceph"), "ceph");
     }
 }

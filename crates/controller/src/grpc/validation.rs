@@ -169,8 +169,9 @@ pub fn normalize_storage_backend(backend: i32, required: bool) -> Result<String,
         controller_proto::StorageBackendType::Filesystem => Ok("filesystem".to_string()),
         controller_proto::StorageBackendType::Lvm => Ok("lvm".to_string()),
         controller_proto::StorageBackendType::Zfs => Ok("zfs".to_string()),
+        controller_proto::StorageBackendType::Ceph => Ok("ceph".to_string()),
         controller_proto::StorageBackendType::Unspecified if required => Err(
-            Status::invalid_argument("storage_backend is required (filesystem|lvm|zfs)"),
+            Status::invalid_argument("storage_backend is required (filesystem|lvm|zfs|ceph)"),
         ),
         controller_proto::StorageBackendType::Unspecified => Ok("filesystem".to_string()),
     }
@@ -181,6 +182,7 @@ pub fn storage_backend_to_proto(backend: &str) -> i32 {
         "filesystem" => controller_proto::StorageBackendType::Filesystem as i32,
         "lvm" => controller_proto::StorageBackendType::Lvm as i32,
         "zfs" => controller_proto::StorageBackendType::Zfs as i32,
+        "ceph" => controller_proto::StorageBackendType::Ceph as i32,
         _ => controller_proto::StorageBackendType::Unspecified as i32,
     }
 }
@@ -235,6 +237,11 @@ mod tests {
             normalize_storage_backend(controller_proto::StorageBackendType::Lvm as i32, true)
                 .expect("lvm"),
             "lvm"
+        );
+        assert_eq!(
+            normalize_storage_backend(controller_proto::StorageBackendType::Ceph as i32, true)
+                .expect("ceph"),
+            "ceph"
         );
         assert!(normalize_storage_backend(0, true).is_err());
         assert_eq!(
@@ -433,6 +440,7 @@ mod proptests {
                 "filesystem" => controller_proto::StorageBackendType::Filesystem as i32,
                 "lvm" => controller_proto::StorageBackendType::Lvm as i32,
                 "zfs" => controller_proto::StorageBackendType::Zfs as i32,
+                "ceph" => controller_proto::StorageBackendType::Ceph as i32,
                 _ => controller_proto::StorageBackendType::Unspecified as i32,
             };
             prop_assert_eq!(v, expected);

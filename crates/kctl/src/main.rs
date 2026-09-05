@@ -1,4 +1,9 @@
-#![allow(dead_code, clippy::too_many_arguments, clippy::enum_variant_names)]
+#![allow(
+    dead_code,
+    clippy::too_many_arguments,
+    clippy::enum_variant_names,
+    clippy::result_large_err
+)]
 
 mod apply_summary;
 mod client;
@@ -144,10 +149,20 @@ enum Command {
         #[command(subcommand)]
         resource: DrainResource,
     },
+    /// Live-migrate a Ceph-backed VM to another CephCluster member
+    Migrate {
+        #[command(subcommand)]
+        resource: MigrateResource,
+    },
     /// Rotate certificates
     Rotate {
         #[command(subcommand)]
         resource: RotateResource,
+    },
+    /// Revoke a certificate (adds it to the cluster CRL and OCSP responder)
+    Revoke {
+        #[command(subcommand)]
+        resource: RevokeResource,
     },
     /// Apply a NixOS configuration to the controller
     Apply {
@@ -228,6 +243,39 @@ enum RotateResource {
         /// Certificate directory (defaults to active context's cert dir)
         #[arg(long)]
         certs_dir: Option<PathBuf>,
+    },
+    /// Rotate node certificates via CSR (private keys stay on the nodes)
+    #[command(name = "node-certs", alias = "node-cert")]
+    NodeCerts {
+        /// Node to rotate
+        #[arg(long)]
+        node: Option<String>,
+        /// Rotate every approved node
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RevokeResource {
+    /// Revoke an issued certificate by serial, subject CN or node id
+    #[command(name = "cert", alias = "certificate")]
+    Cert {
+        /// Serial number in hex (as shown by `kctl get certificates`)
+        #[arg(long)]
+        serial: Option<String>,
+        /// Subject common name, e.g. kctl:alice
+        #[arg(long)]
+        subject: Option<String>,
+        /// Node id whose active certificate should be revoked
+        #[arg(long)]
+        node: Option<String>,
+        /// RFC 5280 reason: unspecified, key-compromise, ca-compromise,
+        /// affiliation-changed, superseded, cessation-of-operation,
+        /// certificate-hold, remove-from-crl, privilege-withdrawn,
+        /// aa-compromise
+        #[arg(long, default_value = "unspecified")]
+        reason: String,
     },
 }
 
@@ -411,6 +459,9 @@ enum DeleteResource {
         /// DiskLayout name
         name: String,
     },
+    /// Delete a CephCluster resource (does not wipe OSDs)
+    #[command(name = "ceph-cluster", alias = "cephcluster")]
+    CephCluster { name: String },
 }
 
 #[derive(Subcommand)]
@@ -564,6 +615,40 @@ enum GetResource {
         #[arg(long = "target-node")]
         target_node: Option<String>,
     },
+    /// List CephCluster resources
+    #[command(name = "ceph-clusters", alias = "ceph-cluster", alias = "cephcluster")]
+    CephClusters,
+    /// List the controller's certificate inventory
+    #[command(name = "certificates", alias = "certificate", alias = "certs")]
+    Certificates {
+        /// Only certificates issued to this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Filter by status: active, rotated, revoked or all
+        #[arg(long)]
+        status: Option<String>,
+        /// Only certificates expiring within this many days
+        #[arg(long = "expiring-within-days", default_value_t = 0)]
+        expiring_within_days: i32,
+    },
+    /// Show certificate rotation and revocation health
+    #[command(name = "pki-status", alias = "pki")]
+    PkiStatus,
+    /// Fetch the current certificate revocation list
+    Crl {
+        /// Write the CRL to this file (.der for DER, anything else for PEM)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+    },
+    /// Show live-migrate receive session state for a VM (read-only)
+    #[command(name = "migrate-session", alias = "migrate-sessions")]
+    MigrateSession {
+        /// VM id or name
+        vm_id: String,
+        /// Only query this node (default: every CephCluster member)
+        #[arg(long)]
+        node: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -613,6 +698,9 @@ enum DescribeResource {
         /// DiskLayout name
         name: String,
     },
+    /// Describe a CephCluster
+    #[command(name = "ceph-cluster", alias = "cephcluster")]
+    CephCluster { name: String },
 }
 
 #[derive(Subcommand)]
@@ -809,6 +897,37 @@ enum DrainResource {
 }
 
 #[derive(Subcommand)]
+enum MigrateResource {
+    /// Live-migrate a VM (shared RBD / Ceph)
+    Vm {
+        /// VM id or name
+        vm_id: String,
+        /// Destination node id (or address)
+        #[arg(long = "target-node")]
+        target_node: String,
+        /// Fall back to cold reassignment if live migrate fails
+        #[arg(long = "allow-cold-fallback")]
+        allow_cold_fallback: bool,
+    },
+    /// Clear a stranded live-migrate receive session on a node.
+    ///
+    /// Reports what it would clear and does nothing unless --force is given.
+    /// Clearing a session whose receive VMM is still alive kills an in-flight
+    /// migration; inspect with `kctl get migrate-session <vm>` first.
+    #[command(name = "reset-session")]
+    ResetSession {
+        /// VM id or name
+        vm_id: String,
+        /// Node holding the stranded session
+        #[arg(long)]
+        node: String,
+        /// Actually clear it. Without this the command only reports.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum WorkloadAction {
     /// Create a workload (vm or container)
     Create {
@@ -963,6 +1082,7 @@ enum StorageBackend {
     Filesystem,
     Lvm,
     Zfs,
+    Ceph,
 }
 
 fn resolve_controller(cli: &Cli) -> Result<config::ConnectionInfo, String> {
@@ -1057,6 +1177,7 @@ async fn main() {
                         StorageBackend::Filesystem => "filesystem".to_string(),
                         StorageBackend::Lvm => "lvm".to_string(),
                         StorageBackend::Zfs => "zfs".to_string(),
+                        StorageBackend::Ceph => "ceph".to_string(),
                     }),
                     storage_size_bytes: *storage_size_bytes,
                     target_dc: target_dc.clone(),
@@ -1165,6 +1286,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::disk_layout::delete(&info, name).await
+        }
+        Command::Delete {
+            resource: DeleteResource::CephCluster { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::delete(&info, name).await
         }
 
         Command::Start {
@@ -1334,6 +1461,12 @@ async fn main() {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::disk_layout::list(&info, target_node.as_deref()).await
         }
+        Command::Get {
+            resource: GetResource::CephClusters,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::list(&info).await
+        }
 
         Command::Describe {
             resource: DescribeResource::Vm { name, target_node },
@@ -1376,6 +1509,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::disk_layout::get(&info, name).await
+        }
+        Command::Describe {
+            resource: DescribeResource::CephCluster { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::get(&info, name).await
         }
 
         Command::Node {
@@ -1453,6 +1592,7 @@ async fn main() {
                     StorageBackend::Filesystem => "filesystem",
                     StorageBackend::Lvm => "lvm",
                     StorageBackend::Zfs => "zfs",
+                    StorageBackend::Ceph => "ceph",
                 }),
                 lvm_vg_name.as_deref(),
                 lvm_lv_prefix.as_deref(),
@@ -1611,6 +1751,46 @@ async fn main() {
             }
         }
 
+        Command::Migrate {
+            resource:
+                MigrateResource::Vm {
+                    vm_id,
+                    target_node,
+                    allow_cold_fallback,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            let mut client = client::controller_client(&info)
+                .await
+                .unwrap_or_else(|e| fatal(&format!("{e}")));
+            let resp = client
+                .migrate_vm(client::controller_proto::MigrateVmRequest {
+                    vm_id: vm_id.to_string(),
+                    target_node: target_node.to_string(),
+                    allow_cold_fallback: *allow_cold_fallback,
+                })
+                .await;
+            match resp {
+                Ok(r) => {
+                    let r = r.into_inner();
+                    println!("{} (mode={})", r.message, r.mode);
+                    if r.success {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("migrate had errors"))
+                    }
+                }
+                Err(e) => Err(anyhow::anyhow!("migrate failed: {e}")),
+            }
+        }
+
+        Command::Migrate {
+            resource: MigrateResource::ResetSession { vm_id, node, force },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::migrate_session::reset(&info, vm_id, node, *force).await
+        }
+
         Command::Rotate {
             resource:
                 RotateResource::Certs {
@@ -1636,6 +1816,66 @@ async fn main() {
             )
             .ok();
             commands::certs::rotate(&certs_path, controller, info.as_ref()).await
+        }
+        Command::Rotate {
+            resource: RotateResource::NodeCerts { node, all },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::rotate_node_certs(&info, node.as_deref(), *all).await
+        }
+        Command::Revoke {
+            resource:
+                RevokeResource::Cert {
+                    serial,
+                    subject,
+                    node,
+                    reason,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::revoke_certificate(
+                &info,
+                serial.as_deref(),
+                subject.as_deref(),
+                node.as_deref(),
+                reason,
+            )
+            .await
+        }
+        Command::Get {
+            resource:
+                GetResource::Certificates {
+                    node,
+                    status,
+                    expiring_within_days,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::list_certificates(
+                &info,
+                node.as_deref(),
+                status.as_deref(),
+                *expiring_within_days,
+            )
+            .await
+        }
+        Command::Get {
+            resource: GetResource::PkiStatus,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::pki_status(&info).await
+        }
+        Command::Get {
+            resource: GetResource::Crl { output },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::pki::get_crl(&info, output.as_deref()).await
+        }
+        Command::Get {
+            resource: GetResource::MigrateSession { vm_id, node },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::migrate_session::status(&info, vm_id, node.as_deref()).await
         }
         Command::Rotate {
             resource: RotateResource::SubCa { certs_dir },
@@ -1759,6 +1999,9 @@ async fn main() {
                         }
                         StorageBackend::Zfs => {
                             client::controller_proto::StorageBackendType::Zfs as i32
+                        }
+                        StorageBackend::Ceph => {
+                            client::controller_proto::StorageBackendType::Ceph as i32
                         }
                     };
                     commands::workload::create(

@@ -55,6 +55,11 @@ service NodeAdmin {
   // provided content and (optionally) triggers a nixos-rebuild.
   rpc ApplyNixConfig(ApplyNixConfigRequest) returns (ApplyNixConfigResponse);
 
+  // GetNixApplyStatus reports whether the rebuild started by a previous
+  // ApplyNixConfig has finished activating. Callers that must observe the new
+  // configuration (live migration handoff, drain) poll this before continuing.
+  rpc GetNixApplyStatus(GetNixApplyStatusRequest) returns (GetNixApplyStatusResponse);
+
   // ApplyDiskLayout validates/applies a disk layout (implemented via disko)
   // for day-2 disk operations. Apply mode is only allowed when node disk
   // management mode is controller-managed.
@@ -101,6 +106,39 @@ service NodeAdmin {
   rpc ActivateSystemUpdate(ActivateSystemUpdateRequest) returns (ActivateSystemUpdateResponse);
   rpc GetSystemUpdateStatus(GetSystemUpdateStatusRequest) returns (GetSystemUpdateStatusResponse);
   rpc RollbackSystemUpdate(RollbackSystemUpdateRequest) returns (RollbackSystemUpdateResponse);
+
+  // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
+  rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
+  rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
+  rpc GetCephHealth(GetCephHealthRequest) returns (GetCephHealthResponse);
+  rpc EnsureCephPool(EnsureCephPoolRequest) returns (EnsureCephPoolResponse);
+
+  // Live migration peer steps (controller orchestrates source + destination).
+  rpc PrepareLiveMigrateReceive(PrepareLiveMigrateReceiveRequest)
+      returns (PrepareLiveMigrateReceiveResponse);
+  rpc WaitLiveMigrateReceive(WaitLiveMigrateReceiveRequest)
+      returns (WaitLiveMigrateReceiveResponse);
+  rpc AbortLiveMigrateReceive(AbortLiveMigrateReceiveRequest)
+      returns (AbortLiveMigrateReceiveResponse);
+  // Read-only view of this node's live-migrate receive bookkeeping for a VM.
+  // Nothing is cleaned up. It exists so an operator can tell a stranded
+  // session from an in-flight receive *before* clearing anything: there is
+  // deliberately no automatic reaping, because a wrong liveness guess would
+  // destroy a live migration. See docs/vm-migration.md.
+  rpc GetLiveMigrateReceiveStatus(GetLiveMigrateReceiveStatusRequest)
+      returns (GetLiveMigrateReceiveStatusResponse);
+  rpc SendLiveMigrate(SendLiveMigrateRequest) returns (SendLiveMigrateResponse);
+  rpc FinalizeLiveMigrateSource(FinalizeLiveMigrateSourceRequest)
+      returns (FinalizeLiveMigrateSourceResponse);
+  rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
+      returns (FinalizeLiveMigrateDestResponse);
+
+  // RotateNodeCert asks the node-agent to rotate its own TLS identity: the
+  // node generates a fresh keypair, submits a CSR to the controller
+  // (Controller.SignNodeCsr), installs the signed chain atomically and
+  // reloads its listener. The private key never leaves the node. A failure
+  // leaves the previous certificate in place and serving.
+  rpc RotateNodeCert(RotateNodeCertRequest) returns (RotateNodeCertResponse);
 }
 
 // VM specification
@@ -440,11 +478,42 @@ message ApplyNixConfigRequest {
   // When true, run `nixos-rebuild switch` after writing the file.
   // When false, only write the file.
   bool rebuild = 2;
+
+  // Caller-generated token identifying this apply. Echoed back in the response
+  // and accepted by GetNixApplyStatus. Empty means the node picks its own.
+  string apply_id = 3;
 }
 
 message ApplyNixConfigResponse {
   bool success = 1;
   string message = 2;
+
+  // Token to poll with GetNixApplyStatus. Empty when the node agent predates
+  // apply tracking, in which case callers must not wait for activation.
+  string apply_id = 3;
+}
+
+enum NixApplyPhase {
+  NIX_APPLY_PHASE_UNSPECIFIED = 0;
+  // Rebuild is still running (or queued behind another apply).
+  NIX_APPLY_PHASE_RUNNING = 1;
+  // `nixos-rebuild test && nixos-rebuild switch` activated successfully.
+  NIX_APPLY_PHASE_SUCCEEDED = 2;
+  NIX_APPLY_PHASE_FAILED = 3;
+  // The node has no record of this apply_id (agent restart, or a newer apply
+  // superseded it).
+  NIX_APPLY_PHASE_UNKNOWN = 4;
+}
+
+message GetNixApplyStatusRequest {
+  // Empty returns the most recent apply on the node.
+  string apply_id = 1;
+}
+
+message GetNixApplyStatusResponse {
+  string apply_id = 1;
+  NixApplyPhase phase = 2;
+  string message = 3;
 }
 
 message ApplyDiskLayoutRequest {
@@ -645,6 +714,7 @@ enum StorageBackendType {
   STORAGE_BACKEND_TYPE_FILESYSTEM = 1;
   STORAGE_BACKEND_TYPE_LVM = 2;
   STORAGE_BACKEND_TYPE_ZFS = 3;
+  STORAGE_BACKEND_TYPE_CEPH = 4;
 }
 
 message InstallToDiskResponse {
@@ -745,3 +815,199 @@ message RollbackSystemUpdateResponse {
   string message = 2;
 }
 
+message ApplyCephConfigRequest {
+  string ceph_nix = 1;
+  bool rebuild = 2;
+  string fsid = 3;
+  bool mon = 4;
+  bool mgr = 5;
+  bool osd = 6;
+  string daemon_id = 7;
+  // JSON bootstrap package (UTF-8): admin/mon/bootstrap-osd keyrings + mon map.
+  // Empty on first apply; node generates and returns it in the response.
+  bytes keyring = 8;
+  // Comma-separated "daemonId=ip" pairs for monmap (public mon IPs, no ports).
+  string mon_map = 9;
+  string public_addr = 10;
+  string cluster_addr = 11;
+}
+
+message ApplyCephConfigResponse {
+  bool success = 1;
+  string message = 2;
+  // Populated when this node generated the cluster bootstrap package.
+  bytes keyring = 3;
+}
+
+message BootstrapCephOsdRequest {
+  string osd_device = 1;
+  bool force_wipe = 2;
+  string cluster_name = 3;
+}
+
+message BootstrapCephOsdResponse {
+  bool success = 1;
+  bool already_prepared = 2;
+  string message = 3;
+  string osd_id = 4;
+}
+
+message GetCephHealthRequest { string cluster_name = 1; }
+
+message GetCephHealthResponse {
+  string health_status = 1;
+  string raw_status = 2;
+  int32 osd_up = 3;
+  int32 osd_in = 4;
+}
+
+message EnsureCephPoolRequest {
+  string pool = 1;
+  int32 size = 2;
+  int32 min_size = 3;
+}
+
+message EnsureCephPoolResponse {
+  bool success = 1;
+  bool created = 2;
+  string message = 3;
+}
+
+message PrepareLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+  // Preferred listen port; 0 = pick an ephemeral free port.
+  int32 listen_port = 4;
+}
+
+message PrepareLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+  int32 listen_port = 3;
+  // Address the source should dial. Empty or a wildcard ("0.0.0.0", "::")
+  // means the destination has no opinion and the caller should fall back to
+  // the host part of the destination node's gRPC address.
+  string listen_addr = 4;
+}
+
+message WaitLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  int32 timeout_seconds = 2;
+}
+
+message WaitLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message AbortLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+}
+
+message AbortLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+  // What the node saw immediately before cleaning up. Recorded so an operator
+  // clearing a session can see afterwards whether they killed a live receive
+  // or collected a corpse.
+  LiveMigrateReceiveState observed = 3;
+}
+
+message GetLiveMigrateReceiveStatusRequest {
+  string vm_name = 1;
+}
+
+// Everything the node can observe about a receive session without touching it.
+message LiveMigrateReceiveState {
+  // A prepare ran here and the session is still tracked in memory. This is
+  // what makes a retried PrepareLiveMigrateReceive answer ALREADY_EXISTS.
+  bool has_session = 1;
+  // Migration port the session holds; 0 when there is no in-memory session.
+  int32 port = 2;
+  // Receive-mode cloud-hypervisor pid from the in-memory session, 0 if none.
+  uint32 session_pid = 3;
+  // Pid recorded in <socket_dir>/<vm>.migrate.pid, 0 when the file is absent.
+  // Survives a node-agent restart, so it can be set while has_session is not.
+  uint32 pid_file_pid = 4;
+  // Whether that pid is a live process. The decisive field: false means
+  // nothing is receiving and the session is safe to clear.
+  bool vmm_alive = 5;
+  // Whether the live pid really is this VM's receive VMM, checked against its
+  // /proc cmdline. False with vmm_alive true means the pid was recycled and
+  // clearing must not kill it.
+  bool vmm_pid_matches_vm = 6;
+  // Whether any process holds a listening socket on `port`.
+  bool port_listening = 7;
+  bool pid_file_present = 8;
+  // <socket_dir>/<vm>.live-migrated: the receive completed and the generated
+  // unit should adopt the running VMM rather than cold-start one.
+  bool marker_present = 9;
+  bool api_socket_present = 10;
+  // One-line operator-facing reading of the fields above.
+  string summary = 11;
+}
+
+message GetLiveMigrateReceiveStatusResponse {
+  bool success = 1;
+  string message = 2;
+  LiveMigrateReceiveState state = 3;
+}
+
+message SendLiveMigrateRequest {
+  string vm_name = 1;
+  // tcp:<dest-ip>:<port>
+  string destination_url = 2;
+  int32 timeout_seconds = 3;
+}
+
+message SendLiveMigrateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message FinalizeLiveMigrateSourceRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+}
+
+message FinalizeLiveMigrateSourceResponse {
+  bool success = 1;
+  string message = 2;
+  // Verified (not merely requested) post-conditions. The controller refuses to
+  // start the VM on the destination unless both are true, so a cold move can
+  // never have two VMMs writing the same RBD image.
+  bool vmm_stopped = 3;
+  bool rbd_unmapped = 4;
+}
+
+message FinalizeLiveMigrateDestRequest {
+  string vm_name = 1;
+}
+
+message FinalizeLiveMigrateDestResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+
+message RotateNodeCertRequest {
+  // Rotate even when the certificate is not yet inside the renewal window.
+  bool force = 1;
+  // Correlation id for controller-driven rotations (audit/log only).
+  string reason = 2;
+}
+
+message RotateNodeCertResponse {
+  bool success = 1;
+  string message = 2;
+  // Serial of the newly installed certificate, empty when no rotation happened.
+  string serial_hex = 3;
+  // True when the certificate was already outside the renewal window and
+  // force was not set, so nothing was changed.
+  bool skipped = 4;
+  int32 days_until_expiry = 5;
+}

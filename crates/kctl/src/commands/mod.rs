@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod audit;
+pub mod ceph_cluster;
 pub mod certs;
 pub mod cluster;
 pub mod cluster_update;
@@ -8,9 +9,11 @@ pub mod conflict;
 pub mod container;
 pub mod disk_layout;
 pub mod image;
+pub mod migrate_session;
 pub mod network;
 pub mod node;
 pub mod operator;
+pub mod pki;
 pub mod security_group;
 pub mod ssh_key;
 pub mod storage_class;

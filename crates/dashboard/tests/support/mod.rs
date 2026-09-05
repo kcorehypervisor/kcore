@@ -302,6 +302,27 @@ impl Controller for MockController {
         Err(unimp("drain_node"))
     }
 
+    async fn migrate_vm(
+        &self,
+        _: Request<MigrateVmRequest>,
+    ) -> Result<Response<MigrateVmResponse>, Status> {
+        Err(unimp("migrate_vm"))
+    }
+
+    async fn get_live_migrate_receive_status(
+        &self,
+        _: Request<GetLiveMigrateReceiveStatusRequest>,
+    ) -> Result<Response<GetLiveMigrateReceiveStatusResponse>, Status> {
+        Err(unimp("get_live_migrate_receive_status"))
+    }
+
+    async fn reset_live_migrate_receive(
+        &self,
+        _: Request<ResetLiveMigrateReceiveRequest>,
+    ) -> Result<Response<ResetLiveMigrateReceiveResponse>, Status> {
+        Err(unimp("reset_live_migrate_receive"))
+    }
+
     async fn approve_node(
         &self,
         _: Request<ApproveNodeRequest>,
@@ -335,6 +356,45 @@ impl Controller for MockController {
         _: Request<RotateSubCaRequest>,
     ) -> Result<Response<RotateSubCaResponse>, Status> {
         Err(unimp("rotate_sub_ca"))
+    }
+
+    async fn sign_node_csr(
+        &self,
+        _: Request<SignNodeCsrRequest>,
+    ) -> Result<Response<SignNodeCsrResponse>, Status> {
+        Err(unimp("sign_node_csr"))
+    }
+
+    async fn rotate_node_certs(
+        &self,
+        _: Request<RotateNodeCertsRequest>,
+    ) -> Result<Response<RotateNodeCertsResponse>, Status> {
+        Err(unimp("rotate_node_certs"))
+    }
+
+    async fn list_certificates(
+        &self,
+        _: Request<ListCertificatesRequest>,
+    ) -> Result<Response<ListCertificatesResponse>, Status> {
+        Err(unimp("list_certificates"))
+    }
+
+    async fn revoke_certificate(
+        &self,
+        _: Request<RevokeCertificateRequest>,
+    ) -> Result<Response<RevokeCertificateResponse>, Status> {
+        Err(unimp("revoke_certificate"))
+    }
+
+    async fn get_crl(&self, _: Request<GetCrlRequest>) -> Result<Response<GetCrlResponse>, Status> {
+        Err(unimp("get_crl"))
+    }
+
+    async fn get_pki_status(
+        &self,
+        _: Request<GetPkiStatusRequest>,
+    ) -> Result<Response<GetPkiStatusResponse>, Status> {
+        Err(unimp("get_pki_status"))
     }
 
     async fn reload_tls(
@@ -536,6 +596,34 @@ impl Controller for MockController {
         _: Request<ClassifyDiskLayoutRequest>,
     ) -> Result<Response<ClassifyDiskLayoutResponse>, Status> {
         Err(unimp("classify_disk_layout"))
+    }
+
+    async fn create_ceph_cluster(
+        &self,
+        _: Request<CreateCephClusterRequest>,
+    ) -> Result<Response<CreateCephClusterResponse>, Status> {
+        Err(unimp("create_ceph_cluster"))
+    }
+
+    async fn get_ceph_cluster(
+        &self,
+        _: Request<GetCephClusterRequest>,
+    ) -> Result<Response<GetCephClusterResponse>, Status> {
+        Err(unimp("get_ceph_cluster"))
+    }
+
+    async fn list_ceph_clusters(
+        &self,
+        _: Request<ListCephClustersRequest>,
+    ) -> Result<Response<ListCephClustersResponse>, Status> {
+        Err(unimp("list_ceph_clusters"))
+    }
+
+    async fn delete_ceph_cluster(
+        &self,
+        _: Request<DeleteCephClusterRequest>,
+    ) -> Result<Response<DeleteCephClusterResponse>, Status> {
+        Err(unimp("delete_ceph_cluster"))
     }
 
     async fn create_cluster_update(

@@ -9,19 +9,37 @@ use serde_json::Value as JsonValue;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::{self, CN_CONTROLLER_PREFIX, CN_KCTL};
 use crate::discovery;
 use crate::disk::classifier::{self, Verdict};
 use crate::disk::lsblk;
+use crate::live_migrate::{self, LiveMigrateState, ReceiveSession};
 use crate::proto;
 use crate::storage::{self, StorageAdapter};
+use crate::vmm;
 pub struct AdminService {
     nix_config_path: PathBuf,
     vm_socket_dir: PathBuf,
     storage: Arc<dyn StorageAdapter>,
     apply_lock: Arc<AsyncMutex<()>>,
+    live_migrate: LiveMigrateState,
+    /// Set by [`AdminService::with_pki`]; `None` leaves `RotateNodeCert`
+    /// answering `unimplemented`, which is what the live-ISO/installer builds
+    /// want since they have no enrolled identity to rotate.
+    pki: Option<PkiRuntime>,
+    /// Serialises rotation so two concurrent RotateNodeCert calls cannot
+    /// interleave their installs.
+    rotate_lock: Arc<AsyncMutex<()>>,
+}
+
+/// Everything `RotateNodeCert` needs: the node config (paths, controller
+/// endpoints, thresholds) and the handle that rebuilds the TLS listener.
+#[derive(Clone)]
+struct PkiRuntime {
+    cfg: crate::config::Config,
+    reload: crate::pki::reload::ReloadHandle,
 }
 
 const BOOTSTRAP_CERT_DIR: &str = "/etc/kcore/certs";
@@ -34,6 +52,23 @@ const DISK_MODE_INSTALLER_ONLY: &str = "installer-only";
 const DISK_MODE_CONTROLLER_MANAGED: &str = "controller-managed";
 const DISK_LAYOUT_DIR: &str = "/etc/kcore/disk";
 const DISK_LAYOUT_CURRENT_PATH: &str = "/etc/kcore/disk/current.nix";
+const CEPH_NIX_PATH: &str = "/etc/nixos/kcore-ceph.nix";
+/// Rebuild verdicts live on tmpfs so they survive the node-agent restart that
+/// `nixos-rebuild switch` performs, but not a reboot (after which there is
+/// nothing in flight to report on anyway).
+const NIX_APPLY_STATE_DIR: &str = "/run/kcore/nix-apply";
+/// How long to wait for a freshly spawned receive-mode Cloud Hypervisor to
+/// bind its migration port. Only covers process start plus one API call.
+const RECEIVE_LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long the destination waits for its `nixos-rebuild` to make the migrated
+/// VM's unit known to systemd before giving up on adopting the guest.
+const UNIT_LOADED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const NIX_APPLY_RUNNING: &str = "running";
+const NIX_APPLY_SUCCEEDED: &str = "succeeded";
+const NIX_APPLY_FAILED: &str = "failed";
+/// A newer apply killed this one's rebuild before it reached a verdict. Maps to
+/// `NIX_APPLY_PHASE_UNKNOWN`: there is nothing left to wait for.
+const NIX_APPLY_SUPERSEDED: &str = "superseded";
 const KCORE_VOLUME_ROOTS: &[&str] = &["/var/lib/kcore/volumes", "/var/lib/kcore/images"];
 
 async fn resolve_nixpkgs_path() -> Option<String> {
@@ -86,6 +121,7 @@ impl AdminService {
             nix_config_path,
             "/run/kcore".to_string(),
             storage::default_adapter(),
+            LiveMigrateState::new(),
         )
     }
 
@@ -93,13 +129,172 @@ impl AdminService {
         nix_config_path: String,
         vm_socket_dir: String,
         storage: Arc<dyn StorageAdapter>,
+        live_migrate: LiveMigrateState,
     ) -> Self {
         Self {
             nix_config_path: PathBuf::from(nix_config_path),
             vm_socket_dir: PathBuf::from(vm_socket_dir),
             storage,
             apply_lock: Arc::new(AsyncMutex::new(())),
+            live_migrate,
+            pki: None,
+            rotate_lock: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    /// Enable `RotateNodeCert` on this service.
+    pub fn with_pki(
+        mut self,
+        cfg: crate::config::Config,
+        reload: crate::pki::reload::ReloadHandle,
+    ) -> Self {
+        self.pki = Some(PkiRuntime { cfg, reload });
+        self
+    }
+
+    /// Map the shared image, start a receive-mode Cloud Hypervisor and wait
+    /// until it is really listening on `port`.
+    ///
+    /// Split out of `prepare_live_migrate_receive` so a failure anywhere in
+    /// here releases the port reservation on the way out. Reporting success
+    /// before the listener exists would have the source dial a closed port.
+    async fn prepare_receive_session(
+        &self,
+        vm_name: &str,
+        pool: &str,
+        image: &str,
+        port: u16,
+    ) -> Result<Response<proto::PrepareLiveMigrateReceiveResponse>, Status> {
+        live_migrate::ensure_rbd_mapped(pool, image)
+            .map_err(|e| Status::internal(format!("map RBD {pool}/{image} for receive: {e}")))?;
+
+        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        let ch_bin = live_migrate::resolve_ch_bin();
+        let ch_pid = live_migrate::spawn_receive_vmm(&client, vm_name, &ch_bin)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "starting receive-mode cloud-hypervisor for {vm_name}: {e}"
+                ))
+            })?;
+        // Cloud Hypervisor binds the port from inside the receive task, so the
+        // listener must be handed over first.
+        self.live_migrate.release_listener(port).await;
+        let receive_task =
+            live_migrate::start_receive_task(client, vm_name.to_string(), port).await;
+        if let Err(e) = live_migrate::wait_for_port_listening(port, RECEIVE_LISTEN_TIMEOUT).await {
+            receive_task.abort();
+            live_migrate::kill_pid(ch_pid);
+            if let Err(unmap) = live_migrate::ensure_rbd_unmapped(pool, image) {
+                warn!(error = %unmap, "unmap RBD after failed receive prepare");
+            }
+            return Err(Status::internal(format!(
+                "receive-mode cloud-hypervisor for {vm_name}: {e}"
+            )));
+        }
+        self.live_migrate
+            .insert(
+                vm_name,
+                ReceiveSession {
+                    port,
+                    ch_pid,
+                    receive_task,
+                },
+            )
+            .await;
+
+        Ok(Response::new(proto::PrepareLiveMigrateReceiveResponse {
+            success: true,
+            message: format!("listening for migration on tcp:0.0.0.0:{port}"),
+            listen_port: port as i32,
+            // Bound on every interface: the controller knows better than this
+            // node which of its addresses the source can reach.
+            listen_addr: "0.0.0.0".into(),
+        }))
+    }
+
+    /// Tear down everything a receive session owns and report what was there.
+    ///
+    /// The single implementation behind both the abort that ends a failed
+    /// migration and the operator escape hatch for a stranded session, so the
+    /// two can never drift over what "cleaned up" means. Returns the state
+    /// observed *before* the teardown, which is the only chance to record
+    /// whether a live receive was killed.
+    ///
+    /// Best-effort throughout: a missing marker or an already-unmapped image
+    /// is the normal case when this runs twice, and must not turn a repeated
+    /// runbook step into an error.
+    async fn clear_receive_session(
+        &self,
+        vm_name: &str,
+        rbd_pool: &str,
+        rbd_image: &str,
+    ) -> live_migrate::ReceiveObservation {
+        // Snapshot before touching anything, so the caller can be told what
+        // was destroyed rather than only that something was.
+        let observed =
+            live_migrate::observe_receive(&self.live_migrate, &self.vm_socket_dir, vm_name).await;
+
+        if let Some(session) = self.live_migrate.take(vm_name).await {
+            session.receive_task.abort();
+            let _ = nix_kill(session.ch_pid);
+            self.live_migrate.release_port(session.port).await;
+        } else if observed.pid_file_pid != 0 {
+            // No session in memory: this agent restarted after spawning the
+            // receive VMM. The pid file is the only remaining handle on it, and
+            // without this the orphan keeps the API socket and the RBD mapping
+            // alive forever.
+            let pid = observed.pid_file_pid;
+            if observed.vmm_alive && !observed.vmm_pid_matches_vm {
+                // The number was recycled onto an unrelated process. The stale
+                // file still goes below, but we do not signal a stranger.
+                warn!(
+                    %vm_name,
+                    pid,
+                    "pid file names a live process that is not this VM's receive VMM; \
+                     refusing to kill it and discarding the stale pid file"
+                );
+            } else {
+                warn!(
+                    %vm_name,
+                    pid,
+                    "no receive session in memory; killing the receive VMM recorded on disk"
+                );
+                live_migrate::kill_pid(pid);
+            }
+        }
+
+        let _ = std::fs::remove_file(live_migrate::handoff_marker_path(
+            &self.vm_socket_dir,
+            vm_name,
+        ));
+        let _ = std::fs::remove_file(live_migrate::migrate_pid_path(&self.vm_socket_dir, vm_name));
+        let _ = std::fs::remove_file(self.vm_socket_dir.join(format!("{vm_name}.sock")));
+
+        if !rbd_pool.is_empty() && !rbd_image.is_empty() {
+            if let Err(e) = live_migrate::ensure_rbd_unmapped(rbd_pool, rbd_image) {
+                warn!(error = %e, "abort unmap RBD failed");
+            }
+        }
+        observed
+    }
+}
+
+fn receive_state_to_proto(
+    obs: &live_migrate::ReceiveObservation,
+) -> proto::LiveMigrateReceiveState {
+    proto::LiveMigrateReceiveState {
+        has_session: obs.has_session,
+        port: obs.port as i32,
+        session_pid: obs.session_pid,
+        pid_file_pid: obs.pid_file_pid,
+        vmm_alive: obs.vmm_alive,
+        vmm_pid_matches_vm: obs.vmm_pid_matches_vm,
+        port_listening: obs.port_listening,
+        pid_file_present: obs.pid_file_present,
+        marker_present: obs.marker_present,
+        api_socket_present: obs.api_socket_present,
+        summary: obs.summary(),
     }
 }
 
@@ -120,6 +315,38 @@ fn validate_disk_path(path: &str, field: &str) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+fn validate_apply_ceph_config_args(ceph_nix: &str, fsid: &str) -> Result<(), Status> {
+    if ceph_nix.trim().is_empty() || fsid.trim().is_empty() {
+        return Err(Status::invalid_argument("ceph_nix and fsid are required"));
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_osd_device(osd_device: &str) -> Result<(), Status> {
+    if !Path::new(osd_device.trim()).is_absolute() {
+        return Err(Status::invalid_argument("osd_device must be absolute"));
+    }
+    Ok(())
+}
+
+/// SIGTERM one process.
+///
+/// Pid 0 is refused: `kill(0, ...)` signals *every process in the caller's
+/// process group*, which for the node agent means itself and every VMM it
+/// shares a group with. A zero pid here only ever means "we never learned the
+/// real one", so there is nothing legitimate to signal.
+fn nix_kill(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("refusing to signal pid 0 (would target the whole process group)".to_string());
+    }
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
 }
 
 fn normalize_disk_management_mode(raw: &str) -> &'static str {
@@ -270,20 +497,132 @@ async fn enforce_stopped_vm_units(stopped_vms: &[String]) {
     }
 }
 
-async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>) {
+/// Sanitize a caller-supplied apply id into something safe to use as a file
+/// name under [`NIX_APPLY_STATE_DIR`].
+fn sanitize_apply_id(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Fallback apply id for callers (older controllers) that do not supply one.
+fn uuid_like_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos:x}")
+}
+
+fn apply_state_path(apply_id: &str) -> PathBuf {
+    PathBuf::from(NIX_APPLY_STATE_DIR).join(format!("{apply_id}.state"))
+}
+
+fn latest_apply_id() -> Option<String> {
+    std::fs::read_to_string(PathBuf::from(NIX_APPLY_STATE_DIR).join("latest"))
+        .ok()
+        .and_then(|s| sanitize_apply_id(&s))
+}
+
+fn record_apply_state(apply_id: &str, phase: &str, message: &str) {
+    if let Err(e) = std::fs::write(apply_state_path(apply_id), format!("{phase}\n{message}\n")) {
+        error!(error = %e, apply_id, "failed to record nix apply state");
+    }
+}
+
+/// Retire the previous apply when a new one starts.
+///
+/// `run_test_then_switch` stops any in-flight `kcore-nix-rebuild` unit before
+/// launching its own, so the older apply's rebuild is killed without ever
+/// writing a verdict. Left alone its state file would read `running` forever
+/// and a controller polling it would block until its own timeout.
+fn supersede_running_applies(new_apply_id: &str) {
+    let Some(previous) = latest_apply_id() else {
+        return;
+    };
+    if previous == new_apply_id {
+        return;
+    }
+    if let Some((phase, _)) = read_apply_state(&previous) {
+        if phase == NIX_APPLY_RUNNING {
+            record_apply_state(
+                &previous,
+                NIX_APPLY_SUPERSEDED,
+                &format!("superseded by apply {new_apply_id}"),
+            );
+        }
+    }
+}
+
+fn write_apply_state(apply_id: &str, phase: &str, message: &str) {
+    if let Err(e) = std::fs::create_dir_all(NIX_APPLY_STATE_DIR) {
+        error!(error = %e, dir = NIX_APPLY_STATE_DIR, "failed to create nix apply state dir");
+        return;
+    }
+    if phase == NIX_APPLY_RUNNING {
+        supersede_running_applies(apply_id);
+    }
+    record_apply_state(apply_id, phase, message);
+    let _ = std::fs::write(
+        PathBuf::from(NIX_APPLY_STATE_DIR).join("latest"),
+        apply_id.as_bytes(),
+    );
+}
+
+/// `(phase, message)` for a recorded apply, or `None` when the node has no
+/// record of it.
+fn read_apply_state(apply_id: &str) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(apply_state_path(apply_id)).ok()?;
+    let mut lines = raw.lines();
+    let phase = lines.next()?.trim().to_string();
+    let message = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    Some((phase, message))
+}
+
+fn apply_phase_to_proto(phase: &str) -> i32 {
+    match phase {
+        NIX_APPLY_RUNNING => proto::NixApplyPhase::Running as i32,
+        NIX_APPLY_SUCCEEDED => proto::NixApplyPhase::Succeeded as i32,
+        NIX_APPLY_FAILED => proto::NixApplyPhase::Failed as i32,
+        _ => proto::NixApplyPhase::Unknown as i32,
+    }
+}
+
+async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>, apply_id: String) {
     let nixpkgs_path = resolve_nixpkgs_path().await;
     let nix_path_val = nixpkgs_path
         .as_deref()
         .map(|p| format!("nixos-config={NIXOS_CONFIG_PATH}:nixpkgs={p}"))
         .unwrap_or_default();
 
+    // `nixos-rebuild switch` restarts kcore-node-agent, so the rebuild must
+    // outlive this process and the *script* — not a task in this process — has
+    // to record the verdict. Callers poll GetNixApplyStatus for that verdict.
+    let state_file = apply_state_path(&apply_id);
+    let state_display = state_file.display().to_string();
     let script = format!(
-        "set -e; export PATH=\"/run/current-system/sw/bin:$PATH\"; \
+        "export PATH=\"/run/current-system/sw/bin:$PATH\"; \
          export NIX_PATH='{nix_path_val}'; \
-         nixos-rebuild test && nixos-rebuild switch"
+         if nixos-rebuild test && nixos-rebuild switch; then \
+           printf '{succeeded}\\nnixos-rebuild test+switch completed\\n' > '{state}.tmp'; \
+         else \
+           printf '{failed}\\nnixos-rebuild test+switch failed (exit %s)\\n' \"$?\" > '{state}.tmp'; \
+         fi; \
+         mv -f '{state}.tmp' '{state}'",
+        succeeded = NIX_APPLY_SUCCEEDED,
+        failed = NIX_APPLY_FAILED,
+        state = state_display,
     );
 
-    info!(path = %path.display(), "launching nixos-rebuild test+switch via transient systemd unit");
+    info!(path = %path.display(), %apply_id, "launching nixos-rebuild test+switch via transient systemd unit");
 
     let _ = Command::new("systemctl")
         .args(["stop", "kcore-nix-rebuild.service"])
@@ -312,11 +651,21 @@ async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>) 
             info!("kcore-nix-rebuild transient unit launched successfully");
         }
         Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
             error!(stderr = %stderr, "failed to launch kcore-nix-rebuild transient unit");
+            write_apply_state(
+                &apply_id,
+                NIX_APPLY_FAILED,
+                &format!("systemd-run failed: {stderr}"),
+            );
         }
         Err(e) => {
             error!(error = %e, "failed to spawn systemd-run for nix rebuild");
+            write_apply_state(
+                &apply_id,
+                NIX_APPLY_FAILED,
+                &format!("spawning systemd-run failed: {e}"),
+            );
         }
     }
 }
@@ -860,6 +1209,7 @@ fn build_install_command_args(req: &proto::InstallToDiskRequest) -> Result<Vec<S
         proto::StorageBackendType::Filesystem => "filesystem",
         proto::StorageBackendType::Lvm => "lvm",
         proto::StorageBackendType::Zfs => "zfs",
+        proto::StorageBackendType::Ceph => "ceph",
         proto::StorageBackendType::Unspecified => "",
     };
     let mode = if typed_mode.is_empty() {
@@ -1068,7 +1418,9 @@ async fn apply_disk_layout_impl(
     if req.apply && req.rebuild {
         if let Some(persisted_path) = persisted.clone() {
             tokio::spawn(async move {
-                run_test_then_switch(persisted_path, Vec::new()).await;
+                let apply_id = format!("disk-layout-{}", uuid_like_suffix());
+                write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+                run_test_then_switch(persisted_path, Vec::new(), apply_id).await;
             });
             rebuild_scheduled = true;
         }
@@ -1156,17 +1508,23 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             return Ok(Response::new(proto::ApplyNixConfigResponse {
                 success: true,
                 message: format!("config written to {}", path.display()),
+                apply_id: String::new(),
             }));
         }
 
+        let apply_id = sanitize_apply_id(&req.apply_id)
+            .unwrap_or_else(|| format!("apply-{}", uuid_like_suffix()));
+        write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+
         let planned_steps = rebuild_sequence(true).join(" -> ");
-        info!(path = %path.display(), steps = %planned_steps, "starting background nix apply flow");
+        info!(path = %path.display(), steps = %planned_steps, %apply_id, "starting background nix apply flow");
         let rebuild_path = path.clone();
         let desired_stopped_vms = parse_stopped_vms_from_nix(&req.configuration_nix);
         let apply_lock = Arc::clone(&self.apply_lock);
+        let spawned_id = apply_id.clone();
         tokio::spawn(async move {
             let _guard = apply_lock.lock().await;
-            run_test_then_switch(rebuild_path, desired_stopped_vms).await;
+            run_test_then_switch(rebuild_path, desired_stopped_vms, spawned_id).await;
         });
 
         Ok(Response::new(proto::ApplyNixConfigResponse {
@@ -1175,6 +1533,583 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 "config written to {}; nixos-rebuild test+switch started",
                 path.display()
             ),
+            apply_id,
+        }))
+    }
+
+    async fn get_nix_apply_status(
+        &self,
+        request: Request<proto::GetNixApplyStatusRequest>,
+    ) -> Result<Response<proto::GetNixApplyStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let apply_id = match sanitize_apply_id(&req.apply_id).or_else(latest_apply_id) {
+            Some(id) => id,
+            None => {
+                return Ok(Response::new(proto::GetNixApplyStatusResponse {
+                    apply_id: String::new(),
+                    phase: proto::NixApplyPhase::Unknown as i32,
+                    message: "no nix apply has run on this node".into(),
+                }))
+            }
+        };
+        let (phase, message) = read_apply_state(&apply_id).unwrap_or_else(|| {
+            (
+                String::new(),
+                format!("no record of nix apply '{apply_id}'"),
+            )
+        });
+        Ok(Response::new(proto::GetNixApplyStatusResponse {
+            apply_id,
+            phase: apply_phase_to_proto(&phase),
+            message,
+        }))
+    }
+
+    async fn apply_ceph_config(
+        &self,
+        request: Request<proto::ApplyCephConfigRequest>,
+    ) -> Result<Response<proto::ApplyCephConfigResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        validate_apply_ceph_config_args(&req.ceph_nix, &req.fsid)?;
+        tokio::fs::write(CEPH_NIX_PATH, req.ceph_nix.as_bytes())
+            .await
+            .map_err(|e| Status::internal(format!("writing {CEPH_NIX_PATH}: {e}")))?;
+
+        let generated = req.keyring.is_empty();
+        let pkg = if generated {
+            crate::ceph_bootstrap::generate_bootstrap_package(&req.fsid)
+                .map_err(Status::internal)?
+        } else {
+            crate::ceph_bootstrap::decode_package(&req.keyring).map_err(Status::invalid_argument)?
+        };
+        if pkg.fsid != req.fsid {
+            return Err(Status::invalid_argument(
+                "bootstrap package fsid does not match request fsid",
+            ));
+        }
+        crate::ceph_bootstrap::write_keyring_files(&pkg).map_err(Status::internal)?;
+
+        if req.rebuild {
+            let out = Command::new("nixos-rebuild")
+                .args(["test"])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("starting nixos-rebuild: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "nixos-rebuild test failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            let out = Command::new("nixos-rebuild")
+                .args(["switch"])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("starting nixos-rebuild: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "nixos-rebuild switch failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+
+        if req.mon {
+            let mons = crate::ceph_bootstrap::parse_mon_map(&req.mon_map)
+                .map_err(Status::invalid_argument)?;
+            crate::ceph_bootstrap::mkfs_mon(&pkg, &req.daemon_id, &mons)
+                .map_err(Status::internal)?;
+            let _ = Command::new("systemctl")
+                .args(["start", &format!("ceph-mon-{}", req.daemon_id)])
+                .output()
+                .await;
+        }
+        if req.mgr {
+            let daemon = req.daemon_id.clone();
+            tokio::task::spawn_blocking(move || crate::ceph_bootstrap::ensure_mgr_keyring(&daemon))
+                .await
+                .map_err(|e| Status::internal(format!("mgr keyring task: {e}")))?
+                .map_err(Status::internal)?;
+            let _ = Command::new("systemctl")
+                .args(["start", &format!("ceph-mgr-{}", req.daemon_id)])
+                .output()
+                .await;
+        }
+
+        let keyring = if generated {
+            crate::ceph_bootstrap::encode_package(&pkg).map_err(Status::internal)?
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(proto::ApplyCephConfigResponse {
+            success: true,
+            message: format!("Ceph config written to {CEPH_NIX_PATH}; mon/mgr bootstrapped"),
+            keyring,
+        }))
+    }
+
+    async fn bootstrap_ceph_osd(
+        &self,
+        request: Request<proto::BootstrapCephOsdRequest>,
+    ) -> Result<Response<proto::BootstrapCephOsdResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        validate_bootstrap_osd_device(&req.osd_device)?;
+        let listed = Command::new("ceph-volume")
+            .args(["lvm", "list", "--format", "json"])
+            .output()
+            .await
+            .map_err(|e| {
+                Status::internal(format!("starting ceph-volume (is Ceph installed?): {e}"))
+            })?;
+        if listed.status.success() {
+            let stdout = String::from_utf8_lossy(&listed.stdout);
+            if stdout.contains(req.osd_device.trim()) {
+                return Ok(Response::new(proto::BootstrapCephOsdResponse {
+                    success: true,
+                    already_prepared: true,
+                    message: "OSD already prepared".into(),
+                    osd_id: String::new(),
+                }));
+            }
+        }
+        let signatures = Command::new("wipefs")
+            .args(["--no-act", req.osd_device.as_str()])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("running wipefs: {e}")))?;
+        if !req.force_wipe && !signatures.stdout.is_empty() {
+            return Err(Status::failed_precondition(
+                "OSD device has signatures; set forceWipe only after verifying the device",
+            ));
+        }
+        if req.force_wipe {
+            let out = Command::new("wipefs")
+                .args(["--all", req.osd_device.as_str()])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("running wipefs: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(
+                    String::from_utf8_lossy(&out.stderr).to_string(),
+                ));
+            }
+        }
+        // Let ceph-volume install/activate systemd units (do not pass --no-systemd).
+        let out = Command::new("ceph-volume")
+            .args(["lvm", "create", "--data", req.osd_device.as_str()])
+            .output()
+            .await
+            .map_err(|e| {
+                Status::internal(format!("starting ceph-volume (is Ceph installed?): {e}"))
+            })?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "ceph-volume failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(Response::new(proto::BootstrapCephOsdResponse {
+            success: true,
+            already_prepared: false,
+            message: "OSD prepared and activated".into(),
+            osd_id: String::new(),
+        }))
+    }
+
+    async fn get_ceph_health(
+        &self,
+        request: Request<proto::GetCephHealthRequest>,
+    ) -> Result<Response<proto::GetCephHealthResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let _ = request.into_inner();
+        let out = Command::new("ceph")
+            .args(["-s", "--format", "json"])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("starting ceph (is Ceph installed?): {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "ceph status failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let raw_status = String::from_utf8_lossy(&out.stdout).to_string();
+        let json: JsonValue = serde_json::from_str(&raw_status)
+            .map_err(|e| Status::internal(format!("invalid ceph status JSON: {e}")))?;
+        let health_status = json
+            .pointer("/health/status")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("HEALTH_ERR")
+            .to_string();
+        let (osd_up, osd_in) = crate::ceph_bootstrap::parse_osd_counters(&json);
+        Ok(Response::new(proto::GetCephHealthResponse {
+            health_status,
+            raw_status,
+            osd_up,
+            osd_in,
+        }))
+    }
+
+    async fn ensure_ceph_pool(
+        &self,
+        request: Request<proto::EnsureCephPoolRequest>,
+    ) -> Result<Response<proto::EnsureCephPoolResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let pool = req.pool.trim();
+        if pool.is_empty() {
+            return Err(Status::invalid_argument("pool is required"));
+        }
+        let listed = Command::new("ceph")
+            .args(["osd", "pool", "ls"])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("ceph osd pool ls: {e}")))?;
+        if !listed.status.success() {
+            return Err(Status::internal(format!(
+                "ceph osd pool ls failed: {}",
+                String::from_utf8_lossy(&listed.stderr).trim()
+            )));
+        }
+        let exists = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .any(|l| l.trim() == pool);
+        let mut created = false;
+        if !exists {
+            let out = Command::new("ceph")
+                .args(["osd", "pool", "create", pool, "32"])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("ceph osd pool create: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "ceph osd pool create failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            created = true;
+        }
+        if req.size > 0 {
+            let _ = Command::new("ceph")
+                .args(["osd", "pool", "set", pool, "size", &req.size.to_string()])
+                .output()
+                .await;
+        }
+        if req.min_size > 0 {
+            let _ = Command::new("ceph")
+                .args([
+                    "osd",
+                    "pool",
+                    "set",
+                    pool,
+                    "min_size",
+                    &req.min_size.to_string(),
+                ])
+                .output()
+                .await;
+        }
+        let _ = Command::new("ceph")
+            .args(["osd", "pool", "application", "enable", pool, "rbd"])
+            .output()
+            .await;
+        let init = Command::new("rbd")
+            .args(["pool", "init", pool])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("rbd pool init: {e}")))?;
+        if !init.status.success() {
+            let err = String::from_utf8_lossy(&init.stderr);
+            if !err.contains("already initialized") && !err.is_empty() {
+                return Err(Status::internal(format!(
+                    "rbd pool init failed: {}",
+                    err.trim()
+                )));
+            }
+        }
+        Ok(Response::new(proto::EnsureCephPoolResponse {
+            success: true,
+            created,
+            message: if created {
+                format!("created and initialized pool {pool}")
+            } else {
+                format!("pool {pool} already present")
+            },
+        }))
+    }
+
+    async fn prepare_live_migrate_receive(
+        &self,
+        request: Request<proto::PrepareLiveMigrateReceiveRequest>,
+    ) -> Result<Response<proto::PrepareLiveMigrateReceiveResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        let pool = req.rbd_pool.trim();
+        let image = req.rbd_image.trim();
+        if vm_name.is_empty() || pool.is_empty() || image.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_name, rbd_pool, and rbd_image are required",
+            ));
+        }
+        if self.live_migrate.get_port(vm_name).await.is_some() {
+            return Err(Status::already_exists(format!(
+                "live migrate receive already prepared for {vm_name}"
+            )));
+        }
+        // The handoff writes a marker and a pid file that the generated VM unit
+        // reads. If the two disagree about where those live, the destination
+        // unit cold-starts a second Cloud Hypervisor instead of adopting the
+        // migrated one, so refuse the migration rather than corrupt the guest.
+        live_migrate::check_socket_dir_matches_nix(&self.vm_socket_dir)
+            .map_err(Status::failed_precondition)?;
+
+        if req.listen_port > u16::MAX as i32 || req.listen_port < 0 {
+            return Err(Status::invalid_argument(format!(
+                "listen_port {} is not a TCP port",
+                req.listen_port
+            )));
+        }
+        // Hold a listener on the port until Cloud Hypervisor is about to bind
+        // it, so nothing can win the race in between.
+        let port = if req.listen_port > 0 {
+            self.live_migrate
+                .reserve_explicit_port(req.listen_port as u16)
+                .await
+                .map_err(Status::failed_precondition)?
+        } else {
+            self.live_migrate
+                .reserve_port()
+                .await
+                .map_err(Status::resource_exhausted)?
+        };
+
+        let prepared = self
+            .prepare_receive_session(vm_name, pool, image, port)
+            .await;
+        if prepared.is_err() {
+            self.live_migrate.release_port(port).await;
+        }
+        prepared
+    }
+
+    async fn wait_live_migrate_receive(
+        &self,
+        request: Request<proto::WaitLiveMigrateReceiveRequest>,
+    ) -> Result<Response<proto::WaitLiveMigrateReceiveResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let timeout = if req.timeout_seconds > 0 {
+            std::time::Duration::from_secs(req.timeout_seconds as u64)
+        } else {
+            std::time::Duration::from_secs(600)
+        };
+        let Some(session) = self.live_migrate.take(vm_name).await else {
+            // Receive may have already completed and been consumed; treat marker as success.
+            let marker = live_migrate::handoff_marker_path(&self.vm_socket_dir, vm_name);
+            if marker.exists() {
+                return Ok(Response::new(proto::WaitLiveMigrateReceiveResponse {
+                    success: true,
+                    message: "receive already completed".into(),
+                }));
+            }
+            return Err(Status::not_found(format!(
+                "no live migrate receive session for {vm_name}"
+            )));
+        };
+        let port = session.port;
+        let outcome = tokio::time::timeout(timeout, session.receive_task).await;
+        // Either way the port is no longer ours to hold: Cloud Hypervisor owns
+        // it on success, and on failure it must go back to the pool.
+        self.live_migrate.release_port(port).await;
+        outcome
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "timed out after {}s waiting for {vm_name} to finish arriving",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| Status::internal(format!("receive task for {vm_name} panicked: {e}")))?
+            .map_err(|e| {
+                Status::internal(format!("receiving live migration for {vm_name}: {e}"))
+            })?;
+        Ok(Response::new(proto::WaitLiveMigrateReceiveResponse {
+            success: true,
+            message: "live migration receive completed".into(),
+        }))
+    }
+
+    async fn abort_live_migrate_receive(
+        &self,
+        request: Request<proto::AbortLiveMigrateReceiveRequest>,
+    ) -> Result<Response<proto::AbortLiveMigrateReceiveResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let observed = self
+            .clear_receive_session(vm_name, req.rbd_pool.trim(), req.rbd_image.trim())
+            .await;
+        Ok(Response::new(proto::AbortLiveMigrateReceiveResponse {
+            success: true,
+            message: "aborted live migrate receive".into(),
+            observed: Some(receive_state_to_proto(&observed)),
+        }))
+    }
+
+    async fn get_live_migrate_receive_status(
+        &self,
+        request: Request<proto::GetLiveMigrateReceiveStatusRequest>,
+    ) -> Result<Response<proto::GetLiveMigrateReceiveStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let observed =
+            live_migrate::observe_receive(&self.live_migrate, &self.vm_socket_dir, vm_name).await;
+        Ok(Response::new(proto::GetLiveMigrateReceiveStatusResponse {
+            success: true,
+            message: observed.summary(),
+            state: Some(receive_state_to_proto(&observed)),
+        }))
+    }
+
+    async fn send_live_migrate(
+        &self,
+        request: Request<proto::SendLiveMigrateRequest>,
+    ) -> Result<Response<proto::SendLiveMigrateResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        let dest = req.destination_url.trim();
+        if vm_name.is_empty() || dest.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_name and destination_url are required",
+            ));
+        }
+        if !dest.starts_with("tcp:") {
+            return Err(Status::invalid_argument(
+                "destination_url must start with tcp:",
+            ));
+        }
+        let unit = live_migrate::vm_unit_name(vm_name);
+        live_migrate::disable_unit_restart(&unit)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "disabling systemd restart for {unit} before sending: {e}"
+                ))
+            })?;
+        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        let timeout = if req.timeout_seconds > 0 {
+            std::time::Duration::from_secs(req.timeout_seconds as u64)
+        } else {
+            std::time::Duration::from_secs(600)
+        };
+        let send_fut = client.send_migration(vm_name, dest);
+        tokio::time::timeout(timeout, send_fut)
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "timed out after {}s sending {vm_name} to {dest}",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                Status::internal(format!(
+                    "cloud-hypervisor refused to send {vm_name} to {dest}: {e}"
+                ))
+            })?;
+        Ok(Response::new(proto::SendLiveMigrateResponse {
+            success: true,
+            message: format!("sent migration for {vm_name} to {dest}"),
+        }))
+    }
+
+    async fn finalize_live_migrate_source(
+        &self,
+        request: Request<proto::FinalizeLiveMigrateSourceRequest>,
+    ) -> Result<Response<proto::FinalizeLiveMigrateSourceResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let unit = live_migrate::vm_unit_name(vm_name);
+        let _ = live_migrate::disable_unit_restart(&unit).await;
+        if let Err(e) = live_migrate::stop_unit(&unit).await {
+            // Unit may already be inactive after CH exited on send.
+            warn!(error = %e, unit = %unit, "finalize source stop");
+        }
+        let pool = req.rbd_pool.trim();
+        let image = req.rbd_image.trim();
+        let has_rbd = !pool.is_empty() && !image.is_empty();
+        if has_rbd {
+            live_migrate::ensure_rbd_unmapped(pool, image)
+                .map_err(|e| Status::internal(format!("unmap RBD on source: {e}")))?;
+        }
+        // Report observed state, not the fact that we asked: the controller
+        // uses these to decide whether it is safe to start the VM elsewhere.
+        let vmm_stopped = live_migrate::unit_is_stopped(&unit)
+            .await
+            .map_err(Status::internal)?;
+        let rbd_unmapped = !has_rbd || !live_migrate::rbd_is_mapped(pool, image);
+        Ok(Response::new(proto::FinalizeLiveMigrateSourceResponse {
+            success: vmm_stopped && rbd_unmapped,
+            message: if vmm_stopped && rbd_unmapped {
+                format!("finalized source after migrate of {vm_name}")
+            } else {
+                format!(
+                    "source not fully released for {vm_name} (vmm_stopped={vmm_stopped}, rbd_unmapped={rbd_unmapped})"
+                )
+            },
+            vmm_stopped,
+            rbd_unmapped,
+        }))
+    }
+
+    async fn finalize_live_migrate_dest(
+        &self,
+        request: Request<proto::FinalizeLiveMigrateDestRequest>,
+    ) -> Result<Response<proto::FinalizeLiveMigrateDestResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let unit = live_migrate::vm_unit_name(vm_name);
+        // The unit only exists once the destination's nixos-rebuild activated,
+        // and that runs asynchronously. Starting a unit systemd has never heard
+        // of would fail the migration for a reason that fixes itself.
+        live_migrate::wait_for_unit_loaded(&unit, UNIT_LOADED_TIMEOUT)
+            .await
+            .map_err(Status::failed_precondition)?;
+        let out = Command::new("systemctl")
+            .args(["start", &unit])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("systemctl start {unit}: {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "systemctl start {unit} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(Response::new(proto::FinalizeLiveMigrateDestResponse {
+            success: true,
+            message: format!("adopted migrated VM via {unit}"),
         }))
     }
 
@@ -1756,6 +2691,54 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             })),
         }
     }
+
+    async fn rotate_node_cert(
+        &self,
+        request: Request<proto::RotateNodeCertRequest>,
+    ) -> Result<Response<proto::RotateNodeCertResponse>, Status> {
+        // Only the controller may drive rotation; kctl goes through the
+        // controller's RotateNodeCerts RPC so the inventory stays authoritative.
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+
+        let pki = self.pki.as_ref().ok_or_else(|| {
+            Status::unimplemented(
+                "this node-agent has no enrolled TLS identity; certificate rotation is unavailable",
+            )
+        })?;
+
+        let _guard = self.rotate_lock.lock().await;
+        match crate::pki::rotate::rotate_once(
+            &pki.cfg,
+            &pki.cfg.cert_rotation,
+            req.force,
+            &req.reason,
+            &pki.reload,
+        )
+        .await
+        {
+            Ok(outcome) => Ok(Response::new(proto::RotateNodeCertResponse {
+                success: true,
+                message: outcome.message,
+                serial_hex: outcome.serial_hex,
+                skipped: outcome.skipped,
+                days_until_expiry: outcome.days_until_expiry,
+            })),
+            // A failed rotation is reported in-band rather than as a Status:
+            // the node is still healthy on its previous certificate, and the
+            // controller's reconciler logs the message and retries next tick.
+            Err(error) => {
+                warn!(%error, node_id = %pki.cfg.node_id, "certificate rotation failed; keeping the existing certificate");
+                Ok(Response::new(proto::RotateNodeCertResponse {
+                    success: false,
+                    message: error,
+                    serial_hex: String::new(),
+                    skipped: false,
+                    days_until_expiry: 0,
+                }))
+            }
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2013,6 +2996,21 @@ fn rollback_blocking(rollback_dir: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use tonic::Request;
+
+    #[test]
+    fn validate_apply_ceph_config_args_requires_nix_and_fsid() {
+        assert!(validate_apply_ceph_config_args("{ }", "fsid").is_ok());
+        assert!(validate_apply_ceph_config_args("", "fsid").is_err());
+        assert!(validate_apply_ceph_config_args("{ }", "  ").is_err());
+        assert!(validate_apply_ceph_config_args("  ", "").is_err());
+    }
+
+    #[test]
+    fn validate_bootstrap_osd_device_requires_absolute_path() {
+        assert!(validate_bootstrap_osd_device("/dev/nvme0n1").is_ok());
+        assert!(validate_bootstrap_osd_device("nvme0n1").is_err());
+        assert!(validate_bootstrap_osd_device("  ").is_err());
+    }
 
     #[test]
     fn bootstrap_pki_writes_supplied_materials_with_correct_permissions() {
@@ -2290,6 +3288,230 @@ mod tests {
         assert!(resp.message.contains("test mode"));
     }
 
+    /// Build a service whose socket dir is a tempdir, so the receive-session
+    /// tests can create and assert on marker / pid / socket files.
+    fn receive_svc(socket_dir: &std::path::Path, state: LiveMigrateState) -> AdminService {
+        AdminService::new_with_storage(
+            socket_dir.join("kcore-vms.nix").display().to_string(),
+            socket_dir.display().to_string(),
+            storage::default_adapter(),
+            state,
+        )
+    }
+
+    /// The cleanup behind both `AbortLiveMigrateReceive` and the operator
+    /// reset. Called directly because the handlers require a real mTLS peer
+    /// certificate, which a unit test has no way to present.
+    async fn clear(svc: &AdminService, vm: &str) -> live_migrate::ReceiveObservation {
+        svc.clear_receive_session(vm, "", "").await
+    }
+
+    /// A pid that is certainly not running: spawned and reaped.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    }
+
+    /// `kill(0, SIGTERM)` signals the caller's whole process group, so a
+    /// session that never learned its VMM's pid must not reach `kill` at all.
+    /// Without this guard the node agent would SIGTERM itself.
+    #[test]
+    fn nix_kill_refuses_pid_zero() {
+        let err = nix_kill(0).expect_err("pid 0 must be refused");
+        assert!(err.contains("process group"), "unexpected message: {err}");
+    }
+
+    /// The operator escape hatch: a stranded session must be cleared along
+    /// with everything it owns — the port reservation, the marker and the pid
+    /// file — so a retried migration can prepare a fresh receive.
+    #[tokio::test]
+    async fn clearing_a_stranded_session_releases_the_port_marker_and_pid_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = LiveMigrateState::new();
+        let port = state.reserve_port().await.expect("reserve");
+        let vm = "vm-stranded";
+        let ch_pid = dead_pid();
+        state
+            .insert(
+                vm,
+                ReceiveSession {
+                    port,
+                    ch_pid,
+                    receive_task: tokio::spawn(async { Ok(()) }),
+                },
+            )
+            .await;
+
+        let marker = live_migrate::handoff_marker_path(temp.path(), vm);
+        let pid_file = live_migrate::migrate_pid_path(temp.path(), vm);
+        let socket = temp.path().join(format!("{vm}.sock"));
+        std::fs::write(&marker, b"1").expect("marker");
+        std::fs::write(&pid_file, ch_pid.to_string()).expect("pid");
+        std::fs::write(&socket, b"").expect("socket");
+
+        let svc = receive_svc(temp.path(), state.clone());
+        let observed = clear(&svc, vm).await;
+
+        assert!(
+            observed.has_session,
+            "the session was there before clearing"
+        );
+        assert_eq!(observed.port, port);
+
+        assert!(!marker.exists(), "handoff marker must be removed");
+        assert!(!pid_file.exists(), "pid file must be removed");
+        assert!(!socket.exists(), "API socket must be removed");
+        assert!(
+            state.get_port(vm).await.is_none(),
+            "the session must no longer be tracked"
+        );
+        // The freed port must be reservable again, otherwise the next
+        // migration to this node loses a slot in the fixed range for good.
+        assert_eq!(
+            state.reserve_explicit_port(port).await.expect("re-reserve"),
+            port
+        );
+    }
+
+    /// Idempotent by design: a runbook step an operator repeats, or runs on
+    /// the wrong node first, must not turn into an error to reason about.
+    #[tokio::test]
+    async fn clearing_a_node_with_no_session_is_a_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let svc = receive_svc(temp.path(), LiveMigrateState::new());
+
+        let observed = clear(&svc, "vm-absent").await;
+        assert!(observed.is_empty(), "nothing was there to begin with");
+        assert!(!observed.vmm_alive);
+
+        // Twice, for good measure: repeating it changes nothing and is still
+        // reported as an empty node rather than an error.
+        assert!(clear(&svc, "vm-absent").await.is_empty());
+    }
+
+    /// A stale pid file whose number has been recycled must not get an
+    /// unrelated process killed. The reported state has to say so, and the
+    /// file still has to be cleaned up.
+    #[tokio::test]
+    async fn clearing_does_not_kill_a_recycled_pid_but_still_clears_the_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vm = "vm-recycled";
+        let pid_file = live_migrate::migrate_pid_path(temp.path(), vm);
+        // The test process itself: alive, and definitely not this VM's VMM.
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("pid");
+
+        let svc = receive_svc(temp.path(), LiveMigrateState::new());
+        let observed = clear(&svc, vm).await;
+
+        assert!(observed.vmm_alive);
+        assert!(!observed.vmm_pid_matches_vm);
+        assert!(!pid_file.exists(), "the stale pid file must be discarded");
+        // If the guard had failed we would have SIGTERMed the test process.
+        assert!(live_migrate::pid_is_alive(std::process::id()));
+    }
+
+    /// The state the operator sees comes from the same snapshot the cleanup
+    /// uses, and taking it must not disturb the session.
+    #[tokio::test]
+    async fn observing_a_prepared_session_leaves_it_intact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = LiveMigrateState::new();
+        let port = state.reserve_port().await.expect("reserve");
+        let vm = "vm-inspect";
+        let ch_pid = dead_pid();
+        state
+            .insert(
+                vm,
+                ReceiveSession {
+                    port,
+                    ch_pid,
+                    receive_task: tokio::spawn(async { Ok(()) }),
+                },
+            )
+            .await;
+        let marker = live_migrate::handoff_marker_path(temp.path(), vm);
+        std::fs::write(&marker, b"1").expect("marker");
+
+        let svc = receive_svc(temp.path(), state.clone());
+        let observed =
+            live_migrate::observe_receive(&svc.live_migrate, &svc.vm_socket_dir, vm).await;
+        let wire = receive_state_to_proto(&observed);
+
+        assert!(wire.has_session);
+        assert_eq!(wire.port, port as i32);
+        assert_eq!(wire.session_pid, ch_pid);
+        assert!(wire.marker_present);
+        assert!(!wire.summary.is_empty());
+
+        // Read-only: inspecting must not disturb the session or its files.
+        assert!(marker.exists(), "inspection must not delete the marker");
+        assert_eq!(state.get_port(vm).await, Some(port));
+    }
+
+    /// Both handlers are behind the controller's client certificate, so an
+    /// unauthenticated caller can neither read nor clear session state.
+    #[tokio::test]
+    async fn receive_session_rpcs_require_a_peer_certificate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let svc = receive_svc(temp.path(), LiveMigrateState::new());
+
+        let err =
+            <AdminService as proto::node_admin_server::NodeAdmin>::get_live_migrate_receive_status(
+                &svc,
+                Request::new(proto::GetLiveMigrateReceiveStatusRequest {
+                    vm_name: "vm-1".into(),
+                }),
+            )
+            .await
+            .expect_err("status must require mTLS");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let err =
+            <AdminService as proto::node_admin_server::NodeAdmin>::abort_live_migrate_receive(
+                &svc,
+                Request::new(proto::AbortLiveMigrateReceiveRequest {
+                    vm_name: "vm-1".into(),
+                    rbd_pool: String::new(),
+                    rbd_image: String::new(),
+                }),
+            )
+            .await
+            .expect_err("abort must require mTLS");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// A superseded apply must not read as `running` forever: the controller
+    /// polls until it gets a verdict, and `running` would make it wait out its
+    /// whole timeout for a rebuild that was already killed.
+    #[test]
+    fn apply_phase_to_proto_reports_a_superseded_apply_as_unknown() {
+        assert_eq!(
+            apply_phase_to_proto(NIX_APPLY_SUPERSEDED),
+            proto::NixApplyPhase::Unknown as i32
+        );
+        assert_eq!(
+            apply_phase_to_proto(NIX_APPLY_RUNNING),
+            proto::NixApplyPhase::Running as i32
+        );
+        assert_eq!(
+            apply_phase_to_proto(NIX_APPLY_SUCCEEDED),
+            proto::NixApplyPhase::Succeeded as i32
+        );
+        assert_eq!(
+            apply_phase_to_proto(NIX_APPLY_FAILED),
+            proto::NixApplyPhase::Failed as i32
+        );
+        assert_eq!(
+            apply_phase_to_proto("something-else"),
+            proto::NixApplyPhase::Unknown as i32
+        );
+    }
+
     #[tokio::test]
     async fn apply_nix_config_requires_mtls_in_insecure_mode() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2298,6 +3520,7 @@ mod tests {
         let req = proto::ApplyNixConfigRequest {
             configuration_nix: "{ ... }: { test = true; }\n".to_string(),
             rebuild: false,
+            apply_id: String::new(),
         };
 
         let status = <AdminService as proto::node_admin_server::NodeAdmin>::apply_nix_config(
@@ -2322,6 +3545,7 @@ mod tests {
             Request::new(proto::ApplyNixConfigRequest {
                 configuration_nix: "{ ... }: {}\n".to_string(),
                 rebuild: false,
+                apply_id: String::new(),
             }),
         )
         .await

@@ -7,6 +7,9 @@
 )]
 
 mod auth;
+mod ceph_cluster_reconciler;
+mod ceph_cluster_spec;
+mod cert_rotation_reconciler;
 mod cluster_update_reconciler;
 mod cluster_update_spec;
 mod config;
@@ -16,6 +19,7 @@ mod grpc;
 mod nixgen;
 mod node_client;
 mod path_safety;
+mod pki;
 mod replication;
 mod replication_policy;
 mod scheduler;
@@ -55,10 +59,12 @@ fn install_fips_crypto_provider() {
 }
 
 pub mod controller_proto {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("kcore.controller");
 }
 
 pub mod node_proto {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("kcore.node");
 }
 
@@ -118,7 +124,69 @@ async fn main() -> anyhow::Result<()> {
     replication::spawn_head_materializer(database.clone());
     replication::spawn_reservation_retry_executor(database.clone());
     disk_reconciler::spawn_disk_layout_reconciler(database.clone(), clients.clone());
+    ceph_cluster_reconciler::spawn_ceph_cluster_reconciler(database.clone(), clients.clone());
     cluster_update_reconciler::spawn_cluster_update_reconciler(database.clone(), clients.clone());
+
+    let crl_cache = pki::crl::CrlCache::new();
+    crl_cache.load_from_db(&database);
+    let revocation = if cfg.revocation.enabled {
+        let fail_mode = pki::revocation::FailMode::from_config_str(&cfg.revocation.fail_mode)
+            .unwrap_or_default();
+        info!(
+            fail_mode = fail_mode.as_str(),
+            max_staleness_secs = cfg.revocation.max_staleness_secs,
+            "peer certificate revocation checking enabled"
+        );
+        pki::revocation::RevocationState::new(
+            fail_mode,
+            time::Duration::seconds(cfg.revocation.max_staleness_secs as i64),
+        )
+    } else {
+        warn!("peer certificate revocation checking is DISABLED (revocation.enabled: false)");
+        pki::revocation::RevocationState::disabled()
+    };
+
+    // Load the revoked set before the listener opens. The reconciler refreshes
+    // it on every tick, but under `hard-fail` a listener that starts before the
+    // first refresh would reject every peer for the length of that race.
+    if let Err(error) = revocation.refresh(&database) {
+        warn!(%error, "initial revoked-serial load failed");
+    }
+
+    cert_rotation_reconciler::spawn_cert_rotation_reconciler(
+        cert_rotation_reconciler::CertRotationContext {
+            db: database.clone(),
+            clients: clients.clone(),
+            sub_ca: sub_ca.clone(),
+            crl_cache: crl_cache.clone(),
+            revocation: revocation.clone(),
+            rotation: cfg.cert_rotation.clone(),
+            pki: cfg.pki.clone(),
+        },
+    );
+
+    if cfg.pki.http_enabled {
+        match cfg.pki.http_listen_addr.parse::<std::net::SocketAddr>() {
+            Ok(pki_addr) => {
+                let state = pki::http::PkiHttpState {
+                    db: database.clone(),
+                    sub_ca: sub_ca.clone(),
+                    crl_cache: crl_cache.clone(),
+                    ocsp_validity: time::Duration::hours(cfg.pki.ocsp_validity_hours),
+                };
+                tokio::spawn(pki::http::serve(pki_addr, state));
+            }
+            Err(error) => warn!(
+                addr = %cfg.pki.http_listen_addr,
+                %error,
+                "invalid pki.httpListenAddr; CRL/OCSP HTTP endpoints disabled"
+            ),
+        }
+    } else {
+        info!(
+            "PKI HTTP endpoints disabled (pki.httpEnabled: false); nodes must use the GetCrl RPC"
+        );
+    }
 
     let staleness_db = database.clone();
     tokio::spawn(async move {
@@ -158,24 +226,40 @@ async fn main() -> anyhow::Result<()> {
             cfg.replication.clone(),
             cfg.require_manual_approval,
             bootstrap_kctl,
-        );
+        )
+        .with_pki(grpc::PkiRuntime {
+            crl_cache: crl_cache.clone(),
+            revocation: revocation.clone(),
+            rotation: cfg.cert_rotation.clone(),
+            pki: cfg.pki.clone(),
+        });
         if let Some(tls) = cfg.tls.as_ref() {
             svc = svc.with_tls_paths(grpc::TlsPaths {
                 cert_file: tls.cert_file.clone(),
                 key_file: tls.key_file.clone(),
             });
         }
-        let controller_svc = controller_proto::controller_server::ControllerServer::new(svc);
+        // Revocation is enforced as an interceptor so every RPC on both
+        // services is covered from one wiring point. tonic builds its rustls
+        // ServerConfig internally and takes no custom ClientCertVerifier, so
+        // this is the earliest place we can reject a revoked peer.
+        let controller_svc =
+            controller_proto::controller_server::ControllerServer::with_interceptor(
+                svc,
+                pki::revocation::interceptor(revocation.clone()),
+            );
 
-        let admin_svc = controller_proto::controller_admin_server::ControllerAdminServer::new(
-            grpc::ControllerAdminService::new(
-                database.clone(),
-                cfg.replication.clone(),
-                addr.port(),
-                bootstrap_kctl,
-                cfg.tls.is_some(),
-            ),
-        );
+        let admin_svc =
+            controller_proto::controller_admin_server::ControllerAdminServer::with_interceptor(
+                grpc::ControllerAdminService::new(
+                    database.clone(),
+                    cfg.replication.clone(),
+                    addr.port(),
+                    bootstrap_kctl,
+                    cfg.tls.is_some(),
+                ),
+                pki::revocation::interceptor(revocation.clone()),
+            );
 
         let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
         health_reporter

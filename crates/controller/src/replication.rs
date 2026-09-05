@@ -1306,9 +1306,12 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                     .unwrap_or_default()
                     .to_string(),
             };
-            let _ = db.delete_vm_by_id_or_name(vm_id);
-            db.insert_vm(&vm)
-                .map_err(|e| format!("insert vm {vm_id} from replication head: {e}"))?;
+            // In place, not delete-then-insert: replaying `vm.create` for a VM
+            // this controller already holds would otherwise cascade away its
+            // `vm_ssh_keys` and `security_group_vm_attachments` rows, which the
+            // event body does not carry in full.
+            db.upsert_vm(&vm)
+                .map_err(|e| format!("upsert vm {vm_id} from replication head: {e}"))?;
             let ssh_keys: Vec<String> = body
                 .get("sshKeyNames")
                 .and_then(Value::as_array)
@@ -1742,6 +1745,7 @@ fn storage_backend_from_i32(raw: i32) -> &'static str {
     match kind {
         controller_proto::StorageBackendType::Lvm => "lvm",
         controller_proto::StorageBackendType::Zfs => "zfs",
+        controller_proto::StorageBackendType::Ceph => "ceph",
         controller_proto::StorageBackendType::Filesystem
         | controller_proto::StorageBackendType::Unspecified => "filesystem",
     }
@@ -2206,6 +2210,54 @@ mod tests {
             .expect("node lookup")
             .is_some());
         assert!(db.get_vm("v-missing-node").expect("vm lookup").is_some());
+    }
+
+    /// Regression: materialization applied `vm.create` as delete-then-insert,
+    /// so replaying an event for a VM this controller already holds cascaded
+    /// away its security group attachments — which the event body does not
+    /// carry and so could never be restored.
+    #[test]
+    fn materializer_vm_create_replay_keeps_security_group_attachments() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node("node-replay");
+        db.upsert_node(&node).expect("insert node");
+        db.insert_vm(&test_vm("vm-replay", &node.id))
+            .expect("insert vm");
+        db.upsert_security_group(&crate::db::SecurityGroupRow {
+            name: "web".to_string(),
+            description: String::new(),
+            created_at: String::new(),
+        })
+        .expect("security group");
+        db.attach_security_group_to_vm("web", "vm-replay")
+            .expect("attach");
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "vm/vm-replay".to_string(),
+            last_op_id: "op-vm-replay".to_string(),
+            last_logical_ts_unix_ms: 100,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 31,
+            last_event_type: "vm.create".to_string(),
+            last_body_json: format!(
+                r#"{{"vmId":"vm-replay","name":"vm-replay","nodeId":"{}","cpu":4,"memoryBytes":2147483648,"imagePath":"","imageUrl":"","imageSha256":"","imageFormat":"qcow2","imageSize":0,"network":"default","autoStart":true,"runtimeState":"unknown","cloudInitUserData":"","storageBackend":"filesystem","storageSizeBytes":0,"vmIp":""}}"#,
+                node.id
+            ),
+        })
+        .expect("upsert vm head");
+
+        assert!(process_materialization_once(&db).expect("materialize replay"));
+        let stored = db.get_vm("vm-replay").expect("vm lookup").expect("vm");
+        assert_eq!(stored.cpu, 4, "the replayed body must be applied");
+        assert_eq!(
+            db.list_security_groups_for_vm("vm-replay").expect("groups"),
+            vec!["web".to_string()],
+            "replaying vm.create must not drop the VM's security groups"
+        );
     }
 
     #[test]
@@ -2881,6 +2933,9 @@ mod tests {
                 peers: vec![],
             }),
             require_manual_approval: false,
+            cert_rotation: Default::default(),
+            revocation: Default::default(),
+            pki: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 
@@ -2914,6 +2969,9 @@ mod tests {
             },
             replication: None,
             require_manual_approval: false,
+            cert_rotation: Default::default(),
+            revocation: Default::default(),
+            pki: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 

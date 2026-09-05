@@ -149,6 +149,36 @@ pub struct DiskLayoutStatusRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct CephClusterRow {
+    pub name: String,
+    pub generation: i64,
+    pub spec_json: String,
+    pub bootstrap_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CephClusterStatusRow {
+    pub name: String,
+    pub observed_generation: i64,
+    pub phase: String,
+    pub health_message: String,
+    pub ceph_status_json: String,
+    pub last_transition_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct VolumeRow {
+    pub id: String,
+    pub vm_id: String,
+    pub pool: String,
+    pub image: String,
+    pub size_bytes: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ClusterUpdateRow {
     pub name: String,
     pub generation: i64,
@@ -283,6 +313,43 @@ pub struct AuditEventRow {
     pub resource: String,
     pub created_at: String,
     pub detail: String,
+}
+
+pub const CERT_STATUS_ACTIVE: &str = "active";
+pub const CERT_STATUS_ROTATED: &str = "rotated";
+pub const CERT_STATUS_REVOKED: &str = "revoked";
+
+/// One certificate the controller has issued (`issued_certificates`).
+///
+/// Timestamps are RFC3339 `%Y-%m-%dT%H:%M:%SZ` strings so lexicographic
+/// comparison in SQL matches chronological order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuedCertRow {
+    pub serial_hex: String,
+    pub subject_cn: String,
+    pub identity_kind: String,
+    pub node_id: String,
+    pub issuer_cn: String,
+    pub fingerprint_sha256: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub issued_at: String,
+    pub status: String,
+    /// RFC 5280 reason code, or -1 when the certificate is not revoked.
+    pub revocation_reason: i32,
+    pub revoked_at: String,
+}
+
+/// Last CRL the controller signed (`crl_state`, single row).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrlStateRow {
+    pub crl_number: i64,
+    pub this_update: String,
+    pub next_update: String,
+    pub crl_pem: String,
+    pub crl_der: Vec<u8>,
+    pub revoked_count: i32,
+    pub issuer_fingerprint: String,
 }
 
 impl Database {
@@ -919,7 +986,86 @@ impl Database {
             );
         }
 
-        const CURRENT_VERSION: i32 = 30;
+        if version < 31 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ceph_clusters (
+                    name TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    spec_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS ceph_cluster_status (
+                    name TEXT PRIMARY KEY REFERENCES ceph_clusters(name) ON DELETE CASCADE,
+                    observed_generation INTEGER NOT NULL DEFAULT 0,
+                    phase TEXT NOT NULL DEFAULT 'pending',
+                    health_message TEXT NOT NULL DEFAULT '',
+                    ceph_status_json TEXT NOT NULL DEFAULT '',
+                    last_transition_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS volumes (
+                    id TEXT PRIMARY KEY,
+                    vm_id TEXT NOT NULL UNIQUE,
+                    pool TEXT NOT NULL,
+                    image TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_volumes_vm ON volumes(vm_id);",
+            )?;
+        }
+
+        if version < 32 {
+            let _ = conn.execute(
+                "ALTER TABLE ceph_clusters ADD COLUMN bootstrap_json TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+        }
+
+        // Certificate inventory + signed CRL state (docs/mtls-bootstrap-and-auth.md §4).
+        // `serial_hex` is uppercase hex without separators so it matches
+        // `openssl x509 -serial` output and can be compared to the serial
+        // extracted from a peer certificate without normalisation.
+        if version < 33 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS issued_certificates (
+                    serial_hex TEXT PRIMARY KEY,
+                    subject_cn TEXT NOT NULL,
+                    identity_kind TEXT NOT NULL DEFAULT 'node',
+                    node_id TEXT NOT NULL DEFAULT '',
+                    issuer_cn TEXT NOT NULL DEFAULT '',
+                    fingerprint_sha256 TEXT NOT NULL DEFAULT '',
+                    not_before TEXT NOT NULL,
+                    not_after TEXT NOT NULL,
+                    issued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                    status TEXT NOT NULL DEFAULT 'active',
+                    revocation_reason INTEGER NOT NULL DEFAULT -1,
+                    revoked_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_issued_certs_status
+                  ON issued_certificates(status);
+                CREATE INDEX IF NOT EXISTS idx_issued_certs_not_after
+                  ON issued_certificates(not_after);
+                CREATE INDEX IF NOT EXISTS idx_issued_certs_node
+                  ON issued_certificates(node_id);
+                CREATE INDEX IF NOT EXISTS idx_issued_certs_subject
+                  ON issued_certificates(subject_cn);
+                -- Single row (id = 1) holding the last signed CRL so crl_number
+                -- stays monotonic across controller restarts.
+                CREATE TABLE IF NOT EXISTS crl_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    crl_number INTEGER NOT NULL DEFAULT 0,
+                    this_update TEXT NOT NULL DEFAULT '',
+                    next_update TEXT NOT NULL DEFAULT '',
+                    crl_pem TEXT NOT NULL DEFAULT '',
+                    crl_der BLOB NOT NULL DEFAULT x'',
+                    revoked_count INTEGER NOT NULL DEFAULT 0,
+                    issuer_fingerprint TEXT NOT NULL DEFAULT ''
+                );",
+            )?;
+        }
+
+        const CURRENT_VERSION: i32 = 33;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -1889,6 +2035,58 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a VM row, or update it in place when the id already exists.
+    ///
+    /// Replication materialization replays `vm.create` for VMs a peer may
+    /// already hold. Emulating that with delete-then-insert would cascade the
+    /// VM's `vm_ssh_keys` and `security_group_vm_attachments` rows away, so the
+    /// conflict is resolved with an `UPDATE` instead. `created_at` is left
+    /// alone: the VM is not being recreated.
+    pub fn upsert_vm(&self, vm: &VmRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                cpu=excluded.cpu,
+                memory_bytes=excluded.memory_bytes,
+                image_path=excluded.image_path,
+                image_url=excluded.image_url,
+                image_sha256=excluded.image_sha256,
+                image_format=excluded.image_format,
+                image_size=excluded.image_size,
+                network=excluded.network,
+                auto_start=excluded.auto_start,
+                node_id=excluded.node_id,
+                runtime_state=excluded.runtime_state,
+                cloud_init_user_data=excluded.cloud_init_user_data,
+                storage_backend=excluded.storage_backend,
+                storage_size_bytes=excluded.storage_size_bytes,
+                vm_ip=excluded.vm_ip",
+            params![
+                vm.id,
+                vm.name,
+                vm.cpu,
+                vm.memory_bytes,
+                vm.image_path,
+                vm.image_url,
+                vm.image_sha256,
+                vm.image_format,
+                vm.image_size,
+                vm.network,
+                vm.auto_start as i32,
+                vm.node_id,
+                vm.runtime_state,
+                vm.cloud_init_user_data,
+                vm.storage_backend,
+                vm.storage_size_bytes,
+                vm.vm_ip,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_workload(&self, workload: &WorkloadRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
@@ -2420,6 +2618,211 @@ impl Database {
         rows.collect()
     }
 
+    pub fn upsert_ceph_cluster(&self, row: &CephClusterRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ceph_clusters (name, generation, spec_json, bootstrap_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5, ''), datetime('now')), datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,
+               spec_json=excluded.spec_json,
+               bootstrap_json=CASE
+                 WHEN excluded.bootstrap_json != '' THEN excluded.bootstrap_json
+                 ELSE ceph_clusters.bootstrap_json
+               END,
+               updated_at=datetime('now')",
+            params![
+                row.name,
+                row.generation,
+                row.spec_json,
+                row.bootstrap_json,
+                row.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_ceph_cluster(&self, name: &str) -> Result<Option<CephClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, spec_json, COALESCE(bootstrap_json, ''), created_at, updated_at
+             FROM ceph_clusters WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(CephClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                bootstrap_json: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_ceph_clusters(&self) -> Result<Vec<CephClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, spec_json, COALESCE(bootstrap_json, ''), created_at, updated_at
+             FROM ceph_clusters ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CephClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                bootstrap_json: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_ceph_cluster_bootstrap(
+        &self,
+        name: &str,
+        bootstrap_json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE ceph_clusters SET bootstrap_json=?2, updated_at=datetime('now') WHERE name=?1",
+            params![name, bootstrap_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_ceph_cluster(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM ceph_clusters WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn upsert_ceph_cluster_status(
+        &self,
+        row: &CephClusterStatusRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ceph_cluster_status
+             (name, observed_generation, phase, health_message, ceph_status_json, last_transition_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET observed_generation=excluded.observed_generation,
+               phase=excluded.phase, health_message=excluded.health_message,
+               ceph_status_json=excluded.ceph_status_json, last_transition_at=datetime('now')",
+            params![row.name, row.observed_generation, row.phase, row.health_message, row.ceph_status_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_ceph_cluster_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<CephClusterStatusRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, observed_generation, phase, health_message, ceph_status_json,
+                    last_transition_at FROM ceph_cluster_status WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(CephClusterStatusRow {
+                name: r.get(0)?,
+                observed_generation: r.get(1)?,
+                phase: r.get(2)?,
+                health_message: r.get(3)?,
+                ceph_status_json: r.get(4)?,
+                last_transition_at: r.get(5)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_ceph_clusters_needing_reconcile(
+        &self,
+    ) -> Result<Vec<CephClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        // Requeue until healthy: lagging observed_generation OR non-terminal phase.
+        let mut stmt = conn.prepare(
+            "SELECT c.name, c.generation, c.spec_json, COALESCE(c.bootstrap_json, ''),
+                    c.created_at, c.updated_at
+             FROM ceph_clusters c LEFT JOIN ceph_cluster_status s ON s.name=c.name
+             WHERE s.name IS NULL
+                OR s.observed_generation < c.generation
+                OR s.phase IN ('pending', 'bootstrapping', 'degraded')
+             ORDER BY c.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CephClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                bootstrap_json: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn upsert_volume(&self, row: &VolumeRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO volumes (id, vm_id, pool, image, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(NULLIF(?6, ''), datetime('now')))
+             ON CONFLICT(vm_id) DO UPDATE SET pool=excluded.pool, image=excluded.image,
+               size_bytes=excluded.size_bytes",
+            params![
+                row.id,
+                row.vm_id,
+                row.pool,
+                row.image,
+                row.size_bytes,
+                row.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_volume_by_vm(&self, vm_id: &str) -> Result<Option<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, vm_id, pool, image, size_bytes, created_at FROM volumes WHERE vm_id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![vm_id], |r| {
+            Ok(VolumeRow {
+                id: r.get(0)?,
+                vm_id: r.get(1)?,
+                pool: r.get(2)?,
+                image: r.get(3)?,
+                size_bytes: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_volumes(&self) -> Result<Vec<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, vm_id, pool, image, size_bytes, created_at FROM volumes ORDER BY vm_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(VolumeRow {
+                id: r.get(0)?,
+                vm_id: r.get(1)?,
+                pool: r.get(2)?,
+                image: r.get(3)?,
+                size_bytes: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_volume_by_vm(&self, vm_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM volumes WHERE vm_id=?1", params![vm_id])? > 0)
+    }
+
     pub fn upsert_cluster_update(&self, row: &ClusterUpdateRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
@@ -2906,6 +3309,22 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Move a VM to another node in place.
+    ///
+    /// Every table keyed on `vms(id)` cascades on delete under
+    /// `PRAGMA foreign_keys=ON` (`vm_ssh_keys`,
+    /// `security_group_vm_attachments`), so reassignment must never be
+    /// expressed as delete-then-reinsert. Returns `false` when no such VM
+    /// exists; a missing target node is rejected by the `node_id` foreign key.
+    pub fn set_vm_node(&self, vm_id: &str, node_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE vms SET node_id = ?2 WHERE id = ?1",
+            params![vm_id, node_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_vm_spec(
         &self,
         id_or_name: &str,
@@ -3310,6 +3729,319 @@ impl Database {
         )?;
         Ok((tpm2, keyfile, unknown))
     }
+
+    // --- Certificate inventory (issued_certificates) -----------------------
+
+    /// Record a newly signed certificate. Re-recording the same serial is a
+    /// no-op on the revocation columns so a replayed insert cannot resurrect a
+    /// revoked serial as active.
+    pub fn record_issued_certificate(&self, row: &IssuedCertRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO issued_certificates
+                (serial_hex, subject_cn, identity_kind, node_id, issuer_cn,
+                 fingerprint_sha256, not_before, not_after, issued_at, status,
+                 revocation_reason, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(serial_hex) DO UPDATE SET
+                subject_cn=excluded.subject_cn,
+                identity_kind=excluded.identity_kind,
+                node_id=excluded.node_id,
+                issuer_cn=excluded.issuer_cn,
+                fingerprint_sha256=excluded.fingerprint_sha256,
+                not_before=excluded.not_before,
+                not_after=excluded.not_after",
+            params![
+                row.serial_hex,
+                row.subject_cn,
+                row.identity_kind,
+                row.node_id,
+                row.issuer_cn,
+                row.fingerprint_sha256,
+                row.not_before,
+                row.not_after,
+                row.issued_at,
+                row.status,
+                row.revocation_reason,
+                row.revoked_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark every `active` certificate for `subject_cn` (except `keep_serial`)
+    /// as `rotated`. Revoked rows are left alone.
+    pub fn mark_superseded_certificates(
+        &self,
+        subject_cn: &str,
+        keep_serial: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE issued_certificates SET status=?3
+             WHERE subject_cn=?1 AND serial_hex<>?2 AND status=?4",
+            params![
+                subject_cn,
+                keep_serial,
+                CERT_STATUS_ROTATED,
+                CERT_STATUS_ACTIVE
+            ],
+        )
+    }
+
+    pub fn get_issued_certificate(
+        &self,
+        serial_hex: &str,
+    ) -> Result<Option<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!("{ISSUED_CERT_SELECT} WHERE serial_hex=?1"))?;
+        let mut rows = stmt.query_map(params![serial_hex], map_issued_cert_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Inventory rows ordered by soonest expiry first.
+    ///
+    /// `status` filters on the status column when non-empty; `node_id` filters
+    /// on node when non-empty; `expiring_before` (RFC3339) keeps only rows with
+    /// `not_after` strictly before it when non-empty.
+    pub fn list_issued_certificates(
+        &self,
+        status: &str,
+        node_id: &str,
+        expiring_before: &str,
+    ) -> Result<Vec<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{ISSUED_CERT_SELECT}
+             WHERE (?1 = '' OR status = ?1)
+               AND (?2 = '' OR node_id = ?2)
+               AND (?3 = '' OR not_after < ?3)
+             ORDER BY not_after ASC, serial_hex ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![status, node_id, expiring_before],
+            map_issued_cert_row,
+        )?;
+        rows.collect()
+    }
+
+    /// Active, unexpired certificates whose `not_after` is at or before
+    /// `threshold` (RFC3339) — the rotation reconciler's work queue.
+    pub fn list_certificates_needing_rotation(
+        &self,
+        threshold: &str,
+        now: &str,
+    ) -> Result<Vec<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{ISSUED_CERT_SELECT}
+             WHERE status = ?3 AND not_after <= ?1 AND not_after > ?2
+             ORDER BY not_after ASC, serial_hex ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![threshold, now, CERT_STATUS_ACTIVE],
+            map_issued_cert_row,
+        )?;
+        rows.collect()
+    }
+
+    /// Newest active certificate for a node, if the node has one on record.
+    pub fn get_active_certificate_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{ISSUED_CERT_SELECT}
+             WHERE node_id=?1 AND status=?2
+             ORDER BY not_after DESC, serial_hex ASC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map(params![node_id, CERT_STATUS_ACTIVE], map_issued_cert_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Revoke by serial. Returns the updated row, or `None` when the serial is
+    /// unknown. Already-revoked serials keep their original reason and time so
+    /// the CRL entry stays stable.
+    pub fn revoke_certificate_by_serial(
+        &self,
+        serial_hex: &str,
+        reason: i32,
+        revoked_at: &str,
+    ) -> Result<Option<IssuedCertRow>, rusqlite::Error> {
+        {
+            let conn = self.lock_conn()?;
+            conn.execute(
+                "UPDATE issued_certificates
+                 SET status=?2, revocation_reason=?3, revoked_at=?4
+                 WHERE serial_hex=?1 AND status<>?2",
+                params![serial_hex, CERT_STATUS_REVOKED, reason, revoked_at],
+            )?;
+        }
+        self.get_issued_certificate(serial_hex)
+    }
+
+    /// Serials to revoke for an identity: every non-revoked row matching
+    /// `subject_cn` (when non-empty) or `node_id` (when non-empty).
+    pub fn find_revocable_serials(
+        &self,
+        subject_cn: &str,
+        node_id: &str,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT serial_hex FROM issued_certificates
+             WHERE status <> ?3
+               AND ((?1 <> '' AND subject_cn = ?1) OR (?2 <> '' AND node_id = ?2))
+             ORDER BY not_after DESC, serial_hex ASC",
+        )?;
+        let rows = stmt.query_map(params![subject_cn, node_id, CERT_STATUS_REVOKED], |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.collect()
+    }
+
+    /// `(serial_hex, revocation_reason, revoked_at)` for every revoked row —
+    /// the CRL contents.
+    pub fn list_revoked_certificates(&self) -> Result<Vec<(String, i32, String)>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT serial_hex, revocation_reason, revoked_at
+             FROM issued_certificates WHERE status = ?1
+             ORDER BY serial_hex ASC",
+        )?;
+        let rows = stmt.query_map(params![CERT_STATUS_REVOKED], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Just the revoked serial set, for the hot enforcement path.
+    pub fn revoked_serial_set(&self) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt =
+            conn.prepare("SELECT serial_hex FROM issued_certificates WHERE status = ?1")?;
+        let rows = stmt.query_map(params![CERT_STATUS_REVOKED], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// `(active, rotated, revoked, expired, expiring_soon)` inventory counts.
+    /// `expired` counts non-revoked rows already past `not_after`; a row is
+    /// counted once, with `expired` taking precedence over `active`.
+    pub fn count_certificates(
+        &self,
+        now: &str,
+        warn_threshold: &str,
+    ) -> Result<(i32, i32, i32, i32, i32), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i32, rusqlite::Error> {
+            conn.query_row(sql, p, |row| row.get(0))
+        };
+        let active = count(
+            "SELECT COUNT(*) FROM issued_certificates WHERE status=?1 AND not_after > ?2",
+            &[&CERT_STATUS_ACTIVE, &now],
+        )?;
+        let rotated = count(
+            "SELECT COUNT(*) FROM issued_certificates WHERE status=?1 AND not_after > ?2",
+            &[&CERT_STATUS_ROTATED, &now],
+        )?;
+        let revoked = count(
+            "SELECT COUNT(*) FROM issued_certificates WHERE status=?1",
+            &[&CERT_STATUS_REVOKED],
+        )?;
+        let expired = count(
+            "SELECT COUNT(*) FROM issued_certificates WHERE status<>?1 AND not_after <= ?2",
+            &[&CERT_STATUS_REVOKED, &now],
+        )?;
+        let expiring_soon = count(
+            "SELECT COUNT(*) FROM issued_certificates
+             WHERE status=?1 AND not_after > ?2 AND not_after <= ?3",
+            &[&CERT_STATUS_ACTIVE, &now, &warn_threshold],
+        )?;
+        Ok((active, rotated, revoked, expired, expiring_soon))
+    }
+
+    // --- CRL state (crl_state, single row) ---------------------------------
+
+    pub fn get_crl_state(&self) -> Result<Option<CrlStateRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT crl_number, this_update, next_update, crl_pem, crl_der,
+                    revoked_count, issuer_fingerprint
+             FROM crl_state WHERE id = 1",
+        )?;
+        let mut rows = stmt.query_map([], |r| {
+            Ok(CrlStateRow {
+                crl_number: r.get(0)?,
+                this_update: r.get(1)?,
+                next_update: r.get(2)?,
+                crl_pem: r.get(3)?,
+                crl_der: r.get(4)?,
+                revoked_count: r.get(5)?,
+                issuer_fingerprint: r.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_crl_state(&self, row: &CrlStateRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO crl_state
+                (id, crl_number, this_update, next_update, crl_pem, crl_der,
+                 revoked_count, issuer_fingerprint)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                crl_number=excluded.crl_number,
+                this_update=excluded.this_update,
+                next_update=excluded.next_update,
+                crl_pem=excluded.crl_pem,
+                crl_der=excluded.crl_der,
+                revoked_count=excluded.revoked_count,
+                issuer_fingerprint=excluded.issuer_fingerprint",
+            params![
+                row.crl_number,
+                row.this_update,
+                row.next_update,
+                row.crl_pem,
+                row.crl_der,
+                row.revoked_count,
+                row.issuer_fingerprint,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+const ISSUED_CERT_SELECT: &str = "SELECT serial_hex, subject_cn, identity_kind, node_id, issuer_cn,
+            fingerprint_sha256, not_before, not_after, issued_at, status,
+            revocation_reason, revoked_at
+     FROM issued_certificates";
+
+fn map_issued_cert_row(row: &rusqlite::Row<'_>) -> Result<IssuedCertRow, rusqlite::Error> {
+    Ok(IssuedCertRow {
+        serial_hex: row.get(0)?,
+        subject_cn: row.get(1)?,
+        identity_kind: row.get(2)?,
+        node_id: row.get(3)?,
+        issuer_cn: row.get(4)?,
+        fingerprint_sha256: row.get(5)?,
+        not_before: row.get(6)?,
+        not_after: row.get(7)?,
+        issued_at: row.get(8)?,
+        status: row.get(9)?,
+        revocation_reason: row.get(10)?,
+        revoked_at: row.get(11)?,
+    })
 }
 
 fn row_to_node(row: &rusqlite::Row) -> Result<NodeRow, rusqlite::Error> {
@@ -4363,6 +5095,108 @@ mod tests {
         assert!(rules[0].enable_dnat);
     }
 
+    /// Regression: node reassignment used to delete and re-insert the `vms`
+    /// row. Both child tables keyed on `vms(id)` cascade on delete, so every
+    /// migrate and drain silently dropped the VM's security groups.
+    #[test]
+    fn set_vm_node_moves_a_vm_without_dropping_its_child_rows() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".to_string();
+        db.upsert_node(&node_a).expect("node-a");
+        let mut node_b = test_node();
+        node_b.id = "node-b".to_string();
+        node_b.address = "10.0.0.2:9091".to_string();
+        db.upsert_node(&node_b).expect("node-b");
+
+        let vm = test_vm("node-a");
+        db.insert_vm(&vm).expect("insert vm");
+        db.insert_ssh_key("ops", "ssh-ed25519 AAAAtest ops@kcore")
+            .expect("ssh key");
+        db.associate_vm_ssh_keys(&vm.id, &["ops".to_string()])
+            .expect("associate key");
+        db.upsert_security_group(&SecurityGroupRow {
+            name: "web".to_string(),
+            description: String::new(),
+            created_at: String::new(),
+        })
+        .expect("security group");
+        db.attach_security_group_to_vm("web", &vm.id)
+            .expect("attach");
+
+        assert!(db.set_vm_node(&vm.id, "node-b").expect("reassign"));
+
+        let moved = db.get_vm(&vm.id).expect("get vm").expect("vm exists");
+        assert_eq!(moved.node_id, "node-b");
+        assert_eq!(
+            db.list_security_groups_for_vm(&vm.id).expect("groups"),
+            vec!["web".to_string()]
+        );
+        assert_eq!(
+            db.get_vm_ssh_key_names(&vm.id).expect("keys"),
+            vec!["ops".to_string()]
+        );
+        assert!(db.list_vms_for_node("node-a").expect("node-a").is_empty());
+        assert_eq!(db.list_vms_for_node("node-b").expect("node-b").len(), 1);
+    }
+
+    #[test]
+    fn set_vm_node_reports_a_missing_vm_rather_than_creating_one() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("node");
+        assert!(!db.set_vm_node("vm-nope", &node.id).expect("update"));
+    }
+
+    #[test]
+    fn set_vm_node_rejects_an_unknown_target_node() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("node");
+        let vm = test_vm(&node.id);
+        db.insert_vm(&vm).expect("insert vm");
+        db.set_vm_node(&vm.id, "node-does-not-exist")
+            .expect_err("the node_id foreign key must reject an unknown node");
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get vm").expect("vm").node_id,
+            node.id
+        );
+    }
+
+    /// Replication replays `vm.create` for VMs a peer already holds; emulating
+    /// that with delete-then-insert would cascade the child rows away.
+    #[test]
+    fn upsert_vm_updates_in_place_and_keeps_child_rows() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("node");
+        let vm = test_vm(&node.id);
+        db.insert_vm(&vm).expect("insert vm");
+        db.upsert_security_group(&SecurityGroupRow {
+            name: "web".to_string(),
+            description: String::new(),
+            created_at: String::new(),
+        })
+        .expect("security group");
+        db.attach_security_group_to_vm("web", &vm.id)
+            .expect("attach");
+
+        let mut updated = vm.clone();
+        updated.cpu = 8;
+        updated.vm_ip = "10.240.0.9".to_string();
+        db.upsert_vm(&updated).expect("upsert existing vm");
+
+        let stored = db.get_vm(&vm.id).expect("get vm").expect("vm exists");
+        assert_eq!(stored.cpu, 8);
+        assert_eq!(stored.vm_ip, "10.240.0.9");
+        assert_eq!(
+            db.list_security_groups_for_vm(&vm.id).expect("groups"),
+            vec!["web".to_string()],
+            "an upsert must not cascade the VM's attachments away"
+        );
+        assert_eq!(db.list_vms().expect("list").len(), 1);
+    }
+
     #[test]
     fn security_group_attachments_roundtrip() {
         let db = Database::open(":memory:").expect("db");
@@ -4466,6 +5300,136 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].dc_id, "DC1");
         assert_eq!(peers[0].address, "10.0.2.1:9090");
+    }
+
+    #[test]
+    fn ceph_cluster_crud_and_status_cascade() {
+        let db = Database::open(":memory:").expect("open db");
+        let row = CephClusterRow {
+            name: "lab".into(),
+            generation: 1,
+            spec_json: r#"{"fsid":"f","publicNetwork":"10.0.0.0/24","clusterNetwork":"10.1.0.0/24","size":3,"minSize":2,"nodes":[]}"#.into(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        db.upsert_ceph_cluster(&row).expect("upsert cluster");
+        let got = db.get_ceph_cluster("lab").expect("get").expect("exists");
+        assert_eq!(got.generation, 1);
+        assert_eq!(db.list_ceph_clusters().unwrap().len(), 1);
+
+        db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+            name: "lab".into(),
+            observed_generation: 0,
+            phase: "pending".into(),
+            health_message: String::new(),
+            ceph_status_json: String::new(),
+            last_transition_at: String::new(),
+        })
+        .expect("status");
+        assert!(db.get_ceph_cluster_status("lab").unwrap().is_some());
+
+        assert!(db.delete_ceph_cluster("lab").unwrap());
+        assert!(db.get_ceph_cluster("lab").unwrap().is_none());
+        assert!(
+            db.get_ceph_cluster_status("lab").unwrap().is_none(),
+            "status must cascade-delete with cluster"
+        );
+        assert!(!db.delete_ceph_cluster("lab").unwrap());
+    }
+
+    #[test]
+    fn ceph_cluster_reconcile_queue_tracks_observed_generation() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "lab".into(),
+            generation: 2,
+            spec_json: "{}".into(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        assert!(
+            db.list_ceph_clusters_needing_reconcile()
+                .unwrap()
+                .iter()
+                .any(|c| c.name == "lab"),
+            "fresh cluster must be queued"
+        );
+
+        db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+            name: "lab".into(),
+            observed_generation: 2,
+            phase: "healthy".into(),
+            health_message: "HEALTH_OK".into(),
+            ceph_status_json: String::new(),
+            last_transition_at: String::new(),
+        })
+        .unwrap();
+        assert!(
+            !db.list_ceph_clusters_needing_reconcile()
+                .unwrap()
+                .iter()
+                .any(|c| c.name == "lab"),
+            "caught-up status must leave queue"
+        );
+
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "lab".into(),
+            generation: 3,
+            spec_json: "{\"bumped\":true}".into(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        assert!(
+            db.list_ceph_clusters_needing_reconcile()
+                .unwrap()
+                .iter()
+                .any(|c| c.name == "lab"),
+            "generation bump must re-queue"
+        );
+    }
+
+    #[test]
+    fn volume_upsert_get_list_delete_by_vm() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).unwrap();
+        db.insert_vm(&test_vm("n1")).unwrap();
+
+        db.upsert_volume(&VolumeRow {
+            id: "vol-1".into(),
+            vm_id: "vm-1".into(),
+            pool: "kcore-vms".into(),
+            image: "kcore-vm-1".into(),
+            size_bytes: 10 * 1024 * 1024 * 1024,
+            created_at: String::new(),
+        })
+        .unwrap();
+        let got = db.get_volume_by_vm("vm-1").unwrap().expect("volume");
+        assert_eq!(got.pool, "kcore-vms");
+        assert_eq!(got.image, "kcore-vm-1");
+        assert_eq!(db.list_volumes().unwrap().len(), 1);
+
+        db.upsert_volume(&VolumeRow {
+            id: "vol-1b".into(),
+            vm_id: "vm-1".into(),
+            pool: "kcore-vms".into(),
+            image: "kcore-vm-1-resized".into(),
+            size_bytes: 20 * 1024 * 1024 * 1024,
+            created_at: String::new(),
+        })
+        .unwrap();
+        let updated = db.get_volume_by_vm("vm-1").unwrap().unwrap();
+        assert_eq!(updated.image, "kcore-vm-1-resized");
+        assert_eq!(updated.size_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(db.list_volumes().unwrap().len(), 1, "unique on vm_id");
+
+        assert!(db.delete_volume_by_vm("vm-1").unwrap());
+        assert!(db.get_volume_by_vm("vm-1").unwrap().is_none());
+        assert!(!db.delete_volume_by_vm("vm-1").unwrap());
     }
 }
 
@@ -4977,6 +5941,53 @@ mod proptests {
             let bumped = db.list_disk_layouts_needing_reconcile().unwrap();
             prop_assert!(bumped.iter().any(|l| l.name == name),
                 "layout whose generation moved past observed_generation must be re-queued");
+        }
+
+        /// **CephCluster reconciler queue**: same observed_generation
+        /// invariant as disk layouts — null status or lagging generation
+        /// must appear in `list_ceph_clusters_needing_reconcile`.
+        #[test]
+        fn ceph_cluster_reconcile_queue_tracks_observed_generation(
+            name in "[a-z0-9-]{1,12}",
+            generation in 1i64..=64,
+        ) {
+            let db = Database::open(":memory:").expect("open db");
+            db.upsert_ceph_cluster(&CephClusterRow {
+                name: name.clone(),
+                generation,
+                spec_json: "{}".to_string(),
+                bootstrap_json: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }).unwrap();
+
+            let pending = db.list_ceph_clusters_needing_reconcile().unwrap();
+            prop_assert!(pending.iter().any(|c| c.name == name),
+                "fresh CephCluster must be queued for reconcile");
+
+            db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+                name: name.clone(),
+                observed_generation: generation,
+                phase: "healthy".to_string(),
+                health_message: String::new(),
+                ceph_status_json: String::new(),
+                last_transition_at: String::new(),
+            }).unwrap();
+            let after = db.list_ceph_clusters_needing_reconcile().unwrap();
+            prop_assert!(!after.iter().any(|c| c.name == name),
+                "caught-up CephCluster must NOT be queued");
+
+            db.upsert_ceph_cluster(&CephClusterRow {
+                name: name.clone(),
+                generation: generation + 1,
+                spec_json: "{\"updated\":true}".to_string(),
+                bootstrap_json: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }).unwrap();
+            let bumped = db.list_ceph_clusters_needing_reconcile().unwrap();
+            prop_assert!(bumped.iter().any(|c| c.name == name),
+                "CephCluster whose generation moved past observed_generation must be re-queued");
         }
 
         /// **Operator create/list**: `create_operator` + `list_operator_rows` round-trip.

@@ -303,6 +303,24 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<DrainNodeResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn migrate_vm(
+        &self,
+        _: TRequest<MigrateVmRequest>,
+    ) -> Result<Response<MigrateVmResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_live_migrate_receive_status(
+        &self,
+        _: TRequest<GetLiveMigrateReceiveStatusRequest>,
+    ) -> Result<Response<GetLiveMigrateReceiveStatusResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn reset_live_migrate_receive(
+        &self,
+        _: TRequest<ResetLiveMigrateReceiveRequest>,
+    ) -> Result<Response<ResetLiveMigrateReceiveResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
     async fn approve_node(
         &self,
         _: TRequest<ApproveNodeRequest>,
@@ -413,6 +431,34 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    async fn create_ceph_cluster(
+        &self,
+        _: TRequest<CreateCephClusterRequest>,
+    ) -> Result<Response<CreateCephClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_ceph_cluster(
+        &self,
+        _: TRequest<GetCephClusterRequest>,
+    ) -> Result<Response<GetCephClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn list_ceph_clusters(
+        &self,
+        _: TRequest<ListCephClustersRequest>,
+    ) -> Result<Response<ListCephClustersResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn delete_ceph_cluster(
+        &self,
+        _: TRequest<DeleteCephClusterRequest>,
+    ) -> Result<Response<DeleteCephClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
     async fn create_cluster_update(
         &self,
         _: TRequest<CreateClusterUpdateRequest>,
@@ -495,6 +541,42 @@ impl Controller for ManyVmsController {
         &self,
         _: TRequest<IssueOperatorCertRequest>,
     ) -> Result<Response<IssueOperatorCertResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn sign_node_csr(
+        &self,
+        _: TRequest<SignNodeCsrRequest>,
+    ) -> Result<Response<SignNodeCsrResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn rotate_node_certs(
+        &self,
+        _: TRequest<RotateNodeCertsRequest>,
+    ) -> Result<Response<RotateNodeCertsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_certificates(
+        &self,
+        _: TRequest<ListCertificatesRequest>,
+    ) -> Result<Response<ListCertificatesResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn revoke_certificate(
+        &self,
+        _: TRequest<RevokeCertificateRequest>,
+    ) -> Result<Response<RevokeCertificateResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_crl(
+        &self,
+        _: TRequest<GetCrlRequest>,
+    ) -> Result<Response<GetCrlResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_pki_status(
+        &self,
+        _: TRequest<GetPkiStatusRequest>,
+    ) -> Result<Response<GetPkiStatusResponse>, Status> {
         Err(Status::unimplemented(""))
     }
 }

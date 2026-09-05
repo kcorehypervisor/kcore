@@ -1,5 +1,5 @@
 use crate::client::{self, controller_proto};
-use crate::commands::{container, disk_layout, network, security_group, ssh_key, vm};
+use crate::commands::{ceph_cluster, container, disk_layout, network, security_group, ssh_key, vm};
 use crate::config::ConnectionInfo;
 use anyhow::{Context, Result};
 
@@ -90,6 +90,9 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
             "container" => return container::create_from_manifest(info, file).await,
             "disklayout" | "disk-layout" | "disk_layout" => {
                 return disk_layout::apply_from_file(info, file).await
+            }
+            "cephcluster" | "ceph-cluster" | "ceph_cluster" => {
+                return ceph_cluster::apply_from_file(info, file).await
             }
             _ => {}
         }
@@ -230,6 +233,21 @@ metadata:
         let path = dir.path().join("vm.yaml");
         std::fs::write(&path, "kind: VM\nmetadata:\n  name: test\n").unwrap();
         assert!(!is_local_manifest_kind(path.to_str().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn detect_manifest_kind_reads_cephcluster() {
+        assert_eq!(
+            unwrap_kind("kind: CephCluster\nmetadata:\n  name: lab\n").as_deref(),
+            Some("CephCluster")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ceph.yaml");
+        std::fs::write(&path, "kind: CephCluster\nmetadata:\n  name: lab\n").unwrap();
+        assert!(
+            !is_local_manifest_kind(path.to_str().unwrap()).unwrap(),
+            "CephCluster is a controller resource, not a local bootstrap kind"
+        );
     }
 
     #[test]

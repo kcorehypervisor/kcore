@@ -139,15 +139,75 @@ pub trait StorageAdapter: Send + Sync {
 }
 
 pub fn from_config(cfg: &StorageConfig) -> Result<Arc<dyn StorageAdapter>, StorageError> {
-    let adapter: Arc<dyn StorageAdapter> = match cfg.backend {
+    let local: Arc<dyn StorageAdapter> = match cfg.backend {
         StorageBackendKind::Filesystem => Arc::new(FilesystemAdapter::new(
             cfg.filesystem_volume_dir.clone(),
             cfg.image_cache_dir.clone(),
         )),
         StorageBackendKind::Lvm => Arc::new(LvmAdapter::new(cfg)?),
         StorageBackendKind::Zfs => Arc::new(ZfsAdapter::new(cfg)?),
+        // Node marked as ceph-primary: still keep a filesystem local adapter for
+        // non-ceph storage_class requests, and route "ceph" via CephAdapter.
+        StorageBackendKind::Ceph => Arc::new(FilesystemAdapter::new(
+            cfg.filesystem_volume_dir.clone(),
+            cfg.image_cache_dir.clone(),
+        )),
     };
-    Ok(adapter)
+    let ceph = Arc::new(CephAdapter::new(cfg));
+    Ok(Arc::new(RoutingStorageAdapter { local, ceph }))
+}
+
+#[derive(Clone)]
+struct RoutingStorageAdapter {
+    local: Arc<dyn StorageAdapter>,
+    ceph: Arc<CephAdapter>,
+}
+
+impl RoutingStorageAdapter {
+    fn for_class(&self, storage_class: &str) -> Arc<dyn StorageAdapter> {
+        if storage_class.eq_ignore_ascii_case("ceph") {
+            Arc::clone(&self.ceph) as Arc<dyn StorageAdapter>
+        } else {
+            Arc::clone(&self.local)
+        }
+    }
+
+    fn for_handle(&self, backend_handle: &str) -> Arc<dyn StorageAdapter> {
+        // Ceph handles are `pool/image`; local LVM/ZFS/fs use absolute paths.
+        if backend_handle.contains('/') && !backend_handle.starts_with('/') {
+            Arc::clone(&self.ceph) as Arc<dyn StorageAdapter>
+        } else {
+            Arc::clone(&self.local)
+        }
+    }
+}
+
+impl StorageAdapter for RoutingStorageAdapter {
+    fn create_volume(&self, req: CreateVolumeRequest) -> Result<String, StorageError> {
+        self.for_class(&req.storage_class).create_volume(req)
+    }
+    fn delete_volume(&self, backend_handle: &str) -> Result<(), StorageError> {
+        self.for_handle(backend_handle)
+            .delete_volume(backend_handle)
+    }
+    fn attach_volume(&self, req: AttachVolumeRequest) -> Result<(), StorageError> {
+        self.for_handle(&req.backend_handle).attach_volume(req)
+    }
+    fn detach_volume(&self, req: DetachVolumeRequest) -> Result<(), StorageError> {
+        self.for_handle(&req.backend_handle).detach_volume(req)
+    }
+    fn ensure_image(&self, req: EnsureImageRequest) -> Result<EnsureImageResult, StorageError> {
+        self.local.ensure_image(req)
+    }
+    fn upload_image(&self, req: UploadImageRequest) -> Result<UploadImageResult, StorageError> {
+        self.local.upload_image(req)
+    }
+    fn upload_image_from_path(
+        &self,
+        req: UploadImageFromPathRequest,
+    ) -> Result<UploadImageResult, StorageError> {
+        self.local.upload_image_from_path(req)
+    }
 }
 
 pub fn default_adapter() -> Arc<dyn StorageAdapter> {
@@ -477,11 +537,100 @@ impl StorageAdapter for ZfsAdapter {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CephAdapter {
+    pool: String,
+    image_cache_dir: PathBuf,
+}
+
+impl CephAdapter {
+    fn new(cfg: &StorageConfig) -> Self {
+        Self {
+            pool: cfg
+                .ceph
+                .as_ref()
+                .map(|c| c.pool.clone())
+                .unwrap_or_else(|| "kcore-vms".to_string()),
+            image_cache_dir: PathBuf::from(&cfg.image_cache_dir),
+        }
+    }
+
+    fn image<'a>(&self, handle: &'a str) -> Result<&'a str, StorageError> {
+        handle
+            .strip_prefix(&format!("{}/", self.pool))
+            .ok_or_else(|| {
+                StorageError::new(
+                    ErrorKind::InvalidArgument,
+                    format!("Ceph handle must be {}/<image>", self.pool),
+                )
+            })
+    }
+}
+
+impl StorageAdapter for CephAdapter {
+    fn create_volume(&self, req: CreateVolumeRequest) -> Result<String, StorageError> {
+        validate_volume_create_inputs(&req)?;
+        let image = sanitize_volume_name(&req.volume_id);
+        let size_mib = crate::ceph_bootstrap::rbd_size_mib(req.size_bytes)
+            .map_err(|e| StorageError::new(ErrorKind::InvalidArgument, e))?;
+        let size_arg = format!("{size_mib}M");
+        run_cmd(
+            "rbd",
+            &[
+                "create",
+                &format!("{}/{}", self.pool, image),
+                "--size",
+                &size_arg,
+                "--image-feature",
+                "layering",
+            ],
+            ErrorKind::Internal,
+        )?;
+        Ok(format!("{}/{}", self.pool, image))
+    }
+
+    fn delete_volume(&self, backend_handle: &str) -> Result<(), StorageError> {
+        self.image(backend_handle)?;
+        run_cmd("rbd", &["rm", backend_handle], ErrorKind::Internal)
+    }
+
+    fn attach_volume(&self, req: AttachVolumeRequest) -> Result<(), StorageError> {
+        validate_attach_request(&req)?;
+        self.image(&req.backend_handle)?;
+        run_cmd("rbd", &["map", &req.backend_handle], ErrorKind::Internal)
+    }
+
+    fn detach_volume(&self, req: DetachVolumeRequest) -> Result<(), StorageError> {
+        validate_detach_request(&req)?;
+        let image = self.image(&req.backend_handle)?;
+        run_cmd(
+            "rbd",
+            &["unmap", &format!("/dev/rbd/{}/{image}", self.pool)],
+            ErrorKind::Internal,
+        )
+    }
+
+    fn ensure_image(&self, req: EnsureImageRequest) -> Result<EnsureImageResult, StorageError> {
+        ensure_image_cached(&self.image_cache_dir, req)
+    }
+    fn upload_image(&self, req: UploadImageRequest) -> Result<UploadImageResult, StorageError> {
+        upload_image_to_cache(&self.image_cache_dir, req)
+    }
+    fn upload_image_from_path(
+        &self,
+        req: UploadImageFromPathRequest,
+    ) -> Result<UploadImageResult, StorageError> {
+        upload_image_file_to_cache(&self.image_cache_dir, req)
+    }
+}
+
 fn run_cmd(program: &str, args: &[&str], err_kind: ErrorKind) -> Result<(), StorageError> {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| StorageError::new(err_kind, format!("running {program}: {e}")))?;
+    let out = Command::new(program).args(args).output().map_err(|e| {
+        StorageError::new(
+            err_kind,
+            format!("running {program}: {e}; ensure the required storage tools are installed"),
+        )
+    })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(StorageError::new(
@@ -1096,6 +1245,105 @@ mod tests {
             .expect("create volume");
         let meta = std::fs::metadata(&handle).expect("volume exists");
         assert_eq!(meta.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn ceph_adapter_rejects_handles_without_pool_prefix() {
+        let adapter = CephAdapter {
+            pool: "kcore-vms".into(),
+            image_cache_dir: PathBuf::from("/var/lib/kcore/images"),
+        };
+        assert_eq!(adapter.image("kcore-vms/img").unwrap(), "img");
+        let err = adapter.image("other/img").expect_err("wrong pool");
+        assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+        let err = adapter
+            .delete_volume("wrong-pool/img")
+            .expect_err("must fail before rbd");
+        assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+        let err = adapter
+            .attach_volume(AttachVolumeRequest {
+                backend_handle: "nope/img".into(),
+                vm_id: "v1".into(),
+                target_device: "/dev/vda".into(),
+                bus: "virtio".into(),
+            })
+            .expect_err("must fail before rbd map");
+        assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+    }
+
+    #[test]
+    fn ceph_adapter_create_volume_rejects_invalid_inputs_before_rbd() {
+        let adapter = CephAdapter {
+            pool: "kcore-vms".into(),
+            image_cache_dir: PathBuf::from("/var/lib/kcore/images"),
+        };
+        let err = adapter
+            .create_volume(CreateVolumeRequest {
+                volume_id: String::new(),
+                storage_class: "ceph".into(),
+                size_bytes: 1024,
+                parameters: HashMap::new(),
+            })
+            .expect_err("empty volume id");
+        assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+        let err = adapter
+            .create_volume(CreateVolumeRequest {
+                volume_id: "ok".into(),
+                storage_class: "ceph".into(),
+                size_bytes: 0,
+                parameters: HashMap::new(),
+            })
+            .expect_err("zero size");
+        assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+    }
+
+    #[test]
+    fn routing_adapter_sends_ceph_class_to_ceph_prefix_check() {
+        let cfg = StorageConfig {
+            backend: StorageBackendKind::Filesystem,
+            ..StorageConfig::default()
+        };
+        let adapter = from_config(&cfg).expect("router");
+        let err = adapter
+            .create_volume(CreateVolumeRequest {
+                volume_id: String::new(),
+                storage_class: "ceph".into(),
+                size_bytes: 1024,
+                parameters: HashMap::new(),
+            })
+            .expect_err("invalid before rbd");
+        assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+    }
+
+    #[test]
+    fn from_config_builds_ceph_adapter_with_default_and_custom_pool() {
+        let default_cfg = StorageConfig {
+            backend: StorageBackendKind::Ceph,
+            ..StorageConfig::default()
+        };
+        let adapter = from_config(&default_cfg).expect("ceph adapter");
+        let err = adapter
+            .delete_volume("kcore-vms/x")
+            .expect_err("rbd missing or fails, but prefix accepted");
+        // Either Internal (rbd not installed) or similar — must NOT be InvalidArgument.
+        assert!(!matches!(err.kind(), ErrorKind::InvalidArgument));
+
+        let custom = StorageConfig {
+            backend: StorageBackendKind::Ceph,
+            ceph: Some(crate::config::CephConfig {
+                pool: "custom-pool".into(),
+            }),
+            ..StorageConfig::default()
+        };
+        let adapter = from_config(&custom).expect("custom pool");
+        let err = adapter
+            .delete_volume("kcore-vms/x")
+            .expect_err("wrong pool prefix");
+        assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+        let err = adapter
+            .delete_volume("custom-pool/x")
+            .expect_err("rbd call after valid prefix");
+        assert!(!matches!(err.kind(), ErrorKind::InvalidArgument));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::node_proto;
 type ComputeClient = node_proto::node_compute_client::NodeComputeClient<Channel>;
 type AdminClient = node_proto::node_admin_client::NodeAdminClient<Channel>;
 type ContainerClient = node_proto::node_container_client::NodeContainerClient<Channel>;
+type StorageClient = node_proto::node_storage_client::NodeStorageClient<Channel>;
 
 #[derive(Clone)]
 pub struct TlsClientConfig {
@@ -18,7 +19,7 @@ pub struct TlsClientConfig {
     pub key_file: String,
 }
 
-type ClientTuple = (ComputeClient, AdminClient, ContainerClient);
+type ClientTuple = (ComputeClient, AdminClient, ContainerClient, StorageClient);
 
 #[derive(Clone)]
 pub struct NodeClients {
@@ -53,13 +54,14 @@ impl NodeClients {
         };
         let compute = ComputeClient::new(channel.clone());
         let admin = AdminClient::new(channel.clone());
-        let container = ContainerClient::new(channel);
+        let container = ContainerClient::new(channel.clone());
+        let storage = StorageClient::new(channel);
 
         info!(address, "connected to node");
         self.clients
             .lock()
             .unwrap()
-            .insert(address.to_string(), (compute, admin, container));
+            .insert(address.to_string(), (compute, admin, container, storage));
         Ok(())
     }
 
@@ -68,7 +70,7 @@ impl NodeClients {
             .lock()
             .unwrap()
             .get(address)
-            .map(|(c, _, _)| c.clone())
+            .map(|(c, _, _, _)| c.clone())
     }
 
     pub fn get_admin(&self, address: &str) -> Option<AdminClient> {
@@ -76,7 +78,7 @@ impl NodeClients {
             .lock()
             .unwrap()
             .get(address)
-            .map(|(_, a, _)| a.clone())
+            .map(|(_, a, _, _)| a.clone())
     }
 
     pub fn get_container(&self, address: &str) -> Option<ContainerClient> {
@@ -84,6 +86,14 @@ impl NodeClients {
             .lock()
             .unwrap()
             .get(address)
-            .map(|(_, _, c)| c.clone())
+            .map(|(_, _, c, _)| c.clone())
+    }
+
+    pub fn get_storage(&self, address: &str) -> Option<StorageClient> {
+        self.clients
+            .lock()
+            .unwrap()
+            .get(address)
+            .map(|(_, _, _, s)| s.clone())
     }
 }

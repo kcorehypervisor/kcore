@@ -41,6 +41,60 @@ tls:
   keyFile: /etc/kcore/certs/<service>.key
 ```
 
+## Certificate Lifecycle: Rotation and Revocation
+
+The controller owns the certificate lifecycle end to end. Full detail, including the config reference and operator runbook, is in [`mtls-bootstrap-and-auth.md`](./mtls-bootstrap-and-auth.md) §4; the security-relevant summary:
+
+### Inventory
+
+Every certificate the controller signs is recorded in `issued_certificates` (DB schema version 33): serial, subject CN, identity kind, node id, issuer CN, SHA-256 fingerprint, validity window, issuance time, status (`active` / `rotated` / `revoked`), and revocation reason plus timestamp. This is the single source of truth for both the CRL and the OCSP responder, so there is no second store that can drift.
+
+### Rotation without moving private keys
+
+Rotation is CSR-based and driven by the node: the node generates a keypair in memory, submits a PKCS#10 CSR over the existing (still valid) mTLS channel, and the controller signs it with the sub-CA. **Private keys never leave the node.** The controller authors the CN, SANs and extended key usages itself — the CSR contributes only its public key, and possession of the matching private key is proven by the CSR self-signature. A CSR requesting an identity for a different host is rejected rather than silently rewritten.
+
+The install is fail-safe by construction:
+
+- the signed chain is validated (parses, expected CN, not expired, public key matches the generated key) **before** anything is written;
+- cert and key are installed with write-temp + `fsync` + `rename`, then re-read and re-verified;
+- a verification failure rolls the previous bytes back.
+
+Any failure leaves the node serving on its existing certificate. TLS is reloaded in-process by rebuilding the listener — no `exec`, no service restart, no lost in-memory state.
+
+The older `RenewNodeCert` RPC, which generated the key on the controller and returned it over the wire, is retained only for compatibility with pre-rotation node-agents. Nothing in the current codebase calls it.
+
+### Revocation enforcement
+
+`kctl revoke cert --serial S | --node ID | --subject CN --reason R` marks the inventory row revoked using an RFC 5280 §5.3.1 reason code, adds the serial to the controller's in-memory set immediately, and regenerates the CRL.
+
+Enforcement is at the **application layer**, not inside the TLS handshake: `tonic::transport::ServerTlsConfig` builds its rustls config internally and accepts no custom `ClientCertVerifier`, so rustls' `WebPkiClientVerifier::with_crls` is unreachable. A `tonic` interceptor on every service instead checks the serial of the presented client certificate before any handler runs. A revoked peer therefore completes the TLS handshake and is then rejected with `PermissionDenied`.
+
+- The controller reads the revoked set straight from `issued_certificates` — authoritative and always fresh.
+- The node-agent fetches a CRL via `Controller.GetCrl` over its existing mTLS channel and **verifies the CRL signature** against its trust bundle before trusting it. An unverified CRL would let whoever can answer `GetCrl` decide which certificates a node rejects.
+
+A serial known to be revoked is rejected no matter how stale the data is: stale data can miss new revocations, it can never invent them.
+
+### Stale-data failure mode
+
+| Mode | Behaviour |
+|------|-----------|
+| `soft-fail` (**default**) | Accept peers absent from the last known revocation set, and warn. A controller outage or transient fetch failure must not lock every node out of its own cluster. |
+| `hard-fail` | Reject every peer with `Unavailable` until revocation data is fresh again. Availability is subordinate to revocation certainty; a controller outage stops the cluster. |
+
+Configurable per component (`revocation.failMode` on both the controller and the node-agent). Stale data under `hard-fail` returns `Unavailable`, not `PermissionDenied` — it is an availability problem and callers should retry.
+
+### CRL and OCSP distribution
+
+The controller serves `GET /pki/crl.der`, `GET /pki/crl.pem`, `POST /pki/ocsp` and `GET /pki/ocsp/{base64}` on `pki.httpListenAddr` (default `0.0.0.0:9092`), plus `GET /pki/healthz`. These are plain HTTP by design: CRLs and OCSP responses are signed objects, RFC 5280 §4.2.1.13 and RFC 6960 §5 do not require transport security for them, and requiring mTLS would mean a node whose certificate has just expired could not fetch what it needs to recover. The listener can be disabled (`pki.httpEnabled: false`); nodes use the gRPC `GetCrl` path regardless.
+
+The CRL is sub-CA-signed with correct `thisUpdate`/`nextUpdate` and a monotonic `crlNumber`, persisted in `crl_state` so a restart serves the same list. The OCSP responder is CA-signed (RFC 6960 §4.2.2.2), answering `good` only for serials in the inventory, `revoked` with reason and time, and `unknown` for everything else — including serials from a different CA, per RFC 6960 §2.2.
+
+X.509, CRL and OCSP encoding all come from maintained crates (`rcgen`, `x509-parser`, `x509-ocsp`, `x509-cert`, `der`, `spki`); no ASN.1 is hand-rolled. Signatures and digests go through `aws-lc-rs`, the same FIPS 140-3 validated backend the TLS stack uses.
+
+### OCSP stapling is not supported
+
+`tonic` 0.12 exposes neither a rustls `sign::CertifiedKey` (server side) nor a `ServerCertVerifier` (client side), so a stapled OCSP response can be neither attached to nor consumed from a KCore handshake. Implemented instead: a full OCSP responder on the controller, and a direct OCSP client in the node-agent that verifies the response signature with `aws-lc-rs` and is used as an escape hatch when the CRL has gone stale. Bulk enforcement uses the CRL. Lifting this needs upstream `tonic` support for supplying a rustls config directly, or moving the gRPC transport to `hyper` + `tokio-rustls`.
+
 ## gRPC Authorization (CN-based)
 
 Every gRPC method checks the caller's certificate Common Name before processing the request. Authorization is enforced per-method in the `auth` module (`crates/controller/src/auth.rs`, `crates/node-agent/src/auth.rs`).
@@ -60,6 +114,14 @@ Every gRPC method checks the caller's certificate Common Name before processing 
 | `ListNodes`            | kctl (`kctl`)       |
 | `GetNode`              | kctl (`kctl`)       |
 | `ApplyNixConfig` (admin) | kctl (`kctl`)     |
+| `SignNodeCsr`          | Nodes (`kcore-node-*`)    |
+| `RotateNodeCerts`      | Operators, `cluster-admin` |
+| `RevokeCertificate`    | Operators, `cluster-admin` |
+| `ListCertificates`     | Operators, `read-only`    |
+| `GetPkiStatus`         | Operators, `read-only`    |
+| `GetCrl`               | Operators (`read-only`) and nodes |
+| `GetLiveMigrateReceiveStatus` | Operators, `read-only`    |
+| `ResetLiveMigrateReceive` | Operators, `cluster-admin` |
 
 ### Node-agent RPC authorization
 
@@ -72,6 +134,11 @@ Every gRPC method checks the caller's certificate Common Name before processing 
 | `GetVm`                    | kctl or Controller                     |
 | `ListVms`                  | kctl or Controller                     |
 | `GetNodeInfo`              | kctl or Controller                     |
+| `RotateNodeCert`           | Controller only (`kcore-controller-*`) |
+| `GetLiveMigrateReceiveStatus` | Controller only (`kcore-controller-*`) |
+| `AbortLiveMigrateReceive`  | Controller only (`kcore-controller-*`) |
+
+In addition to the per-method CN check, both services run a revocation interceptor ahead of every handler; see "Revocation enforcement" above.
 
 When TLS is disabled (`--allow-insecure`), authorization checks are skipped since no certificates are available to inspect.
 
@@ -126,10 +193,77 @@ make audit    # Run cargo audit standalone
 make check    # Run clippy + fmt + audit together
 ```
 
+## Release Artifacts: SBOMs and Signing
+
+Every release publishes two SBOMs and one signature. The operational detail
+lives in [release-verification.md](./release-verification.md); this section
+records the two design decisions behind it.
+
+### Two SBOMs, because there are two dependency graphs
+
+`Cargo.lock` resolves ~511 Rust packages. The ISO's Nix closure is a
+different universe: kernel, systemd, `cloud-hypervisor`, openssl, qemu.
+Neither document answers the other's questions, and neither is a subset of
+the other, so they ship separately and are named to make confusing them
+hard:
+
+| Asset | Graph | Generator |
+|---|---|---|
+| `kcore-$(VERSION)-crates.cdx.json` | Rust dependencies from `Cargo.lock` | `cargo-cyclonedx`, merged with `cyclonedx-cli` |
+| `kcore-$(VERSION)-iso-closure.cdx.json` / `.spdx.json` | Nix runtime closure of the system the ISO boots | `sbomnix` |
+
+Both are generated at release time by [`scripts/sbom.sh`](../scripts/sbom.sh)
+and are not committed, so there is no committed artifact to drift and nothing
+new runs on pull requests.
+
+### Signing uses Sigstore, not the cluster PKI
+
+The obvious instinct is that kcore already has a PKI, so it should sign its
+own releases. That instinct is wrong, and the reasons are worth writing down.
+
+The CA under [`crates/controller/src/pki/`](../crates/controller/src/pki/) is
+built for intra-cluster mTLS and nothing else:
+
+- **It is generated per installation.** Each cluster mints its own root at
+  bootstrap. There is no single key an outside party could pin, so a
+  signature from one cluster's CA means nothing to someone downloading an
+  ISO — the trust anchor is per-deployment, while a release artifact needs a
+  project-wide one.
+- **Its leaves cannot express code signing.** Every certificate is
+  `CN=kcore-node-<host>` or `CN=kctl:<name>`, carrying ServerAuth and
+  ClientAuth EKUs only. Nothing in the profile says "this signed a release",
+  and CN-based authorization (see "gRPC Authorization" above) reads those
+  names as cluster identities.
+- **The signing key is online by design.** The sub-CA signs node CSRs on
+  demand, so its key is loaded in a long-running network service. Granting
+  it release authority would convert any controller compromise into a
+  supply-chain compromise of every kcore download — a strictly worse
+  blast radius than the cluster it was scoped to.
+
+Releases are therefore signed with **Sigstore keyless signing** via `cosign`,
+against a maintainer's OIDC identity. No long-lived private key exists to
+steal, and the expected identity is published rather than pinned to a key.
+
+### What the signature does and does not prove
+
+It proves that **a kcore maintainer stood behind these exact bytes**. It does
+**not** prove that those bytes were built from a particular commit by a
+particular pipeline — releases are still cut on a maintainer's machine, so no
+machine-checkable record ties an artifact to a source revision. Moving builds
+into CI is what would change that, and it has not been done.
+
+This is still a real improvement over checksums alone.
+[`scripts/get-kctl.sh`](../scripts/get-kctl.sh) fetches `SHA256SUMS` from the
+same host as the tarball it describes, which detects corruption but not
+tampering: anyone able to replace the tarball can replace the checksums file
+with it. A signature over `SHA256SUMS` closes that gap, and because every
+other asset is listed in `SHA256SUMS`, one signature covers them all.
+
 ## Known Limitations
 
-- **No certificate rotation workflow** -- certs must be manually regenerated and redistributed before expiry
-- **No CRL/OCSP** -- revoked certificates are not checked
+- **No OCSP stapling** -- `tonic` 0.12 offers no hook for a rustls `CertifiedKey` or `ServerCertVerifier`. The controller runs an OCSP responder and clients query it directly; see "OCSP stapling is not supported" above.
+- **Revocation is enforced above TLS, not inside it** -- a revoked peer completes the handshake and is rejected by an interceptor before any handler runs, because `ServerTlsConfig` takes no custom `ClientCertVerifier`.
+- **Operator certificates rotate manually** -- `kctl operator issue-cert <name>` re-issues them. Only node certificates rotate automatically.
 - **No rate limiting** on gRPC endpoints
 - **SQLite is single-writer** -- acceptable for the expected scale (tens of nodes), but limits concurrent write throughput
 
@@ -191,3 +325,10 @@ Key test areas to be aware of:
 - **`admin::tests`** -- verifies disk path validation, PKI file permissions (`0o600`/`0o644`), bootstrap write behavior
 - **`pki::tests`** -- verifies cluster PKI generation, conditional controller key inclusion, mTLS handshake acceptance/rejection
 - **`client::tests`** -- end-to-end mTLS connect tests (valid cert succeeds, untrusted cert fails)
+- **`grpc::signing::tests`** (controller) -- CSR signing binds the chain to the CSR's public key, and rejects a CSR requesting another host's CN or SAN
+- **`cert_rotation_reconciler::tests`** (controller) -- renewal fires at the configured threshold and not before, under both the day window and the lifetime-fraction rule
+- **`pki::crl::tests`** (controller) -- CRL contents, signature verification against the sub-CA, `crlNumber` monotonicity, persistence across restart
+- **`pki::ocsp::tests`** (controller) -- `good` / `revoked` (with reason and time) / `unknown` responses, including serials issued by a different CA
+- **`pki::revocation::{tests,prop_tests}`** (controller and node-agent) -- a revoked serial is never allowed under either fail mode; soft-fail never denies an unrevoked serial; hard-fail tracks the staleness bound exactly
+- **`pki::rotate::tests`** (node-agent) -- a chain bound to a different key, a wrong CN, or an expired certificate is refused before install; a failed rotation leaves the previous certificate loadable
+- **`pki::http::tests`** (controller) -- CRL content types, `503` before a CRL exists, OCSP over both POST and the base64 GET form

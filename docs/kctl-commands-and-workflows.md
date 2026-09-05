@@ -15,6 +15,7 @@ Connection defaults:
 
 - Controller default port: `9090`
 - Node-agent default port: `9091`
+- Controller PKI HTTP listener (CRL and OCSP, plain HTTP): `9092`
 - Default cert dir: `~/.kcore/certs`
 
 ## 2) Initialize cluster PKI and context
@@ -496,7 +497,7 @@ kctl apply -f ./controller-config.nix --dry-run
 
 Top-level commands:
 
-- `kctl create vm ... --storage-backend <filesystem|lvm|zfs> --storage-size-bytes <bytes>`
+- `kctl create vm ... --storage-backend <filesystem|lvm|zfs|ceph> --storage-size-bytes <bytes>`
 - `kctl create cluster ...`
 - `kctl create network <name> --external-ip ... --gateway-ip ... [--type nat|bridge|vxlan] [--no-outbound-nat] [--vlan-id ...] [--target-node ...]`
 - `kctl create ssh-key <name> --public-key "ssh-rsa ..."`
@@ -507,10 +508,15 @@ Top-level commands:
 - `kctl set vm ... --state <running|stopped>`
 - `kctl start vm ...`
 - `kctl stop vm ...`
+- `kctl migrate vm <id|name> --target-node <node> [--allow-cold-fallback]` (Ceph / shared RBD live migrate)
+- `kctl migrate reset-session <id|name> --node <node> [--force]` (clear a stranded live-migrate receive session; reports only without `--force`)
+- `kctl drain node <node-id> [--target-node <node>]` (cold-reassign all VMs off a node)
+- `kctl get migrate-session <id|name> [--node <node>]` (read-only live-migrate receive session state)
 - `kctl get vms [name]`
 - `kctl get nodes [name]`
 - `kctl get networks [--target-node ...]`
 - `kctl get ssh-keys`
+- `kctl get ceph-cluster` / `kctl describe ceph-cluster <name>`
 - `kctl get compliance-report` (full compliance report with per-node breakdown)
 - `kctl node disks`
 - `kctl node nics`
@@ -523,6 +529,11 @@ Top-level commands:
 - `kctl node reject <NODE_ID>`
 - `kctl rotate certs --controller <host:port>` (rotate controller cert and push to controller)
 - `kctl rotate sub-ca` (generate and push new sub-CA to controller)
+- `kctl rotate node-certs --node <NODE_ID> | --all` (force CSR-based node cert rotation; the node keypair never leaves the node)
+- `kctl get certificates [--node <id>] [--status active|rotated|revoked|all] [--expiring-within-days N]` (aliases `certs`, `certificate`)
+- `kctl get pki-status` (alias `pki`; inventory counts, rotation thresholds, CRL number and window, revocation fail mode, soonest expiries)
+- `kctl get crl [-o <file>]` (`.der` writes DER, any other name writes PEM)
+- `kctl revoke cert --serial <hex> | --node <id> | --subject <cn> [--reason <rfc5280-reason>]`
 - `kctl apply -f ... [--dry-run]`
 - `kctl version`
 
@@ -558,6 +569,12 @@ Day-2 operations:
 5. for day-2 disk layout changes, prefer declarative `kctl apply -f <DiskLayout>.yaml` (use `kctl diff -f` first); for one-off pushes, `kctl node apply-disk ...` (validate first, then `--apply`)
 6. rotate controller cert with `kctl rotate certs --controller <host:port>`
 7. rotate sub-CA with `kctl rotate sub-ca`
+8. audit the certificate inventory with `kctl get pki-status` and
+   `kctl get certificates --expiring-within-days 45`; node certificates rotate
+   on their own, so this should normally report nothing to do
+9. revoke a compromised identity with `kctl revoke cert --node <id> --reason
+   key-compromise` (or `--serial` / `--subject`), then confirm it landed on the
+   CRL with `kctl get crl`
 
 ## 12) Storage backend examples
 
@@ -584,3 +601,30 @@ kctl create vm app-zfs-01 \
   --storage-size-bytes 42949672960 \
   --target-node 192.168.40.105:9091
 ```
+
+### Ceph VM + migration
+
+After a healthy `CephCluster` (see [`ceph.md`](./ceph.md)):
+
+```bash
+kctl create vm app-ceph-01 \
+  --storage-backend ceph \
+  --storage-size-bytes 42949672960 \
+  --image <https-url> \
+  --image-sha256 <sha256>
+
+kctl migrate vm app-ceph-01 --target-node node-b
+kctl drain node node-a --target-node node-b
+```
+
+If a retried migration fails with `ALREADY_EXISTS`, the destination is holding a stranded
+receive session. Inspect it before clearing it — clearing one whose receive VMM is still
+alive kills an in-flight migration:
+
+```bash
+kctl get migrate-session app-ceph-01
+kctl migrate reset-session app-ceph-01 --node node-b --force
+```
+
+Details: [`vm-migration.md`](./vm-migration.md), including the
+[stranded receive session runbook](./vm-migration.md#runbook-a-stranded-receive-session).

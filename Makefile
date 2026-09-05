@@ -1,4 +1,4 @@
-.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace test-replication-soak coverage test-controller test-node-agent test-kctl test-rust-filter loc iso iso-remote kctl clean install-hooks kani help release-tag release-build release-dist release-publish release
+.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace test-replication-soak coverage test-controller test-node-agent test-kctl test-rust-filter loc iso iso-remote kctl clean install-hooks kani help release-tag release-build release-dist release-sign release-publish release sbom sbom-iso sbom-all verify-release
 
 VERSION := $(shell cat VERSION)
 V ?= v$(VERSION)
@@ -102,21 +102,43 @@ kctl:
 	cargo build --release -p kctl
 
 # Local release flow (run from this machine): tag v$(VERSION), push the tag,
-# build ISO + Linux/macOS kctl, package dist/, then publish GitHub Release assets.
+# build ISO + Linux/macOS kctl, package dist/ with SBOMs, sign SHA256SUMS,
+# then publish GitHub Release assets.
+# Extra flags for scripts/release.sh, e.g. RELEASE_FLAGS=--no-sign
+RELEASE_FLAGS ?=
+
 release-tag:
-	bash ./scripts/release.sh tag
+	bash ./scripts/release.sh $(RELEASE_FLAGS) tag
 
 release-build:
-	bash ./scripts/release.sh build
+	bash ./scripts/release.sh $(RELEASE_FLAGS) build
 
 release-dist:
-	bash ./scripts/release.sh dist
+	bash ./scripts/release.sh $(RELEASE_FLAGS) dist
+
+release-sign:
+	bash ./scripts/release.sh $(RELEASE_FLAGS) sign
 
 release-publish:
-	bash ./scripts/release.sh publish
+	bash ./scripts/release.sh $(RELEASE_FLAGS) publish
 
 release:
-	bash ./scripts/release.sh release
+	bash ./scripts/release.sh $(RELEASE_FLAGS) release
+
+# SBOMs are generated at release time into dist/ and are never committed, so
+# there is nothing for CI to drift-check. `release-dist` runs both targets
+# before writing SHA256SUMS.
+sbom:
+	bash ./scripts/sbom.sh crates
+
+sbom-iso:
+	bash ./scripts/sbom.sh iso
+
+sbom-all:
+	bash ./scripts/sbom.sh all
+
+verify-release:
+	bash ./scripts/verify-release.sh $(V)
 
 install-hooks:
 	@for hook in scripts/hooks/*; do \
@@ -159,9 +181,14 @@ help:
 	@echo "  kctl        Build kctl CLI only"
 	@echo "  release-tag     Create/push annotated tag v$(VERSION)"
 	@echo "  release-build   Build ISO + Linux/macOS kctl release binaries"
-	@echo "  release-dist    Linux/macOS kctl tarballs + ISO under dist/ + SHA256SUMS"
+	@echo "  release-dist    Linux/macOS kctl tarballs + ISO + SBOMs under dist/ + SHA256SUMS"
+	@echo "  release-sign    Sign dist/SHA256SUMS with Sigstore (cosign keyless)"
 	@echo "  release-publish Create/update GitHub Release assets from tag (needs gh/GH_TOKEN)"
 	@echo "  release         Local full release: tag + build + dist + GitHub Release publish"
+	@echo "  sbom            Crate (Cargo) CycloneDX SBOM under dist/"
+	@echo "  sbom-iso        ISO Nix closure CycloneDX + SPDX SBOMs under dist/"
+	@echo "  sbom-all        Both SBOMs (run by release-dist)"
+	@echo "  verify-release V=vX.Y.Z  Verify a published release's signature and checksums"
 	@echo "  install-hooks  Install git pre-commit/pre-push hooks"
 	@echo "  clean       Remove build artifacts"
 	@echo "  help        Show this help"

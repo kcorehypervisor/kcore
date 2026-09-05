@@ -24,18 +24,25 @@ tonic-health = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pem = "3"
+aws-lc-rs = "1.16.2"
+const-oid = { version = "0.9.5", features = ["db"] }
+der = { version = "0.7.8", features = ["alloc", "oid"] }
+spki = { version = "0.7.2", features = ["alloc"] }
+x509-cert = "0.2.5"
+x509-ocsp = { version = "0.2.1", features = ["std"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 time = "0.3"
-x509-parser = "0.18"
+# verify-aws: CRL and OCSP signature verification through aws-lc-rs, not ring.
+x509-parser = { version = "0.18", features = ["verify-aws"] }
 anyhow = "1.0.102"
 libc = "0.2"
+tempfile = "3"
 
 [build-dependencies]
 tonic-build = "0.12"
 
 [dev-dependencies]
-rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
-tempfile = "3"
 proptest = "1.11"
 
 [lints]

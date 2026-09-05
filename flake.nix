@@ -182,6 +182,13 @@
               pkgs.nixfmt
               pkgs.cargo-zigbuild
               pkgs.zig
+              # Release supply-chain tooling (see docs/release-verification.md).
+              # Versions are pinned by flake.lock; sbomnix is deliberately
+              # absent -- its ~1.3 GB closure is fetched on demand by
+              # scripts/sbom.sh via `nix run --inputs-from .`.
+              pkgs.cargo-cyclonedx
+              pkgs.cyclonedx-cli
+              pkgs.cosign
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.cloud-hypervisor
@@ -205,6 +212,7 @@
           kcoreVersion = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile ./VERSION);
           chVmModule = ./modules/ch-vm;
           dashboardModule = ./modules/kcore-dashboard.nix;
+          cephModule = ./modules/kcore-ceph.nix;
         in
         {
           nixosModules = {
@@ -212,6 +220,7 @@
             default = chVmModule;
             kcore-disko = ./modules/kcore-disko.nix;
             kcore-dashboard = dashboardModule;
+            kcore-ceph = cephModule;
           };
 
           nixosConfigurations.kcore-iso = inputs.nixpkgs.lib.nixosSystem {
@@ -235,6 +244,7 @@
                   diskoPackage = inputs.disko.packages.x86_64-linux.default;
                   kcoreDiskoModule = ./modules/kcore-disko.nix;
                   kcoreBrandingModule = ./modules/kcore-branding.nix;
+                  kcoreCephModule = ./modules/kcore-ceph.nix;
                 in
                 {
                   system.stateVersion = "25.05";
@@ -869,6 +879,8 @@
                                                                 echo "Copying disko configuration..."
                                                                 cp ${kcoreDiskoModule} /mnt/etc/nixos/modules/kcore-disko.nix
                                                                 cp ${kcoreBrandingModule} /mnt/etc/nixos/modules/kcore-branding.nix
+                                                                cp ${kcoreCephModule} /mnt/etc/nixos/modules/kcore-ceph.nix
+                                                                printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-ceph.nix
                                                                 cp /tmp/disko-config.nix /mnt/etc/nixos/disko-config.nix
 
                                                                 echo "Copying kcore config and certificates..."
@@ -1178,6 +1190,8 @@
                           ./hardware-configuration.nix
                           ./modules/ch-vm
                           ./modules/kcore-branding.nix
+                          ./modules/kcore-ceph.nix
+                          ./kcore-ceph.nix
                           ./kcore-vms.nix
                         ];
 

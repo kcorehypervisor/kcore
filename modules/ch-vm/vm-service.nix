@@ -23,19 +23,24 @@ let
 
       isLvm = vmCfg.storageBackend == "lvm";
       isZfs = vmCfg.storageBackend == "zfs";
-      isBlockBackend = isLvm || isZfs;
+      isCeph = vmCfg.storageBackend == "ceph";
+      isBlockBackend = isLvm || isZfs || isCeph;
 
       lvName = "kcore-${vmName}";
       lvDevice = "/dev/${cfg.lvmVgName}/${lvName}";
 
       zvolDataset = "${cfg.zfsPoolName}/kcore-${vmName}";
       zvolDevice = "/dev/zvol/${zvolDataset}";
+      rbdImage = if vmCfg.rbdImage != "" then vmCfg.rbdImage else "kcore-${vmName}";
+      rbdDevice = "/dev/rbd/${cfg.rbdPool}/${rbdImage}";
 
       actualDisk =
         if isLvm then
           lvDevice
         else if isZfs then
           zvolDevice
+        else if isCeph then
+          rbdDevice
         else
           toString vmCfg.image;
       actualFormat = if isBlockBackend then "raw" else vmCfg.imageFormat;
@@ -91,11 +96,55 @@ let
         fi
       '';
 
+      cephMapScript = pkgs.writeShellScript "ceph-map-${vmName}" ''
+        set -e
+        IMAGE="${cfg.rbdPool}/${rbdImage}"
+        RBD_DEV="${rbdDevice}"
+        SOURCE="${toString vmCfg.image}"
+        # Controller/CephAdapter owns rbd create; this script only maps and
+        # seeds the guest image once onto the block device (like LVM/ZFS).
+        if ! ${pkgs.ceph}/bin/rbd info "$IMAGE" >/dev/null 2>&1; then
+          echo "ERROR: RBD image $IMAGE does not exist; create the VM via kctl first"
+          exit 1
+        fi
+        if [ ! -b "$RBD_DEV" ]; then
+          ${pkgs.ceph}/bin/rbd map "$IMAGE"
+        fi
+        test -b "$RBD_DEV"
+        # Cluster-visible seed flag so cold drain/migrate to another node does
+        # not re-run qemu-img convert and wipe the shared RBD.
+        LOCAL_MARKER="/var/lib/kcore/rbd-seeded/${rbdImage}"
+        SEEDED=0
+        if ${pkgs.ceph}/bin/rbd image-meta get "$IMAGE" kcore.seeded >/dev/null 2>&1; then
+          SEEDED=1
+        elif [ -f "$LOCAL_MARKER" ]; then
+          SEEDED=1
+          ${pkgs.ceph}/bin/rbd image-meta set "$IMAGE" kcore.seeded 1 || true
+        fi
+        if [ "$SEEDED" -eq 0 ]; then
+          test -e "$SOURCE" || { echo "missing source image: $SOURCE"; exit 1; }
+          echo "Seeding RBD $IMAGE from $SOURCE..."
+          ${pkgs.qemu-utils}/bin/qemu-img convert \
+            -f ${vmCfg.imageFormat} -O raw \
+            "$SOURCE" "$RBD_DEV"
+          ${pkgs.ceph}/bin/rbd image-meta set "$IMAGE" kcore.seeded 1
+          mkdir -p "$(dirname "$LOCAL_MARKER")"
+          touch "$LOCAL_MARKER"
+        fi
+      '';
+
+      # Live migration requires MAP_SHARED guest RAM (`shared=on`).
+      memoryArg =
+        if isCeph then
+          "--memory size=${toString vmCfg.memorySize}M,shared=on"
+        else
+          "--memory size=${toString vmCfg.memorySize}M";
+
       chArgs = lib.concatStringsSep " " (
         [
           "--api-socket ${socketPath}"
           "--cpus boot=${toString vmCfg.cores}"
-          "--memory size=${toString vmCfg.memorySize}M"
+          memoryArg
           "--firmware ${firmwarePath}"
           "--serial socket=${serialSocket}"
           "--disk ${vmDiskArg} ${seedDiskArg}"
@@ -104,44 +153,71 @@ let
         ++ vmCfg.extraArgs
       );
 
-      basePreChecks = [
-        "${pkgs.coreutils}/bin/rm -f ${socketPath} ${serialSocket}"
-        "${pkgs.bash}/bin/bash -euc 'test -f ${seedIso} || { echo \"missing cloud-init seed: ${seedIso}\"; exit 1; }'"
-        "${pkgs.bash}/bin/bash -euc 'test -f ${firmwarePath} || { echo \"missing firmware: ${firmwarePath}\"; exit 1; }'"
-      ];
+      liveMigratedMarker = "${cfg.socketDir}/${vmName}.live-migrated";
+      migratePidFile = "${cfg.socketDir}/${vmName}.migrate.pid";
 
-      sourceImageCheck = "${pkgs.bash}/bin/bash -euc 'test -e ${toString vmCfg.image} || { echo \"missing source image: ${toString vmCfg.image}\"; exit 1; }'";
+      # After a live receive, CH is already running outside systemd. Skip
+      # destructive socket cleanup so the handoff ExecStart can adopt it.
+      startPreScript = pkgs.writeShellScript "kcore-vm-${vmName}-pre" ''
+        set -e
+        if [ -f "${liveMigratedMarker}" ]; then
+          echo "live-migrated marker present; skipping socket wipe / cold provision"
+          exit 0
+        fi
+        ${pkgs.coreutils}/bin/rm -f ${socketPath} ${serialSocket}
+        ${pkgs.bash}/bin/bash -euc 'test -f ${seedIso} || { echo "missing cloud-init seed: ${seedIso}"; exit 1; }'
+        ${pkgs.bash}/bin/bash -euc 'test -f ${firmwarePath} || { echo "missing firmware: ${firmwarePath}"; exit 1; }'
+        ${pkgs.bash}/bin/bash -euc 'test -e ${toString vmCfg.image} || { echo "missing source image: ${toString vmCfg.image}"; exit 1; }'
+        ${
+          if isLvm then
+            "${lvmProvisionScript}"
+          else if isZfs then
+            "${zfsProvisionScript}"
+          else if isCeph then
+            "${cephMapScript}"
+          else
+            "true"
+        }
+      '';
 
-      lvmPreChecks = [
-        sourceImageCheck
-        "${lvmProvisionScript}"
-      ];
-      zfsPreChecks = [
-        sourceImageCheck
-        "${zfsProvisionScript}"
-      ];
-      fsPreChecks = [ sourceImageCheck ];
-
-      storagePreChecks =
-        if isLvm then
-          lvmPreChecks
-        else if isZfs then
-          zfsPreChecks
-        else
-          fsPreChecks;
+      # Adopt an in-flight receive-mode CH (tail --pid) or cold-start CH.
+      startScript = pkgs.writeShellScript "kcore-vm-${vmName}-start" ''
+        set -e
+        if [ -f "${liveMigratedMarker}" ]; then
+          if [ ! -f "${migratePidFile}" ]; then
+            echo "ERROR: ${liveMigratedMarker} present but ${migratePidFile} missing"
+            exit 1
+          fi
+          pid="$(${pkgs.coreutils}/bin/cat "${migratePidFile}")"
+          if ! ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null; then
+            echo "ERROR: live-migrated cloud-hypervisor pid $pid is not running"
+            exit 1
+          fi
+          ${pkgs.coreutils}/bin/rm -f "${liveMigratedMarker}" "${migratePidFile}"
+          echo "Adopting live-migrated cloud-hypervisor pid $pid"
+          exec ${pkgs.coreutils}/bin/tail --pid="$pid" -f /dev/null
+        fi
+        exec ${chBin} ${chArgs}
+      '';
     in
     {
       description = "kcore VM ${vmName}";
       requires = [ "kcore-tap-${vmName}.service" ];
       after = [ "kcore-tap-${vmName}.service" ];
       wantedBy = lib.optionals vmCfg.autoStart [ "multi-user.target" ];
-      stopIfChanged = true;
+      # A live-migrated CH survives the destination rebuild because the unit is
+      # *new* there: switch-to-configuration only consults
+      # stopIfChanged/restartIfChanged for units that already existed and
+      # changed, so the handoff needs no override here. Leaving the defaults on
+      # keeps VM spec updates (cpu/memory/extraArgs) actually taking effect for
+      # Ceph-backed VMs.
 
       serviceConfig = {
         Type = "simple";
-        ExecStartPre = basePreChecks ++ storagePreChecks;
-        ExecStart = "${chBin} ${chArgs}";
+        ExecStartPre = [ "${startPreScript}" ];
+        ExecStart = "${startScript}";
         ExecStop = "${pkgs.curl}/bin/curl --unix-socket ${socketPath} -s -X PUT http://localhost/api/v1/vm.power-button";
+        ExecStopPost = lib.optionalString isCeph "-${pkgs.ceph}/bin/rbd unmap ${rbdDevice}";
         TimeoutStopSec = 30;
         Restart = if vmCfg.autoStart then "always" else "no";
         RestartSec = 5;

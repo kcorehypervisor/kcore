@@ -12,12 +12,22 @@ For a deep operational runbook focused specifically on day-2 filesystem changes,
 
 - `docs/day-2-filesystem-operations.md`
 
+For **kcore SAN** (shared Ceph / RBD), see:
+
+- `docs/ceph.md` — fabric + RBD integration
+- `docs/vm-migration.md` — cold drain and Cloud Hypervisor live migration
+
+Operator guides on the product site:
+
+- [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html)
+- [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.html)
+
 ## Storage Model
 
 There are two connected storage concepts:
 
 1. **Node storage capability**  
-   Each node registers a storage backend capability (`filesystem`, `lvm`, `zfs`) with the controller.
+   Each node registers a storage backend capability (`filesystem`, `lvm`, `zfs`, or `ceph` for kcore SAN members) with the controller.
 
 2. **VM storage request**  
    Every VM create request now carries required storage metadata:

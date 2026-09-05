@@ -335,7 +335,7 @@ pub fn print_compliance_report(r: &controller_proto::GetComplianceReportResponse
                 n.node_id,
                 n.hostname,
                 n.address,
-                &n.approval_status,
+                n.approval_status,
                 format_cert_expiry(n.cert_expiry_days),
                 format_luks_method(&n.luks_method),
             );
@@ -418,6 +418,7 @@ fn storage_backend_str(value: i32) -> &'static str {
         controller_proto::StorageBackendType::Filesystem => "filesystem",
         controller_proto::StorageBackendType::Lvm => "lvm",
         controller_proto::StorageBackendType::Zfs => "zfs",
+        controller_proto::StorageBackendType::Ceph => "ceph",
         controller_proto::StorageBackendType::Unspecified => "unspecified",
     }
 }
@@ -544,7 +545,7 @@ mod proptests {
         #[test]
         fn storage_backend_str_known_set(state in any::<i32>()) {
             let s = storage_backend_str(state);
-            prop_assert!(matches!(s, "filesystem" | "lvm" | "zfs" | "unspecified"));
+            prop_assert!(matches!(s, "filesystem" | "lvm" | "zfs" | "ceph" | "unspecified"));
         }
 
         /// `section` never panics for any title length, including
