@@ -193,6 +193,72 @@ make audit    # Run cargo audit standalone
 make check    # Run clippy + fmt + audit together
 ```
 
+## Release Artifacts: SBOMs and Signing
+
+Every release publishes two SBOMs and one signature. The operational detail
+lives in [release-verification.md](./release-verification.md); this section
+records the two design decisions behind it.
+
+### Two SBOMs, because there are two dependency graphs
+
+`Cargo.lock` resolves ~511 Rust packages. The ISO's Nix closure is a
+different universe: kernel, systemd, `cloud-hypervisor`, openssl, qemu.
+Neither document answers the other's questions, and neither is a subset of
+the other, so they ship separately and are named to make confusing them
+hard:
+
+| Asset | Graph | Generator |
+|---|---|---|
+| `kcore-$(VERSION)-crates.cdx.json` | Rust dependencies from `Cargo.lock` | `cargo-cyclonedx`, merged with `cyclonedx-cli` |
+| `kcore-$(VERSION)-iso-closure.cdx.json` / `.spdx.json` | Nix runtime closure of the system the ISO boots | `sbomnix` |
+
+Both are generated at release time by [`scripts/sbom.sh`](../scripts/sbom.sh)
+and are not committed, so there is no committed artifact to drift and nothing
+new runs on pull requests.
+
+### Signing uses Sigstore, not the cluster PKI
+
+The obvious instinct is that kcore already has a PKI, so it should sign its
+own releases. That instinct is wrong, and the reasons are worth writing down.
+
+The CA under [`crates/controller/src/pki/`](../crates/controller/src/pki/) is
+built for intra-cluster mTLS and nothing else:
+
+- **It is generated per installation.** Each cluster mints its own root at
+  bootstrap. There is no single key an outside party could pin, so a
+  signature from one cluster's CA means nothing to someone downloading an
+  ISO — the trust anchor is per-deployment, while a release artifact needs a
+  project-wide one.
+- **Its leaves cannot express code signing.** Every certificate is
+  `CN=kcore-node-<host>` or `CN=kctl:<name>`, carrying ServerAuth and
+  ClientAuth EKUs only. Nothing in the profile says "this signed a release",
+  and CN-based authorization (see "gRPC Authorization" above) reads those
+  names as cluster identities.
+- **The signing key is online by design.** The sub-CA signs node CSRs on
+  demand, so its key is loaded in a long-running network service. Granting
+  it release authority would convert any controller compromise into a
+  supply-chain compromise of every kcore download — a strictly worse
+  blast radius than the cluster it was scoped to.
+
+Releases are therefore signed with **Sigstore keyless signing** via `cosign`,
+against a maintainer's OIDC identity. No long-lived private key exists to
+steal, and the expected identity is published rather than pinned to a key.
+
+### What the signature does and does not prove
+
+It proves that **a kcore maintainer stood behind these exact bytes**. It does
+**not** prove that those bytes were built from a particular commit by a
+particular pipeline — releases are still cut on a maintainer's machine, so no
+machine-checkable record ties an artifact to a source revision. Moving builds
+into CI is what would change that, and it has not been done.
+
+This is still a real improvement over checksums alone.
+[`scripts/get-kctl.sh`](../scripts/get-kctl.sh) fetches `SHA256SUMS` from the
+same host as the tarball it describes, which detects corruption but not
+tampering: anyone able to replace the tarball can replace the checksums file
+with it. A signature over `SHA256SUMS` closes that gap, and because every
+other asset is listed in `SHA256SUMS`, one signature covers them all.
+
 ## Known Limitations
 
 - **No OCSP stapling** -- `tonic` 0.12 offers no hook for a rustls `CertifiedKey` or `ServerCertVerifier`. The controller runs an OCSP responder and clients query it directly; see "OCSP stapling is not supported" above.
