@@ -2,7 +2,7 @@
 # Build release artifacts (Nix ISO + Linux/macOS kctl), package dist/, publish GitHub Release.
 # Usage:
 #   ./scripts/release.sh build    # nix build ISO + Linux kctl, cargo-zigbuild macOS kctl
-#   ./scripts/release.sh dist     # dist/*.tar.gz, ISO copy, dist/SHA256SUMS
+#   ./scripts/release.sh dist     # dist/*.tar.gz, ISO copy, crate SBOM, dist/SHA256SUMS
 #   ./scripts/release.sh tag      # create/push v$(VERSION)
 #   ./scripts/release.sh publish  # gh release create/upload (needs tag on remote)
 #   ./scripts/release.sh release  # tag + build + dist + publish
@@ -24,6 +24,10 @@ KCTL_ARCHIVES=(
 	"${KCTL_LINUX_ARCHIVE}"
 	"${KCTL_MACOS_X86_64_ARCHIVE}"
 	"${KCTL_MACOS_AARCH64_ARCHIVE}"
+)
+# The Rust dependency graph; see scripts/sbom.sh.
+SBOM_FILES=(
+	"kcore-${VERSION}-crates.cdx.json"
 )
 TAG="v${VERSION}"
 
@@ -121,6 +125,7 @@ cmd_build() {
 cmd_dist() {
 	require_cmd tar
 	require_cmd sha256sum
+	require_cmd nix
 	[[ -f result-kctl/bin/kctl ]] || die "run '${0} build' first (missing result-kctl/bin/kctl)"
 	[[ -f target/x86_64-apple-darwin/release/kctl ]] || die "run '${0} build' first (missing target/x86_64-apple-darwin/release/kctl)"
 	[[ -f target/aarch64-apple-darwin/release/kctl ]] || die "run '${0} build' first (missing target/aarch64-apple-darwin/release/kctl)"
@@ -139,10 +144,19 @@ cmd_dist() {
 	tar -C target/aarch64-apple-darwin/release -czf "dist/${KCTL_MACOS_AARCH64_ARCHIVE}" kctl
 	echo "==> Copying $(basename "${ISO_SRC}") to dist/${ISO_NAME}..."
 	cp -f "${ISO_SRC}" "dist/${ISO_NAME}"
+
+	# Generated here, before SHA256SUMS, so the SBOM is covered by the
+	# checksums file.
+	echo "==> Generating crate SBOM..."
+	nix develop --command bash ./scripts/sbom.sh crates
+	for sbom in "${SBOM_FILES[@]}"; do
+		[[ -s "dist/${sbom}" ]] || die "scripts/sbom.sh produced no dist/${sbom}"
+	done
+
 	echo "==> Writing dist/SHA256SUMS..."
 	(
 		cd dist
-		sha256sum "${ISO_NAME}" "${KCTL_ARCHIVES[@]}" >SHA256SUMS
+		sha256sum "${ISO_NAME}" "${KCTL_ARCHIVES[@]}" "${SBOM_FILES[@]}" >SHA256SUMS
 	)
 	echo "==> dist layout:"
 	ls -lh dist/
@@ -157,6 +171,9 @@ cmd_publish() {
 		[[ -f "dist/${archive}" ]] || die "run '${0} dist' first (missing dist/${archive})"
 	done
 	[[ -f "dist/${ISO_NAME}" ]] || die "run '${0} dist' first"
+	for sbom in "${SBOM_FILES[@]}"; do
+		[[ -f "dist/${sbom}" ]] || die "run '${0} dist' first (missing dist/${sbom})"
+	done
 	[[ -f dist/SHA256SUMS ]] || die "run '${0} dist' first"
 
 	target_commit="$(git rev-parse "${TAG}^{commit}" 2>/dev/null)" || die "missing local tag ${TAG}; run '${0} tag' first"
@@ -171,6 +188,9 @@ cmd_publish() {
 	assets=("dist/${ISO_NAME}")
 	for archive in "${KCTL_ARCHIVES[@]}"; do
 		assets+=("dist/${archive}")
+	done
+	for sbom in "${SBOM_FILES[@]}"; do
+		assets+=("dist/${sbom}")
 	done
 	assets+=(dist/SHA256SUMS)
 	create_args=(
