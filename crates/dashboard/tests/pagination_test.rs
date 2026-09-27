@@ -77,6 +77,18 @@ impl Controller for ManyVmsController {
     async fn get_vm(&self, _: TRequest<GetVmRequest>) -> Result<Response<GetVmResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn list_gpus(
+        &self,
+        _: TRequest<ListGpusRequest>,
+    ) -> Result<Response<ListGpusResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_pci_devices(
+        &self,
+        _: TRequest<ListGpusRequest>,
+    ) -> Result<Response<ListGpusResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
 
     type AttachVmConsoleStream =
         tokio_stream::wrappers::ReceiverStream<Result<ConsoleMessage, Status>>;

@@ -164,8 +164,8 @@ fn state_detail(
 
 fn print_gpu_table(rows: &[GpuView]) {
     println!(
-        "{:<16}  {:<10}  {:<10}  {:<16}  {:<14}  {:>5}  {:<8}  {}",
-        "NODE", "GPU", "ROLE", "MODEL", "ADDRESS", "GROUP", "STATE", "DETAIL"
+        "{:<16}  {:<10}  {:<10}  {:<16}  {:<14}  {:>5}  {:<8}  DETAIL",
+        "NODE", "GPU", "ROLE", "MODEL", "ADDRESS", "GROUP", "STATE"
     );
     for row in rows {
         println!(
@@ -184,8 +184,8 @@ fn print_gpu_table(rows: &[GpuView]) {
 
 fn print_pci_table(rows: &[GpuView]) {
     println!(
-        "{:<16}  {:<6}  {:<14}  {:<10}  {:<10}  {:<14}  {:>5}  {:<8}  {}",
-        "NODE", "KIND", "NAME", "ROLE", "CLASS", "ADDRESS", "GROUP", "STATE", "DETAIL"
+        "{:<16}  {:<6}  {:<14}  {:<10}  {:<10}  {:<14}  {:>5}  {:<8}  DETAIL",
+        "NODE", "KIND", "NAME", "ROLE", "CLASS", "ADDRESS", "GROUP", "STATE"
     );
     for row in rows {
         println!(
