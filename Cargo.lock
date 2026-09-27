@@ -1844,6 +1844,7 @@ dependencies = [
  "const-oid",
  "der",
  "kcore-disko-types",
+ "kcore-gpu",
  "kcore-sanitize",
  "libc",
  "pem",
@@ -1917,6 +1918,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcore-gpu"
+version = "0.3.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "kcore-node-agent"
 version = "0.3.0"
 dependencies = [
@@ -1931,6 +1939,7 @@ dependencies = [
  "hyper-util",
  "hyperlocal",
  "kcore-disko-types",
+ "kcore-gpu",
  "kcore-sanitize",
  "libc",
  "pem",
@@ -1971,6 +1980,7 @@ dependencies = [
  "clap",
  "dirs",
  "kcore-disk-layout-yaml",
+ "kcore-gpu",
  "kcore-sanitize",
  "libc",
  "proptest",

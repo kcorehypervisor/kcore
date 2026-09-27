@@ -1305,6 +1305,7 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                pci_devices: pci_devices_from_replication_body(&body)?,
             };
             // In place, not delete-then-insert: replaying `vm.create` for a VM
             // this controller already holds would otherwise cascade away its
@@ -1312,6 +1313,14 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             // event body does not carry in full.
             db.upsert_vm(&vm)
                 .map_err(|e| format!("upsert vm {vm_id} from replication head: {e}"))?;
+            if let Some(gpu_name) = body.get("gpuName").and_then(Value::as_str) {
+                if gpu_name.is_empty() {
+                    let _ = db.clear_vm_gpu(vm_id);
+                } else {
+                    db.set_vm_gpu(vm_id, gpu_name)
+                        .map_err(|e| format!("storing GPU assignment for vm {vm_id}: {e}"))?;
+                }
+            }
             let ssh_keys: Vec<String> = body
                 .get("sshKeyNames")
                 .and_then(Value::as_array)
@@ -1682,6 +1691,23 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
     }
 }
 
+fn pci_devices_from_replication_body(body: &Value) -> Result<String, String> {
+    let Some(value) = body.get("pciDevices") else {
+        return Ok(String::new());
+    };
+    let addrs: Vec<String> = if let Some(items) = value.as_array() {
+        items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    } else if let Some(s) = value.as_str() {
+        crate::pci::split_pci_devices(s)
+    } else {
+        return Err("pciDevices must be a list of PCI addresses".into());
+    };
+    crate::pci::join_pci_devices(&addrs).map_err(|e| format!("pciDevices: {e}"))
+}
+
 fn required_str<'a>(body: &'a Value, key: &str, resource_key: &str) -> Result<&'a str, String> {
     body.get(key)
         .and_then(Value::as_str)
@@ -1883,6 +1909,7 @@ mod tests {
             storage_backend: "fs".to_string(),
             storage_size_bytes: 0,
             vm_ip: String::new(),
+            pci_devices: String::new(),
         }
     }
 
@@ -2667,6 +2694,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_size_bytes: 10 * 1024 * 1024 * 1024,
             vm_ip: String::new(),
+            pci_devices: String::new(),
         };
         db.insert_vm(&vm).expect("insert vm");
         db.associate_vm_ssh_keys("vm-ssh", &[String::from("operator-key")])

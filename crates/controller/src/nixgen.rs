@@ -250,6 +250,17 @@ pub fn generate_node_config_with_security_groups(
             "      autoStart = {};\n",
             if vm.auto_start { "true" } else { "false" }
         ));
+        let pci_devices = crate::pci::split_pci_devices(&vm.pci_devices);
+        if !pci_devices.is_empty() {
+            out.push_str("      pciDevices = [\n");
+            for addr in &pci_devices {
+                out.push_str(&format!(
+                    "        {{ address = \"{}\"; }}\n",
+                    nix_escape(addr)
+                ));
+            }
+            out.push_str("      ];\n");
+        }
         let ssh_keys = vm_ssh_keys.get(&vm.id).cloned().unwrap_or_default();
         if !vm.cloud_init_user_data.is_empty() {
             let escaped = nix_escape(&vm.cloud_init_user_data);
@@ -303,6 +314,9 @@ pub fn generate_node_config_with_security_groups(
     }
 
     out.push_str("  };\n");
+    if vms.iter().any(|vm| !vm.pci_devices.is_empty()) {
+        out.push_str("  ch-vm.vfio.enable = true;\n");
+    }
     out.push_str("}\n");
     out
 }
@@ -331,6 +345,7 @@ mod tests {
             storage_backend: "filesystem".into(),
             storage_size_bytes: 10 * 1024 * 1024 * 1024,
             vm_ip: String::new(),
+            pci_devices: String::new(),
         }
     }
 
@@ -363,6 +378,23 @@ mod tests {
         assert!(config.contains("storageBackend = \"filesystem\""));
         assert!(config.contains("storageSizeBytes = 10737418240"));
         assert!(config.contains("cloudInitInstanceId = \"vm-1\";"));
+    }
+
+    #[test]
+    fn emits_pci_passthrough_devices() {
+        let mut guest = vm(true, "gpu-guest");
+        guest.pci_devices = "0000:03:00.0,0000:03:00.1".into();
+        let config = generate_node_config(
+            &[guest],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(config.contains("address = \"0000:03:00.0\""));
+        assert!(config.contains("address = \"0000:03:00.1\""));
+        assert!(config.contains("ch-vm.vfio.enable = true;"));
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //!
 //! | Kind          | Mutable                                  | Immutable                                                                                                                                   |
 //! | ------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-//! | VM            | `cpu`, `memory_bytes`, `desired_state`   | `disks`, `nics`, `storage_backend`, `storage_size_bytes`, `target_node`, `target_dc`, `ssh_key_names`, `cloud_init_user_data`, `image_*`    |
+//! | VM            | `cpu`, `memory_bytes`, `desired_state`   | `disks`, `nics`, `storage_backend`, `storage_size_bytes`, `pci_devices`, `target_node`, `target_dc`, `ssh_key_names`, `cloud_init_user_data`, `image_*`    |
 //! | Container     | `env`, `ports`, `desired_state`          | `image`, `command`, `network`, `storage_backend`, `storage_size_bytes`, `mount_target`                                                      |
 //! | Network       | *(none)*                                 | all fields                                                                                                                                  |
 //! | SshKey        | *(none)*                                 | `public_key`                                                                                                                                |
@@ -107,6 +107,19 @@ pub fn diff_vm(
     }
     if incoming.storage_size_bytes > 0 && stored.storage_size_bytes != incoming.storage_size_bytes {
         diff.immutable.push("storage_size_bytes".into());
+    }
+    // Empty pci_devices means "unspecified" so a re-apply that omits the list
+    // does not detach devices. A different non-empty list is a recreate.
+    if !incoming.spec.pci_devices.is_empty() {
+        match crate::pci::join_pci_devices(&incoming.spec.pci_devices) {
+            Ok(joined) if joined != stored.pci_devices => {
+                diff.immutable.push("pci_devices".into());
+            }
+            Err(_) => {
+                diff.immutable.push("pci_devices".into());
+            }
+            Ok(_) => {}
+        }
     }
 
     // image_* — if either url or path is provided, it must match what was stored.
@@ -449,6 +462,7 @@ mod tests {
             storage_backend: "lvm".into(),
             storage_size_bytes: 20 * 1024 * 1024 * 1024,
             vm_ip: "10.0.0.5".into(),
+            pci_devices: String::new(),
         }
     }
 
@@ -463,6 +477,8 @@ mod tests {
             storage_backend: String::new(),
             storage_size_bytes: 0,
             desired_state: controller_proto::VmDesiredState::Unspecified as i32,
+            pci_devices: vec![],
+            gpus: vec![],
         }
     }
 
@@ -551,6 +567,28 @@ mod tests {
         };
         let diff = diff_vm(&stored, &[], &apply);
         assert!(diff.immutable.iter().any(|f| f == "storage_backend"));
+    }
+
+    #[test]
+    fn vm_pci_devices_change_is_immutable() {
+        let mut stored = sample_vm();
+        stored.pci_devices = "0000:03:00.0".into();
+        let mut spec = sample_vm_spec(stored.cpu, stored.memory_bytes);
+        spec.pci_devices = vec!["0000:03:00.1".into()];
+        let apply = VmApply {
+            spec: &spec,
+            image_url: "",
+            image_sha256: "",
+            image_path: "",
+            cloud_init_user_data: "",
+            ssh_key_names: &[],
+            storage_backend: "",
+            storage_size_bytes: 0,
+            target_node: "",
+            target_dc: "",
+        };
+        let diff = diff_vm(&stored, &[], &apply);
+        assert!(diff.immutable.iter().any(|f| f == "pci_devices"));
     }
 
     #[test]
@@ -1170,6 +1208,7 @@ mod proptests {
                 storage_backend: "filesystem".into(),
                 storage_size_bytes: 0,
                 vm_ip: String::new(),
+                pci_devices: String::new(),
             };
             let desired_state = if auto_start {
                 controller_proto::VmDesiredState::Running as i32
@@ -1186,6 +1225,8 @@ mod proptests {
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
                 desired_state,
+                pci_devices: vec![],
+                gpus: vec![],
             };
             let apply = VmApply {
                 spec: &spec,
@@ -1234,6 +1275,7 @@ mod proptests {
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
                 vm_ip: String::new(),
+                pci_devices: String::new(),
             };
             let spec = controller_proto::VmSpec {
                 id: String::new(),
@@ -1245,6 +1287,8 @@ mod proptests {
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
                 desired_state: controller_proto::VmDesiredState::Running as i32,
+                pci_devices: vec![],
+                gpus: vec![],
             };
             let apply = VmApply {
                 spec: &spec,

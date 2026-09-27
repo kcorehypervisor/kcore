@@ -206,6 +206,7 @@ mod tests {
             storage_backend: backend.to_string(),
             storage_size_bytes: 3221225472,
             vm_ip: String::new(),
+            pci_devices: String::new(),
         }
     }
 

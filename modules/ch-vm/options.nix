@@ -212,6 +212,22 @@ let
         description = "Optional static DHCP reservation IP (used by dnsmasq on NAT networks).";
       };
 
+      pciDevices = lib.mkOption {
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              address = lib.mkOption {
+                type = lib.types.str;
+                example = "0000:03:00.0";
+                description = "PCI address to pass through, for example 0000:03:00.0. List every function in the device IOMMU group.";
+              };
+            };
+          }
+        );
+        default = [ ];
+        description = "PCI devices assigned to this VM with VFIO. Cloud Hypervisor receives one --device per address.";
+      };
+
       extraArgs = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];

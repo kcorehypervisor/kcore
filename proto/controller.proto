@@ -42,6 +42,10 @@ service Controller {
   // Node operations
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  // GPUs reported by node agents. Names (radeon0) are per node.
+  rpc ListGpus(ListGpusRequest) returns (ListGpusResponse);
+  // Full PCI inventory: AI GPUs, NICs, NVMe, and raw groups.
+  rpc ListPciDevices(ListGpusRequest) returns (ListGpusResponse);
 
   // SSH key management
   rpc CreateSshKey(CreateSshKeyRequest) returns (CreateSshKeyResponse);
@@ -166,6 +170,37 @@ message HeartbeatRequest {
   NodeUsage usage = 2;
   int32 cert_expiry_days = 3; // Days until node TLS certificate expires
   string luks_method = 4;     // "tpm2", "key-file", or "" (not reported)
+  // Present only when the node agent scanned PCI. Empty with gpus_reported
+  // means the node has no PCI devices. Omitted (gpus_reported false) leaves
+  // inventory alone. Rows are GPUs, NICs, NVMe, and raw groups; see GpuInfo.kind.
+  repeated GpuInfo gpus = 5;
+  bool gpus_reported = 6;
+}
+
+message GpuInfo {
+  string name = 1;            // radeon0, nic0, nvme0, or a raw BDF
+  string family = 2;          // radeon, nvidia, intel, accel, nic, nvme, raw
+  string model = 3;           // AMD 1002:744c
+  string address = 4;         // primary function, 0000:03:00.0
+  repeated string pci_devices = 5;
+  int32 iommu_group = 6;      // -1 when the device has no IOMMU group
+  bool assignable = 7;
+  string blocked_reason = 8;
+  string node_id = 9;         // set by the controller when listing
+  string assigned_vm = 10;    // VM name when this device is in use
+  string kind = 11;           // gpu, nic, nvme, raw; empty means gpu
+  string role = 12;           // compute (AI), platform (host iGPU), passthrough
+  string class_code = 13;     // 0x030200
+  string characteristics = 14; // purpose=ai class=... vendor=... iommu-companions=...
+  string driver = 15;
+}
+
+message ListGpusRequest {
+  string node_id = 1; // empty lists every node
+}
+
+message ListGpusResponse {
+  repeated GpuInfo gpus = 1;
 }
 
 message HeartbeatResponse {
@@ -622,6 +657,14 @@ message VmSpec {
   string storage_backend = 7;   // filesystem, lvm, zfs
   int64 storage_size_bytes = 8; // Provisioned volume size
   VmDesiredState desired_state = 9; // declarative desired state (running|stopped)
+  // PCI addresses to pass through (VFIO). Canonical form is 0000:03:00.0.
+  // Every function in the IOMMU group must be listed. Empty leaves a stored
+  // list unchanged on apply.
+  repeated string pci_devices = 10;
+  // Named devices: GPU (radeon0), NIC (nic0), NVMe (nvme0), or a family
+  // (radeon, nic, nvme) meaning the first free device of that family.
+  // GPUs are AI compute devices. Empty leaves a stored assignment unchanged.
+  repeated string gpus = 11;
 }
 
 message Disk {
@@ -832,6 +875,10 @@ message MigrateVmRequest {
   string target_node = 2;
   // When true, fall back to cold reassignment (drain-style) if live migrate fails.
   bool allow_cold_fallback = 3;
+  // Destination devices. Empty picks a free device of the same family for
+  // each named device the VM has now (a radeon on the source becomes a free
+  // radeon on the target). Ignored for VMs with no PCI devices.
+  repeated string gpus = 4;
 }
 
 message MigrateVmResponse {

@@ -19,6 +19,7 @@ mod grpc;
 mod nixgen;
 mod node_client;
 mod path_safety;
+mod pci;
 mod pki;
 mod replication;
 mod replication_policy;

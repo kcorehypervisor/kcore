@@ -32,6 +32,10 @@ pub struct CreateArgs {
     pub storage_backend: Option<String>,
     pub storage_size_bytes: Option<i64>,
     pub target_dc: Option<String>,
+    pub gpu: Vec<String>,
+    pub nic: Vec<String>,
+    pub nvme: Vec<String>,
+    pub pci: Vec<String>,
 }
 
 pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<()> {
@@ -60,8 +64,23 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
         storage_backend: None,
         storage_size_bytes: None,
         target_dc: None,
+        gpu: vec![],
+        nic: vec![],
+        nvme: vec![],
+        pci: vec![],
     };
     create(info, args).await
+}
+
+fn device_names(args: &CreateArgs, manifest_gpus: Vec<String>) -> Vec<String> {
+    if args.gpu.is_empty() && args.nic.is_empty() && args.nvme.is_empty() {
+        manifest_gpus
+    } else {
+        let mut names = args.gpu.clone();
+        names.extend(args.nic.iter().cloned());
+        names.extend(args.nvme.iter().cloned());
+        names
+    }
 }
 
 pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
@@ -105,6 +124,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_ssh_keys,
         manifest_cloud_init,
         manifest_desired_state,
+        manifest_pci_devices,
+        manifest_gpus,
     ) = if let Some(path) = &args.filename {
         let manifest = parse_vm_manifest(path)?;
         let n = args.name.clone().unwrap_or(manifest.name);
@@ -123,6 +144,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             manifest.ssh_keys,
             manifest.cloud_init_user_data,
             manifest.desired_state,
+            manifest.pci_devices,
+            manifest.gpus,
         )
     } else {
         let n = args
@@ -157,6 +180,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             vec![],
             None,
             proto::VmDesiredState::Unspecified,
+            vec![],
+            vec![],
         )
     };
     let image = resolve_create_image_source(
@@ -200,12 +225,21 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         storage_backend: String::new(),
         storage_size_bytes: 0,
         desired_state: manifest_desired_state as i32,
+        pci_devices: if args.pci.is_empty() {
+            manifest_pci_devices
+        } else {
+            args.pci.clone()
+        },
+        gpus: device_names(&args, manifest_gpus),
     };
 
     let target_node = args
         .target_node
         .or(manifest_target_node)
         .unwrap_or_default();
+    if (!spec.pci_devices.is_empty() || !spec.gpus.is_empty()) && target_node.trim().is_empty() {
+        bail!("a GPU assignment requires --target-node (or spec.targetNode)");
+    }
     let target_dc = args.target_dc.or(manifest_target_dc).unwrap_or_default();
     let ssh_key_names = if args.ssh_keys.is_empty() {
         manifest_ssh_keys
@@ -705,6 +739,8 @@ struct VmManifest {
     ssh_keys: Vec<String>,
     cloud_init_user_data: Option<String>,
     desired_state: proto::VmDesiredState,
+    pci_devices: Vec<String>,
+    gpus: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1090,6 +1126,34 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         None => proto::VmDesiredState::Unspecified,
     };
 
+    let mut gpus = doc["spec"]["gpus"]
+        .as_sequence()
+        .or_else(|| doc["spec"]["gpu"].as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .or_else(|| doc["spec"]["gpu"].as_str().map(|s| vec![s.to_string()]))
+        .unwrap_or_default();
+    for key in ["devices", "nvmes", "pciNics"] {
+        if let Some(seq) = doc["spec"][key].as_sequence() {
+            for value in seq.iter().filter_map(|v| v.as_str()) {
+                gpus.push(value.to_string());
+            }
+        }
+    }
+
+    let pci_devices = doc["spec"]["pciDevices"]
+        .as_sequence()
+        .or_else(|| doc["spec"]["pci_devices"].as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(VmManifest {
         name,
         cpu,
@@ -1105,6 +1169,8 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         ssh_keys,
         cloud_init_user_data,
         desired_state,
+        pci_devices,
+        gpus,
     })
 }
 
@@ -1316,6 +1382,10 @@ mod tests {
             storage_backend: Some("filesystem".into()),
             storage_size_bytes: Some(10 * 1024 * 1024 * 1024),
             target_dc: None,
+            gpu: vec![],
+            nic: vec![],
+            nvme: vec![],
+            pci: vec![],
         }
     }
 

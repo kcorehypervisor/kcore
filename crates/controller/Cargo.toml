@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.102"
+kcore-gpu = { path = "../kcore-gpu" }
 kcore-sanitize = { path = "../kcore-sanitize" }
 kcore-disko-types = { path = "../kcore-disko-types" }
 aws-lc-rs = "1.16.2"

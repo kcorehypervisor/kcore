@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/kcore-gpu",
     "crates/kcore-sanitize",
     "crates/kcore-disko-types",
     "crates/kcore-disk-layout-yaml",
