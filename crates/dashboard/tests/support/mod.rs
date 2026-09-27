@@ -82,6 +82,20 @@ impl Controller for MockController {
         Err(unimp("get_vm"))
     }
 
+    async fn list_gpus(
+        &self,
+        _: Request<ListGpusRequest>,
+    ) -> Result<Response<ListGpusResponse>, Status> {
+        Err(unimp("list_gpus"))
+    }
+
+    async fn list_pci_devices(
+        &self,
+        _: Request<ListGpusRequest>,
+    ) -> Result<Response<ListGpusResponse>, Status> {
+        Err(unimp("list_pci_devices"))
+    }
+
     type AttachVmConsoleStream =
         tokio_stream::wrappers::ReceiverStream<Result<ConsoleMessage, Status>>;
 
