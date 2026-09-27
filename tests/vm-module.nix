@@ -29,6 +29,18 @@ pkgs.testers.runNixOSTest {
           network = "default";
           autoStart = false;
         };
+
+        virtualMachines.gpu-guest = {
+          image = testImage;
+          cores = 1;
+          memorySize = 256;
+          network = "default";
+          autoStart = false;
+          pciDevices = [
+            { address = "0000:03:00.0"; }
+            { address = "0000:03:00.1"; }
+          ];
+        };
       };
 
       virtualisation.memorySize = 2048;
@@ -52,5 +64,10 @@ pkgs.testers.runNixOSTest {
 
     machine.succeed("test -d /run/kcore")
     machine.succeed("test -f /etc/kcore/seeds/this-name-is-way-too-long.iso")
+
+    machine.succeed("systemctl cat kcore-vm-gpu-guest.service | grep -F -- '--device path=/sys/bus/pci/devices/0000:03:00.0,iommu=on'")
+    machine.succeed("systemctl cat kcore-vm-gpu-guest.service | grep -F -- '--device path=/sys/bus/pci/devices/0000:03:00.1,iommu=on'")
+    machine.succeed("grep -q iommu=pt /proc/cmdline")
+    machine.succeed("systemctl cat kcore-vm-gpu-guest.service | grep -F vfio-bind-gpu-guest")
   '';
 }

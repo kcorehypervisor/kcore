@@ -69,6 +69,28 @@ pub struct VmRow {
     pub storage_backend: String,
     pub storage_size_bytes: i64,
     pub vm_ip: String,
+    /// Comma-separated canonical PCI addresses (`0000:03:00.0`). Empty means none.
+    pub pci_devices: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeGpuRow {
+    pub node_id: String,
+    pub name: String,
+    pub family: String,
+    pub model: String,
+    pub address: String,
+    pub pci_devices: String,
+    pub iommu_group: i32,
+    pub assignable: bool,
+    pub blocked_reason: String,
+    /// `gpu`, `nic`, `nvme`, or `raw`. Empty means `gpu`.
+    pub kind: String,
+    /// `compute`, `platform`, or `passthrough`.
+    pub role: String,
+    pub class_code: String,
+    pub characteristics: String,
+    pub driver: String,
 }
 
 #[derive(Debug, Clone)]
@@ -426,7 +448,8 @@ impl Database {
                 cloud_init_user_data TEXT NOT NULL DEFAULT '',
                 storage_backend TEXT NOT NULL DEFAULT 'filesystem',
                 storage_size_bytes INTEGER NOT NULL DEFAULT 0,
-                vm_ip TEXT NOT NULL DEFAULT ''
+                vm_ip TEXT NOT NULL DEFAULT '',
+                pci_devices TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS networks (
                 name TEXT NOT NULL,
@@ -1065,7 +1088,45 @@ impl Database {
             )?;
         }
 
-        const CURRENT_VERSION: i32 = 33;
+        if version < 34 {
+            let _ = conn.execute(
+                "ALTER TABLE vms ADD COLUMN pci_devices TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+        }
+
+        if version < 35 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS node_gpus (
+                    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    family TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    pci_devices TEXT NOT NULL,
+                    iommu_group INTEGER NOT NULL DEFAULT -1,
+                    assignable INTEGER NOT NULL DEFAULT 0,
+                    blocked_reason TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (node_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS vm_gpu_bindings (
+                    vm_id TEXT PRIMARY KEY REFERENCES vms(id) ON DELETE CASCADE,
+                    gpu_name TEXT NOT NULL
+                );",
+            )?;
+        }
+
+        if version < 36 {
+            conn.execute_batch(
+                "ALTER TABLE node_gpus ADD COLUMN kind TEXT NOT NULL DEFAULT 'gpu';
+                ALTER TABLE node_gpus ADD COLUMN role TEXT NOT NULL DEFAULT '';
+                ALTER TABLE node_gpus ADD COLUMN class_code TEXT NOT NULL DEFAULT '';
+                ALTER TABLE node_gpus ADD COLUMN characteristics TEXT NOT NULL DEFAULT '';
+                ALTER TABLE node_gpus ADD COLUMN driver TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
+
+        const CURRENT_VERSION: i32 = 36;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -2010,8 +2071,8 @@ impl Database {
     pub fn insert_vm(&self, vm: &VmRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 vm.id,
                 vm.name,
@@ -2030,6 +2091,7 @@ impl Database {
                 vm.storage_backend,
                 vm.storage_size_bytes,
                 vm.vm_ip,
+                vm.pci_devices,
             ],
         )?;
         Ok(())
@@ -2045,8 +2107,8 @@ impl Database {
     pub fn upsert_vm(&self, vm: &VmRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17)
+            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 cpu=excluded.cpu,
@@ -2063,7 +2125,8 @@ impl Database {
                 cloud_init_user_data=excluded.cloud_init_user_data,
                 storage_backend=excluded.storage_backend,
                 storage_size_bytes=excluded.storage_size_bytes,
-                vm_ip=excluded.vm_ip",
+                vm_ip=excluded.vm_ip,
+                pci_devices=excluded.pci_devices",
             params![
                 vm.id,
                 vm.name,
@@ -2082,6 +2145,7 @@ impl Database {
                 vm.storage_backend,
                 vm.storage_size_bytes,
                 vm.vm_ip,
+                vm.pci_devices,
             ],
         )?;
         Ok(())
@@ -2228,7 +2292,7 @@ impl Database {
     pub fn get_vm(&self, vm_id: &str) -> Result<Option<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip FROM vms WHERE id = ?1",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices FROM vms WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![vm_id], row_to_vm)?;
         rows.next().transpose()
@@ -2237,7 +2301,7 @@ impl Database {
     pub fn list_vms(&self) -> Result<Vec<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip FROM vms",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices FROM vms",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
         rows.collect()
@@ -2246,7 +2310,7 @@ impl Database {
     pub fn list_vms_for_node(&self, node_id: &str) -> Result<Vec<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip FROM vms WHERE node_id = ?1",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices FROM vms WHERE node_id = ?1",
         )?;
         let rows = stmt.query_map(params![node_id], row_to_vm)?;
         rows.collect()
@@ -3316,6 +3380,117 @@ impl Database {
     /// `security_group_vm_attachments`), so reassignment must never be
     /// expressed as delete-then-reinsert. Returns `false` when no such VM
     /// exists; a missing target node is rejected by the `node_id` foreign key.
+    pub fn set_vm_pci_devices(
+        &self,
+        vm_id: &str,
+        pci_devices: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE vms SET pci_devices = ?2 WHERE id = ?1",
+            params![vm_id, pci_devices],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn set_vm_gpu(&self, vm_id: &str, gpu_name: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vm_gpu_bindings (vm_id, gpu_name) VALUES (?1, ?2)
+             ON CONFLICT(vm_id) DO UPDATE SET gpu_name = excluded.gpu_name",
+            params![vm_id, gpu_name],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_vm_gpu(&self, vm_id: &str) -> Result<Option<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare("SELECT gpu_name FROM vm_gpu_bindings WHERE vm_id = ?1")?;
+        let mut rows = stmt.query_map(params![vm_id], |row| row.get::<_, String>(0))?;
+        rows.next().transpose()
+    }
+
+    pub fn clear_vm_gpu(&self, vm_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM vm_gpu_bindings WHERE vm_id = ?1",
+            params![vm_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_node_gpus(
+        &self,
+        node_id: &str,
+        gpus: &[NodeGpuRow],
+    ) -> Result<(), rusqlite::Error> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM node_gpus WHERE node_id = ?1", params![node_id])?;
+        for gpu in gpus {
+            let kind = if gpu.kind.is_empty() {
+                "gpu".to_string()
+            } else {
+                gpu.kind.clone()
+            };
+            tx.execute(
+                "INSERT INTO node_gpus (node_id, name, family, model, address, pci_devices, iommu_group, assignable, blocked_reason, kind, role, class_code, characteristics, driver)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    node_id,
+                    gpu.name,
+                    gpu.family,
+                    gpu.model,
+                    gpu.address,
+                    gpu.pci_devices,
+                    gpu.iommu_group,
+                    gpu.assignable as i32,
+                    gpu.blocked_reason,
+                    kind,
+                    gpu.role,
+                    gpu.class_code,
+                    gpu.characteristics,
+                    gpu.driver,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_node_gpus(
+        &self,
+        node_id: Option<&str>,
+    ) -> Result<Vec<NodeGpuRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, name, family, model, address, pci_devices, iommu_group, assignable, blocked_reason, kind, role, class_code, characteristics, driver
+             FROM node_gpus
+             WHERE (?1 = '' OR node_id = ?1)
+             ORDER BY node_id, address",
+        )?;
+        let filter = node_id.unwrap_or("");
+        let rows = stmt.query_map(params![filter], |row| {
+            Ok(NodeGpuRow {
+                node_id: row.get(0)?,
+                name: row.get(1)?,
+                family: row.get(2)?,
+                model: row.get(3)?,
+                address: row.get(4)?,
+                pci_devices: row.get(5)?,
+                iommu_group: row.get(6)?,
+                assignable: row.get::<_, i32>(7)? != 0,
+                blocked_reason: row.get(8)?,
+                kind: row.get(9)?,
+                role: row.get(10)?,
+                class_code: row.get(11)?,
+                characteristics: row.get(12)?,
+                driver: row.get(13)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn set_vm_node(&self, vm_id: &str, node_id: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let rows = conn.execute(
@@ -4089,6 +4264,7 @@ fn row_to_vm(row: &rusqlite::Row) -> Result<VmRow, rusqlite::Error> {
         storage_backend: row.get(15)?,
         storage_size_bytes: row.get(16)?,
         vm_ip: row.get(17)?,
+        pci_devices: row.get(18)?,
     })
 }
 
@@ -4207,7 +4383,20 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_size_bytes: 0,
             vm_ip: String::new(),
+            pci_devices: String::new(),
         }
+    }
+
+    #[test]
+    fn vm_pci_devices_round_trip() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        let mut vm = test_vm(&node.id);
+        vm.pci_devices = "0000:03:00.0,0000:03:00.1".into();
+        db.insert_vm(&vm).expect("insert vm");
+        let got = db.get_vm("vm-1").expect("get vm").expect("vm");
+        assert_eq!(got.pci_devices, "0000:03:00.0,0000:03:00.1");
     }
 
     fn test_workload(node_id: &str) -> WorkloadRow {
@@ -4323,6 +4512,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_size_bytes: 0,
             vm_ip: String::new(),
+            pci_devices: String::new(),
         })
         .expect("insert qcow vm");
 
@@ -5238,6 +5428,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_size_bytes: 1024 * 1024,
             vm_ip: "10.240.0.22".to_string(),
+            pci_devices: String::new(),
         })
         .expect("vm");
         db.insert_network(&NetworkRow {
@@ -5515,6 +5706,7 @@ mod proptests {
             storage_backend: "filesystem".to_string(),
             storage_size_bytes: 0,
             vm_ip: String::new(),
+            pci_devices: String::new(),
         }
     }
 

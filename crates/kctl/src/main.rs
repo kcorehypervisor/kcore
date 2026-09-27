@@ -124,6 +124,16 @@ enum Command {
         #[command(subcommand)]
         resource: DescribeResource,
     },
+    /// List GPUs on this machine or across the cluster
+    Gpu {
+        #[command(subcommand)]
+        action: GpuAction,
+    },
+    /// List PCI devices that can be attached to a VM
+    Pci {
+        #[command(subcommand)]
+        action: PciAction,
+    },
     /// Node administration commands
     Node {
         #[command(subcommand)]
@@ -149,7 +159,7 @@ enum Command {
         #[command(subcommand)]
         resource: DrainResource,
     },
-    /// Live-migrate a Ceph-backed VM to another CephCluster member
+    /// Migrate a VM. GPU VMs move cold onto a free or named GPU.
     Migrate {
         #[command(subcommand)]
         resource: MigrateResource,
@@ -355,6 +365,22 @@ enum CreateResource {
         /// Target datacenter (optional; controller picks any DC if empty)
         #[arg(long = "dc")]
         target_dc: Option<String>,
+        /// AI GPU to assign, by inventory name or family (repeatable). Requires --target-node.
+        /// Example: --gpu radeon0. A family (`radeon`, `nvidia`, `intel`, `accel`) takes the first free one.
+        #[arg(long = "gpu")]
+        gpu: Vec<String>,
+        /// Ethernet NIC to assign, by inventory name or family (repeatable).
+        /// Example: --nic nic0. Family `nic` takes the first free one.
+        #[arg(long = "nic")]
+        nic: Vec<String>,
+        /// NVMe controller to assign, by inventory name or family (repeatable).
+        /// Example: --nvme nvme0. Family `nvme` takes the first free one.
+        #[arg(long = "nvme")]
+        nvme: Vec<String>,
+        /// Raw PCI address to pass through (repeatable). Every function in the IOMMU group.
+        /// Example: --pci 0000:03:00.0 --pci 0000:03:00.1
+        #[arg(long = "pci")]
+        pci: Vec<String>,
     },
     /// Create a container on a node
     Container {
@@ -885,6 +911,35 @@ enum SshKeyAction {
 }
 
 #[derive(Subcommand)]
+enum GpuAction {
+    /// List AI and platform GPUs. Use --local to read this machine.
+    List {
+        /// Only GPUs on this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Scan PCI devices on the machine where kctl is running
+        #[arg(long)]
+        local: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PciAction {
+    /// List GPUs, NICs, NVMe, and raw PCI groups.
+    List {
+        /// Only devices on this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Scan PCI devices on the machine where kctl is running
+        #[arg(long)]
+        local: bool,
+        /// gpu, nic, nvme, or raw
+        #[arg(long = "type")]
+        kind: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DrainResource {
     /// Drain a node
     Node {
@@ -898,7 +953,7 @@ enum DrainResource {
 
 #[derive(Subcommand)]
 enum MigrateResource {
-    /// Live-migrate a VM (shared RBD / Ceph)
+    /// Move a VM to another node. A GPU VM is cold-migrated onto a destination GPU.
     Vm {
         /// VM id or name
         vm_id: String,
@@ -908,6 +963,18 @@ enum MigrateResource {
         /// Fall back to cold reassignment if live migrate fails
         #[arg(long = "allow-cold-fallback")]
         allow_cold_fallback: bool,
+        /// GPU to attach on the destination (repeatable).
+        /// Omit this to take a free GPU of the same family.
+        /// Example: --gpu radeon0
+        #[arg(long = "gpu")]
+        gpu: Vec<String>,
+        /// NIC to attach on the destination (repeatable).
+        /// Omit this to take a free NIC of the same family.
+        #[arg(long = "nic")]
+        nic: Vec<String>,
+        /// NVMe controller to attach on the destination (repeatable).
+        #[arg(long = "nvme")]
+        nvme: Vec<String>,
     },
     /// Clear a stranded live-migrate receive session on a node.
     ///
@@ -1146,6 +1213,10 @@ async fn main() {
                     storage_backend,
                     storage_size_bytes,
                     target_dc,
+                    gpu,
+                    nic,
+                    nvme,
+                    pci,
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -1181,6 +1252,10 @@ async fn main() {
                     }),
                     storage_size_bytes: *storage_size_bytes,
                     target_dc: target_dc.clone(),
+                    gpu: gpu.clone(),
+                    nic: nic.clone(),
+                    nvme: nvme.clone(),
+                    pci: pci.clone(),
                 },
             )
             .await
@@ -1517,6 +1592,26 @@ async fn main() {
             commands::ceph_cluster::get(&info, name).await
         }
 
+        Command::Gpu { action } => match action {
+            GpuAction::List { node, local } => {
+                if *local {
+                    commands::gpu::list_local()
+                } else {
+                    let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+                    commands::gpu::list(&info, node.as_deref()).await
+                }
+            }
+        },
+        Command::Pci { action } => match action {
+            PciAction::List { node, local, kind } => {
+                if *local {
+                    commands::gpu::list_pci_local(kind.as_deref())
+                } else {
+                    let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+                    commands::gpu::list_pci(&info, node.as_deref(), kind.as_deref()).await
+                }
+            }
+        },
         Command::Node {
             action: NodeAction::Approve { node_id },
         } => {
@@ -1757,17 +1852,24 @@ async fn main() {
                     vm_id,
                     target_node,
                     allow_cold_fallback,
+                    gpu,
+                    nic,
+                    nvme,
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             let mut client = client::controller_client(&info)
                 .await
                 .unwrap_or_else(|e| fatal(&format!("{e}")));
+            let mut devices = gpu.clone();
+            devices.extend(nic.clone());
+            devices.extend(nvme.clone());
             let resp = client
                 .migrate_vm(client::controller_proto::MigrateVmRequest {
                     vm_id: vm_id.to_string(),
                     target_node: target_node.to_string(),
                     allow_cold_fallback: *allow_cold_fallback,
+                    gpus: devices,
                 })
                 .await;
             match resp {

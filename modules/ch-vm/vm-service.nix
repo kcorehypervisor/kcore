@@ -133,6 +133,8 @@ let
         fi
       '';
 
+      normalizedPci = map (dev: dev // { address = lib.toLower dev.address; }) vmCfg.pciDevices;
+
       # Live migration requires MAP_SHARED guest RAM (`shared=on`).
       memoryArg =
         if isCeph then
@@ -150,11 +152,68 @@ let
           "--disk ${vmDiskArg} ${seedDiskArg}"
           "--net tap=${tapName vmName},mac=${mac}"
         ]
+        ++ map (dev: "--device path=/sys/bus/pci/devices/${dev.address},iommu=on") normalizedPci
         ++ vmCfg.extraArgs
       );
 
       liveMigratedMarker = "${cfg.socketDir}/${vmName}.live-migrated";
       migratePidFile = "${cfg.socketDir}/${vmName}.migrate.pid";
+
+      # Bind the VM's PCI devices to vfio-pci. The guest gets each one via
+      # `--device`. Live migration does not carry these devices, so a
+      # receive-mode handoff skips the bind (the unit only adopts the pid).
+      vfioBindScript = pkgs.writeShellScript "vfio-bind-${vmName}" ''
+        set -euo pipefail
+        if [ -f "${liveMigratedMarker}" ]; then
+          echo "live-migrated marker present; not rebinding PCI devices"
+          exit 0
+        fi
+        ${pkgs.kmod}/bin/modprobe vfio-pci
+        requested="${lib.concatStringsSep " " (map (dev: dev.address) normalizedPci)}"
+        for addr in $requested; do
+          dev="/sys/bus/pci/devices/$addr"
+          if [ ! -e "$dev" ]; then
+            echo "PCI device $addr does not exist on this node"
+            exit 1
+          fi
+          if [ ! -e "$dev/iommu_group" ]; then
+            echo "PCI device $addr has no IOMMU group. Boot with ch-vm.vfio.enable and reboot before attaching it."
+            exit 1
+          fi
+          group=$(${pkgs.coreutils}/bin/readlink -f "$dev/iommu_group")
+          for member in "$group"/devices/*; do
+            m=$(${pkgs.coreutils}/bin/basename "$member")
+            case " $requested " in
+              *" $m "*) ;;
+              *)
+                echo "IOMMU group of $addr also contains $m. Pass every device in that group."
+                exit 1
+                ;;
+            esac
+          done
+          current=""
+          if [ -e "$dev/driver" ]; then
+            current=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/driver")")
+          fi
+          if [ "$current" != "vfio-pci" ]; then
+            echo "Binding $addr to vfio-pci (was ''${current:-unbound})"
+            echo vfio-pci > "$dev/driver_override"
+            if [ -n "$current" ]; then
+              echo "$addr" > "$dev/driver/unbind"
+            fi
+            echo "$addr" > /sys/bus/pci/drivers_probe
+          fi
+          if [ ! -e "$dev/driver" ]; then
+            echo "Failed to bind $addr to vfio-pci"
+            exit 1
+          fi
+          current=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/driver")")
+          if [ "$current" != "vfio-pci" ]; then
+            echo "Failed to bind $addr to vfio-pci (current driver: $current)"
+            exit 1
+          fi
+        done
+      '';
 
       # After a live receive, CH is already running outside systemd. Skip
       # destructive socket cleanup so the handoff ExecStart can adopt it.
@@ -214,7 +273,9 @@ let
 
       serviceConfig = {
         Type = "simple";
-        ExecStartPre = [ "${startPreScript}" ];
+        ExecStartPre = lib.optionals (normalizedPci != [ ]) [ "${vfioBindScript}" ] ++ [
+          "${startPreScript}"
+        ];
         ExecStart = "${startScript}";
         ExecStop = "${pkgs.curl}/bin/curl --unix-socket ${socketPath} -s -X PUT http://localhost/api/v1/vm.power-button";
         ExecStopPost = lib.optionalString isCeph "-${pkgs.ceph}/bin/rbd unmap ${rbdDevice}";
@@ -236,7 +297,17 @@ in
         assertion = cfg.virtualMachines != { } -> cfg.gatewayInterface != "";
         message = "ch-vm.vms.gatewayInterface must be set when virtualMachines are defined.";
       }
-    ];
+    ]
+    ++ lib.concatLists (
+      lib.mapAttrsToList (
+        vmName: vmCfg:
+        map (dev: {
+          assertion =
+            builtins.match "[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\\.[0-7]" dev.address != null;
+          message = "VM '${vmName}' pciDevices address '${dev.address}' must look like 0000:03:00.0";
+        }) vmCfg.pciDevices
+      ) cfg.virtualMachines
+    );
 
     boot.supportedFilesystems = lib.mkIf anyVmUsesZfs [ "zfs" ];
 

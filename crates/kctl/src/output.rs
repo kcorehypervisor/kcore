@@ -55,6 +55,19 @@ pub fn print_vm_detail(
             println!("  - network={} mac={}", n.network, n.mac_address);
         }
     }
+
+    if !spec.gpus.is_empty() {
+        println!("\nGPUs:");
+        for name in &spec.gpus {
+            println!("  - {name}");
+        }
+    }
+    if !spec.pci_devices.is_empty() {
+        println!("\nPCI functions:");
+        for addr in &spec.pci_devices {
+            println!("  - {addr}");
+        }
+    }
 }
 
 pub fn print_volume_table(volumes: &[controller_proto::VolumeInfo]) {

@@ -35,6 +35,8 @@ pub async fn create(
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
+                pci_devices: vec![],
+                gpus: vec![],
             }),
             container_spec: None,
             image_url: image.unwrap_or_default().to_string(),

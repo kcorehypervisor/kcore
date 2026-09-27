@@ -8,6 +8,7 @@ pub mod compliance;
 pub mod conflict;
 pub mod container;
 pub mod disk_layout;
+pub mod gpu;
 pub mod image;
 pub mod migrate_session;
 pub mod network;

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+kcore-gpu = { path = "../kcore-gpu" }
 kcore-sanitize = { path = "../kcore-sanitize" }
 kcore-disk-layout-yaml = { path = "../kcore-disk-layout-yaml" }
 dirs = "6"

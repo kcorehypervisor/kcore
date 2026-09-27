@@ -281,6 +281,37 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
             }
         };
         let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+        let (gpus, gpus_reported) = match kcore_gpu::scan_pci(std::path::Path::new(
+            "/sys/bus/pci/devices",
+        )) {
+            Ok(found) => (
+                found
+                    .into_iter()
+                    .map(|gpu| controller_proto::GpuInfo {
+                        name: gpu.name,
+                        family: gpu.family,
+                        model: gpu.model,
+                        address: gpu.address,
+                        pci_devices: gpu.functions,
+                        iommu_group: gpu.iommu_group,
+                        assignable: gpu.assignable,
+                        blocked_reason: gpu.blocked_reason,
+                        node_id: String::new(),
+                        assigned_vm: String::new(),
+                        kind: gpu.kind,
+                        role: gpu.role,
+                        class_code: gpu.class_code,
+                        characteristics: gpu.characteristics,
+                        driver: gpu.driver,
+                    })
+                    .collect(),
+                true,
+            ),
+            Err(e) => {
+                warn!(error = %e, "PCI inventory scan failed; leaving the controller inventory unchanged");
+                (Vec::new(), false)
+            }
+        };
         match client
             .heartbeat(controller_proto::HeartbeatRequest {
                 node_id: cfg.node_id.clone(),
@@ -290,6 +321,8 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
                 }),
                 cert_expiry_days,
                 luks_method: detect_luks_method(),
+                gpus,
+                gpus_reported,
             })
             .await
         {
