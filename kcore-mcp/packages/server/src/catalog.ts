@@ -55,6 +55,15 @@ export const KINDS: ResourceKind[] = [
     immutable: ["publicKey"],
   },
   {
+    id: "postgresql",
+    yamlKind: "Postgresql",
+    title: "PostgreSQL database",
+    summary:
+      "One database from the NixOS postgresql package (services.postgresql). v1 is a single database per node, reached through the local Unix socket. port can change; package, database, and targetNode cannot.",
+    mutable: ["port"],
+    immutable: ["database", "package", "targetNode"],
+  },
+  {
     id: "container",
     yamlKind: "Container",
     title: "Container",
@@ -125,6 +134,14 @@ export const KINDS: ResourceKind[] = [
     summary: "RGW object store on a Ceph cluster. members is the list of node ids that run the gateway.",
     mutable: ["port", "tls", "members"],
     immutable: ["cephCluster"],
+  },
+  {
+    id: "image",
+    yamlKind: "Image",
+    title: "Node image",
+    summary: "Boot image cached on a node. Read lists ListImages on each ready node. Images are not created through the controller.",
+    mutable: [],
+    immutable: ["name", "path"],
   },
   {
     id: "cluster-update",

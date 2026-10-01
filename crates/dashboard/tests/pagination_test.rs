@@ -200,6 +200,31 @@ impl Controller for ManyVmsController {
         }))
     }
 
+    async fn create_postgresql(
+        &self,
+        _: TRequest<CreatePostgresqlRequest>,
+    ) -> Result<Response<CreatePostgresqlResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn delete_postgresql(
+        &self,
+        _: TRequest<DeletePostgresqlRequest>,
+    ) -> Result<Response<DeletePostgresqlResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_postgresql(
+        &self,
+        _: TRequest<GetPostgresqlRequest>,
+    ) -> Result<Response<GetPostgresqlResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_postgresqls(
+        &self,
+        _: TRequest<ListPostgresqlsRequest>,
+    ) -> Result<Response<ListPostgresqlsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
     async fn create_security_group(
         &self,
         _: TRequest<CreateSecurityGroupRequest>,

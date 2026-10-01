@@ -1,0 +1,18 @@
+# One PostgreSQL database from the NixOS postgresql package.
+#
+#   kctl apply -f examples/postgresql/app.yaml
+#   kctl create postgresql -f examples/postgresql/app.yaml
+#
+# kctl apply and the MCP kcore_apply tool are the declarative upsert:
+# the first apply creates the database, a later apply can change port,
+# and a change to package, database, or targetNode is rejected.
+#
+# v1 listens on the node's Unix socket. Connect as the postgres superuser:
+#   sudo -u postgres psql -d app
+kind: Postgresql
+metadata:
+  name: app
+spec:
+  database: app
+  package: postgresql
+  port: 5432

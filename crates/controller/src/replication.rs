@@ -628,6 +628,9 @@ fn apply_replication_event(
         | "vm.desired_state.set"
         | "network.create"
         | "network.delete"
+        | "postgresql.create"
+        | "postgresql.update"
+        | "postgresql.delete"
         | "security_group.create"
         | "security_group.delete"
         | "security_group.attach"
@@ -954,6 +957,13 @@ fn apply_domain_compensation(
                 let _ = db
                     .delete_disk_layout(name)
                     .map_err(|e| format!("compensate disk_layout.create delete {name}: {e}"))?;
+            }
+        }
+        "postgresql.create" => {
+            if let Some(name) = loser_body.get("name").and_then(Value::as_str) {
+                let _ = db
+                    .delete_postgresql(name)
+                    .map_err(|e| format!("compensate postgresql.create delete {name}: {e}"))?;
             }
         }
         _ => {}
@@ -1685,6 +1695,34 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let _ = db
                 .delete_disk_layout(name)
                 .map_err(|e| format!("delete disk layout {name}: {e}"))?;
+            Ok(())
+        }
+        "postgresql.create" | "postgresql.update" => {
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let node_id = required_str(&body, "nodeId", &head.resource_key)?;
+            let database = required_str(&body, "database", &head.resource_key)?;
+            let package = required_str(&body, "package", &head.resource_key)?;
+            let port = body
+                .get("port")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| format!("missing port for {}", head.resource_key))?;
+            ensure_replicated_node_exists(db, node_id)?;
+            db.upsert_postgresql(&crate::db::PostgresqlRow {
+                name: name.to_string(),
+                database_name: database.to_string(),
+                package: package.to_string(),
+                port: port as i32,
+                node_id: node_id.to_string(),
+                created_at: String::new(),
+            })
+            .map_err(|e| format!("upsert postgresql {name}: {e}"))?;
+            Ok(())
+        }
+        "postgresql.delete" => {
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let _ = db
+                .delete_postgresql(name)
+                .map_err(|e| format!("delete postgresql {name}: {e}"))?;
             Ok(())
         }
         _ => Ok(()),

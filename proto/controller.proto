@@ -32,6 +32,11 @@ service Controller {
   rpc CreateNetwork(CreateNetworkRequest) returns (CreateNetworkResponse);
   rpc DeleteNetwork(DeleteNetworkRequest) returns (DeleteNetworkResponse);
   rpc ListNetworks(ListNetworksRequest) returns (ListNetworksResponse);
+  // One NixOS services.postgresql database per node. v1 is a single database.
+  rpc CreatePostgresql(CreatePostgresqlRequest) returns (CreatePostgresqlResponse);
+  rpc DeletePostgresql(DeletePostgresqlRequest) returns (DeletePostgresqlResponse);
+  rpc GetPostgresql(GetPostgresqlRequest) returns (GetPostgresqlResponse);
+  rpc ListPostgresqls(ListPostgresqlsRequest) returns (ListPostgresqlsResponse);
   rpc CreateSecurityGroup(CreateSecurityGroupRequest) returns (CreateSecurityGroupResponse);
   rpc GetSecurityGroup(GetSecurityGroupRequest) returns (GetSecurityGroupResponse);
   rpc ListSecurityGroups(ListSecurityGroupsRequest) returns (ListSecurityGroupsResponse);
@@ -512,6 +517,59 @@ message NetworkInfo {
   int32 vlan_id = 8;
   string network_type = 9;  // "nat", "bridge", or "vxlan"
   bool enable_outbound_nat = 10;
+}
+
+// A single PostgreSQL database realized by the NixOS services.postgresql module
+// (pkgs.postgresql or a pinned major). v1 allows one instance per node and
+// does not open TCP; clients use the local Unix socket.
+message PostgresqlInfo {
+  string name = 1;
+  string database = 2;
+  string package = 3;
+  int32 port = 4;
+  string node_id = 5;
+}
+
+message CreatePostgresqlRequest {
+  string name = 1;
+  string database = 2;  // empty uses name when name is a PostgreSQL identifier
+  string package = 3;   // empty selects pkgs.postgresql
+  int32 port = 4;       // 0 selects 5432
+  string target_node = 5;
+}
+
+message CreatePostgresqlResponse {
+  bool success = 1;
+  string message = 2;
+  string node_id = 3;
+  ApplyAction action = 4;
+  repeated string changed_fields = 5;
+  PostgresqlInfo postgresql = 6;
+}
+
+message DeletePostgresqlRequest {
+  string name = 1;
+}
+
+message DeletePostgresqlResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetPostgresqlRequest {
+  string name = 1;
+}
+
+message GetPostgresqlResponse {
+  PostgresqlInfo postgresql = 1;
+}
+
+message ListPostgresqlsRequest {
+  string target_node = 1;
+}
+
+message ListPostgresqlsResponse {
+  repeated PostgresqlInfo postgresqls = 1;
 }
 
 enum SecurityGroupTargetKind {

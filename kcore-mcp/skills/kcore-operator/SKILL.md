@@ -1,6 +1,6 @@
 ---
 name: kcore-operator
-description: Operate a kcore cluster from the editor. Use when the user wants to create a cluster context, VM, network, volume, Ceph resource, or day-2 change, or asks what Terraform would do on kcore.
+description: Operate a kcore cluster from the editor. Use when the user wants to create a cluster context, VM, network, PostgreSQL database, volume, Ceph resource, or day-2 change, or asks what Terraform would do on kcore.
 ---
 
 # kcore operator

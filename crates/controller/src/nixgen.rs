@@ -321,6 +321,59 @@ pub fn generate_node_config_with_security_groups(
     out
 }
 
+/// One database rendered into the node module as `services.postgresql`.
+#[derive(Debug, Clone)]
+pub struct PostgresqlNix {
+    pub database: String,
+    pub package: String,
+    pub port: i32,
+}
+
+/// Append `services.postgresql` to a generated node module.
+///
+/// An unexpected package or database is left out of the file. Those values
+/// are already rejected at the RPC boundary; this is the last check before
+/// the text is written as root during `nixos-rebuild`.
+pub fn with_postgresql(config: String, pg: Option<&PostgresqlNix>) -> String {
+    let Some(pg) = pg else {
+        return config;
+    };
+    let Some(block) = render_postgresql(pg) else {
+        return config;
+    };
+    let trimmed = config.trim_end();
+    let Some(body) = trimmed.strip_suffix('}') else {
+        return format!("{config}{block}");
+    };
+    format!("{body}{block}}}\n")
+}
+
+fn render_postgresql(pg: &PostgresqlNix) -> Option<String> {
+    let package = match pg.package.as_str() {
+        "postgresql" | "postgresql_14" | "postgresql_15" | "postgresql_16" | "postgresql_17" => {
+            pg.package.as_str()
+        }
+        _ => return None,
+    };
+    if !(1..=65535).contains(&pg.port) || !safe_postgresql_ident(&pg.database) {
+        return None;
+    }
+    Some(format!(
+        "  services.postgresql = {{\n    enable = true;\n    package = pkgs.{package};\n    port = {};\n    ensureDatabases = [ \"{}\" ];\n  }};\n",
+        pg.port,
+        nix_escape(&pg.database),
+    ))
+}
+
+fn safe_postgresql_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_') && (1..=63).contains(&name.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +934,61 @@ mod tests {
         assert!(config.contains("hostPort = 8443;"));
         assert!(config.contains("targetIp = \"10.240.10.22\";"));
         assert!(config.contains("enableDnat = true;"));
+    }
+
+    #[test]
+    fn postgresql_block_uses_nixos_package_and_drops_unsafe_values() {
+        let base = generate_node_config(
+            &[vm(true, "web-01")],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        let with = with_postgresql(
+            base.clone(),
+            Some(&PostgresqlNix {
+                database: "app".into(),
+                package: "postgresql".into(),
+                port: 5432,
+            }),
+        );
+        assert!(with.contains("ch-vm.vms"));
+        assert!(with.contains("services.postgresql"));
+        assert!(with.contains("package = pkgs.postgresql;"));
+        assert!(with.contains("ensureDatabases = [ \"app\" ];"));
+        assert!(with.trim_end().ends_with('}'));
+
+        let injected = with_postgresql(
+            base.clone(),
+            Some(&PostgresqlNix {
+                database: "app\"; builtins.trace \"x\"".into(),
+                package: "postgresql".into(),
+                port: 5432,
+            }),
+        );
+        assert_eq!(injected, base);
+        let bad_pkg = with_postgresql(
+            base.clone(),
+            Some(&PostgresqlNix {
+                database: "app".into(),
+                package: "postgresql; import /tmp/evil".into(),
+                port: 5432,
+            }),
+        );
+        assert_eq!(bad_pkg, base);
+        assert_eq!(
+            with_postgresql(base, None),
+            generate_node_config(
+                &[vm(true, "web-01")],
+                "eno1",
+                &default_net(),
+                &[],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            )
+        );
     }
 }
 

@@ -429,6 +429,27 @@ enum CreateResource {
         #[arg(long = "no-outbound-nat")]
         no_outbound_nat: bool,
     },
+    /// Create one PostgreSQL database from the NixOS postgresql package
+    #[command(alias = "postgres")]
+    Postgresql {
+        /// Instance name (optional when using -f)
+        name: Option<String>,
+        /// Create from a Postgresql YAML manifest
+        #[arg(short = 'f', long = "filename")]
+        file: Option<String>,
+        /// Database name. Defaults to the instance name.
+        #[arg(long)]
+        database: Option<String>,
+        /// nixpkgs attribute: postgresql, postgresql_14, postgresql_15, postgresql_16, postgresql_17
+        #[arg(long, default_value = "postgresql")]
+        package: String,
+        /// TCP port recorded for the service. Clients still use the local Unix socket in v1.
+        #[arg(long, default_value_t = 5432)]
+        port: i32,
+        /// Target node (optional, controller picks a free ready node)
+        #[arg(long = "target-node")]
+        target_node: Option<String>,
+    },
     /// Create cluster PKI and local context for mTLS
     Cluster {
         /// Controller address (host:port)
@@ -463,6 +484,12 @@ enum DeleteResource {
         /// Target node (optional; required if network exists on multiple nodes)
         #[arg(long = "target-node")]
         target_node: Option<String>,
+    },
+    /// Delete a PostgreSQL database from the node config
+    #[command(alias = "postgres")]
+    Postgresql {
+        /// Instance name
+        name: String,
     },
     /// Delete an image from a node
     Image {
@@ -600,6 +627,15 @@ enum GetResource {
         #[arg(long = "target-node")]
         target_node: Option<String>,
     },
+    /// Get or list PostgreSQL databases
+    #[command(name = "postgresql", alias = "postgres")]
+    Postgresql {
+        /// Instance name (omit to list all)
+        name: Option<String>,
+        /// Filter by node
+        #[arg(long = "target-node")]
+        target_node: Option<String>,
+    },
     /// List storage classes
     #[command(name = "storage-class", alias = "storage-classes")]
     StorageClass,
@@ -703,6 +739,12 @@ enum DescribeResource {
         /// Target node (optional; required if name exists on multiple nodes)
         #[arg(long = "target-node")]
         target_node: Option<String>,
+    },
+    /// Describe a PostgreSQL database
+    #[command(name = "postgresql", alias = "postgres")]
+    Postgresql {
+        /// Instance name
+        name: String,
     },
     /// Describe a storage class
     #[command(name = "storage-class", alias = "storage-classes")]
@@ -1315,6 +1357,35 @@ async fn main() {
         }
         Command::Create {
             resource:
+                CreateResource::Postgresql {
+                    name,
+                    file,
+                    database,
+                    package,
+                    port,
+                    target_node,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            if let Some(file) = file {
+                commands::postgresql::create_from_manifest(&info, file).await
+            } else {
+                let Some(name) = name.as_deref() else {
+                    fatal("postgresql name is required unless -f is set");
+                };
+                commands::postgresql::create(
+                    &info,
+                    name,
+                    database.as_deref(),
+                    package,
+                    *port,
+                    target_node.as_deref(),
+                )
+                .await
+            }
+        }
+        Command::Create {
+            resource:
                 CreateResource::Cluster {
                     controller,
                     certs_dir,
@@ -1343,6 +1414,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::network::delete(&info, name, target_node.clone()).await
+        }
+        Command::Delete {
+            resource: DeleteResource::Postgresql { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::postgresql::delete(&info, name).await
         }
 
         Command::Delete {
@@ -1485,6 +1562,16 @@ async fn main() {
             }
         }
         Command::Get {
+            resource: GetResource::Postgresql { name, target_node },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            if let Some(name) = name {
+                commands::postgresql::get(&info, name).await
+            } else {
+                commands::postgresql::list(&info, target_node.as_deref()).await
+            }
+        }
+        Command::Get {
             resource: GetResource::Networks { target_node },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -1561,6 +1648,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::network::describe(&info, name, target_node.clone()).await
+        }
+        Command::Describe {
+            resource: DescribeResource::Postgresql { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::postgresql::get(&info, name).await
         }
         Command::Describe {
             resource: DescribeResource::StorageClass { name },

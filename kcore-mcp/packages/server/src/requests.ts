@@ -38,6 +38,8 @@ export function buildApply(kind: ResourceKind, spec: Record<string, unknown>): R
       return [{ target: "controller", method: "createSshKey", request: sshKeyRequest(spec) }];
     case "container":
       return [{ target: "controller", method: "createWorkload", request: containerRequest(spec) }];
+    case "postgresql":
+      return [{ target: "controller", method: "createPostgresql", request: postgresqlRequest(spec) }];
     case "volume":
       return [{ target: "controller", method: "createVolume", request: volumeRequest(spec) }];
     case "volume-snapshot":
@@ -80,6 +82,10 @@ export function buildRead(kind: ResourceKind, name?: string): RpcCall {
       return named
         ? { target: "controller", method: "getWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: named } }
         : { target: "controller", method: "listWorkloads", request: { kind: "WORKLOAD_KIND_CONTAINER" } };
+    case "postgresql":
+      return named
+        ? { target: "controller", method: "getPostgresql", request: { name: named } }
+        : { target: "controller", method: "listPostgresqls", request: {} };
     case "volume":
       return named
         ? { target: "controller", method: "getVolume", request: { name: named } }
@@ -114,6 +120,8 @@ export function buildRead(kind: ResourceKind, name?: string): RpcCall {
       return named
         ? { target: "controller", method: "getClusterUpdate", request: { name: named } }
         : { target: "controller", method: "listClusterUpdates", request: {} };
+    case "image":
+      throw new InputError("image reads are collected from each node");
     default:
       throw new InputError(`unsupported kind ${kind.id}`);
   }
@@ -132,6 +140,8 @@ export function buildDelete(kind: ResourceKind, name: string): RpcCall {
       return { target: "controller", method: "deleteSshKey", request: { name: id } };
     case "container":
       return { target: "controller", method: "deleteWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: id } };
+    case "postgresql":
+      return { target: "controller", method: "deletePostgresql", request: { name: id } };
     case "volume":
       return { target: "controller", method: "deleteVolume", request: { name: id } };
     case "volume-snapshot":
@@ -578,6 +588,41 @@ function hostOf(address: string): string {
 function stringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
+}
+
+const POSTGRESQL_PACKAGES = new Set([
+  "postgresql",
+  "postgresql_14",
+  "postgresql_15",
+  "postgresql_16",
+  "postgresql_17",
+]);
+
+function postgresqlRequest(spec: Record<string, unknown>): Record<string, unknown> {
+  const name = assertName(required(spec, "name", "name"), "name");
+  const database = opt(spec, "database") ?? name;
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(database)) {
+    throw new InputError(
+      "database must be a PostgreSQL identifier: a letter or underscore, then letters, digits, or underscores",
+    );
+  }
+  const packageName = opt(spec, "package") ?? "postgresql";
+  if (!POSTGRESQL_PACKAGES.has(packageName)) {
+    throw new InputError(
+      "package must be postgresql, postgresql_14, postgresql_15, postgresql_16, or postgresql_17",
+    );
+  }
+  const port = spec.port == null || spec.port === "" ? 5432 : Number(spec.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new InputError("port must be an integer from 1 to 65535");
+  }
+  return {
+    name,
+    database,
+    package: packageName,
+    port,
+    targetNode: opt(spec, "targetNode") ?? "",
+  };
 }
 
 function opt(spec: Record<string, unknown>, key: string): string | undefined {

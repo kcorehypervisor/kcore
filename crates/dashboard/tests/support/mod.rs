@@ -225,6 +225,34 @@ impl Controller for MockController {
         }))
     }
 
+    async fn create_postgresql(
+        &self,
+        _: Request<CreatePostgresqlRequest>,
+    ) -> Result<Response<CreatePostgresqlResponse>, Status> {
+        Err(unimp("create_postgresql"))
+    }
+
+    async fn delete_postgresql(
+        &self,
+        _: Request<DeletePostgresqlRequest>,
+    ) -> Result<Response<DeletePostgresqlResponse>, Status> {
+        Err(unimp("delete_postgresql"))
+    }
+
+    async fn get_postgresql(
+        &self,
+        _: Request<GetPostgresqlRequest>,
+    ) -> Result<Response<GetPostgresqlResponse>, Status> {
+        Err(unimp("get_postgresql"))
+    }
+
+    async fn list_postgresqls(
+        &self,
+        _: Request<ListPostgresqlsRequest>,
+    ) -> Result<Response<ListPostgresqlsResponse>, Status> {
+        Err(unimp("list_postgresqls"))
+    }
+
     async fn create_security_group(
         &self,
         _: Request<CreateSecurityGroupRequest>,

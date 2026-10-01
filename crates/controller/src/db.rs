@@ -125,6 +125,17 @@ pub struct NetworkRow {
     pub next_ip: i32,
 }
 
+/// One NixOS `services.postgresql` database. v1 keeps a single row per node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresqlRow {
+    pub name: String,
+    pub database_name: String,
+    pub package: String,
+    pub port: i32,
+    pub node_id: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SecurityGroupRow {
     pub name: String,
@@ -1126,7 +1137,21 @@ impl Database {
             )?;
         }
 
-        const CURRENT_VERSION: i32 = 36;
+        if version < 37 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS postgresql_instances (
+                    name TEXT PRIMARY KEY,
+                    database_name TEXT NOT NULL,
+                    package TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    node_id TEXT NOT NULL REFERENCES nodes(id),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(node_id)
+                );",
+            )?;
+        }
+
+        const CURRENT_VERSION: i32 = 37;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -2376,6 +2401,97 @@ impl Database {
         )?;
         let rows = stmt.query_map(params![node_id], row_to_network)?;
         rows.collect()
+    }
+
+    pub fn insert_postgresql(&self, row: &PostgresqlRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO postgresql_instances (name, database_name, package, port, node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.name,
+                row.database_name,
+                row.package,
+                row.port,
+                row.node_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_postgresql(&self, row: &PostgresqlRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO postgresql_instances (name, database_name, package, port, node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(name) DO UPDATE SET
+               database_name = excluded.database_name,
+               package = excluded.package,
+               port = excluded.port,
+               node_id = excluded.node_id",
+            params![
+                row.name,
+                row.database_name,
+                row.package,
+                row.port,
+                row.node_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_postgresql_port(&self, name: &str, port: i32) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let changed = conn.execute(
+            "UPDATE postgresql_instances SET port = ?1 WHERE name = ?2",
+            params![port, name],
+        )?;
+        if changed == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    }
+
+    pub fn get_postgresql(&self, name: &str) -> Result<Option<PostgresqlRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, database_name, package, port, node_id, created_at
+             FROM postgresql_instances WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], row_to_postgresql)?;
+        rows.next().transpose()
+    }
+
+    pub fn get_postgresql_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<PostgresqlRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, database_name, package, port, node_id, created_at
+             FROM postgresql_instances WHERE node_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![node_id], row_to_postgresql)?;
+        rows.next().transpose()
+    }
+
+    pub fn list_postgresqls(&self) -> Result<Vec<PostgresqlRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, database_name, package, port, node_id, created_at
+             FROM postgresql_instances ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], row_to_postgresql)?;
+        rows.collect()
+    }
+
+    pub fn delete_postgresql(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let changed = conn.execute(
+            "DELETE FROM postgresql_instances WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn list_networks_by_name(&self, name: &str) -> Result<Vec<NetworkRow>, rusqlite::Error> {
@@ -4282,6 +4398,17 @@ fn row_to_network(row: &rusqlite::Row) -> Result<NetworkRow, rusqlite::Error> {
         enable_outbound_nat: row.get::<_, i32>(9)? != 0,
         vni: row.get(10)?,
         next_ip: row.get(11)?,
+    })
+}
+
+fn row_to_postgresql(row: &rusqlite::Row) -> Result<PostgresqlRow, rusqlite::Error> {
+    Ok(PostgresqlRow {
+        name: row.get(0)?,
+        database_name: row.get(1)?,
+        package: row.get(2)?,
+        port: row.get(3)?,
+        node_id: row.get(4)?,
+        created_at: row.get(5)?,
     })
 }
 
