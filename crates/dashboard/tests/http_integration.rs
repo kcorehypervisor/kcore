@@ -59,6 +59,10 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(home.contains(r#"href="/vms""#));
     assert!(home.contains(r#"href="/networks""#));
     assert!(home.contains(r#"href="/storage""#));
+    assert!(home.contains(r#"href="/volumes""#));
+    assert!(home.contains(r#"href="/operations""#));
+    assert!(home.contains(r#"href="/ceph""#));
+    assert!(home.contains(r#"href="/audit""#));
     assert!(home.contains("kcore"));
     assert!(home.contains("Dashboard"));
     assert!(home.contains("kcorehypervisor.com"));
@@ -109,6 +113,10 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(
         compliance.contains("vm/web-01"),
         "compliance must show mock audit resource"
+    );
+    assert!(
+        compliance.contains(r#"href="/audit""#),
+        "compliance must link to the searchable audit trail"
     );
 
     // Replication section (now from ControllerAdmin mock)
@@ -165,6 +173,7 @@ async fn all_dashboard_pages_against_mock_controller() {
         "VMs must link to serial console"
     );
     assert!(vms.contains(">Console<"), "VMs must show Console action");
+    assert!(vms.contains("LVM"), "VMs must show storage backend");
 
     // ── Serial console page ──────────────────────────────────────────
     let (status, console) = fetch(&app, "/vms/mock-vm-alpha/console").await;
@@ -252,6 +261,26 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(nets.contains("203.0.113.1"), "SDN must show external IP");
     assert!(nets.contains("10.0.0.1"), "SDN must show gateway");
     assert!(nets.contains("nat"), "SDN must show network type");
+    assert!(
+        nets.contains("VXLAN overlays"),
+        "networks must summarize VXLAN"
+    );
+    assert!(
+        nets.contains("mock-overlay"),
+        "networks must show the VXLAN network"
+    );
+    assert!(
+        nets.contains("fd00:10::/64"),
+        "VXLAN network must show its IPv6 prefix"
+    );
+    assert!(
+        nets.contains("vxlan100"),
+        "host view must list VXLAN interfaces"
+    );
+    assert!(
+        nets.contains("tcp 22"),
+        "VXLAN network must show forwarded ports"
+    );
 
     // ── Storage ──────────────────────────────────────────────────────
     let (status, storage) = fetch(&app, "/storage").await;
@@ -281,6 +310,132 @@ async fn all_dashboard_pages_against_mock_controller() {
         storage.contains("Data (kcore)"),
         "storage must show mount hint for kcore path"
     );
+    assert!(
+        storage.contains(">Ceph<"),
+        "storage must show a Ceph backend stat"
+    );
+
+    // ── Volumes ──────────────────────────────────────────────────────
+    let (status, volumes) = fetch(&app, "/volumes").await;
+    assert_eq!(status, StatusCode::OK, "/volumes status");
+    assert!(volumes.contains("Volumes"), "volumes page heading");
+    assert!(
+        volumes.contains("mock-pgdata"),
+        "volumes must show mock volume name"
+    );
+    assert!(
+        volumes.contains("kcore-vms"),
+        "volumes must show the Ceph pool"
+    );
+    assert!(
+        volumes.contains("Ceph"),
+        "volumes must show the Ceph backend"
+    );
+
+    // ── Operations ───────────────────────────────────────────────────
+    let (status, operations) = fetch(&app, "/operations").await;
+    assert_eq!(status, StatusCode::OK, "/operations status");
+    assert!(
+        operations.contains("VM operations") || operations.contains("Operations"),
+        "operations page heading"
+    );
+    assert!(
+        operations.contains("op-mock-1") || operations.contains("live_migrate"),
+        "operations must show mock operation"
+    );
+    assert!(
+        operations.contains("node-mock-b"),
+        "operations must show the migration target"
+    );
+    assert!(
+        operations.contains("Recent API activity"),
+        "operations must show audit activity when VM jobs are the only long-running records"
+    );
+    assert!(
+        operations.contains("CreateVm"),
+        "operations activity must include audit events"
+    );
+
+    let (status, ops_search) = fetch(&app, "/operations?q=CreateVm").await;
+    assert_eq!(status, StatusCode::OK, "/operations?q=CreateVm status");
+    assert!(
+        ops_search.contains("CreateVm"),
+        "operations search must keep matching audit rows"
+    );
+    assert!(
+        ops_search.contains("No VM jobs match this search."),
+        "operations search must hide unrelated VM jobs"
+    );
+
+    // ── Audit trail ──────────────────────────────────────────────────
+    let (status, audit) = fetch(&app, "/audit").await;
+    assert_eq!(status, StatusCode::OK, "/audit status");
+    assert!(audit.contains("Audit trail"), "audit page heading");
+    assert!(audit.contains("CreateVm"), "audit must list CreateVm");
+    assert!(
+        audit.contains("RegisterNode"),
+        "audit must list RegisterNode"
+    );
+
+    let (status, audit_q) = fetch(&app, "/audit?q=web-01").await;
+    assert_eq!(status, StatusCode::OK, "/audit?q=web-01 status");
+    assert!(
+        audit_q.contains("vm/web-01"),
+        "audit search must match the resource"
+    );
+    assert!(
+        !audit_q.contains("RegisterNode"),
+        "audit search must drop non-matching events"
+    );
+
+    let (status, audit_action) = fetch(&app, "/audit?action=RegisterNode").await;
+    assert_eq!(status, StatusCode::OK, "/audit?action=RegisterNode status");
+    assert!(
+        audit_action.contains("node/node-mock-a"),
+        "exact action filter must keep RegisterNode"
+    );
+    assert!(
+        !audit_action.contains("vm/web-01"),
+        "exact action filter must drop other actions"
+    );
+
+    let (status, audit_since) = fetch(&app, "/audit?since=2026-08-03").await;
+    assert_eq!(status, StatusCode::OK, "/audit?since status");
+    assert!(
+        audit_since.contains("CreateVm"),
+        "since filter must keep later events"
+    );
+    assert!(
+        !audit_since.contains("RegisterNode"),
+        "since filter must drop earlier events"
+    );
+
+    let (status, audit_miss) = fetch(&app, "/audit?q=no-such-event-xyz").await;
+    assert_eq!(status, StatusCode::OK, "/audit miss status");
+    assert!(
+        audit_miss.contains("No audit events match this search."),
+        "empty search must say so"
+    );
+
+    // ── Ceph ─────────────────────────────────────────────────────────
+    let (status, ceph) = fetch(&app, "/ceph").await;
+    assert_eq!(status, StatusCode::OK, "/ceph status");
+    assert!(
+        ceph.contains("mock-ceph"),
+        "ceph page must show the cluster"
+    );
+    assert!(ceph.contains("HEALTH_OK"), "ceph page must show health");
+    assert!(
+        ceph.contains("10.20.0.0/24"),
+        "ceph page must show the public network"
+    );
+    assert!(ceph.contains("/dev/sdb"), "ceph page must show OSD devices");
+    assert!(ceph.contains("mock-home"), "ceph page must show CephFS");
+    assert!(
+        ceph.contains("mock-s3"),
+        "ceph page must show the object store"
+    );
+    assert!(ceph.contains("7480"), "object store must show its port");
 
     // ── 404 for unknown path ─────────────────────────────────────────
     let (status, body404) = fetch(&app, "/nonexistent-page-xyz").await;
@@ -301,6 +456,10 @@ async fn all_dashboard_pages_against_mock_controller() {
         ("/vms", &vms),
         ("/networks", &nets),
         ("/storage", &storage),
+        ("/volumes", &volumes),
+        ("/operations", &operations),
+        ("/audit", &audit),
+        ("/ceph", &ceph),
     ] {
         assert!(body.contains("nav"), "{page} must have navigation element");
         assert!(body.contains("kcore"), "{page} must show brand name");

@@ -12,6 +12,9 @@ pub struct CreateArgs {
     pub vlan_id: i32,
     pub network_type: String,
     pub enable_outbound_nat: bool,
+    pub ipv6_prefix: String,
+    pub ipv6_gateway: String,
+    pub east_west_firewall: bool,
 }
 
 pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
@@ -28,6 +31,9 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             vlan_id: args.vlan_id,
             network_type: args.network_type,
             enable_outbound_nat: args.enable_outbound_nat,
+            ipv6_prefix: args.ipv6_prefix,
+            ipv6_gateway: args.ipv6_gateway,
+            east_west_firewall: args.east_west_firewall,
         })
         .await?
         .into_inner();
@@ -96,6 +102,20 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
         .as_bool()
         .or_else(|| spec["enable_outbound_nat"].as_bool())
         .unwrap_or(network_type != "bridge");
+    let ipv6_prefix = spec["ipv6Prefix"]
+        .as_str()
+        .or_else(|| spec["ipv6_prefix"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let ipv6_gateway = spec["ipv6Gateway"]
+        .as_str()
+        .or_else(|| spec["ipv6_gateway"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let east_west_firewall = spec["eastWestFirewall"]
+        .as_bool()
+        .or_else(|| spec["east_west_firewall"].as_bool())
+        .unwrap_or(false);
     let allowed_tcp_ports: Vec<i32> = spec["allowedTcpPorts"]
         .as_sequence()
         .or_else(|| spec["allowed_tcp_ports"].as_sequence())
@@ -128,6 +148,9 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
             vlan_id,
             network_type,
             enable_outbound_nat,
+            ipv6_prefix,
+            ipv6_gateway,
+            east_west_firewall,
         })
         .await?
         .into_inner();
@@ -270,6 +293,13 @@ pub async fn describe(
     );
     println!("Bridge:            {}", compute_bridge_name(name));
     println!("Gateway IP:        {}", first.gateway_ip);
+    if !first.ipv6_prefix.is_empty() {
+        println!("IPv6 prefix:       {}", first.ipv6_prefix);
+        println!("IPv6 gateway:      {}", first.ipv6_gateway);
+    }
+    if first.east_west_firewall {
+        println!("East-west:         filtered");
+    }
     println!("Internal netmask:  {}", first.internal_netmask);
     if let Some(cidr) = ipv4_subnet_from_gateway_mask(&first.gateway_ip, &first.internal_netmask) {
         println!("Network CIDR:      {cidr}");

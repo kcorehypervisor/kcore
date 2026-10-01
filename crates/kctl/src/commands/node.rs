@@ -25,6 +25,54 @@ pub async fn approve(info: &ConnectionInfo, node_id: &str) -> Result<()> {
     }
 }
 
+pub async fn cordon(info: &ConnectionInfo, node_id: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .cordon_node(controller_proto::CordonNodeRequest {
+            node_id: node_id.to_string(),
+        })
+        .await?
+        .into_inner();
+    if resp.success {
+        println!("{}", resp.message);
+        Ok(())
+    } else {
+        anyhow::bail!("cordon failed: {}", resp.message)
+    }
+}
+
+pub async fn uncordon(info: &ConnectionInfo, node_id: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .uncordon_node(controller_proto::UncordonNodeRequest {
+            node_id: node_id.to_string(),
+        })
+        .await?
+        .into_inner();
+    if resp.success {
+        println!("{}", resp.message);
+        Ok(())
+    } else {
+        anyhow::bail!("uncordon failed: {}", resp.message)
+    }
+}
+
+pub async fn delete(info: &ConnectionInfo, node_id: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .delete_node(controller_proto::DeleteNodeRequest {
+            node_id: node_id.to_string(),
+        })
+        .await?
+        .into_inner();
+    if resp.success {
+        println!("{}", resp.message);
+        Ok(())
+    } else {
+        anyhow::bail!("delete failed: {}", resp.message)
+    }
+}
+
 pub async fn reject(info: &ConnectionInfo, node_id: &str) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let resp = client

@@ -4,7 +4,7 @@ kcore SAN is the cluster’s **shared block storage** fabric. Guests use **Ceph 
 
 Operator-facing overview: [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html) · migration runbook: [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.html) · deep migration notes in-repo: [`vm-migration.md`](./vm-migration.md).
 
-Status: **Phases 1–2 + live migration shipped**.
+Status: **Phases 1–2 + live migration shipped; volumes, snapshots, resize, and OSD dm-crypt (E1) landed.** Bootstrap waits for `nixos-rebuild` before `ceph-mon --mkfs`, and reuses the first key set if that rebuild restarts the node agent. A node joining a cluster that already has quorum is added with `ceph mon add` and mkfs'd from that monmap. Removing a node from the spec happens after the remaining members are up: its OSDs are purged and `ceph mon rm` runs on a survivor. `kctl delete ceph-cluster` stops daemons on members first (`--force` deletes the record when a member cannot be reached). A node may list extra OSD disks in `osdDevices` alongside `osdDevice`. Volumes are first-class (`kctl create volume` / `attach` / `detach` / `resize` / `snapshot` / `restore` / `flatten`). New `CephCluster` manifests default `encryptOsds: true` (`ceph-volume --dmcrypt`); the flag is immutable after create — rotate by replacing OSD devices.
 
 ## Design split: NixOS vs KCore
 
@@ -25,10 +25,10 @@ KCore does **not** use cephadm or Rook. The reconciler pushes declarative Nix an
 
 - **`ceph_clusters`** — desired `CephCluster` spec (FSID, networks, nodes, size/minSize) + bootstrap JSON (keys).
 - **`ceph_cluster_status`** — reconciled phase (`bootstrapping` / `healthy` / `degraded` / …).
-- **`volumes`** — cluster-scoped RBD identity (`pool`, `image`, `size_bytes`) keyed by `vm_id`. The volume does **not** move when the VM’s `node_id` changes.
+- **`volumes`** — cluster-scoped RBD identity (`pool`, `image`, `size_bytes`) with a unique **name**, `role` (`root`|`data`), `slot`, and `attach_state`. Root volumes are created with the VM; data volumes may be detached. Live migrate maps every attached image.
 - **`vms.storage_backend = ceph`** — schedule only onto nodes that are members of a healthy `CephCluster` (membership via `CephCluster.spec.nodes`, not only `nodes.storage_backend`).
 
-Runtime Nix for a Ceph VM includes `storageBackend = "ceph"` and `rbdImage = "kcore-<vm-id>"` (see `crates/controller/src/nixgen.rs`).
+Runtime Nix for a Ceph VM includes `storageBackend = "ceph"`, `rbdImage` for the root, and optional `dataDisks = [ { rbdImage; serial; } ]` (see `crates/controller/src/nixgen.rs`).
 
 ## Phase 1 — fabric bootstrap
 
@@ -53,6 +53,8 @@ spec:
       clusterIface: eth2
       osdDevice: /dev/nvme0n1
     # … additional members
+  # encryptOsds: true   # default; LUKS per OSD via ceph-volume --dmcrypt
+  # encryptOsds: false  # labs only; set on first create — immutable afterwards
 ```
 
 ```bash
@@ -66,9 +68,11 @@ kctl describe ceph-cluster lab-san
 1. Persist spec + generation.
 2. `ApplyCephConfig` — write `/etc/nixos/kcore-ceph.nix`, rebuild; cluster name is always `ceph`; `mon_host` lists every member.
 3. First eligible node builds mon/admin/bootstrap-osd keyrings (`ceph-authtool`); controller redistributes the package; peers run `ceph-mon --mkfs` / mgr auth.
-4. `BootstrapCephOsd` — `ceph-volume lvm create` on `osdDevice` (refuses non-empty disks unless `forceWipe: true`), activate units (no `--no-systemd`).
+4. `BootstrapCephOsd` — `ceph-volume lvm create` on `osdDevice` (with `--dmcrypt` when `encryptOsds` is true; refuses non-empty disks unless `forceWipe: true`), activate units (no `--no-systemd`).
 5. `EnsureCephPool` for `kcore-vms` (size/min_size, RBD application, `rbd pool init`).
 6. Poll health until `HEALTH_OK`; otherwise requeue.
+
+OSD dm-crypt protects disk theft/RMA; it does **not** protect a compromised mon or host. Keys live in the mon config-key store. Enabling encryption on an existing plain cluster means replacing OSD devices (remove → backfill → re-add with dmcrypt).
 
 Discover hardware before writing the manifest:
 
@@ -99,6 +103,28 @@ Delete resolves the VM by id **or name** first, then uses the resolved id for th
 `DeleteCephCluster` is refused with `FAILED_PRECONDITION` while any `ceph`-backed VM still lives on one of the cluster's member nodes, and names the blocking VMs. Removing the record first would strand those VMs: the reconciler stops managing the cluster and their nodes stop counting as Ceph-capable, so they can no longer be created, migrated, or drained. VMs on local backends do not block deletion.
 
 Local backends (`filesystem` / `lvm` / `zfs`) remain for single-node latency-sensitive workloads.
+
+### Volumes, snapshots, resize
+
+```bash
+kctl create volume pgdata --size-bytes 107374182400 --vm db-1
+kctl snapshot volume pgdata
+kctl create volume pgdata-clone --from-snapshot <snap>
+kctl restore volume pgdata --snapshot <snap>   # VM stopped / detached
+kctl flatten volume pgdata-clone
+kctl resize volume pgdata --size-bytes 214748364800
+kctl create snapshot-policy nightly --vm db-1 --schedule @daily --keep 7
+kctl get snapshot-policies
+```
+
+Resize grows the RBD image only (shrink refused). When the VM is running,
+GuestOps SSH (user `kcore`) probes or grows the guest disk by virtio serial
+(`--grow-filesystem`). `guestVisibleBytes` updates on successful probe/grow.
+
+Per-volume encryption (E2): `kctl create volume … --encrypt` formats LUKS2 on
+the host over the mapped RBD device. The DEK is wrapped by
+`/etc/kcore/recovery/volume-master.key` and unlocked on the owning node before
+boot / live-migrate receive. Guests see a normal block device.
 
 ## Lab topology (reference)
 

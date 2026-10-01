@@ -72,10 +72,11 @@ all nodes and picks the one with the most free capacity. See
 
 ## SyncVmState — the companion RPC
 
-Alongside heartbeats, nodes also send `SyncVmState` RPCs that report the
-runtime state of each VM on that node (`running`, `stopped`, `paused`,
-`error`). This updates the `runtime_state` column in the `vms` table so that
-`kctl get vms` can show live state without polling every node.
+After each accepted heartbeat, the node agent reads Cloud Hypervisor
+`vm.info` for every API socket in `vmSocketDir` and sends `SyncVmState`.
+The controller writes `runtime_state` only when the reported state differs
+from the stored value. That transition emits `vm.state.changed` when webhooks
+are configured (see [webhooks.md](webhooks.md)).
 
 ```protobuf
 rpc SyncVmState(SyncVmStateRequest) returns (SyncVmStateResponse);
@@ -129,7 +130,8 @@ When a node exceeds the deadline:
 
 1. Its status is set to `not-ready` via `UPDATE nodes SET status = 'not-ready'`.
 2. A warning is logged: `node missed heartbeat deadline, marked not-ready`.
-3. The scheduler will no longer place new VMs on that node.
+3. If `webhooks` is configured, the controller emits `node.heartbeat.missed`. See [webhooks.md](webhooks.md).
+4. The scheduler will no longer place new VMs on that node.
 
 If the node comes back and sends a heartbeat, the heartbeat handler sets
 `status = 'ready'` again automatically.

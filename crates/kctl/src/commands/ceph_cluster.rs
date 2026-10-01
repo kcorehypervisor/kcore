@@ -37,7 +37,14 @@ struct ManifestSpec {
     min_size: Option<i32>,
     #[serde(default)]
     force_wipe: bool,
+    /// OSD dm-crypt (`ceph-volume --dmcrypt`). Defaults true for new clusters.
+    #[serde(default = "default_encrypt_osds")]
+    encrypt_osds: bool,
     nodes: Vec<ManifestNode>,
+}
+
+fn default_encrypt_osds() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,7 +80,10 @@ struct ManifestNode {
     cluster_addr: String,
     public_iface: String,
     cluster_iface: String,
+    #[serde(default)]
     osd_device: String,
+    #[serde(default)]
+    osd_devices: Vec<String>,
 }
 
 fn parse_manifest(file: &str) -> Result<CephClusterManifest> {
@@ -97,6 +107,7 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::CephClusterSpec {
         size,
         min_size,
         force_wipe: spec.force_wipe,
+        encrypt_osds: spec.encrypt_osds,
         nodes: spec
             .nodes
             .iter()
@@ -107,6 +118,7 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::CephClusterSpec {
                 public_iface: n.public_iface.clone(),
                 cluster_iface: n.cluster_iface.clone(),
                 osd_device: n.osd_device.clone(),
+                osd_devices: n.osd_devices.clone(),
             })
             .collect(),
     }
@@ -183,6 +195,7 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
     println!("Public:     {}", spec.public_network);
     println!("Cluster:    {}", spec.cluster_network);
     println!("Size/min:   {}/{}", spec.size, spec.min_size);
+    println!("Encrypt OSDs: {}", spec.encrypt_osds);
     println!(
         "Phase:      {:?}",
         controller_proto::CephClusterPhase::try_from(status.phase)
@@ -191,19 +204,29 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
     println!("Health:     {}", status.health_message);
     println!("Nodes:");
     for n in &spec.nodes {
+        let mut devices = vec![n.osd_device.clone()];
+        for extra in &n.osd_devices {
+            if !extra.is_empty() && !devices.iter().any(|have| have == extra) {
+                devices.push(extra.clone());
+            }
+        }
         println!(
             "  - {} mon={} cluster={} osd={}",
-            n.node_id, n.mon_addr, n.cluster_addr, n.osd_device
+            n.node_id,
+            n.mon_addr,
+            n.cluster_addr,
+            devices.join(",")
         );
     }
     Ok(())
 }
 
-pub async fn delete(info: &ConnectionInfo, name: &str) -> Result<()> {
+pub async fn delete(info: &ConnectionInfo, name: &str, force: bool) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let resp = client
         .delete_ceph_cluster(controller_proto::DeleteCephClusterRequest {
             name: name.to_string(),
+            force,
         })
         .await?
         .into_inner();
@@ -252,6 +275,7 @@ spec:
         let proto = to_proto_spec(&m.spec);
         assert_eq!(proto.size, 3);
         assert_eq!(proto.min_size, 2);
+        assert!(proto.encrypt_osds, "new manifests default encryptOsds true");
         assert_eq!(proto.nodes.len(), 1);
         assert_eq!(proto.nodes[0].osd_device, "/dev/nvme0n1");
 

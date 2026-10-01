@@ -14,6 +14,7 @@
 //! of that fails the node keeps serving its existing certificate and the next
 //! tick retries, so a failed rotation is never worse than no rotation.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
@@ -41,6 +42,7 @@ pub struct CertRotationContext {
     pub revocation: RevocationState,
     pub rotation: CertRotationConfig,
     pub pki: PkiConfig,
+    pub webhooks: crate::webhooks::Dispatcher,
 }
 
 /// Is this certificate inside its renewal window?
@@ -92,17 +94,21 @@ pub fn spawn_cert_rotation_reconciler(ctx: CertRotationContext) {
     tokio::spawn(async move {
         // Publish revocation data and a CRL before the first sleep so a
         // freshly started controller enforces revocation immediately.
-        reconcile_once(&ctx).await;
+        let mut cert_warnings = crate::webhooks::WarningDedup::default();
+        reconcile_once(&ctx, &mut cert_warnings).await;
         let mut ticker = tokio_time::interval(interval);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            reconcile_once(&ctx).await;
+            reconcile_once(&ctx, &mut cert_warnings).await;
         }
     });
 }
 
-async fn reconcile_once(ctx: &CertRotationContext) {
+async fn reconcile_once(
+    ctx: &CertRotationContext,
+    cert_warnings: &mut crate::webhooks::WarningDedup,
+) {
     if let Err(error) = ctx.revocation.refresh(&ctx.db) {
         warn!(%error, "failed to refresh revoked serial set");
     }
@@ -125,7 +131,7 @@ async fn reconcile_once(ctx: &CertRotationContext) {
         warn!(%error, "failed to regenerate CRL");
     }
 
-    warn_about_expiring_certificates(&ctx.db, &ctx.rotation);
+    warn_about_expiring_certificates(&ctx.db, &ctx.rotation, &ctx.webhooks, cert_warnings);
 
     if !ctx.rotation.enabled {
         return;
@@ -161,7 +167,16 @@ async fn reconcile_once(ctx: &CertRotationContext) {
 
 /// Log a warning for every active certificate inside the warning window, so
 /// expiry is visible in the controller journal and not only via `kctl`.
-fn warn_about_expiring_certificates(db: &Database, cfg: &CertRotationConfig) {
+///
+/// The same pass emits `cert.expiry.warning` once per certificate (or once per
+/// node, when the only signal is the expiry the node reports on heartbeat)
+/// until that certificate leaves the window.
+fn warn_about_expiring_certificates(
+    db: &Database,
+    cfg: &CertRotationConfig,
+    webhooks: &crate::webhooks::Dispatcher,
+    dedup: &mut crate::webhooks::WarningDedup,
+) {
     let now = OffsetDateTime::now_utc();
     let threshold = format_ts(now + Duration::days(cfg.warn_before_days));
     let rows = match db.list_issued_certificates(crate::db::CERT_STATUS_ACTIVE, "", &threshold) {
@@ -171,6 +186,7 @@ fn warn_about_expiring_certificates(db: &Database, cfg: &CertRotationConfig) {
             return;
         }
     };
+    let mut covered_nodes = HashSet::new();
     for row in rows {
         let days = parse_ts(&row.not_after)
             .map(|na| crate::pki::days_until(na, now))
@@ -192,7 +208,60 @@ fn warn_about_expiring_certificates(db: &Database, cfg: &CertRotationConfig) {
                 "certificate expires soon"
             );
         }
+        if !row.node_id.is_empty() {
+            covered_nodes.insert(row.node_id.clone());
+        }
+        let slot = format!("cert/{}", row.serial_hex);
+        let fingerprint = format!("{}|{}", row.serial_hex, row.not_after);
+        if dedup.claim(&slot, &fingerprint) {
+            webhooks.emit(
+                crate::webhooks::EVENT_CERT_EXPIRY_WARNING,
+                format!("cert/{}", row.serial_hex),
+                serde_json::json!({
+                    "serial": row.serial_hex,
+                    "subject": row.subject_cn,
+                    "nodeId": row.node_id,
+                    "notAfter": row.not_after,
+                    "daysUntilExpiry": days,
+                    "expired": days < 0,
+                }),
+            );
+        }
     }
+
+    // Nodes enrolled before certificate inventory existed only report a day
+    // count on heartbeat. Skip any node the inventory pass already covered,
+    // and skip nodes whose inventory cert is still outside the window.
+    if let Ok(nodes) = db.list_nodes() {
+        for node in nodes {
+            if node.cert_expiry_days < 0
+                || i64::from(node.cert_expiry_days) > cfg.warn_before_days
+                || covered_nodes.contains(&node.id)
+            {
+                continue;
+            }
+            if matches!(db.get_active_certificate_for_node(&node.id), Ok(Some(_))) {
+                continue;
+            }
+            let slot = format!("node/{}/cert-reported", node.id);
+            if dedup.claim(&slot, "in-window") {
+                webhooks.emit(
+                    crate::webhooks::EVENT_CERT_EXPIRY_WARNING,
+                    format!("node/{}", node.id),
+                    serde_json::json!({
+                        "serial": "",
+                        "subject": "",
+                        "nodeId": node.id,
+                        "notAfter": "",
+                        "daysUntilExpiry": node.cert_expiry_days,
+                        "expired": false,
+                        "source": "node-reported",
+                    }),
+                );
+            }
+        }
+    }
+    dedup.finish_pass();
 }
 
 /// Node ids whose certificate is due for renewal.

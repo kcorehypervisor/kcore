@@ -152,6 +152,112 @@ impl AdminService {
         self
     }
 
+    async fn resolve_vm_ssh_ip(
+        &self,
+        vm_name: &str,
+        network: &str,
+    ) -> Result<(String, u16), Status> {
+        let port = 22u16;
+        let vmm = crate::vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        let vm_info = vmm.get_vm_info(vm_name).await;
+        let vm_mac = vm_info.as_ref().and_then(vm_primary_mac);
+        let lease_files = lease_files_for_network(&self.vm_socket_dir, network);
+        for lease in &lease_files {
+            if let Some(ip) = find_vm_ip_in_lease_file(lease, vm_name, vm_mac.as_deref()) {
+                return Ok((ip, port));
+            }
+        }
+        if let Some(mac) = vm_mac.as_deref() {
+            if let Some(ip) = find_vm_ip_in_neigh(mac, network).await {
+                return Ok((ip, port));
+            }
+        }
+        Err(Status::failed_precondition(
+            "no DHCP lease / neigh entry for VM; cannot GuestOps SSH",
+        ))
+    }
+
+    async fn guest_disk_op(
+        &self,
+        vm_name: &str,
+        network: &str,
+        disk_serial: &str,
+        ssh_user: &str,
+        port: i32,
+        timeout_ms: i32,
+        grow: bool,
+    ) -> Result<Response<proto::GuestDiskProbeResponse>, Status> {
+        let vm_name = vm_name.trim();
+        let serial = disk_serial.trim();
+        if vm_name.is_empty() || serial.is_empty() {
+            return Err(Status::invalid_argument("vm_name and disk_serial required"));
+        }
+        let paths = crate::guest_ops::GuestOpsPaths::default();
+        crate::guest_ops::ensure_keypair(&paths)
+            .await
+            .map_err(Status::internal)?;
+        let (ip, default_port) = self.resolve_vm_ssh_ip(vm_name, network).await?;
+        let port = if port > 0 { port as u16 } else { default_port };
+        let user = if ssh_user.trim().is_empty() {
+            crate::guest_ops::DEFAULT_SSH_USER
+        } else {
+            ssh_user.trim()
+        };
+        let timeout = std::time::Duration::from_millis(if timeout_ms > 0 {
+            timeout_ms as u64
+        } else {
+            30_000
+        });
+        let remote = if grow {
+            crate::guest_ops::grow_script(serial)
+        } else {
+            format!("lsblk -bno NAME,SIZE,SERIAL,TYPE")
+        };
+        let stdout =
+            crate::guest_ops::ssh_exec(&paths.identity_file(), user, &ip, port, &remote, timeout)
+                .await
+                .map_err(Status::failed_precondition)?;
+        let (device, size) = if grow {
+            // grow script prints final disk size on last line
+            let size = stdout
+                .lines()
+                .rev()
+                .find_map(|l| l.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            let probe = crate::guest_ops::ssh_exec(
+                &paths.identity_file(),
+                user,
+                &ip,
+                port,
+                "lsblk -bno NAME,SIZE,SERIAL,TYPE",
+                timeout,
+            )
+            .await
+            .unwrap_or_default();
+            let dev = crate::guest_ops::parse_lsblk_for_serial(&probe, serial)
+                .map(|(d, _)| d)
+                .unwrap_or_else(|| "unknown".into());
+            (dev, size)
+        } else {
+            crate::guest_ops::parse_lsblk_for_serial(&stdout, serial).ok_or_else(|| {
+                Status::not_found(format!(
+                    "no guest disk with serial '{serial}' (lsblk output empty or unmatched)"
+                ))
+            })?
+        };
+        Ok(Response::new(proto::GuestDiskProbeResponse {
+            success: true,
+            message: if grow {
+                format!("grew {device} to {size} bytes")
+            } else {
+                format!("probed {device} = {size} bytes")
+            },
+            ip,
+            size_bytes: size,
+            device,
+        }))
+    }
+
     /// Map the shared image, start a receive-mode Cloud Hypervisor and wait
     /// until it is really listening on `port`.
     ///
@@ -161,12 +267,21 @@ impl AdminService {
     async fn prepare_receive_session(
         &self,
         vm_name: &str,
-        pool: &str,
-        image: &str,
+        images: &[(String, String)],
         port: u16,
     ) -> Result<Response<proto::PrepareLiveMigrateReceiveResponse>, Status> {
-        live_migrate::ensure_rbd_mapped(pool, image)
-            .map_err(|e| Status::internal(format!("map RBD {pool}/{image} for receive: {e}")))?;
+        live_migrate::ensure_migration_host_devices(vm_name)
+            .await
+            .map_err(|e| {
+                Status::failed_precondition(format!(
+                    "destination is not ready to receive {vm_name}: {e}"
+                ))
+            })?;
+        for (pool, image) in images {
+            live_migrate::ensure_rbd_mapped(pool, image).map_err(|e| {
+                Status::internal(format!("map RBD {pool}/{image} for receive: {e}"))
+            })?;
+        }
 
         let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
         let ch_bin = live_migrate::resolve_ch_bin();
@@ -185,8 +300,10 @@ impl AdminService {
         if let Err(e) = live_migrate::wait_for_port_listening(port, RECEIVE_LISTEN_TIMEOUT).await {
             receive_task.abort();
             live_migrate::kill_pid(ch_pid);
-            if let Err(unmap) = live_migrate::ensure_rbd_unmapped(pool, image) {
-                warn!(error = %unmap, "unmap RBD after failed receive prepare");
+            for (pool, image) in images {
+                if let Err(unmap) = live_migrate::ensure_rbd_unmapped(pool, image) {
+                    warn!(error = %unmap, "unmap RBD after failed receive prepare");
+                }
             }
             return Err(Status::internal(format!(
                 "receive-mode cloud-hypervisor for {vm_name}: {e}"
@@ -227,8 +344,7 @@ impl AdminService {
     async fn clear_receive_session(
         &self,
         vm_name: &str,
-        rbd_pool: &str,
-        rbd_image: &str,
+        images: &[(String, String)],
     ) -> live_migrate::ReceiveObservation {
         // Snapshot before touching anything, so the caller can be told what
         // was destroyed rather than only that something was.
@@ -271,12 +387,36 @@ impl AdminService {
         let _ = std::fs::remove_file(live_migrate::migrate_pid_path(&self.vm_socket_dir, vm_name));
         let _ = std::fs::remove_file(self.vm_socket_dir.join(format!("{vm_name}.sock")));
 
-        if !rbd_pool.is_empty() && !rbd_image.is_empty() {
-            if let Err(e) = live_migrate::ensure_rbd_unmapped(rbd_pool, rbd_image) {
-                warn!(error = %e, "abort unmap RBD failed");
+        if !images.is_empty() {
+            for (pool, image) in images {
+                if let Err(e) = live_migrate::ensure_rbd_unmapped(pool, image) {
+                    warn!(error = %e, pool = %pool, image = %image, "abort unmap RBD failed");
+                }
             }
         }
         observed
+    }
+}
+
+fn rbd_images_from_migrate_request(
+    pool: &str,
+    image: &str,
+    volumes: &[proto::RbdImageRef],
+) -> Vec<(String, String)> {
+    let from_list: Vec<_> = volumes
+        .iter()
+        .filter(|v| !v.pool.trim().is_empty() && !v.image.trim().is_empty())
+        .map(|v| (v.pool.trim().to_string(), v.image.trim().to_string()))
+        .collect();
+    if !from_list.is_empty() {
+        return from_list;
+    }
+    let pool = pool.trim();
+    let image = image.trim();
+    if !pool.is_empty() && !image.is_empty() {
+        vec![(pool.to_string(), image.to_string())]
+    } else {
+        Vec::new()
     }
 }
 
@@ -327,6 +467,178 @@ fn validate_apply_ceph_config_args(ceph_nix: &str, fsid: &str) -> Result<(), Sta
 fn validate_bootstrap_osd_device(osd_device: &str) -> Result<(), Status> {
     if !Path::new(osd_device.trim()).is_absolute() {
         return Err(Status::invalid_argument("osd_device must be absolute"));
+    }
+    Ok(())
+}
+
+fn ceph_authtool_present() -> bool {
+    std::process::Command::new("ceph-authtool")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn stored_bootstrap_bytes(fsid: &str) -> Vec<u8> {
+    let Ok(bytes) = std::fs::read(crate::ceph_bootstrap::BOOTSTRAP_STATE_PATH) else {
+        return Vec::new();
+    };
+    match crate::ceph_bootstrap::decode_package(&bytes) {
+        Ok(pkg) if pkg.fsid == fsid => bytes,
+        _ => Vec::new(),
+    }
+}
+
+async fn require_unit_started(unit: &str) -> Result<(), Status> {
+    let start = Command::new("systemctl")
+        .args(["start", unit])
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("starting {unit}: {e}")))?;
+    if !start.status.success() {
+        return Err(Status::internal(format!(
+            "systemctl start {unit} failed: {}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        )));
+    }
+    let active = Command::new("systemctl")
+        .args(["is-active", unit])
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("checking {unit}: {e}")))?;
+    let state = String::from_utf8_lossy(&active.stdout).trim().to_string();
+    if state == "active" || state == "activating" {
+        return Ok(());
+    }
+    Err(Status::internal(format!(
+        "{unit} is '{state}' after start: {}",
+        String::from_utf8_lossy(&active.stderr).trim()
+    )))
+}
+
+fn daemon_id_from_ceph_nix(text: &str) -> String {
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(idx) = line.find("daemonId") else {
+            continue;
+        };
+        let rest = &line[idx + "daemonId".len()..];
+        let Some((_, value)) = rest.split_once('=') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        if !value.is_empty() && !value.contains([' ', '.', '/']) {
+            return value;
+        }
+    }
+    String::new()
+}
+
+async fn list_prepared_osds() -> Result<Vec<crate::ceph_bootstrap::ListedOsd>, Status> {
+    let listed = Command::new("ceph-volume")
+        .args(["lvm", "list", "--format", "json"])
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("starting ceph-volume: {e}")))?;
+    if !listed.status.success() {
+        return Err(Status::internal(format!(
+            "ceph-volume lvm list failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        )));
+    }
+    crate::ceph_bootstrap::parse_ceph_volume_lvm_list(&String::from_utf8_lossy(&listed.stdout))
+        .map_err(Status::internal)
+}
+
+fn osd_matches_device(osd: &crate::ceph_bootstrap::ListedOsd, device: &str) -> bool {
+    osd.devices
+        .iter()
+        .any(|existing| crate::ceph_bootstrap::same_block_device(existing, device))
+}
+
+async fn prepare_osd_device(device: &str, force_wipe: bool, encrypt: bool) -> Result<(), Status> {
+    let signatures = Command::new("wipefs")
+        .args(["--no-act", device])
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("running wipefs: {e}")))?;
+    if !force_wipe && !signatures.stdout.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "OSD device {device} has signatures; set forceWipe only after verifying the device"
+        )));
+    }
+    if force_wipe {
+        let out = Command::new("wipefs")
+            .args(["--all", device])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("running wipefs: {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            ));
+        }
+    }
+    let mut args = vec!["lvm", "create", "--data", device];
+    if encrypt {
+        args.push("--dmcrypt");
+    }
+    let out = Command::new("ceph-volume")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("starting ceph-volume: {e}")))?;
+    if !out.status.success() {
+        return Err(Status::internal(format!(
+            "ceph-volume lvm create {device} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+async fn retire_osd(osd: &crate::ceph_bootstrap::ListedOsd) -> Result<(), Status> {
+    let id = osd.id.trim();
+    if id.is_empty() {
+        return Err(Status::internal("ceph-volume listed an OSD with no id"));
+    }
+    let _ = Command::new("ceph").args(["osd", "out", id]).output().await;
+    let _ = Command::new("systemctl")
+        .args(["stop", &format!("ceph-osd@{id}")])
+        .output()
+        .await;
+    let purge = Command::new("ceph")
+        .args(["osd", "purge", id, "--yes-i-really-mean-it"])
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("ceph osd purge: {e}")))?;
+    let purge_err = String::from_utf8_lossy(&purge.stderr);
+    if !purge.status.success()
+        && !purge_err.contains("does not exist")
+        && !purge_err.contains("not present")
+    {
+        return Err(Status::internal(format!(
+            "ceph osd purge {id} failed: {}",
+            purge_err.trim()
+        )));
+    }
+    for device in &osd.devices {
+        let zap = Command::new("ceph-volume")
+            .args(["lvm", "zap", "--destroy", device])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("ceph-volume zap: {e}")))?;
+        if !zap.status.success() {
+            return Err(Status::internal(format!(
+                "ceph-volume zap {device} failed: {}",
+                String::from_utf8_lossy(&zap.stderr).trim()
+            )));
+        }
     }
     Ok(())
 }
@@ -1573,58 +1885,49 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         validate_apply_ceph_config_args(&req.ceph_nix, &req.fsid)?;
+        let previous = tokio::fs::read_to_string(CEPH_NIX_PATH)
+            .await
+            .unwrap_or_default();
+        let nix_changed = previous != req.ceph_nix;
         tokio::fs::write(CEPH_NIX_PATH, req.ceph_nix.as_bytes())
             .await
             .map_err(|e| Status::internal(format!("writing {CEPH_NIX_PATH}: {e}")))?;
 
-        let generated = req.keyring.is_empty();
-        let pkg = if generated {
-            crate::ceph_bootstrap::generate_bootstrap_package(&req.fsid)
-                .map_err(Status::internal)?
-        } else {
-            crate::ceph_bootstrap::decode_package(&req.keyring).map_err(Status::invalid_argument)?
-        };
-        if pkg.fsid != req.fsid {
-            return Err(Status::invalid_argument(
-                "bootstrap package fsid does not match request fsid",
-            ));
+        // `nixos-rebuild switch` restarts this agent. Generating keys or mkfs'ing
+        // the mon in the same process, then blocking on the rebuild, dropped the
+        // RPC before the controller ever saw the keyring — the retry minted a
+        // second key set over a mon that already had the first.
+        let tools = ceph_authtool_present();
+        if req.rebuild && (nix_changed || !tools) {
+            let apply_id = format!("ceph-{}", uuid_like_suffix());
+            write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+            let apply_lock = Arc::clone(&self.apply_lock);
+            let spawned_id = apply_id.clone();
+            tokio::spawn(async move {
+                let _guard = apply_lock.lock().await;
+                run_test_then_switch(PathBuf::from(CEPH_NIX_PATH), Vec::new(), spawned_id).await;
+            });
+            return Ok(Response::new(proto::ApplyCephConfigResponse {
+                success: true,
+                message: format!(
+                    "Ceph nix written to {CEPH_NIX_PATH}; nixos-rebuild {apply_id} started"
+                ),
+                keyring: stored_bootstrap_bytes(&req.fsid),
+                apply_id,
+                daemons_started: false,
+            }));
         }
-        crate::ceph_bootstrap::write_keyring_files(&pkg).map_err(Status::internal)?;
 
-        if req.rebuild {
-            let out = Command::new("nixos-rebuild")
-                .args(["test"])
-                .output()
-                .await
-                .map_err(|e| Status::internal(format!("starting nixos-rebuild: {e}")))?;
-            if !out.status.success() {
-                return Err(Status::internal(format!(
-                    "nixos-rebuild test failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
-            }
-            let out = Command::new("nixos-rebuild")
-                .args(["switch"])
-                .output()
-                .await
-                .map_err(|e| Status::internal(format!("starting nixos-rebuild: {e}")))?;
-            if !out.status.success() {
-                return Err(Status::internal(format!(
-                    "nixos-rebuild switch failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
-            }
-        }
+        let pkg = crate::ceph_bootstrap::resolve_bootstrap_package(&req.fsid, &req.keyring)
+            .map_err(|e| Status::internal(format!("ceph bootstrap package: {e}")))?;
+        crate::ceph_bootstrap::write_keyring_files(&pkg).map_err(Status::internal)?;
 
         if req.mon {
             let mons = crate::ceph_bootstrap::parse_mon_map(&req.mon_map)
                 .map_err(Status::invalid_argument)?;
             crate::ceph_bootstrap::mkfs_mon(&pkg, &req.daemon_id, &mons)
                 .map_err(Status::internal)?;
-            let _ = Command::new("systemctl")
-                .args(["start", &format!("ceph-mon-{}", req.daemon_id)])
-                .output()
-                .await;
+            require_unit_started(&format!("ceph-mon-{}", req.daemon_id)).await?;
         }
         if req.mgr {
             let daemon = req.daemon_id.clone();
@@ -1632,21 +1935,16 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 .await
                 .map_err(|e| Status::internal(format!("mgr keyring task: {e}")))?
                 .map_err(Status::internal)?;
-            let _ = Command::new("systemctl")
-                .args(["start", &format!("ceph-mgr-{}", req.daemon_id)])
-                .output()
-                .await;
+            require_unit_started(&format!("ceph-mgr-{}", req.daemon_id)).await?;
         }
 
-        let keyring = if generated {
-            crate::ceph_bootstrap::encode_package(&pkg).map_err(Status::internal)?
-        } else {
-            Vec::new()
-        };
+        let keyring = crate::ceph_bootstrap::encode_package(&pkg).map_err(Status::internal)?;
         Ok(Response::new(proto::ApplyCephConfigResponse {
             success: true,
-            message: format!("Ceph config written to {CEPH_NIX_PATH}; mon/mgr bootstrapped"),
+            message: format!("Ceph config written to {CEPH_NIX_PATH}; mon/mgr started"),
             keyring,
+            apply_id: String::new(),
+            daemons_started: true,
         }))
     }
 
@@ -1666,56 +1964,161 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             })?;
         if listed.status.success() {
             let stdout = String::from_utf8_lossy(&listed.stdout);
-            if stdout.contains(req.osd_device.trim()) {
-                return Ok(Response::new(proto::BootstrapCephOsdResponse {
-                    success: true,
-                    already_prepared: true,
-                    message: "OSD already prepared".into(),
-                    osd_id: String::new(),
-                }));
+            if let Ok(osds) = crate::ceph_bootstrap::parse_ceph_volume_lvm_list(&stdout) {
+                if osds.iter().any(|osd| {
+                    osd.devices
+                        .iter()
+                        .any(|d| crate::ceph_bootstrap::same_block_device(d, req.osd_device.trim()))
+                }) {
+                    return Ok(Response::new(proto::BootstrapCephOsdResponse {
+                        success: true,
+                        already_prepared: true,
+                        message: "OSD already prepared".into(),
+                        osd_id: String::new(),
+                    }));
+                }
             }
         }
-        let signatures = Command::new("wipefs")
-            .args(["--no-act", req.osd_device.as_str()])
-            .output()
-            .await
-            .map_err(|e| Status::internal(format!("running wipefs: {e}")))?;
-        if !req.force_wipe && !signatures.stdout.is_empty() {
-            return Err(Status::failed_precondition(
-                "OSD device has signatures; set forceWipe only after verifying the device",
-            ));
-        }
-        if req.force_wipe {
-            let out = Command::new("wipefs")
-                .args(["--all", req.osd_device.as_str()])
-                .output()
-                .await
-                .map_err(|e| Status::internal(format!("running wipefs: {e}")))?;
-            if !out.status.success() {
-                return Err(Status::internal(
-                    String::from_utf8_lossy(&out.stderr).to_string(),
-                ));
-            }
-        }
-        // Let ceph-volume install/activate systemd units (do not pass --no-systemd).
-        let out = Command::new("ceph-volume")
-            .args(["lvm", "create", "--data", req.osd_device.as_str()])
-            .output()
-            .await
-            .map_err(|e| {
-                Status::internal(format!("starting ceph-volume (is Ceph installed?): {e}"))
-            })?;
-        if !out.status.success() {
-            return Err(Status::internal(format!(
-                "ceph-volume failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
+        prepare_osd_device(req.osd_device.trim(), req.force_wipe, req.encrypt_osds).await?;
         Ok(Response::new(proto::BootstrapCephOsdResponse {
             success: true,
             already_prepared: false,
             message: "OSD prepared and activated".into(),
             osd_id: String::new(),
+        }))
+    }
+
+    async fn reconcile_ceph_osds(
+        &self,
+        request: Request<proto::ReconcileCephOsdsRequest>,
+    ) -> Result<Response<proto::ReconcileCephOsdsResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if req.osd_devices.is_empty() {
+            return Err(Status::invalid_argument(
+                "osd_devices must name at least one disk; an empty list would retire every OSD",
+            ));
+        }
+        for device in &req.osd_devices {
+            validate_bootstrap_osd_device(device)?;
+        }
+        let prepared = list_prepared_osds().await?;
+        let mut created = Vec::new();
+        let mut retired = Vec::new();
+        for device in &req.osd_devices {
+            if prepared.iter().any(|osd| osd_matches_device(osd, device)) {
+                continue;
+            }
+            prepare_osd_device(device, req.force_wipe, req.encrypt_osds).await?;
+            created.push(device.clone());
+        }
+        for osd in &prepared {
+            let still_wanted = osd.devices.iter().any(|existing| {
+                req.osd_devices
+                    .iter()
+                    .any(|wanted| crate::ceph_bootstrap::same_block_device(existing, wanted))
+            });
+            if still_wanted {
+                continue;
+            }
+            retire_osd(osd).await?;
+            retired.push(format!("osd.{} ({})", osd.id, osd.devices.join(",")));
+        }
+        Ok(Response::new(proto::ReconcileCephOsdsResponse {
+            success: true,
+            message: format!("created {}; retired {}", created.len(), retired.len()),
+            created,
+            retired,
+        }))
+    }
+
+    async fn teardown_ceph_node(
+        &self,
+        request: Request<proto::TeardownCephNodeRequest>,
+    ) -> Result<Response<proto::TeardownCephNodeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let _ = request.into_inner();
+        let nix = tokio::fs::read_to_string(CEPH_NIX_PATH)
+            .await
+            .unwrap_or_default();
+        let daemon_id = daemon_id_from_ceph_nix(&nix);
+        let prepared = list_prepared_osds().await?;
+        for osd in &prepared {
+            retire_osd(osd).await?;
+        }
+        if !daemon_id.is_empty() {
+            let _ = Command::new("systemctl")
+                .args([
+                    "stop",
+                    &format!("ceph-mon-{daemon_id}"),
+                    &format!("ceph-mgr-{daemon_id}"),
+                ])
+                .output()
+                .await;
+        }
+        tokio::fs::write(CEPH_NIX_PATH, "{ ... }: {}\n")
+            .await
+            .map_err(|e| Status::internal(format!("clearing {CEPH_NIX_PATH}: {e}")))?;
+        let apply_id = format!("ceph-teardown-{}", uuid_like_suffix());
+        write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+        let apply_lock = Arc::clone(&self.apply_lock);
+        let spawned_id = apply_id.clone();
+        tokio::spawn(async move {
+            let _guard = apply_lock.lock().await;
+            run_test_then_switch(PathBuf::from(CEPH_NIX_PATH), Vec::new(), spawned_id).await;
+        });
+        Ok(Response::new(proto::TeardownCephNodeResponse {
+            success: true,
+            message: format!("Ceph daemons stopped; nixos-rebuild {apply_id} started"),
+            daemon_id,
+            apply_id,
+        }))
+    }
+
+    async fn remove_ceph_mon(
+        &self,
+        request: Request<proto::RemoveCephMonRequest>,
+    ) -> Result<Response<proto::RemoveCephMonResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let daemon_id = request.into_inner().daemon_id;
+        let daemon_id = daemon_id.trim();
+        if daemon_id.is_empty() {
+            return Err(Status::invalid_argument("daemon_id is required"));
+        }
+        let out = Command::new("ceph")
+            .args(["mon", "rm", daemon_id])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("ceph mon rm: {e}")))?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let missing = stderr.contains("does not exist") || stderr.contains("no such");
+        if !out.status.success() && !missing {
+            return Err(Status::internal(format!(
+                "ceph mon rm {daemon_id} failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(Response::new(proto::RemoveCephMonResponse {
+            success: true,
+            message: if missing {
+                format!("mon {daemon_id} was already gone")
+            } else {
+                format!("removed mon {daemon_id}")
+            },
+        }))
+    }
+
+    async fn get_host_cpu_flags(
+        &self,
+        request: Request<proto::GetHostCpuFlagsRequest>,
+    ) -> Result<Response<proto::GetHostCpuFlagsResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let _ = request.into_inner();
+        let text = tokio::fs::read_to_string("/proc/cpuinfo")
+            .await
+            .unwrap_or_default();
+        Ok(Response::new(proto::GetHostCpuFlagsResponse {
+            flags: live_migrate::cpu_flags_from_cpuinfo(&text),
         }))
     }
 
@@ -1847,17 +2250,30 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let vm_name = req.vm_name.trim();
-        let pool = req.rbd_pool.trim();
-        let image = req.rbd_image.trim();
-        if vm_name.is_empty() || pool.is_empty() || image.is_empty() {
+        let images =
+            rbd_images_from_migrate_request(&req.rbd_pool, &req.rbd_image, &req.rbd_volumes);
+        if vm_name.is_empty() || images.is_empty() {
             return Err(Status::invalid_argument(
-                "vm_name, rbd_pool, and rbd_image are required",
+                "vm_name and at least one RBD image (rbd_volumes or rbd_pool/rbd_image) are required",
             ));
         }
-        if self.live_migrate.get_port(vm_name).await.is_some() {
-            return Err(Status::already_exists(format!(
-                "live migrate receive already prepared for {vm_name}"
-            )));
+        if self.live_migrate.get_port(vm_name).await.is_some()
+            || live_migrate::migrate_pid_path(&self.vm_socket_dir, vm_name).exists()
+            || live_migrate::handoff_marker_path(&self.vm_socket_dir, vm_name).exists()
+        {
+            let observed =
+                live_migrate::observe_receive(&self.live_migrate, &self.vm_socket_dir, vm_name)
+                    .await;
+            if observed.receive_looks_live() {
+                return Err(Status::already_exists(format!(
+                    "live migrate receive already prepared for {vm_name}"
+                )));
+            }
+            // Nothing is listening and the receive VMM is not this VM. The
+            // session is the corpse of a controller crash. Clearing a live
+            // receive is still refused above.
+            info!(%vm_name, summary = %observed.summary(), "clearing a dead live-migrate receive before prepare");
+            self.clear_receive_session(vm_name, &images).await;
         }
         // The handoff writes a marker and a pid file that the generated VM unit
         // reads. If the two disagree about where those live, the destination
@@ -1865,6 +2281,23 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         // migrated one, so refuse the migration rather than corrupt the guest.
         live_migrate::check_socket_dir_matches_nix(&self.vm_socket_dir)
             .map_err(Status::failed_precondition)?;
+
+        // E2: unlock LUKS volumes after RBD map (prepare_receive maps images).
+        for enc in &req.encrypted_volumes {
+            let pool = enc.pool.trim();
+            let image = enc.image.trim();
+            if pool.is_empty() || image.is_empty() || enc.dek.is_empty() {
+                continue;
+            }
+            live_migrate::ensure_rbd_mapped(pool, image).map_err(Status::internal)?;
+            let rbd = format!("/dev/rbd/{pool}/{image}");
+            let mapper = enc.mapper_name.clone();
+            let dek = enc.dek.clone();
+            tokio::task::spawn_blocking(move || crate::volume_crypto::open(&rbd, &dek, &mapper))
+                .await
+                .map_err(|e| Status::internal(format!("task join: {e}")))?
+                .map_err(Status::internal)?;
+        }
 
         if req.listen_port > u16::MAX as i32 || req.listen_port < 0 {
             return Err(Status::invalid_argument(format!(
@@ -1886,9 +2319,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 .map_err(Status::resource_exhausted)?
         };
 
-        let prepared = self
-            .prepare_receive_session(vm_name, pool, image, port)
-            .await;
+        let prepared = self.prepare_receive_session(vm_name, &images, port).await;
         if prepared.is_err() {
             self.live_migrate.release_port(port).await;
         }
@@ -1955,9 +2386,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if vm_name.is_empty() {
             return Err(Status::invalid_argument("vm_name is required"));
         }
-        let observed = self
-            .clear_receive_session(vm_name, req.rbd_pool.trim(), req.rbd_image.trim())
-            .await;
+        let images =
+            rbd_images_from_migrate_request(&req.rbd_pool, &req.rbd_image, &req.rbd_volumes);
+        let observed = self.clear_receive_session(vm_name, &images).await;
         Ok(Response::new(proto::AbortLiveMigrateReceiveResponse {
             success: true,
             message: "aborted live migrate receive".into(),
@@ -1981,6 +2412,30 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             success: true,
             message: observed.summary(),
             state: Some(receive_state_to_proto(&observed)),
+        }))
+    }
+
+    async fn get_live_migrate_progress(
+        &self,
+        request: Request<proto::GetLiveMigrateProgressRequest>,
+    ) -> Result<Response<proto::GetLiveMigrateProgressResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let observed =
+            live_migrate::observe_receive(&self.live_migrate, &self.vm_socket_dir, vm_name).await;
+        let memory_bytes = live_migrate::guest_memory_bytes(vm_name).unwrap_or(0);
+        let elapsed = live_migrate::elapsed_since_pid_file(&self.vm_socket_dir, vm_name);
+        Ok(Response::new(proto::GetLiveMigrateProgressResponse {
+            success: true,
+            message: observed.summary(),
+            state: Some(receive_state_to_proto(&observed)),
+            estimate: true,
+            elapsed_seconds: elapsed as i64,
+            memory_bytes,
         }))
     }
 
@@ -2054,17 +2509,23 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }
         let pool = req.rbd_pool.trim();
         let image = req.rbd_image.trim();
-        let has_rbd = !pool.is_empty() && !image.is_empty();
+        let images = rbd_images_from_migrate_request(pool, image, &req.rbd_volumes);
+        let has_rbd = !images.is_empty();
         if has_rbd {
-            live_migrate::ensure_rbd_unmapped(pool, image)
-                .map_err(|e| Status::internal(format!("unmap RBD on source: {e}")))?;
+            for (p, i) in &images {
+                live_migrate::ensure_rbd_unmapped(p, i)
+                    .map_err(|e| Status::internal(format!("unmap RBD on source: {e}")))?;
+            }
         }
         // Report observed state, not the fact that we asked: the controller
         // uses these to decide whether it is safe to start the VM elsewhere.
         let vmm_stopped = live_migrate::unit_is_stopped(&unit)
             .await
             .map_err(Status::internal)?;
-        let rbd_unmapped = !has_rbd || !live_migrate::rbd_is_mapped(pool, image);
+        let rbd_unmapped = !has_rbd
+            || images
+                .iter()
+                .all(|(p, i)| !live_migrate::rbd_is_mapped(p, i));
         Ok(Response::new(proto::FinalizeLiveMigrateSourceResponse {
             success: vmm_stopped && rbd_unmapped,
             message: if vmm_stopped && rbd_unmapped {
@@ -2110,6 +2571,56 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         Ok(Response::new(proto::FinalizeLiveMigrateDestResponse {
             success: true,
             message: format!("adopted migrated VM via {unit}"),
+        }))
+    }
+
+    async fn hot_add_disk(
+        &self,
+        request: Request<proto::HotAddDiskRequest>,
+    ) -> Result<Response<proto::HotAddDiskResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        let path = req.path.trim();
+        let serial = req.serial.trim();
+        if vm_name.is_empty() || path.is_empty() || serial.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_name, path, and serial are required",
+            ));
+        }
+        if !path.starts_with("/dev/") {
+            return Err(Status::invalid_argument("path must be under /dev/"));
+        }
+        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        client
+            .add_disk(vm_name, path, serial, req.readonly)
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(proto::HotAddDiskResponse {
+            success: true,
+            message: format!("hot-added {path} serial={serial} to {vm_name}"),
+        }))
+    }
+
+    async fn hot_remove_disk(
+        &self,
+        request: Request<proto::HotRemoveDiskRequest>,
+    ) -> Result<Response<proto::HotRemoveDiskResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        let disk_id = req.disk_id.trim();
+        if vm_name.is_empty() || disk_id.is_empty() {
+            return Err(Status::invalid_argument("vm_name and disk_id are required"));
+        }
+        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        client
+            .remove_disk(vm_name, disk_id)
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(proto::HotRemoveDiskResponse {
+            success: true,
+            message: format!("hot-removed {disk_id} from {vm_name}"),
         }))
     }
 
@@ -2282,6 +2793,109 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
 
         let _ = tokio::fs::remove_file(&tmp_path).await;
         Ok(Response::new(resp))
+    }
+
+    async fn ensure_guest_ops_key(
+        &self,
+        request: Request<proto::EnsureGuestOpsKeyRequest>,
+    ) -> Result<Response<proto::EnsureGuestOpsKeyResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let _ = request.into_inner();
+        let paths = crate::guest_ops::GuestOpsPaths::default();
+        let pk = crate::guest_ops::ensure_keypair(&paths)
+            .await
+            .map_err(Status::internal)?;
+        Ok(Response::new(proto::EnsureGuestOpsKeyResponse {
+            success: true,
+            message: "ok".into(),
+            public_key: pk,
+        }))
+    }
+
+    async fn guest_disk_probe(
+        &self,
+        request: Request<proto::GuestDiskProbeRequest>,
+    ) -> Result<Response<proto::GuestDiskProbeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        self.guest_disk_op(
+            &req.vm_name,
+            &req.network,
+            &req.disk_serial,
+            &req.ssh_user,
+            req.port,
+            req.timeout_ms,
+            false,
+        )
+        .await
+    }
+
+    async fn guest_grow_filesystem(
+        &self,
+        request: Request<proto::GuestGrowFilesystemRequest>,
+    ) -> Result<Response<proto::GuestGrowFilesystemResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let probe = self
+            .guest_disk_op(
+                &req.vm_name,
+                &req.network,
+                &req.disk_serial,
+                &req.ssh_user,
+                req.port,
+                req.timeout_ms,
+                true,
+            )
+            .await?
+            .into_inner();
+        Ok(Response::new(proto::GuestGrowFilesystemResponse {
+            success: probe.success,
+            message: probe.message,
+            ip: probe.ip,
+            size_bytes: probe.size_bytes,
+            device: probe.device,
+        }))
+    }
+
+    async fn guest_fs_freeze(
+        &self,
+        request: Request<proto::GuestFsFreezeRequest>,
+    ) -> Result<Response<proto::GuestFsFreezeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let paths = crate::guest_ops::GuestOpsPaths::default();
+        crate::guest_ops::ensure_keypair(&paths)
+            .await
+            .map_err(Status::internal)?;
+        let (ip, default_port) = self.resolve_vm_ssh_ip(vm_name, &req.network).await?;
+        let port = if req.port > 0 {
+            req.port as u16
+        } else {
+            default_port
+        };
+        let user = if req.ssh_user.trim().is_empty() {
+            crate::guest_ops::DEFAULT_SSH_USER
+        } else {
+            req.ssh_user.trim()
+        };
+        let timeout = std::time::Duration::from_millis(if req.timeout_ms > 0 {
+            req.timeout_ms as u64
+        } else {
+            30_000
+        });
+        crate::guest_ops::guest_fsfreeze(&paths, user, &ip, port, req.freeze, timeout)
+            .await
+            .map_err(Status::failed_precondition)?;
+        let action = if req.freeze { "froze" } else { "unfroze" };
+        Ok(Response::new(proto::GuestFsFreezeResponse {
+            success: true,
+            message: format!("{action} guest filesystem on {vm_name} via SSH"),
+            ip,
+        }))
     }
 
     async fn check_vm_ssh_ready(
@@ -2998,6 +3612,15 @@ mod tests {
     use tonic::Request;
 
     #[test]
+    fn daemon_id_from_ceph_nix_reads_the_quoted_value() {
+        let nix = r#"{ ... }: {
+  kcore.ceph.daemonId = "dell-tower-1";
+}"#;
+        assert_eq!(daemon_id_from_ceph_nix(nix), "dell-tower-1");
+        assert_eq!(daemon_id_from_ceph_nix("{ ... }: {}"), "");
+    }
+
+    #[test]
     fn validate_apply_ceph_config_args_requires_nix_and_fsid() {
         assert!(validate_apply_ceph_config_args("{ }", "fsid").is_ok());
         assert!(validate_apply_ceph_config_args("", "fsid").is_err());
@@ -3303,7 +3926,7 @@ mod tests {
     /// reset. Called directly because the handlers require a real mTLS peer
     /// certificate, which a unit test has no way to present.
     async fn clear(svc: &AdminService, vm: &str) -> live_migrate::ReceiveObservation {
-        svc.clear_receive_session(vm, "", "").await
+        svc.clear_receive_session(vm, &[]).await
     }
 
     /// A pid that is certainly not running: spawned and reaped.
@@ -3478,6 +4101,7 @@ mod tests {
                     vm_name: "vm-1".into(),
                     rbd_pool: String::new(),
                     rbd_image: String::new(),
+                    rbd_volumes: vec![],
                 }),
             )
             .await

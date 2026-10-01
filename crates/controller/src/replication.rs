@@ -622,10 +622,14 @@ fn apply_replication_event(
         | "node.approve"
         | "node.reject"
         | "node.drain"
+        | "node.cordon"
+        | "node.uncordon"
+        | "node.delete"
         | "vm.create"
         | "vm.update"
         | "vm.delete"
         | "vm.desired_state.set"
+        | "vm.migrate"
         | "network.create"
         | "network.delete"
         | "postgresql.create"
@@ -643,6 +647,12 @@ fn apply_replication_event(
         | "operator_role.revoke"
         | "disk_layout.create"
         | "disk_layout.delete"
+        | "volume.create"
+        | "volume.delete"
+        | "volume.attach"
+        | "volume.detach"
+        | "volume_snapshot.create"
+        | "volume_snapshot.delete"
         | "controller.register" => {
             // Phase-2 skeleton: payload validation + typed dispatch point.
             Ok(())
@@ -1344,6 +1354,79 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 db.associate_vm_ssh_keys(vm_id, &ssh_keys)
                     .map_err(|e| format!("associating SSH keys for vm {vm_id}: {e}"))?;
             }
+            if body.get("extraNics").is_some() {
+                let extras = body
+                    .get("extraNics")
+                    .and_then(Value::as_array)
+                    .map(|vals| {
+                        vals.iter()
+                            .enumerate()
+                            .filter_map(|(index, nic)| {
+                                let network = nic.get("network")?.as_str()?.to_string();
+                                let position = nic
+                                    .get("position")
+                                    .and_then(Value::as_i64)
+                                    .and_then(|v| i32::try_from(v).ok())
+                                    .unwrap_or((index + 1) as i32);
+                                Some(crate::db::VmNicRow {
+                                    vm_id: vm_id.to_string(),
+                                    position,
+                                    network,
+                                    mac_address: nic
+                                        .get("macAddress")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    model: nic
+                                        .get("model")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("virtio")
+                                        .to_string(),
+                                    ip_address: nic
+                                        .get("ipAddress")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                db.replace_vm_nics(vm_id, &extras)
+                    .map_err(|e| format!("replacing extra NICs for vm {vm_id}: {e}"))?;
+            }
+            if body.get("ipv6Addresses").is_some() {
+                let rows = body
+                    .get("ipv6Addresses")
+                    .and_then(Value::as_array)
+                    .map(|vals| {
+                        vals.iter()
+                            .filter_map(|row| {
+                                let address = row.get("address")?.as_str()?.to_string();
+                                if address.is_empty() {
+                                    return None;
+                                }
+                                let position = row
+                                    .get("position")
+                                    .and_then(Value::as_i64)
+                                    .and_then(|v| i32::try_from(v).ok())
+                                    .unwrap_or(0);
+                                Some(crate::db::VmIpv6Row {
+                                    vm_id: vm_id.to_string(),
+                                    position,
+                                    address,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                db.replace_vm_ipv6(vm_id, &rows)
+                    .map_err(|e| format!("replacing IPv6 addresses for vm {vm_id}: {e}"))?;
+            }
+            if let Some(group) = body.get("antiAffinity").and_then(Value::as_str) {
+                db.set_vm_anti_affinity(vm_id, group)
+                    .map_err(|e| format!("setting anti-affinity for vm {vm_id}: {e}"))?;
+            }
             Ok(())
         }
         "vm.desired_state.set" => {
@@ -1355,6 +1438,23 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let _ = db
                 .set_vm_auto_start(vm_id, auto_start)
                 .map_err(|e| format!("set vm auto_start {vm_id}: {e}"))?;
+            Ok(())
+        }
+        "vm.migrate" => {
+            let vm_id = vm_id_from_body_or_resource(&body, &head.resource_key)?;
+            let target = required_str(&body, "targetNode", &head.resource_key)?;
+            ensure_replicated_node_exists(db, target)?;
+            let moved = db
+                .set_vm_node(vm_id, target)
+                .map_err(|e| format!("reassign vm {vm_id} to {target}: {e}"))?;
+            if !moved {
+                return Err(format!("vm {vm_id} not found for {}", head.resource_key));
+            }
+            if let Some(source) = body.get("sourceNode").and_then(Value::as_str) {
+                if !source.is_empty() {
+                    let _ = db.mark_node_config_push(source);
+                }
+            }
             Ok(())
         }
         "vm.update" => {
@@ -1412,6 +1512,32 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 .map_err(|e| format!("set node status drained {node_id}: {e}"))?;
             Ok(())
         }
+        "node.cordon" => {
+            let node_id = required_str(&body, "nodeId", &head.resource_key)?;
+            let _ = db
+                .update_node_status(node_id, "cordoned")
+                .map_err(|e| format!("set node status cordoned {node_id}: {e}"))?;
+            Ok(())
+        }
+        "node.uncordon" => {
+            let node_id = required_str(&body, "nodeId", &head.resource_key)?;
+            let _ = db
+                .update_node_status(node_id, "ready")
+                .map_err(|e| format!("set node status ready {node_id}: {e}"))?;
+            Ok(())
+        }
+        "node.delete" => {
+            let node_id = required_str(&body, "nodeId", &head.resource_key)?;
+            if let Ok(serials) = db.find_revocable_serials("", node_id) {
+                let revoked_at = crate::pki::format_ts(time::OffsetDateTime::now_utc());
+                for serial in serials {
+                    let _ = db.revoke_certificate_by_serial(&serial, 5, &revoked_at);
+                }
+            }
+            db.delete_node(node_id)
+                .map_err(|e| format!("delete node {node_id}: {e}"))?;
+            Ok(())
+        }
         "network.create" => {
             let node_id = required_str(&body, "nodeId", &head.resource_key)?;
             let name = required_str(&body, "name", &head.resource_key)?;
@@ -1458,6 +1584,33 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let _ = db.delete_network(node_id, name);
             db.insert_network(&network)
                 .map_err(|e| format!("insert network {name} on {node_id}: {e}"))?;
+            if body.get("ipv6Prefix").is_some() || body.get("eastWestFirewall").is_some() {
+                let prefix = body
+                    .get("ipv6Prefix")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let gateway = body
+                    .get("ipv6Gateway")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let east_west = body
+                    .get("eastWestFirewall")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !prefix.is_empty() || east_west {
+                    db.upsert_network_policy(&crate::db::NetworkPolicyRow {
+                        node_id: node_id.to_string(),
+                        name: name.to_string(),
+                        east_west,
+                        ipv6_prefix: prefix,
+                        ipv6_gateway: gateway,
+                        ipv6_next: 2,
+                    })
+                    .map_err(|e| format!("upsert network policy {name} on {node_id}: {e}"))?;
+                }
+            }
             Ok(())
         }
         "network.delete" => {
@@ -1678,11 +1831,16 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let node_id = required_str(&body, "nodeId", &head.resource_key)?;
             let layout_nix = required_str(&body, "layoutNix", &head.resource_key)?;
             let generation = body.get("generation").and_then(Value::as_i64).unwrap_or(1);
+            let evacuate = body
+                .get("evacuate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let row = crate::db::DiskLayoutRow {
                 name: name.to_string(),
                 node_id: node_id.to_string(),
                 generation,
                 layout_nix: layout_nix.to_string(),
+                evacuate,
                 created_at: String::new(),
                 updated_at: String::new(),
             };
@@ -1723,6 +1881,140 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let _ = db
                 .delete_postgresql(name)
                 .map_err(|e| format!("delete postgresql {name}: {e}"))?;
+            Ok(())
+        }
+        "volume.create" | "volume.attach" | "volume.detach" => {
+            let id = required_str(&body, "id", &head.resource_key)?;
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let existing = db
+                .get_volume_by_id(id)
+                .map_err(|e| format!("get volume {id}: {e}"))?
+                .or(db
+                    .get_volume_by_name(name)
+                    .map_err(|e| format!("get volume by name {name}: {e}"))?);
+            let mut row = existing.unwrap_or_else(|| {
+                let mut v = crate::db::VolumeRow::new_data(name, 0);
+                v.id = id.to_string();
+                v.serial = crate::db::VolumeRow::serial_from_id(id);
+                v
+            });
+            row.id = id.to_string();
+            row.name = name.to_string();
+            if let Some(v) = body.get("role").and_then(Value::as_str) {
+                row.role = v.to_string();
+            }
+            if let Some(v) = body.get("pool").and_then(Value::as_str) {
+                row.pool = v.to_string();
+            }
+            if let Some(v) = body.get("image").and_then(Value::as_str) {
+                row.image = v.to_string();
+            }
+            if let Some(v) = body.get("sizeBytes").and_then(Value::as_i64) {
+                row.size_bytes = v;
+            }
+            if let Some(v) = body.get("vmId").and_then(Value::as_str) {
+                row.vm_id = v.to_string();
+            }
+            if let Some(v) = body.get("attachState").and_then(Value::as_str) {
+                row.attach_state = v.to_string();
+            }
+            if let Some(v) = body.get("serial").and_then(Value::as_str) {
+                row.serial = v.to_string();
+            }
+            if let Some(v) = body.get("slot").and_then(Value::as_i64) {
+                row.slot = v as i32;
+            }
+            if let Some(v) = body.get("storageClass").and_then(Value::as_str) {
+                row.storage_class = v.to_string();
+            }
+            if let Some(v) = body.get("sourceJson").and_then(Value::as_str) {
+                row.source_json = v.to_string();
+            }
+            if let Some(v) = body.get("parentSnapshotId").and_then(Value::as_str) {
+                row.parent_snapshot_id = v.to_string();
+            }
+            if let Some(v) = body.get("encrypted").and_then(Value::as_bool) {
+                row.encrypted = v;
+            }
+            if let Some(v) = body.get("generation").and_then(Value::as_i64) {
+                row.generation = v;
+            }
+            // wrapped_dek is intentionally not replicated: master key is local.
+            db.upsert_volume(&row)
+                .map_err(|e| format!("upsert volume {name}: {e}"))?;
+            Ok(())
+        }
+        "volume.delete" => {
+            let id = body.get("id").and_then(Value::as_str).unwrap_or_default();
+            let name = body.get("name").and_then(Value::as_str).unwrap_or_default();
+            if !id.is_empty() {
+                let _ = db
+                    .delete_volume_by_id(id)
+                    .map_err(|e| format!("delete volume {id}: {e}"))?;
+            } else if !name.is_empty() {
+                if let Some(row) = db
+                    .get_volume_by_name(name)
+                    .map_err(|e| format!("get volume {name}: {e}"))?
+                {
+                    let _ = db
+                        .delete_volume_by_id(&row.id)
+                        .map_err(|e| format!("delete volume {}: {e}", row.id))?;
+                }
+            }
+            Ok(())
+        }
+        "volume_snapshot.create" => {
+            let id = required_str(&body, "id", &head.resource_key)?;
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let volume_id = required_str(&body, "volumeId", &head.resource_key)?;
+            if db
+                .get_volume_snapshot_by_id(id)
+                .map_err(|e| format!("get volume snapshot {id}: {e}"))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            let row = crate::db::VolumeSnapshotRow {
+                id: id.to_string(),
+                name: name.to_string(),
+                volume_id: volume_id.to_string(),
+                rbd_snap: body
+                    .get("rbdSnap")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name)
+                    .to_string(),
+                protected: body
+                    .get("protected")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                size_bytes: body.get("sizeBytes").and_then(Value::as_i64).unwrap_or(0),
+                consistency: body
+                    .get("consistency")
+                    .and_then(Value::as_str)
+                    .unwrap_or("crash")
+                    .to_string(),
+                created_at: String::new(),
+            };
+            db.insert_volume_snapshot(&row)
+                .map_err(|e| format!("insert volume snapshot {name}: {e}"))?;
+            Ok(())
+        }
+        "volume_snapshot.delete" => {
+            let id = body.get("id").and_then(Value::as_str).unwrap_or_default();
+            if !id.is_empty() {
+                let _ = db
+                    .delete_volume_snapshot(id)
+                    .map_err(|e| format!("delete volume snapshot {id}: {e}"))?;
+            } else if let Some(name) = body.get("name").and_then(Value::as_str) {
+                if let Some(snap) = db
+                    .get_volume_snapshot_by_name(name)
+                    .map_err(|e| format!("get volume snapshot {name}: {e}"))?
+                {
+                    let _ = db
+                        .delete_volume_snapshot(&snap.id)
+                        .map_err(|e| format!("delete volume snapshot {}: {e}", snap.id))?;
+                }
+            }
             Ok(())
         }
         _ => Ok(()),
@@ -2582,6 +2874,110 @@ mod tests {
     }
 
     #[test]
+    fn apply_head_to_domain_cordons_and_revokes_on_delete() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node("node-1")).expect("insert");
+        db.record_issued_certificate(&crate::db::IssuedCertRow {
+            serial_hex: "0C0D".to_string(),
+            subject_cn: "kcore-node-node-1".to_string(),
+            identity_kind: "node".to_string(),
+            node_id: "node-1".to_string(),
+            issuer_cn: "kcore-sub-ca".to_string(),
+            fingerprint_sha256: "bb".to_string(),
+            not_before: "2026-01-01T00:00:00Z".to_string(),
+            not_after: "2027-01-01T00:00:00Z".to_string(),
+            issued_at: "2026-01-01T00:00:00Z".to_string(),
+            status: crate::db::CERT_STATUS_ACTIVE.to_string(),
+            revocation_reason: -1,
+            revoked_at: String::new(),
+        })
+        .expect("record cert");
+
+        let cordon = ReplicationResourceHeadRow {
+            resource_key: "node/node-1".to_string(),
+            last_op_id: "op-cordon".to_string(),
+            last_logical_ts_unix_ms: 1,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 1,
+            last_event_type: "node.cordon".to_string(),
+            last_body_json: r#"{"nodeId":"node-1"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &cordon).expect("cordon");
+        assert_eq!(
+            db.get_node("node-1").expect("get").expect("node").status,
+            "cordoned"
+        );
+
+        let delete = ReplicationResourceHeadRow {
+            resource_key: "node/node-1".to_string(),
+            last_op_id: "op-delete".to_string(),
+            last_logical_ts_unix_ms: 2,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 2,
+            last_event_type: "node.delete".to_string(),
+            last_body_json: r#"{"nodeId":"node-1","certificatesRevoked":1}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &delete).expect("delete");
+        assert!(db.get_node("node-1").expect("get").is_none());
+        let cert = db
+            .get_issued_certificate("0C0D")
+            .expect("cert")
+            .expect("row");
+        assert_eq!(cert.status, crate::db::CERT_STATUS_REVOKED);
+        assert_eq!(cert.revocation_reason, 5);
+    }
+
+    #[test]
+    fn apply_head_to_domain_upserts_and_deletes_volume() {
+        let db = Database::open(":memory:").expect("open db");
+        let head = ReplicationResourceHeadRow {
+            resource_key: "volume/pgdata".to_string(),
+            last_op_id: "op-vol-1".to_string(),
+            last_logical_ts_unix_ms: 1,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 1,
+            last_event_type: "volume.create".to_string(),
+            last_body_json: r#"{"id":"vol-1","name":"pgdata","role":"data","pool":"kcore-vms","image":"kcore-vol-abc","sizeBytes":1073741824,"vmId":"","attachState":"detached","serial":"abc","slot":0,"storageClass":"ceph","sourceJson":"{}","encrypted":false}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &head).expect("apply volume.create");
+        let row = db
+            .get_volume_by_name("pgdata")
+            .expect("db")
+            .expect("volume row");
+        assert_eq!(row.id, "vol-1");
+        assert_eq!(row.pool, "kcore-vms");
+        assert_eq!(row.attach_state, "detached");
+
+        let del = ReplicationResourceHeadRow {
+            resource_key: "volume/pgdata".to_string(),
+            last_op_id: "op-vol-2".to_string(),
+            last_logical_ts_unix_ms: 2,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 2,
+            last_event_type: "volume.delete".to_string(),
+            last_body_json: r#"{"id":"vol-1","name":"pgdata"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &del).expect("apply volume.delete");
+        assert!(db.get_volume_by_name("pgdata").expect("db").is_none());
+    }
+
+    #[test]
     fn apply_head_to_domain_upserts_ssh_key() {
         let db = Database::open(":memory:").expect("open db");
         let head = ReplicationResourceHeadRow {
@@ -3002,6 +3398,11 @@ mod tests {
             cert_rotation: Default::default(),
             revocation: Default::default(),
             pki: Default::default(),
+            rate_limit: Default::default(),
+            sbom: Default::default(),
+            webhooks: Default::default(),
+            scheduler: Default::default(),
+            failover: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 
@@ -3038,6 +3439,11 @@ mod tests {
             cert_rotation: Default::default(),
             revocation: Default::default(),
             pki: Default::default(),
+            rate_limit: Default::default(),
+            sbom: Default::default(),
+            webhooks: Default::default(),
+            scheduler: Default::default(),
+            failover: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 

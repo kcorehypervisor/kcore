@@ -41,6 +41,20 @@ service NodeStorage {
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
   rpc AttachVolume(AttachVolumeRequest) returns (AttachVolumeResponse);
   rpc DetachVolume(DetachVolumeRequest) returns (DetachVolumeResponse);
+  rpc SnapshotVolume(SnapshotVolumeRequest) returns (SnapshotVolumeResponse);
+  rpc DeleteVolumeSnapshot(DeleteVolumeSnapshotRequest) returns (DeleteVolumeSnapshotResponse);
+  rpc CloneVolume(CloneVolumeRequest) returns (CloneVolumeResponse);
+  rpc RollbackVolume(RollbackVolumeRequest) returns (RollbackVolumeResponse);
+  rpc FlattenVolume(FlattenVolumeRequest) returns (FlattenVolumeResponse);
+  rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
+
+  // Host-side LUKS over a mapped RBD device (E2 per-volume encryption).
+  rpc FormatEncryptedVolume(FormatEncryptedVolumeRequest)
+      returns (FormatEncryptedVolumeResponse);
+  rpc UnlockEncryptedVolume(UnlockEncryptedVolumeRequest)
+      returns (UnlockEncryptedVolumeResponse);
+  rpc LockEncryptedVolume(LockEncryptedVolumeRequest)
+      returns (LockEncryptedVolumeResponse);
 }
 
 // NodeInfo service reports node capacity and status
@@ -83,6 +97,19 @@ service NodeAdmin {
   // CheckVmSshReady resolves VM IP from DHCP leases and probes SSH port.
   rpc CheckVmSshReady(CheckVmSshReadyRequest) returns (CheckVmSshReadyResponse);
 
+  // Ensure a per-node GuestOps SSH identity exists; returns the public key.
+  rpc EnsureGuestOpsKey(EnsureGuestOpsKeyRequest) returns (EnsureGuestOpsKeyResponse);
+
+  // Probe a guest block device size by virtio serial (SSH + lsblk).
+  rpc GuestDiskProbe(GuestDiskProbeRequest) returns (GuestDiskProbeResponse);
+
+  // Grow guest partition + filesystem for a disk identified by virtio serial.
+  rpc GuestGrowFilesystem(GuestGrowFilesystemRequest)
+      returns (GuestGrowFilesystemResponse);
+
+  // Freeze or unfreeze guest filesystems via fsfreeze on / (quiesced snapshots).
+  rpc GuestFsFreeze(GuestFsFreezeRequest) returns (GuestFsFreezeResponse);
+
   // AttachVmConsole bridges raw bytes to the Cloud Hypervisor serial Unix
   // socket (/run/kcore/<vm_name>.serial.sock). The first client message must
   // set vm_name; subsequent messages carry data only.
@@ -110,8 +137,18 @@ service NodeAdmin {
   // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
   rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
   rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
+  // Create every OSD in osd_devices that is not already prepared, and retire
+  // OSDs this node has that are not in that list. Retirement only touches
+  // devices ceph-volume itself reports.
+  rpc ReconcileCephOsds(ReconcileCephOsdsRequest) returns (ReconcileCephOsdsResponse);
   rpc GetCephHealth(GetCephHealthRequest) returns (GetCephHealthResponse);
   rpc EnsureCephPool(EnsureCephPoolRequest) returns (EnsureCephPoolResponse);
+  // Stop this node's mon/mgr, purge its OSDs, and queue a rebuild that drops
+  // kcore.ceph from the system configuration.
+  rpc TeardownCephNode(TeardownCephNodeRequest) returns (TeardownCephNodeResponse);
+  // `ceph mon rm` on a member that is still in quorum.
+  rpc RemoveCephMon(RemoveCephMonRequest) returns (RemoveCephMonResponse);
+  rpc GetHostCpuFlags(GetHostCpuFlagsRequest) returns (GetHostCpuFlagsResponse);
 
   // Live migration peer steps (controller orchestrates source + destination).
   rpc PrepareLiveMigrateReceive(PrepareLiveMigrateReceiveRequest)
@@ -121,17 +158,23 @@ service NodeAdmin {
   rpc AbortLiveMigrateReceive(AbortLiveMigrateReceiveRequest)
       returns (AbortLiveMigrateReceiveResponse);
   // Read-only view of this node's live-migrate receive bookkeeping for a VM.
-  // Nothing is cleaned up. It exists so an operator can tell a stranded
-  // session from an in-flight receive *before* clearing anything: there is
-  // deliberately no automatic reaping, because a wrong liveness guess would
-  // destroy a live migration. See docs/vm-migration.md.
+  // A prepare clears a session that is already dead (no matching VMM, port not
+  // listening). A session that still looks live is left alone: clearing it
+  // would destroy the guest. See docs/vm-migration.md.
   rpc GetLiveMigrateReceiveStatus(GetLiveMigrateReceiveStatusRequest)
       returns (GetLiveMigrateReceiveStatusResponse);
+  // Best-effort progress for an in-flight receive (phase + estimate flags).
+  rpc GetLiveMigrateProgress(GetLiveMigrateProgressRequest)
+      returns (GetLiveMigrateProgressResponse);
   rpc SendLiveMigrate(SendLiveMigrateRequest) returns (SendLiveMigrateResponse);
   rpc FinalizeLiveMigrateSource(FinalizeLiveMigrateSourceRequest)
       returns (FinalizeLiveMigrateSourceResponse);
   rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
       returns (FinalizeLiveMigrateDestResponse);
+
+  // Hotplug a mapped block device into a running Cloud Hypervisor guest.
+  rpc HotAddDisk(HotAddDiskRequest) returns (HotAddDiskResponse);
+  rpc HotRemoveDisk(HotRemoveDiskRequest) returns (HotRemoveDiskResponse);
 
   // RotateNodeCert asks the node-agent to rotate its own TLS identity: the
   // node generates a fresh keypair, submits a CSR to the controller
@@ -441,6 +484,97 @@ message DetachVolumeRequest {
 
 message DetachVolumeResponse {}
 
+message SnapshotVolumeRequest {
+  // pool/image
+  string backend_handle = 1;
+  string snapshot_name = 2;
+  bool protect = 3;
+}
+
+message SnapshotVolumeResponse {
+  string snapshot_handle = 1; // pool/image@snap
+}
+
+message DeleteVolumeSnapshotRequest {
+  string backend_handle = 1; // pool/image
+  string snapshot_name = 2;
+  bool unprotect = 3;
+}
+
+message DeleteVolumeSnapshotResponse {}
+
+message CloneVolumeRequest {
+  string parent_handle = 1; // pool/image
+  string parent_snapshot = 2;
+  string child_image = 3;
+}
+
+message CloneVolumeResponse {
+  string backend_handle = 1; // pool/child_image
+}
+
+message RollbackVolumeRequest {
+  string backend_handle = 1; // pool/image
+  string snapshot_name = 2;
+}
+
+message RollbackVolumeResponse {}
+
+message FlattenVolumeRequest {
+  string backend_handle = 1; // pool/image (clone)
+}
+
+message FlattenVolumeResponse {}
+
+message ResizeVolumeRequest {
+  string backend_handle = 1; // pool/image
+  int64 size_bytes = 2;
+  // Pass through to `rbd resize --allow-shrink` when shrinking.
+  bool allow_shrink = 3;
+}
+
+message ResizeVolumeResponse {
+  bool success = 1;
+  string message = 2;
+  int64 size_bytes = 3;
+}
+
+message FormatEncryptedVolumeRequest {
+  // Mapped RBD path, e.g. /dev/rbd/kcore-vms/kcore-vol-abc
+  string rbd_device = 1;
+  // Raw 32-byte DEK (not hex); used as LUKS passphrase via key-file.
+  bytes dek = 2;
+  // dm-crypt name under /dev/mapper/ (e.g. kcore-vol-abc)
+  string mapper_name = 3;
+}
+
+message FormatEncryptedVolumeResponse {
+  bool success = 1;
+  string message = 2;
+  string mapper_path = 3;
+}
+
+message UnlockEncryptedVolumeRequest {
+  string rbd_device = 1;
+  bytes dek = 2;
+  string mapper_name = 3;
+}
+
+message UnlockEncryptedVolumeResponse {
+  bool success = 1;
+  string message = 2;
+  string mapper_path = 3;
+}
+
+message LockEncryptedVolumeRequest {
+  string mapper_name = 1;
+}
+
+message LockEncryptedVolumeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
 // GetNodeInfo
 message GetNodeInfoRequest {}
 
@@ -450,6 +584,8 @@ message GetNodeInfoResponse {
   NodeCapacity capacity = 3;
   NodeUsage usage = 4;
   repeated StorageBackend storage_backends = 5;
+  // ssh-ed25519 public key for GuestOps (empty until EnsureGuestOpsKey).
+  string guest_ops_public_key = 6;
 }
 
 message NodeCapacity {
@@ -608,6 +744,65 @@ message CheckVmSshReadyResponse {
   int32 port = 3;
   string reason = 4;
   bool fatal = 5;
+}
+
+message EnsureGuestOpsKeyRequest {}
+
+message EnsureGuestOpsKeyResponse {
+  bool success = 1;
+  string message = 2;
+  // OpenSSH public key line (ssh-ed25519 …)
+  string public_key = 3;
+}
+
+message GuestDiskProbeRequest {
+  string vm_name = 1;
+  string network = 2;
+  // Virtio serial as set on the disk (matches /dev/disk/by-id/virtio-<serial>).
+  string disk_serial = 3;
+  string ssh_user = 4; // default kcore
+  int32 port = 5;
+  int32 timeout_ms = 6;
+}
+
+message GuestDiskProbeResponse {
+  bool success = 1;
+  string message = 2;
+  string ip = 3;
+  int64 size_bytes = 4;
+  string device = 5; // e.g. /dev/vdb
+}
+
+message GuestGrowFilesystemRequest {
+  string vm_name = 1;
+  string network = 2;
+  string disk_serial = 3;
+  string ssh_user = 4;
+  int32 port = 5;
+  int32 timeout_ms = 6;
+}
+
+message GuestGrowFilesystemResponse {
+  bool success = 1;
+  string message = 2;
+  string ip = 3;
+  int64 size_bytes = 4;
+  string device = 5;
+}
+
+message GuestFsFreezeRequest {
+  string vm_name = 1;
+  string network = 2;
+  string ssh_user = 3;
+  int32 port = 4;
+  int32 timeout_ms = 5;
+  bool freeze = 6; // true = --freeze /, false = --unfreeze /
+}
+
+message GuestFsFreezeResponse {
+  bool success = 1;
+  string message = 2;
+  string ip = 3;
 }
 
 // Bidirectional console payload between controller/dashboard and node-agent.
@@ -835,14 +1030,21 @@ message ApplyCephConfigRequest {
 message ApplyCephConfigResponse {
   bool success = 1;
   string message = 2;
-  // Populated when this node generated the cluster bootstrap package.
+  // Populated when this node generated or loaded the cluster bootstrap package.
   bytes keyring = 3;
+  // Set when a nixos-rebuild was started and the caller must wait before
+  // mon mkfs. Empty when no rebuild was needed.
+  string apply_id = 4;
+  // True once mon and mgr have been mkfs'd and started. False when the
+  // response only queued a rebuild; call again with rebuild=false afterwards.
+  bool daemons_started = 5;
 }
 
 message BootstrapCephOsdRequest {
   string osd_device = 1;
   bool force_wipe = 2;
   string cluster_name = 3;
+  bool encrypt_osds = 4;
 }
 
 message BootstrapCephOsdResponse {
@@ -873,12 +1075,65 @@ message EnsureCephPoolResponse {
   string message = 3;
 }
 
+message ReconcileCephOsdsRequest {
+  repeated string osd_devices = 1;
+  bool force_wipe = 2;
+  bool encrypt_osds = 3;
+}
+
+message ReconcileCephOsdsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated string created = 3;
+  repeated string retired = 4;
+}
+
+message TeardownCephNodeRequest {}
+
+message TeardownCephNodeResponse {
+  bool success = 1;
+  string message = 2;
+  // Mon daemon id that was stopped, so a surviving member can `ceph mon rm` it.
+  string daemon_id = 3;
+  string apply_id = 4;
+}
+
+message RemoveCephMonRequest { string daemon_id = 1; }
+
+message RemoveCephMonResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetHostCpuFlagsRequest {}
+
+message GetHostCpuFlagsResponse { repeated string flags = 1; }
+
+message RbdImageRef {
+  string pool = 1;
+  string image = 2;
+}
+
+// DEK material for unlocking an encrypted volume on the destination before
+// live-migrate receive. DEK is sent only over mTLS to the owning/receiving node.
+message EncryptedVolumeKey {
+  string pool = 1;
+  string image = 2;
+  string mapper_name = 3;
+  bytes dek = 4;
+}
+
 message PrepareLiveMigrateReceiveRequest {
   string vm_name = 1;
   string rbd_pool = 2;
   string rbd_image = 3;
   // Preferred listen port; 0 = pick an ephemeral free port.
   int32 listen_port = 4;
+  // All RBD images to map before receive (root + data). When empty, the
+  // agent falls back to rbd_pool/rbd_image alone.
+  repeated RbdImageRef rbd_volumes = 5;
+  // Optional LUKS unlocks after RBD map (E2).
+  repeated EncryptedVolumeKey encrypted_volumes = 6;
 }
 
 message PrepareLiveMigrateReceiveResponse {
@@ -905,6 +1160,7 @@ message AbortLiveMigrateReceiveRequest {
   string vm_name = 1;
   string rbd_pool = 2;
   string rbd_image = 3;
+  repeated RbdImageRef rbd_volumes = 4;
 }
 
 message AbortLiveMigrateReceiveResponse {
@@ -956,6 +1212,20 @@ message GetLiveMigrateReceiveStatusResponse {
   LiveMigrateReceiveState state = 3;
 }
 
+message GetLiveMigrateProgressRequest {
+  string vm_name = 1;
+}
+
+message GetLiveMigrateProgressResponse {
+  bool success = 1;
+  string message = 2;
+  LiveMigrateReceiveState state = 3;
+  // Always true for this estimate path — CH has no reliable byte counter.
+  bool estimate = 4;
+  int64 elapsed_seconds = 5;
+  int64 memory_bytes = 6;
+}
+
 message SendLiveMigrateRequest {
   string vm_name = 1;
   // tcp:<dest-ip>:<port>
@@ -972,6 +1242,7 @@ message FinalizeLiveMigrateSourceRequest {
   string vm_name = 1;
   string rbd_pool = 2;
   string rbd_image = 3;
+  repeated RbdImageRef rbd_volumes = 4;
 }
 
 message FinalizeLiveMigrateSourceResponse {
@@ -1010,4 +1281,28 @@ message RotateNodeCertResponse {
   // force was not set, so nothing was changed.
   bool skipped = 4;
   int32 days_until_expiry = 5;
+}
+
+message HotAddDiskRequest {
+  string vm_name = 1;
+  // Absolute host path (mapped RBD or /dev/mapper/…).
+  string path = 2;
+  string serial = 3;
+  bool readonly = 4;
+}
+
+message HotAddDiskResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message HotRemoveDiskRequest {
+  string vm_name = 1;
+  // Virtio device id / serial used at add time.
+  string disk_id = 2;
+}
+
+message HotRemoveDiskResponse {
+  bool success = 1;
+  string message = 2;
 }

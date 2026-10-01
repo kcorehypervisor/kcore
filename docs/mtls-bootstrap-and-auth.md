@@ -354,7 +354,7 @@ kctl get pki-status
 
 reports inventory counts by status, how many active certificates are inside the warning window, the rotation thresholds in force, sub-CA availability, the CRL number and update window, the revocation fail mode, the CRL/OCSP URLs, and the twenty soonest-expiring active certificates. It prints an explicit `WARNING` line when anything is inside the warning window.
 
-`kctl get nodes` continues to show the `CERT EXPIRY` column with a `⚠` inside 30 days. The rotation reconciler logs a warning per certificate inside `certRotation.warnBeforeDays`, and logs every rotation with the old and new serials.
+`kctl get nodes` continues to show the `CERT EXPIRY` column with a `⚠` inside 30 days. The rotation reconciler logs a warning per certificate inside `certRotation.warnBeforeDays`, emits `cert.expiry.warning` once per certificate while it stays in that window (see [webhooks.md](webhooks.md)), and logs every rotation with the old and new serials. The same window emits a `cert.expiry.warning` webhook once per certificate; see [webhooks.md](webhooks.md).
 
 ### 4.8 Trust chain
 
@@ -388,6 +388,15 @@ pki:
   crlValidityHours: 24           # nextUpdate - thisUpdate
   crlRefreshBeforeHours: 6       # regenerate once nextUpdate is this close
   ocspValidityHours: 1           # OCSP response nextUpdate window
+
+rateLimit:
+  enabled: true                  # per-identity token bucket on gRPC
+  requestsPerSecond: 100
+  burst: 200
+
+sbom:
+  cratesFile: ""                 # installed crates CycloneDX; empty serves the embedded Cargo.lock graph
+  isoClosureFile: ""             # installed ISO-closure CycloneDX; empty makes that kind NotFound
 ```
 
 Node-agent (`node-agent.yaml`):
@@ -406,6 +415,11 @@ revocation:
   failMode: soft-fail            # soft-fail | hard-fail
   ocspEnabled: true              # allow live OCSP point queries
   ocspUrl: ""                    # e.g. http://192.168.40.105:9092
+
+rateLimit:
+  enabled: true
+  requestsPerSecond: 100
+  burst: 200
 ```
 
 Validation rejects an unrecognised `failMode`, a `renewAtLifetimeFraction` outside `0.0..=1.0`, a `maxStalenessSecs` shorter than the fetch interval (the CRL would be stale the moment it arrived), and an `ocspUrl` without an `http://` or `https://` scheme.

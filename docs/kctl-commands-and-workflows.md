@@ -406,6 +406,10 @@ For a full image-centric guide (including large raw upload and wait-for-ssh flow
 
 - `docs/images.md`
 
+Windows Server uses the same upload and `kctl create vm` flow. The image is
+built outside the cluster, and the node boots it with Hyper-V CPU enlightenments.
+See [windows-guests.md](./windows-guests.md).
+
 ## 8) Network operations
 
 ### Create a network
@@ -418,6 +422,9 @@ kctl create network <name> \
   [--internal-netmask <mask>] \
   [--vlan-id <id>] \
   [--no-outbound-nat] \
+  [--ipv6-prefix <prefix/64>] \
+  [--ipv6-gateway <prefix::1>] \
+  [--east-west-firewall] \
   [--target-node <node-addr-or-id>]
 ```
 
@@ -430,6 +437,9 @@ kctl create network <name> \
 | `--internal-netmask` | no | `255.255.255.0` | Subnet mask |
 | `--vlan-id` | no | `0` | 802.1Q VLAN tag |
 | `--no-outbound-nat` | no | `false` | Disable masquerade (vxlan only) |
+| `--ipv6-prefix` | no | empty | Optional IPv6 /64. Set together with `--ipv6-gateway` |
+| `--ipv6-gateway` | no | empty | Bridge gateway, the first address of the prefix |
+| `--east-west-firewall` | no | off | Drop VM-to-VM traffic on this bridge |
 | `--target-node` | no | auto | Target node |
 
 Examples:
@@ -458,6 +468,15 @@ kctl create network internal \
   --external-ip 203.0.113.10 \
   --gateway-ip 10.251.0.1 \
   --no-outbound-nat
+
+# VXLAN with IPv6 and an east-west filter
+kctl create network overlay \
+  --type vxlan \
+  --external-ip 0.0.0.0 \
+  --gateway-ip 10.240.0.1 \
+  --ipv6-prefix fd00:10:240::/64 \
+  --ipv6-gateway fd00:10:240::1 \
+  --east-west-firewall
 ```
 
 ### List and delete networks
@@ -499,7 +518,8 @@ Top-level commands:
 
 - `kctl create vm ... --storage-backend <filesystem|lvm|zfs|ceph> --storage-size-bytes <bytes>`
 - `kctl create cluster ...`
-- `kctl create network <name> --external-ip ... --gateway-ip ... [--type nat|bridge|vxlan] [--no-outbound-nat] [--vlan-id ...] [--target-node ...]`
+- `kctl create vm ... [--extra-network <name>]... [--label key=value]... [--anti-affinity <group>]`
+- `kctl create network <name> --external-ip ... --gateway-ip ... [--type nat|bridge|vxlan] [--no-outbound-nat] [--ipv6-prefix ...] [--ipv6-gateway ...] [--east-west-firewall] [--vlan-id ...] [--target-node ...]`
 - `kctl create ssh-key <name> --public-key "ssh-rsa ..."`
 - `kctl delete vm ...`
 - `kctl delete network <name> [--target-node ...]`
@@ -527,6 +547,12 @@ Top-level commands:
 - `kctl pull image <uri>` (legacy/manual path)
 - `kctl node approve <NODE_ID>`
 - `kctl node reject <NODE_ID>`
+- `kctl node cordon <NODE_ID>` — stop placing new VMs here; VMs already on the node stay
+- `kctl node uncordon <NODE_ID>` — make a cordoned node schedulable again
+- `kctl node delete <NODE_ID>` — remove an empty node and revoke its certificates
+- `kctl get cluster-health` — ready nodes, VMs still on not-ready nodes, certificate expiry, replication conflicts
+- `kctl backup -o snapshot.sqlite` — consistent copy of the controller database
+- `kctl restore controller -f snapshot.sqlite --confirm` — replace the controller database from that snapshot
 - `kctl rotate certs --controller <host:port>` (rotate controller cert and push to controller)
 - `kctl rotate sub-ca` (generate and push new sub-CA to controller)
 - `kctl rotate node-certs --node <NODE_ID> | --all` (force CSR-based node cert rotation; the node keypair never leaves the node)

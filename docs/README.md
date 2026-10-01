@@ -17,6 +17,7 @@
 | Release verification (SBOMs + Sigstore) | [release-verification.md](./release-verification.md) |
 | Formal methods | [formal-methods-and-verification.md](./formal-methods-and-verification.md) |
 | Heartbeat | [heartbeat.md](./heartbeat.md) |
+| Webhooks and events | [webhooks.md](./webhooks.md) |
 | kctl workflows | [kctl-commands-and-workflows.md](./kctl-commands-and-workflows.md) |
 | Migrations | [migrations.md](./migrations.md) |
 | mTLS / bootstrap | [mtls-bootstrap-and-auth.md](./mtls-bootstrap-and-auth.md) |
@@ -30,6 +31,7 @@
 | Storage | [storage.md](./storage.md) |
 | kcore SAN (Ceph) | [ceph.md](./ceph.md) |
 | VM migration (cold / live) | [vm-migration.md](./vm-migration.md) |
+| Windows guests | [windows-guests.md](./windows-guests.md) |
 | Containerd support | [support-for-containerd.md](./support-for-containerd.md) |
 | Zero-external resolution | [zero-external-resolution-algorithm.md](./zero-external-resolution-algorithm.md) |
 

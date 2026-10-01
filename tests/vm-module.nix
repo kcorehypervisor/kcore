@@ -61,6 +61,8 @@ pkgs.testers.runNixOSTest {
     machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F -- '--firmware /nix/store/'")
     machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F 'CLOUDHV.fd'")
     machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F 'image_type=raw'")
+    machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F 'kvm_hyperv=on'")
+    machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F 'TimeoutStartSec=15min'")
 
     machine.succeed("test -d /run/kcore")
     machine.succeed("test -f /etc/kcore/seeds/this-name-is-way-too-long.iso")

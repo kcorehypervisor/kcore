@@ -70,3 +70,11 @@ Resolved rules are rendered into Nix under
 
 The `ch-vm` networking module translates these rules into `nftables` rules in
 the existing NAT pipeline.
+
+## East-west
+
+North-south NAT and DNAT stay as they are. When a network sets
+`eastWestFirewall`, rules that name a `targetIp` are also accepted on the
+bridge filter before other VM-to-VM traffic on that network is dropped.
+Rules without a target IP are not turned into east-west allows. The filter
+is off unless the network asks for it. See [networking.md](./networking.md).

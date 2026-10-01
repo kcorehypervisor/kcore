@@ -1858,8 +1858,10 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "spki",
+ "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tonic-build",
@@ -1867,7 +1869,9 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+ "webpki-roots",
  "x509-cert",
  "x509-ocsp",
  "x509-parser",
@@ -1990,6 +1994,7 @@ dependencies = [
  "ring",
  "rustls",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "time",
@@ -4829,6 +4834,15 @@ checksum = "854ba17bb104abfb26ba36da9729addc7ce7f06f5c0f90f3c391f8461cca21f9"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

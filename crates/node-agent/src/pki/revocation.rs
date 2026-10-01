@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
 
-use crate::config::{Config, NodeRevocationConfig};
+use crate::config::{Config, NodeRevocationConfig, RateLimitConfig};
 use crate::controller_proto;
 
 /// What to do when revocation data cannot be refreshed within
@@ -890,6 +890,7 @@ mod tests {
             storage: crate::config::StorageConfig::default(),
             cert_rotation: crate::config::CertRotationConfig::default(),
             revocation: NodeRevocationConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         };
         let state = RevocationState::new(FailMode::SoftFail, Duration::hours(6));
         let err = ocsp_backfill(&cfg, &state)
@@ -920,6 +921,7 @@ mod tests {
             storage: crate::config::StorageConfig::default(),
             cert_rotation: crate::config::CertRotationConfig::default(),
             revocation: NodeRevocationConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         };
         assert!(issuer_candidates(&cfg).is_empty());
     }
@@ -953,6 +955,7 @@ mod tests {
             storage: crate::config::StorageConfig::default(),
             cert_rotation: crate::config::CertRotationConfig::default(),
             revocation: NodeRevocationConfig::default(),
+            rate_limit: RateLimitConfig::default(),
         };
 
         // Seed a known-good set, then fail a refresh: the set must survive so

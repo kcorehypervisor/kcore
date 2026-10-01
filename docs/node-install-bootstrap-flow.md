@@ -36,8 +36,8 @@ Expected local layout on the operator machine:
    - **Agent-only node**: calls `IssueNodeBootstrapCert` RPC on the target controller, which signs a node cert using its sub-CA. The root CA is loaded from disk.
 6. `kctl` sends `InstallToDiskRequest` including cert PEM payload, ordered `controllers`, and `dc_id`.
 7. Live `node-agent` writes certs to `/etc/kcore/certs` and starts `install-to-disk`.
-8. Installer generates a `disko-config.nix` from install parameters and runs `disko --mode format,mount` to partition, encrypt, format, and mount disks declaratively.
-9. Installer copies `/etc/kcore/*`, binaries, and NixOS config into `/mnt` on target disk.
+8. Installer generates a `disko-config.nix` from install parameters and runs `disko --mode format,mount` to partition, encrypt, format, and mount disks declaratively. The LUKS root device is read from `cryptsetup status cryptroot` after that, not guessed from the disk name.
+9. Installer copies `/etc/kcore/*`, binaries, and NixOS config into `/mnt` on target disk. For key-file unlock, the passphrase is stored at `/etc/kcore/recovery/crypto_keyfile.bin` on both the live system (so `nixos-install` can put it in the initrd) and the installed system (so a later rebuild can too). It is not copied onto the unencrypted ESP. Data disks accept the same `nvme0n1` or `/dev/nvme0n1` forms as the OS disk, and must not be that disk.
 10. `nixos-install` completes and host reboots from installed disk.
 11. Installed services read `/etc/kcore/certs/*` and start successfully.
 12. Installer writes `/etc/kcore/disko-management-mode=installer-only` to enforce safe default ownership split.

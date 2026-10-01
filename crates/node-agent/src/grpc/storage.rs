@@ -95,6 +95,169 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         .map_err(|e| Status::internal(format!("task join: {e}")))??;
         Ok(Response::new(proto::DetachVolumeResponse {}))
     }
+
+    async fn snapshot_volume(
+        &self,
+        request: Request<proto::SnapshotVolumeRequest>,
+    ) -> Result<Response<proto::SnapshotVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let resp = tokio::task::spawn_blocking(move || {
+            storage::ceph_snapshot_volume(&req.backend_handle, &req.snapshot_name, req.protect)
+                .map(|snapshot_handle| proto::SnapshotVolumeResponse { snapshot_handle })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(resp))
+    }
+
+    async fn delete_volume_snapshot(
+        &self,
+        request: Request<proto::DeleteVolumeSnapshotRequest>,
+    ) -> Result<Response<proto::DeleteVolumeSnapshotResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        tokio::task::spawn_blocking(move || {
+            storage::ceph_delete_snapshot(&req.backend_handle, &req.snapshot_name, req.unprotect)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::DeleteVolumeSnapshotResponse {}))
+    }
+
+    async fn clone_volume(
+        &self,
+        request: Request<proto::CloneVolumeRequest>,
+    ) -> Result<Response<proto::CloneVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let resp = tokio::task::spawn_blocking(move || {
+            storage::ceph_clone_volume(&req.parent_handle, &req.parent_snapshot, &req.child_image)
+                .map(|backend_handle| proto::CloneVolumeResponse { backend_handle })
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(resp))
+    }
+
+    async fn rollback_volume(
+        &self,
+        request: Request<proto::RollbackVolumeRequest>,
+    ) -> Result<Response<proto::RollbackVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        tokio::task::spawn_blocking(move || {
+            storage::ceph_rollback_volume(&req.backend_handle, &req.snapshot_name)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::RollbackVolumeResponse {}))
+    }
+
+    async fn flatten_volume(
+        &self,
+        request: Request<proto::FlattenVolumeRequest>,
+    ) -> Result<Response<proto::FlattenVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        tokio::task::spawn_blocking(move || storage::ceph_flatten_volume(&req.backend_handle))
+            .await
+            .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::FlattenVolumeResponse {}))
+    }
+
+    async fn resize_volume(
+        &self,
+        request: Request<proto::ResizeVolumeRequest>,
+    ) -> Result<Response<proto::ResizeVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let allow_shrink = req.allow_shrink;
+        let size = tokio::task::spawn_blocking(move || {
+            storage::ceph_resize_volume(&req.backend_handle, req.size_bytes, allow_shrink)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::ResizeVolumeResponse {
+            success: true,
+            message: format!("resized to {size} bytes"),
+            size_bytes: size,
+        }))
+    }
+
+    async fn format_encrypted_volume(
+        &self,
+        request: Request<proto::FormatEncryptedVolumeRequest>,
+    ) -> Result<Response<proto::FormatEncryptedVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let mapper = tokio::task::spawn_blocking(move || {
+            let rbd = resolve_rbd_device(&req.rbd_device)?;
+            crate::volume_crypto::format_and_open(&rbd, &req.dek, &req.mapper_name)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(Status::internal)?;
+        Ok(Response::new(proto::FormatEncryptedVolumeResponse {
+            success: true,
+            message: format!("formatted and opened {mapper}"),
+            mapper_path: mapper,
+        }))
+    }
+
+    async fn unlock_encrypted_volume(
+        &self,
+        request: Request<proto::UnlockEncryptedVolumeRequest>,
+    ) -> Result<Response<proto::UnlockEncryptedVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let mapper = tokio::task::spawn_blocking(move || {
+            let rbd = resolve_rbd_device(&req.rbd_device)?;
+            crate::volume_crypto::open(&rbd, &req.dek, &req.mapper_name)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(Status::internal)?;
+        Ok(Response::new(proto::UnlockEncryptedVolumeResponse {
+            success: true,
+            message: format!("opened {mapper}"),
+            mapper_path: mapper,
+        }))
+    }
+
+    async fn lock_encrypted_volume(
+        &self,
+        request: Request<proto::LockEncryptedVolumeRequest>,
+    ) -> Result<Response<proto::LockEncryptedVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        tokio::task::spawn_blocking(move || crate::volume_crypto::close(&req.mapper_name))
+            .await
+            .map_err(|e| Status::internal(format!("task join: {e}")))?
+            .map_err(Status::internal)?;
+        Ok(Response::new(proto::LockEncryptedVolumeResponse {
+            success: true,
+            message: "closed".into(),
+        }))
+    }
+}
+
+/// Accept either `/dev/rbd/pool/image` or `pool/image` and ensure mapped.
+fn resolve_rbd_device(rbd_device: &str) -> Result<String, String> {
+    let s = rbd_device.trim();
+    if s.starts_with("/dev/rbd/") {
+        let rest = &s["/dev/rbd/".len()..];
+        let (pool, image) = rest
+            .split_once('/')
+            .ok_or_else(|| "rbd_device must be /dev/rbd/<pool>/<image>".to_string())?;
+        crate::live_migrate::ensure_rbd_mapped(pool, image)?;
+        return Ok(s.to_string());
+    }
+    if let Some((pool, image)) = s.split_once('/') {
+        crate::live_migrate::ensure_rbd_mapped(pool, image)?;
+        return Ok(format!("/dev/rbd/{pool}/{image}"));
+    }
+    Err("rbd_device must be pool/image or /dev/rbd/pool/image".into())
 }
 
 #[cfg(test)]

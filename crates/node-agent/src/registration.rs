@@ -327,6 +327,26 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
             .await
         {
             Ok(_) => {
+                let vms = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    collect_local_vm_runtime(&cfg.vm_socket_dir),
+                )
+                .await
+                {
+                    Ok(vms) => vms,
+                    Err(_) => {
+                        warn!("timed out reading VM runtime state; heartbeat was still accepted");
+                        Vec::new()
+                    }
+                };
+                if !vms.is_empty() {
+                    let _ = client
+                        .sync_vm_state(controller_proto::SyncVmStateRequest {
+                            node_id: cfg.node_id.clone(),
+                            vms,
+                        })
+                        .await;
+                }
                 let workloads = collect_local_workload_runtime();
                 if !workloads.is_empty() {
                     let _ = client
@@ -344,6 +364,32 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
         }
     }
     Err(last_err.unwrap_or_else(|| Box::new(std::io::Error::other("heartbeat failed"))))
+}
+
+fn ch_state_to_controller(state: &str) -> i32 {
+    match state {
+        "Running" => controller_proto::VmState::Running as i32,
+        "Paused" => controller_proto::VmState::Paused as i32,
+        "Shutdown" | "Created" => controller_proto::VmState::Stopped as i32,
+        _ => controller_proto::VmState::Unknown as i32,
+    }
+}
+
+/// Read Cloud Hypervisor `vm.info` for every API socket and report it to the
+/// controller. Socket names are the VM names the controller stored.
+async fn collect_local_vm_runtime(socket_dir: &str) -> Vec<controller_proto::VmInfo> {
+    let client = crate::vmm::Client::new(socket_dir);
+    client
+        .list_vms()
+        .await
+        .into_iter()
+        .map(|(name, info)| controller_proto::VmInfo {
+            id: name.clone(),
+            name,
+            state: ch_state_to_controller(&info.state),
+            ..Default::default()
+        })
+        .collect()
 }
 
 fn collect_local_workload_runtime() -> Vec<controller_proto::WorkloadRuntimeInfo> {
@@ -546,6 +592,7 @@ mod tests {
             storage: crate::config::StorageConfig::default(),
             cert_rotation: crate::config::CertRotationConfig::default(),
             revocation: crate::config::NodeRevocationConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
         };
         let endpoints = super::controller_endpoints(&cfg);
         assert_eq!(
@@ -592,6 +639,46 @@ mod tests {
 
         let days = cert_days_remaining(&pem).unwrap();
         assert!((4..=5).contains(&days), "expected ~5 days, got {days}");
+    }
+
+    #[test]
+    fn ch_state_mapping_matches_the_compute_service() {
+        assert_eq!(
+            ch_state_to_controller("Running"),
+            controller_proto::VmState::Running as i32
+        );
+        assert_eq!(
+            ch_state_to_controller("Paused"),
+            controller_proto::VmState::Paused as i32
+        );
+        assert_eq!(
+            ch_state_to_controller("Shutdown"),
+            controller_proto::VmState::Stopped as i32
+        );
+        assert_eq!(
+            ch_state_to_controller("Created"),
+            controller_proto::VmState::Stopped as i32
+        );
+        assert_eq!(
+            ch_state_to_controller("something-else"),
+            controller_proto::VmState::Unknown as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_local_vm_runtime_is_empty_without_sockets() {
+        let dir = std::env::temp_dir().join(format!(
+            "kcore-vm-runtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let vms = collect_local_vm_runtime(dir.to_str().expect("utf8")).await;
+        assert!(vms.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

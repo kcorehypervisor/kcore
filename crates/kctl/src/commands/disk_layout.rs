@@ -48,6 +48,8 @@ struct ManifestMetadata {
 struct DiskLayoutSpec {
     node_id: String,
     #[serde(default)]
+    evacuate: bool,
+    #[serde(default)]
     layout_nix: String,
     #[serde(default)]
     layout_nix_file: String,
@@ -73,6 +75,7 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
                 node_id: manifest.spec.node_id.trim().to_string(),
                 generation: 0, // server assigns
                 layout_nix,
+                evacuate: manifest.spec.evacuate,
                 created_at: None,
                 updated_at: None,
             }),
@@ -101,6 +104,7 @@ pub async fn diff_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
                 node_id: manifest.spec.node_id.trim().to_string(),
                 generation: 0,
                 layout_nix,
+                evacuate: manifest.spec.evacuate,
                 created_at: None,
                 updated_at: None,
             }),
@@ -147,16 +151,18 @@ pub async fn list(info: &ConnectionInfo, node_filter: Option<&str>) -> Result<()
         return Ok(());
     }
     println!(
-        "{:<24}  {:<24}  {:>4}  {:<10}  {:<20}",
-        "NAME", "NODE", "GEN", "PHASE", "REFUSAL_REASON"
+        "{:<24}  {:<24}  {:>5}  {:>4}  {:<10}  {:<20}",
+        "NAME", "NODE", "EVAC", "GEN", "PHASE", "REFUSAL_REASON"
     );
     for entry in resp.disk_layouts {
         let layout = entry.disk_layout.unwrap_or_default();
         let status = entry.status.unwrap_or_default();
+        let evac = if layout.evacuate { "true" } else { "false" };
         println!(
-            "{:<24}  {:<24}  {:>4}  {:<10}  {:<20}",
+            "{:<24}  {:<24}  {:>5}  {:>4}  {:<10}  {:<20}",
             layout.name,
             layout.node_id,
+            evac,
             layout.generation,
             phase_str(status.phase),
             status.refusal_reason,
@@ -176,6 +182,7 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
     let layout = resp.disk_layout.context("disk layout not found")?;
     println!("Name:        {}", layout.name);
     println!("Node:        {}", layout.node_id);
+    println!("Evacuate:    {}", layout.evacuate);
     println!("Generation:  {}", layout.generation);
     if let Some(status) = resp.status {
         println!("Observed:    {}", status.observed_generation);
@@ -324,6 +331,7 @@ spec:
     fn resolve_requires_one_of_inline_or_file() {
         let spec = DiskLayoutSpec {
             node_id: "n".to_string(),
+            evacuate: false,
             layout_nix: String::new(),
             layout_nix_file: String::new(),
             disk_layout: None,
@@ -336,6 +344,7 @@ spec:
     fn resolve_refuses_both_inline_and_file() {
         let spec = DiskLayoutSpec {
             node_id: "n".to_string(),
+            evacuate: false,
             layout_nix: "disko.devices = {};".to_string(),
             layout_nix_file: "disk.nix".to_string(),
             disk_layout: None,
@@ -353,12 +362,32 @@ spec:
         std::fs::write(&manifest_path, "ignored").unwrap();
         let spec = DiskLayoutSpec {
             node_id: "n".to_string(),
+            evacuate: false,
             layout_nix: String::new(),
             layout_nix_file: "disk.nix".to_string(),
             disk_layout: None,
         };
         let got = resolve_layout_nix(manifest_path.to_str().unwrap(), &spec).unwrap();
         assert!(got.contains("disko.devices"));
+    }
+
+    #[test]
+    fn manifest_parses_evacuate_flag() {
+        let manifest = r#"
+kind: DiskLayout
+metadata:
+  name: evac-test
+spec:
+  nodeId: node-a
+  evacuate: true
+  layoutNix: |
+    { disko.devices = { disk.data = { device = "/dev/sda"; }; }; }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dl.yaml");
+        std::fs::write(&path, manifest).unwrap();
+        let got = parse_manifest(path.to_str().unwrap()).unwrap();
+        assert!(got.spec.evacuate);
     }
 
     #[test]

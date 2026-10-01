@@ -370,6 +370,42 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<RejectNodeResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn cordon_node(
+        &self,
+        _: TRequest<CordonNodeRequest>,
+    ) -> Result<Response<CordonNodeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn uncordon_node(
+        &self,
+        _: TRequest<UncordonNodeRequest>,
+    ) -> Result<Response<UncordonNodeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn delete_node(
+        &self,
+        _: TRequest<DeleteNodeRequest>,
+    ) -> Result<Response<DeleteNodeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_cluster_health(
+        &self,
+        _: TRequest<GetClusterHealthRequest>,
+    ) -> Result<Response<GetClusterHealthResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn backup_cluster(
+        &self,
+        _: TRequest<BackupClusterRequest>,
+    ) -> Result<Response<BackupClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn restore_cluster(
+        &self,
+        _: TRequest<RestoreClusterRequest>,
+    ) -> Result<Response<RestoreClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
     async fn renew_node_cert(
         &self,
         _: TRequest<RenewNodeCertRequest>,
@@ -426,10 +462,157 @@ impl Controller for ManyVmsController {
         Ok(Response::new(ListAuditEventsResponse::default()))
     }
 
+    async fn get_crypto_config(
+        &self,
+        _: TRequest<GetCryptoConfigRequest>,
+    ) -> Result<Response<GetCryptoConfigResponse>, Status> {
+        Ok(Response::new(GetCryptoConfigResponse::default()))
+    }
+
+    async fn export_sbom(
+        &self,
+        _: TRequest<ExportSbomRequest>,
+    ) -> Result<Response<ExportSbomResponse>, Status> {
+        Ok(Response::new(ExportSbomResponse::default()))
+    }
+
     async fn list_volumes(
         &self,
         _: TRequest<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn create_volume(
+        &self,
+        _: TRequest<CreateVolumeRequest>,
+    ) -> Result<Response<CreateVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_volume(
+        &self,
+        _: TRequest<GetVolumeRequest>,
+    ) -> Result<Response<GetVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn attach_volume(
+        &self,
+        _: TRequest<AttachVolumeRequest>,
+    ) -> Result<Response<AttachVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn detach_volume(
+        &self,
+        _: TRequest<DetachVolumeRequest>,
+    ) -> Result<Response<DetachVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn delete_volume(
+        &self,
+        _: TRequest<DeleteVolumeRequest>,
+    ) -> Result<Response<DeleteVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn list_vm_operations(
+        &self,
+        _: TRequest<ListVmOperationsRequest>,
+    ) -> Result<Response<ListVmOperationsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_vm_operation(
+        &self,
+        _: TRequest<GetVmOperationRequest>,
+    ) -> Result<Response<GetVmOperationResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn cancel_vm_operation(
+        &self,
+        _: TRequest<CancelVmOperationRequest>,
+    ) -> Result<Response<CancelVmOperationResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn create_volume_snapshot(
+        &self,
+        _: TRequest<CreateVolumeSnapshotRequest>,
+    ) -> Result<Response<CreateVolumeSnapshotResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn list_volume_snapshots(
+        &self,
+        _: TRequest<ListVolumeSnapshotsRequest>,
+    ) -> Result<Response<ListVolumeSnapshotsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn delete_volume_snapshot(
+        &self,
+        _: TRequest<DeleteVolumeSnapshotRequest>,
+    ) -> Result<Response<DeleteVolumeSnapshotResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn restore_volume(
+        &self,
+        _: TRequest<RestoreVolumeRequest>,
+    ) -> Result<Response<RestoreVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn flatten_volume(
+        &self,
+        _: TRequest<FlattenVolumeRequest>,
+    ) -> Result<Response<FlattenVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn resize_volume(
+        &self,
+        _: TRequest<ResizeVolumeRequest>,
+    ) -> Result<Response<ResizeVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn encrypt_volume(
+        &self,
+        _: TRequest<EncryptVolumeRequest>,
+    ) -> Result<Response<EncryptVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn create_snapshot_policy(
+        &self,
+        _: TRequest<CreateSnapshotPolicyRequest>,
+    ) -> Result<Response<CreateSnapshotPolicyResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_snapshot_policy(
+        &self,
+        _: TRequest<GetSnapshotPolicyRequest>,
+    ) -> Result<Response<GetSnapshotPolicyResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn list_snapshot_policies(
+        &self,
+        _: TRequest<ListSnapshotPoliciesRequest>,
+    ) -> Result<Response<ListSnapshotPoliciesResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn delete_snapshot_policy(
+        &self,
+        _: TRequest<DeleteSnapshotPolicyRequest>,
+    ) -> Result<Response<DeleteSnapshotPolicyResponse>, Status> {
         Err(Status::unimplemented(""))
     }
 
@@ -493,6 +676,67 @@ impl Controller for ManyVmsController {
         &self,
         _: TRequest<DeleteCephClusterRequest>,
     ) -> Result<Response<DeleteCephClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn create_shared_filesystem(
+        &self,
+        _: TRequest<CreateSharedFilesystemRequest>,
+    ) -> Result<Response<CreateSharedFilesystemResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_shared_filesystem(
+        &self,
+        _: TRequest<GetSharedFilesystemRequest>,
+    ) -> Result<Response<GetSharedFilesystemResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_shared_filesystems(
+        &self,
+        _: TRequest<ListSharedFilesystemsRequest>,
+    ) -> Result<Response<ListSharedFilesystemsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn delete_shared_filesystem(
+        &self,
+        _: TRequest<DeleteSharedFilesystemRequest>,
+    ) -> Result<Response<DeleteSharedFilesystemResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn create_object_store(
+        &self,
+        _: TRequest<CreateObjectStoreRequest>,
+    ) -> Result<Response<CreateObjectStoreResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_object_store(
+        &self,
+        _: TRequest<GetObjectStoreRequest>,
+    ) -> Result<Response<GetObjectStoreResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_object_stores(
+        &self,
+        _: TRequest<ListObjectStoresRequest>,
+    ) -> Result<Response<ListObjectStoresResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn delete_object_store(
+        &self,
+        _: TRequest<DeleteObjectStoreRequest>,
+    ) -> Result<Response<DeleteObjectStoreResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn create_object_user(
+        &self,
+        _: TRequest<CreateObjectUserRequest>,
+    ) -> Result<Response<CreateObjectUserResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn delete_object_user(
+        &self,
+        _: TRequest<DeleteObjectUserRequest>,
+    ) -> Result<Response<DeleteObjectUserResponse>, Status> {
         Err(Status::unimplemented(""))
     }
 

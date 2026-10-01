@@ -138,17 +138,81 @@ pub async fn list_replication_conflicts(
     Ok(resp.into_inner())
 }
 
+pub async fn list_volumes(cfg: &DashboardConfig) -> Result<Vec<controller_proto::VolumeInfo>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_volumes(controller_proto::ListVolumesRequest { vm: String::new() })
+        .await
+        .context("ListVolumes RPC")?;
+    Ok(resp.into_inner().volumes)
+}
+
+pub async fn list_ceph_clusters(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::CephCluster>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_ceph_clusters(controller_proto::ListCephClustersRequest {})
+        .await
+        .context("ListCephClusters RPC")?;
+    Ok(resp.into_inner().ceph_clusters)
+}
+
+pub async fn list_shared_filesystems(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::SharedFilesystem>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_shared_filesystems(controller_proto::ListSharedFilesystemsRequest {})
+        .await
+        .context("ListSharedFilesystems RPC")?;
+    Ok(resp.into_inner().shared_filesystems)
+}
+
+pub async fn list_object_stores(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::ObjectStore>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_object_stores(controller_proto::ListObjectStoresRequest {})
+        .await
+        .context("ListObjectStores RPC")?;
+    Ok(resp.into_inner().object_stores)
+}
+
+pub async fn list_vm_operations(
+    cfg: &DashboardConfig,
+    include_finished: bool,
+) -> Result<Vec<controller_proto::VmOperation>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_vm_operations(controller_proto::ListVmOperationsRequest {
+            include_finished,
+            vm_id: String::new(),
+        })
+        .await
+        .context("ListVmOperations RPC")?;
+    Ok(resp.into_inner().operations)
+}
+
 pub async fn list_audit_events(
     cfg: &DashboardConfig,
     limit: u32,
+    since: &str,
+    action: &str,
 ) -> Result<Vec<controller_proto::AuditEvent>> {
     let channel = connect_channel(cfg).await?;
     let mut client = controller_proto::controller_client::ControllerClient::new(channel);
     let resp = client
         .list_audit_events(controller_proto::ListAuditEventsRequest {
             limit,
-            since: String::new(),
-            action: String::new(),
+            since: since.to_string(),
+            action: action.to_string(),
         })
         .await
         .context("ListAuditEvents RPC")?;

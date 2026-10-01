@@ -1,5 +1,5 @@
 use crate::config::NetworkConfig;
-use crate::db::{NetworkRow, VmRow};
+use crate::db::{NetworkRow, VmNicRow, VmRow};
 
 #[derive(Debug, Clone)]
 pub struct VxlanMeta {
@@ -58,6 +58,50 @@ pub fn generate_node_config_with_security_groups(
     vm_ssh_keys: &std::collections::HashMap<String, Vec<String>>,
     vxlan_peers: &std::collections::HashMap<String, VxlanMeta>,
     security_group_rules: &std::collections::HashMap<String, Vec<SecurityGroupResolvedRule>>,
+) -> String {
+    generate_node_config_inner(
+        vms,
+        gateway_interface,
+        network,
+        networks,
+        vm_ssh_keys,
+        vxlan_peers,
+        security_group_rules,
+        &std::collections::HashSet::new(),
+        &[],
+        &[],
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    )
+}
+
+fn ipv6_address<'a>(
+    vm_ipv6: &'a std::collections::HashMap<String, Vec<crate::db::VmIpv6Row>>,
+    vm_id: &str,
+    position: i32,
+) -> Option<&'a str> {
+    vm_ipv6.get(vm_id).and_then(|rows| {
+        rows.iter()
+            .find(|row| row.position == position && !row.address.is_empty())
+            .map(|row| row.address.as_str())
+    })
+}
+
+pub fn generate_node_config_inner(
+    vms: &[VmRow],
+    gateway_interface: &str,
+    network: &NetworkConfig,
+    networks: &[NetworkRow],
+    vm_ssh_keys: &std::collections::HashMap<String, Vec<String>>,
+    vxlan_peers: &std::collections::HashMap<String, VxlanMeta>,
+    security_group_rules: &std::collections::HashMap<String, Vec<SecurityGroupResolvedRule>>,
+    incoming_vm_ids: &std::collections::HashSet<String>,
+    volumes: &[crate::db::VolumeRow],
+    guest_ops_keys: &[String],
+    extra_nics: &std::collections::HashMap<String, Vec<VmNicRow>>,
+    network_policies: &std::collections::HashMap<String, crate::db::NetworkPolicyRow>,
+    vm_ipv6: &std::collections::HashMap<String, Vec<crate::db::VmIpv6Row>>,
 ) -> String {
     let mut out = String::from("{ pkgs, ... }: {\n");
     out.push_str("  ch-vm.vms = {\n");
@@ -154,6 +198,21 @@ pub fn generate_node_config_with_security_groups(
         if !net.enable_outbound_nat {
             out.push_str("      enableOutboundNat = false;\n");
         }
+        if let Some(policy) = network_policies.get(&net.name) {
+            if policy.east_west {
+                out.push_str("      eastWestFirewall = true;\n");
+            }
+            if !policy.ipv6_prefix.is_empty() {
+                out.push_str(&format!(
+                    "      ipv6Prefix = \"{}\";\n",
+                    nix_escape(&policy.ipv6_prefix)
+                ));
+                out.push_str(&format!(
+                    "      ipv6Gateway = \"{}\";\n",
+                    nix_escape(&policy.ipv6_gateway)
+                ));
+            }
+        }
         if let Some(vxlan) = vxlan_peers.get(&net.name) {
             out.push_str(&format!("      vni = {};\n", vxlan.vni));
             let peer_list: Vec<String> = vxlan
@@ -221,10 +280,47 @@ pub fn generate_node_config_with_security_groups(
             vm.storage_size_bytes
         ));
         if vm.storage_backend == "ceph" {
+            let root = volumes.iter().find(|v| {
+                v.vm_id == vm.id && v.role == crate::db::VolumeRow::ROLE_ROOT && v.is_attached()
+            });
+            let rbd_image = root.map(|v| v.image.as_str()).unwrap_or("");
+            let rbd_image = if rbd_image.is_empty() {
+                format!("kcore-{}", vm.id)
+            } else {
+                rbd_image.to_string()
+            };
             out.push_str(&format!(
-                "      rbdImage = \"kcore-{}\";\n",
-                nix_escape(&vm.id)
+                "      rbdImage = \"{}\";\n",
+                nix_escape(&rbd_image)
             ));
+            let mut data: Vec<_> = volumes
+                .iter()
+                .filter(|v| {
+                    v.vm_id == vm.id && v.role == crate::db::VolumeRow::ROLE_DATA && v.is_attached()
+                })
+                .collect();
+            data.sort_by_key(|v| (v.slot, v.name.as_str()));
+            if !data.is_empty() {
+                out.push_str("      dataDisks = [\n");
+                for v in data {
+                    if v.encrypted {
+                        let mapper = crate::volume_crypto::mapper_name_for_serial(&v.serial);
+                        out.push_str(&format!(
+                            "        {{ rbdImage = \"{}\"; serial = \"{}\"; encrypted = true; mapperName = \"{}\"; }}\n",
+                            nix_escape(&v.image),
+                            nix_escape(&v.serial),
+                            nix_escape(&mapper)
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "        {{ rbdImage = \"{}\"; serial = \"{}\"; }}\n",
+                            nix_escape(&v.image),
+                            nix_escape(&v.serial)
+                        ));
+                    }
+                }
+                out.push_str("      ];\n");
+            }
         }
         out.push_str(&format!("      imageSize = {};\n", vm.image_size));
         out.push_str(&format!("      cores = {};\n", vm.cpu));
@@ -246,10 +342,24 @@ pub fn generate_node_config_with_security_groups(
                 nix_escape(&vm.vm_ip)
             ));
         }
+        if let Some(addr) = ipv6_address(vm_ipv6, &vm.id, 0) {
+            out.push_str(&format!(
+                "      dhcpReservedIPv6 = \"{}\";\n",
+                nix_escape(addr)
+            ));
+        }
+        let incoming = incoming_vm_ids.contains(&vm.id);
         out.push_str(&format!(
             "      autoStart = {};\n",
-            if vm.auto_start { "true" } else { "false" }
+            if vm.auto_start && !incoming {
+                "true"
+            } else {
+                "false"
+            }
         ));
+        if incoming {
+            out.push_str("      incomingMigration = true;\n");
+        }
         let pci_devices = crate::pci::split_pci_devices(&vm.pci_devices);
         if !pci_devices.is_empty() {
             out.push_str("      pciDevices = [\n");
@@ -261,7 +371,12 @@ pub fn generate_node_config_with_security_groups(
             }
             out.push_str("      ];\n");
         }
-        let ssh_keys = vm_ssh_keys.get(&vm.id).cloned().unwrap_or_default();
+        let mut ssh_keys = vm_ssh_keys.get(&vm.id).cloned().unwrap_or_default();
+        for pk in guest_ops_keys {
+            if !pk.is_empty() && !ssh_keys.iter().any(|k| k == pk) {
+                ssh_keys.push(pk.clone());
+            }
+        }
         if !vm.cloud_init_user_data.is_empty() {
             let escaped = nix_escape(&vm.cloud_init_user_data);
             out.push_str(&format!(
@@ -292,22 +407,57 @@ pub fn generate_node_config_with_security_groups(
         }
 
         if !vm.vm_ip.is_empty() {
-            let vm_net = networks.iter().find(|n| n.name == vm.network);
-            if let Some(net) = vm_net {
-                if net.network_type == "vxlan" {
-                    let cidr = netmask_to_cidr(&net.internal_netmask);
-                    let mut net_cfg = String::from(
-                        "version: 2\nethernets:\n  kcore0:\n    match:\n      name: \"e*\"\n    dhcp4: false\n",
-                    );
-                    net_cfg.push_str(&format!("    addresses: [\"{}/{}\"]\n", vm.vm_ip, cidr));
-                    net_cfg.push_str(&format!("    gateway4: \"{}\"\n", net.gateway_ip));
-                    net_cfg.push_str("    nameservers:\n      addresses: [1.1.1.1, 8.8.8.8]\n");
-                    let escaped = nix_escape(&net_cfg);
-                    out.push_str(&format!(
-                        "      cloudInitNetworkConfigFile = pkgs.writeText \"{nix_name}-network-config.yaml\" \"{escaped}\";\n"
-                    ));
+            let extras = extra_nics.get(&vm.id).map(Vec::as_slice).unwrap_or(&[]);
+            if extras.is_empty() {
+                let vm_net = networks.iter().find(|n| n.name == vm.network);
+                if let Some(net) = vm_net {
+                    if net.network_type == "vxlan" {
+                        let cidr = netmask_to_cidr(&net.internal_netmask);
+                        let mut net_cfg = String::from(
+                            "version: 2\nethernets:\n  kcore0:\n    match:\n      name: \"e*\"\n    dhcp4: false\n",
+                        );
+                        net_cfg.push_str(&format!("    addresses: [\"{}/{}\"", vm.vm_ip, cidr));
+                        if let Some(addr) = ipv6_address(vm_ipv6, &vm.id, 0) {
+                            net_cfg.push_str(&format!(", \"{addr}/64\""));
+                        }
+                        net_cfg.push_str("]\n");
+                        net_cfg.push_str(&format!("    gateway4: \"{}\"\n", net.gateway_ip));
+                        net_cfg.push_str("    nameservers:\n      addresses: [1.1.1.1, 8.8.8.8]\n");
+                        let escaped = nix_escape(&net_cfg);
+                        out.push_str(&format!(
+                            "      cloudInitNetworkConfigFile = pkgs.writeText \"{nix_name}-network-config.yaml\" \"{escaped}\";\n"
+                        ));
+                    }
                 }
             }
+        }
+        let extras = extra_nics.get(&vm.id).cloned().unwrap_or_default();
+        if !extras.is_empty() {
+            out.push_str("      extraNics = [\n");
+            for nic in &extras {
+                out.push_str("        {\n");
+                out.push_str(&format!(
+                    "          network = \"{}\";\n",
+                    nix_escape(&nic.network)
+                ));
+                if !nic.mac_address.is_empty() {
+                    out.push_str(&format!(
+                        "          macAddress = \"{}\";\n",
+                        nix_escape(&nic.mac_address)
+                    ));
+                }
+                if !nic.ip_address.is_empty() {
+                    out.push_str(&format!(
+                        "          ipv4 = \"{}\";\n",
+                        nix_escape(&nic.ip_address)
+                    ));
+                }
+                if let Some(addr) = ipv6_address(vm_ipv6, &vm.id, nic.position) {
+                    out.push_str(&format!("          ipv6 = \"{}\";\n", nix_escape(addr)));
+                }
+                out.push_str("        }\n");
+            }
+            out.push_str("      ];\n");
         }
 
         out.push_str("    };\n");
@@ -377,6 +527,7 @@ fn safe_postgresql_ident(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::VolumeRow;
 
     fn vm(auto_start: bool, name: &str) -> VmRow {
         VmRow {
@@ -779,6 +930,127 @@ mod tests {
     }
 
     #[test]
+    fn extra_nics_are_emitted_and_skip_the_single_nic_cloud_init_file() {
+        let mut v = vm(true, "web");
+        v.id = "vm-web".into();
+        v.network = "frontend".into();
+        v.vm_ip = "10.240.0.10".into();
+        let networks = vec![NetworkRow {
+            name: "frontend".into(),
+            external_ip: "0.0.0.0".into(),
+            gateway_ip: "10.240.0.1".into(),
+            internal_netmask: "255.255.255.0".into(),
+            node_id: "node-1".into(),
+            allowed_tcp_ports: String::new(),
+            allowed_udp_ports: String::new(),
+            vlan_id: 0,
+            network_type: "vxlan".into(),
+            enable_outbound_nat: true,
+            vni: 1,
+            next_ip: 11,
+        }];
+        let mut extras = std::collections::HashMap::new();
+        extras.insert(
+            v.id.clone(),
+            vec![VmNicRow {
+                vm_id: v.id.clone(),
+                position: 1,
+                network: "backend".into(),
+                mac_address: String::new(),
+                model: "virtio".into(),
+                ip_address: "10.241.0.10".into(),
+            }],
+        );
+        let config = generate_node_config_inner(
+            &[v],
+            "eno1",
+            &default_net(),
+            &networks,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &[],
+            &[],
+            &extras,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(config.contains("extraNics"));
+        assert!(!config.contains("eastWestFirewall"));
+        assert!(!config.contains("dhcpReservedIPv6"));
+        assert!(config.contains("backend"));
+        assert!(config.contains("10.241.0.10"));
+        assert!(
+            !config.contains("cloudInitNetworkConfigFile"),
+            "multi-NIC cloud-init is rendered by the module:\n{config}"
+        );
+    }
+
+    #[test]
+    fn ipv6_and_east_west_are_emitted_only_when_the_policy_sets_them() {
+        let mut v = vm(true, "web");
+        v.id = "vm-web".into();
+        v.network = "frontend".into();
+        v.vm_ip = "10.240.0.10".into();
+        let networks = vec![NetworkRow {
+            name: "frontend".into(),
+            external_ip: "0.0.0.0".into(),
+            gateway_ip: "10.240.0.1".into(),
+            internal_netmask: "255.255.255.0".into(),
+            node_id: "node-1".into(),
+            allowed_tcp_ports: String::new(),
+            allowed_udp_ports: String::new(),
+            vlan_id: 0,
+            network_type: "vxlan".into(),
+            enable_outbound_nat: true,
+            vni: 1,
+            next_ip: 11,
+        }];
+        let mut policies = std::collections::HashMap::new();
+        policies.insert(
+            "frontend".into(),
+            crate::db::NetworkPolicyRow {
+                node_id: "node-1".into(),
+                name: "frontend".into(),
+                east_west: true,
+                ipv6_prefix: "fd00:10:240::/64".into(),
+                ipv6_gateway: "fd00:10:240::1".into(),
+                ipv6_next: 3,
+            },
+        );
+        let mut addresses = std::collections::HashMap::new();
+        addresses.insert(
+            v.id.clone(),
+            vec![crate::db::VmIpv6Row {
+                vm_id: v.id.clone(),
+                position: 0,
+                address: "fd00:10:240::2".into(),
+            }],
+        );
+        let config = generate_node_config_inner(
+            &[v],
+            "eno1",
+            &default_net(),
+            &networks,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            &policies,
+            &addresses,
+        );
+        assert!(config.contains("eastWestFirewall = true;"));
+        assert!(config.contains("ipv6Prefix = \"fd00:10:240::/64\";"));
+        assert!(config.contains("ipv6Gateway = \"fd00:10:240::1\";"));
+        assert!(config.contains("dhcpReservedIPv6 = \"fd00:10:240::2\";"));
+        assert!(config.contains("fd00:10:240::2/64"));
+    }
+
+    #[test]
     fn emits_lvm_vg_name_when_vm_uses_lvm() {
         let mut v = vm(true, "lvm-vm");
         v.storage_backend = "lvm".into();
@@ -832,6 +1104,50 @@ mod tests {
             !config.contains("lvmVgName"),
             "ZFS VM should not contain lvmVgName"
         );
+    }
+
+    #[test]
+    fn clone_from_snapshot_boot_lists_rbd_in_data_disks() {
+        let mut v = vm(true, "app");
+        v.id = "vm-1".into();
+        v.storage_backend = "ceph".into();
+        let root = VolumeRow::new_root("vm-1", "app", 10 * 1024 * 1024 * 1024);
+        let mut parent = VolumeRow::new_data("pgdata", 20 * 1024 * 1024 * 1024);
+        parent.vm_id = v.id.clone();
+        parent.attach_state = VolumeRow::ATTACH_ATTACHED.into();
+        parent.slot = 1;
+        let mut clone = VolumeRow::new_data("pgdata-clone", parent.size_bytes);
+        clone.parent_snapshot_id = "snap-t0".into();
+        clone.vm_id = "vm-scratch".into();
+        clone.attach_state = VolumeRow::ATTACH_ATTACHED.into();
+        clone.slot = 1;
+        clone.image = "kcore-vol-clone01".into();
+        let clone_serial = clone.serial.clone();
+        let mut scratch = vm(false, "scratch");
+        scratch.id = "vm-scratch".into();
+        scratch.storage_backend = "ceph".into();
+        let scratch_root = VolumeRow::new_root("vm-scratch", "scratch", 10 * 1024 * 1024 * 1024);
+        let config = generate_node_config_inner(
+            &[v, scratch],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &[root, parent, clone, scratch_root],
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            config.contains("rbdImage = \"kcore-vol-clone01\""),
+            "clone attached as scratch VM data disk must appear in nixgen:\n{config}"
+        );
+        assert!(config.contains("dataDisks = ["));
+        assert!(config.contains(&format!("serial = \"{clone_serial}\"")));
     }
 
     #[test]

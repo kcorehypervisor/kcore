@@ -51,6 +51,35 @@ pub struct ComplianceDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeRowDto {
+    pub name: String,
+    pub role: String,
+    pub attach_state: String,
+    pub size: String,
+    /// Attached VM name or id (whichever is available).
+    pub vm: String,
+    pub encrypted: bool,
+    pub backend: String,
+    pub pool: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmOperationRowDto {
+    pub id: String,
+    pub kind: String,
+    pub phase: String,
+    pub vm: String,
+    pub cancel_requested: bool,
+    pub send_succeeded: bool,
+    pub source_node: String,
+    pub target_node: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VmRowDto {
     pub id: String,
     pub name: String,
@@ -58,6 +87,7 @@ pub struct VmRowDto {
     pub cpu: i32,
     pub memory: String,
     pub node_id: String,
+    pub storage_backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +111,10 @@ pub struct NetworkRowDto {
     pub internal_netmask: String,
     pub vlan_id: i32,
     pub enable_outbound_nat: bool,
+    /// Prefix, or prefix plus gateway when both are set.
+    pub ipv6: String,
+    pub east_west_firewall: bool,
+    pub forwarded_ports: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +179,7 @@ pub struct StorageOverviewDto {
     pub backend_filesystem_nodes: i32,
     pub backend_lvm_nodes: i32,
     pub backend_zfs_nodes: i32,
+    pub backend_ceph_nodes: i32,
     pub backend_unspecified_nodes: i32,
     pub nodes_luks_tpm2: i32,
     pub nodes_luks_keyfile: i32,
@@ -204,6 +239,41 @@ pub struct AuditEventDto {
     pub resource: String,
     pub created_at: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CephClusterRowDto {
+    pub name: String,
+    pub phase: String,
+    pub health_message: String,
+    pub public_network: String,
+    pub cluster_network: String,
+    pub size: i32,
+    pub min_size: i32,
+    pub encrypt_osds: bool,
+    pub members: String,
+    pub osd_devices: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedFilesystemRowDto {
+    pub name: String,
+    pub ceph_cluster: String,
+    pub phase: String,
+    pub health_message: String,
+    pub quota: String,
+    pub clients: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectStoreRowDto {
+    pub name: String,
+    pub ceph_cluster: String,
+    pub phase: String,
+    pub health_message: String,
+    pub port: i32,
+    pub tls: bool,
+    pub members: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

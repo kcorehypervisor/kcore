@@ -65,7 +65,7 @@ The older `RenewNodeCert` RPC, which generated the key on the controller and ret
 
 ### Revocation enforcement
 
-`kctl revoke cert --serial S | --node ID | --subject CN --reason R` marks the inventory row revoked using an RFC 5280 §5.3.1 reason code, adds the serial to the controller's in-memory set immediately, and regenerates the CRL.
+`kctl revoke cert --serial S | --node ID | --subject CN --reason R` marks the inventory row revoked using an RFC 5280 §5.3.1 reason code, adds the serial to the controller's in-memory set immediately, and regenerates the CRL. `kctl node delete` does the same for every certificate issued to that node, with reason 5 (cessation of operation), after the node has no VMs, workloads, or networks left.
 
 Enforcement is at the **application layer**, not inside the TLS handshake: `tonic::transport::ServerTlsConfig` builds its rustls config internally and accepts no custom `ClientCertVerifier`, so rustls' `WebPkiClientVerifier::with_crls` is unreachable. A `tonic` interceptor on every service instead checks the serial of the presented client certificate before any handler runs. A revoked peer therefore completes the TLS handshake and is then rejected with `PermissionDenied`.
 
@@ -244,6 +244,15 @@ Releases are therefore signed with **Sigstore keyless signing** via `cosign`,
 against a maintainer's OIDC identity. No long-lived private key exists to
 steal, and the expected identity is published rather than pinned to a key.
 
+`ExportSbom` serves one of those documents from a running controller.
+`sbom.cratesFile` and `sbom.isoClosureFile` point at the installed release
+files (the bytes the signature covers). When `cratesFile` is empty the
+controller serves a CycloneDX 1.5 graph generated from `Cargo.lock` at build
+time. That embedded graph is always available and is labelled `source=embedded`;
+it is not the signed release asset. `GetCryptoConfig` reports the library,
+cipher suites, rate limit, and this signing scheme. Both RPCs are `read-only`:
+`kctl get crypto-config`, `kctl get sbom`, and `kctl get sbom -o sbom.json`.
+
 ### What the signature does and does not prove
 
 It proves that **a kcore maintainer stood behind these exact bytes**. It does
@@ -259,12 +268,30 @@ tampering: anyone able to replace the tarball can replace the checksums file
 with it. A signature over `SHA256SUMS` closes that gap, and because every
 other asset is listed in `SHA256SUMS`, one signature covers them all.
 
+## gRPC rate limiting
+
+Every controller and node-agent RPC except the health service passes a
+per-identity token bucket before revocation is checked. The key is the client
+certificate CN, the remote address when there is no certificate, or a single
+`anonymous` bucket when there is neither. The default is 100 requests per
+second with a burst of 200. A peer that exceeds it receives
+`RESOURCE_EXHAUSTED` and does not consume anyone else's budget.
+
+```yaml
+rateLimit:
+  enabled: true
+  requestsPerSecond: 100
+  burst: 200
+```
+
+Set `enabled: false` to turn the bucket off. `requestsPerSecond` and `burst`
+must both be greater than zero while the limit is enabled.
+
 ## Known Limitations
 
 - **No OCSP stapling** -- `tonic` 0.12 offers no hook for a rustls `CertifiedKey` or `ServerCertVerifier`. The controller runs an OCSP responder and clients query it directly; see "OCSP stapling is not supported" above.
 - **Revocation is enforced above TLS, not inside it** -- a revoked peer completes the handshake and is rejected by an interceptor before any handler runs, because `ServerTlsConfig` takes no custom `ClientCertVerifier`.
 - **Operator certificates rotate manually** -- `kctl operator issue-cert <name>` re-issues them. Only node certificates rotate automatically.
-- **No rate limiting** on gRPC endpoints
 - **SQLite is single-writer** -- acceptable for the expected scale (tens of nodes), but limits concurrent write throughput
 
 ## Developer Workflow
@@ -330,5 +357,7 @@ Key test areas to be aware of:
 - **`pki::crl::tests`** (controller) -- CRL contents, signature verification against the sub-CA, `crlNumber` monotonicity, persistence across restart
 - **`pki::ocsp::tests`** (controller) -- `good` / `revoked` (with reason and time) / `unknown` responses, including serials issued by a different CA
 - **`pki::revocation::{tests,prop_tests}`** (controller and node-agent) -- a revoked serial is never allowed under either fail mode; soft-fail never denies an unrevoked serial; hard-fail tracks the staleness bound exactly
+- **`rate_limit::tests`** (controller and node-agent) -- a burst is enforced per identity, refill restores tokens without exceeding the cap, and a disabled limiter does not reject
+- **`sbom::tests`** (controller) -- the embedded Cargo.lock CycloneDX graph parses, an installed file is preferred, and a Sigstore bundle beside that file is reported
 - **`pki::rotate::tests`** (node-agent) -- a chain bound to a different key, a wrong CN, or an expired certificate is refused before install; a failed rotation leaves the previous certificate loadable
 - **`pki::http::tests`** (controller) -- CRL content types, `503` before a CRL exists, OCSP over both POST and the base64 GET form
