@@ -1,14 +1,13 @@
 # kcore MCP
 
-MCP server and editor plugins for [kcore](https://kcorehypervisor.com). An agent can create a cluster context, VMs, networks, volumes, Ceph resources, and the rest of the declarative surface `kctl apply` already exposes. The same upsert rules Terraform and Crossplane use apply here: create updates mutable fields and rejects immutable ones.
+MCP server and editor plugins for [kcore](https://kcorehypervisor.com). An agent can create a cluster (CA, controller certificate, and client certificate), VMs, networks, volumes, Ceph resources, and the rest of the declarative controller API. The same upsert rules Terraform and Crossplane use apply here: create updates mutable fields and rejects immutable ones.
 
 The server asks before it changes anything. `kcore_advise` returns the questions an operator still has to answer. Plan and apply refuse to run while those questions are open. Clients that support MCP elicitation also get a form for the missing answers.
 
 ## What you need
 
 - Node.js 20 or newer
-- `kctl` on `PATH` (or `KCTL_BIN`)
-- A context in `~/.kcore/config` for anything except the first cluster bootstrap
+- A context in `~/.kcore/config` for anything except the first cluster bootstrap, which this server creates (certificates included)
 
 ```bash
 npm install
@@ -21,9 +20,9 @@ npm run build
 | Tool | Role |
 | --- | --- |
 | `kcore_advise` | Questions to ask before a change. Read-only. |
-| `kcore_plan` | Local diff plus optional `kctl apply --dry-run` or `kctl diff`. |
-| `kcore_apply` | Declarative apply after `confirm: true`. |
-| `kcore_read` | `kctl get` / `describe`. |
+| `kcore_plan` | Local diff, plus a controller read when `checkCluster` is set. Cluster plans describe the certificates that will be written. |
+| `kcore_apply` | Declarative apply after `confirm: true`. Cluster apply writes the CA, controller certificate, and client certificate into `~/.kcore`. |
+| `kcore_read` | Controller get and describe RPCs. |
 | `kcore_delete` | Delete, or cancel a non-terminal cluster update. |
 | `kcore_operation` | Power state, migrate, drain, cordon, node approval, update approve/rollback, node install. |
 | `kcore_catalog` | Resource kinds and which fields are mutable. |

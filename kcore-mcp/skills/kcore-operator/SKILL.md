@@ -17,4 +17,4 @@ kcore apply is a declarative upsert. Creating an existing resource updates mutab
 
 ## Connection
 
-The server shells out to `kctl` and uses `~/.kcore/config`. Pass `connection.controller` or `connection.operator` when the user names a different context.
+The server dials the controller gRPC API with the certificates in `~/.kcore/config`. Creating a cluster generates those certificates locally. Pass `connection.controller` or `connection.operator` when the user names a different context.

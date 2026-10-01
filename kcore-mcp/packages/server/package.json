@@ -14,12 +14,15 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --banner:js='#!/usr/bin/env node' && chmod +x dist/index.js",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --banner:js='#!/usr/bin/env node\nimport { createRequire as __kcoreCreateRequire } from \"node:module\"; const require = __kcoreCreateRequire(import.meta.url);' && chmod +x dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && tsx --test test/**/*.test.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@grpc/grpc-js": "^1.14.0",
+    "@grpc/proto-loader": "^0.8.0",
+    "@peculiar/x509": "^1.13.0",
     "@modelcontextprotocol/sdk": "^1.20.0",
     "yaml": "^2.8.0",
     "zod": "^3.25.0"

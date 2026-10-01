@@ -4,11 +4,14 @@ import { z } from "zod";
 import { advise, mergeAnswers, normalizeDesired, type Question } from "./advise.js";
 import { KINDS, findKind } from "./catalog.js";
 import { InputError } from "./names.js";
-import { installNodeArgs, operationArgs, renderApply, renderPlanCommand } from "./manifest.js";
-import { runKctl, runWithManifest, type KctlConnection } from "./kctl.js";
+import { resolveConnection } from "./connection.js";
+import { callController, callNode, redact } from "./grpc.js";
+import { createClusterContext } from "./pki.js";
+import { bootstrapCertRequest, buildApply, buildDelete, buildOperation, buildPlanCall, buildRead, type RpcCall } from "./requests.js";
 import { diffSpec } from "./plan.js";
+import type { ConnectionOptions } from "./connection.js";
 
-const INSTRUCTIONS = `kcore MCP drives a kcore cluster through kctl, with the same declarative upsert Terraform uses: apply creates a missing resource, updates mutable fields, and rejects immutable changes.
+const INSTRUCTIONS = `kcore MCP dials the kcore controller gRPC API. Apply is a declarative upsert: it creates a missing resource, updates mutable fields, and rejects immutable changes.
 
 Before every create, update, delete, migrate, drain, or node install:
 1. Call kcore_advise and ask the operator every blocking question. Wait for the answers.
@@ -19,8 +22,7 @@ Before every create, update, delete, migrate, drain, or node install:
 Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request.`;
 
 const connectionShape = {
-  bin: z.string().optional().describe("Path to kctl. Defaults to KCTL_BIN or kctl on PATH."),
-  config: z.string().optional().describe("kctl config path. Defaults to ~/.kcore/config."),
+  config: z.string().optional().describe("Path to the kcore context file. Defaults to ~/.kcore/config."),
   controller: z.string().optional().describe("Controller host:port override."),
   insecure: z.boolean().optional().describe("Plain HTTP, skipping TLS client auth."),
   tlsServerName: z.string().optional().describe("SNI / certificate name when dialing an IP."),
@@ -30,30 +32,34 @@ const connectionShape = {
 
 const specSchema = z.record(z.string(), z.unknown()).optional();
 
-type ConnectionInput = {
-  bin?: string;
-  config?: string;
-  controller?: string;
-  insecure?: boolean;
-  tlsServerName?: string;
-  operator?: string;
-  node?: string;
-};
+type ConnectionInput = ConnectionOptions;
 
-function connectionOf(input: ConnectionInput | undefined): KctlConnection {
+function connectionOf(input: ConnectionInput | undefined, controller?: string): ConnectionOptions {
   return {
-    bin: input?.bin,
     config: input?.config,
-    controller: input?.controller,
+    controller: controller || input?.controller,
     insecure: input?.insecure,
     tlsServerName: input?.tlsServerName,
     operator: input?.operator,
-    node: input?.node,
+    timeoutMs: input?.timeoutMs,
   };
 }
 
+function dial(input: ConnectionInput | undefined, spec: Record<string, unknown>): ConnectionOptions {
+  const controller = typeof spec.controller === "string" && spec.controller.trim() ? spec.controller.trim() : undefined;
+  return connectionOf(input, controller);
+}
+
+async function execute(call: RpcCall, options: ConnectionOptions): Promise<unknown> {
+  if (call.target === "node") {
+    if (!call.address) throw new InputError("node address is required");
+    return callNode(call.address, options, call.method, call.request);
+  }
+  return callController(options, call.method, call.request);
+}
+
 function text(payload: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
+  return { content: [{ type: "text" as const, text: JSON.stringify(redact(payload), null, 2) }] };
 }
 
 function failure(error: unknown) {
@@ -120,7 +126,6 @@ export function createServer(): McpServer {
           summary: kind.summary,
           mutable: kind.mutable,
           immutable: kind.immutable,
-          transport: kind.transport,
         })),
       }),
   );
@@ -148,7 +153,7 @@ export function createServer(): McpServer {
     {
       title: "Plan a kcore change",
       description:
-        "Terraform-style plan. If required answers are missing, returns the questions instead of contacting the cluster. With checkCluster, also runs kctl apply --dry-run or kctl diff.",
+        "Terraform-style plan. If required answers are missing, returns the questions instead of contacting the cluster. With checkCluster, calls the controller read, ClassifyDiskLayout, or PlanClusterUpdate RPC.",
       inputSchema: {
         kind: z.string().optional(),
         intent: z.string().optional(),
@@ -156,7 +161,7 @@ export function createServer(): McpServer {
         manifest: z.string().optional(),
         current: z.record(z.string(), z.unknown()).nullable().optional().describe("Existing spec from a previous read. Omit when unknown."),
         acceptDefaults: z.boolean().optional(),
-        checkCluster: z.boolean().optional().describe("Run the kctl dry-run against the cluster."),
+        checkCluster: z.boolean().optional().describe("Call the controller to read current state or run a plan RPC."),
         connection: z.object(connectionShape).optional(),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
@@ -165,21 +170,37 @@ export function createServer(): McpServer {
       try {
         const prepared = await prepare(input, extra as ToolExtra);
         if (!prepared.ready || !prepared.desired) return text(prepared.advice);
+        if (prepared.desired.kind.id === "cluster") {
+          return text({
+            ok: true,
+            kind: "cluster",
+            plan: {
+              action: "create",
+              summary:
+                "Generate a cluster CA, a controller certificate for this address, and a client certificate. The context is saved for later gRPC calls. Private keys stay on disk.",
+            },
+            files: ["ca.crt", "ca.key", "sub-ca.crt", "sub-ca.key", "controller.crt", "controller.key", "kctl.crt", "kctl.key"],
+            warnings: prepared.advice.warnings,
+            next: "Show this plan to the operator. Call kcore_apply with confirm true only after they agree.",
+          });
+        }
         const local = diffSpec(prepared.desired.kind, prepared.desired.spec, input.current);
-        let cluster: { code: number; stdout: string; stderr: string } | undefined;
-        if (input.checkCluster && prepared.desired.kind.transport !== "create-flags") {
-          const rendered = renderApply(prepared.desired.kind, prepared.desired.spec, prepared.desired.manifest);
-          if (!rendered.yaml || rendered.fileArgIndex === undefined) {
-            return text({ ...prepared.advice, plan: local, note: "This kind has no dry-run manifest. The local plan is the preview." });
+        let cluster: unknown;
+        if (input.checkCluster) {
+          const call = buildPlanCall(prepared.desired.kind, prepared.desired.spec);
+          try {
+            cluster = await execute(call, dial(input.connection, prepared.desired.spec));
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (/not found/i.test(message)) cluster = { found: false, message };
+            else throw error;
           }
-          const command = renderPlanCommand(prepared.desired.kind);
-          const fileAt = command.lastIndexOf("");
-          cluster = await runWithManifest(command, fileAt, rendered.yaml, connectionOf(input.connection));
         }
         return text({
-          ok: cluster ? cluster.code === 0 : true,
+          ok: true,
           kind: prepared.desired.kind.id,
           plan: local,
+          rpc: buildApply(prepared.desired.kind, prepared.desired.spec).map((call) => call.method),
           warnings: prepared.advice.warnings,
           recommendedQuestions: prepared.advice.recommended,
           cluster,
@@ -241,17 +262,19 @@ export function createServer(): McpServer {
             });
           }
         }
-        const rendered = renderApply(prepared.desired.kind, prepared.desired.spec, prepared.desired.manifest);
-        const result =
-          rendered.yaml !== undefined && rendered.fileArgIndex !== undefined
-            ? await runWithManifest(rendered.args, rendered.fileArgIndex, rendered.yaml, connectionOf(input.connection))
-            : await runKctl(rendered.args, connectionOf(input.connection));
+        if (prepared.desired.kind.id === "cluster") {
+          const created = await createClusterContext(prepared.desired.spec, connectionOf(input.connection));
+          return text({ applied: true, plan: local, ...created });
+        }
+        const options = dial(input.connection, prepared.desired.spec);
+        const responses = [];
+        for (const call of buildApply(prepared.desired.kind, prepared.desired.spec)) {
+          responses.push({ method: call.method, response: await execute(call, options) });
+        }
         return text({
-          applied: result.code === 0,
+          applied: true,
           plan: local,
-          code: result.code,
-          stdout: result.stdout,
-          stderr: result.stderr,
+          responses,
         });
       } catch (error) {
         return failure(error);
@@ -263,7 +286,7 @@ export function createServer(): McpServer {
     "kcore_read",
     {
       title: "Read kcore resources",
-      description: "List or get a resource through kctl. Read-only.",
+      description: "List or get a resource from the controller. Read-only.",
       inputSchema: {
         kind: z.string(),
         name: z.string().optional(),
@@ -275,8 +298,9 @@ export function createServer(): McpServer {
       try {
         const kind = findKind(input.kind);
         if (!kind) throw new InputError(`unknown kind ${input.kind}`);
-        const result = await runKctl(kind.getArgs(input.name), connectionOf(input.connection));
-        return text({ ok: result.code === 0, code: result.code, stdout: result.stdout, stderr: result.stderr });
+        const call = buildRead(kind, input.name);
+        const response = await execute(call, connectionOf(input.connection));
+        return text({ ok: true, method: call.method, response });
       } catch (error) {
         return failure(error);
       }
@@ -325,8 +349,9 @@ export function createServer(): McpServer {
             });
           }
         }
-        const result = await runKctl(kind.deleteArgs(input.name), connectionOf(input.connection));
-        return text({ deleted: result.code === 0, code: result.code, stdout: result.stdout, stderr: result.stderr });
+        const call = buildDelete(kind, input.name);
+        const response = await execute(call, connectionOf(input.connection));
+        return text({ deleted: true, method: call.method, response });
       } catch (error) {
         return failure(error);
       }
@@ -412,12 +437,25 @@ export function createServer(): McpServer {
           }
         }
         if (input.action === "install-node") {
-          const built = installNodeArgs(input.spec);
-          const result = await runKctl(built.args, { ...connectionOf(input.connection), node: built.node, timeoutMs: 600_000 });
-          return text({ applied: result.code === 0, code: result.code, stdout: result.stdout, stderr: result.stderr });
+          const boot = bootstrapCertRequest(input.spec);
+          const issued = await callController(connectionOf(input.connection), "issueNodeBootstrapCert", {
+            nodeId: boot.nodeId,
+            nodeHost: boot.nodeHost,
+          }) as { certPem?: string; keyPem?: string; success?: boolean; message?: string };
+          if (issued.success === false) {
+            return text({ applied: false, error: issued.message || "the controller refused the node bootstrap certificate" });
+          }
+          const call = buildOperation("install-node", input.spec);
+          const material = resolveConnection(connectionOf(input.connection));
+          call.request.caCertPem = material.ca?.toString("utf8") ?? "";
+          call.request.nodeCertPem = issued.certPem ?? "";
+          call.request.nodeKeyPem = issued.keyPem ?? "";
+          const response = await execute(call, { ...connectionOf(input.connection), timeoutMs: 600_000 });
+          return text({ applied: true, method: call.method, response });
         }
-        const result = await runKctl(operationArgs(input.action, input.spec), connectionOf(input.connection));
-        return text({ applied: result.code === 0, code: result.code, stdout: result.stdout, stderr: result.stderr });
+        const call = buildOperation(input.action, input.spec);
+        const response = await execute(call, connectionOf(input.connection));
+        return text({ applied: true, method: call.method, response });
       } catch (error) {
         return failure(error);
       }

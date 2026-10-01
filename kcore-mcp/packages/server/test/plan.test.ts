@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { findKind } from "../src/catalog.js";
 import { InputError } from "../src/names.js";
-import { installNodeArgs, renderApply } from "../src/manifest.js";
+import { buildApply, buildOperation } from "../src/requests.js";
 import { diffSpec } from "../src/plan.js";
 
 const sha = "ab".repeat(32);
 
-test("VM manifests match the kctl YAML shape", () => {
+test("a VM apply is a CreateVm RPC", () => {
   const kind = findKind("vm");
   assert.ok(kind);
-  const rendered = renderApply(kind, {
+  const [call] = buildApply(kind, {
     name: "web-01",
     imageUrl: "https://example.com/debian.qcow2",
     imageSha256: sha,
@@ -21,11 +21,12 @@ test("VM manifests match the kctl YAML shape", () => {
     memoryBytes: "4G",
     sshKeys: ["deploy"],
   });
-  assert.match(rendered.yaml ?? "", /kind: VM/);
-  assert.match(rendered.yaml ?? "", /name: web-01/);
-  assert.match(rendered.yaml ?? "", /storageBackend: zfs/);
-  assert.match(rendered.yaml ?? "", /image: https:\/\/example.com\/debian.qcow2/);
-  assert.deepEqual(rendered.args.slice(0, 2), ["apply", "-f"]);
+  assert.equal(call.method, "createVm");
+  assert.equal(call.request.storageBackend, "STORAGE_BACKEND_TYPE_ZFS");
+  assert.equal(call.request.imageUrl, "https://example.com/debian.qcow2");
+  const vm = call.request.spec as { name: string; memoryBytes: string };
+  assert.equal(vm.name, "web-01");
+  assert.equal(vm.memoryBytes, String(4 * 1024 ** 3));
 });
 
 test("a URL image without https is refused", () => {
@@ -33,7 +34,7 @@ test("a URL image without https is refused", () => {
   assert.ok(kind);
   assert.throws(
     () =>
-      renderApply(kind, {
+      buildApply(kind, {
         name: "web-01",
         imageUrl: "http://example.com/debian.qcow2",
         imageSha256: sha,
@@ -51,7 +52,7 @@ test("unsafe resource names are refused", () => {
   assert.ok(kind);
   assert.throws(
     () =>
-      renderApply(kind, {
+      buildApply(kind, {
         name: "bad name",
         type: "nat",
         externalIp: "203.0.113.10",
@@ -61,24 +62,28 @@ test("unsafe resource names are refused", () => {
   );
 });
 
-test("volume create uses kctl flags", () => {
+test("volume create is a CreateVolume RPC", () => {
   const kind = findKind("volume");
   assert.ok(kind);
-  const rendered = renderApply(kind, { name: "data", sizeBytes: "10737418240", encrypt: "yes" });
-  assert.deepEqual(rendered.args, ["create", "volume", "data", "--size-bytes", "10737418240", "--encrypt"]);
+  const [call] = buildApply(kind, { name: "data", sizeBytes: "10737418240", encrypt: "yes" });
+  assert.equal(call.method, "createVolume");
+  assert.equal(call.request.encrypt, true);
+  assert.equal(call.request.sizeBytes, "10737418240");
 });
 
-test("node install args name the disk and the controller", () => {
-  const built = installNodeArgs({
+test("node install names the disk and asks the controller for a bootstrap certificate", () => {
+  const call = buildOperation("install-node", {
     node: "10.0.0.21:9091",
     osDisk: "/dev/sda",
     joinController: "10.0.0.10:9090",
     dataDisk: "/dev/nvme0n1",
   });
-  assert.equal(built.node, "10.0.0.21:9091");
-  assert.ok(built.args.includes("/dev/sda"));
-  assert.ok(built.args.includes("/dev/nvme0n1"));
-  assert.ok(built.args.includes("10.0.0.10:9090"));
+  assert.equal(call.target, "node");
+  assert.equal(call.method, "installToDisk");
+  assert.equal(call.address, "10.0.0.21:9091");
+  assert.equal(call.request.osDisk, "/dev/sda");
+  assert.deepEqual(call.request.dataDisks, ["/dev/nvme0n1"]);
+  assert.equal(call.request.controller, "10.0.0.10:9090");
 });
 
 test("mutable VM fields update and immutable fields replace", () => {
@@ -91,9 +96,13 @@ test("mutable VM fields update and immutable fields replace", () => {
   assert.equal(replace.action, "replace");
 });
 
-test("cluster update plan uses the update subcommand", () => {
+test("a cluster update is a CreateClusterUpdate RPC", () => {
   const kind = findKind("cluster-update");
   assert.ok(kind);
-  const rendered = renderApply(kind, { name: "rel" }, "kind: ClusterUpdate\nmetadata:\n  name: rel\nspec: {}\n");
-  assert.deepEqual(rendered.args.slice(0, 4), ["update", "cluster", "apply", "-f"]);
+  const [call] = buildApply(kind, {
+    name: "rel",
+    version: "0.3.0",
+    flakeRef: "github:kcorehypervisor/kcore/v0.3.0",
+  });
+  assert.equal(call.method, "createClusterUpdate");
 });
