@@ -1,7 +1,7 @@
 {
   "name": "kcore-vscode",
   "displayName": "kcore",
-  "description": "Operate kcore clusters and VMs from the editor. The agent asks you the questions Terraform would, then plans and applies through kctl.",
+  "description": "Operate kcore clusters and VMs from the editor. The agent asks you the questions Terraform would, then plans and applies over the controller API.",
   "version": "0.1.0",
   "publisher": "kcore",
   "license": "Apache-2.0",

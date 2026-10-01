@@ -81,7 +81,7 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
         question(
           "controller",
           "What is the controller address (host:port)?",
-          "kctl writes a context that dials this address over mTLS.",
+          "The MCP generates a CA and a client certificate for this address, then dials it over mTLS.",
           missing(spec, "controller"),
           { example: "10.0.0.10:9090" },
         ),

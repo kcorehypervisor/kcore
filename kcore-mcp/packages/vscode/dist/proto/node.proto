@@ -1,0 +1,1013 @@
+syntax = "proto3";
+
+package kcore.node;
+
+option go_package = "github.com/kcore/kcore/api/node";
+
+import "google/protobuf/timestamp.proto";
+
+// NodeCompute service handles VM lifecycle operations
+service NodeCompute {
+  rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
+  rpc UpdateVm(UpdateVmRequest) returns (UpdateVmResponse);
+  rpc DeleteVm(DeleteVmRequest) returns (DeleteVmResponse);
+  rpc SetVmDesiredState(SetVmDesiredStateRequest) returns (SetVmDesiredStateResponse);
+  rpc RebootVm(RebootVmRequest) returns (RebootVmResponse);
+  rpc GetVm(GetVmRequest) returns (GetVmResponse);
+  rpc ListVms(ListVmsRequest) returns (ListVmsResponse);
+  rpc PullImage(PullImageRequest) returns (PullImageResponse);
+  rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
+  rpc DeleteImage(DeleteImageRequest) returns (DeleteImageResponse);
+  rpc CreateWorkload(CreateWorkloadRequest) returns (CreateWorkloadResponse);
+  rpc DeleteWorkload(DeleteWorkloadRequest) returns (DeleteWorkloadResponse);
+  rpc SetWorkloadDesiredState(SetWorkloadDesiredStateRequest) returns (SetWorkloadDesiredStateResponse);
+  rpc GetWorkload(GetWorkloadRequest) returns (GetWorkloadResponse);
+  rpc ListWorkloads(ListWorkloadsRequest) returns (ListWorkloadsResponse);
+}
+
+// NodeContainer service handles container lifecycle operations on a node.
+service NodeContainer {
+  rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
+  rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
+  rpc StopContainer(StopContainerRequest) returns (StopContainerResponse);
+  rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse);
+  rpc GetContainer(GetContainerRequest) returns (GetContainerResponse);
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+}
+
+// NodeStorage service handles volume operations
+service NodeStorage {
+  rpc CreateVolume(CreateVolumeRequest) returns (CreateVolumeResponse);
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
+  rpc AttachVolume(AttachVolumeRequest) returns (AttachVolumeResponse);
+  rpc DetachVolume(DetachVolumeRequest) returns (DetachVolumeResponse);
+}
+
+// NodeInfo service reports node capacity and status
+service NodeInfo {
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+}
+
+// NodeAdmin service provides node-level management operations.
+// Deployments are expected to enforce mTLS on the transport layer.
+service NodeAdmin {
+  // ApplyNixConfig replaces the node's /etc/nixos/configuration.nix with the
+  // provided content and (optionally) triggers a nixos-rebuild.
+  rpc ApplyNixConfig(ApplyNixConfigRequest) returns (ApplyNixConfigResponse);
+
+  // GetNixApplyStatus reports whether the rebuild started by a previous
+  // ApplyNixConfig has finished activating. Callers that must observe the new
+  // configuration (live migration handoff, drain) poll this before continuing.
+  rpc GetNixApplyStatus(GetNixApplyStatusRequest) returns (GetNixApplyStatusResponse);
+
+  // ApplyDiskLayout validates/applies a disk layout (implemented via disko)
+  // for day-2 disk operations. Apply mode is only allowed when node disk
+  // management mode is controller-managed.
+  rpc ApplyDiskLayout(ApplyDiskLayoutRequest) returns (ApplyDiskLayoutResponse);
+
+  // DEPRECATED: forwarding shim for the old name; will be removed one release
+  // after ApplyDiskLayout has shipped. Use ApplyDiskLayout instead.
+  rpc ApplyDiskoLayout(ApplyDiskoLayoutRequest) returns (ApplyDiskoLayoutResponse) {
+    option deprecated = true;
+  }
+
+  // EnsureImage verifies/downloads an image file at destination_path and
+  // enforces SHA256 integrity before VM activation.
+  rpc EnsureImage(EnsureImageRequest) returns (EnsureImageResponse);
+
+  // UploadImage writes a local image blob to the node image cache.
+  // Accepted formats are qcow2 and raw.
+  rpc UploadImage(UploadImageRequest) returns (UploadImageResponse);
+  rpc UploadImageStream(stream UploadImageChunk) returns (UploadImageResponse);
+
+  // CheckVmSshReady resolves VM IP from DHCP leases and probes SSH port.
+  rpc CheckVmSshReady(CheckVmSshReadyRequest) returns (CheckVmSshReadyResponse);
+
+  // AttachVmConsole bridges raw bytes to the Cloud Hypervisor serial Unix
+  // socket (/run/kcore/<vm_name>.serial.sock). The first client message must
+  // set vm_name; subsequent messages carry data only.
+  rpc AttachVmConsole(stream ConsoleMessage) returns (stream ConsoleMessage);
+
+  // ListDisks returns block devices available on the node.
+  rpc ListDisks(ListDisksRequest) returns (ListDisksResponse);
+
+  // ListNetworkInterfaces returns network interfaces and addresses.
+  rpc ListNetworkInterfaces(ListNetworkInterfacesRequest) returns (ListNetworkInterfacesResponse);
+
+  // GetLvmInfo returns node LVM topology (VG/LV/PV) when available.
+  rpc GetLvmInfo(GetLvmInfoRequest) returns (GetLvmInfoResponse);
+
+  // InstallToDisk triggers a non-interactive install-to-disk workflow.
+  // The implementation enforces disk wipe and reboot at the end.
+  rpc InstallToDisk(InstallToDiskRequest) returns (InstallToDiskResponse);
+
+  // Cluster rollouts: prepare / activate pinned flake outputs (see docs/cluster-updates.md).
+  rpc PrepareSystemUpdate(PrepareSystemUpdateRequest) returns (PrepareSystemUpdateResponse);
+  rpc ActivateSystemUpdate(ActivateSystemUpdateRequest) returns (ActivateSystemUpdateResponse);
+  rpc GetSystemUpdateStatus(GetSystemUpdateStatusRequest) returns (GetSystemUpdateStatusResponse);
+  rpc RollbackSystemUpdate(RollbackSystemUpdateRequest) returns (RollbackSystemUpdateResponse);
+
+  // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
+  rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
+  rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
+  rpc GetCephHealth(GetCephHealthRequest) returns (GetCephHealthResponse);
+  rpc EnsureCephPool(EnsureCephPoolRequest) returns (EnsureCephPoolResponse);
+
+  // Live migration peer steps (controller orchestrates source + destination).
+  rpc PrepareLiveMigrateReceive(PrepareLiveMigrateReceiveRequest)
+      returns (PrepareLiveMigrateReceiveResponse);
+  rpc WaitLiveMigrateReceive(WaitLiveMigrateReceiveRequest)
+      returns (WaitLiveMigrateReceiveResponse);
+  rpc AbortLiveMigrateReceive(AbortLiveMigrateReceiveRequest)
+      returns (AbortLiveMigrateReceiveResponse);
+  // Read-only view of this node's live-migrate receive bookkeeping for a VM.
+  // Nothing is cleaned up. It exists so an operator can tell a stranded
+  // session from an in-flight receive *before* clearing anything: there is
+  // deliberately no automatic reaping, because a wrong liveness guess would
+  // destroy a live migration. See docs/vm-migration.md.
+  rpc GetLiveMigrateReceiveStatus(GetLiveMigrateReceiveStatusRequest)
+      returns (GetLiveMigrateReceiveStatusResponse);
+  rpc SendLiveMigrate(SendLiveMigrateRequest) returns (SendLiveMigrateResponse);
+  rpc FinalizeLiveMigrateSource(FinalizeLiveMigrateSourceRequest)
+      returns (FinalizeLiveMigrateSourceResponse);
+  rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
+      returns (FinalizeLiveMigrateDestResponse);
+
+  // RotateNodeCert asks the node-agent to rotate its own TLS identity: the
+  // node generates a fresh keypair, submits a CSR to the controller
+  // (Controller.SignNodeCsr), installs the signed chain atomically and
+  // reloads its listener. The private key never leaves the node. A failure
+  // leaves the previous certificate in place and serving.
+  rpc RotateNodeCert(RotateNodeCertRequest) returns (RotateNodeCertResponse);
+}
+
+// VM specification
+message VmSpec {
+  string id = 1;
+  string name = 2;
+  int32 cpu = 3;
+  int64 memory_bytes = 4;
+  repeated Disk disks = 5;
+  repeated Nic nics = 6;
+}
+
+message Disk {
+  string name = 1;
+  string backend_handle = 2; // e.g., /dev/vg0/vm-123-root or /path/to/file.qcow2
+  string bus = 3; // virtio, scsi, etc.
+  string device = 4; // vda, sda, etc.
+}
+
+message Nic {
+  string network = 1;
+  string model = 2; // virtio, e1000, etc.
+  string mac_address = 3;
+}
+
+// VM status
+enum VmState {
+  VM_STATE_UNKNOWN = 0;
+  VM_STATE_STOPPED = 1;
+  VM_STATE_RUNNING = 2;
+  VM_STATE_PAUSED = 3;
+  VM_STATE_ERROR = 4;
+}
+
+message VmStatus {
+  string id = 1;
+  VmState state = 2;
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+// CreateVm
+message CreateVmRequest {
+  VmSpec spec = 1;
+  
+  // Optional: Boot image (cloud-init images, ISOs, etc.)
+  string image_uri = 2;    // HTTP/HTTPS URI to download image (e.g., "https://cloud.debian.org/images/...")
+  string image_path = 3;   // Path to local image file (e.g., "/var/lib/images/debian-12.qcow2")
+  string image_format = 4; // Image format: qcow2, raw, iso (auto-detected if empty)
+}
+
+message CreateVmResponse {
+  VmStatus status = 1;
+}
+
+// UpdateVm
+message UpdateVmRequest {
+  VmSpec spec = 1;
+}
+
+message UpdateVmResponse {
+  VmStatus status = 1;
+}
+
+// DeleteVm
+message DeleteVmRequest {
+  string vm_id = 1;
+}
+
+message DeleteVmResponse {}
+
+enum VmDesiredState {
+  VM_DESIRED_STATE_UNSPECIFIED = 0;
+  VM_DESIRED_STATE_RUNNING = 1;
+  VM_DESIRED_STATE_STOPPED = 2;
+}
+
+message SetVmDesiredStateRequest {
+  string vm_id = 1;
+  VmDesiredState desired_state = 2;
+}
+
+message SetVmDesiredStateResponse {
+  VmStatus status = 1;
+}
+
+// RebootVm
+message RebootVmRequest {
+  string vm_id = 1;
+  bool force = 2;
+}
+
+message RebootVmResponse {
+  VmStatus status = 1;
+}
+
+// GetVm
+message GetVmRequest {
+  string vm_id = 1;
+}
+
+message GetVmResponse {
+  VmSpec spec = 1;
+  VmStatus status = 2;
+}
+
+// ListVms
+message ListVmsRequest {}
+
+message ListVmsResponse {
+  repeated VmInfo vms = 1;
+}
+
+message VmInfo {
+  string id = 1;
+  string name = 2;
+  VmState state = 3;
+  int32 cpu = 4;
+  int64 memory_bytes = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+enum ContainerState {
+  CONTAINER_STATE_UNKNOWN = 0;
+  CONTAINER_STATE_CREATED = 1;
+  CONTAINER_STATE_RUNNING = 2;
+  CONTAINER_STATE_STOPPED = 3;
+  CONTAINER_STATE_ERROR = 4;
+}
+
+enum WorkloadKind {
+  WORKLOAD_KIND_UNSPECIFIED = 0;
+  WORKLOAD_KIND_VM = 1;
+  WORKLOAD_KIND_CONTAINER = 2;
+}
+
+enum WorkloadDesiredState {
+  WORKLOAD_DESIRED_STATE_UNSPECIFIED = 0;
+  WORKLOAD_DESIRED_STATE_RUNNING = 1;
+  WORKLOAD_DESIRED_STATE_STOPPED = 2;
+}
+
+message ContainerSpec {
+  string name = 1;
+  string image = 2;
+  string network = 3; // host runtime network name (e.g. bridge or kcore-managed bridge)
+  repeated string command = 4;
+  map<string, string> env = 5;
+  repeated string ports = 6; // host:container or ip:host:container
+  string storage_backend = 7; // filesystem|lvm|zfs
+  int64 storage_size_bytes = 8;
+  string mount_target = 9; // container mount point, defaults to /data
+}
+
+message ContainerInfo {
+  string id = 1;
+  string name = 2;
+  string image = 3;
+  ContainerState state = 4;
+  string status = 5;
+}
+
+message CreateContainerRequest {
+  ContainerSpec spec = 1;
+}
+
+message CreateContainerResponse {
+  ContainerInfo container = 1;
+}
+
+message StartContainerRequest {
+  string name = 1;
+}
+
+message StartContainerResponse {
+  ContainerInfo container = 1;
+}
+
+message StopContainerRequest {
+  string name = 1;
+}
+
+message StopContainerResponse {
+  ContainerInfo container = 1;
+}
+
+message DeleteContainerRequest {
+  string name = 1;
+  bool force = 2;
+}
+
+message DeleteContainerResponse {
+  bool success = 1;
+}
+
+message GetContainerRequest {
+  string name = 1;
+}
+
+message GetContainerResponse {
+  ContainerInfo container = 1;
+}
+
+message ListContainersRequest {}
+
+message ListContainersResponse {
+  repeated ContainerInfo containers = 1;
+}
+
+message WorkloadInfo {
+  WorkloadKind kind = 1;
+  VmInfo vm = 2;
+  ContainerInfo container = 3;
+}
+
+message CreateWorkloadRequest {
+  WorkloadKind kind = 1;
+  VmSpec vm_spec = 2;
+  ContainerSpec container_spec = 3;
+  string image_uri = 4;
+  string image_path = 5;
+  string image_format = 6;
+}
+
+message CreateWorkloadResponse {
+  WorkloadInfo workload = 1;
+}
+
+message DeleteWorkloadRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+  bool force = 3;
+}
+
+message DeleteWorkloadResponse {
+  bool success = 1;
+}
+
+message SetWorkloadDesiredStateRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+  WorkloadDesiredState desired_state = 3;
+}
+
+message SetWorkloadDesiredStateResponse {
+  WorkloadInfo workload = 1;
+}
+
+message GetWorkloadRequest {
+  WorkloadKind kind = 1;
+  string workload_id = 2;
+}
+
+message GetWorkloadResponse {
+  WorkloadInfo workload = 1;
+}
+
+message ListWorkloadsRequest {
+  WorkloadKind kind = 1; // optional filter
+}
+
+message ListWorkloadsResponse {
+  repeated WorkloadInfo workloads = 1;
+}
+
+// CreateVolume
+message CreateVolumeRequest {
+  string volume_id = 1;
+  string storage_class = 2;
+  int64 size_bytes = 3;
+  map<string, string> parameters = 4; // StorageClass-specific params
+}
+
+message CreateVolumeResponse {
+  string backend_handle = 1;
+}
+
+// DeleteVolume
+message DeleteVolumeRequest {
+  string backend_handle = 1;
+}
+
+message DeleteVolumeResponse {}
+
+// AttachVolume
+message AttachVolumeRequest {
+  string backend_handle = 1;
+  string vm_id = 2;
+  string target_device = 3; // vda, sda, etc.
+  string bus = 4; // virtio, scsi, etc.
+}
+
+message AttachVolumeResponse {}
+
+// DetachVolume
+message DetachVolumeRequest {
+  string backend_handle = 1;
+  string vm_id = 2;
+}
+
+message DetachVolumeResponse {}
+
+// GetNodeInfo
+message GetNodeInfoRequest {}
+
+message GetNodeInfoResponse {
+  string node_id = 1;
+  string hostname = 2;
+  NodeCapacity capacity = 3;
+  NodeUsage usage = 4;
+  repeated StorageBackend storage_backends = 5;
+}
+
+message NodeCapacity {
+  int32 cpu_cores = 1;
+  int64 memory_bytes = 2;
+}
+
+message NodeUsage {
+  int32 cpu_cores_used = 1;
+  int64 memory_bytes_used = 2;
+}
+
+message StorageBackend {
+  string storage_class = 1;
+  int64 total_bytes = 2;
+  int64 free_bytes = 3;
+  bool shared = 4; // Whether volumes are visible from other nodes
+}
+
+// Management API messages
+
+message ApplyNixConfigRequest {
+  // Full contents to write to /etc/nixos/configuration.nix
+  string configuration_nix = 1;
+
+  // When true, run `nixos-rebuild switch` after writing the file.
+  // When false, only write the file.
+  bool rebuild = 2;
+
+  // Caller-generated token identifying this apply. Echoed back in the response
+  // and accepted by GetNixApplyStatus. Empty means the node picks its own.
+  string apply_id = 3;
+}
+
+message ApplyNixConfigResponse {
+  bool success = 1;
+  string message = 2;
+
+  // Token to poll with GetNixApplyStatus. Empty when the node agent predates
+  // apply tracking, in which case callers must not wait for activation.
+  string apply_id = 3;
+}
+
+enum NixApplyPhase {
+  NIX_APPLY_PHASE_UNSPECIFIED = 0;
+  // Rebuild is still running (or queued behind another apply).
+  NIX_APPLY_PHASE_RUNNING = 1;
+  // `nixos-rebuild test && nixos-rebuild switch` activated successfully.
+  NIX_APPLY_PHASE_SUCCEEDED = 2;
+  NIX_APPLY_PHASE_FAILED = 3;
+  // The node has no record of this apply_id (agent restart, or a newer apply
+  // superseded it).
+  NIX_APPLY_PHASE_UNKNOWN = 4;
+}
+
+message GetNixApplyStatusRequest {
+  // Empty returns the most recent apply on the node.
+  string apply_id = 1;
+}
+
+message GetNixApplyStatusResponse {
+  string apply_id = 1;
+  NixApplyPhase phase = 2;
+  string message = 3;
+}
+
+message ApplyDiskLayoutRequest {
+  // Full Nix expression containing the layout (a `disko.devices` attribute set
+  // under the hood). Disko is still the tool that performs the partitioning;
+  // the operator surface uses the plain word "disk".
+  string disk_layout_nix = 1;
+  // When true, run disko --mode format,mount. When false, syntax/eval validation only.
+  bool apply = 2;
+  // Maximum allowed runtime for command execution.
+  int32 timeout_seconds = 3;
+  // When true (the default) and the layout applies successfully, chain
+  // nixos-rebuild test followed by nixos-rebuild switch so the persisted
+  // layout is evaluated by NixOS. When false, skip the rebuild (validation
+  // or local-only apply flows).
+  bool rebuild = 4;
+}
+
+message ApplyDiskLayoutResponse {
+  bool success = 1;
+  string message = 2;
+  string mode = 3; // installer-only or controller-managed
+  // When the request was refused by the classifier, this is a stable machine
+  // readable reason. Empty on success or non-classifier failures.
+  string refusal_reason = 4;
+}
+
+// DEPRECATED: renamed to ApplyDiskLayoutRequest. Keeps `disko_nix` field
+// for wire compatibility with clients on the previous release. New clients
+// MUST use ApplyDiskLayoutRequest.
+message ApplyDiskoLayoutRequest {
+  option deprecated = true;
+  string disko_nix = 1;
+  bool apply = 2;
+  int32 timeout_seconds = 3;
+}
+
+// DEPRECATED: renamed to ApplyDiskLayoutResponse.
+message ApplyDiskoLayoutResponse {
+  option deprecated = true;
+  bool success = 1;
+  string message = 2;
+  string mode = 3;
+}
+
+message EnsureImageRequest {
+  string image_url = 1;         // HTTPS source URL
+  string image_sha256 = 2;      // required lowercase/uppercase hex SHA256
+  string destination_path = 3;  // absolute target path on node
+}
+
+message EnsureImageResponse {
+  string path = 1;          // resolved local path
+  int64 size_bytes = 2;     // file size after ensure
+  bool cached = 3;          // true if existing validated file reused
+  bool downloaded = 4;      // true if downloaded in this call
+}
+
+message UploadImageRequest {
+  bytes image_bytes = 1;       // image payload uploaded by client
+  string source_name = 2;      // optional source filename from client
+  string destination_name = 3; // optional desired filename on node
+  string image_format = 4;     // required: qcow2 or raw
+  string image_sha256 = 5;     // optional expected SHA256
+}
+
+message UploadImageResponse {
+  string path = 1;          // resolved local path
+  int64 size_bytes = 2;     // file size after write
+  string image_format = 3;  // qcow2 or raw
+  string image_sha256 = 4;  // computed SHA256
+}
+
+message UploadImageChunk {
+  bytes chunk_data = 1;       // chunk bytes (may be empty for metadata-only first message)
+  string source_name = 2;     // optional source filename from client
+  string destination_name = 3; // optional desired filename on node
+  string image_format = 4;     // required: qcow2 or raw
+  string image_sha256 = 5;     // optional expected SHA256
+}
+
+message CheckVmSshReadyRequest {
+  string vm_name = 1;
+  string network = 2;          // optional; if empty, scan all dnsmasq lease files
+  int32 port = 3;              // default 22 when <= 0
+  int32 timeout_ms = 4;        // default 1500ms when <= 0
+}
+
+message CheckVmSshReadyResponse {
+  bool ready = 1;
+  string ip = 2;
+  int32 port = 3;
+  string reason = 4;
+  bool fatal = 5;
+}
+
+// Bidirectional console payload between controller/dashboard and node-agent.
+message ConsoleMessage {
+  string vm_name = 1; // required on the first client → server message
+  bytes data = 2;     // raw serial bytes
+}
+
+message ListDisksRequest {}
+
+message DiskInfo {
+  string name = 1;
+  string path = 2;
+  string size = 3;
+  string model = 4;
+  string fstype = 5;
+  string mountpoint = 6;
+}
+
+message ListDisksResponse {
+  repeated DiskInfo disks = 1;
+}
+
+message ListNetworkInterfacesRequest {}
+
+message NetworkInterfaceInfo {
+  string name = 1;
+  string mac_address = 2;
+  string state = 3;
+  int32 mtu = 4;
+  repeated string addresses = 5; // CIDR format
+}
+
+message ListNetworkInterfacesResponse {
+  repeated NetworkInterfaceInfo interfaces = 1;
+}
+
+message GetLvmInfoRequest {}
+
+message LvmVolumeGroupInfo {
+  string name = 1;
+  int64 size_bytes = 2;
+  int64 free_bytes = 3;
+  string attr = 4;
+}
+
+message LvmLogicalVolumeInfo {
+  string name = 1;
+  string vg_name = 2;
+  int64 size_bytes = 3;
+  string attr = 4;
+  string path = 5;
+  string pool = 6;
+  string origin = 7;
+  string data_percent = 8;
+  string metadata_percent = 9;
+}
+
+message LvmPhysicalVolumeInfo {
+  string name = 1;
+  string vg_name = 2;
+  int64 size_bytes = 3;
+  int64 free_bytes = 4;
+  string attr = 5;
+}
+
+message GetLvmInfoResponse {
+  bool available = 1;
+  string message = 2;
+  repeated LvmVolumeGroupInfo volume_groups = 3;
+  repeated LvmLogicalVolumeInfo logical_volumes = 4;
+  repeated LvmPhysicalVolumeInfo physical_volumes = 5;
+}
+
+message InstallToDiskRequest {
+  string os_disk = 1;            // e.g. /dev/sda
+  repeated string data_disks = 2; // e.g. /dev/nvme0n1
+  string controller = 3;         // existing controller endpoint (IP/FQDN[:port])
+  bool run_controller = 11;      // install and run local controller on this node
+  string ca_cert_pem = 4;        // Cluster CA certificate (PEM)
+  string node_cert_pem = 5;      // Node mTLS certificate (PEM)
+  string node_key_pem = 6;       // Node mTLS private key (PEM)
+  string controller_cert_pem = 7; // Controller server/client certificate (PEM)
+  string controller_key_pem = 8;  // Controller server/client private key (PEM)
+  string kctl_cert_pem = 9;      // kctl client certificate (PEM)
+  string kctl_key_pem = 10;      // kctl client private key (PEM)
+  string data_disk_mode = 12;    // storage mode for data disks: "filesystem", "lvm", or "zfs"
+  StorageBackendType storage_backend = 13; // typed storage backend (preferred over data_disk_mode when set)
+  string lvm_vg_name = 14;       // optional LVM VG name for install automation
+  string lvm_lv_prefix = 15;     // optional LVM LV prefix for install automation
+  string zfs_pool_name = 16;     // optional ZFS pool name for install automation
+  string zfs_dataset_prefix = 17; // optional ZFS dataset prefix for install automation
+  bool disable_vxlan = 18;       // when true, node rejects VXLAN network creation
+  string sub_ca_cert_pem = 19;   // Sub-CA certificate for node cert renewal (controller nodes only)
+  string sub_ca_key_pem = 20;    // Sub-CA private key for node cert renewal (controller nodes only)
+  string dc_id = 21;             // Datacenter identity for installed node (default DC1)
+  repeated string controllers = 22; // Optional ordered controller endpoints for fallback
+  string hostname = 23;           // Hostname for installed node (auto-generated from IP if empty)
+  string node_id = 24;            // Node identity for installed node (defaults to hostname if empty)
+}
+
+enum StorageBackendType {
+  STORAGE_BACKEND_TYPE_UNSPECIFIED = 0;
+  STORAGE_BACKEND_TYPE_FILESYSTEM = 1;
+  STORAGE_BACKEND_TYPE_LVM = 2;
+  STORAGE_BACKEND_TYPE_ZFS = 3;
+  STORAGE_BACKEND_TYPE_CEPH = 4;
+}
+
+message InstallToDiskResponse {
+  bool accepted = 1;
+  string message = 2;
+  string luks_method = 3;  // "tpm2" or "key-file"
+}
+
+// Image management
+
+message PullImageRequest {
+  string uri = 1;           // HTTP/HTTPS URI to download image
+  string name = 2;          // Optional: custom name for the image (defaults to filename from URI)
+}
+
+message PullImageResponse {
+  string path = 1;          // Local path where image was saved
+  int64 size_bytes = 2;     // Size of the downloaded image
+  bool cached = 3;          // True if image was already cached (not downloaded)
+}
+
+message ListImagesRequest {}
+
+message ListImagesResponse {
+  repeated ImageInfo images = 1;
+}
+
+message ImageInfo {
+  string name = 1;          // Filename
+  string path = 2;          // Full path
+  int64 size_bytes = 3;     // File size
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message DeleteImageRequest {
+  string name = 1;          // Image name (filename) or full path
+  bool force = 2;           // Force deletion even if in use
+}
+
+message DeleteImageResponse {
+  bool success = 1;
+  string message = 2;       // Optional message (e.g., "Image deleted" or "Image in use")
+}
+
+// --- System update (cluster rollouts) --------------------------------------------------------
+
+message PrepareSystemUpdateRequest {
+  string update_name = 1;
+  string flake_ref = 2;
+  string flake_rev = 3;
+  // Reserved for NixOS system attr; MVP uses per-package flake attributes instead.
+  string system_profile = 4;
+  string host_system = 5;
+  int32 timeout_seconds = 6;
+}
+
+message PrepareSystemUpdateResponse {
+  bool success = 1;
+  string message = 2;
+  string prepared_closure = 3;
+  string manifest_path = 4;
+  string current_generation = 5;
+  string target_generation = 6;
+  bool requires_reboot = 7;
+}
+
+message ActivateSystemUpdateRequest {
+  string update_name = 1;
+  string activation_mode = 2;
+  string prepared_closure = 3;
+}
+
+message ActivateSystemUpdateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetSystemUpdateStatusRequest {
+  string update_name = 1;
+}
+
+message GetSystemUpdateStatusResponse {
+  bool success = 1;
+  string message = 2;
+  string phase = 3;
+  string prepared_closure = 4;
+  string systemctl_failed_summary = 5;
+  string booted_generation = 6;
+  string current_generation = 7;
+}
+
+message RollbackSystemUpdateRequest {
+  string update_name = 1;
+}
+
+message RollbackSystemUpdateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ApplyCephConfigRequest {
+  string ceph_nix = 1;
+  bool rebuild = 2;
+  string fsid = 3;
+  bool mon = 4;
+  bool mgr = 5;
+  bool osd = 6;
+  string daemon_id = 7;
+  // JSON bootstrap package (UTF-8): admin/mon/bootstrap-osd keyrings + mon map.
+  // Empty on first apply; node generates and returns it in the response.
+  bytes keyring = 8;
+  // Comma-separated "daemonId=ip" pairs for monmap (public mon IPs, no ports).
+  string mon_map = 9;
+  string public_addr = 10;
+  string cluster_addr = 11;
+}
+
+message ApplyCephConfigResponse {
+  bool success = 1;
+  string message = 2;
+  // Populated when this node generated the cluster bootstrap package.
+  bytes keyring = 3;
+}
+
+message BootstrapCephOsdRequest {
+  string osd_device = 1;
+  bool force_wipe = 2;
+  string cluster_name = 3;
+}
+
+message BootstrapCephOsdResponse {
+  bool success = 1;
+  bool already_prepared = 2;
+  string message = 3;
+  string osd_id = 4;
+}
+
+message GetCephHealthRequest { string cluster_name = 1; }
+
+message GetCephHealthResponse {
+  string health_status = 1;
+  string raw_status = 2;
+  int32 osd_up = 3;
+  int32 osd_in = 4;
+}
+
+message EnsureCephPoolRequest {
+  string pool = 1;
+  int32 size = 2;
+  int32 min_size = 3;
+}
+
+message EnsureCephPoolResponse {
+  bool success = 1;
+  bool created = 2;
+  string message = 3;
+}
+
+message PrepareLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+  // Preferred listen port; 0 = pick an ephemeral free port.
+  int32 listen_port = 4;
+}
+
+message PrepareLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+  int32 listen_port = 3;
+  // Address the source should dial. Empty or a wildcard ("0.0.0.0", "::")
+  // means the destination has no opinion and the caller should fall back to
+  // the host part of the destination node's gRPC address.
+  string listen_addr = 4;
+}
+
+message WaitLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  int32 timeout_seconds = 2;
+}
+
+message WaitLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message AbortLiveMigrateReceiveRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+}
+
+message AbortLiveMigrateReceiveResponse {
+  bool success = 1;
+  string message = 2;
+  // What the node saw immediately before cleaning up. Recorded so an operator
+  // clearing a session can see afterwards whether they killed a live receive
+  // or collected a corpse.
+  LiveMigrateReceiveState observed = 3;
+}
+
+message GetLiveMigrateReceiveStatusRequest {
+  string vm_name = 1;
+}
+
+// Everything the node can observe about a receive session without touching it.
+message LiveMigrateReceiveState {
+  // A prepare ran here and the session is still tracked in memory. This is
+  // what makes a retried PrepareLiveMigrateReceive answer ALREADY_EXISTS.
+  bool has_session = 1;
+  // Migration port the session holds; 0 when there is no in-memory session.
+  int32 port = 2;
+  // Receive-mode cloud-hypervisor pid from the in-memory session, 0 if none.
+  uint32 session_pid = 3;
+  // Pid recorded in <socket_dir>/<vm>.migrate.pid, 0 when the file is absent.
+  // Survives a node-agent restart, so it can be set while has_session is not.
+  uint32 pid_file_pid = 4;
+  // Whether that pid is a live process. The decisive field: false means
+  // nothing is receiving and the session is safe to clear.
+  bool vmm_alive = 5;
+  // Whether the live pid really is this VM's receive VMM, checked against its
+  // /proc cmdline. False with vmm_alive true means the pid was recycled and
+  // clearing must not kill it.
+  bool vmm_pid_matches_vm = 6;
+  // Whether any process holds a listening socket on `port`.
+  bool port_listening = 7;
+  bool pid_file_present = 8;
+  // <socket_dir>/<vm>.live-migrated: the receive completed and the generated
+  // unit should adopt the running VMM rather than cold-start one.
+  bool marker_present = 9;
+  bool api_socket_present = 10;
+  // One-line operator-facing reading of the fields above.
+  string summary = 11;
+}
+
+message GetLiveMigrateReceiveStatusResponse {
+  bool success = 1;
+  string message = 2;
+  LiveMigrateReceiveState state = 3;
+}
+
+message SendLiveMigrateRequest {
+  string vm_name = 1;
+  // tcp:<dest-ip>:<port>
+  string destination_url = 2;
+  int32 timeout_seconds = 3;
+}
+
+message SendLiveMigrateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message FinalizeLiveMigrateSourceRequest {
+  string vm_name = 1;
+  string rbd_pool = 2;
+  string rbd_image = 3;
+}
+
+message FinalizeLiveMigrateSourceResponse {
+  bool success = 1;
+  string message = 2;
+  // Verified (not merely requested) post-conditions. The controller refuses to
+  // start the VM on the destination unless both are true, so a cold move can
+  // never have two VMMs writing the same RBD image.
+  bool vmm_stopped = 3;
+  bool rbd_unmapped = 4;
+}
+
+message FinalizeLiveMigrateDestRequest {
+  string vm_name = 1;
+}
+
+message FinalizeLiveMigrateDestResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+
+message RotateNodeCertRequest {
+  // Rotate even when the certificate is not yet inside the renewal window.
+  bool force = 1;
+  // Correlation id for controller-driven rotations (audit/log only).
+  string reason = 2;
+}
+
+message RotateNodeCertResponse {
+  bool success = 1;
+  string message = 2;
+  // Serial of the newly installed certificate, empty when no rotation happened.
+  string serial_hex = 3;
+  // True when the certificate was already outside the renewal window and
+  // force was not set, so nothing was changed.
+  bool skipped = 4;
+  int32 days_until_expiry = 5;
+}

@@ -1,5 +1,5 @@
 import * as esbuild from "esbuild";
-import { copyFile, mkdir } from "node:fs/promises";
+import { cp, copyFile, mkdir } from "node:fs/promises";
 
 await esbuild.build({
   entryPoints: ["src/extension.ts"],
@@ -13,3 +13,4 @@ await esbuild.build({
 
 await mkdir("dist", { recursive: true });
 await copyFile("../server/dist/index.js", "dist/mcp.js");
+await cp("../server/proto", "dist/proto", { recursive: true });
