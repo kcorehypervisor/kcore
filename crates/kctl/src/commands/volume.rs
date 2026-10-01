@@ -152,8 +152,8 @@ pub async fn list_snapshot_policies(info: &ConnectionInfo) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<20}  {:<12}  {:<14}  {:>4}  {:<8}  {}",
-        "NAME", "SCHEDULE", "SELECTOR", "KEEP", "ENABLED", "LAST"
+        "{:<20}  {:<12}  {:<14}  {:>4}  {:<8}  LAST",
+        "NAME", "SCHEDULE", "SELECTOR", "KEEP", "ENABLED"
     );
     for p in resp.policies {
         let sel = if !p.selector_volume.is_empty() {
@@ -276,8 +276,8 @@ pub async fn list_snapshots(info: &ConnectionInfo, volume: Option<String>) -> Re
         return Ok(());
     }
     println!(
-        "{:<24}  {:<18}  {:<12}  {:>10}  {}",
-        "NAME", "VOLUME", "CONSISTENCY", "SIZE", "RBD_SNAP"
+        "{:<24}  {:<18}  {:<12}  {:>10}  RBD_SNAP",
+        "NAME", "VOLUME", "CONSISTENCY", "SIZE"
     );
     for s in resp.snapshots {
         println!(

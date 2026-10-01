@@ -4434,12 +4434,12 @@ impl Database {
     /// Detach data volumes (clear vm_id, attach_state=detached) without deleting RBD.
     pub fn detach_data_volumes_for_vm(&self, vm_id: &str) -> Result<usize, rusqlite::Error> {
         let conn = self.lock_conn()?;
-        Ok(conn.execute(
+        conn.execute(
             "UPDATE volumes SET vm_id='', attach_state='detached', slot=0,
                generation=generation+1
              WHERE vm_id=?1 AND role='data'",
             params![vm_id],
-        )?)
+        )
     }
 
     pub fn insert_vm_operation(&self, row: &VmOperationRow) -> Result<(), rusqlite::Error> {

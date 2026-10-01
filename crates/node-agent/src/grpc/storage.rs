@@ -245,8 +245,7 @@ impl proto::node_storage_server::NodeStorage for StorageService {
 /// Accept either `/dev/rbd/pool/image` or `pool/image` and ensure mapped.
 fn resolve_rbd_device(rbd_device: &str) -> Result<String, String> {
     let s = rbd_device.trim();
-    if s.starts_with("/dev/rbd/") {
-        let rest = &s["/dev/rbd/".len()..];
+    if let Some(rest) = s.strip_prefix("/dev/rbd/") {
         let (pool, image) = rest
             .split_once('/')
             .ok_or_else(|| "rbd_device must be /dev/rbd/<pool>/<image>".to_string())?;

@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
 
-use crate::config::{Config, NodeRevocationConfig, RateLimitConfig};
+use crate::config::{Config, NodeRevocationConfig};
 use crate::controller_proto;
 
 /// What to do when revocation data cannot be refreshed within
@@ -520,6 +520,7 @@ pub fn spawn_crl_refresh_loop(cfg: Config, state: RevocationState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RateLimitConfig;
     use crate::pki::test_support::{ensure_crypto_provider, node_leaf, test_ca};
     use crate::pki::{facts_from_pem, hex_upper};
 

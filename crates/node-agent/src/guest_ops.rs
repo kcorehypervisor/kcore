@@ -107,7 +107,7 @@ pub fn parse_lsblk_for_serial(stdout: &str, serial: &str) -> Option<(String, i64
         let size: i64 = cols[1].parse().unwrap_or(0);
         let ser = cols[2];
         let typ = cols.get(3).copied().unwrap_or("disk");
-        if ser != want && ser != &format!("virtio-{want}") {
+        if ser != want && ser != format!("virtio-{want}") {
             continue;
         }
         let path = if name.starts_with('/') {

@@ -252,7 +252,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> Option<u64> {
     let mp = if m > 2 { m - 3 } else { m + 9 };
     let doy = (153 * (mp as u64) + 2) / 5 + (d as u64) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = (era * 146097) as i64 + doe as i64 - 719468;
+    let days = (era * 146097) + doe as i64 - 719468;
     if days < 0 {
         None
     } else {

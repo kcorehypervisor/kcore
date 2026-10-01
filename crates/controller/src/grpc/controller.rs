@@ -2181,7 +2181,7 @@ impl ControllerService {
         };
         let encrypted_volumes = self
             .encrypted_volume_keys_for_vols(if attached.is_empty() {
-                std::slice::from_ref(&volume)
+                std::slice::from_ref(volume)
             } else {
                 attached.as_slice()
             })
@@ -8788,7 +8788,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             &actor,
             "BackupCluster",
             "cluster/database",
-            &format!("schema {schema_version}, {} bytes", sqlite.len()),
+            format!("schema {schema_version}, {} bytes", sqlite.len()),
         );
         Ok(Response::new(controller_proto::BackupClusterResponse {
             sqlite,
@@ -8822,7 +8822,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             &actor,
             "RestoreCluster",
             "cluster/database",
-            &format!("restored schema {schema_version}"),
+            format!("restored schema {schema_version}"),
         );
         info!(schema_version, "controller database restored from snapshot");
         Ok(Response::new(controller_proto::RestoreClusterResponse {
@@ -9768,7 +9768,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let node = self
             .pick_healthy_ceph_node()
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
             self.clients
                 .connect(&node.address)
@@ -10085,7 +10085,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let node = self
             .pick_healthy_ceph_node()
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
             let _ = self.clients.connect(&node.address).await;
         }
@@ -10240,7 +10240,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )));
         }
         let consistency = volume_snapshot::normalize_snapshot_consistency(&req.consistency)
-            .map_err(|m| Status::invalid_argument(m))?;
+            .map_err(Status::invalid_argument)?;
         let vm_for_quiesce = if vol.vm_id.is_empty() {
             None
         } else {
@@ -10265,7 +10265,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let node = self
             .pick_healthy_ceph_node()
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
             let _ = self.clients.connect(&node.address).await;
         }
@@ -10396,7 +10396,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let node = self
             .pick_healthy_ceph_node()
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
             let _ = self.clients.connect(&node.address).await;
         }
@@ -10477,7 +10477,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let node = self
             .pick_healthy_ceph_node()
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
             let _ = self.clients.connect(&node.address).await;
         }
@@ -10530,7 +10530,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let node = self
             .pick_healthy_ceph_node()
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
             let _ = self.clients.connect(&node.address).await;
         }
@@ -10602,7 +10602,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let node = self
             .pick_healthy_ceph_node()
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
             self.clients
                 .connect(&node.address)
@@ -10760,7 +10760,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let node = self
             .pick_healthy_ceph_node()
             .await
-            .map_err(|e| Status::failed_precondition(e))?;
+            .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
             let _ = self.clients.connect(&node.address).await;
         }
@@ -13898,7 +13898,6 @@ mod tests {
     /// Builds two Ceph-capable nodes plus one Ceph-backed VM with a volume row
     /// on `node-a`. The CephCluster has no status row, so callers decide
     /// whether it counts as healthy.
-
     fn test_root_volume(id: &str, vm_id: &str, vm_name: &str, size_bytes: i64) -> VolumeRow {
         VolumeRow {
             id: id.into(),
@@ -15516,7 +15515,7 @@ mod tests {
 
         let n = db.get_node(&node.id).expect("get").expect("exists");
         assert_eq!(n.status, "cordoned");
-        assert!(scheduler::select_node(&[n.clone()]).is_none());
+        assert!(scheduler::select_node(std::slice::from_ref(&n)).is_none());
         let vm = db.get_vm("vm-1").expect("get vm").expect("vm stays");
         assert_eq!(vm.node_id, node.id);
 
