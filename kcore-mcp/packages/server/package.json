@@ -1,0 +1,33 @@
+{
+  "name": "kcore-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for kcore. Plans and applies clusters, VMs, networks, and storage the way Terraform would, and asks the operator before it changes anything.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "kcore-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --banner:js='#!/usr/bin/env node' && chmod +x dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && tsx --test test/**/*.test.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "yaml": "^2.8.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

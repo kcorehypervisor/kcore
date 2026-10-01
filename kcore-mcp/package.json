@@ -1,0 +1,19 @@
+{
+  "name": "kcore-mcp",
+  "private": true,
+  "version": "0.1.0",
+  "description": "MCP server and editor plugins for kcore clusters and virtual machines",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/server",
+    "packages/vscode"
+  ],
+  "scripts": {
+    "build": "npm run build -w kcore-mcp && npm run build -w kcore-vscode",
+    "test": "npm test -w kcore-mcp",
+    "start": "npm start -w kcore-mcp"
+  }
+}
