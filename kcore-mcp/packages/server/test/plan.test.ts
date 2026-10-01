@@ -7,6 +7,16 @@ import { diffSpec } from "../src/plan.js";
 
 const sha = "ab".repeat(32);
 
+test("a PostgreSQL apply is a CreatePostgresql RPC", () => {
+  const kind = findKind("postgresql");
+  assert.ok(kind);
+  const [call] = buildApply(kind, { name: "app", package: "postgresql_16" });
+  assert.equal(call.method, "createPostgresql");
+  assert.equal(call.request.database, "app");
+  assert.equal(call.request.package, "postgresql_16");
+  assert.equal(call.request.port, 5432);
+});
+
 test("a VM apply is a CreateVm RPC", () => {
   const kind = findKind("vm");
   assert.ok(kind);

@@ -11,10 +11,19 @@ type GrpcClient = {
   [method: string]: unknown;
 };
 
-type Loaded = {
-  controller: grpc.ServiceClientConstructor;
-  nodeAdmin: grpc.ServiceClientConstructor;
-};
+export const SERVICE_NAMES = [
+  "controller",
+  "controller-admin",
+  "node-compute",
+  "node-container",
+  "node-storage",
+  "node-info",
+  "node-admin",
+] as const;
+
+export type ServiceName = (typeof SERVICE_NAMES)[number];
+
+type Loaded = Record<ServiceName, grpc.ServiceClientConstructor>;
 
 let loaded: Loaded | undefined;
 
@@ -43,15 +52,30 @@ function services(): Loaded {
   );
   const pkg = grpc.loadPackageDefinition(definition) as {
     kcore: {
-      controller: { Controller: grpc.ServiceClientConstructor };
-      node: { NodeAdmin: grpc.ServiceClientConstructor };
+      controller: { Controller: grpc.ServiceClientConstructor; ControllerAdmin: grpc.ServiceClientConstructor };
+      node: {
+        NodeCompute: grpc.ServiceClientConstructor;
+        NodeContainer: grpc.ServiceClientConstructor;
+        NodeStorage: grpc.ServiceClientConstructor;
+        NodeInfo: grpc.ServiceClientConstructor;
+        NodeAdmin: grpc.ServiceClientConstructor;
+      };
     };
   };
   loaded = {
     controller: pkg.kcore.controller.Controller,
-    nodeAdmin: pkg.kcore.node.NodeAdmin,
+    "controller-admin": pkg.kcore.controller.ControllerAdmin,
+    "node-compute": pkg.kcore.node.NodeCompute,
+    "node-container": pkg.kcore.node.NodeContainer,
+    "node-storage": pkg.kcore.node.NodeStorage,
+    "node-info": pkg.kcore.node.NodeInfo,
+    "node-admin": pkg.kcore.node.NodeAdmin,
   };
   return loaded;
+}
+
+export function serviceClient(name: ServiceName): grpc.ServiceClientConstructor {
+  return services()[name];
 }
 
 export function controllerMethods(): string[] {
@@ -75,13 +99,26 @@ function channelOptions(conn: ResolvedConnection): grpc.ChannelOptions {
 }
 
 export async function callController(options: ConnectionOptions, method: string, request: Record<string, unknown>): Promise<unknown> {
-  const conn = resolveConnection(options);
-  return callService(services().controller, conn.address, conn, method, request);
+  return callApi("controller", undefined, options, method, request);
 }
 
 export async function callNode(address: string, options: ConnectionOptions, method: string, request: Record<string, unknown>): Promise<unknown> {
-  const conn = resolveConnection({ ...options, controller: address });
-  return callService(services().nodeAdmin, conn.address, conn, method, request);
+  return callApi("node-admin", address, options, method, request);
+}
+
+export async function callNodeCompute(address: string, options: ConnectionOptions, method: string, request: Record<string, unknown>): Promise<unknown> {
+  return callApi("node-compute", address, options, method, request);
+}
+
+export async function callApi(
+  service: ServiceName,
+  address: string | undefined,
+  options: ConnectionOptions,
+  method: string,
+  request: Record<string, unknown>,
+): Promise<unknown> {
+  const conn = resolveConnection(address ? { ...options, controller: address } : options);
+  return callService(services()[service], conn.address, conn, method, request);
 }
 
 function callService(
@@ -95,7 +132,7 @@ function callService(
   const fn = client[method];
   if (typeof fn !== "function") {
     client.close();
-    throw new InputError(`The controller API has no ${method} method.`);
+    throw new InputError(`The gRPC API has no ${method} method.`);
   }
   const deadline = new Date(Date.now() + conn.timeoutMs);
   return new Promise((resolve, reject) => {

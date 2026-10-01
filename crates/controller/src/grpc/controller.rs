@@ -33,8 +33,8 @@ use crate::config::{NetworkConfig, ReplicationConfig};
 use crate::controller_proto;
 use crate::db::{
     CephClusterRow, CephClusterStatusRow, ClusterUpdateNodeRow, ClusterUpdateRow, Database,
-    DiskLayoutRow, DiskLayoutStatusRow, NetworkRow, NodeRow, OperatorRow, SecurityGroupRow,
-    SecurityGroupRuleRow, VmRow, VolumeRow, WorkloadRow,
+    DiskLayoutRow, DiskLayoutStatusRow, NetworkRow, NodeRow, OperatorRow, PostgresqlRow,
+    SecurityGroupRow, SecurityGroupRuleRow, VmRow, VolumeRow, WorkloadRow,
 };
 use crate::node_proto;
 use crate::{nixgen, node_client::NodeClients, scheduler};
@@ -53,7 +53,9 @@ use super::validation::{
     derive_image_format, derive_image_format_from_path, derive_local_image_path,
     normalize_image_format, normalize_storage_backend, storage_backend_to_proto,
     validate_image_path, validate_image_sha256, validate_image_url, validate_ipv4,
-    validate_netmask, validate_network_name, validate_network_type, validate_storage_size_bytes,
+    validate_netmask, validate_network_name, validate_network_type, validate_postgresql_database,
+    validate_postgresql_name, validate_postgresql_package, validate_postgresql_port,
+    validate_storage_size_bytes,
 };
 
 #[cfg(test)]
@@ -230,6 +232,9 @@ const EVT_VM_DELETE: &str = "vm.delete";
 const EVT_VM_DESIRED_STATE_SET: &str = "vm.desired_state.set";
 const EVT_NETWORK_CREATE: &str = "network.create";
 const EVT_NETWORK_DELETE: &str = "network.delete";
+const EVT_POSTGRESQL_CREATE: &str = "postgresql.create";
+const EVT_POSTGRESQL_UPDATE: &str = "postgresql.update";
+const EVT_POSTGRESQL_DELETE: &str = "postgresql.delete";
 const EVT_SECURITY_GROUP_CREATE: &str = "security_group.create";
 const EVT_SECURITY_GROUP_DELETE: &str = "security_group.delete";
 const EVT_SECURITY_GROUP_ATTACH: &str = "security_group.attach";
@@ -729,14 +734,26 @@ impl ControllerService {
             }
         }
 
-        let nix_config = nixgen::generate_node_config_with_security_groups(
-            &vms,
-            iface,
-            &self.default_network,
-            &networks,
-            &vm_ssh_keys,
-            &vxlan_peers,
-            &security_group_rules,
+        let postgresql = self
+            .db
+            .get_postgresql_for_node(&node.id)
+            .map_err(|e| Status::internal(format!("listing postgresql: {e}")))?;
+        let postgresql_nix = postgresql.as_ref().map(|row| nixgen::PostgresqlNix {
+            database: row.database_name.clone(),
+            package: row.package.clone(),
+            port: row.port,
+        });
+        let nix_config = nixgen::with_postgresql(
+            nixgen::generate_node_config_with_security_groups(
+                &vms,
+                iface,
+                &self.default_network,
+                &networks,
+                &vm_ssh_keys,
+                &vxlan_peers,
+                &security_group_rules,
+            ),
+            postgresql_nix.as_ref(),
         );
 
         let mut admin = self.ensure_admin_client_for_node(node).await?;
@@ -934,6 +951,15 @@ impl ControllerService {
                 );
             }
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn lookup_node(&self, target: &str) -> Result<NodeRow, Status> {
+        self.db
+            .get_node_by_address(target)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or_else(|| self.db.get_node(target).ok().flatten())
+            .ok_or_else(|| Status::not_found(format!("node {target} not found")))
     }
 
     #[allow(clippy::result_large_err)]
@@ -2680,6 +2706,26 @@ fn node_update_row_to_proto(row: &ClusterUpdateNodeRow) -> controller_proto::Nod
         last_error: row.last_error.clone(),
         last_transition_at: parse_datetime_to_timestamp(&row.last_transition_at),
     }
+}
+
+fn postgresql_info(row: &PostgresqlRow) -> controller_proto::PostgresqlInfo {
+    controller_proto::PostgresqlInfo {
+        name: row.name.clone(),
+        database: row.database_name.clone(),
+        package: row.package.clone(),
+        port: row.port,
+        node_id: row.node_id.clone(),
+    }
+}
+
+fn postgresql_replication_body(row: &PostgresqlRow) -> serde_json::Value {
+    serde_json::json!({
+        "name": row.name,
+        "database": row.database_name,
+        "package": row.package,
+        "port": row.port,
+        "nodeId": row.node_id,
+    })
 }
 
 #[tonic::async_trait]
@@ -4981,6 +5027,256 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     enable_outbound_nat: n.enable_outbound_nat,
                 })
                 .collect(),
+        }))
+    }
+
+    async fn create_postgresql(
+        &self,
+        request: Request<controller_proto::CreatePostgresqlRequest>,
+    ) -> Result<Response<controller_proto::CreatePostgresqlResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = validate_postgresql_name(&req.name)?;
+        let package = validate_postgresql_package(&req.package)?;
+        let port = validate_postgresql_port(req.port)?;
+        let database = if req.database.trim().is_empty() {
+            validate_postgresql_database(&name).map_err(|_| {
+                Status::invalid_argument(
+                    "database is required when the instance name is not a PostgreSQL identifier",
+                )
+            })?
+        } else {
+            validate_postgresql_database(&req.database)?
+        };
+
+        if let Some(existing) = self
+            .db
+            .get_postgresql(&name)
+            .map_err(|e| Status::internal(format!("checking postgresql: {e}")))?
+        {
+            let node = if req.target_node.trim().is_empty() {
+                self.lookup_node(&existing.node_id)?
+            } else {
+                self.lookup_node(&req.target_node)?
+            };
+            if node.id != existing.node_id {
+                return Err(Status::invalid_argument(format!(
+                    "cannot change immutable field target_node on postgresql '{name}' \
+                     (delete it and recreate)"
+                )));
+            }
+            if existing.database_name != database {
+                return Err(Status::invalid_argument(format!(
+                    "cannot change immutable field database on postgresql '{name}' \
+                     (delete it and recreate)"
+                )));
+            }
+            if existing.package != package {
+                return Err(Status::invalid_argument(format!(
+                    "cannot change immutable field package on postgresql '{name}' \
+                     (delete it and recreate)"
+                )));
+            }
+            if existing.port == port {
+                return Ok(Response::new(controller_proto::CreatePostgresqlResponse {
+                    success: true,
+                    message: format!("postgresql '{name}' on node '{}' unchanged", node.id),
+                    node_id: node.id.clone(),
+                    action: controller_proto::ApplyAction::Unchanged as i32,
+                    changed_fields: Vec::new(),
+                    postgresql: Some(postgresql_info(&existing)),
+                }));
+            }
+            self.db
+                .update_postgresql_port(&name, port)
+                .map_err(|e| Status::internal(format!("updating postgresql port: {e}")))?;
+            let updated = self
+                .db
+                .get_postgresql(&name)
+                .map_err(|e| Status::internal(format!("reading postgresql: {e}")))?
+                .ok_or_else(|| Status::internal("postgresql disappeared during update"))?;
+            if let Err(err) = self.push_config_to_node(&node).await {
+                let _ = self.db.update_postgresql_port(&name, existing.port);
+                return Err(err);
+            }
+            self.log_replication_event(
+                &actor,
+                Some("CreatePostgresql"),
+                EVT_POSTGRESQL_UPDATE,
+                &format!("postgresql/{name}"),
+                postgresql_replication_body(&updated),
+            );
+            return Ok(Response::new(controller_proto::CreatePostgresqlResponse {
+                success: true,
+                message: format!("updated postgresql '{name}' on node '{}'", node.id),
+                node_id: node.id,
+                action: controller_proto::ApplyAction::Updated as i32,
+                changed_fields: vec!["port".to_string()],
+                postgresql: Some(postgresql_info(&updated)),
+            }));
+        }
+
+        let node = if req.target_node.trim().is_empty() {
+            let occupied = self
+                .db
+                .list_postgresqls()
+                .map_err(|e| Status::internal(format!("listing postgresql: {e}")))?
+                .into_iter()
+                .map(|row| row.node_id)
+                .collect::<HashSet<_>>();
+            let nodes = self
+                .db
+                .list_nodes()
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let candidates: Vec<NodeRow> = nodes
+                .into_iter()
+                .filter(|candidate| !occupied.contains(&candidate.id))
+                .collect();
+            scheduler::select_node(&candidates)
+                .cloned()
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "no ready node is free for PostgreSQL; v1 runs one database per node",
+                    )
+                })?
+        } else {
+            self.lookup_node(&req.target_node)?
+        };
+
+        if let Some(other) = self
+            .db
+            .get_postgresql_for_node(&node.id)
+            .map_err(|e| Status::internal(format!("checking node postgresql: {e}")))?
+        {
+            return Err(Status::failed_precondition(format!(
+                "node '{}' already runs postgresql '{}'; v1 is a single database per node",
+                node.id, other.name
+            )));
+        }
+
+        let row = PostgresqlRow {
+            name: name.clone(),
+            database_name: database,
+            package,
+            port,
+            node_id: node.id.clone(),
+            created_at: String::new(),
+        };
+        self.db
+            .insert_postgresql(&row)
+            .map_err(|e| Status::internal(format!("storing postgresql: {e}")))?;
+        if let Err(err) = self.push_config_to_node(&node).await {
+            let _ = self.db.delete_postgresql(&name);
+            return Err(err);
+        }
+        self.log_replication_event(
+            &actor,
+            Some("CreatePostgresql"),
+            EVT_POSTGRESQL_CREATE,
+            &format!("postgresql/{name}"),
+            postgresql_replication_body(&row),
+        );
+        Ok(Response::new(controller_proto::CreatePostgresqlResponse {
+            success: true,
+            message: format!(
+                "created postgresql '{name}' database '{}' on node '{}' using pkgs.{}",
+                row.database_name, node.id, row.package
+            ),
+            node_id: node.id,
+            action: controller_proto::ApplyAction::Created as i32,
+            changed_fields: Vec::new(),
+            postgresql: Some(postgresql_info(&row)),
+        }))
+    }
+
+    async fn delete_postgresql(
+        &self,
+        request: Request<controller_proto::DeletePostgresqlRequest>,
+    ) -> Result<Response<controller_proto::DeletePostgresqlResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = validate_postgresql_name(&req.name)?;
+        let existing = self
+            .db
+            .get_postgresql(&name)
+            .map_err(|e| Status::internal(format!("reading postgresql: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("postgresql '{name}' not found")))?;
+        let node = self
+            .db
+            .get_node(&existing.node_id)
+            .map_err(|e| Status::internal(format!("reading node {}: {e}", existing.node_id)))?;
+        self.db
+            .delete_postgresql(&name)
+            .map_err(|e| Status::internal(format!("deleting postgresql: {e}")))?;
+        if let Some(node) = node.as_ref() {
+            if let Err(err) = self.push_config_to_node(node).await {
+                let _ = self.db.insert_postgresql(&existing);
+                return Err(err);
+            }
+        }
+        self.log_replication_event(
+            &actor,
+            Some("DeletePostgresql"),
+            EVT_POSTGRESQL_DELETE,
+            &format!("postgresql/{name}"),
+            postgresql_replication_body(&existing),
+        );
+        let message = if node.is_some() {
+            format!(
+                "deleted postgresql '{name}' from node '{}'. The NixOS service is removed from the node config; /var/lib/postgresql is left on disk",
+                existing.node_id
+            )
+        } else {
+            format!(
+                "deleted postgresql '{name}'. Node '{}' is gone, so no config was pushed",
+                existing.node_id
+            )
+        };
+        Ok(Response::new(controller_proto::DeletePostgresqlResponse {
+            success: true,
+            message,
+        }))
+    }
+
+    async fn get_postgresql(
+        &self,
+        request: Request<controller_proto::GetPostgresqlRequest>,
+    ) -> Result<Response<controller_proto::GetPostgresqlResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        let name = validate_postgresql_name(&req.name)?;
+        let row = self
+            .db
+            .get_postgresql(&name)
+            .map_err(|e| Status::internal(format!("reading postgresql: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("postgresql '{name}' not found")))?;
+        Ok(Response::new(controller_proto::GetPostgresqlResponse {
+            postgresql: Some(postgresql_info(&row)),
+        }))
+    }
+
+    async fn list_postgresqls(
+        &self,
+        request: Request<controller_proto::ListPostgresqlsRequest>,
+    ) -> Result<Response<controller_proto::ListPostgresqlsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        let rows = if req.target_node.trim().is_empty() {
+            self.db
+                .list_postgresqls()
+                .map_err(|e| Status::internal(format!("listing postgresql: {e}")))?
+        } else {
+            let node = self.lookup_node(&req.target_node)?;
+            self.db
+                .get_postgresql_for_node(&node.id)
+                .map_err(|e| Status::internal(format!("listing postgresql: {e}")))?
+                .into_iter()
+                .collect()
+        };
+        Ok(Response::new(controller_proto::ListPostgresqlsResponse {
+            postgresqls: rows.iter().map(postgresql_info).collect(),
         }))
     }
 
@@ -12105,5 +12401,123 @@ mod tests {
             "CephCluster member must schedule ceph VMs even if node.storage_backend is filesystem"
         );
         assert!(!svc.node_supports_backend(&node, "zfs"));
+    }
+
+    fn postgresql_service() -> (Database, ControllerService, NodeRow) {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        let hook: PushHook = Arc::new(|_n: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        (db, svc, node)
+    }
+
+    #[tokio::test]
+    async fn create_postgresql_is_idempotent_and_one_database_per_node() {
+        let (db, svc, node) = postgresql_service();
+        let created = <ControllerService as controller_proto::controller_server::Controller>::create_postgresql(
+            &svc,
+            Request::new(controller_proto::CreatePostgresqlRequest {
+                name: "app".into(),
+                database: String::new(),
+                package: String::new(),
+                port: 0,
+                target_node: node.id.clone(),
+            }),
+        )
+        .await
+        .expect("create")
+        .into_inner();
+        assert_eq!(
+            created.action,
+            controller_proto::ApplyAction::Created as i32
+        );
+        let stored = db.get_postgresql("app").unwrap().expect("row");
+        assert_eq!(stored.database_name, "app");
+        assert_eq!(stored.package, "postgresql");
+        assert_eq!(stored.port, 5432);
+        assert_eq!(stored.node_id, node.id);
+
+        let again = <ControllerService as controller_proto::controller_server::Controller>::create_postgresql(
+            &svc,
+            Request::new(controller_proto::CreatePostgresqlRequest {
+                name: "app".into(),
+                database: "app".into(),
+                package: "postgresql".into(),
+                port: 5432,
+                target_node: String::new(),
+            }),
+        )
+        .await
+        .expect("unchanged")
+        .into_inner();
+        assert_eq!(
+            again.action,
+            controller_proto::ApplyAction::Unchanged as i32
+        );
+
+        let updated = <ControllerService as controller_proto::controller_server::Controller>::create_postgresql(
+            &svc,
+            Request::new(controller_proto::CreatePostgresqlRequest {
+                name: "app".into(),
+                database: "app".into(),
+                package: "postgresql".into(),
+                port: 5433,
+                target_node: node.id.clone(),
+            }),
+        )
+        .await
+        .expect("port update")
+        .into_inner();
+        assert_eq!(
+            updated.action,
+            controller_proto::ApplyAction::Updated as i32
+        );
+        assert_eq!(updated.changed_fields, vec!["port".to_string()]);
+
+        let package_change = <ControllerService as controller_proto::controller_server::Controller>::create_postgresql(
+            &svc,
+            Request::new(controller_proto::CreatePostgresqlRequest {
+                name: "app".into(),
+                database: "app".into(),
+                package: "postgresql_16".into(),
+                port: 5433,
+                target_node: node.id.clone(),
+            }),
+        )
+        .await;
+        assert!(package_change.is_err());
+
+        let second = <ControllerService as controller_proto::controller_server::Controller>::create_postgresql(
+            &svc,
+            Request::new(controller_proto::CreatePostgresqlRequest {
+                name: "other".into(),
+                database: "other".into(),
+                package: "postgresql".into(),
+                port: 5432,
+                target_node: node.id.clone(),
+            }),
+        )
+        .await;
+        assert!(second.is_err());
+
+        let deleted = <ControllerService as controller_proto::controller_server::Controller>::delete_postgresql(
+            &svc,
+            Request::new(controller_proto::DeletePostgresqlRequest {
+                name: "app".into(),
+            }),
+        )
+        .await
+        .expect("delete")
+        .into_inner();
+        assert!(deleted.success);
+        assert!(db.get_postgresql("app").unwrap().is_none());
     }
 }

@@ -110,6 +110,76 @@ pub fn validate_network_type(network_type: &str) -> Result<String, Status> {
     }
 }
 
+pub fn validate_postgresql_name(name: &str) -> Result<String, Status> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 63 {
+        return Err(Status::invalid_argument(
+            "postgresql name is required and must be at most 63 characters",
+        ));
+    }
+    let mut chars = trimmed.chars();
+    let starts_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+    if !starts_ok
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Status::invalid_argument(
+            "postgresql name must start with a letter or digit and contain only letters, digits, '-' or '_'",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// PostgreSQL unquoted identifiers. Hyphens are rejected so the name can be
+/// placed in `ensureDatabases` without quoting.
+pub fn validate_postgresql_database(name: &str) -> Result<String, Status> {
+    let trimmed = name.trim();
+    let mut chars = trimmed.chars();
+    let ok = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && (1..=63).contains(&trimmed.len())
+        }
+        _ => false,
+    };
+    if !ok {
+        return Err(Status::invalid_argument(
+            "database must be a PostgreSQL identifier: a letter or underscore, then letters, digits, or underscores, at most 63 characters",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn validate_postgresql_package(package: &str) -> Result<String, Status> {
+    let trimmed = package.trim();
+    let value = if trimmed.is_empty() {
+        "postgresql"
+    } else {
+        trimmed
+    };
+    match value {
+        "postgresql" | "postgresql_14" | "postgresql_15" | "postgresql_16" | "postgresql_17" => {
+            Ok(value.to_string())
+        }
+        _ => Err(Status::invalid_argument(
+            "package must be one of postgresql, postgresql_14, postgresql_15, postgresql_16, postgresql_17",
+        )),
+    }
+}
+
+/// `0` selects the NixOS default port.
+pub fn validate_postgresql_port(port: i32) -> Result<i32, Status> {
+    if port == 0 {
+        return Ok(5432);
+    }
+    if (1..=65535).contains(&port) {
+        Ok(port)
+    } else {
+        Err(Status::invalid_argument("port must be between 1 and 65535"))
+    }
+}
+
 pub fn validate_network_name(name: &str) -> Result<String, Status> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -261,6 +331,29 @@ mod tests {
     }
 
     #[test]
+    fn validate_postgresql_accepts_defaults_and_rejects_injection() {
+        assert_eq!(
+            validate_postgresql_package("").expect("default package"),
+            "postgresql"
+        );
+        assert_eq!(
+            validate_postgresql_package("postgresql_16").expect("pinned"),
+            "postgresql_16"
+        );
+        assert!(validate_postgresql_package("pkgs.postgresql").is_err());
+        assert!(validate_postgresql_package("postgresql; evil").is_err());
+        assert_eq!(validate_postgresql_port(0).expect("default port"), 5432);
+        assert!(validate_postgresql_port(70000).is_err());
+        assert_eq!(
+            validate_postgresql_database("app_db").expect("ident"),
+            "app_db"
+        );
+        assert!(validate_postgresql_database("app-db").is_err());
+        assert!(validate_postgresql_database("app\"; evil").is_err());
+        assert_eq!(validate_postgresql_name("app-1").expect("name"), "app-1");
+        assert!(validate_postgresql_name("-app").is_err());
+    }
+
     fn validate_network_name_rejects_default_keyword() {
         assert!(validate_network_name("default").is_err());
         assert!(validate_network_name(" default  ").is_err());

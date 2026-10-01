@@ -5,7 +5,8 @@ import { advise, mergeAnswers, normalizeDesired, type Question } from "./advise.
 import { KINDS, findKind } from "./catalog.js";
 import { InputError } from "./names.js";
 import { resolveConnection } from "./connection.js";
-import { callController, callNode, redact } from "./grpc.js";
+import { callApi, callController, callNode, callNodeCompute, redact, SERVICE_NAMES } from "./grpc.js";
+import { requireRpc, rpcCatalog } from "./rpc.js";
 import { createClusterContext } from "./pki.js";
 import { bootstrapCertRequest, buildApply, buildDelete, buildOperation, buildPlanCall, buildRead, type RpcCall } from "./requests.js";
 import { diffSpec } from "./plan.js";
@@ -19,7 +20,7 @@ Before every create, update, delete, migrate, drain, or node install:
 3. Call kcore_plan and show that plan.
 4. Call kcore_apply or kcore_delete only after the operator explicitly agrees, with confirm set to true.
 
-Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request.`;
+Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller or node method; pass confirm true before a method that is not a get, list, classify, check, or plan.`;
 
 const connectionShape = {
   config: z.string().optional().describe("Path to the kcore context file. Defaults to ~/.kcore/config."),
@@ -48,6 +49,51 @@ function connectionOf(input: ConnectionInput | undefined, controller?: string): 
 function dial(input: ConnectionInput | undefined, spec: Record<string, unknown>): ConnectionOptions {
   const controller = typeof spec.controller === "string" && spec.controller.trim() ? spec.controller.trim() : undefined;
   return connectionOf(input, controller);
+}
+
+async function readImages(options: ConnectionOptions, node: string | undefined, name: string | undefined): Promise<unknown> {
+  const wanted = name?.trim();
+  const targets = node?.trim()
+    ? [{ nodeId: "", hostname: "", address: nodeAgentAddress(node.trim()) }]
+    : await clusterNodes(options);
+  const listed = [];
+  for (const target of targets) {
+    try {
+      const response = (await callNodeCompute(target.address, options, "listImages", {})) as { images?: Array<Record<string, unknown>> };
+      const images = (response.images ?? []).filter((image) => !wanted || image.name === wanted || image.path === wanted);
+      listed.push({ ...target, images });
+    } catch (error) {
+      listed.push({ ...target, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return { nodes: listed };
+}
+
+async function clusterNodes(options: ConnectionOptions): Promise<Array<{ nodeId: string; hostname: string; address: string }>> {
+  const response = (await callController(options, "listNodes", {})) as {
+    nodes?: Array<{ nodeId?: string; hostname?: string; address?: string }>;
+  };
+  return (response.nodes ?? [])
+    .filter((node) => node.address)
+    .map((node) => ({
+      nodeId: node.nodeId ?? "",
+      hostname: node.hostname ?? "",
+      address: nodeAgentAddress(node.address ?? ""),
+    }));
+}
+
+function nodeAgentAddress(address: string): string {
+  if (address.startsWith("[")) {
+    const end = address.indexOf("]");
+    const host = end > 1 ? address.slice(1, end) : address;
+    const port = end > 1 ? address.slice(end + 1) : "";
+    return port === "" || port === ":9090" ? `[${host}]:9091` : address;
+  }
+  const split = address.lastIndexOf(":");
+  if (split <= 0) return `${address}:9091`;
+  const port = address.slice(split + 1);
+  if (port === "9090") return `${address.slice(0, split)}:9091`;
+  return address;
 }
 
 async function execute(call: RpcCall, options: ConnectionOptions): Promise<unknown> {
@@ -127,7 +173,48 @@ export function createServer(): McpServer {
           mutable: kind.mutable,
           immutable: kind.immutable,
         })),
+        rpc: "Call kcore_rpc with no method to list every implemented unary gRPC method.",
       }),
+  );
+
+  server.registerTool(
+    "kcore_rpc",
+    {
+      title: "Call a kcore gRPC method",
+      description:
+        "Call one implemented unary RPC on the controller or a node. Omit method to list them. Request fields use proto JSON names in camelCase. Streaming RPCs and node methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true.",
+      inputSchema: {
+        service: z.enum(SERVICE_NAMES).optional().describe("gRPC service. Required when method is set."),
+        method: z.string().optional().describe("CamelCase RPC name, such as listNodes or getPkiStatus."),
+        request: z.record(z.string(), z.unknown()).optional().describe("RPC request message. Empty for methods with an empty request."),
+        confirm: z.boolean().optional().describe("Required for any method that is not a get, list, classify, check, or plan."),
+        connection: z.object(connectionShape).optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    },
+    async (input) => {
+      try {
+        if (!input.method) return text({ ok: true, methods: rpcCatalog(input.service) });
+        if (!input.service) throw new InputError("service is required when method is set");
+        const rpc = requireRpc(input.service, input.method);
+        if (!rpc.readOnly && input.confirm !== true) {
+          return text({
+            ok: false,
+            applied: false,
+            service: rpc.service,
+            method: rpc.method,
+            askTheUser: `Show ${rpc.service}.${rpc.method} to the operator. Call kcore_rpc again with confirm true only after they agree.`,
+          });
+        }
+        const nodeService = rpc.service.startsWith("node-");
+        const address = input.connection?.node;
+        if (nodeService && !address) throw new InputError("connection.node is required for a node RPC (host:port, usually :9091)");
+        const response = await callApi(rpc.service, nodeService ? address : undefined, connectionOf(input.connection), rpc.method, input.request ?? {});
+        return text({ ok: true, service: rpc.service, method: rpc.method, response });
+      } catch (error) {
+        return failure(error);
+      }
+    },
   );
 
   server.registerTool(
@@ -298,8 +385,13 @@ export function createServer(): McpServer {
       try {
         const kind = findKind(input.kind);
         if (!kind) throw new InputError(`unknown kind ${input.kind}`);
+        const options = connectionOf(input.connection);
+        if (kind.id === "image") {
+          const response = await readImages(options, input.connection?.node, input.name);
+          return text({ ok: true, method: "listImages", response });
+        }
         const call = buildRead(kind, input.name);
-        const response = await execute(call, connectionOf(input.connection));
+        const response = await execute(call, options);
         return text({ ok: true, method: call.method, response });
       } catch (error) {
         return failure(error);

@@ -32,6 +32,7 @@ const INTENT: Array<[RegExp, string]> = [
   [/\bvirtual machines?\b|\bvms?\b/i, "vm"],
   [/\bnetworks?\b|\bvxlan\b|\bbridge\b/i, "network"],
   [/\bssh keys?\b/i, "ssh-key"],
+  [/\bpostgres(?:ql)?\b/i, "postgresql"],
   [/\bcontainers?\b/i, "container"],
   [/\bvolumes?\b/i, "volume"],
   [/\bsnapshot polic/i, "snapshot-policy"],
@@ -152,6 +153,43 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           "The controller stores the public key and can inject it into cloud-init. The private key stays with the operator.",
           missing(spec, "publicKey"),
           { example: "ssh-ed25519 AAAA... operator@host" },
+        ),
+      ].filter((item) => item.required || missing(spec, item.id));
+    case "postgresql":
+      return [
+        question(
+          "name",
+          "What should this PostgreSQL instance be called?",
+          "The name identifies the resource. It is also the database name when you leave database empty and the name is a PostgreSQL identifier.",
+          missing(spec, "name"),
+          { example: "app" },
+        ),
+        question(
+          "database",
+          "What is the single database name?",
+          "NixOS ensureDatabases creates this database. Use letters, digits, and underscores. Defaults to the instance name.",
+          false,
+          { example: "app" },
+        ),
+        question(
+          "package",
+          "Which NixOS PostgreSQL package should it use?",
+          "postgresql tracks the nixpkgs default. Pin postgresql_16 when the major version must stay put. This choice is immutable.",
+          false,
+          { choices: ["postgresql", "postgresql_14", "postgresql_15", "postgresql_16", "postgresql_17"] },
+        ),
+        question(
+          "port",
+          "Which port should PostgreSQL use?",
+          "Defaults to 5432. v1 still serves clients on the local Unix socket.",
+          false,
+          { example: "5432" },
+        ),
+        question(
+          "targetNode",
+          "Pin it to a node, or let the scheduler choose a free one?",
+          "v1 runs one PostgreSQL database on a node. targetNode is immutable.",
+          false,
         ),
       ].filter((item) => item.required || missing(spec, item.id));
     case "container":
@@ -437,6 +475,11 @@ export function warningsFor(kind: ResourceKind, spec: Record<string, unknown>): 
   }
   if (kind.id === "disk-layout") {
     warnings.push("Plan this layout before apply. The node refuses a disk that still backs a VM, an LVM PV, or a ZFS pool member.");
+  }
+  if (kind.id === "postgresql") {
+    warnings.push(
+      "v1 is one database per node, from the NixOS postgresql package, on the local Unix socket. Deleting the resource removes it from the node config and leaves /var/lib/postgresql on disk.",
+    );
   }
   if (kind.id === "cluster-update") {
     warnings.push("A cluster update can reboot nodes. Plan it, read the blockers, and apply only after the operator agrees.");
