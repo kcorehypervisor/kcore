@@ -1,0 +1,9 @@
+{
+  "name": "kcore",
+  "version": "0.1.0",
+  "description": "Create and operate kcore clusters and VMs. The agent asks before it plans or applies.",
+  "license": "Apache-2.0",
+  "keywords": ["kcore", "mcp", "vm", "cluster"],
+  "mcpServers": "./mcp.json",
+  "skills": "./skills"
+}

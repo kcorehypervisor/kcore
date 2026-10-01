@@ -1,0 +1,14 @@
+{
+  "name": "kcore",
+  "version": "0.1.0",
+  "description": "Create and operate kcore clusters and VMs from the agent. It asks the questions Terraform would, then plans and applies through kctl.",
+  "author": {
+    "name": "kcore"
+  },
+  "homepage": "https://kcorehypervisor.com",
+  "license": "Apache-2.0",
+  "keywords": ["kcore", "mcp", "vm", "cluster", "infrastructure"],
+  "rules": "./rules",
+  "skills": "./skills",
+  "commands": "./commands"
+}

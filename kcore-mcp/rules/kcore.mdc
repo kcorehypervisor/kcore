@@ -1,0 +1,12 @@
+---
+description: Ask the operator before any kcore cluster or VM change, then plan and apply through the kcore MCP.
+alwaysApply: true
+---
+
+When the user wants to create or change a kcore cluster, VM, network, volume, or related resource:
+
+1. Use the kcore MCP. Call `kcore_advise` before any mutation.
+2. Ask the user every blocking question, in plain language, and wait for the answer. Also ask recommended questions unless they said to use defaults.
+3. Call `kcore_plan` and show the plan, including immutable fields that would force a replacement.
+4. Call `kcore_apply`, `kcore_delete`, or `kcore_operation` only after the user explicitly agrees. Pass `confirm: true`.
+5. Ask for image URLs, checksums, IP addresses, disk devices, and SSH keys. Leave `kctl` on the user's PATH and `~/.kcore/config` as the connection.

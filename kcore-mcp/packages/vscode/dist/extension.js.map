@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../src/extension.ts"],
+  "sourcesContent": ["import * as vscode from \"vscode\";\nimport { join } from \"node:path\";\n\nexport function activate(context: vscode.ExtensionContext): void {\n  const didChange = new vscode.EventEmitter<void>();\n  context.subscriptions.push(didChange);\n  context.subscriptions.push(\n    vscode.lm.registerMcpServerDefinitionProvider(\"kcore\", {\n      onDidChangeMcpServerDefinitions: didChange.event,\n      provideMcpServerDefinitions: () => {\n        const server = join(context.extensionPath, \"dist\", \"mcp.js\");\n        return [new vscode.McpStdioServerDefinition(\"kcore\", \"node\", [server], {}, \"0.1.0\")];\n      },\n    }),\n  );\n}\n\nexport function deactivate(): void {}\n"],
+  "mappings": ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;AAAA;AAAA;AAAA;AAAA;AAAA;AAAA;AAAA,aAAwB;AACxB,uBAAqB;AAEd,SAAS,SAAS,SAAwC;AAC/D,QAAM,YAAY,IAAW,oBAAmB;AAChD,UAAQ,cAAc,KAAK,SAAS;AACpC,UAAQ,cAAc;AAAA,IACb,UAAG,oCAAoC,SAAS;AAAA,MACrD,iCAAiC,UAAU;AAAA,MAC3C,6BAA6B,MAAM;AACjC,cAAM,aAAS,uBAAK,QAAQ,eAAe,QAAQ,QAAQ;AAC3D,eAAO,CAAC,IAAW,gCAAyB,SAAS,QAAQ,CAAC,MAAM,GAAG,CAAC,GAAG,OAAO,CAAC;AAAA,MACrF;AAAA,IACF,CAAC;AAAA,EACH;AACF;AAEO,SAAS,aAAmB;AAAC;",
+  "names": []
+}
