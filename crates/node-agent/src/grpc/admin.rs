@@ -3996,10 +3996,22 @@ mod tests {
         );
         // The freed port must be reservable again, otherwise the next
         // migration to this node loses a slot in the fixed range for good.
-        assert_eq!(
-            state.reserve_explicit_port(port).await.expect("re-reserve"),
-            port
-        );
+        // Other tests bind the same fixed range in parallel, so wait briefly
+        // if the kernel still reports the port busy after we dropped it.
+        let mut rebound = None;
+        for _ in 0..40 {
+            match state.reserve_explicit_port(port).await {
+                Ok(got) => {
+                    rebound = Some(got);
+                    break;
+                }
+                Err(err) if err.contains("not available") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(err) => panic!("re-reserve: {err}"),
+            }
+        }
+        assert_eq!(rebound.expect("re-reserve"), port);
     }
 
     /// Idempotent by design: a runbook step an operator repeats, or runs on
