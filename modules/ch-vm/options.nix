@@ -70,6 +70,24 @@ let
         description = "Whether to add masquerade rules for outbound internet access. Set to false for fully isolated overlays.";
       };
 
+      ipv6Prefix = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Optional IPv6 /64 for this bridge. Empty leaves the network IPv4-only.";
+      };
+
+      ipv6Gateway = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Gateway address on ipv6Prefix, placed on the bridge. Empty when ipv6Prefix is empty.";
+      };
+
+      eastWestFirewall = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Drop VM-to-VM traffic on this bridge. The gateway, DHCP, and security-group rules that name a target IP stay allowed.";
+      };
+
       securityGroupRules = lib.mkOption {
         type = lib.types.listOf (
           lib.types.submodule {
@@ -155,7 +173,40 @@ let
       rbdImage = lib.mkOption {
         type = lib.types.str;
         default = "";
-        description = "RBD image name; defaults to kcore-<VM name>.";
+        description = "RBD image name for the root disk; defaults to kcore-<VM name>.";
+      };
+
+      dataDisks = lib.mkOption {
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              rbdImage = lib.mkOption {
+                type = lib.types.str;
+                description = "RBD image name for this data disk.";
+              };
+              serial = lib.mkOption {
+                type = lib.types.str;
+                description = "Stable virtio serial (guest /dev/disk/by-id/virtio-<serial>).";
+              };
+              encrypted = lib.mkOption {
+                type = lib.types.bool;
+                default = false;
+                description = "Host-side LUKS over RBD; CH uses /dev/mapper/<mapperName>.";
+              };
+              mapperName = lib.mkOption {
+                type = lib.types.str;
+                default = "";
+                description = "dm-crypt name when encrypted=true.";
+              };
+              readonly = lib.mkOption {
+                type = lib.types.bool;
+                default = false;
+              };
+            };
+          }
+        );
+        default = [ ];
+        description = "Additional Ceph RBD data disks attached to this VM.";
       };
 
       cores = lib.mkOption {
@@ -200,6 +251,12 @@ let
         description = "Whether to start this VM automatically on boot.";
       };
 
+      incomingMigration = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Stage tap, cloud-init seed and firmware for a live-migration receive without starting the guest.";
+      };
+
       macAddress = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
@@ -210,6 +267,12 @@ let
         type = lib.types.nullOr lib.types.str;
         default = null;
         description = "Optional static DHCP reservation IP (used by dnsmasq on NAT networks).";
+      };
+
+      dhcpReservedIPv6 = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional static IPv6 address on NIC 0. Configured beside IPv4. No DHCPv6.";
       };
 
       pciDevices = lib.mkOption {
@@ -226,6 +289,38 @@ let
         );
         default = [ ];
         description = "PCI devices assigned to this VM with VFIO. Cloud Hypervisor receives one --device per address.";
+      };
+
+      # NIC 0 is `network` above and owns the guest default route. Each entry
+      # here is another virtio NIC on a different named network.
+      extraNics = lib.mkOption {
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              network = lib.mkOption {
+                type = lib.types.str;
+                description = "Network name (a key in ch-vm.vms.networks).";
+              };
+              macAddress = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "MAC for this NIC. Generated from the VM name and index when null.";
+              };
+              ipv4 = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Address on this network. NAT stores it as a DHCP reservation. VXLAN configures it statically, without a default route.";
+              };
+              ipv6 = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Optional static IPv6 address on this NIC. No default route is installed from it.";
+              };
+            };
+          }
+        );
+        default = [ ];
+        description = "Additional NICs. The guest is multi-homed: only NIC 0 installs the default route.";
       };
 
       extraArgs = lib.mkOption {

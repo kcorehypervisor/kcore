@@ -32,6 +32,10 @@ impl proto::node_info_server::NodeInfo for InfoService {
             .await
             .map_err(|e| Status::internal(format!("task join: {e}")))?;
 
+        let guest_ops_public_key =
+            crate::guest_ops::read_public_key(&crate::guest_ops::GuestOpsPaths::default())
+                .unwrap_or_default();
+
         Ok(Response::new(proto::GetNodeInfoResponse {
             node_id: self.node_id.clone(),
             hostname,
@@ -44,6 +48,7 @@ impl proto::node_info_server::NodeInfo for InfoService {
                 memory_bytes_used: memory_used,
             }),
             storage_backends: Vec::new(),
+            guest_ops_public_key,
         }))
     }
 }

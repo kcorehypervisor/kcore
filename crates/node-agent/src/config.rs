@@ -25,6 +25,9 @@ pub struct Config {
     pub cert_rotation: CertRotationConfig,
     #[serde(default)]
     pub revocation: NodeRevocationConfig,
+    /// Per-identity token bucket on the node-agent gRPC services.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 /// Node-side certificate rotation. The controller drives rotation too
@@ -221,6 +224,36 @@ impl Default for NodeRevocationConfig {
     }
 }
 
+fn default_rate_limit_rps() -> u32 {
+    100
+}
+
+fn default_rate_limit_burst() -> u32 {
+    200
+}
+
+/// Inbound gRPC rate limit. Same defaults as the controller.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_rate_limit_rps")]
+    pub requests_per_second: u32,
+    #[serde(default = "default_rate_limit_burst")]
+    pub burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            requests_per_second: default_rate_limit_rps(),
+            burst: default_rate_limit_burst(),
+        }
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -279,6 +312,20 @@ impl Config {
             StorageBackendKind::Ceph => {}
         }
         self.validate_pki()?;
+        self.validate_rate_limit()?;
+        Ok(())
+    }
+
+    fn validate_rate_limit(&self) -> anyhow::Result<()> {
+        if !self.rate_limit.enabled {
+            return Ok(());
+        }
+        if self.rate_limit.requests_per_second == 0 {
+            anyhow::bail!("rateLimit.requestsPerSecond must be greater than 0");
+        }
+        if self.rate_limit.burst == 0 {
+            anyhow::bail!("rateLimit.burst must be greater than 0");
+        }
         Ok(())
     }
 

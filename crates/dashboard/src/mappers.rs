@@ -2,11 +2,12 @@
 
 use crate::controller_client::controller_proto;
 use crate::dto::{
-    AccessControlEntryDto, AuditEventDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto,
-    LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
-    NodeStorageDto, NodeSummaryDto, ReplicationConflictDto, ReplicationIncomingDto,
-    ReplicationOutgoingDto, ReplicationStatusDto, StorageDiskRowDto, StorageOverviewDto, VmRowDto,
-    VmsPageDto,
+    AccessControlEntryDto, AuditEventDto, CephClusterRowDto, ComplianceDto, HostInterfaceDto,
+    LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto,
+    NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto,
+    ReplicationConflictDto, ReplicationIncomingDto, ReplicationOutgoingDto, ReplicationStatusDto,
+    SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto,
+    VmsPageDto, VolumeRowDto,
 };
 use crate::format::{self, paginate_by_name, VM_PAGE_SIZE};
 
@@ -71,6 +72,7 @@ pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> Vms
             cpu: v.cpu,
             memory: format::memory_mebibytes(v.memory_bytes),
             node_id: v.node_id,
+            storage_backend: format::storage_backend_name(&v.storage_backend),
         })
         .collect();
     let page = page.max(1);
@@ -146,16 +148,50 @@ fn disk_role_hint(mountpoint: &str, fstype: &str) -> String {
     "Block device".into()
 }
 
+fn count_storage_backends(
+    nodes: &[controller_proto::NodeStorageOverview],
+) -> (i32, i32, i32, i32, i32) {
+    let mut filesystem = 0;
+    let mut lvm = 0;
+    let mut zfs = 0;
+    let mut ceph = 0;
+    let mut unspecified = 0;
+    for node in nodes {
+        match node.storage_backend {
+            x if x == controller_proto::StorageBackendType::Filesystem as i32 => filesystem += 1,
+            x if x == controller_proto::StorageBackendType::Lvm as i32 => lvm += 1,
+            x if x == controller_proto::StorageBackendType::Zfs as i32 => zfs += 1,
+            x if x == controller_proto::StorageBackendType::Ceph as i32 => ceph += 1,
+            _ => unspecified += 1,
+        }
+    }
+    (filesystem, lvm, zfs, ceph, unspecified)
+}
+
 pub fn storage_overview_from_proto(
     r: controller_proto::GetStorageOverviewResponse,
 ) -> StorageOverviewDto {
+    // Prefer the per-node enum so a controller that still folds Ceph into
+    // "unspecified" still shows a Ceph count.
+    let (filesystem, lvm, zfs, ceph, unspecified) = if r.nodes.is_empty() {
+        (
+            r.backend_filesystem_nodes,
+            r.backend_lvm_nodes,
+            r.backend_zfs_nodes,
+            r.backend_ceph_nodes,
+            r.backend_unspecified_nodes,
+        )
+    } else {
+        count_storage_backends(&r.nodes)
+    };
     StorageOverviewDto {
         approved_nodes: r.approved_nodes,
         nodes_disk_inventory_ok: r.nodes_disk_inventory_ok,
-        backend_filesystem_nodes: r.backend_filesystem_nodes,
-        backend_lvm_nodes: r.backend_lvm_nodes,
-        backend_zfs_nodes: r.backend_zfs_nodes,
-        backend_unspecified_nodes: r.backend_unspecified_nodes,
+        backend_filesystem_nodes: filesystem,
+        backend_lvm_nodes: lvm,
+        backend_zfs_nodes: zfs,
+        backend_ceph_nodes: ceph,
+        backend_unspecified_nodes: unspecified,
         nodes_luks_tpm2: r.nodes_luks_tpm2,
         nodes_luks_keyfile: r.nodes_luks_keyfile,
         nodes_luks_unknown: r.nodes_luks_unknown,
@@ -263,6 +299,57 @@ pub fn network_overview_from_proto(
     }
 }
 
+fn volume_vm_label(v: &controller_proto::VolumeInfo) -> String {
+    if !v.vm_name.is_empty() {
+        v.vm_name.clone()
+    } else {
+        v.vm_id.clone()
+    }
+}
+
+pub fn volumes_from_proto(vols: Vec<controller_proto::VolumeInfo>) -> Vec<VolumeRowDto> {
+    let mut rows: Vec<VolumeRowDto> = vols
+        .into_iter()
+        .map(|v| {
+            let vm = volume_vm_label(&v);
+            VolumeRowDto {
+                name: v.name,
+                role: v.role,
+                attach_state: v.attach_state,
+                size: format::bytes_human(v.storage_size_bytes),
+                vm,
+                encrypted: v.encrypted,
+                backend: format::storage_backend_name(&v.storage_backend),
+                pool: v.pool,
+                node_id: v.node_id,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn vm_operations_from_proto(ops: Vec<controller_proto::VmOperation>) -> Vec<VmOperationRowDto> {
+    let mut rows: Vec<VmOperationRowDto> = ops
+        .into_iter()
+        .map(|o| VmOperationRowDto {
+            id: o.id,
+            kind: o.kind,
+            phase: o.phase,
+            vm: o.vm_id,
+            cancel_requested: o.cancel_requested,
+            send_succeeded: o.send_succeeded,
+            source_node: o.source_node,
+            target_node: o.target_node,
+            started_at: timestamp_label(o.started_at),
+            finished_at: timestamp_label(o.finished_at),
+            detail: o.detail_json,
+        })
+        .collect();
+    rows.sort_by(|a, b| b.id.cmp(&a.id));
+    rows
+}
+
 pub fn networks_from_proto(nets: Vec<controller_proto::NetworkInfo>) -> Vec<NetworkRowDto> {
     let mut rows: Vec<NetworkRowDto> = nets
         .into_iter()
@@ -275,6 +362,9 @@ pub fn networks_from_proto(nets: Vec<controller_proto::NetworkInfo>) -> Vec<Netw
             internal_netmask: n.internal_netmask,
             vlan_id: n.vlan_id,
             enable_outbound_nat: n.enable_outbound_nat,
+            ipv6: format_ipv6(&n.ipv6_prefix, &n.ipv6_gateway),
+            east_west_firewall: n.east_west_firewall,
+            forwarded_ports: format_ports(&n.allowed_tcp_ports, &n.allowed_udp_ports),
         })
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -331,6 +421,191 @@ pub fn conflicts_from_proto(
             incumbent_controller_id: c.incumbent_controller_id,
             challenger_controller_id: c.challenger_controller_id,
             reason: c.reason,
+        })
+        .collect()
+}
+
+fn timestamp_label(ts: Option<prost_types::Timestamp>) -> String {
+    match ts {
+        Some(t) if t.seconds > 0 => format::format_unix_utc(t.seconds),
+        _ => "—".to_string(),
+    }
+}
+
+fn format_ipv6(prefix: &str, gateway: &str) -> String {
+    if prefix.is_empty() {
+        "—".to_string()
+    } else if gateway.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix} ({gateway})")
+    }
+}
+
+fn format_ports(tcp: &[i32], udp: &[i32]) -> String {
+    let mut parts = Vec::new();
+    if !tcp.is_empty() {
+        let list = tcp
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("tcp {list}"));
+    }
+    if !udp.is_empty() {
+        let list = udp
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("udp {list}"));
+    }
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn join_nonempty(items: impl IntoIterator<Item = String>) -> String {
+    let joined = items
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if joined.is_empty() {
+        "—".to_string()
+    } else {
+        joined
+    }
+}
+
+pub fn ceph_clusters_from_proto(
+    clusters: Vec<controller_proto::CephCluster>,
+) -> Vec<CephClusterRowDto> {
+    let mut rows: Vec<CephClusterRowDto> = clusters
+        .into_iter()
+        .map(|c| {
+            let spec = c.spec.unwrap_or_default();
+            let status = c.status.unwrap_or_default();
+            let members = join_nonempty(spec.nodes.iter().map(|n| n.node_id.clone()));
+            let osd_devices = join_nonempty(spec.nodes.iter().flat_map(|n| {
+                let mut devs = vec![n.osd_device.clone()];
+                devs.extend(n.osd_devices.clone());
+                devs
+            }));
+            CephClusterRowDto {
+                name: c.name,
+                phase: format::service_phase_label(status.phase).to_string(),
+                health_message: status.health_message,
+                public_network: spec.public_network,
+                cluster_network: spec.cluster_network,
+                size: spec.size,
+                min_size: spec.min_size,
+                encrypt_osds: spec.encrypt_osds,
+                members,
+                osd_devices,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn shared_filesystems_from_proto(
+    filesystems: Vec<controller_proto::SharedFilesystem>,
+) -> Vec<SharedFilesystemRowDto> {
+    let mut rows: Vec<SharedFilesystemRowDto> = filesystems
+        .into_iter()
+        .map(|fs| {
+            let spec = fs.spec.unwrap_or_default();
+            let status = fs.status.unwrap_or_default();
+            let quota = if spec.quota_bytes <= 0 {
+                "—".to_string()
+            } else {
+                format::bytes_human(spec.quota_bytes)
+            };
+            SharedFilesystemRowDto {
+                name: fs.name,
+                ceph_cluster: spec.ceph_cluster,
+                phase: format::service_phase_label(status.phase).to_string(),
+                health_message: status.health_message,
+                quota,
+                clients: spec.clients.len() as i32,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn object_stores_from_proto(
+    stores: Vec<controller_proto::ObjectStore>,
+) -> Vec<ObjectStoreRowDto> {
+    let mut rows: Vec<ObjectStoreRowDto> = stores
+        .into_iter()
+        .map(|store| {
+            let spec = store.spec.unwrap_or_default();
+            let status = store.status.unwrap_or_default();
+            ObjectStoreRowDto {
+                name: store.name,
+                ceph_cluster: spec.ceph_cluster,
+                phase: format::service_phase_label(status.phase).to_string(),
+                health_message: status.health_message,
+                port: spec.port,
+                tls: spec.tls,
+                members: join_nonempty(spec.members),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn filter_audit_events(
+    events: Vec<AuditEventDto>,
+    q: &str,
+    action: &str,
+    since: &str,
+) -> Vec<AuditEventDto> {
+    let q = q.trim().to_ascii_lowercase();
+    let action = action.trim();
+    let since = since.trim();
+    events
+        .into_iter()
+        .filter(|event| {
+            if !action.is_empty() && event.action != action {
+                return false;
+            }
+            if !since.is_empty() && event.created_at.as_str() < since {
+                return false;
+            }
+            if q.is_empty() {
+                return true;
+            }
+            let hay = format!(
+                "{} {} {} {}",
+                event.actor, event.action, event.resource, event.detail
+            )
+            .to_ascii_lowercase();
+            hay.contains(&q)
+        })
+        .collect()
+}
+
+pub fn filter_vm_operations(rows: Vec<VmOperationRowDto>, q: &str) -> Vec<VmOperationRowDto> {
+    let q = q.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|op| {
+            format!(
+                "{} {} {} {} {} {} {}",
+                op.id, op.kind, op.phase, op.vm, op.source_node, op.target_node, op.detail
+            )
+            .to_ascii_lowercase()
+            .contains(&q)
         })
         .collect()
 }
@@ -447,6 +722,69 @@ mod tests {
     }
 
     #[test]
+    fn volumes_maps_and_sorts_by_name() {
+        let vols = vec![
+            controller_proto::VolumeInfo {
+                name: "vol-b".into(),
+                role: "data".into(),
+                attach_state: "attached".into(),
+                storage_size_bytes: 10 * 1024 * 1024 * 1024,
+                vm_name: "web".into(),
+                vm_id: "vm-1".into(),
+                encrypted: true,
+                ..Default::default()
+            },
+            controller_proto::VolumeInfo {
+                name: "vol-a".into(),
+                role: "root".into(),
+                attach_state: "detached".into(),
+                storage_size_bytes: 20 * 1024 * 1024 * 1024,
+                vm_name: String::new(),
+                vm_id: "vm-orphan".into(),
+                encrypted: false,
+                ..Default::default()
+            },
+        ];
+        let rows = volumes_from_proto(vols);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "vol-a");
+        assert_eq!(rows[0].vm, "vm-orphan");
+        assert!(!rows[0].encrypted);
+        assert_eq!(rows[1].name, "vol-b");
+        assert_eq!(rows[1].vm, "web");
+        assert!(rows[1].encrypted);
+        assert!(rows[1].size.contains("10"));
+    }
+
+    #[test]
+    fn vm_operations_sort_newest_id_first() {
+        let ops = vec![
+            controller_proto::VmOperation {
+                id: "op-001".into(),
+                kind: "migrate".into(),
+                phase: "running".into(),
+                vm_id: "vm-a".into(),
+                cancel_requested: false,
+                send_succeeded: true,
+                ..Default::default()
+            },
+            controller_proto::VmOperation {
+                id: "op-999".into(),
+                kind: "start".into(),
+                phase: "done".into(),
+                vm_id: "vm-b".into(),
+                cancel_requested: true,
+                send_succeeded: false,
+                ..Default::default()
+            },
+        ];
+        let rows = vm_operations_from_proto(ops);
+        assert_eq!(rows[0].id, "op-999");
+        assert_eq!(rows[1].id, "op-001");
+        assert!(rows[0].cancel_requested);
+    }
+
+    #[test]
     fn networks_sort_by_name() {
         let nets = vec![
             controller_proto::NetworkInfo {
@@ -460,6 +798,7 @@ mod tests {
                 vlan_id: 0,
                 network_type: "nat".into(),
                 enable_outbound_nat: true,
+                ..Default::default()
             },
             controller_proto::NetworkInfo {
                 name: "a-net".into(),
@@ -472,6 +811,7 @@ mod tests {
                 vlan_id: 0,
                 network_type: "bridge".into(),
                 enable_outbound_nat: false,
+                ..Default::default()
             },
         ];
         let rows = networks_from_proto(nets);
@@ -549,6 +889,7 @@ mod tests {
             backend_filesystem_nodes: 1,
             backend_lvm_nodes: 0,
             backend_zfs_nodes: 0,
+            backend_ceph_nodes: 0,
             backend_unspecified_nodes: 0,
             nodes_luks_tpm2: 0,
             nodes_luks_keyfile: 0,
@@ -609,6 +950,58 @@ mod tests {
         assert_eq!(dto.nodes[0].lvm_logical_volumes[0].data_percent, "42.00");
         assert_eq!(dto.nodes[0].lvm_physical_volumes.len(), 1);
         assert_eq!(dto.nodes[0].lvm_physical_volumes[0].name, "/dev/sda3");
+        assert_eq!(dto.backend_zfs_nodes, 1);
+        assert_eq!(dto.backend_ceph_nodes, 0);
+    }
+
+    #[test]
+    fn storage_overview_counts_ceph_even_when_aggregate_says_unspecified() {
+        let r = controller_proto::GetStorageOverviewResponse {
+            approved_nodes: 1,
+            backend_unspecified_nodes: 1,
+            nodes: vec![controller_proto::NodeStorageOverview {
+                node_id: "n-ceph".into(),
+                hostname: "ceph-1".into(),
+                storage_backend: controller_proto::StorageBackendType::Ceph as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dto = storage_overview_from_proto(r);
+        assert_eq!(dto.backend_ceph_nodes, 1);
+        assert_eq!(dto.backend_unspecified_nodes, 0);
+        assert_eq!(dto.nodes[0].storage_backend, "Ceph");
+    }
+
+    #[test]
+    fn audit_search_filters_action_text_and_since() {
+        let events = vec![
+            AuditEventDto {
+                id: 1,
+                actor: "kctl".into(),
+                action: "CreateVm".into(),
+                resource: "vm/web-01".into(),
+                created_at: "2026-08-04T12:00:00.000Z".into(),
+                detail: String::new(),
+            },
+            AuditEventDto {
+                id: 2,
+                actor: "kcore-node-a".into(),
+                action: "RegisterNode".into(),
+                resource: "node/node-mock-a".into(),
+                created_at: "2026-08-01T00:00:00.000Z".into(),
+                detail: "joined".into(),
+            },
+        ];
+        let by_text = filter_audit_events(events.clone(), "web-01", "", "");
+        assert_eq!(by_text.len(), 1);
+        assert_eq!(by_text[0].action, "CreateVm");
+        let by_action = filter_audit_events(events.clone(), "", "RegisterNode", "");
+        assert_eq!(by_action.len(), 1);
+        assert_eq!(by_action[0].resource, "node/node-mock-a");
+        let by_since = filter_audit_events(events, "", "", "2026-08-03");
+        assert_eq!(by_since.len(), 1);
+        assert_eq!(by_since[0].action, "CreateVm");
     }
 
     #[test]

@@ -7,28 +7,47 @@
 )]
 
 mod auth;
+mod ceph_cli;
 mod ceph_cluster_reconciler;
 mod ceph_cluster_spec;
 mod cert_rotation_reconciler;
+mod cluster_health;
 mod cluster_update_reconciler;
 mod cluster_update_spec;
 mod config;
+mod crypto_profile;
 mod db;
 mod disk_reconciler;
 mod grpc;
+mod guest_ops;
+mod net_policy;
 mod nixgen;
 mod node_client;
+mod object_store_reconciler;
+mod object_store_spec;
 mod path_safety;
 mod pci;
 mod pki;
+mod rate_limit;
 mod replication;
 mod replication_policy;
+mod sbom;
 mod scheduler;
+mod shared_filesystem_reconciler;
+mod shared_filesystem_spec;
+mod snapshot_policy_reconciler;
+mod vm_nics;
+mod vm_operation_policy;
+mod vm_operation_reconciler;
+mod volume_crypto;
+mod volume_snapshot;
+mod webhooks;
 
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use tokio::signal;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
@@ -124,9 +143,36 @@ async fn main() -> anyhow::Result<()> {
     replication::spawn_compensation_executor(database.clone());
     replication::spawn_head_materializer(database.clone());
     replication::spawn_reservation_retry_executor(database.clone());
-    disk_reconciler::spawn_disk_layout_reconciler(database.clone(), clients.clone());
+    disk_reconciler::spawn_disk_layout_reconciler(
+        database.clone(),
+        clients.clone(),
+        disk_reconciler::DiskLayoutReconcilerConfig {
+            default_network: cfg.default_network.clone(),
+            sub_ca: sub_ca.clone(),
+        },
+    );
     ceph_cluster_reconciler::spawn_ceph_cluster_reconciler(database.clone(), clients.clone());
+    shared_filesystem_reconciler::spawn_shared_filesystem_reconciler(database.clone());
+    object_store_reconciler::spawn_object_store_reconciler(database.clone());
     cluster_update_reconciler::spawn_cluster_update_reconciler(database.clone(), clients.clone());
+    snapshot_policy_reconciler::spawn_snapshot_policy_reconciler(database.clone(), clients.clone());
+    vm_operation_reconciler::spawn_vm_operation_reconciler(database.clone(), clients.clone());
+    {
+        let db = database.clone();
+        let clients = clients.clone();
+        tokio::spawn(async move {
+            // Refresh GuestOps pubkeys periodically so cloud-init can inject them.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                ticker.tick().await;
+                match guest_ops::sync_guest_ops_keys(&db, &clients).await {
+                    Ok(n) if n > 0 => tracing::info!(synced = n, "guest-ops keys refreshed"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "guest-ops key sync failed"),
+                }
+            }
+        });
+    }
 
     let crl_cache = pki::crl::CrlCache::new();
     crl_cache.load_from_db(&database);
@@ -154,6 +200,9 @@ async fn main() -> anyhow::Result<()> {
         warn!(%error, "initial revoked-serial load failed");
     }
 
+    let webhooks =
+        webhooks::Dispatcher::spawn(&cfg.webhooks, webhooks::EventSource::from_config(&cfg));
+
     cert_rotation_reconciler::spawn_cert_rotation_reconciler(
         cert_rotation_reconciler::CertRotationContext {
             db: database.clone(),
@@ -163,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
             revocation: revocation.clone(),
             rotation: cfg.cert_rotation.clone(),
             pki: cfg.pki.clone(),
+            webhooks: webhooks.clone(),
         },
     );
 
@@ -190,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let staleness_db = database.clone();
+    let staleness_webhooks = webhooks.clone();
     tokio::spawn(async move {
         const HEARTBEAT_TIMEOUT_SECS: i64 = 90;
         const CHECK_INTERVAL_SECS: u64 = 30;
@@ -207,6 +258,17 @@ async fn main() -> anyhow::Result<()> {
                                 last_heartbeat = %node.last_heartbeat,
                                 "node missed heartbeat deadline, marked not-ready"
                             );
+                            staleness_webhooks.emit(
+                                webhooks::EVENT_NODE_HEARTBEAT_MISSED,
+                                format!("node/{}", node.id),
+                                serde_json::json!({
+                                    "nodeId": node.id,
+                                    "hostname": node.hostname,
+                                    "address": node.address,
+                                    "lastHeartbeat": node.last_heartbeat,
+                                    "timeoutSeconds": HEARTBEAT_TIMEOUT_SECS,
+                                }),
+                            );
                         }
                     }
                 }
@@ -217,7 +279,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let mut failover_task: Option<tokio::task::JoinHandle<()>> = None;
     loop {
+        if let Some(task) = failover_task.take() {
+            task.abort();
+        }
         let bootstrap_kctl = cfg.auth.as_ref().map(|a| a.bootstrap_kctl).unwrap_or(false);
         let mut svc = grpc::ControllerService::new(
             database.clone(),
@@ -240,17 +306,41 @@ async fn main() -> anyhow::Result<()> {
                 key_file: tls.key_file.clone(),
             });
         }
-        // Revocation is enforced as an interceptor so every RPC on both
-        // services is covered from one wiring point. tonic builds its rustls
-        // ServerConfig internally and takes no custom ClientCertVerifier, so
-        // this is the earliest place we can reject a revoked peer.
-        let controller_svc =
-            controller_proto::controller_server::ControllerServer::with_interceptor(
-                svc,
+        svc = svc.with_security(
+            cfg.rate_limit.clone(),
+            cfg.sbom.clone(),
+            cfg.revocation.fail_mode.clone(),
+        );
+        svc = svc.with_webhooks(webhooks.clone());
+        svc = svc.with_scheduler(&cfg.scheduler);
+        if cfg.failover.enabled {
+            let failover_svc = svc.clone();
+            failover_task = Some(tokio::spawn(async move {
+                let mut announced = std::collections::HashSet::new();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    failover_svc.failover_not_ready_nodes(&mut announced).await;
+                }
+            }));
+        }
+        // Revocation and the rate limit are interceptors so every RPC on both
+        // services is covered from one wiring point. The rate limit runs
+        // first. tonic builds its rustls ServerConfig internally and takes no
+        // custom ClientCertVerifier, so the interceptor is the earliest place
+        // we can reject a revoked peer. The health service is not wrapped.
+        let limiter = rate_limit::RateLimiter::from_config(&cfg.rate_limit);
+        let controller_server = controller_proto::controller_server::ControllerServer::new(svc)
+            .max_decoding_message_size(40 * 1024 * 1024)
+            .max_encoding_message_size(40 * 1024 * 1024);
+        let controller_svc = InterceptedService::new(
+            InterceptedService::new(
+                controller_server,
                 pki::revocation::interceptor(revocation.clone()),
-            );
+            ),
+            limiter.interceptor(),
+        );
 
-        let admin_svc =
+        let admin_svc = InterceptedService::new(
             controller_proto::controller_admin_server::ControllerAdminServer::with_interceptor(
                 grpc::ControllerAdminService::new(
                     database.clone(),
@@ -260,7 +350,9 @@ async fn main() -> anyhow::Result<()> {
                     cfg.tls.is_some(),
                 ),
                 pki::revocation::interceptor(revocation.clone()),
-            );
+            ),
+            limiter.interceptor(),
+        );
 
         let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
         health_reporter

@@ -19,6 +19,12 @@ fn is_sqlite_memory_database_path(path: &str) -> bool {
     false
 }
 
+fn snapshot_temp_path() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("kcore-snapshot-{}-{n}.sqlite", std::process::id()))
+}
+
 fn validate_database_path(path: &str) -> Result<()> {
     crate::path_safety::assert_safe_path(path, "database path")
 }
@@ -46,6 +52,24 @@ pub struct NodeRow {
     pub cert_expiry_days: i32,
     pub luks_method: String,
     pub dc_id: String,
+}
+
+/// Result of [`Database::apply_vm_runtime_state`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmRuntimeApply {
+    Missing,
+    Unchanged,
+    Changed(VmRuntimeChange),
+}
+
+/// A VM runtime state that was stored because it differed from the previous value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmRuntimeChange {
+    pub vm_id: String,
+    pub name: String,
+    pub node_id: String,
+    pub previous: String,
+    pub current: String,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +117,17 @@ pub struct NodeGpuRow {
     pub driver: String,
 }
 
+/// A NIC after the primary. Position 0 stays on `vms.network` / `vms.vm_ip`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmNicRow {
+    pub vm_id: String,
+    pub position: i32,
+    pub network: String,
+    pub mac_address: String,
+    pub model: String,
+    pub ip_address: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkloadRow {
     pub id: String,
@@ -136,6 +171,45 @@ pub struct PostgresqlRow {
     pub created_at: String,
 }
 
+/// Optional IPv6 prefix and east-west filtering for one network on one node.
+///
+/// Missing rows mean both are off. `ipv6_next` is the next host id to hand
+/// out (the gateway is host 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkPolicyRow {
+    pub node_id: String,
+    pub name: String,
+    pub east_west: bool,
+    pub ipv6_prefix: String,
+    pub ipv6_gateway: String,
+    pub ipv6_next: i32,
+}
+
+impl NetworkPolicyRow {
+    pub fn absent(node_id: &str, name: &str) -> Self {
+        Self {
+            node_id: node_id.to_string(),
+            name: name.to_string(),
+            east_west: false,
+            ipv6_prefix: String::new(),
+            ipv6_gateway: String::new(),
+            ipv6_next: 2,
+        }
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.east_west || !self.ipv6_prefix.is_empty()
+    }
+}
+
+/// Static IPv6 address for one NIC. Position 0 is the primary NIC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmIpv6Row {
+    pub vm_id: String,
+    pub position: i32,
+    pub address: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SecurityGroupRow {
     pub name: String,
@@ -167,6 +241,7 @@ pub struct DiskLayoutRow {
     pub node_id: String,
     pub generation: i64,
     pub layout_nix: String,
+    pub evacuate: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -202,13 +277,216 @@ pub struct CephClusterStatusRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct SharedFilesystemRow {
+    pub name: String,
+    pub generation: i64,
+    pub spec_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedFilesystemStatusRow {
+    pub name: String,
+    pub observed_generation: i64,
+    pub phase: String,
+    pub health_message: String,
+    pub last_transition_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectStoreRow {
+    pub name: String,
+    pub generation: i64,
+    pub spec_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectStoreStatusRow {
+    pub name: String,
+    pub observed_generation: i64,
+    pub phase: String,
+    pub health_message: String,
+    pub last_transition_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectUserRow {
+    pub name: String,
+    pub store_name: String,
+    pub access_key: String,
+    pub secret: String,
+    pub created_at: String,
+}
+
+/// Cluster-scoped block volume (Ceph RBD in v1). A VM may have one `root`
+/// volume and zero or more `data` volumes; detached volumes have an empty
+/// `vm_id`. See `.cursor/design/volumes.md` (local, not in git).
+#[derive(Debug, Clone)]
 pub struct VolumeRow {
     pub id: String,
+    pub name: String,
     pub vm_id: String,
+    pub role: String,
+    pub slot: i32,
     pub pool: String,
     pub image: String,
     pub size_bytes: i64,
+    pub storage_class: String,
+    pub attach_state: String,
+    pub serial: String,
+    pub source_json: String,
+    pub guest_format_json: String,
+    pub generation: i64,
+    pub parent_snapshot_id: String,
+    /// -1 means not yet observed in the guest.
+    pub guest_visible_bytes: i64,
+    pub guest_checked_at: String,
+    /// Host-side LUKS over RBD (E2).
+    pub encrypted: bool,
+    /// Base64 AES-GCM wrap of the volume DEK (empty when not encrypted).
+    pub wrapped_dek: String,
     pub created_at: String,
+}
+
+impl VolumeRow {
+    pub const ROLE_ROOT: &'static str = "root";
+    pub const ROLE_DATA: &'static str = "data";
+    pub const ATTACH_DETACHED: &'static str = "detached";
+    pub const ATTACH_ATTACHING: &'static str = "attaching";
+    pub const ATTACH_ATTACHED: &'static str = "attached";
+    pub const ATTACH_DETACHING: &'static str = "detaching";
+
+    /// Stable virtio serial from a volume id (hex digits, up to 12 chars).
+    pub fn serial_from_id(id: &str) -> String {
+        let hex: String = id
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .take(12)
+            .collect();
+        if hex.is_empty() {
+            format!("vol{}", id.chars().take(8).collect::<String>())
+        } else {
+            hex.to_ascii_lowercase()
+        }
+    }
+
+    pub fn new_root(vm_id: &str, vm_name: &str, size_bytes: i64) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = format!("{vm_name}-root");
+        Self {
+            serial: Self::serial_from_id(&id),
+            id,
+            name,
+            vm_id: vm_id.to_string(),
+            role: Self::ROLE_ROOT.into(),
+            slot: 0,
+            pool: "kcore-vms".into(),
+            image: format!("kcore-{vm_id}"),
+            size_bytes,
+            storage_class: "ceph".into(),
+            attach_state: Self::ATTACH_ATTACHED.into(),
+            source_json: "{}".into(),
+            guest_format_json: String::new(),
+            generation: 1,
+            parent_snapshot_id: String::new(),
+            guest_visible_bytes: -1,
+            guest_checked_at: String::new(),
+            encrypted: false,
+            wrapped_dek: String::new(),
+            created_at: String::new(),
+        }
+    }
+
+    pub fn new_data(name: &str, size_bytes: i64) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        let image = format!("kcore-vol-{}", Self::serial_from_id(&id));
+        Self {
+            serial: Self::serial_from_id(&id),
+            id,
+            name: name.to_string(),
+            vm_id: String::new(),
+            role: Self::ROLE_DATA.into(),
+            slot: 0,
+            pool: "kcore-vms".into(),
+            image,
+            size_bytes,
+            storage_class: "ceph".into(),
+            attach_state: Self::ATTACH_DETACHED.into(),
+            source_json: "{}".into(),
+            guest_format_json: String::new(),
+            generation: 1,
+            parent_snapshot_id: String::new(),
+            guest_visible_bytes: -1,
+            guest_checked_at: String::new(),
+            encrypted: false,
+            wrapped_dek: String::new(),
+            created_at: String::new(),
+        }
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.attach_state == Self::ATTACH_ATTACHED || self.attach_state == Self::ATTACH_ATTACHING
+    }
+}
+
+/// Long-running per-VM action (live migrate, resize, …). At most one open
+/// operation per vm_id (partial unique index on finished_at = '').
+#[derive(Debug, Clone)]
+pub struct VmOperationRow {
+    pub id: String,
+    pub vm_id: String,
+    pub kind: String,
+    pub phase: String,
+    pub source_node: String,
+    pub target_node: String,
+    pub cancel_requested: bool,
+    pub send_succeeded: bool,
+    pub detail_json: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub finished_at: String,
+}
+
+impl VmOperationRow {
+    pub const KIND_LIVE_MIGRATE: &'static str = "live_migrate";
+    pub const PHASE_PREPARING: &'static str = "Preparing";
+    pub const PHASE_SENDING: &'static str = "Sending";
+    pub const PHASE_WAITING: &'static str = "Waiting";
+    pub const PHASE_REASSIGNED: &'static str = "Reassigned";
+    pub const PHASE_FINALIZING_DEST: &'static str = "FinalizingDest";
+    pub const PHASE_FINALIZING_SOURCE: &'static str = "FinalizingSource";
+    pub const PHASE_DONE: &'static str = "Done";
+    pub const PHASE_FAILED: &'static str = "Failed";
+    pub const PHASE_CANCELLED: &'static str = "Cancelled";
+}
+
+#[derive(Debug, Clone)]
+pub struct VolumeSnapshotRow {
+    pub id: String,
+    pub name: String,
+    pub volume_id: String,
+    pub rbd_snap: String,
+    pub protected: bool,
+    pub size_bytes: i64,
+    pub consistency: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotPolicyRow {
+    pub name: String,
+    pub selector_vm: String,
+    pub selector_volume: String,
+    pub schedule: String,
+    pub keep: i32,
+    pub enabled: bool,
+    pub last_run_at: String,
+    pub last_message: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +662,12 @@ pub struct CrlStateRow {
     pub revoked_count: i32,
     pub issuer_fingerprint: String,
 }
+
+/// Schema version written by [`Database::migrate`].
+pub const SCHEMA_VERSION: i32 = 49;
+
+/// Largest controller snapshot accepted by backup and restore.
+pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 
 impl Database {
     pub fn open(path: &str) -> Result<Self> {
@@ -1151,7 +1435,251 @@ impl Database {
             )?;
         }
 
-        const CURRENT_VERSION: i32 = 37;
+        if version < 38 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ceph_retired_nodes (
+                    cluster_name TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    PRIMARY KEY (cluster_name, node_id)
+                );",
+            )?;
+        }
+
+        // First-class volumes: many per VM, detachable data disks (schema 39).
+        if version < 39 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS volumes_v35 (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    vm_id TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'root',
+                    slot INTEGER NOT NULL DEFAULT 0,
+                    pool TEXT NOT NULL,
+                    image TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    storage_class TEXT NOT NULL DEFAULT 'ceph',
+                    attach_state TEXT NOT NULL DEFAULT 'attached',
+                    serial TEXT NOT NULL DEFAULT '',
+                    source_json TEXT NOT NULL DEFAULT '{}',
+                    guest_format_json TEXT NOT NULL DEFAULT '',
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT OR IGNORE INTO volumes_v35 (
+                    id, name, vm_id, role, slot, pool, image, size_bytes,
+                    storage_class, attach_state, serial, source_json,
+                    guest_format_json, generation, created_at
+                )
+                SELECT
+                    v.id,
+                    COALESCE(
+                        (SELECT name FROM vms WHERE id = v.vm_id) || '-root',
+                        v.image || '-root'
+                    ),
+                    v.vm_id,
+                    'root',
+                    0,
+                    v.pool,
+                    v.image,
+                    v.size_bytes,
+                    'ceph',
+                    'attached',
+                    lower(substr(replace(v.id, '-', ''), 1, 12)),
+                    '{}',
+                    '',
+                    1,
+                    v.created_at
+                FROM volumes v;
+                DROP TABLE IF EXISTS volumes;
+                ALTER TABLE volumes_v35 RENAME TO volumes;
+                CREATE INDEX IF NOT EXISTS idx_volumes_vm ON volumes(vm_id);
+                CREATE INDEX IF NOT EXISTS idx_volumes_attach ON volumes(attach_state);",
+            )?;
+        }
+
+        if version < 40 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vm_operations (
+                    id TEXT PRIMARY KEY,
+                    vm_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    source_node TEXT NOT NULL DEFAULT '',
+                    target_node TEXT NOT NULL DEFAULT '',
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    send_succeeded INTEGER NOT NULL DEFAULT 0,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    finished_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_vm_operations_vm ON vm_operations(vm_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_operations_open_vm
+                  ON vm_operations(vm_id) WHERE finished_at = '';",
+            )?;
+        }
+
+        if version < 41 {
+            conn.execute_batch(
+                "ALTER TABLE volumes ADD COLUMN parent_snapshot_id TEXT NOT NULL DEFAULT '';
+                 CREATE TABLE IF NOT EXISTS volume_snapshots (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    volume_id TEXT NOT NULL,
+                    rbd_snap TEXT NOT NULL,
+                    protected INTEGER NOT NULL DEFAULT 1,
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    consistency TEXT NOT NULL DEFAULT 'crash',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_volume_snapshots_volume
+                   ON volume_snapshots(volume_id);",
+            )?;
+        }
+
+        if version < 42 {
+            // guest_visible_bytes: -1 = unknown (not yet checked)
+            conn.execute_batch(
+                "ALTER TABLE volumes ADD COLUMN guest_visible_bytes INTEGER NOT NULL DEFAULT -1;
+                 ALTER TABLE volumes ADD COLUMN guest_checked_at TEXT NOT NULL DEFAULT '';
+                 CREATE TABLE IF NOT EXISTS snapshot_policies (
+                    name TEXT PRIMARY KEY,
+                    selector_vm TEXT NOT NULL DEFAULT '',
+                    selector_volume TEXT NOT NULL DEFAULT '',
+                    schedule TEXT NOT NULL,
+                    keep INTEGER NOT NULL DEFAULT 7,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_run_at TEXT NOT NULL DEFAULT '',
+                    last_message TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            )?;
+        }
+
+        if version < 43 {
+            conn.execute_batch(
+                "ALTER TABLE volumes ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE volumes ADD COLUMN wrapped_dek TEXT NOT NULL DEFAULT '';
+                 CREATE TABLE IF NOT EXISTS guest_ops_node_keys (
+                    node_id TEXT PRIMARY KEY,
+                    public_key TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            )?;
+        }
+
+        if version < 44 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS shared_filesystems (
+                    name TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    spec_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS shared_filesystem_status (
+                    name TEXT PRIMARY KEY REFERENCES shared_filesystems(name) ON DELETE CASCADE,
+                    observed_generation INTEGER NOT NULL DEFAULT 0,
+                    phase TEXT NOT NULL DEFAULT 'pending',
+                    health_message TEXT NOT NULL DEFAULT '',
+                    last_transition_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS object_stores (
+                    name TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    spec_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS object_store_status (
+                    name TEXT PRIMARY KEY REFERENCES object_stores(name) ON DELETE CASCADE,
+                    observed_generation INTEGER NOT NULL DEFAULT 0,
+                    phase TEXT NOT NULL DEFAULT 'pending',
+                    health_message TEXT NOT NULL DEFAULT '',
+                    last_transition_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS object_users (
+                    name TEXT NOT NULL,
+                    store_name TEXT NOT NULL REFERENCES object_stores(name) ON DELETE CASCADE,
+                    access_key TEXT NOT NULL,
+                    secret TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (name, store_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_object_users_store ON object_users(store_name);",
+            )?;
+        }
+
+        if version < 45 {
+            let _ = conn.execute(
+                "ALTER TABLE disk_layouts ADD COLUMN evacuate INTEGER NOT NULL DEFAULT 0",
+                [],
+            );
+        }
+
+        if version < 46 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vm_nics (
+                    vm_id TEXT NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    network TEXT NOT NULL,
+                    mac_address TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT 'virtio',
+                    ip_address TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (vm_id, position)
+                );",
+            )?;
+        }
+
+        if version < 47 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vm_placement (
+                    vm_id TEXT PRIMARY KEY REFERENCES vms(id) ON DELETE CASCADE,
+                    anti_affinity TEXT NOT NULL DEFAULT ''
+                );",
+            )?;
+        }
+
+        if version < 48 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS network_policy (
+                    node_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    east_west INTEGER NOT NULL DEFAULT 0,
+                    ipv6_prefix TEXT NOT NULL DEFAULT '',
+                    ipv6_gateway TEXT NOT NULL DEFAULT '',
+                    ipv6_next INTEGER NOT NULL DEFAULT 2,
+                    PRIMARY KEY (node_id, name)
+                );
+                CREATE TABLE IF NOT EXISTS vm_ipv6 (
+                    vm_id TEXT NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    PRIMARY KEY (vm_id, position)
+                );
+                CREATE TABLE IF NOT EXISTS vxlan_released_ips (
+                    network TEXT NOT NULL,
+                    ip TEXT NOT NULL,
+                    PRIMARY KEY (network, ip)
+                );
+                CREATE TABLE IF NOT EXISTS ipv6_released (
+                    scope TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    PRIMARY KEY (scope, address)
+                );",
+            )?;
+        }
+
+        if version < 49 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pending_node_config_push (
+                    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE
+                );",
+            )?;
+        }
+
+        const CURRENT_VERSION: i32 = SCHEMA_VERSION;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
             conn.execute(
@@ -1166,6 +1694,107 @@ impl Database {
     fn schema_version(conn: &Connection) -> i32 {
         conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap_or(0)
+    }
+
+    /// Consistent SQLite snapshot of this database, and the schema version it carries.
+    pub fn snapshot_sqlite(&self) -> Result<(Vec<u8>, i32), String> {
+        let conn = self.lock_conn().map_err(|e| e.to_string())?;
+        let version = Self::schema_version(&conn);
+        let path = snapshot_temp_path();
+        conn.backup(
+            rusqlite::DatabaseName::Main,
+            &path,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+        .map_err(|e| format!("sqlite backup: {e}"))?;
+        drop(conn);
+        let bytes = std::fs::read(&path).map_err(|e| format!("reading snapshot: {e}"));
+        let _ = std::fs::remove_file(&path);
+        let bytes = bytes?;
+        if bytes.len() > MAX_CLUSTER_SNAPSHOT_BYTES {
+            return Err(format!(
+                "snapshot is {} bytes, above the {MAX_CLUSTER_SNAPSHOT_BYTES} byte limit",
+                bytes.len()
+            ));
+        }
+        Ok((bytes, version))
+    }
+
+    /// Replace this database with a snapshot, then run migrations up to [`SCHEMA_VERSION`].
+    pub fn restore_sqlite(&self, bytes: &[u8]) -> Result<i32, String> {
+        if bytes.is_empty() {
+            return Err("snapshot is empty".to_string());
+        }
+        if bytes.len() > MAX_CLUSTER_SNAPSHOT_BYTES {
+            return Err(format!(
+                "snapshot is {} bytes, above the {MAX_CLUSTER_SNAPSHOT_BYTES} byte limit",
+                bytes.len()
+            ));
+        }
+        if !bytes.starts_with(b"SQLite format 3\0") {
+            return Err("snapshot is not a SQLite database".to_string());
+        }
+        let path = snapshot_temp_path();
+        std::fs::write(&path, bytes).map_err(|e| format!("writing snapshot: {e}"))?;
+        let restored = (|| {
+            let src = Connection::open(&path).map_err(|e| format!("opening snapshot: {e}"))?;
+            let integrity: String = src
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(|e| format!("integrity check: {e}"))?;
+            if integrity != "ok" {
+                return Err(format!("snapshot failed integrity check: {integrity}"));
+            }
+            let version = Self::schema_version(&src);
+            if !(1..=SCHEMA_VERSION).contains(&version) {
+                return Err(format!(
+                    "snapshot schema version {version} is outside 1..={SCHEMA_VERSION}"
+                ));
+            }
+            drop(src);
+            {
+                let mut conn = self.lock_conn().map_err(|e| e.to_string())?;
+                conn.restore(
+                    rusqlite::DatabaseName::Main,
+                    &path,
+                    None::<fn(rusqlite::backup::Progress)>,
+                )
+                .map_err(|e| format!("sqlite restore: {e}"))?;
+            }
+            self.migrate()
+                .map_err(|e| format!("migrate after restore: {e}"))?;
+            Ok(version)
+        })();
+        let _ = std::fs::remove_file(&path);
+        restored
+    }
+
+    pub fn mark_node_config_push(&self, node_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO pending_node_config_push (node_id) VALUES (?1)
+             ON CONFLICT(node_id) DO NOTHING",
+            params![node_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn node_needs_config_push(&self, node_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM pending_node_config_push WHERE node_id = ?1",
+            params![node_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+    }
+
+    pub fn clear_node_config_push(&self, node_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM pending_node_config_push WHERE node_id = ?1",
+            params![node_id],
+        )?;
+        Ok(())
     }
 
     pub fn append_replication_outbox(
@@ -2058,7 +2687,11 @@ impl Database {
         let conn = self.lock_conn()?;
         let rows = conn.execute(
             "UPDATE nodes SET last_heartbeat = datetime('now'), \
-             status = CASE WHEN approval_status = 'approved' THEN 'ready' ELSE status END, \
+             status = CASE \
+               WHEN status IN ('cordoned', 'draining', 'drained') THEN status \
+               WHEN approval_status = 'approved' THEN 'ready' \
+               ELSE status \
+             END, \
              cpu_used = ?2, memory_used = ?3, cert_expiry_days = ?4, luks_method = ?5 \
              WHERE id = ?1",
             params![node_id, cpu_used, mem_used, cert_expiry_days, luks_method],
@@ -2120,6 +2753,145 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn replace_vm_nics(&self, vm_id: &str, nics: &[VmNicRow]) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM vm_nics WHERE vm_id = ?1", params![vm_id])?;
+        for nic in nics {
+            conn.execute(
+                "INSERT INTO vm_nics (vm_id, position, network, mac_address, model, ip_address)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    vm_id,
+                    nic.position,
+                    nic.network,
+                    nic.mac_address,
+                    nic.model,
+                    nic.ip_address,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn insert_vm_nic(&self, nic: &VmNicRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vm_nics (vm_id, position, network, mac_address, model, ip_address)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                nic.vm_id,
+                nic.position,
+                nic.network,
+                nic.mac_address,
+                nic.model,
+                nic.ip_address,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_vm_nics(&self, vm_id: &str) -> Result<Vec<VmNicRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT vm_id, position, network, mac_address, model, ip_address
+             FROM vm_nics WHERE vm_id = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![vm_id], |row| {
+            Ok(VmNicRow {
+                vm_id: row.get(0)?,
+                position: row.get(1)?,
+                network: row.get(2)?,
+                mac_address: row.get(3)?,
+                model: row.get(4)?,
+                ip_address: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn list_all_vm_nics(&self) -> Result<Vec<VmNicRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT vm_id, position, network, mac_address, model, ip_address
+             FROM vm_nics ORDER BY vm_id, position",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(VmNicRow {
+                vm_id: row.get(0)?,
+                position: row.get(1)?,
+                network: row.get(2)?,
+                mac_address: row.get(3)?,
+                model: row.get(4)?,
+                ip_address: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn list_nic_ips_on_node_network(
+        &self,
+        node_id: &str,
+        network: &str,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT n.ip_address FROM vm_nics n
+             JOIN vms v ON v.id = n.vm_id
+             WHERE v.node_id = ?1 AND n.network = ?2 AND n.ip_address != ''",
+        )?;
+        let rows = stmt.query_map(params![node_id, network], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    pub fn set_vm_anti_affinity(
+        &self,
+        vm_id: &str,
+        anti_affinity: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vm_placement (vm_id, anti_affinity) VALUES (?1, ?2)
+             ON CONFLICT(vm_id) DO UPDATE SET anti_affinity = excluded.anti_affinity",
+            params![vm_id, anti_affinity],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_vm_anti_affinity(&self, vm_id: &str) -> Result<String, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        match conn.query_row(
+            "SELECT anti_affinity FROM vm_placement WHERE vm_id = ?1",
+            params![vm_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn anti_affinity_groups_by_node(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT v.node_id, p.anti_affinity
+             FROM vm_placement p
+             JOIN vms v ON v.id = p.vm_id
+             WHERE p.anti_affinity != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (node_id, group) = row?;
+            out.entry(node_id).or_default().push(group);
+        }
+        Ok(out)
     }
 
     /// Insert a VM row, or update it in place when the id already exists.
@@ -2529,28 +3301,176 @@ impl Database {
     /// same L2 domain). Picks the global max `next_ip`, returns it, and
     /// bumps every row's counter so the next call is also unique.
     pub fn allocate_vm_ip_global(&self, network_name: &str) -> Result<String, rusqlite::Error> {
-        let conn = self.lock_conn()?;
-        let (gateway_ip, global_next): (String, i32) = conn.query_row(
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(ip) = take_released_vxlan_ip(&tx, network_name)? {
+            tx.commit()?;
+            return Ok(ip);
+        }
+        let (gateway_ip, global_next): (String, i32) = tx.query_row(
             "SELECT gateway_ip, MAX(next_ip) FROM networks WHERE name = ?1",
             params![network_name],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let new_next = global_next + 1;
-        conn.execute(
+        tx.execute(
             "UPDATE networks SET next_ip = ?1 WHERE name = ?2",
             params![new_next, network_name],
         )?;
+        tx.commit()?;
         let prefix = gateway_ip.rsplit_once('.').map(|x| x.0).unwrap_or("10.0.0");
         Ok(format!("{}.{}", prefix, global_next))
     }
 
     pub fn delete_network(&self, node_id: &str, name: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM network_policy WHERE node_id = ?1 AND name = ?2",
+            params![node_id, name],
+        )?;
         let rows = conn.execute(
             "DELETE FROM networks WHERE node_id = ?1 AND name = ?2",
             params![node_id, name],
         )?;
         Ok(rows > 0)
+    }
+
+    pub fn upsert_network_policy(&self, policy: &NetworkPolicyRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO network_policy (node_id, name, east_west, ipv6_prefix, ipv6_gateway, ipv6_next)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(node_id, name) DO UPDATE SET
+               east_west = excluded.east_west,
+               ipv6_prefix = excluded.ipv6_prefix,
+               ipv6_gateway = excluded.ipv6_gateway",
+            params![
+                policy.node_id,
+                policy.name,
+                if policy.east_west { 1 } else { 0 },
+                policy.ipv6_prefix,
+                policy.ipv6_gateway,
+                policy.ipv6_next,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Stored policy, or an absent row when the network has never set one.
+    pub fn get_network_policy(
+        &self,
+        node_id: &str,
+        name: &str,
+    ) -> Result<NetworkPolicyRow, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        match conn.query_row(
+            "SELECT node_id, name, east_west, ipv6_prefix, ipv6_gateway, ipv6_next
+             FROM network_policy WHERE node_id = ?1 AND name = ?2",
+            params![node_id, name],
+            row_to_network_policy,
+        ) {
+            Ok(row) => Ok(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Ok(NetworkPolicyRow::absent(node_id, name))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn list_network_policies_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<NetworkPolicyRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, name, east_west, ipv6_prefix, ipv6_gateway, ipv6_next
+             FROM network_policy WHERE node_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![node_id], row_to_network_policy)?;
+        rows.collect()
+    }
+
+    /// Allocate one IPv6 address and store it on the VM.
+    ///
+    /// `global` is true for VXLAN, where every node shares the prefix.
+    /// A previously released address is reused before `ipv6_next` advances.
+    pub fn allocate_vm_ipv6(
+        &self,
+        node_id: &str,
+        network: &str,
+        vm_id: &str,
+        position: i32,
+        global: bool,
+    ) -> Result<String, rusqlite::Error> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let scope = crate::net_policy::ipv6_scope(global, node_id, network);
+        let address = if let Some(released) = take_released_ipv6(&tx, &scope)? {
+            released
+        } else {
+            let (prefix, next) = if global {
+                tx.query_row(
+                    "SELECT ipv6_prefix, MAX(ipv6_next) FROM network_policy WHERE name = ?1 AND ipv6_prefix != ''",
+                    params![network],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)),
+                )?
+            } else {
+                tx.query_row(
+                    "SELECT ipv6_prefix, ipv6_next FROM network_policy WHERE node_id = ?1 AND name = ?2",
+                    params![node_id, network],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)),
+                )?
+            };
+            let host = u32::try_from(next).unwrap_or(0);
+            let address = crate::net_policy::ipv6_for_host(&prefix, host).map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e,
+                )))
+            })?;
+            let new_next = next + 1;
+            if global {
+                tx.execute(
+                    "UPDATE network_policy SET ipv6_next = ?1 WHERE name = ?2",
+                    params![new_next, network],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE network_policy SET ipv6_next = ?1 WHERE node_id = ?2 AND name = ?3",
+                    params![new_next, node_id, network],
+                )?;
+            }
+            address
+        };
+        tx.execute(
+            "INSERT INTO vm_ipv6 (vm_id, position, address) VALUES (?1, ?2, ?3)",
+            params![vm_id, position, address],
+        )?;
+        tx.commit()?;
+        Ok(address)
+    }
+
+    pub fn list_vm_ipv6(&self, vm_id: &str) -> Result<Vec<VmIpv6Row>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT vm_id, position, address FROM vm_ipv6 WHERE vm_id = ?1 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![vm_id], row_to_vm_ipv6)?;
+        rows.collect()
+    }
+
+    pub fn replace_vm_ipv6(&self, vm_id: &str, rows: &[VmIpv6Row]) -> Result<(), rusqlite::Error> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM vm_ipv6 WHERE vm_id = ?1", params![vm_id])?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO vm_ipv6 (vm_id, position, address) VALUES (?1, ?2, ?3)",
+                params![vm_id, row.position, row.address],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn upsert_security_group(&self, sg: &SecurityGroupRow) -> Result<(), rusqlite::Error> {
@@ -2608,22 +3528,24 @@ impl Database {
     ) -> Result<DiskLayoutRow, rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO disk_layouts (name, node_id, generation, layout_nix)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO disk_layouts (name, node_id, generation, layout_nix, evacuate)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(name) DO UPDATE SET
                node_id = excluded.node_id,
                generation = excluded.generation,
                layout_nix = excluded.layout_nix,
+               evacuate = excluded.evacuate,
                updated_at = datetime('now')",
             params![
                 layout.name,
                 layout.node_id,
                 layout.generation,
                 layout.layout_nix,
+                layout.evacuate as i32,
             ],
         )?;
         let mut stmt = conn.prepare(
-            "SELECT name, node_id, generation, layout_nix, created_at, updated_at
+            "SELECT name, node_id, generation, layout_nix, evacuate, created_at, updated_at
              FROM disk_layouts WHERE name = ?1",
         )?;
         let row = stmt.query_row(params![layout.name], |row| {
@@ -2632,8 +3554,9 @@ impl Database {
                 node_id: row.get(1)?,
                 generation: row.get(2)?,
                 layout_nix: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
+                evacuate: row.get::<_, i32>(4)? != 0,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })?;
         Ok(row)
@@ -2642,7 +3565,7 @@ impl Database {
     pub fn get_disk_layout(&self, name: &str) -> Result<Option<DiskLayoutRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT name, node_id, generation, layout_nix, created_at, updated_at
+            "SELECT name, node_id, generation, layout_nix, evacuate, created_at, updated_at
              FROM disk_layouts WHERE name = ?1",
         )?;
         let mut rows = stmt.query_map(params![name], |row| {
@@ -2651,8 +3574,9 @@ impl Database {
                 node_id: row.get(1)?,
                 generation: row.get(2)?,
                 layout_nix: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
+                evacuate: row.get::<_, i32>(4)? != 0,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })?;
         rows.next().transpose()
@@ -2665,7 +3589,7 @@ impl Database {
         let conn = self.lock_conn()?;
         if let Some(node_id) = node_id_filter {
             let mut stmt = conn.prepare(
-                "SELECT name, node_id, generation, layout_nix, created_at, updated_at
+                "SELECT name, node_id, generation, layout_nix, evacuate, created_at, updated_at
                  FROM disk_layouts WHERE node_id = ?1 ORDER BY name ASC",
             )?;
             let rows = stmt.query_map(params![node_id], |row| {
@@ -2674,14 +3598,15 @@ impl Database {
                     node_id: row.get(1)?,
                     generation: row.get(2)?,
                     layout_nix: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
+                    evacuate: row.get::<_, i32>(4)? != 0,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
                 })
             })?;
             rows.collect()
         } else {
             let mut stmt = conn.prepare(
-                "SELECT name, node_id, generation, layout_nix, created_at, updated_at
+                "SELECT name, node_id, generation, layout_nix, evacuate, created_at, updated_at
                  FROM disk_layouts ORDER BY name ASC",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -2690,8 +3615,9 @@ impl Database {
                     node_id: row.get(1)?,
                     generation: row.get(2)?,
                     layout_nix: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
+                    evacuate: row.get::<_, i32>(4)? != 0,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
                 })
             })?;
             rows.collect()
@@ -2779,7 +3705,7 @@ impl Database {
     ) -> Result<Vec<DiskLayoutRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT d.name, d.node_id, d.generation, d.layout_nix, d.created_at, d.updated_at
+            "SELECT d.name, d.node_id, d.generation, d.layout_nix, d.evacuate, d.created_at, d.updated_at
              FROM disk_layouts d
              LEFT JOIN disk_layout_status s ON s.name = d.name
              WHERE s.name IS NULL OR s.observed_generation < d.generation
@@ -2791,8 +3717,9 @@ impl Database {
                 node_id: row.get(1)?,
                 generation: row.get(2)?,
                 layout_nix: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
+                evacuate: row.get::<_, i32>(4)? != 0,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })?;
         rows.collect()
@@ -2874,7 +3801,56 @@ impl Database {
 
     pub fn delete_ceph_cluster(&self, name: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.lock_conn()?;
+        self.clear_retired_ceph_nodes_conn(&conn, name)?;
         Ok(conn.execute("DELETE FROM ceph_clusters WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn add_retired_ceph_node(
+        &self,
+        cluster: &str,
+        node_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ceph_retired_nodes (cluster_name, node_id) VALUES (?1, ?2)
+             ON CONFLICT(cluster_name, node_id) DO NOTHING",
+            params![cluster, node_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_retired_ceph_nodes(&self, cluster: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id FROM ceph_retired_nodes WHERE cluster_name=?1 ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map(params![cluster], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    pub fn clear_retired_ceph_node(
+        &self,
+        cluster: &str,
+        node_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM ceph_retired_nodes WHERE cluster_name=?1 AND node_id=?2",
+            params![cluster, node_id],
+        )?;
+        Ok(())
+    }
+
+    fn clear_retired_ceph_nodes_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        cluster: &str,
+    ) -> Result<(), rusqlite::Error> {
+        conn.execute(
+            "DELETE FROM ceph_retired_nodes WHERE cluster_name=?1",
+            params![cluster],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_ceph_cluster_status(
@@ -2943,64 +3919,872 @@ impl Database {
         rows.collect()
     }
 
-    pub fn upsert_volume(&self, row: &VolumeRow) -> Result<(), rusqlite::Error> {
+    pub fn upsert_shared_filesystem(
+        &self,
+        row: &SharedFilesystemRow,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO volumes (id, vm_id, pool, image, size_bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(NULLIF(?6, ''), datetime('now')))
-             ON CONFLICT(vm_id) DO UPDATE SET pool=excluded.pool, image=excluded.image,
-               size_bytes=excluded.size_bytes",
+            "INSERT INTO shared_filesystems (name, generation, spec_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, COALESCE(NULLIF(?4, ''), datetime('now')), datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET
+               generation = excluded.generation,
+               spec_json = excluded.spec_json,
+               updated_at = datetime('now')",
+            params![row.name, row.generation, row.spec_json, row.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_shared_filesystem(
+        &self,
+        name: &str,
+    ) -> Result<Option<SharedFilesystemRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, spec_json, created_at, updated_at
+             FROM shared_filesystems WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(SharedFilesystemRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_shared_filesystems(&self) -> Result<Vec<SharedFilesystemRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, spec_json, created_at, updated_at
+             FROM shared_filesystems ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SharedFilesystemRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_shared_filesystem(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute(
+            "DELETE FROM shared_filesystems WHERE name = ?1",
+            params![name],
+        )? > 0)
+    }
+
+    pub fn upsert_shared_filesystem_status(
+        &self,
+        row: &SharedFilesystemStatusRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO shared_filesystem_status (
+                name, observed_generation, phase, health_message, last_transition_at
+             ) VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5, ''), datetime('now')))
+             ON CONFLICT(name) DO UPDATE SET
+               observed_generation = excluded.observed_generation,
+               phase = excluded.phase,
+               health_message = excluded.health_message,
+               last_transition_at = excluded.last_transition_at",
             params![
-                row.id,
-                row.vm_id,
-                row.pool,
-                row.image,
-                row.size_bytes,
+                row.name,
+                row.observed_generation,
+                row.phase,
+                row.health_message,
+                row.last_transition_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_shared_filesystem_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<SharedFilesystemStatusRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, observed_generation, phase, health_message, last_transition_at
+             FROM shared_filesystem_status WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(SharedFilesystemStatusRow {
+                name: r.get(0)?,
+                observed_generation: r.get(1)?,
+                phase: r.get(2)?,
+                health_message: r.get(3)?,
+                last_transition_at: r.get(4)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_shared_filesystems_needing_reconcile(
+        &self,
+    ) -> Result<Vec<SharedFilesystemRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT f.name, f.generation, f.spec_json, f.created_at, f.updated_at
+             FROM shared_filesystems f
+             LEFT JOIN shared_filesystem_status s ON s.name = f.name
+             WHERE s.name IS NULL
+                OR s.observed_generation < f.generation
+                OR s.phase IN ('pending', 'bootstrapping', 'degraded')
+             ORDER BY f.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SharedFilesystemRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn upsert_object_store(&self, row: &ObjectStoreRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO object_stores (name, generation, spec_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, COALESCE(NULLIF(?4, ''), datetime('now')), datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET
+               generation = excluded.generation,
+               spec_json = excluded.spec_json,
+               updated_at = datetime('now')",
+            params![row.name, row.generation, row.spec_json, row.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_object_store(&self, name: &str) -> Result<Option<ObjectStoreRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, spec_json, created_at, updated_at
+             FROM object_stores WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(ObjectStoreRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_object_stores(&self) -> Result<Vec<ObjectStoreRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, spec_json, created_at, updated_at
+             FROM object_stores ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ObjectStoreRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_object_store(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM object_stores WHERE name = ?1", params![name])? > 0)
+    }
+
+    pub fn upsert_object_store_status(
+        &self,
+        row: &ObjectStoreStatusRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO object_store_status (
+                name, observed_generation, phase, health_message, last_transition_at
+             ) VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5, ''), datetime('now')))
+             ON CONFLICT(name) DO UPDATE SET
+               observed_generation = excluded.observed_generation,
+               phase = excluded.phase,
+               health_message = excluded.health_message,
+               last_transition_at = excluded.last_transition_at",
+            params![
+                row.name,
+                row.observed_generation,
+                row.phase,
+                row.health_message,
+                row.last_transition_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_object_store_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<ObjectStoreStatusRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, observed_generation, phase, health_message, last_transition_at
+             FROM object_store_status WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(ObjectStoreStatusRow {
+                name: r.get(0)?,
+                observed_generation: r.get(1)?,
+                phase: r.get(2)?,
+                health_message: r.get(3)?,
+                last_transition_at: r.get(4)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_object_stores_needing_reconcile(
+        &self,
+    ) -> Result<Vec<ObjectStoreRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT o.name, o.generation, o.spec_json, o.created_at, o.updated_at
+             FROM object_stores o
+             LEFT JOIN object_store_status s ON s.name = o.name
+             WHERE s.name IS NULL
+                OR s.observed_generation < o.generation
+                OR s.phase IN ('pending', 'bootstrapping', 'degraded')
+             ORDER BY o.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ObjectStoreRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                spec_json: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn insert_object_user(&self, row: &ObjectUserRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO object_users (name, store_name, access_key, secret, created_at)
+             VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5, ''), datetime('now')))",
+            params![
+                row.name,
+                row.store_name,
+                row.access_key,
+                row.secret,
                 row.created_at
             ],
         )?;
         Ok(())
     }
 
-    pub fn get_volume_by_vm(&self, vm_id: &str) -> Result<Option<VolumeRow>, rusqlite::Error> {
+    pub fn get_object_user(
+        &self,
+        name: &str,
+        store_name: &str,
+    ) -> Result<Option<ObjectUserRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, vm_id, pool, image, size_bytes, created_at FROM volumes WHERE vm_id=?1",
+            "SELECT name, store_name, access_key, secret, created_at
+             FROM object_users WHERE name = ?1 AND store_name = ?2",
         )?;
-        let mut rows = stmt.query_map(params![vm_id], |r| {
-            Ok(VolumeRow {
-                id: r.get(0)?,
-                vm_id: r.get(1)?,
-                pool: r.get(2)?,
-                image: r.get(3)?,
-                size_bytes: r.get(4)?,
-                created_at: r.get(5)?,
+        let mut rows = stmt.query_map(params![name, store_name], |r| {
+            Ok(ObjectUserRow {
+                name: r.get(0)?,
+                store_name: r.get(1)?,
+                access_key: r.get(2)?,
+                secret: r.get(3)?,
+                created_at: r.get(4)?,
             })
         })?;
         rows.next().transpose()
     }
 
-    pub fn list_volumes(&self) -> Result<Vec<VolumeRow>, rusqlite::Error> {
+    pub fn list_object_users_for_store(
+        &self,
+        store_name: &str,
+    ) -> Result<Vec<ObjectUserRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, vm_id, pool, image, size_bytes, created_at FROM volumes ORDER BY vm_id",
+            "SELECT name, store_name, access_key, secret, created_at
+             FROM object_users WHERE store_name = ?1 ORDER BY name",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(VolumeRow {
-                id: r.get(0)?,
-                vm_id: r.get(1)?,
-                pool: r.get(2)?,
-                image: r.get(3)?,
-                size_bytes: r.get(4)?,
-                created_at: r.get(5)?,
+        let rows = stmt.query_map(params![store_name], |r| {
+            Ok(ObjectUserRow {
+                name: r.get(0)?,
+                store_name: r.get(1)?,
+                access_key: r.get(2)?,
+                secret: r.get(3)?,
+                created_at: r.get(4)?,
             })
         })?;
         rows.collect()
     }
 
+    pub fn delete_object_user(
+        &self,
+        name: &str,
+        store_name: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute(
+            "DELETE FROM object_users WHERE name = ?1 AND store_name = ?2",
+            params![name, store_name],
+        )? > 0)
+    }
+
+    pub fn upsert_volume(&self, row: &VolumeRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO volumes (
+                id, name, vm_id, role, slot, pool, image, size_bytes,
+                storage_class, attach_state, serial, source_json,
+                guest_format_json, generation, parent_snapshot_id,
+                guest_visible_bytes, guest_checked_at, encrypted, wrapped_dek,
+                created_at
+             )
+             VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19,
+                COALESCE(NULLIF(?20, ''), datetime('now'))
+             )
+             ON CONFLICT(id) DO UPDATE SET
+               name=excluded.name,
+               vm_id=excluded.vm_id,
+               role=excluded.role,
+               slot=excluded.slot,
+               pool=excluded.pool,
+               image=excluded.image,
+               size_bytes=excluded.size_bytes,
+               storage_class=excluded.storage_class,
+               attach_state=excluded.attach_state,
+               serial=excluded.serial,
+               source_json=excluded.source_json,
+               guest_format_json=excluded.guest_format_json,
+               generation=excluded.generation,
+               parent_snapshot_id=excluded.parent_snapshot_id,
+               guest_visible_bytes=excluded.guest_visible_bytes,
+               guest_checked_at=excluded.guest_checked_at,
+               encrypted=excluded.encrypted,
+               wrapped_dek=excluded.wrapped_dek",
+            params![
+                row.id,
+                row.name,
+                row.vm_id,
+                row.role,
+                row.slot,
+                row.pool,
+                row.image,
+                row.size_bytes,
+                row.storage_class,
+                row.attach_state,
+                row.serial,
+                row.source_json,
+                row.guest_format_json,
+                row.generation,
+                row.parent_snapshot_id,
+                row.guest_visible_bytes,
+                row.guest_checked_at,
+                row.encrypted as i32,
+                row.wrapped_dek,
+                row.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn map_volume_row(r: &rusqlite::Row<'_>) -> Result<VolumeRow, rusqlite::Error> {
+        Ok(VolumeRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            vm_id: r.get(2)?,
+            role: r.get(3)?,
+            slot: r.get(4)?,
+            pool: r.get(5)?,
+            image: r.get(6)?,
+            size_bytes: r.get(7)?,
+            storage_class: r.get(8)?,
+            attach_state: r.get(9)?,
+            serial: r.get(10)?,
+            source_json: r.get(11)?,
+            guest_format_json: r.get(12)?,
+            generation: r.get(13)?,
+            parent_snapshot_id: r.get(14)?,
+            guest_visible_bytes: r.get(15)?,
+            guest_checked_at: r.get(16)?,
+            encrypted: r.get::<_, i32>(17)? != 0,
+            wrapped_dek: r.get(18)?,
+            created_at: r.get(19)?,
+        })
+    }
+
+    const VOLUME_SELECT: &'static str =
+        "SELECT id, name, vm_id, role, slot, pool, image, size_bytes,
+            storage_class, attach_state, serial, source_json, guest_format_json,
+            generation, parent_snapshot_id, guest_visible_bytes, guest_checked_at,
+            encrypted, wrapped_dek, created_at FROM volumes";
+
+    /// Root volume for a VM (attach_state may still be attached). None when the
+    /// VM has no Ceph root row yet.
+    pub fn get_volume_by_vm(&self, vm_id: &str) -> Result<Option<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE vm_id=?1 AND role='root' ORDER BY slot LIMIT 1",
+            Self::VOLUME_SELECT
+        ))?;
+        let mut rows = stmt.query_map(params![vm_id], Self::map_volume_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn get_volume_by_id(&self, id: &str) -> Result<Option<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!("{} WHERE id=?1", Self::VOLUME_SELECT))?;
+        let mut rows = stmt.query_map(params![id], Self::map_volume_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn get_volume_by_name(&self, name: &str) -> Result<Option<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!("{} WHERE name=?1", Self::VOLUME_SELECT))?;
+        let mut rows = stmt.query_map(params![name], Self::map_volume_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn list_volumes_for_vm(&self, vm_id: &str) -> Result<Vec<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE vm_id=?1 ORDER BY role ASC, slot ASC, name ASC",
+            Self::VOLUME_SELECT
+        ))?;
+        let rows = stmt.query_map(params![vm_id], Self::map_volume_row)?;
+        rows.collect()
+    }
+
+    /// Volumes that must be mapped for a running or migrating VM.
+    pub fn list_attached_volumes_for_vm(
+        &self,
+        vm_id: &str,
+    ) -> Result<Vec<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE vm_id=?1 AND attach_state IN ('attached', 'attaching')
+             ORDER BY role ASC, slot ASC, name ASC",
+            Self::VOLUME_SELECT
+        ))?;
+        let rows = stmt.query_map(params![vm_id], Self::map_volume_row)?;
+        rows.collect()
+    }
+
+    pub fn next_data_slot_for_vm(&self, vm_id: &str) -> Result<i32, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let max: Option<i32> = conn.query_row(
+            "SELECT MAX(slot) FROM volumes WHERE vm_id=?1 AND role='data'",
+            params![vm_id],
+            |r| r.get(0),
+        )?;
+        Ok(max.unwrap_or(0) + 1)
+    }
+
+    pub fn list_volumes(&self) -> Result<Vec<VolumeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!("{} ORDER BY name ASC", Self::VOLUME_SELECT))?;
+        let rows = stmt.query_map([], Self::map_volume_row)?;
+        rows.collect()
+    }
+
+    pub fn delete_volume_by_id(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM volumes WHERE id=?1", params![id])? > 0)
+    }
+
+    /// Delete every volume row for a VM (root and data). Prefer
+    /// `delete_root_and_optionally_data` from DeleteVm.
     pub fn delete_volume_by_vm(&self, vm_id: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.lock_conn()?;
         Ok(conn.execute("DELETE FROM volumes WHERE vm_id=?1", params![vm_id])? > 0)
+    }
+
+    pub fn delete_root_volume_by_vm(&self, vm_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute(
+            "DELETE FROM volumes WHERE vm_id=?1 AND role='root'",
+            params![vm_id],
+        )? > 0)
+    }
+
+    /// Detach data volumes (clear vm_id, attach_state=detached) without deleting RBD.
+    pub fn detach_data_volumes_for_vm(&self, vm_id: &str) -> Result<usize, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute(
+            "UPDATE volumes SET vm_id='', attach_state='detached', slot=0,
+               generation=generation+1
+             WHERE vm_id=?1 AND role='data'",
+            params![vm_id],
+        )?)
+    }
+
+    pub fn insert_vm_operation(&self, row: &VmOperationRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vm_operations (
+                id, vm_id, kind, phase, source_node, target_node,
+                cancel_requested, send_succeeded, detail_json,
+                started_at, updated_at, finished_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                COALESCE(NULLIF(?10, ''), datetime('now')),
+                datetime('now'), ?11)",
+            params![
+                row.id,
+                row.vm_id,
+                row.kind,
+                row.phase,
+                row.source_node,
+                row.target_node,
+                row.cancel_requested as i32,
+                row.send_succeeded as i32,
+                row.detail_json,
+                row.started_at,
+                row.finished_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_vm_operation(&self, id: &str) -> Result<Option<VmOperationRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, vm_id, kind, phase, source_node, target_node,
+                    cancel_requested, send_succeeded, detail_json,
+                    started_at, updated_at, finished_at
+             FROM vm_operations WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::map_vm_operation_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn get_open_vm_operation(
+        &self,
+        vm_id: &str,
+    ) -> Result<Option<VmOperationRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, vm_id, kind, phase, source_node, target_node,
+                    cancel_requested, send_succeeded, detail_json,
+                    started_at, updated_at, finished_at
+             FROM vm_operations WHERE vm_id=?1 AND finished_at='' LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![vm_id], Self::map_vm_operation_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn list_vm_operations(
+        &self,
+        include_finished: bool,
+    ) -> Result<Vec<VmOperationRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let sql = if include_finished {
+            "SELECT id, vm_id, kind, phase, source_node, target_node,
+                    cancel_requested, send_succeeded, detail_json,
+                    started_at, updated_at, finished_at
+             FROM vm_operations ORDER BY started_at DESC"
+        } else {
+            "SELECT id, vm_id, kind, phase, source_node, target_node,
+                    cancel_requested, send_succeeded, detail_json,
+                    started_at, updated_at, finished_at
+             FROM vm_operations WHERE finished_at='' ORDER BY started_at DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], Self::map_vm_operation_row)?;
+        rows.collect()
+    }
+
+    pub fn update_vm_operation_phase(
+        &self,
+        id: &str,
+        phase: &str,
+        send_succeeded: Option<bool>,
+        detail_json: Option<&str>,
+        finished: bool,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let finished_at = if finished {
+            "datetime('now')"
+        } else {
+            "finished_at"
+        };
+        // finished_at expression can't be bound as string for SQL keyword — branch.
+        if finished {
+            conn.execute(
+                "UPDATE vm_operations SET phase=?2,
+                   send_succeeded=COALESCE(?3, send_succeeded),
+                   detail_json=COALESCE(?4, detail_json),
+                   updated_at=datetime('now'),
+                   finished_at=datetime('now')
+                 WHERE id=?1",
+                params![id, phase, send_succeeded.map(|b| b as i32), detail_json,],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE vm_operations SET phase=?2,
+                   send_succeeded=COALESCE(?3, send_succeeded),
+                   detail_json=COALESCE(?4, detail_json),
+                   updated_at=datetime('now')
+                 WHERE id=?1",
+                params![id, phase, send_succeeded.map(|b| b as i32), detail_json,],
+            )?;
+        }
+        let _ = finished_at;
+        Ok(())
+    }
+
+    pub fn request_cancel_vm_operation(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute(
+            "UPDATE vm_operations SET cancel_requested=1, updated_at=datetime('now')
+             WHERE id=?1 AND finished_at=''",
+            params![id],
+        )? > 0)
+    }
+
+    fn map_vm_operation_row(r: &rusqlite::Row<'_>) -> Result<VmOperationRow, rusqlite::Error> {
+        Ok(VmOperationRow {
+            id: r.get(0)?,
+            vm_id: r.get(1)?,
+            kind: r.get(2)?,
+            phase: r.get(3)?,
+            source_node: r.get(4)?,
+            target_node: r.get(5)?,
+            cancel_requested: r.get::<_, i32>(6)? != 0,
+            send_succeeded: r.get::<_, i32>(7)? != 0,
+            detail_json: r.get(8)?,
+            started_at: r.get(9)?,
+            updated_at: r.get(10)?,
+            finished_at: r.get(11)?,
+        })
+    }
+
+    pub fn insert_volume_snapshot(&self, row: &VolumeSnapshotRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO volume_snapshots (
+                id, name, volume_id, rbd_snap, protected, size_bytes, consistency, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                COALESCE(NULLIF(?8, ''), datetime('now')))",
+            params![
+                row.id,
+                row.name,
+                row.volume_id,
+                row.rbd_snap,
+                row.protected as i32,
+                row.size_bytes,
+                row.consistency,
+                row.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_volume_snapshot_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<VolumeSnapshotRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, volume_id, rbd_snap, protected, size_bytes, consistency, created_at
+             FROM volume_snapshots WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], Self::map_volume_snapshot_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn get_volume_snapshot_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<VolumeSnapshotRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, volume_id, rbd_snap, protected, size_bytes, consistency, created_at
+             FROM volume_snapshots WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::map_volume_snapshot_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn list_volume_snapshots(
+        &self,
+        volume_id: Option<&str>,
+    ) -> Result<Vec<VolumeSnapshotRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        if let Some(vid) = volume_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, volume_id, rbd_snap, protected, size_bytes, consistency, created_at
+                 FROM volume_snapshots WHERE volume_id=?1 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map(params![vid], Self::map_volume_snapshot_row)?;
+            rows.collect()
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, volume_id, rbd_snap, protected, size_bytes, consistency, created_at
+                 FROM volume_snapshots ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map([], Self::map_volume_snapshot_row)?;
+            rows.collect()
+        }
+    }
+
+    pub fn count_volumes_with_parent_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM volumes WHERE parent_snapshot_id=?1",
+            params![snapshot_id],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn delete_volume_snapshot(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM volume_snapshots WHERE id=?1", params![id])? > 0)
+    }
+
+    fn map_volume_snapshot_row(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<VolumeSnapshotRow, rusqlite::Error> {
+        Ok(VolumeSnapshotRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            volume_id: r.get(2)?,
+            rbd_snap: r.get(3)?,
+            protected: r.get::<_, i32>(4)? != 0,
+            size_bytes: r.get(5)?,
+            consistency: r.get(6)?,
+            created_at: r.get(7)?,
+        })
+    }
+
+    pub fn upsert_snapshot_policy(&self, row: &SnapshotPolicyRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO snapshot_policies (
+                name, selector_vm, selector_volume, schedule, keep, enabled,
+                last_run_at, last_message, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                COALESCE(NULLIF(?9, ''), datetime('now')), datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET
+               selector_vm=excluded.selector_vm,
+               selector_volume=excluded.selector_volume,
+               schedule=excluded.schedule,
+               keep=excluded.keep,
+               enabled=excluded.enabled,
+               last_run_at=excluded.last_run_at,
+               last_message=excluded.last_message,
+               updated_at=datetime('now')",
+            params![
+                row.name,
+                row.selector_vm,
+                row.selector_volume,
+                row.schedule,
+                row.keep,
+                row.enabled as i32,
+                row.last_run_at,
+                row.last_message,
+                row.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_snapshot_policy(
+        &self,
+        name: &str,
+    ) -> Result<Option<SnapshotPolicyRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, selector_vm, selector_volume, schedule, keep, enabled,
+                    last_run_at, last_message, created_at, updated_at
+             FROM snapshot_policies WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], Self::map_snapshot_policy_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn list_snapshot_policies(&self) -> Result<Vec<SnapshotPolicyRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, selector_vm, selector_volume, schedule, keep, enabled,
+                    last_run_at, last_message, created_at, updated_at
+             FROM snapshot_policies ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], Self::map_snapshot_policy_row)?;
+        rows.collect()
+    }
+
+    pub fn delete_snapshot_policy(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM snapshot_policies WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn upsert_guest_ops_key(
+        &self,
+        node_id: &str,
+        public_key: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO guest_ops_node_keys (node_id, public_key, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(node_id) DO UPDATE SET
+               public_key=excluded.public_key,
+               updated_at=datetime('now')",
+            params![node_id, public_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_guest_ops_keys(&self) -> Result<Vec<(String, String)>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt =
+            conn.prepare("SELECT node_id, public_key FROM guest_ops_node_keys ORDER BY node_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    fn map_snapshot_policy_row(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<SnapshotPolicyRow, rusqlite::Error> {
+        Ok(SnapshotPolicyRow {
+            name: r.get(0)?,
+            selector_vm: r.get(1)?,
+            selector_volume: r.get(2)?,
+            schedule: r.get(3)?,
+            keep: r.get(4)?,
+            enabled: r.get::<_, i32>(5)? != 0,
+            last_run_at: r.get(6)?,
+            last_message: r.get(7)?,
+            created_at: r.get(8)?,
+            updated_at: r.get(9)?,
+        })
     }
 
     pub fn upsert_cluster_update(&self, row: &ClusterUpdateRow) -> Result<(), rusqlite::Error> {
@@ -3480,12 +5264,84 @@ impl Database {
         Ok(rows > 0)
     }
 
-    pub fn delete_vm_by_id_or_name(&self, id_or_name: &str) -> Result<bool, rusqlite::Error> {
+    /// Write `state` only when it differs from the stored runtime state.
+    ///
+    /// `Missing` means this node does not track that VM name. `Unchanged`
+    /// means the row exists and already has `state`, so callers must not treat
+    /// it as an orphan or as a transition.
+    pub fn apply_vm_runtime_state(
+        &self,
+        node_id: &str,
+        vm_name: &str,
+        state: &str,
+    ) -> Result<VmRuntimeApply, rusqlite::Error> {
         let conn = self.lock_conn()?;
+        let found = conn.query_row(
+            "SELECT id, name, node_id, runtime_state FROM vms WHERE name = ?1 AND node_id = ?2",
+            params![vm_name, node_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        );
+        let (vm_id, name, stored_node, previous) = match found {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(VmRuntimeApply::Missing),
+            Err(err) => return Err(err),
+        };
+        if previous == state {
+            return Ok(VmRuntimeApply::Unchanged);
+        }
         let rows = conn.execute(
+            "UPDATE vms SET runtime_state = ?1 WHERE id = ?2 AND runtime_state = ?3",
+            params![state, vm_id, previous],
+        )?;
+        if rows == 0 {
+            return Ok(VmRuntimeApply::Unchanged);
+        }
+        Ok(VmRuntimeApply::Changed(VmRuntimeChange {
+            vm_id,
+            name,
+            node_id: stored_node,
+            previous,
+            current: state.to_string(),
+        }))
+    }
+
+    pub fn delete_vm_by_id_or_name(&self, id_or_name: &str) -> Result<bool, rusqlite::Error> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let found = {
+            let mut stmt = tx.prepare(
+                "SELECT id, node_id, network, vm_ip FROM vms WHERE id = ?1 OR name = ?1",
+            )?;
+            let rows = stmt.query_map(params![id_or_name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let found: Vec<(String, String, String, String)> =
+                rows.collect::<Result<Vec<_>, _>>()?;
+            found
+        };
+        if found.is_empty() {
+            return Ok(false);
+        }
+        for (vm_id, node_id, network, vm_ip) in &found {
+            release_vm_addresses(&tx, vm_id, node_id, network, vm_ip)?;
+        }
+        let rows = tx.execute(
             "DELETE FROM vms WHERE id = ?1 OR name = ?1",
             params![id_or_name],
         )?;
+        tx.commit()?;
         Ok(rows > 0)
     }
 
@@ -3912,6 +5768,31 @@ impl Database {
         let mut stmt = conn.prepare("SELECT key_name FROM vm_ssh_keys WHERE vm_id = ?1")?;
         let rows = stmt.query_map(params![vm_id], |row| row.get::<_, String>(0))?;
         rows.collect()
+    }
+
+    /// Remove a node row and its labels.
+    ///
+    /// VMs, networks, and workloads reference `nodes(id)` without cascade, so
+    /// the caller must refuse while any of those rows remain.
+    pub fn delete_node(&self, node_id: &str) -> Result<bool, rusqlite::Error> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM node_labels WHERE node_id = ?1",
+            params![node_id],
+        )?;
+        let rows = tx.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])?;
+        tx.commit()?;
+        Ok(rows > 0)
+    }
+
+    pub fn count_workloads_for_node(&self, node_id: &str) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM workloads WHERE node_id = ?1",
+            params![node_id],
+            |row| row.get(0),
+        )
     }
 
     pub fn update_node_status(&self, node_id: &str, status: &str) -> Result<bool, rusqlite::Error> {
@@ -4382,6 +6263,183 @@ fn row_to_vm(row: &rusqlite::Row) -> Result<VmRow, rusqlite::Error> {
         vm_ip: row.get(17)?,
         pci_devices: row.get(18)?,
     })
+}
+
+fn row_to_network_policy(row: &rusqlite::Row) -> Result<NetworkPolicyRow, rusqlite::Error> {
+    Ok(NetworkPolicyRow {
+        node_id: row.get(0)?,
+        name: row.get(1)?,
+        east_west: row.get::<_, i32>(2)? != 0,
+        ipv6_prefix: row.get(3)?,
+        ipv6_gateway: row.get(4)?,
+        ipv6_next: row.get(5)?,
+    })
+}
+
+fn row_to_vm_ipv6(row: &rusqlite::Row) -> Result<VmIpv6Row, rusqlite::Error> {
+    Ok(VmIpv6Row {
+        vm_id: row.get(0)?,
+        position: row.get(1)?,
+        address: row.get(2)?,
+    })
+}
+
+fn take_released_vxlan_ip(
+    conn: &rusqlite::Connection,
+    network_name: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let ip = match conn.query_row(
+        "SELECT ip FROM vxlan_released_ips
+         WHERE network = ?1
+           AND ip NOT IN (SELECT vm_ip FROM vms WHERE vm_ip != '')
+           AND ip NOT IN (SELECT ip_address FROM vm_nics WHERE ip_address != '')
+         ORDER BY ip LIMIT 1",
+        params![network_name],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(ip) => ip,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    conn.execute(
+        "DELETE FROM vxlan_released_ips WHERE network = ?1 AND ip = ?2",
+        params![network_name, ip],
+    )?;
+    Ok(Some(ip))
+}
+
+fn take_released_ipv6(
+    conn: &rusqlite::Connection,
+    scope: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let address = match conn.query_row(
+        "SELECT address FROM ipv6_released
+         WHERE scope = ?1
+           AND address NOT IN (SELECT address FROM vm_ipv6)
+         ORDER BY address LIMIT 1",
+        params![scope],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(address) => address,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    conn.execute(
+        "DELETE FROM ipv6_released WHERE scope = ?1 AND address = ?2",
+        params![scope, address],
+    )?;
+    Ok(Some(address))
+}
+
+fn release_vm_addresses(
+    conn: &rusqlite::Connection,
+    vm_id: &str,
+    node_id: &str,
+    primary_network: &str,
+    primary_ip: &str,
+) -> Result<(), rusqlite::Error> {
+    release_vxlan_ip(conn, node_id, primary_network, primary_ip)?;
+    let extras: Vec<(i32, String, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT position, network, ip_address FROM vm_nics WHERE vm_id = ?1")?;
+        let rows = stmt.query_map(params![vm_id], |row| {
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (_position, network, ip) in &extras {
+        release_vxlan_ip(conn, node_id, network, ip)?;
+    }
+    let ipv6: Vec<(i32, String)> = {
+        let mut stmt = conn.prepare("SELECT position, address FROM vm_ipv6 WHERE vm_id = ?1")?;
+        let rows = stmt.query_map(params![vm_id], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (position, address) in ipv6 {
+        let network = if position == 0 {
+            primary_network.to_string()
+        } else {
+            extras
+                .iter()
+                .find(|(pos, _, _)| *pos == position)
+                .map(|(_, network, _)| network.clone())
+                .unwrap_or_else(|| primary_network.to_string())
+        };
+        release_ipv6(conn, node_id, &network, &address)?;
+    }
+    Ok(())
+}
+
+fn release_vxlan_ip(
+    conn: &rusqlite::Connection,
+    node_id: &str,
+    network: &str,
+    ip: &str,
+) -> Result<(), rusqlite::Error> {
+    if ip.trim().is_empty() {
+        return Ok(());
+    }
+    let meta = match conn.query_row(
+        "SELECT network_type, gateway_ip FROM networks WHERE node_id = ?1 AND name = ?2",
+        params![node_id, network],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ) {
+        Ok(meta) => meta,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.0 != "vxlan" || ip == meta.1 {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO vxlan_released_ips (network, ip) VALUES (?1, ?2)",
+        params![network, ip],
+    )?;
+    Ok(())
+}
+
+fn release_ipv6(
+    conn: &rusqlite::Connection,
+    node_id: &str,
+    network: &str,
+    address: &str,
+) -> Result<(), rusqlite::Error> {
+    if address.trim().is_empty() {
+        return Ok(());
+    }
+    let policy = match conn.query_row(
+        "SELECT ipv6_gateway FROM network_policy WHERE node_id = ?1 AND name = ?2",
+        params![node_id, network],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(gateway) => gateway,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if address == policy {
+        return Ok(());
+    }
+    let global = match conn.query_row(
+        "SELECT network_type FROM networks WHERE node_id = ?1 AND name = ?2",
+        params![node_id, network],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(kind) => kind == "vxlan",
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(e) => return Err(e),
+    };
+    let scope = crate::net_policy::ipv6_scope(global, node_id, network);
+    conn.execute(
+        "INSERT OR IGNORE INTO ipv6_released (scope, address) VALUES (?1, ?2)",
+        params![scope, address],
+    )?;
+    Ok(())
 }
 
 fn row_to_network(row: &rusqlite::Row) -> Result<NetworkRow, rusqlite::Error> {
@@ -4924,6 +6982,108 @@ mod tests {
     }
 
     #[test]
+    fn vxlan_released_ip_is_reused_and_skipped_while_still_assigned() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        db.insert_network(&NetworkRow {
+            name: "overlay".into(),
+            external_ip: "0.0.0.0".into(),
+            gateway_ip: "10.50.0.1".into(),
+            internal_netmask: "255.255.255.0".into(),
+            node_id: node.id.clone(),
+            allowed_tcp_ports: String::new(),
+            allowed_udp_ports: String::new(),
+            vlan_id: 0,
+            network_type: "vxlan".into(),
+            enable_outbound_nat: false,
+            vni: 10200,
+            next_ip: 2,
+        })
+        .expect("insert network");
+
+        let first = db.allocate_vm_ip_global("overlay").expect("alloc");
+        assert_eq!(first, "10.50.0.2");
+        let mut vm = test_vm(&node.id);
+        vm.network = "overlay".into();
+        vm.vm_ip = first.clone();
+        db.insert_vm(&vm).expect("insert vm");
+        assert!(db.delete_vm_by_id_or_name(&vm.id).expect("delete"));
+
+        let mut still = test_vm(&node.id);
+        still.id = "vm-hold".into();
+        still.name = "hold".into();
+        still.network = "overlay".into();
+        still.vm_ip = first.clone();
+        still.image_path = "/var/lib/kcore/images/hold.raw".into();
+        db.insert_vm(&still).expect("hold the address");
+        let skipped = db.allocate_vm_ip_global("overlay").expect("skip in-use");
+        assert_eq!(skipped, "10.50.0.3");
+
+        assert!(db.delete_vm_by_id_or_name(&still.id).expect("delete hold"));
+        let reused = db.allocate_vm_ip_global("overlay").expect("reuse");
+        assert_eq!(reused, "10.50.0.2");
+        // .3 was handed out while .2 was still assigned, so the counter is already past it.
+        let fresh = db.allocate_vm_ip_global("overlay").expect("fresh");
+        assert_eq!(fresh, "10.50.0.4");
+    }
+
+    #[test]
+    fn ipv6_allocates_from_the_prefix_and_reclaims_on_delete() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        db.insert_network(&NetworkRow {
+            name: "overlay".into(),
+            external_ip: "0.0.0.0".into(),
+            gateway_ip: "10.50.0.1".into(),
+            internal_netmask: "255.255.255.0".into(),
+            node_id: node.id.clone(),
+            allowed_tcp_ports: String::new(),
+            allowed_udp_ports: String::new(),
+            vlan_id: 0,
+            network_type: "vxlan".into(),
+            enable_outbound_nat: true,
+            vni: 1,
+            next_ip: 2,
+        })
+        .expect("insert network");
+        db.upsert_network_policy(&NetworkPolicyRow {
+            node_id: node.id.clone(),
+            name: "overlay".into(),
+            east_west: true,
+            ipv6_prefix: "fd00:10:240::/64".into(),
+            ipv6_gateway: "fd00:10:240::1".into(),
+            ipv6_next: 2,
+        })
+        .expect("policy");
+
+        let mut vm = test_vm(&node.id);
+        vm.network = "overlay".into();
+        db.insert_vm(&vm).expect("insert vm");
+        let first = db
+            .allocate_vm_ipv6(&node.id, "overlay", &vm.id, 0, true)
+            .expect("alloc v6");
+        assert_eq!(first, "fd00:10:240::2");
+        assert!(db.delete_vm_by_id_or_name(&vm.id).expect("delete"));
+
+        let mut again = test_vm(&node.id);
+        again.id = "vm-2".into();
+        again.name = "web-2".into();
+        again.network = "overlay".into();
+        again.image_path = "/var/lib/kcore/images/web-2.raw".into();
+        db.insert_vm(&again).expect("insert again");
+        let reused = db
+            .allocate_vm_ipv6(&node.id, "overlay", &again.id, 0, true)
+            .expect("reuse v6");
+        assert_eq!(reused, "fd00:10:240::2");
+        let next = db
+            .allocate_vm_ipv6(&node.id, "overlay", &again.id, 1, true)
+            .expect("next v6");
+        assert_eq!(next, "fd00:10:240::3");
+    }
+
+    #[test]
     fn vm_ip_stored_and_retrieved() {
         let db = Database::open(":memory:").expect("open db");
         let node = test_node();
@@ -5458,11 +7618,78 @@ mod tests {
     }
 
     #[test]
+    fn apply_vm_runtime_state_reports_missing_unchanged_and_changed() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("node");
+        let vm = test_vm(&node.id);
+        db.insert_vm(&vm).expect("insert vm");
+
+        assert_eq!(
+            db.apply_vm_runtime_state(&node.id, "missing", "running")
+                .expect("missing"),
+            VmRuntimeApply::Missing
+        );
+        assert_eq!(
+            db.apply_vm_runtime_state(&node.id, &vm.name, "unknown")
+                .expect("same state"),
+            VmRuntimeApply::Unchanged
+        );
+        match db
+            .apply_vm_runtime_state(&node.id, &vm.name, "running")
+            .expect("change")
+        {
+            VmRuntimeApply::Changed(change) => {
+                assert_eq!(change.vm_id, vm.id);
+                assert_eq!(change.previous, "unknown");
+                assert_eq!(change.current, "running");
+            }
+            other => panic!("expected a change, got {other:?}"),
+        }
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("vm").runtime_state,
+            "running"
+        );
+        assert_eq!(
+            db.apply_vm_runtime_state(&node.id, &vm.name, "running")
+                .expect("second write"),
+            VmRuntimeApply::Unchanged
+        );
+    }
+
     fn set_vm_node_reports_a_missing_vm_rather_than_creating_one() {
         let db = Database::open(":memory:").expect("open db");
         let node = test_node();
         db.upsert_node(&node).expect("node");
         assert!(!db.set_vm_node("vm-nope", &node.id).expect("update"));
+    }
+
+    #[test]
+    fn extra_nics_round_trip_and_cascade_with_the_vm() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("node");
+        let vm = test_vm(&node.id);
+        db.insert_vm(&vm).expect("insert vm");
+        db.insert_vm_nic(&VmNicRow {
+            vm_id: vm.id.clone(),
+            position: 1,
+            network: "backend".into(),
+            mac_address: "52:54:00:11:22:33".into(),
+            model: "virtio".into(),
+            ip_address: "10.1.0.8".into(),
+        })
+        .expect("insert nic");
+        let listed = db.list_vm_nics(&vm.id).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].network, "backend");
+        assert_eq!(
+            db.list_nic_ips_on_node_network(&node.id, "backend")
+                .expect("ips"),
+            vec!["10.1.0.8".to_string()]
+        );
+        db.delete_vm_by_id_or_name(&vm.id).expect("delete");
+        assert!(db.list_vm_nics(&vm.id).expect("after delete").is_empty());
     }
 
     #[test]
@@ -5711,43 +7938,142 @@ mod tests {
         );
     }
 
+    fn test_root_volume(id: &str, vm_id: &str, vm_name: &str, size_bytes: i64) -> VolumeRow {
+        VolumeRow {
+            id: id.into(),
+            name: format!("{vm_name}-root"),
+            vm_id: vm_id.into(),
+            role: VolumeRow::ROLE_ROOT.into(),
+            slot: 0,
+            pool: "kcore-vms".into(),
+            image: format!("kcore-{vm_id}"),
+            size_bytes,
+            storage_class: "ceph".into(),
+            attach_state: VolumeRow::ATTACH_ATTACHED.into(),
+            serial: VolumeRow::serial_from_id(id),
+            source_json: "{}".into(),
+            guest_format_json: String::new(),
+            generation: 1,
+            parent_snapshot_id: String::new(),
+            guest_visible_bytes: -1,
+            guest_checked_at: String::new(),
+            encrypted: false,
+            wrapped_dek: String::new(),
+            created_at: String::new(),
+        }
+    }
+
     #[test]
     fn volume_upsert_get_list_delete_by_vm() {
         let db = Database::open(":memory:").expect("open db");
         db.upsert_node(&test_node()).unwrap();
         db.insert_vm(&test_vm("n1")).unwrap();
 
-        db.upsert_volume(&VolumeRow {
-            id: "vol-1".into(),
-            vm_id: "vm-1".into(),
-            pool: "kcore-vms".into(),
-            image: "kcore-vm-1".into(),
-            size_bytes: 10 * 1024 * 1024 * 1024,
-            created_at: String::new(),
-        })
+        db.upsert_volume(&test_root_volume(
+            "vol-1",
+            "vm-1",
+            "vm-1",
+            10 * 1024 * 1024 * 1024,
+        ))
         .unwrap();
         let got = db.get_volume_by_vm("vm-1").unwrap().expect("volume");
         assert_eq!(got.pool, "kcore-vms");
         assert_eq!(got.image, "kcore-vm-1");
+        assert_eq!(got.role, "root");
         assert_eq!(db.list_volumes().unwrap().len(), 1);
 
-        db.upsert_volume(&VolumeRow {
-            id: "vol-1b".into(),
-            vm_id: "vm-1".into(),
-            pool: "kcore-vms".into(),
-            image: "kcore-vm-1-resized".into(),
-            size_bytes: 20 * 1024 * 1024 * 1024,
-            created_at: String::new(),
-        })
-        .unwrap();
+        let mut resized = test_root_volume("vol-1", "vm-1", "vm-1", 20 * 1024 * 1024 * 1024);
+        resized.image = "kcore-vm-1-resized".into();
+        db.upsert_volume(&resized).unwrap();
         let updated = db.get_volume_by_vm("vm-1").unwrap().unwrap();
         assert_eq!(updated.image, "kcore-vm-1-resized");
         assert_eq!(updated.size_bytes, 20 * 1024 * 1024 * 1024);
-        assert_eq!(db.list_volumes().unwrap().len(), 1, "unique on vm_id");
+        assert_eq!(db.list_volumes().unwrap().len(), 1, "upsert by id");
+
+        let mut data = VolumeRow::new_data("pgdata", 5 * 1024 * 1024 * 1024);
+        data.vm_id = "vm-1".into();
+        data.attach_state = VolumeRow::ATTACH_ATTACHED.into();
+        data.slot = 1;
+        db.upsert_volume(&data).unwrap();
+        assert_eq!(db.list_volumes_for_vm("vm-1").unwrap().len(), 2);
+        assert_eq!(db.list_attached_volumes_for_vm("vm-1").unwrap().len(), 2);
 
         assert!(db.delete_volume_by_vm("vm-1").unwrap());
         assert!(db.get_volume_by_vm("vm-1").unwrap().is_none());
         assert!(!db.delete_volume_by_vm("vm-1").unwrap());
+    }
+
+    #[test]
+    fn vm_operation_insert_open_unique_and_cancel() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).unwrap();
+        db.insert_vm(&test_vm("n1")).unwrap();
+
+        let op = VmOperationRow {
+            id: "op-1".into(),
+            vm_id: "vm-1".into(),
+            kind: VmOperationRow::KIND_LIVE_MIGRATE.into(),
+            phase: VmOperationRow::PHASE_PREPARING.into(),
+            source_node: "n1".into(),
+            target_node: "n2".into(),
+            cancel_requested: false,
+            send_succeeded: false,
+            detail_json: "{}".into(),
+            started_at: String::new(),
+            updated_at: String::new(),
+            finished_at: String::new(),
+        };
+        db.insert_vm_operation(&op).unwrap();
+        assert!(db.get_open_vm_operation("vm-1").unwrap().is_some());
+        assert!(
+            db.insert_vm_operation(&VmOperationRow {
+                id: "op-2".into(),
+                ..op.clone()
+            })
+            .is_err(),
+            "only one open operation per VM"
+        );
+        assert!(db.request_cancel_vm_operation("op-1").unwrap());
+        let got = db.get_vm_operation("op-1").unwrap().unwrap();
+        assert!(got.cancel_requested);
+        db.update_vm_operation_phase(
+            "op-1",
+            VmOperationRow::PHASE_CANCELLED,
+            Some(false),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(db.get_open_vm_operation("vm-1").unwrap().is_none());
+        // Now a new open op is allowed.
+        db.insert_vm_operation(&VmOperationRow {
+            id: "op-3".into(),
+            finished_at: String::new(),
+            ..op
+        })
+        .unwrap();
+        assert_eq!(db.list_vm_operations(true).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn snapshot_round_trip_restores_nodes_and_rejects_garbage() {
+        let src = Database::open(":memory:").expect("open");
+        let node = test_node();
+        src.upsert_node(&node).expect("insert");
+        src.mark_node_config_push(&node.id).expect("flag");
+        let (bytes, version) = src.snapshot_sqlite().expect("snapshot");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(bytes.starts_with(b"SQLite format 3\0"));
+
+        let dst = Database::open(":memory:").expect("open dest");
+        let restored = dst.restore_sqlite(&bytes).expect("restore");
+        assert_eq!(restored, SCHEMA_VERSION);
+        let got = dst.get_node(&node.id).expect("get").expect("node");
+        assert_eq!(got.hostname, node.hostname);
+        assert!(dst.node_needs_config_push(&node.id).expect("flag"));
+
+        let err = dst.restore_sqlite(b"not a database").expect_err("garbage");
+        assert!(err.contains("not a SQLite"));
     }
 }
 
@@ -6083,6 +8409,7 @@ mod proptests {
                 node_id: node_id.clone(),
                 generation,
                 layout_nix: layout_nix.clone(),
+                evacuate: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             };
@@ -6093,8 +8420,31 @@ mod proptests {
             prop_assert_eq!(&got.node_id, &node_id);
             prop_assert_eq!(got.generation, generation);
             prop_assert_eq!(&got.layout_nix, &layout_nix);
+            prop_assert!(!got.evacuate);
             prop_assert!(!got.created_at.is_empty());
             prop_assert!(!got.updated_at.is_empty());
+        }
+
+        /// **DiskLayout evacuate flag** persists through upsert/get.
+        #[test]
+        fn disk_layout_evacuate_flag_round_trips(node_id in "[a-z0-9-]{1,8}", name in "[a-z0-9-]{1,12}") {
+            let db = Database::open(":memory:").expect("open db");
+            db.upsert_node(&make_node(
+                &node_id, "h", "127.0.0.1:9091",
+                4, 1024, 0, 0, false, 0, "DC1",
+            )).unwrap();
+            let layout = DiskLayoutRow {
+                name: name.clone(),
+                node_id: node_id.clone(),
+                generation: 1,
+                layout_nix: "{ disko.devices = {}; }".to_string(),
+                evacuate: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            db.upsert_disk_layout(&layout).unwrap();
+            let got = db.get_disk_layout(&name).unwrap().expect("layout exists");
+            prop_assert!(got.evacuate);
         }
 
         /// **DiskLayout upsert is idempotent**: applying the same row
@@ -6115,6 +8465,7 @@ mod proptests {
                 node_id: node_id.clone(),
                 generation: 1,
                 layout_nix: "{ disko.devices = {}; }".to_string(),
+                evacuate: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             };
@@ -6150,6 +8501,7 @@ mod proptests {
                 node_id: missing_node,
                 generation: 1,
                 layout_nix: "{}".to_string(),
+                evacuate: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             };
@@ -6186,6 +8538,7 @@ mod proptests {
                 node_id: node_id.clone(),
                 generation: 7,
                 layout_nix: "{}".to_string(),
+                evacuate: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             };
@@ -6229,6 +8582,7 @@ mod proptests {
                 node_id: node_id.clone(),
                 generation,
                 layout_nix: "{}".to_string(),
+                evacuate: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             }).unwrap();
@@ -6254,6 +8608,7 @@ mod proptests {
                 node_id: node_id.clone(),
                 generation: generation + 1,
                 layout_nix: "{ updated = true; }".to_string(),
+                evacuate: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             }).unwrap();
@@ -6346,5 +8701,54 @@ mod proptests {
             prop_assert!(db.list_operator_role_strings(&name).unwrap().is_empty());
             prop_assert!(db.get_operator_row(&name).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn snap_clone_parent_link_blocks_prune_semantics() {
+        let db = Database::open(":memory:").expect("db");
+        let mut root = VolumeRow::new_data("pgdata", 10 * 1024 * 1024 * 1024);
+        root.vm_id = "vm-1".into();
+        root.attach_state = VolumeRow::ATTACH_ATTACHED.into();
+        db.upsert_volume(&root).unwrap();
+        let snap = VolumeSnapshotRow {
+            id: "snap-1".into(),
+            name: "pgdata-t0".into(),
+            volume_id: root.id.clone(),
+            rbd_snap: "s1".into(),
+            protected: true,
+            size_bytes: root.size_bytes,
+            consistency: "crash".into(),
+            created_at: String::new(),
+        };
+        db.insert_volume_snapshot(&snap).unwrap();
+        let mut clone = VolumeRow::new_data("pgdata-clone", root.size_bytes);
+        clone.parent_snapshot_id = snap.id.clone();
+        db.upsert_volume(&clone).unwrap();
+        assert_eq!(db.count_volumes_with_parent_snapshot(&snap.id).unwrap(), 1);
+        clone.parent_snapshot_id.clear();
+        db.upsert_volume(&clone).unwrap();
+        assert_eq!(db.count_volumes_with_parent_snapshot(&snap.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn encrypted_volume_persists_wrapped_dek() {
+        let db = Database::open(":memory:").expect("db");
+        let mut vol = VolumeRow::new_data("secret", 1024 * 1024);
+        vol.encrypted = true;
+        vol.wrapped_dek = "v1blob".into();
+        db.upsert_volume(&vol).unwrap();
+        let loaded = db.get_volume_by_name("secret").unwrap().unwrap();
+        assert!(loaded.encrypted);
+        assert_eq!(loaded.wrapped_dek, "v1blob");
+    }
+
+    #[test]
+    fn guest_ops_node_keys_round_trip() {
+        let db = Database::open(":memory:").expect("db");
+        db.upsert_guest_ops_key("n1", "ssh-ed25519 AAAA n1")
+            .unwrap();
+        let keys = db.list_guest_ops_keys().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "n1");
     }
 }

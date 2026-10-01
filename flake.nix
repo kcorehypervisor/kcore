@@ -80,6 +80,8 @@
               inherit cargoArtifacts;
               pname = "kcore-node-agent";
               cargoExtraArgs = "-p kcore-node-agent";
+              # guest_ops tests and the agent itself call ssh-keygen.
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.openssh ];
             }
           );
 
@@ -616,6 +618,24 @@
                                                                   echo "Error: $DISK_PATH is not a valid block device"
                                                                   exit 1
                                                                 fi
+                                                                NORMALIZED_DATA_DISKS=()
+                                                                DISK_REAL=$(readlink -f "$DISK_PATH")
+                                                                for dd in "''${DATA_DISKS[@]}"; do
+                                                                  if [[ "$dd" != /dev/* ]]; then
+                                                                    dd="/dev/$dd"
+                                                                  fi
+                                                                  if [ ! -b "$dd" ]; then
+                                                                    echo "Error: data disk $dd is not a block device"
+                                                                    exit 1
+                                                                  fi
+                                                                  DD_REAL=$(readlink -f "$dd")
+                                                                  if [ "$DD_REAL" = "$DISK_REAL" ]; then
+                                                                    echo "Error: data disk $dd is the same device as the OS disk"
+                                                                    exit 1
+                                                                  fi
+                                                                  NORMALIZED_DATA_DISKS+=("$dd")
+                                                                done
+                                                                DATA_DISKS=("''${NORMALIZED_DATA_DISKS[@]}")
 
                                                                 echo "Selected: $DISK_PATH"
                                                                 lsblk "$DISK_PATH"
@@ -668,14 +688,24 @@
                                                                   partprobe "$target" 2>/dev/null || true
                                                                 }
 
-                                                                for vg in $(vgs --noheadings -o vg_name 2>/dev/null || true); do
-                                                                  vgchange -an "$vg" 2>/dev/null || true
-                                                                done
+                                                                unmount_disk_holders() {
+                                                                  local disk="$1"
+                                                                  local dev vg
+                                                                  while read -r dev; do
+                                                                    [ -z "$dev" ] && continue
+                                                                    [ "$dev" = "$disk" ] && continue
+                                                                    umount "$dev" 2>/dev/null || true
+                                                                  done < <(lsblk -ln -o PATH "$disk" 2>/dev/null || true)
+                                                                  # Only VGs whose physical volumes sit on this disk.
+                                                                  while read -r vg; do
+                                                                    [ -z "$vg" ] && continue
+                                                                    vgchange -an "$vg" 2>/dev/null || true
+                                                                  done < <(pvs --noheadings -o vg_name,pv_name 2>/dev/null | awk -v disk="$disk" 'index($2, disk)==1 { n=length(disk); rest=substr($2, n+1); if (rest=="" || (disk ~ /[A-Za-z]$/ && rest ~ /^[0-9]+$/) || rest ~ /^p[0-9]+$/) print $1 }' | sort -u)
+                                                                }
 
-                                                                for part in "$DISK_PATH"*; do
-                                                                  if [ -b "$part" ]; then
-                                                                    umount "$part" 2>/dev/null || true
-                                                                  fi
+                                                                unmount_disk_holders "$DISK_PATH"
+                                                                for dd in "''${DATA_DISKS[@]}"; do
+                                                                  unmount_disk_holders "$dd"
                                                                 done
 
                                                                 # Always wipe signatures on target disks for clean re-installs.
@@ -698,18 +728,18 @@
 
                                                                 echo "Disk encryption method: $LUKS_METHOD"
 
+                                                                if [ "$DATA_DISK_MODE" = "lvm" ] && [ -z "$LVM_VG_NAME" ]; then
+                                                                  LVM_VG_NAME="vg_kcore"
+                                                                fi
+                                                                if [ "$DATA_DISK_MODE" = "zfs" ] && [ -z "$ZFS_POOL_NAME" ]; then
+                                                                  ZFS_POOL_NAME="tank0"
+                                                                fi
+
                                                                 # Generate LUKS passphrase for disko (hex avoids shell-special chars)
                                                                 LUKS_PASSPHRASE=$(${pkgs.openssl}/bin/openssl rand -hex 32)
                                                                 mkdir -p /tmp/luks
                                                                 printf "%s" "$LUKS_PASSPHRASE" > /tmp/luks/password
                                                                 chmod 0400 /tmp/luks/password
-
-                                                                # Compute ROOT_PART path for post-install TPM enrollment
-                                                                if [[ "$DISK" == *nvme* ]] || [[ "$DISK" == *mmcblk* ]]; then
-                                                                  ROOT_PART="''${DISK_PATH}p2"
-                                                                else
-                                                                  ROOT_PART="''${DISK_PATH}2"
-                                                                fi
 
                                                                 # --- Build disko device configuration ---
                                                                 DATA_DISK_NIX=""
@@ -846,10 +876,26 @@
                                                                 echo "Running disko (partition, format, mount)..."
                                                                 disko --mode format,mount --root-mountpoint /mnt /tmp/disko-config.nix
 
-                                                                # For key-file method, copy passphrase to /boot for initrd unlock
+                                                                # Partition names are not a function of the disk path: nvme uses
+                                                                # p2, virtio uses 2, by-id uses -part2. cryptsetup reports the
+                                                                # device it actually opened.
+                                                                ROOT_PART=""
+                                                                if [ -e /dev/mapper/cryptroot ]; then
+                                                                  ROOT_PART="$(cryptsetup status cryptroot 2>/dev/null | awk '/device:/ {print $2; exit}')"
+                                                                fi
+                                                                if [ -z "$ROOT_PART" ] || [ ! -b "$ROOT_PART" ]; then
+                                                                  echo "Error: could not find the LUKS device behind /dev/mapper/cryptroot"
+                                                                  exit 1
+                                                                fi
+                                                                echo "LUKS root partition: $ROOT_PART"
+
+                                                                # The initrd is built on the live system, so the key file has to
+                                                                # exist at the path named in configuration.nix here AND on the
+                                                                # installed system (the same absolute path after reboot).
                                                                 if [ "$LUKS_METHOD" = "key-file" ]; then
-                                                                  cp /tmp/luks/password /mnt/boot/crypto_keyfile.bin
-                                                                  chmod 0400 /mnt/boot/crypto_keyfile.bin
+                                                                  install -d -m 0700 /etc/kcore/recovery /mnt/etc/kcore/recovery
+                                                                  install -m 0400 /tmp/luks/password /etc/kcore/recovery/crypto_keyfile.bin
+                                                                  install -m 0400 /tmp/luks/password /mnt/etc/kcore/recovery/crypto_keyfile.bin
                                                                 fi
 
                                                                 if [ "''${#DATA_DISKS[@]}" -gt 0 ]; then
@@ -881,7 +927,9 @@
                                                                 cp ${kcoreBrandingModule} /mnt/etc/nixos/modules/kcore-branding.nix
                                                                 cp ${kcoreCephModule} /mnt/etc/nixos/modules/kcore-ceph.nix
                                                                 printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-ceph.nix
-                                                                cp /tmp/disko-config.nix /mnt/etc/nixos/disko-config.nix
+                                                                # The format already happened. The saved graph must not point at
+                                                                # /tmp, which is gone after reboot.
+                                                                sed 's|passwordFile = "/tmp/luks/password"|passwordFile = "/etc/kcore/recovery/crypto_keyfile.bin"|' /tmp/disko-config.nix > /mnt/etc/nixos/disko-config.nix
 
                                                                 echo "Copying kcore config and certificates..."
                                                                 mkdir -p /mnt/etc/kcore
@@ -1135,6 +1183,10 @@
 
                                                                 # Build LUKS boot config for kcoreOS
                                                                 ROOT_PART_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+                                                                if [ -z "$ROOT_PART_UUID" ]; then
+                                                                  echo "Error: $ROOT_PART has no UUID; refusing to write a crypttab that cannot unlock"
+                                                                  exit 1
+                                                                fi
                                                                 LUKS_BOOT_CONFIG=""
                                                                 if [ "$LUKS_METHOD" = "tpm2" ]; then
                                                                   LUKS_BOOT_CONFIG=$(cat <<'LUKSEOF'
@@ -1154,7 +1206,7 @@
                                                 preLVM = true;
                                                 keyFile = "/crypto_keyfile.bin";
                                               };
-                                              boot.initrd.secrets."/crypto_keyfile.bin" = "/boot/crypto_keyfile.bin";
+                                              boot.initrd.secrets."/crypto_keyfile.bin" = "/etc/kcore/recovery/crypto_keyfile.bin";
                       LUKSEOF
                                                                   )
                                                                   LUKS_BOOT_CONFIG="''${LUKS_BOOT_CONFIG//ROOT_PART_UUID_PLACEHOLDER/$ROOT_PART_UUID}"
@@ -1212,6 +1264,7 @@
                         networking.bridges.br0.interfaces = [ "$GATEWAY_INTERFACE" ];
                         networking.interfaces.br0.useDHCP = true;
                         networking.interfaces."$GATEWAY_INTERFACE".useDHCP = false;
+                        networking.dhcpcd.extraConfig = "timeout 60";
                         networking.firewall.enable = true;
                         networking.firewall.allowedTCPPorts = [ 22 9091 $EXTRA_TCP_PORTS ];
                         networking.firewall.allowedUDPPorts = [ $EXTRA_UDP_PORTS ];
@@ -1224,6 +1277,10 @@
                         };
                         users.mutableUsers = true;
 
+                        # Keep classic dbus. A later nixpkgs default of broker makes
+                        # nixos-rebuild refuse to switch a running node.
+                        services.dbus.implementation = "dbus";
+
                         services.openssh = {
                           enable = true;
                           listenAddresses = [ { addr = "0.0.0.0"; port = 22; } ];
@@ -1231,6 +1288,16 @@
                             PermitRootLogin = "yes";
                             PasswordAuthentication = true;
                           };
+                        };
+
+                        systemd.services.kcore-br0-forward-delay = {
+                          description = "Drop the bridge STP delay before DHCP";
+                          after = [ "network-setup.service" ];
+                          before = [ "dhcpcd.service" ];
+                          wantedBy = [ "multi-user.target" ];
+                          serviceConfig.Type = "oneshot";
+                          path = [ pkgs.iproute2 ];
+                          script = "ip link set br0 type bridge forward_delay 0 stp_state 0 || true";
                         };
 
                         systemd.services.kcore-node-agent = {

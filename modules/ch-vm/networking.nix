@@ -16,7 +16,7 @@ let
       short = "kb-${hash}";
     in
     if builtins.stringLength full <= 15 then full else short;
-  inherit (helpers) tapName;
+  inherit (helpers) tapName vmInterfaces;
   upstreamIface =
     _netName: netCfg:
     if netCfg.vlanId > 0 then
@@ -137,15 +137,82 @@ let
       hosts = { };
     } sorted).hosts;
 
-  vmMacAddress =
-    vmName: vmCfg:
-    if vmCfg.macAddress != null then
-      lib.toLower vmCfg.macAddress
-    else
-      lib.toLower (helpers.generateMac vmName);
-
   natVmConfigsForNetwork =
     netName: lib.filterAttrs (_: vmCfg: vmCfg.network == netName) cfg.virtualMachines;
+
+  vmsUsingNetwork =
+    netName:
+    lib.filterAttrs (
+      _: vmCfg: vmCfg.network == netName || lib.any (nic: nic.network == netName) vmCfg.extraNics
+    ) cfg.virtualMachines;
+
+  interfacesOnNetwork =
+    netName:
+    lib.concatLists (
+      lib.mapAttrsToList (
+        vmName: vmCfg:
+        map (iface: iface // { inherit vmName; }) (
+          lib.filter (iface: iface.network == netName) (vmInterfaces vmName vmCfg)
+        )
+      ) cfg.virtualMachines
+    );
+
+  # VM-to-VM drop on the bridge. Gateway, DHCP, and security-group rules
+  # that name a target IP are accepted first. A /24 uses one subnet drop.
+  # Any other mask drops only the known VM addresses on this network.
+  eastWestNft =
+    netName: netCfg:
+    let
+      ifaces = interfacesOnNetwork netName;
+      knownV4 = lib.unique (lib.filter (ip: ip != null) (map (iface: iface.ipv4) ifaces));
+      pairDrops = lib.concatMapStrings (
+        src:
+        lib.concatMapStrings (
+          dst:
+          lib.optionalString (src != dst) ''
+            nft add rule bridge kcoreew-${netName} forward ip saddr ${src} ip daddr ${dst} drop
+          ''
+        ) knownV4
+      ) knownV4;
+      subnetDrop =
+        if netCfg.internalNetmask == "255.255.255.0" then
+          let
+            parts = lib.splitString "." netCfg.gatewayIP;
+            cidr = "${builtins.elemAt parts 0}.${builtins.elemAt parts 1}.${builtins.elemAt parts 2}.0/24";
+          in
+          ''
+            nft add rule bridge kcoreew-${netName} forward ip saddr ${cidr} ip daddr ${cidr} drop
+          ''
+        else
+          pairDrops;
+      allows = lib.concatMapStrings (
+        rule:
+        lib.optionalString (rule.targetIp != "") ''
+          nft add rule bridge kcoreew-${netName} forward ip saddr ${rule.sourceCidr} ip daddr ${rule.targetIp} ${rule.protocol} dport ${toString rule.targetPort} accept
+        ''
+      ) netCfg.securityGroupRules;
+      v6accept = lib.optionalString (netCfg.ipv6Prefix != "") ''
+        nft add rule bridge kcoreew-${netName} forward ip6 daddr ${netCfg.ipv6Gateway} accept
+        nft add rule bridge kcoreew-${netName} forward ip6 saddr ${netCfg.ipv6Gateway} accept
+      '';
+      v6drop = lib.optionalString (netCfg.ipv6Prefix != "") ''
+        nft add rule bridge kcoreew-${netName} forward ip6 saddr ${netCfg.ipv6Prefix} ip6 daddr ${netCfg.ipv6Prefix} drop
+      '';
+    in
+    ''
+      nft delete table bridge kcoreew-${netName} 2>/dev/null || true
+      nft add table bridge kcoreew-${netName}
+      nft add chain bridge kcoreew-${netName} forward '{ type filter hook forward priority 0; policy accept; }'
+      nft add rule bridge kcoreew-${netName} forward ct state established,related accept
+      nft add rule bridge kcoreew-${netName} forward ip daddr ${netCfg.gatewayIP} accept
+      nft add rule bridge kcoreew-${netName} forward ip saddr ${netCfg.gatewayIP} accept
+      nft add rule bridge kcoreew-${netName} forward udp dport 67 accept
+      nft add rule bridge kcoreew-${netName} forward udp dport 68 accept
+      ${allows}
+      ${v6accept}
+      ${subnetDrop}
+      ${v6drop}
+    '';
 in
 {
   config = lib.mkIf cfg.enable {
@@ -154,6 +221,15 @@ in
         assertion = cfg.networks ? ${vmCfg.network};
         message = "VM '${vmName}' references network '${vmCfg.network}' which is not defined in ch-vm.vms.networks.";
       }) cfg.virtualMachines
+      ++ lib.concatLists (
+        lib.mapAttrsToList (
+          vmName: vmCfg:
+          lib.imap0 (i: nic: {
+            assertion = cfg.networks ? ${nic.network};
+            message = "VM '${vmName}' extra NIC ${toString (i + 1)} references network '${nic.network}' which is not defined in ch-vm.vms.networks.";
+          }) vmCfg.extraNics
+        ) cfg.virtualMachines
+      )
       ++ lib.mapAttrsToList (netName: netCfg: {
         assertion = !(netCfg.networkType == "bridge" && netCfg.vlanId == 0);
         message = "Network '${netName}' uses bridge mode without a VLAN ID. This would enslave the management NIC (${cfg.gatewayInterface}) and sever host connectivity. Set vlanId > 0 or use nat/vxlan instead.";
@@ -175,7 +251,7 @@ in
           description = "kcore bridge for network ${netName}";
           wantedBy = [ "multi-user.target" ];
           before = lib.mapAttrsToList (vmName: _vmCfg: "kcore-vm-${vmName}.service") (
-            lib.filterAttrs (_: vm: vm.network == netName) cfg.virtualMachines
+            vmsUsingNetwork netName
           );
 
           serviceConfig = {
@@ -222,6 +298,12 @@ in
 
               ip link add "$bridge" type bridge
               ip link set "$bridge" up
+
+              ${lib.optionalString (netCfg.ipv6Gateway != "" && netCfg.networkType != "bridge") ''
+                ip -6 addr replace ${netCfg.ipv6Gateway}/64 dev "$bridge"
+              ''}
+
+              ${lib.optionalString netCfg.eastWestFirewall (eastWestNft netName netCfg)}
 
               ${lib.optionalString isBridge ''
                 # Bridge mode: attach physical NIC (or VLAN sub-if) directly to bridge.
@@ -291,6 +373,7 @@ in
             ''
               bridge="${bridgeName netName}"
               nft delete table ip kcore-${netName} 2>/dev/null || true
+              nft delete table bridge kcoreew-${netName} 2>/dev/null || true
               ${lib.optionalString isVxlan ''
                 ip link delete vxlan${toString netCfg.vni} 2>/dev/null || true
               ''}
@@ -319,53 +402,74 @@ in
             ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /run/kcore";
             ExecStart =
               let
-                netVms = natVmConfigsForNetwork netName;
-                vmNames = lib.attrNames netVms;
-                reservedHosts = assignDhcpReservedHosts vmNames;
-                dhcpHostArgs = lib.concatMapStringsSep " " (
-                  vmName:
-                  let
-                    vmCfg = netVms.${vmName};
-                    mac = vmMacAddress vmName vmCfg;
-                    hostOctet = toString reservedHosts.${vmName};
-                    fallbackIp = "${subnetPrefix netCfg.gatewayIP}.${hostOctet}";
-                    fixedIp = if vmCfg.dhcpReservedIPv4 != null then vmCfg.dhcpReservedIPv4 else fallbackIp;
-                  in
-                  "--dhcp-host=${mac},${fixedIp},${vmName},infinite"
-                ) vmNames;
+                ifaces = interfacesOnNetwork netName;
+                dhcpHostArgs = lib.concatStringsSep " " (
+                  lib.filter (arg: arg != "") (
+                    map (
+                      iface:
+                      let
+                        hostLabel = if iface.index == 0 then iface.vmName else "${iface.vmName}-nic${toString iface.index}";
+                        fixedIp =
+                          if iface.ipv4 != null then
+                            iface.ipv4
+                          else if iface.index == 0 then
+                            let
+                              netVms = natVmConfigsForNetwork netName;
+                              vmNames = lib.attrNames netVms;
+                              reservedHosts = assignDhcpReservedHosts vmNames;
+                              hostOctet = toString reservedHosts.${iface.vmName};
+                            in
+                            "${subnetPrefix netCfg.gatewayIP}.${hostOctet}"
+                          else
+                            null;
+                      in
+                      lib.optionalString (
+                        fixedIp != null
+                      ) "--dhcp-host=${iface.macAddress},${fixedIp},${hostLabel},infinite"
+                    ) ifaces
+                  )
+                );
               in
               "${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --bind-interfaces --interface=${bridgeName netName} --except-interface=lo --dhcp-authoritative --dhcp-range=${subnetPrefix netCfg.gatewayIP}.100,${subnetPrefix netCfg.gatewayIP}.199,${netCfg.internalNetmask},12h --dhcp-option=option:router,${netCfg.gatewayIP} --dhcp-option=option:dns-server,1.1.1.1,8.8.8.8 --dhcp-leasefile=/run/kcore/dnsmasq-${netName}.leases --pid-file=/run/kcore/dnsmasq-${netName}.pid ${dhcpHostArgs}";
           };
         }
       ) (lib.filterAttrs (_: netCfg: netCfg.networkType == "nat") cfg.networks)
-      // lib.mapAttrs' (
-        vmName: vmCfg:
-        lib.nameValuePair "kcore-tap-${vmName}" {
-          description = "TAP interface for VM ${vmName}";
-          requires = [ "kcore-bridge-${vmCfg.network}.service" ];
-          after = [ "kcore-bridge-${vmCfg.network}.service" ];
-          before = [ "kcore-vm-${vmName}.service" ];
-          wantedBy = [ "kcore-vm-${vmName}.service" ];
+      // lib.listToAttrs (
+        lib.concatLists (
+          lib.mapAttrsToList (
+            vmName: vmCfg:
+            map (iface: {
+              name = iface.unit;
+              value = {
+                description = "TAP interface ${iface.tap} for VM ${vmName} on ${iface.network}";
+                requires = [ "kcore-bridge-${iface.network}.service" ];
+                after = [ "kcore-bridge-${iface.network}.service" ];
+                before = [ "kcore-vm-${vmName}.service" ];
+                wantedBy =
+                  if vmCfg.incomingMigration then [ "multi-user.target" ] else [ "kcore-vm-${vmName}.service" ];
 
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-          };
+                serviceConfig = {
+                  Type = "oneshot";
+                  RemainAfterExit = true;
+                };
 
-          path = [ pkgs.iproute2 ];
+                path = [ pkgs.iproute2 ];
 
-          script = ''
-            tap="${tapName vmName}"
-            ip tuntap add dev "$tap" mode tap
-            ip link set "$tap" master "${bridgeName vmCfg.network}"
-            ip link set "$tap" up
-          '';
+                script = ''
+                  tap="${iface.tap}"
+                  ip tuntap add dev "$tap" mode tap
+                  ip link set "$tap" master "${bridgeName iface.network}"
+                  ip link set "$tap" up
+                '';
 
-          preStop = ''
-            ip link delete "${tapName vmName}" 2>/dev/null || true
-          '';
-        }
-      ) cfg.virtualMachines;
+                preStop = ''
+                  ip link delete "${iface.tap}" 2>/dev/null || true
+                '';
+              };
+            }) (vmInterfaces vmName vmCfg)
+          ) cfg.virtualMachines
+        )
+      );
 
     # NixOS firewall trustedInterfaces expects explicit interface names, not globs.
     # Build the exact bridge interface list so DHCP/DNS traffic from VM bridges

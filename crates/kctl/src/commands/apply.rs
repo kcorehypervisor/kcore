@@ -1,6 +1,7 @@
 use crate::client::{self, controller_proto};
 use crate::commands::{
-    ceph_cluster, container, disk_layout, network, postgresql, security_group, ssh_key, vm,
+    ceph_cluster, container, disk_layout, network, object_store, postgresql, security_group,
+    shared_filesystem, ssh_key, vm,
 };
 use crate::config::ConnectionInfo;
 use anyhow::{Context, Result};
@@ -96,6 +97,12 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
             }
             "cephcluster" | "ceph-cluster" | "ceph_cluster" => {
                 return ceph_cluster::apply_from_file(info, file).await
+            }
+            "sharedfilesystem" | "shared-filesystem" | "shared_filesystem" => {
+                return shared_filesystem::apply_from_file(info, file).await
+            }
+            "objectstore" | "object-store" | "object_store" => {
+                return object_store::apply_from_file(info, file).await
             }
             _ => {}
         }

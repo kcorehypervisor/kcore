@@ -4,8 +4,8 @@ kcore moves VMs between nodes in two ways. Both assume the guest disk is **share
 
 | Mode | Operator command | Guest downtime | Disk copy | Typical use |
 |------|------------------|----------------|-----------|-------------|
-| **Cold** | `kctl drain node …` or `kctl migrate vm … --allow-cold-fallback` | Full stop/start (or reassignment then start) | None (shared RBD) | Maintenance, evacuate a node, fallback |
-| **Live** | `kctl migrate vm <id> --target-node <node>` | Brief pause during CH cutover | None (shared RBD) | Keep workload running while changing host |
+| **Cold** | `kctl migrate vm … --allow-cold-fallback` after a live send did not start, or a local-disk VM during drain | Full stop/start | None (shared RBD) | Fallback, local disks |
+| **Live** | `kctl migrate vm <id> --target-node <node>`, and `kctl drain node` for Ceph guests | Brief pause during CH cutover | None (shared RBD) | Keep the workload running |
 
 Product docs: [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.html) · SAN overview: [`ceph.md`](./ceph.md).
 
@@ -17,6 +17,19 @@ Product docs: [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.
 - Live only: Cloud Hypervisor on both nodes; guest memory configured with `shared=on` (Ceph VM units in `modules/ch-vm/vm-service.nix`); TCP allowed between node data IPs for an ephemeral migration port.
 
 RBAC: `DrainNode` → `cluster-admin`; `MigrateVm` → `vm-admin`.
+
+## Automatic failover
+
+When a node misses heartbeats for 90 seconds the controller marks it `not-ready` and, unless `failover.enabled` is false, moves each Ceph VM onto another healthy member of the same cluster. The move is a cold reassignment: the failed node is not contacted. Local `filesystem`, `lvm`, and `zfs` VMs stay on that node and show up in `kctl get cluster-health` as VMs on a not-ready node.
+
+The failed node is recorded in `pending_node_config_push`. Its next successful heartbeat pushes a configuration that no longer starts the moved guests, so a node that comes back does not boot a second copy of a Ceph VM. `kctl get cluster-health` reports `healthy`, `degraded`, or `unhealthy` from node readiness, those leftover VMs, certificates inside 30 days, and unresolved replication conflicts.
+
+```yaml
+failover:
+  enabled: true
+```
+
+`kctl backup -o snapshot.sqlite` writes a consistent SQLite snapshot (at most 32 MiB). `kctl restore controller -f snapshot.sqlite --confirm` replaces this controller's database and runs migrations. Peer controllers keep their own copies; restart them after a restore so they do not keep serving the previous database.
 
 ---
 
@@ -122,6 +135,9 @@ Orchestrator: controller `MigrateVm` → node `NodeAdmin` peer RPCs.
 
 **Prepare (destination)** — `crates/node-agent/src/live_migrate.rs`
 
+The controller first pushes the destination Nix with `incomingMigration = true` and waits for it to activate. That installs the per-VM tap (started on its own, not only as a dependency of the VM unit), the cloud-init seed at `/etc/kcore/seeds/<vm>.iso`, and the firmware in the Nix store, without starting a second guest. Prepare then:
+
+- `systemctl start` the tap unit and refuse if the seed ISO is missing.
 - `rbd map <pool>/<image>` → `/dev/rbd/<pool>/<image>` (same path the migrated config will open).
 - Spawn `cloud-hypervisor --api-socket=/run/kcore/<vm>.sock` with **no** CLI disk/memory (empty receive VMM).
 - Record PID in `/run/kcore/<vm>.migrate.pid`.
@@ -166,6 +182,22 @@ First boot seeds the RBD with `qemu-img convert` and sets Ceph image-meta `kcore
 
 Images are created with **`layering` only**. Exclusive-lock is omitted so source and destination can map the same image during cutover. Changing this without another locking strategy will break live migrate.
 
+### Operations and cancel
+
+Each live migrate creates a **`vm_operations`** row (phases: Preparing → Sending → … → Done/Failed/Cancelled). `MigrateVm` returns `operation_id`.
+
+```bash
+kctl get operations
+kctl get operation <id>      # includes estimate progress (elapsed + guest memory bound)
+kctl cancel operation <id>   # only while still Preparing
+```
+
+Cancel after send is refused: the guest may already run only on the destination.
+
+Progress is intentionally an **estimate**: Cloud Hypervisor exposes no reliable byte counter here. `kctl get operation` reports phase, elapsed seconds, and guest memory size (`estimate: true`). Never treat that as percent-complete.
+
+After a controller restart, a reconciler resumes open ops that are safe to continue: `Waiting` re-calls `WaitLiveMigrateReceive`; `Reassigned` / finalize phases re-run dest/source finalize RPCs. `Preparing` / `Sending` are left for cancel or operator `migrate reset-session`.
+
 ---
 
 ## Runbook: a stranded receive session
@@ -183,9 +215,9 @@ Nothing is actually receiving. What happened is that the destination node still 
 
 The same state can also survive on disk without an in-memory session, if the **node agent** restarted after spawning the receive VMM: the `.migrate.pid` file is then the only remaining handle on an orphaned Cloud Hypervisor that still holds the API socket and the RBD mapping.
 
-### There is no automatic reaping — on purpose
+### There is no automatic reaping of a live receive
 
-Nothing in kcore reaps a receive session on a timer or on the next prepare. Reaping requires deciding that a session is *provably* dead, and the cost of getting that wrong is asymmetric: clearing a session whose receive VMM is still running kills an in-flight migration and can leave the guest destroyed on both sides. So kcore surfaces the evidence and an operator makes the call.
+Nothing in kcore clears a receive whose VMM is still this VM, or whose migration port is still listening. The next `PrepareLiveMigrateReceive` does clear a session that is already dead (no matching VMM, nothing listening) so a controller crash does not stick forever. A session that still looks live keeps answering `ALREADY_EXISTS` until an operator clears it. Reaping a live receive would kill the only remaining guest.
 
 ### 1. Look before acting
 

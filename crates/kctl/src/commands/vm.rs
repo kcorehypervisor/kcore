@@ -17,6 +17,7 @@ pub struct CreateArgs {
     pub image_path: Option<String>,
     pub image_format: Option<String>,
     pub network: Option<String>,
+    pub extra_networks: Vec<String>,
     pub target_node: Option<String>,
     pub wait: bool,
     pub wait_for_ssh: bool,
@@ -36,6 +37,8 @@ pub struct CreateArgs {
     pub nic: Vec<String>,
     pub nvme: Vec<String>,
     pub pci: Vec<String>,
+    pub node_labels: Vec<String>,
+    pub anti_affinity: Option<String>,
 }
 
 pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<()> {
@@ -49,6 +52,7 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
         image_path: None,
         image_format: None,
         network: None,
+        extra_networks: vec![],
         target_node: None,
         wait: false,
         wait_for_ssh: false,
@@ -68,6 +72,8 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
         nic: vec![],
         nvme: vec![],
         pci: vec![],
+        node_labels: vec![],
+        anti_affinity: None,
     };
     create(info, args).await
 }
@@ -113,7 +119,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         vm_name,
         vm_cpu,
         mem_bytes,
-        nics,
+        mut nics,
         manifest_image,
         manifest_image_sha256,
         manifest_image_format,
@@ -126,6 +132,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_desired_state,
         manifest_pci_devices,
         manifest_gpus,
+        manifest_node_labels,
+        manifest_anti_affinity,
     ) = if let Some(path) = &args.filename {
         let manifest = parse_vm_manifest(path)?;
         let n = args.name.clone().unwrap_or(manifest.name);
@@ -146,6 +154,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             manifest.desired_state,
             manifest.pci_devices,
             manifest.gpus,
+            manifest.node_labels,
+            manifest.anti_affinity,
         )
     } else {
         let n = args
@@ -182,8 +192,31 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             proto::VmDesiredState::Unspecified,
             vec![],
             vec![],
+            vec![],
+            None,
         )
     };
+    if nics.is_empty() && !args.extra_networks.is_empty() {
+        nics.push(proto::Nic {
+            network: args
+                .network
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            model: "virtio".to_string(),
+            mac_address: String::new(),
+        });
+    }
+    for network in &args.extra_networks {
+        let network = network.trim();
+        if network.is_empty() {
+            bail!("--extra-network must name a network");
+        }
+        nics.push(proto::Nic {
+            network: network.to_string(),
+            model: "virtio".to_string(),
+            mac_address: String::new(),
+        });
+    }
     let image = resolve_create_image_source(
         args.image.as_deref(),
         args.image_sha256.as_deref(),
@@ -252,6 +285,14 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         cloud_init_user_data
     };
 
+    let mut node_labels = args.node_labels.clone();
+    node_labels.extend(manifest_node_labels);
+    let anti_affinity = args
+        .anti_affinity
+        .clone()
+        .or(manifest_anti_affinity)
+        .unwrap_or_default();
+
     let req = proto::CreateVmRequest {
         target_node,
         spec: Some(spec),
@@ -264,6 +305,8 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         storage_backend: storage_backend_to_proto(&storage_backend),
         storage_size_bytes,
         target_dc,
+        node_labels,
+        anti_affinity,
     };
 
     let resp = client.create_vm(req).await?.into_inner();
@@ -406,12 +449,18 @@ fn node_address_for_vm_node_id(nodes: &[proto::NodeInfo], node_id: &str) -> Opti
         .map(|n| n.address.clone())
 }
 
-pub async fn delete(info: &ConnectionInfo, vm_id: &str, target_node: Option<String>) -> Result<()> {
+pub async fn delete(
+    info: &ConnectionInfo,
+    vm_id: &str,
+    target_node: Option<String>,
+    delete_data_volumes: bool,
+) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     client
         .delete_vm(proto::DeleteVmRequest {
             vm_id: vm_id.to_string(),
             target_node: target_node.unwrap_or_default(),
+            delete_data_volumes,
         })
         .await?;
     println!("VM '{vm_id}' deleted");
@@ -741,6 +790,8 @@ struct VmManifest {
     desired_state: proto::VmDesiredState,
     pci_devices: Vec<String>,
     gpus: Vec<String>,
+    node_labels: Vec<String>,
+    anti_affinity: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1029,7 +1080,12 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
                 .map(|n| proto::Nic {
                     network: n["network"].as_str().unwrap_or("default").to_string(),
                     model: n["model"].as_str().unwrap_or("virtio").to_string(),
-                    mac_address: String::new(),
+                    mac_address: n["macAddress"]
+                        .as_str()
+                        .or_else(|| n["mac_address"].as_str())
+                        .or_else(|| n["mac"].as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 })
                 .collect()
         })
@@ -1171,6 +1227,19 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         desired_state,
         pci_devices,
         gpus,
+        node_labels: doc["spec"]["nodeLabels"]
+            .as_sequence()
+            .or_else(|| doc["spec"]["node_labels"].as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        anti_affinity: doc["spec"]["antiAffinity"]
+            .as_str()
+            .or_else(|| doc["spec"]["anti_affinity"].as_str())
+            .map(|s| s.to_string()),
     })
 }
 
@@ -1367,6 +1436,7 @@ mod tests {
             image_path: None,
             image_format: None,
             network: None,
+            extra_networks: vec![],
             target_node: None,
             wait: false,
             wait_for_ssh: false,
@@ -1386,6 +1456,8 @@ mod tests {
             nic: vec![],
             nvme: vec![],
             pci: vec![],
+            node_labels: vec![],
+            anti_affinity: None,
         }
     }
 
@@ -1443,6 +1515,7 @@ mod tests {
             vlan_id: 0,
             network_type: "vxlan".to_string(),
             enable_outbound_nat: true,
+            ..Default::default()
         }];
         assert_eq!(network_type_for("vxlan-test", "node-a", &networks), "vxlan");
         assert_eq!(network_type_for("missing", "node-a", &networks), "unknown");

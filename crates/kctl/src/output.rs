@@ -72,21 +72,25 @@ pub fn print_vm_detail(
 
 pub fn print_volume_table(volumes: &[controller_proto::VolumeInfo]) {
     println!(
-        "{:<20}  {:<12}  {:<20}  {:<10}  {:>8}  {:<40}  {:<8}",
-        "VM", "VM_ID", "NODE", "BACKEND", "SIZE", "VOLUME", "STATE"
+        "{:<18}  {:<8}  {:<10}  {:<16}  {:>8}  {:<28}  {:<10}",
+        "NAME", "ROLE", "ATTACH", "VM", "SIZE", "IMAGE", "SERIAL"
     );
     for v in volumes {
         let size = crate::client::format_bytes(v.storage_size_bytes);
-        let state = vm_state_str(v.vm_state);
+        let vm = if v.vm_name.is_empty() {
+            "-"
+        } else {
+            v.vm_name.as_str()
+        };
         println!(
-            "{:<20}  {:<12}  {:<20}  {:<10}  {:>8}  {:<40}  {:<8}",
-            v.vm_name,
-            &v.vm_id[..v.vm_id.len().min(12)],
-            truncate_node_id(&v.node_id),
-            v.storage_backend,
+            "{:<18}  {:<8}  {:<10}  {:<16}  {:>8}  {:<28}  {:<10}",
+            v.name,
+            v.role,
+            v.attach_state,
+            vm,
             size,
-            v.backend_handle,
-            state,
+            format!("{}/{}", v.pool, v.image),
+            v.serial,
         );
     }
 }
@@ -228,6 +232,66 @@ fn format_luks_method(method: &str) -> &str {
         "tpm2" => "TPM2",
         "key-file" => "key-file",
         _ => "-",
+    }
+}
+
+pub fn print_crypto_config(r: &controller_proto::GetCryptoConfigResponse) {
+    println!("=== KCore Crypto Config ===");
+    field("Library", &r.crypto_library);
+    field("FIPS", &r.fips_certificate);
+    field("TLS 1.3", &r.tls13_cipher_suites.join(", "));
+    field("TLS 1.2", &r.tls12_cipher_suites.join(", "));
+    field("Key Exchange", &r.kx_groups.join(", "));
+    field("Excluded", &r.excluded_algorithms.join(", "));
+    field(
+        "mTLS",
+        if r.mtls_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    field(
+        "Rate limit",
+        if r.rate_limit_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    field(
+        "Rate",
+        &format!(
+            "{} req/s, burst {}",
+            r.rate_limit_requests_per_second, r.rate_limit_burst
+        ),
+    );
+    field("Revocation", &r.revocation_fail_mode);
+    field("Release signing", &r.signing_scheme);
+}
+
+pub fn print_sbom_summary(r: &controller_proto::ExportSbomResponse, written_to: Option<&str>) {
+    println!("=== KCore SBOM ===");
+    field("Format", &r.format);
+    field("Spec", &r.spec_version);
+    field("File", &r.filename);
+    field("SHA-256", &r.sha256);
+    field("Source", &r.source);
+    field("Generator", &r.generator);
+    field(
+        "Signature",
+        if r.signature_present {
+            "bundle found beside the installed file"
+        } else if r.source == "embedded" {
+            "not a signed release asset (Cargo.lock graph embedded at build time)"
+        } else {
+            "no Sigstore bundle beside this file"
+        },
+    );
+    field("Release signing", &r.signing_scheme);
+    field("Bytes", &r.document.len().to_string());
+    if let Some(path) = written_to {
+        field("Wrote", path);
     }
 }
 

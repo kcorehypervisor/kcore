@@ -105,6 +105,21 @@ enum Command {
         #[command(subcommand)]
         resource: StopResource,
     },
+    /// Attach a resource (e.g. volume to a stopped VM)
+    Attach {
+        #[command(subcommand)]
+        resource: AttachResource,
+    },
+    /// Detach a resource (e.g. data volume from a stopped VM)
+    Detach {
+        #[command(subcommand)]
+        resource: DetachResource,
+    },
+    /// Cancel a long-running operation (when phase allows)
+    Cancel {
+        #[command(subcommand)]
+        resource: CancelOpResource,
+    },
     /// Set desired resource state (declarative)
     Set {
         #[command(subcommand)]
@@ -114,6 +129,26 @@ enum Command {
     Update {
         #[command(subcommand)]
         resource: UpdateResource,
+    },
+    /// Restore a volume from a snapshot (in-place rollback; VM must be stopped)
+    Restore {
+        #[command(subcommand)]
+        resource: RestoreResource,
+    },
+    /// Flatten a cloned volume (break parent snapshot dependency)
+    Flatten {
+        #[command(subcommand)]
+        resource: FlattenResource,
+    },
+    /// Grow or shrink a Ceph volume (shrink requires --allow-shrink)
+    Resize {
+        #[command(subcommand)]
+        resource: ResizeResource,
+    },
+    /// Format LUKS on an existing plain RBD volume (data-destructive)
+    Encrypt {
+        #[command(subcommand)]
+        resource: EncryptResource,
     },
     /// Get or list resources
     Get {
@@ -154,6 +189,12 @@ enum Command {
     Operator {
         #[command(subcommand)]
         action: OperatorAction,
+    },
+    /// Write a consistent SQLite snapshot of the controller database
+    Backup {
+        /// File to write
+        #[arg(short = 'o', long)]
+        output: PathBuf,
     },
     /// Drain a node (migrate all VMs to other nodes)
     Drain {
@@ -321,6 +362,9 @@ enum CreateResource {
         /// Network name
         #[arg(long)]
         network: Option<String>,
+        /// Additional NIC on another network. Repeat for each extra interface.
+        #[arg(long = "extra-network")]
+        extra_networks: Vec<String>,
         /// Target node (optional, controller picks if empty)
         #[arg(long = "target-node")]
         target_node: Option<String>,
@@ -382,6 +426,12 @@ enum CreateResource {
         /// Example: --pci 0000:03:00.0 --pci 0000:03:00.1
         #[arg(long = "pci")]
         pci: Vec<String>,
+        /// Required node label (key=value). Repeat to require every label.
+        #[arg(long = "label")]
+        node_labels: Vec<String>,
+        /// Keep this VM off nodes that already host the same anti-affinity group
+        #[arg(long = "anti-affinity")]
+        anti_affinity: Option<String>,
     },
     /// Create a container on a node
     Container {
@@ -428,6 +478,71 @@ enum CreateResource {
         /// Disable outbound NAT (for vxlan networks; makes overlay fully isolated)
         #[arg(long = "no-outbound-nat")]
         no_outbound_nat: bool,
+        /// Optional IPv6 /64. The gateway must be the first address of this prefix.
+        #[arg(long = "ipv6-prefix")]
+        ipv6_prefix: Option<String>,
+        /// IPv6 gateway on the bridge (prefix::1)
+        #[arg(long = "ipv6-gateway")]
+        ipv6_gateway: Option<String>,
+        /// Drop VM-to-VM traffic on this bridge except security-group allows, the gateway, and DHCP
+        #[arg(long = "east-west-firewall")]
+        east_west_firewall: bool,
+    },
+    /// Create a detached Ceph data volume (optionally attach to a stopped VM)
+    Volume {
+        /// Volume name
+        name: String,
+        /// Size in bytes
+        #[arg(long = "size-bytes", default_value_t = 0)]
+        size_bytes: i64,
+        /// Optional VM id or name to attach immediately (VM must be stopped)
+        #[arg(long)]
+        vm: Option<String>,
+        /// Clone from an existing volume snapshot
+        #[arg(long = "from-snapshot")]
+        from_snapshot: Option<String>,
+        /// Host-side LUKS over RBD (E2); DEK wrapped by cluster master key
+        #[arg(long)]
+        encrypt: bool,
+    },
+    /// Create a crash-consistent snapshot of a volume
+    VolumeSnapshot {
+        /// Volume id or name
+        volume: String,
+        /// Snapshot name (optional; auto-generated if empty)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Create a SnapshotPolicy (scheduled crash-consistent snaps + retention)
+    SnapshotPolicy {
+        name: String,
+        /// Select volumes by VM id or name
+        #[arg(long)]
+        vm: Option<String>,
+        /// Select a single volume by id or name
+        #[arg(long)]
+        volume: Option<String>,
+        /// `@hourly`, `@daily`, or `every:<seconds>`
+        #[arg(long, default_value = "@daily")]
+        schedule: String,
+        /// Number of snapshots to retain per volume
+        #[arg(long, default_value_t = 7)]
+        keep: i32,
+        /// Disable the policy on create/update
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Create a SharedFilesystem (CephFS) from a YAML manifest
+    #[command(name = "shared-filesystem", alias = "sharedfilesystem")]
+    SharedFilesystem {
+        #[arg(short = 'f', long = "filename")]
+        file: String,
+    },
+    /// Create an ObjectStore (RGW) from a YAML manifest
+    #[command(name = "object-store", alias = "objectstore")]
+    ObjectStore {
+        #[arg(short = 'f', long = "filename")]
+        file: String,
     },
     /// Create one PostgreSQL database from the NixOS postgresql package
     #[command(alias = "postgres")]
@@ -476,7 +591,16 @@ enum DeleteResource {
         /// Target node (optional)
         #[arg(long = "target-node")]
         target_node: Option<String>,
+        /// Also delete Ceph data volumes belonging to the VM
+        #[arg(long = "delete-data-volumes")]
+        delete_data_volumes: bool,
     },
+    /// Delete a detached data volume
+    Volume { name: String },
+    /// Delete a volume snapshot
+    VolumeSnapshot { name: String },
+    /// Delete a SnapshotPolicy
+    SnapshotPolicy { name: String },
     /// Delete a network
     Network {
         /// Network name
@@ -513,9 +637,20 @@ enum DeleteResource {
         /// DiskLayout name
         name: String,
     },
-    /// Delete a CephCluster resource (does not wipe OSDs)
+    /// Delete a CephCluster. Stops mons and OSDs on members first.
+    /// `--force` deletes the record when a member cannot be reached.
     #[command(name = "ceph-cluster", alias = "cephcluster")]
-    CephCluster { name: String },
+    CephCluster {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete a SharedFilesystem (CephFS) resource
+    #[command(name = "shared-filesystem", alias = "sharedfilesystem")]
+    SharedFilesystem { name: String },
+    /// Delete an ObjectStore (RGW) resource
+    #[command(name = "object-store", alias = "objectstore")]
+    ObjectStore { name: String },
 }
 
 #[derive(Subcommand)]
@@ -549,6 +684,78 @@ enum StopResource {
     Container {
         /// Container name
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttachResource {
+    /// Attach a detached data volume to a stopped Ceph VM
+    Volume {
+        name: String,
+        #[arg(long)]
+        vm: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DetachResource {
+    /// Detach a data volume from its VM (VM must be stopped)
+    Volume { name: String },
+}
+
+#[derive(Subcommand)]
+enum CancelOpResource {
+    /// Cancel a VM operation (only while still Preparing for live migrate)
+    Operation { id: String },
+}
+
+#[derive(Subcommand)]
+enum RestoreResource {
+    Volume {
+        name: String,
+        #[arg(long)]
+        snapshot: String,
+    },
+    /// Replace the controller database from a snapshot taken by `kctl backup`
+    Controller {
+        /// Snapshot file
+        #[arg(short = 'f', long)]
+        file: PathBuf,
+        /// Required. Restore overwrites the live controller database.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum FlattenResource {
+    Volume { name: String },
+}
+
+#[derive(Subcommand)]
+enum ResizeResource {
+    /// Grow or shrink a Ceph RBD volume (shrink: detached only, `--allow-shrink`)
+    Volume {
+        name: String,
+        #[arg(long = "size-bytes")]
+        size_bytes: i64,
+        /// Attempt guest filesystem grow when SSH is available (best-effort)
+        #[arg(long)]
+        grow_filesystem: bool,
+        /// Shrink via `rbd resize --allow-shrink` (destroys tail; volume must be detached)
+        #[arg(long = "allow-shrink")]
+        allow_shrink: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum EncryptResource {
+    /// LUKS-format a plain volume (destroys existing plaintext; VM stopped or detached)
+    Volume {
+        name: String,
+        /// Acknowledge that all existing volume data will be destroyed (no offline migration)
+        #[arg(long = "destroy-data")]
+        destroy_data: bool,
     },
 }
 
@@ -640,11 +847,52 @@ enum GetResource {
     #[command(name = "storage-class", alias = "storage-classes")]
     StorageClass,
     /// List VM volumes across the cluster
-    #[command(alias = "volume")]
-    Volumes,
+    Volumes {
+        /// Optional VM id or name filter
+        #[arg(long)]
+        vm: Option<String>,
+    },
+    /// Get one volume by name or id
+    Volume { name: String },
+    /// List long-running VM operations (live migrate, …)
+    Operations {
+        #[arg(long)]
+        include_finished: bool,
+        #[arg(long)]
+        vm: Option<String>,
+    },
+    /// Get one VM operation by id
+    Operation { id: String },
+    /// List volume snapshots
+    #[command(alias = "snapshot")]
+    Snapshots {
+        #[arg(long)]
+        volume: Option<String>,
+    },
+    /// List or get SnapshotPolicy resources
+    #[command(alias = "snapshot-policy")]
+    SnapshotPolicies {
+        /// Policy name (omit to list all)
+        name: Option<String>,
+    },
     /// Show compliance report
     #[command(alias = "compliance")]
     ComplianceReport,
+    /// Node readiness, VM placement, certificate expiry, and replication conflicts
+    #[command(name = "cluster-health")]
+    ClusterHealth,
+    /// Show the controller cryptographic configuration
+    #[command(name = "crypto-config", alias = "crypto")]
+    CryptoConfig,
+    /// Export a CycloneDX SBOM from the controller
+    Sbom {
+        /// `crates` (default) or `iso-closure`
+        #[arg(long, default_value = "crates")]
+        kind: String,
+        /// Write the document to this path. Without it, only the summary is printed.
+        #[arg(short = 'o', long)]
+        output: Option<String>,
+    },
     /// List recent audit events
     #[command(name = "audit-events", alias = "audit")]
     AuditEvents {
@@ -681,6 +929,16 @@ enum GetResource {
     /// List CephCluster resources
     #[command(name = "ceph-clusters", alias = "ceph-cluster", alias = "cephcluster")]
     CephClusters,
+    /// List SharedFilesystem resources
+    #[command(
+        name = "shared-filesystems",
+        alias = "shared-filesystem",
+        alias = "sharedfilesystem"
+    )]
+    SharedFilesystems,
+    /// List ObjectStore resources
+    #[command(name = "object-stores", alias = "object-store", alias = "objectstore")]
+    ObjectStores,
     /// List the controller's certificate inventory
     #[command(name = "certificates", alias = "certificate", alias = "certs")]
     Certificates {
@@ -761,6 +1019,9 @@ enum DescribeResource {
     /// Describe cluster compliance report
     #[command(name = "compliance-report", alias = "compliance")]
     ComplianceReport,
+    /// Describe the controller cryptographic configuration
+    #[command(name = "crypto-config", alias = "crypto")]
+    CryptoConfig,
     /// Describe a DiskLayout (current generation, observed status, body)
     #[command(name = "disk-layout", alias = "disklayout")]
     DiskLayout {
@@ -770,6 +1031,12 @@ enum DescribeResource {
     /// Describe a CephCluster
     #[command(name = "ceph-cluster", alias = "cephcluster")]
     CephCluster { name: String },
+    /// Describe a SharedFilesystem
+    #[command(name = "shared-filesystem", alias = "sharedfilesystem")]
+    SharedFilesystem { name: String },
+    /// Describe an ObjectStore
+    #[command(name = "object-store", alias = "objectstore")]
+    ObjectStore { name: String },
 }
 
 #[derive(Subcommand)]
@@ -831,6 +1098,21 @@ enum NodeAction {
     /// Reject a pending node
     Reject {
         /// Node ID to reject
+        node_id: String,
+    },
+    /// Stop scheduling new VMs onto a node without moving the ones already there
+    Cordon {
+        /// Node ID to cordon
+        node_id: String,
+    },
+    /// Make a cordoned node schedulable again
+    Uncordon {
+        /// Node ID to uncordon
+        node_id: String,
+    },
+    /// Remove a node that has no VMs or networks, and revoke its certificates
+    Delete {
+        /// Node ID to delete
         node_id: String,
     },
     /// Apply a NixOS configuration to a node
@@ -1241,6 +1523,7 @@ async fn main() {
                     image_path,
                     image_format,
                     network,
+                    extra_networks,
                     target_node,
                     wait,
                     wait_for_ssh,
@@ -1260,6 +1543,8 @@ async fn main() {
                     nic,
                     nvme,
                     pci,
+                    node_labels,
+                    anti_affinity,
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -1275,6 +1560,7 @@ async fn main() {
                     image_path: image_path.clone(),
                     image_format: image_format.clone(),
                     network: network.clone(),
+                    extra_networks: extra_networks.clone(),
                     target_node: target_node.clone(),
                     wait: *wait,
                     wait_for_ssh: *wait_for_ssh,
@@ -1299,6 +1585,8 @@ async fn main() {
                     nic: nic.clone(),
                     nvme: nvme.clone(),
                     pci: pci.clone(),
+                    node_labels: node_labels.clone(),
+                    anti_affinity: anti_affinity.clone(),
                 },
             )
             .await
@@ -1337,6 +1625,9 @@ async fn main() {
                     vlan_id,
                     network_type,
                     no_outbound_nat,
+                    ipv6_prefix,
+                    ipv6_gateway,
+                    east_west_firewall,
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -1351,6 +1642,9 @@ async fn main() {
                     vlan_id: *vlan_id,
                     network_type: network_type.clone(),
                     enable_outbound_nat: !*no_outbound_nat,
+                    ipv6_prefix: ipv6_prefix.clone().unwrap_or_default(),
+                    ipv6_gateway: ipv6_gateway.clone().unwrap_or_default(),
+                    east_west_firewall: *east_west_firewall,
                 },
             )
             .await
@@ -1386,6 +1680,68 @@ async fn main() {
         }
         Command::Create {
             resource:
+                CreateResource::Volume {
+                    name,
+                    size_bytes,
+                    vm,
+                    from_snapshot,
+                    encrypt,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::create(
+                &info,
+                name,
+                *size_bytes,
+                vm.clone(),
+                from_snapshot.clone(),
+                *encrypt,
+            )
+            .await
+        }
+        Command::Create {
+            resource: CreateResource::VolumeSnapshot { volume, name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::snapshot(&info, volume, name.clone()).await
+        }
+        Command::Create {
+            resource:
+                CreateResource::SnapshotPolicy {
+                    name,
+                    vm,
+                    volume,
+                    schedule,
+                    keep,
+                    disabled,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::create_snapshot_policy(
+                &info,
+                name,
+                vm.clone(),
+                volume.clone(),
+                schedule.clone(),
+                *keep,
+                !*disabled,
+            )
+            .await
+        }
+        Command::Create {
+            resource: CreateResource::SharedFilesystem { file },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::shared_filesystem::apply_from_file(&info, file).await
+        }
+        Command::Create {
+            resource: CreateResource::ObjectStore { file },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::object_store::apply_from_file(&info, file).await
+        }
+        Command::Create {
+            resource:
                 CreateResource::Cluster {
                     controller,
                     certs_dir,
@@ -1404,10 +1760,33 @@ async fn main() {
         }
 
         Command::Delete {
-            resource: DeleteResource::Vm { vm_id, target_node },
+            resource:
+                DeleteResource::Vm {
+                    vm_id,
+                    target_node,
+                    delete_data_volumes,
+                },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::vm::delete(&info, vm_id, target_node.clone()).await
+            commands::vm::delete(&info, vm_id, target_node.clone(), *delete_data_volumes).await
+        }
+        Command::Delete {
+            resource: DeleteResource::Volume { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::delete(&info, name).await
+        }
+        Command::Delete {
+            resource: DeleteResource::VolumeSnapshot { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::delete_snapshot(&info, name).await
+        }
+        Command::Delete {
+            resource: DeleteResource::SnapshotPolicy { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::delete_snapshot_policy(&info, name).await
         }
         Command::Delete {
             resource: DeleteResource::Network { name, target_node },
@@ -1441,10 +1820,22 @@ async fn main() {
             commands::disk_layout::delete(&info, name).await
         }
         Command::Delete {
-            resource: DeleteResource::CephCluster { name },
+            resource: DeleteResource::CephCluster { name, force },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::ceph_cluster::delete(&info, name).await
+            commands::ceph_cluster::delete(&info, name, *force).await
+        }
+        Command::Delete {
+            resource: DeleteResource::SharedFilesystem { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::shared_filesystem::delete(&info, name).await
+        }
+        Command::Delete {
+            resource: DeleteResource::ObjectStore { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::object_store::delete(&info, name).await
         }
 
         Command::Start {
@@ -1471,6 +1862,67 @@ async fn main() {
         } => {
             let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
             commands::container::stop(&info, name).await
+        }
+
+        Command::Attach {
+            resource: AttachResource::Volume { name, vm },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::attach(&info, name, vm).await
+        }
+        Command::Detach {
+            resource: DetachResource::Volume { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::detach(&info, name).await
+        }
+        Command::Cancel {
+            resource: CancelOpResource::Operation { id },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operation::cancel(&info, id).await
+        }
+
+        Command::Restore {
+            resource: RestoreResource::Volume { name, snapshot },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::restore(&info, name, snapshot).await
+        }
+        Command::Restore {
+            resource: RestoreResource::Controller { file, confirm },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::cluster_ops::restore(&info, &file, *confirm).await
+        }
+        Command::Backup { output } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::cluster_ops::backup(&info, &output).await
+        }
+        Command::Flatten {
+            resource: FlattenResource::Volume { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::flatten(&info, name).await
+        }
+        Command::Resize {
+            resource:
+                ResizeResource::Volume {
+                    name,
+                    size_bytes,
+                    grow_filesystem,
+                    allow_shrink,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::resize(&info, name, *size_bytes, *grow_filesystem, *allow_shrink)
+                .await
+        }
+        Command::Encrypt {
+            resource: EncryptResource::Volume { name, destroy_data },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::encrypt(&info, name, *destroy_data).await
         }
 
         Command::Set {
@@ -1584,16 +2036,72 @@ async fn main() {
             commands::storage_class::list(&info).await
         }
         Command::Get {
-            resource: GetResource::Volumes,
+            resource: GetResource::Volumes { vm },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::volume::list(&info).await
+            commands::volume::list(&info, vm.clone()).await
+        }
+        Command::Get {
+            resource: GetResource::Volume { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::get(&info, name).await
+        }
+        Command::Get {
+            resource:
+                GetResource::Operations {
+                    include_finished,
+                    vm,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operation::list(&info, *include_finished, vm.clone()).await
+        }
+        Command::Get {
+            resource: GetResource::Operation { id },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operation::get(&info, id).await
+        }
+        Command::Get {
+            resource: GetResource::Snapshots { volume },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::list_snapshots(&info, volume.clone()).await
+        }
+        Command::Get {
+            resource: GetResource::SnapshotPolicies { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            if let Some(n) = name {
+                commands::volume::get_snapshot_policy(&info, n).await
+            } else {
+                commands::volume::list_snapshot_policies(&info).await
+            }
         }
         Command::Get {
             resource: GetResource::ComplianceReport,
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::compliance::report(&info).await
+        }
+        Command::Get {
+            resource: GetResource::ClusterHealth,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::cluster_ops::health(&info).await
+        }
+        Command::Get {
+            resource: GetResource::CryptoConfig,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::compliance::crypto_config(&info).await
+        }
+        Command::Get {
+            resource: GetResource::Sbom { kind, output },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::compliance::export_sbom(&info, kind, output.as_deref()).await
         }
         Command::Get {
             resource:
@@ -1629,6 +2137,18 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::ceph_cluster::list(&info).await
+        }
+        Command::Get {
+            resource: GetResource::SharedFilesystems,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::shared_filesystem::list(&info).await
+        }
+        Command::Get {
+            resource: GetResource::ObjectStores,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::object_store::list(&info).await
         }
 
         Command::Describe {
@@ -1674,6 +2194,12 @@ async fn main() {
             commands::compliance::report(&info).await
         }
         Command::Describe {
+            resource: DescribeResource::CryptoConfig,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::compliance::crypto_config(&info).await
+        }
+        Command::Describe {
             resource: DescribeResource::DiskLayout { name },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -1684,6 +2210,18 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::ceph_cluster::get(&info, name).await
+        }
+        Command::Describe {
+            resource: DescribeResource::SharedFilesystem { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::shared_filesystem::get(&info, name).await
+        }
+        Command::Describe {
+            resource: DescribeResource::ObjectStore { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::object_store::get(&info, name).await
         }
 
         Command::Gpu { action } => match action {
@@ -1718,6 +2256,27 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::node::reject(&info, node_id).await
+        }
+
+        Command::Node {
+            action: NodeAction::Cordon { node_id },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::node::cordon(&info, node_id).await
+        }
+
+        Command::Node {
+            action: NodeAction::Uncordon { node_id },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::node::uncordon(&info, node_id).await
+        }
+
+        Command::Node {
+            action: NodeAction::Delete { node_id },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::node::delete(&info, node_id).await
         }
 
         Command::Node {

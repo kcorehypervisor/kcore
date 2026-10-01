@@ -68,6 +68,17 @@ Behavior details:
 
 So for the VM create/delete controller path, generated Nix is **written immediately** and then **validated before activation**.
 
+## Network fields the generator adds
+
+`generate_node_config_inner` leaves a single-NIC IPv4 guest unchanged. When the database has the matching rows it also emits:
+
+- `extraNics` for NICs after the primary, and skips the single-NIC VXLAN cloud-init file so the module renders every interface.
+- `dhcpReservedIPv6` and `ipv6` on an extra NIC when `vm_ipv6` has an address.
+- `eastWestFirewall`, `ipv6Prefix`, and `ipv6Gateway` on a network whose policy sets them.
+- `vxlanPeers` limited to other ready, approved nodes that have the same network name.
+
+See [networking.md](./networking.md) and [scheduler.md](./scheduler.md). Placement itself is decided before this file is rendered.
+
 ## vm-module.nix (test module)
 
 File: `kcore-rust/tests/vm-module.nix`

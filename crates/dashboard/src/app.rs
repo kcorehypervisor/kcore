@@ -1,13 +1,15 @@
 use crate::api::{
     get_compliance_dto, get_network_overview_dto, get_replication_status_dto,
-    get_storage_overview_dto, list_audit_events_dto, list_networks_dto,
-    list_replication_conflicts_dto, list_vms_page,
+    get_storage_overview_dto, list_audit_events_dto, list_ceph_clusters_dto, list_networks_dto,
+    list_object_stores_dto, list_operations_dto, list_replication_conflicts_dto,
+    list_shared_filesystems_dto, list_vms_page, list_volumes_dto,
 };
 use crate::dto::{
-    AuditEventDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
-    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
-    NodeSummaryDto, ReplicationConflictDto, ReplicationStatusDto, StorageDiskRowDto,
-    StorageOverviewDto, VmRowDto, VmsPageDto,
+    AuditEventDto, CephClusterRowDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto,
+    LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
+    NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto,
+    ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto,
+    VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};
@@ -56,8 +58,12 @@ pub fn App() -> impl IntoView {
                     <a href="/">"Overview"</a>
                     <a href="/compliance">"Compliance"</a>
                     <a href="/vms">"Virtual machines"</a>
+                    <a href="/volumes">"Volumes"</a>
+                    <a href="/ceph">"Ceph"</a>
                     <a href="/networks">"Networks"</a>
                     <a href="/storage">"Storage"</a>
+                    <a href="/operations">"Operations"</a>
+                    <a href="/audit">"Audit"</a>
                 </nav>
             </header>
             <main class="page">
@@ -66,6 +72,10 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/") view=HomePage/>
                         <Route path=path!("/compliance") view=CompliancePage/>
                         <Route path=path!("/vms") view=VmsPage/>
+                        <Route path=path!("/volumes") view=VolumesPage/>
+                        <Route path=path!("/ceph") view=CephPage/>
+                        <Route path=path!("/operations") view=OperationsPage/>
+                        <Route path=path!("/audit") view=AuditPage/>
                         <Route path=path!("/networks") view=NetworksPage/>
                         <Route path=path!("/storage") view=StoragePage/>
                     </FlatRoutes>
@@ -98,13 +108,29 @@ fn HomePage() -> impl IntoView {
                 <h2>"Virtual machines"</h2>
                 <p class="muted">"Cluster-wide VM list with paging when you have more than ten."</p>
             </a>
+            <a href="/volumes" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Volumes"</h2>
+                <p class="muted">"Ceph RBD volumes, attach state, pool, and LUKS encryption flags."</p>
+            </a>
+            <a href="/ceph" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Ceph"</h2>
+                <p class="muted">"Ceph clusters, CephFS shares, and RGW object stores."</p>
+            </a>
+            <a href="/operations" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Operations"</h2>
+                <p class="muted">"Live migration jobs and recent controller API activity."</p>
+            </a>
+            <a href="/audit" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Audit trail"</h2>
+                <p class="muted">"Search actor, action, resource, and time across the append-only log."</p>
+            </a>
             <a href="/networks" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Networks"</h2>
-                <p class="muted">"NAT, bridge, and overlay networks registered with the controller."</p>
+                <p class="muted">"Host interfaces plus NAT, bridge, and VXLAN networks."</p>
             </a>
             <a href="/storage" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Storage"</h2>
-                <p class="muted">"Cluster-wide data-plane backends (filesystem, LVM, ZFS) and block inventory per node."</p>
+                <p class="muted">"Filesystem, LVM, ZFS, and Ceph data planes, with per-node block inventory."</p>
             </a>
         </div>
     }
@@ -115,7 +141,10 @@ fn CompliancePage() -> impl IntoView {
     let res = Resource::new(|| (), |_| get_compliance_dto());
     let replication_res = Resource::new(|| (), |_| get_replication_status_dto());
     let conflicts_res = Resource::new(|| (), |_| list_replication_conflicts_dto());
-    let audit_res = Resource::new(|| (), |_| list_audit_events_dto());
+    let audit_res = Resource::new(
+        || (),
+        |_| list_audit_events_dto(String::new(), String::new(), String::new(), 50),
+    );
     view! {
         <section class="hero">
             <h1>"Compliance report"</h1>
@@ -131,10 +160,11 @@ fn CompliancePage() -> impl IntoView {
         </Suspense>
         <section class="card" style="margin-top: 1rem;">
             <h2>"Recent audit events"</h2>
+            <p class="muted"><a href="/audit">"Search the full audit trail"</a></p>
             <Suspense fallback=move || view! { <p class="muted">"Loading audit events…"</p> }>
                 {move || Suspend::new(async move {
                     match audit_res.await {
-                        Ok(data) => audit_events_view(data).into_any(),
+                        Ok(data) => audit_events_view(data, false).into_any(),
                         Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
                     }
                 })}
@@ -165,9 +195,14 @@ fn CompliancePage() -> impl IntoView {
     }
 }
 
-fn audit_events_view(events: Vec<AuditEventDto>) -> impl IntoView {
+fn audit_events_view(events: Vec<AuditEventDto>, searched: bool) -> impl IntoView {
     if events.is_empty() {
-        return view! { <p class="muted">"No audit events yet."</p> }.into_any();
+        let msg = if searched {
+            "No audit events match this search."
+        } else {
+            "No audit events yet."
+        };
+        return view! { <p class="muted">{msg}</p> }.into_any();
     }
     view! {
         <div class="table-wrap">
@@ -531,6 +566,7 @@ fn vms_table(data: VmsPageDto) -> impl IntoView {
                         <th>"Name"</th>
                         <th>"State"</th>
                         <th>"Node"</th>
+                        <th>"Storage"</th>
                         <th>"vCPU"</th>
                         <th>"Memory"</th>
                         <th></th>
@@ -582,6 +618,7 @@ fn vm_row(vm: VmRowDto) -> impl IntoView {
             </td>
             <td><span class={badge_class}>{vm.state.clone()}</span></td>
             <td><code class="inline">{vm.node_id.clone()}</code></td>
+            <td>{vm.storage_backend.clone()}</td>
             <td>{vm.cpu}</td>
             <td>{vm.memory.clone()}</td>
             <td><a href=console_href>"Console"</a></td>
@@ -603,13 +640,252 @@ fn urlencoding_path(s: &str) -> String {
 }
 
 #[component]
+fn VolumesPage() -> impl IntoView {
+    let res = Resource::new(|| (), |_| list_volumes_dto());
+    view! {
+        <section class="hero">
+            <h1>"Volumes"</h1>
+            <p class="muted">"Ceph RBD volumes from the controller (same data as kctl volume list). Local LVM and ZFS disks are on the Storage page."</p>
+        </section>
+        <Suspense fallback=move || view! { <p class="muted">"Loading volumes…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(rows) => volumes_table(rows).into_any(),
+                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn volumes_table(rows: Vec<VolumeRowDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! {
+            <div class="empty-note">"No Ceph RBD volumes registered. Local disks are on the Storage page. Create a volume with "<code class="inline">"kctl create volume"</code>"."</div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Backend"</th>
+                        <th>"Pool"</th>
+                        <th>"Node"</th>
+                        <th>"Role"</th>
+                        <th>"Attach"</th>
+                        <th>"Size"</th>
+                        <th>"VM"</th>
+                        <th>"Encrypted"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|v| {
+                        let vm_cell = if v.vm.is_empty() { "-".to_string() } else { v.vm.clone() };
+                        let enc = if v.encrypted { "yes" } else { "no" };
+                        view! {
+                            <tr>
+                                <td><strong>{v.name.clone()}</strong></td>
+                                <td>{v.backend.clone()}</td>
+                                <td><code class="inline">{if v.pool.is_empty() { "—".to_string() } else { v.pool.clone() }}</code></td>
+                                <td><code class="inline">{if v.node_id.is_empty() { "—".to_string() } else { v.node_id.clone() }}</code></td>
+                                <td>{if v.role.is_empty() { "-".to_string() } else { v.role.clone() }}</td>
+                                <td>{if v.attach_state.is_empty() { "-".to_string() } else { v.attach_state.clone() }}</td>
+                                <td>{v.size.clone()}</td>
+                                <td><code class="inline">{vm_cell}</code></td>
+                                <td>{enc}</td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn OperationsPage() -> impl IntoView {
+    let query = use_query_map();
+    let q = Memo::new(move |_| query.get().get("q").unwrap_or_default());
+    let ops_res = Resource::new(
+        move || q.get(),
+        |q| async move { list_operations_dto(q).await },
+    );
+    let activity_res = Resource::new(
+        move || q.get(),
+        |q| async move { list_audit_events_dto(q, String::new(), String::new(), 100).await },
+    );
+    view! {
+        <section class="hero">
+            <h1>"Operations"</h1>
+            <p class="muted">
+                "Long-running VM jobs such as live migration, and the recent controller API activity those jobs sit beside. "
+                <a href="/audit">"Open the full audit trail"</a>"."
+            </p>
+        </section>
+        <form class="filters" method="get" action="/operations">
+            <label>
+                "Search"
+                <input type="search" name="q" placeholder="VM, kind, phase, actor, action…" value=move || q.get() />
+            </label>
+            <button type="submit">"Search"</button>
+        </form>
+        <h2 class="section-title">"VM jobs"</h2>
+        <Suspense fallback=move || view! { <p class="muted">"Loading operations…"</p> }>
+            {move || {
+                let searched = !q.get().trim().is_empty();
+                Suspend::new(async move {
+                    match ops_res.await {
+                        Ok(rows) => operations_table(rows, searched).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
+        </Suspense>
+        <h2 class="section-title">"Recent API activity"</h2>
+        <p class="muted">"Start, stop, register, and other controller calls from the audit log."</p>
+        <Suspense fallback=move || view! { <p class="muted">"Loading activity…"</p> }>
+            {move || {
+                let searched = !q.get().trim().is_empty();
+                Suspend::new(async move {
+                    match activity_res.await {
+                        Ok(rows) => audit_events_view(rows, searched).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+#[component]
+fn AuditPage() -> impl IntoView {
+    let query = use_query_map();
+    let filters = Memo::new(move |_| {
+        let qmap = query.get();
+        (
+            qmap.get("q").unwrap_or_default(),
+            qmap.get("action").unwrap_or_default(),
+            qmap.get("since").unwrap_or_default(),
+        )
+    });
+    let res = Resource::new(
+        move || filters.get(),
+        |(q, action, since)| async move { list_audit_events_dto(q, action, since, 200).await },
+    );
+    view! {
+        <section class="hero">
+            <h1>"Audit trail"</h1>
+            <p class="muted">
+                "Append-only controller log. Search matches actor, action, resource, and detail in the latest 200 events. "
+                "Action is an exact filter sent to the controller. Since is an inclusive RFC3339 lower bound."
+            </p>
+        </section>
+        <form class="filters" method="get" action="/audit">
+            <label>
+                "Search"
+                <input type="search" name="q" placeholder="actor, action, resource, detail" value=move || filters.get().0 />
+            </label>
+            <label>
+                "Action"
+                <input type="text" name="action" placeholder="CreateVm" value=move || filters.get().1 />
+            </label>
+            <label>
+                "Since"
+                <input type="text" name="since" placeholder="2026-08-03T00:00:00Z" value=move || filters.get().2 />
+            </label>
+            <button type="submit">"Search"</button>
+        </form>
+        <Suspense fallback=move || view! { <p class="muted">"Loading audit events…"</p> }>
+            {move || {
+                let searched = {
+                    let (q, action, since) = filters.get();
+                    !q.trim().is_empty() || !action.trim().is_empty() || !since.trim().is_empty()
+                };
+                Suspend::new(async move {
+                    match res.await {
+                        Ok(rows) => audit_events_view(rows, searched).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
+        </Suspense>
+    }
+}
+
+fn operations_table(rows: Vec<VmOperationRowDto>, searched: bool) -> impl IntoView {
+    if rows.is_empty() {
+        let msg = if searched {
+            "No VM jobs match this search."
+        } else {
+            "No long-running VM jobs recorded. Live migration is the job kind stored here; start and stop appear in API activity."
+        };
+        return view! {
+            <div class="empty-note">{msg}</div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"ID"</th>
+                        <th>"Kind"</th>
+                        <th>"Phase"</th>
+                        <th>"VM"</th>
+                        <th>"Source"</th>
+                        <th>"Target"</th>
+                        <th>"Started"</th>
+                        <th>"Finished"</th>
+                        <th>"Cancel"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|o| {
+                        let cancel = if o.cancel_requested { "yes" } else { "no" };
+                        let source = display_or_dash(&o.source_node);
+                        let target = display_or_dash(&o.target_node);
+                        view! {
+                            <tr>
+                                <td><code class="inline">{o.id.clone()}</code></td>
+                                <td>{o.kind.clone()}</td>
+                                <td>{o.phase.clone()}</td>
+                                <td><code class="inline">{o.vm.clone()}</code></td>
+                                <td><code class="inline">{source}</code></td>
+                                <td><code class="inline">{target}</code></td>
+                                <td>{o.started_at.clone()}</td>
+                                <td>{o.finished_at.clone()}</td>
+                                <td>{cancel}</td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+fn display_or_dash(value: &str) -> String {
+    if value.trim().is_empty() {
+        "—".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+#[component]
 fn NetworksPage() -> impl IntoView {
     let sdn_res = Resource::new(|| (), |_| list_networks_dto());
     let overview_res = Resource::new(|| (), |_| get_network_overview_dto());
     view! {
         <section class="hero">
             <h1>"Networks"</h1>
-            <p class="muted">"Host networking, VLAN configs, and software-defined networks across all nodes."</p>
+            <p class="muted">"Host interfaces, per-node VXLAN capability, and NAT, bridge, and VXLAN networks."</p>
         </section>
 
         <h2 class="section-title">"Host networking"</h2>
@@ -626,7 +902,7 @@ fn NetworksPage() -> impl IntoView {
         <Suspense fallback=move || view! { <p class="muted">"Loading SDN data…"</p> }>
             {move || Suspend::new(async move {
                 match sdn_res.await {
-                    Ok(rows) => sdn_table(rows).into_any(),
+                    Ok(rows) => sdn_section(rows).into_any(),
                     Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
                 }
             })}
@@ -636,7 +912,26 @@ fn NetworksPage() -> impl IntoView {
 
 fn host_networking_view(data: NetworkOverviewDto) -> impl IntoView {
     let has_nodes = !data.nodes.is_empty();
+    let vxlan_ready = data.nodes.iter().filter(|n| !n.disable_vxlan).count();
+    let vxlan_off = data.nodes.iter().filter(|n| n.disable_vxlan).count();
+    let vxlan_ifaces = data
+        .nodes
+        .iter()
+        .flat_map(|n| n.interfaces.iter())
+        .filter(|iface| iface.kind == "vxlan")
+        .count();
     view! {
+        <section class="card" style="margin-bottom: 1rem;">
+            <h2>"VXLAN on nodes"</h2>
+            <p class="muted" style="font-size: 0.85rem; margin-bottom: 0.75rem;">
+                "A node accepts overlay networks unless it was registered with VXLAN disabled. Interfaces named vxlan or kvx- are the tunnels currently up."
+            </p>
+            <div class="stat-row">
+                <div class="stat"><div class="label">"VXLAN enabled"</div><div class="value">{vxlan_ready}</div></div>
+                <div class="stat"><div class="label">"VXLAN disabled"</div><div class="value">{vxlan_off}</div></div>
+                <div class="stat"><div class="label">"VXLAN interfaces"</div><div class="value">{vxlan_ifaces}</div></div>
+            </div>
+        </section>
         <section class="card" style="margin-bottom: 1rem;">
             <h2>"Default network config"</h2>
             <dl class="kv">
@@ -671,7 +966,7 @@ fn node_network_card(node: NodeNetworkDto) -> impl IntoView {
                 <span class="muted">{node.address.clone()}</span>
             </div>
             <dl class="kv">
-                <dt>"Gateway iface"</dt><dd><code class="inline">{node.gateway_interface.clone()}</code></dd>
+                <dt>"Gateway iface"</dt><dd><code class="inline">{display_or_dash(&node.gateway_interface)}</code></dd>
                 <dt>"VXLAN"</dt><dd>{vxlan_label}</dd>
             </dl>
             <Show when=move || has_ifaces>
@@ -720,10 +1015,40 @@ fn iface_row(iface: HostInterfaceDto) -> impl IntoView {
     }
 }
 
+fn sdn_section(rows: Vec<NetworkRowDto>) -> impl IntoView {
+    let vxlan_networks = rows.iter().filter(|n| n.network_type == "vxlan").count();
+    let isolated = rows
+        .iter()
+        .filter(|n| n.network_type == "vxlan" && !n.enable_outbound_nat)
+        .count();
+    let firewalls = rows.iter().filter(|n| n.east_west_firewall).count();
+    view! {
+        <section class="card" style="margin-bottom: 1rem;">
+            <h2>"VXLAN overlays"</h2>
+            <div class="stat-row">
+                <div class="stat"><div class="label">"VXLAN networks"</div><div class="value">{vxlan_networks}</div></div>
+                <div class="stat"><div class="label">"Isolated"</div><div class="value">{isolated}</div></div>
+                <div class="stat"><div class="label">"East-west firewall"</div><div class="value">{firewalls}</div></div>
+            </div>
+            <p class="muted" style="font-size: 0.85rem; margin-top: 0.75rem;">
+                "Create an overlay with "<code class="inline">"kctl create network --type vxlan"</code>
+                ". Turn outbound NAT off to keep the overlay isolated from the internet."
+            </p>
+        </section>
+        {sdn_table(rows)}
+    }
+}
+
 fn sdn_table(rows: Vec<NetworkRowDto>) -> impl IntoView {
     if rows.is_empty() {
         return view! {
-            <div class="empty-note">"No software-defined networks configured. Use "<code class="inline">"kctl create network"</code>" to add one."</div>
+            <div class="empty-note">
+                "No software-defined networks configured. Add one with "
+                <code class="inline">"kctl create network"</code>
+                ", including "
+                <code class="inline">"--type vxlan"</code>
+                " for an overlay."
+            </div>
         }
         .into_any();
     }
@@ -738,12 +1063,18 @@ fn sdn_table(rows: Vec<NetworkRowDto>) -> impl IntoView {
                         <th>"External"</th>
                         <th>"Gateway"</th>
                         <th>"Netmask"</th>
+                        <th>"IPv6"</th>
                         <th>"VLAN"</th>
                         <th>"Outbound NAT"</th>
+                        <th>"East-west"</th>
+                        <th>"Ports"</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {rows.into_iter().map(|n| view! {
+                    {rows.into_iter().map(|n| {
+                        let nat = if n.enable_outbound_nat { "yes" } else { "no" };
+                        let east = if n.east_west_firewall { "yes" } else { "no" };
+                        view! {
                         <tr>
                             <td><strong>{n.name.clone()}</strong></td>
                             <td>{n.network_type.clone()}</td>
@@ -751,10 +1082,13 @@ fn sdn_table(rows: Vec<NetworkRowDto>) -> impl IntoView {
                             <td>{n.external_ip.clone()}</td>
                             <td>{n.gateway_ip.clone()}</td>
                             <td>{n.internal_netmask.clone()}</td>
+                            <td>{n.ipv6.clone()}</td>
                             <td>{n.vlan_id}</td>
-                            <td>{if n.enable_outbound_nat { "yes" } else { "no" }}</td>
+                            <td>{nat}</td>
+                            <td>{east}</td>
+                            <td>{n.forwarded_ports.clone()}</td>
                         </tr>
-                    }).collect_view()}
+                    }}).collect_view()}
                 </tbody>
             </table>
         </div>
@@ -769,9 +1103,10 @@ fn StoragePage() -> impl IntoView {
         <section class="hero">
             <h1>"Storage"</h1>
             <p class="muted">
-                "Cluster-wide VM data-plane type (filesystem, LVM, ZFS) and LUKS posture from the controller; "
+                "Cluster-wide VM data-plane type (filesystem, LVM, ZFS, Ceph) and LUKS posture from the controller; "
                 "block devices are queried on each node with "
-                <code class="inline">"lsblk"</code>" (top-level disks)."
+                <code class="inline">"lsblk"</code>" (top-level disks). Ceph clusters, CephFS, and RGW are on the "
+                <a href="/ceph">"Ceph"</a>" page."
             </p>
         </section>
         <Suspense fallback=move || view! { <p class="muted">"Loading storage overview…"</p> }>
@@ -800,6 +1135,7 @@ fn storage_overview_view(data: StorageOverviewDto) -> impl IntoView {
                     <div class="stat"><div class="label">"Filesystem"</div><div class="value">{data.backend_filesystem_nodes}</div></div>
                     <div class="stat"><div class="label">"LVM"</div><div class="value">{data.backend_lvm_nodes}</div></div>
                     <div class="stat"><div class="label">"ZFS"</div><div class="value">{data.backend_zfs_nodes}</div></div>
+                    <div class="stat"><div class="label">"Ceph"</div><div class="value">{data.backend_ceph_nodes}</div></div>
                     <div class="stat"><div class="label">"Unspecified"</div><div class="value">{data.backend_unspecified_nodes}</div></div>
                 </div>
             </section>
@@ -1029,4 +1365,174 @@ fn storage_disk_row(d: StorageDiskRowDto) -> impl IntoView {
             <td><span class="muted">{role_hint}</span></td>
         </tr>
     }
+}
+
+#[component]
+fn CephPage() -> impl IntoView {
+    let clusters_res = Resource::new(|| (), |_| list_ceph_clusters_dto());
+    let fs_res = Resource::new(|| (), |_| list_shared_filesystems_dto());
+    let rgw_res = Resource::new(|| (), |_| list_object_stores_dto());
+    view! {
+        <section class="hero">
+            <h1>"Ceph"</h1>
+            <p class="muted">
+                "Declarative Ceph clusters, CephFS shared filesystems, and RGW object stores. "
+                "RBD volumes attached to VMs are listed on the "<a href="/volumes">"Volumes"</a>" page."
+            </p>
+        </section>
+        <h2 class="section-title">"Clusters"</h2>
+        <Suspense fallback=move || view! { <p class="muted">"Loading Ceph clusters…"</p> }>
+            {move || Suspend::new(async move {
+                match clusters_res.await {
+                    Ok(rows) => ceph_clusters_table(rows).into_any(),
+                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                }
+            })}
+        </Suspense>
+        <h2 class="section-title">"Shared filesystems"</h2>
+        <Suspense fallback=move || view! { <p class="muted">"Loading CephFS…"</p> }>
+            {move || Suspend::new(async move {
+                match fs_res.await {
+                    Ok(rows) => shared_filesystems_table(rows).into_any(),
+                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                }
+            })}
+        </Suspense>
+        <h2 class="section-title">"Object stores"</h2>
+        <Suspense fallback=move || view! { <p class="muted">"Loading object stores…"</p> }>
+            {move || Suspend::new(async move {
+                match rgw_res.await {
+                    Ok(rows) => object_stores_table(rows).into_any(),
+                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn ceph_clusters_table(rows: Vec<CephClusterRowDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! {
+            <div class="empty-note">"No Ceph clusters. Create one with "<code class="inline">"kctl create ceph-cluster"</code>"."</div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Phase"</th>
+                        <th>"Health"</th>
+                        <th>"Public"</th>
+                        <th>"Cluster net"</th>
+                        <th>"Size"</th>
+                        <th>"OSD encrypt"</th>
+                        <th>"Members"</th>
+                        <th>"OSD devices"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|c| {
+                        let enc = if c.encrypt_osds { "yes" } else { "no" };
+                        let health = if c.health_message.is_empty() { "—".to_string() } else { c.health_message.clone() };
+                        view! {
+                            <tr>
+                                <td><strong>{c.name.clone()}</strong></td>
+                                <td>{c.phase.clone()}</td>
+                                <td>{health}</td>
+                                <td><code class="inline">{display_or_dash(&c.public_network)}</code></td>
+                                <td><code class="inline">{display_or_dash(&c.cluster_network)}</code></td>
+                                <td>{format!("{}/{}", c.min_size, c.size)}</td>
+                                <td>{enc}</td>
+                                <td>{c.members.clone()}</td>
+                                <td><code class="inline">{c.osd_devices.clone()}</code></td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+fn shared_filesystems_table(rows: Vec<SharedFilesystemRowDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! {
+            <div class="empty-note">"No shared filesystems."</div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Cluster"</th>
+                        <th>"Phase"</th>
+                        <th>"Health"</th>
+                        <th>"Quota"</th>
+                        <th>"Clients"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|fs| view! {
+                        <tr>
+                            <td><strong>{fs.name.clone()}</strong></td>
+                            <td><code class="inline">{display_or_dash(&fs.ceph_cluster)}</code></td>
+                            <td>{fs.phase.clone()}</td>
+                            <td>{display_or_dash(&fs.health_message)}</td>
+                            <td>{fs.quota.clone()}</td>
+                            <td>{fs.clients}</td>
+                        </tr>
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+fn object_stores_table(rows: Vec<ObjectStoreRowDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! {
+            <div class="empty-note">"No object stores."</div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Cluster"</th>
+                        <th>"Phase"</th>
+                        <th>"Port"</th>
+                        <th>"TLS"</th>
+                        <th>"Members"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|store| {
+                        let tls = if store.tls { "yes" } else { "no" };
+                        view! {
+                            <tr>
+                                <td><strong>{store.name.clone()}</strong></td>
+                                <td><code class="inline">{display_or_dash(&store.ceph_cluster)}</code></td>
+                                <td>{store.phase.clone()}</td>
+                                <td>{store.port}</td>
+                                <td>{tls}</td>
+                                <td>{store.members.clone()}</td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
 }

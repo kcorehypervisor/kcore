@@ -7,12 +7,12 @@
 let
   cfg = config.ch-vm.vms;
   helpers = import ./helpers.nix { inherit lib; };
-  inherit (helpers) tapName generateMac;
+  inherit (helpers) vmInterfaces;
 
   mkVmService =
     vmName: vmCfg:
     let
-      mac = if vmCfg.macAddress != null then vmCfg.macAddress else generateMac vmName;
+      ifaces = vmInterfaces vmName vmCfg;
 
       socketPath = "${cfg.socketDir}/${vmName}.sock";
       serialSocket = "${cfg.socketDir}/${vmName}.serial.sock";
@@ -28,6 +28,10 @@ let
 
       lvName = "kcore-${vmName}";
       lvDevice = "/dev/${cfg.lvmVgName}/${lvName}";
+      # Written only after qemu-img convert finishes. A timeout or crash leaves
+      # the volume in place without this file, so the next start seeds it again
+      # instead of booting a half-written Windows disk.
+      seedMarker = "/var/lib/kcore/volume-seeded/${vmName}";
 
       zvolDataset = "${cfg.zfsPoolName}/kcore-${vmName}";
       zvolDevice = "/dev/zvol/${zvolDataset}";
@@ -45,8 +49,22 @@ let
           toString vmCfg.image;
       actualFormat = if isBlockBackend then "raw" else vmCfg.imageFormat;
 
-      vmDiskArg = "path=${actualDisk},image_type=${actualFormat}";
+      vmDiskArg =
+        "path=${actualDisk},image_type=${actualFormat}"
+        + lib.optionalString isCeph ",serial=root-${vmName}";
       seedDiskArg = "path=${seedIso},readonly=on,image_type=raw";
+      dataDiskArgs = lib.concatMapStringsSep " " (
+        disk:
+        let
+          ro = lib.optionalString disk.readonly ",readonly=on";
+          path =
+            if disk.encrypted then
+              "/dev/mapper/${disk.mapperName}"
+            else
+              "/dev/rbd/${cfg.rbdPool}/${disk.rbdImage}";
+        in
+        "path=${path},image_type=raw,serial=${disk.serial}${ro}"
+      ) vmCfg.dataDisks;
 
       lvmProvisionScript = pkgs.writeShellScript "lvm-provision-${vmName}" ''
         set -e
@@ -54,17 +72,23 @@ let
         VG="${cfg.lvmVgName}"
         LV="${lvName}"
         SIZE_BYTES="${toString vmCfg.storageSizeBytes}"
+        SEED_MARKER="${seedMarker}"
 
         if [ ! -b "$LV_DEVICE" ]; then
           echo "Creating LV $VG/$LV (''${SIZE_BYTES} bytes)..."
           ${pkgs.lvm2.bin}/bin/lvcreate -y -L "''${SIZE_BYTES}B" -n "$LV" "$VG"
+          rm -f "$SEED_MARKER"
+        fi
+        if [ ! -f "$SEED_MARKER" ]; then
           echo "Converting source image to LV..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
             -f ${vmCfg.imageFormat} -O raw \
             ${toString vmCfg.image} "$LV_DEVICE"
+          mkdir -p "$(dirname "$SEED_MARKER")"
+          touch "$SEED_MARKER"
           echo "LVM volume provisioned: $LV_DEVICE"
         else
-          echo "LV $LV_DEVICE already exists, skipping provision"
+          echo "LV $LV_DEVICE already seeded, skipping provision"
         fi
       '';
 
@@ -73,11 +97,11 @@ let
         ZVOL_DATASET="${zvolDataset}"
         ZVOL_DEVICE="${zvolDevice}"
         SIZE_BYTES="${toString vmCfg.storageSizeBytes}"
+        SEED_MARKER="${seedMarker}"
 
         if ! ${pkgs.zfs}/bin/zfs list -H "$ZVOL_DATASET" >/dev/null 2>&1; then
           echo "Creating zvol $ZVOL_DATASET (''${SIZE_BYTES} bytes)..."
           ${pkgs.zfs}/bin/zfs create -V "''${SIZE_BYTES}" -o volmode=dev "$ZVOL_DATASET"
-          # Wait for the device node to appear
           for i in $(seq 1 30); do
             [ -b "$ZVOL_DEVICE" ] && break
             sleep 0.2
@@ -86,31 +110,41 @@ let
             echo "ERROR: zvol device $ZVOL_DEVICE did not appear after create"
             exit 1
           fi
+          rm -f "$SEED_MARKER"
+        fi
+        if [ ! -f "$SEED_MARKER" ]; then
           echo "Converting source image to zvol..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
             -f ${vmCfg.imageFormat} -O raw \
             ${toString vmCfg.image} "$ZVOL_DEVICE"
+          mkdir -p "$(dirname "$SEED_MARKER")"
+          touch "$SEED_MARKER"
           echo "ZFS volume provisioned: $ZVOL_DEVICE"
         else
-          echo "zvol $ZVOL_DATASET already exists, skipping provision"
+          echo "zvol $ZVOL_DATASET already seeded, skipping provision"
         fi
       '';
 
       cephMapScript = pkgs.writeShellScript "ceph-map-${vmName}" ''
         set -e
+        map_one() {
+          local IMAGE="$1"
+          local RBD_DEV="/dev/rbd/$IMAGE"
+          if ! ${pkgs.ceph}/bin/rbd info "$IMAGE" >/dev/null 2>&1; then
+            echo "ERROR: RBD image $IMAGE does not exist; create/attach the volume via kctl first"
+            exit 1
+          fi
+          if [ ! -b "$RBD_DEV" ]; then
+            ${pkgs.ceph}/bin/rbd map "$IMAGE"
+          fi
+          test -b "$RBD_DEV"
+        }
         IMAGE="${cfg.rbdPool}/${rbdImage}"
         RBD_DEV="${rbdDevice}"
         SOURCE="${toString vmCfg.image}"
         # Controller/CephAdapter owns rbd create; this script only maps and
-        # seeds the guest image once onto the block device (like LVM/ZFS).
-        if ! ${pkgs.ceph}/bin/rbd info "$IMAGE" >/dev/null 2>&1; then
-          echo "ERROR: RBD image $IMAGE does not exist; create the VM via kctl first"
-          exit 1
-        fi
-        if [ ! -b "$RBD_DEV" ]; then
-          ${pkgs.ceph}/bin/rbd map "$IMAGE"
-        fi
-        test -b "$RBD_DEV"
+        # seeds the guest image once onto the root block device (like LVM/ZFS).
+        map_one "$IMAGE"
         # Cluster-visible seed flag so cold drain/migrate to another node does
         # not re-run qemu-img convert and wipe the shared RBD.
         LOCAL_MARKER="/var/lib/kcore/rbd-seeded/${rbdImage}"
@@ -131,6 +165,16 @@ let
           mkdir -p "$(dirname "$LOCAL_MARKER")"
           touch "$LOCAL_MARKER"
         fi
+        ${lib.concatMapStrings (disk: ''
+          map_one "${cfg.rbdPool}/${disk.rbdImage}"
+        '') vmCfg.dataDisks}
+      '';
+
+      cephUnmapScript = pkgs.writeShellScript "ceph-unmap-${vmName}" ''
+        ${pkgs.ceph}/bin/rbd unmap ${rbdDevice} || true
+        ${lib.concatMapStrings (disk: ''
+          ${pkgs.ceph}/bin/rbd unmap /dev/rbd/${cfg.rbdPool}/${disk.rbdImage} || true
+        '') vmCfg.dataDisks}
       '';
 
       normalizedPci = map (dev: dev // { address = lib.toLower dev.address; }) vmCfg.pciDevices;
@@ -145,14 +189,15 @@ let
       chArgs = lib.concatStringsSep " " (
         [
           "--api-socket ${socketPath}"
-          "--cpus boot=${toString vmCfg.cores}"
+          # Windows needs Hyper-V enlightenments. Linux guests tolerate them, so every VM gets them.
+          "--cpus boot=${toString vmCfg.cores},kvm_hyperv=on"
           memoryArg
           "--firmware ${firmwarePath}"
           "--serial socket=${serialSocket}"
-          "--disk ${vmDiskArg} ${seedDiskArg}"
-          "--net tap=${tapName vmName},mac=${mac}"
+          "--disk ${vmDiskArg} ${seedDiskArg}${lib.optionalString (dataDiskArgs != "") " ${dataDiskArgs}"}"
         ]
         ++ map (dev: "--device path=/sys/bus/pci/devices/${dev.address},iommu=on") normalizedPci
+        ++ map (iface: "--net tap=${iface.tap},mac=${iface.macAddress}") ifaces
         ++ vmCfg.extraArgs
       );
 
@@ -261,9 +306,9 @@ let
     in
     {
       description = "kcore VM ${vmName}";
-      requires = [ "kcore-tap-${vmName}.service" ];
-      after = [ "kcore-tap-${vmName}.service" ];
-      wantedBy = lib.optionals vmCfg.autoStart [ "multi-user.target" ];
+      requires = map (iface: "${iface.unit}.service") ifaces;
+      after = map (iface: "${iface.unit}.service") ifaces;
+      wantedBy = lib.optionals (vmCfg.autoStart && !vmCfg.incomingMigration) [ "multi-user.target" ];
       # A live-migrated CH survives the destination rebuild because the unit is
       # *new* there: switch-to-configuration only consults
       # stopIfChanged/restartIfChanged for units that already existed and
@@ -278,9 +323,12 @@ let
         ];
         ExecStart = "${startScript}";
         ExecStop = "${pkgs.curl}/bin/curl --unix-socket ${socketPath} -s -X PUT http://localhost/api/v1/vm.power-button";
-        ExecStopPost = lib.optionalString isCeph "-${pkgs.ceph}/bin/rbd unmap ${rbdDevice}";
+        ExecStopPost = lib.optionalString isCeph "-${cephUnmapScript}";
         TimeoutStopSec = 30;
-        Restart = if vmCfg.autoStart then "always" else "no";
+        # ExecStartPre copies the image onto the volume. The 90s default is
+        # shorter than a Windows qcow2 convert, which then fails the unit.
+        TimeoutStartSec = "15min";
+        Restart = if vmCfg.autoStart && !vmCfg.incomingMigration then "always" else "no";
         RestartSec = 5;
 
         Group = "kvm";

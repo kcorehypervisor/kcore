@@ -235,7 +235,8 @@ pub async fn connect(info: &ConnectionInfo) -> Result<Channel> {
         let uri = format!("{scheme}://{address}");
         let mut endpoint = Endpoint::from_shared(uri.clone())?
             .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30));
+            // VM create waits for the image fetch and nixos-rebuild on the node.
+            .timeout(std::time::Duration::from_secs(900));
 
         if let Some((ca_pem, client_cert_pem, client_key_pem)) = &tls_pems {
             let mut tls = ClientTlsConfig::new();
@@ -287,9 +288,11 @@ pub async fn controller_client(
     info: &ConnectionInfo,
 ) -> Result<controller_proto::controller_client::ControllerClient<Channel>> {
     let channel = connect(info).await?;
-    Ok(controller_proto::controller_client::ControllerClient::new(
-        channel,
-    ))
+    Ok(
+        controller_proto::controller_client::ControllerClient::new(channel)
+            .max_decoding_message_size(40 * 1024 * 1024)
+            .max_encoding_message_size(40 * 1024 * 1024),
+    )
 }
 
 pub async fn controller_admin_client(

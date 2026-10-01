@@ -29,6 +29,64 @@ pub struct Config {
     /// CRL/OCSP distribution endpoints.
     #[serde(default)]
     pub pki: PkiConfig,
+    /// Per-identity token bucket on the controller gRPC services.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    /// Optional installed release SBOMs served by `ExportSbom`.
+    #[serde(default)]
+    pub sbom: SbomConfig,
+    /// Outbound webhooks for cluster events. No endpoints means nothing is sent.
+    #[serde(default)]
+    pub webhooks: WebhooksConfig,
+    /// Placement ceiling and the ratios applied to live node load.
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
+    /// Move Ceph VMs off a node that has missed its heartbeat deadline.
+    #[serde(default)]
+    pub failover: FailoverConfig,
+}
+
+/// Automatic placement of shared-disk VMs when a node becomes unreachable.
+///
+/// Local-disk VMs stay on the failed node. Set `enabled` to false to leave
+/// every VM where it is until an operator drains the node.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for FailoverConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Ratios applied to physical CPU and memory when deciding whether a node
+/// can take another VM. `1.0` schedules against physical capacity. Heartbeat
+/// load is what counts as used, so a higher ratio admits VMs onto a quiet
+/// node whose live load still has room.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerConfig {
+    #[serde(default = "default_overcommit")]
+    pub cpu_overcommit: f64,
+    #[serde(default = "default_overcommit")]
+    pub memory_overcommit: f64,
+}
+
+fn default_overcommit() -> f64 {
+    1.0
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            cpu_overcommit: 1.0,
+            memory_overcommit: 1.0,
+        }
+    }
 }
 
 /// Controller-driven certificate rotation.
@@ -197,6 +255,120 @@ fn default_crl_refresh_before_hours() -> i64 {
 
 fn default_ocsp_validity_hours() -> i64 {
     1
+}
+
+fn default_rate_limit_rps() -> u32 {
+    100
+}
+
+fn default_rate_limit_burst() -> u32 {
+    200
+}
+
+/// Inbound gRPC rate limit. Defaults are high enough for heartbeats and
+/// reconciliation, and low enough that one peer cannot pin a core.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_rate_limit_rps")]
+    pub requests_per_second: u32,
+    #[serde(default = "default_rate_limit_burst")]
+    pub burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            requests_per_second: default_rate_limit_rps(),
+            burst: default_rate_limit_burst(),
+        }
+    }
+}
+
+fn default_webhook_timeout_secs() -> u64 {
+    5
+}
+
+fn default_webhook_max_retries() -> u32 {
+    3
+}
+
+/// Outbound event delivery. `enabled: false` is the kill switch; an empty
+/// endpoint list delivers nothing even when delivery is enabled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhooksConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Per-attempt deadline, including DNS, connect, TLS, and the response status.
+    #[serde(default = "default_webhook_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Extra attempts after the first. 5xx, 408, 429, and network errors are retried.
+    #[serde(default = "default_webhook_max_retries")]
+    pub max_retries: u32,
+    #[serde(default)]
+    pub endpoints: Vec<WebhookEndpoint>,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: default_webhook_timeout_secs(),
+            max_retries: default_webhook_max_retries(),
+            endpoints: Vec::new(),
+        }
+    }
+}
+
+/// One HTTPS (or HTTP) receiver. `events` empty subscribes to every known event.
+/// `secret` is never logged; it is the HMAC-SHA256 key for `X-Kcore-Signature`.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookEndpoint {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// PEM bundle merged into the HTTPS trust store for this endpoint.
+    /// Public webpki roots are always included. Empty uses public roots only.
+    #[serde(default)]
+    pub ca_file: String,
+}
+
+impl std::fmt::Debug for WebhookEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookEndpoint")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field(
+                "secret",
+                &if self.secret.is_empty() {
+                    "none"
+                } else {
+                    "redacted"
+                },
+            )
+            .field("events", &self.events)
+            .field("ca_file", &self.ca_file)
+            .finish()
+    }
+}
+
+/// Paths of release SBOM documents installed next to the controller.
+/// Empty `crates_file` serves the Cargo.lock graph embedded at build time.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SbomConfig {
+    #[serde(default)]
+    pub crates_file: String,
+    #[serde(default)]
+    pub iso_closure_file: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -375,6 +547,105 @@ impl Config {
         if self.pki.crl_refresh_before_hours < 0 {
             anyhow::bail!("pki.crlRefreshBeforeHours must not be negative");
         }
+        self.validate_rate_limit()?;
+        self.validate_sbom_paths()?;
+        self.validate_webhooks()?;
+        self.validate_scheduler()?;
+        Ok(())
+    }
+
+    fn validate_scheduler(&self) -> Result<()> {
+        for (name, ratio) in [
+            ("cpuOvercommit", self.scheduler.cpu_overcommit),
+            ("memoryOvercommit", self.scheduler.memory_overcommit),
+        ] {
+            if !ratio.is_finite() || !(1.0..=16.0).contains(&ratio) {
+                anyhow::bail!("scheduler.{name} must be between 1.0 and 16.0 (got {ratio})");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_webhooks(&self) -> Result<()> {
+        let hooks = &self.webhooks;
+        if hooks.timeout_secs == 0 || hooks.timeout_secs > 30 {
+            anyhow::bail!(
+                "webhooks.timeoutSecs must be from 1 to 30 (got {})",
+                hooks.timeout_secs
+            );
+        }
+        if hooks.max_retries > 10 {
+            anyhow::bail!(
+                "webhooks.maxRetries must be from 0 to 10 (got {})",
+                hooks.max_retries
+            );
+        }
+        let mut names = std::collections::HashSet::new();
+        for ep in &hooks.endpoints {
+            let name = ep.name.trim();
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                anyhow::bail!(
+                    "webhooks endpoint name '{name}' must be 1-64 ASCII letters, digits, '_' or '-'"
+                );
+            }
+            if !names.insert(name.to_string()) {
+                anyhow::bail!("webhooks endpoint name '{name}' is duplicated");
+            }
+            crate::webhooks::parse_webhook_url(&ep.url).map_err(|err| {
+                anyhow::anyhow!("webhooks endpoint '{name}' has an invalid url: {err}")
+            })?;
+            for event in &ep.events {
+                if !crate::webhooks::is_known_event(event) {
+                    anyhow::bail!(
+                        "webhooks endpoint '{name}' subscribes to unknown event '{event}' (known: {})",
+                        crate::webhooks::KNOWN_EVENTS.join(", ")
+                    );
+                }
+            }
+            if !ep.ca_file.trim().is_empty() {
+                crate::path_safety::assert_safe_path(&ep.ca_file, "webhooks.caFile")?;
+                if !std::path::Path::new(&ep.ca_file).is_file() {
+                    anyhow::bail!(
+                        "webhooks endpoint '{name}' caFile '{}' does not exist",
+                        ep.ca_file
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_rate_limit(&self) -> Result<()> {
+        if !self.rate_limit.enabled {
+            return Ok(());
+        }
+        if self.rate_limit.requests_per_second == 0 {
+            anyhow::bail!("rateLimit.requestsPerSecond must be greater than 0");
+        }
+        if self.rate_limit.burst == 0 {
+            anyhow::bail!("rateLimit.burst must be greater than 0");
+        }
+        Ok(())
+    }
+
+    fn validate_sbom_paths(&self) -> Result<()> {
+        for (label, path) in [
+            ("sbom.cratesFile", self.sbom.crates_file.trim()),
+            ("sbom.isoClosureFile", self.sbom.iso_closure_file.trim()),
+        ] {
+            if path.is_empty() {
+                continue;
+            }
+            crate::path_safety::assert_safe_path(path, label)?;
+            if !std::path::Path::new(path).is_file() {
+                anyhow::bail!("{label} '{path}' does not exist");
+            }
+        }
         Ok(())
     }
 }
@@ -540,6 +811,10 @@ defaultNetwork:
         assert_eq!(cfg.pki.http_listen_addr, "0.0.0.0:9092");
         assert_eq!(cfg.pki.crl_validity_hours, 24);
         assert_eq!(cfg.pki.ocsp_validity_hours, 1);
+        assert!(cfg.rate_limit.enabled);
+        assert_eq!(cfg.rate_limit.requests_per_second, 100);
+        assert_eq!(cfg.rate_limit.burst, 200);
+        assert!(cfg.sbom.crates_file.is_empty());
     }
 
     #[test]
@@ -683,5 +958,88 @@ defaultNetwork:
             "unexpected error: {s}"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn webhooks_default_to_enabled_with_no_endpoints() {
+        let cfg = load_with("webhooks-default", "").expect("load");
+        assert!(cfg.webhooks.enabled);
+        assert!(cfg.webhooks.endpoints.is_empty());
+        assert_eq!(cfg.webhooks.timeout_secs, 5);
+        assert_eq!(cfg.webhooks.max_retries, 3);
+    }
+
+    #[test]
+    fn webhooks_section_parses_endpoints_and_rejects_bad_values() {
+        let cfg = load_with(
+            "webhooks-ok",
+            r#"
+webhooks:
+  timeoutSecs: 2
+  maxRetries: 1
+  endpoints:
+    - name: pager
+      url: https://hooks.example/kcore
+      secret: top-secret
+      events:
+        - node.heartbeat.missed
+        - vm.state.changed
+"#,
+        )
+        .expect("load");
+        assert_eq!(cfg.webhooks.endpoints.len(), 1);
+        assert_eq!(cfg.webhooks.endpoints[0].name, "pager");
+        assert_eq!(cfg.webhooks.endpoints[0].events.len(), 2);
+        let rendered = format!("{:?}", cfg.webhooks.endpoints[0]);
+        assert!(rendered.contains("redacted"), "{rendered}");
+        assert!(!rendered.contains("top-secret"), "{rendered}");
+
+        for (name, snippet, needle) in [
+            (
+                "webhooks-scheme",
+                r#"
+webhooks:
+  endpoints:
+    - name: pager
+      url: ftp://example/hook
+"#,
+                "scheme",
+            ),
+            (
+                "webhooks-event",
+                r#"
+webhooks:
+  endpoints:
+    - name: pager
+      url: http://127.0.0.1/hook
+      events:
+        - vm.deleted
+"#,
+                "unknown event",
+            ),
+            (
+                "webhooks-dup",
+                r#"
+webhooks:
+  endpoints:
+    - name: pager
+      url: http://127.0.0.1/hook
+    - name: pager
+      url: http://127.0.0.1/other
+"#,
+                "duplicated",
+            ),
+            (
+                "webhooks-timeout",
+                r#"
+webhooks:
+  timeoutSecs: 0
+"#,
+                "timeoutSecs",
+            ),
+        ] {
+            let err = load_with(name, snippet).expect_err("must fail");
+            assert!(err.to_string().contains(needle), "{name}: {err}");
+        }
     }
 }

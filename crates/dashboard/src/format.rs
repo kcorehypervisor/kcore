@@ -6,8 +6,62 @@ pub fn storage_backend_label(backend: i32) -> &'static str {
         1 => "Filesystem",
         2 => "LVM",
         3 => "ZFS",
+        4 => "Ceph",
         _ => "Unspecified",
     }
+}
+
+/// Display name for a storage backend string from volume or VM records.
+pub fn storage_backend_name(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => "—".to_string(),
+        "filesystem" => "Filesystem".to_string(),
+        "lvm" => "LVM".to_string(),
+        "zfs" => "ZFS".to_string(),
+        "ceph" => "Ceph".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Ceph cluster, CephFS, and RGW phase enums share this numbering.
+pub fn service_phase_label(phase: i32) -> &'static str {
+    match phase {
+        1 => "Pending",
+        2 => "Bootstrapping",
+        3 => "Healthy",
+        4 => "Degraded",
+        5 => "Failed",
+        _ => "Unspecified",
+    }
+}
+
+/// UTC timestamp from Unix seconds. Non-positive values render as an em dash.
+pub fn format_unix_utc(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "—".to_string();
+    }
+    let days = seconds.div_euclid(86_400);
+    let tod = seconds.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let hh = tod / 3_600;
+    let mm = (tod % 3_600) / 60;
+    let ss = tod % 60;
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Howard Hinnant's `civil_from_days`, with `days` counted from 1970-01-01.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
 }
 
 /// VM state from `kcore.controller.VmState` (i32).
@@ -112,7 +166,26 @@ mod tests {
         assert_eq!(storage_backend_label(1), "Filesystem");
         assert_eq!(storage_backend_label(2), "LVM");
         assert_eq!(storage_backend_label(3), "ZFS");
+        assert_eq!(storage_backend_label(4), "Ceph");
         assert_eq!(storage_backend_label(0), "Unspecified");
+    }
+
+    #[test]
+    fn unix_utc_known_instant() {
+        assert_eq!(format_unix_utc(1_700_000_000), "2023-11-14 22:13:20Z");
+        assert_eq!(format_unix_utc(0), "—");
+    }
+
+    #[test]
+    fn storage_backend_names() {
+        assert_eq!(storage_backend_name("ceph"), "Ceph");
+        assert_eq!(storage_backend_name(""), "—");
+    }
+
+    #[test]
+    fn service_phases() {
+        assert_eq!(service_phase_label(3), "Healthy");
+        assert_eq!(service_phase_label(0), "Unspecified");
     }
 
     #[test]
@@ -350,7 +423,10 @@ mod proptests {
             let v = vm_state_label(state);
             prop_assert!(matches!(v, "Stopped" | "Running" | "Paused" | "Error" | "Unknown"));
             let s = storage_backend_label(backend);
-            prop_assert!(matches!(s, "Filesystem" | "LVM" | "ZFS" | "Unspecified"));
+            prop_assert!(matches!(
+                s,
+                "Filesystem" | "LVM" | "ZFS" | "Ceph" | "Unspecified"
+            ));
         }
     }
 }

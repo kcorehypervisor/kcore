@@ -624,6 +624,119 @@ impl StorageAdapter for CephAdapter {
     }
 }
 
+fn validate_rbd_pool_image_handle(backend_handle: &str) -> Result<String, StorageError> {
+    let handle = backend_handle.trim();
+    if handle.is_empty() {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "backend_handle is required",
+        ));
+    }
+    if !handle.contains('/') || handle.starts_with('/') {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "backend_handle must be pool/image",
+        ));
+    }
+    Ok(handle.to_string())
+}
+
+fn rbd_snap_full_name(backend_handle: &str, snapshot_name: &str) -> Result<String, StorageError> {
+    let handle = validate_rbd_pool_image_handle(backend_handle)?;
+    let snap = snapshot_name.trim();
+    if snap.is_empty() {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "snapshot_name is required",
+        ));
+    }
+    Ok(format!("{handle}@{snap}"))
+}
+
+fn run_argv_plan(plan: &[Vec<String>], err_kind: ErrorKind) -> Result<(), StorageError> {
+    for args in plan {
+        if args.is_empty() {
+            continue;
+        }
+        let prog = args[0].as_str();
+        let rest: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+        run_cmd(prog, &rest, err_kind)?;
+    }
+    Ok(())
+}
+
+/// Ordered `rbd` argv lists for snapshot create (+ optional protect).
+pub fn rbd_snapshot_command_plan(
+    backend_handle: &str,
+    snapshot_name: &str,
+    protect: bool,
+) -> Result<Vec<Vec<String>>, StorageError> {
+    let full = rbd_snap_full_name(backend_handle, snapshot_name)?;
+    let mut plan = vec![vec![
+        "rbd".into(),
+        "snap".into(),
+        "create".into(),
+        full.clone(),
+    ]];
+    if protect {
+        plan.push(vec!["rbd".into(), "snap".into(), "protect".into(), full]);
+    }
+    Ok(plan)
+}
+
+/// Ordered argv for snapshot delete (optional unprotect, then rm).
+pub fn rbd_delete_snapshot_command_plan(
+    backend_handle: &str,
+    snapshot_name: &str,
+    unprotect: bool,
+) -> Result<Vec<Vec<String>>, StorageError> {
+    let full = rbd_snap_full_name(backend_handle, snapshot_name)?;
+    let mut plan = Vec::new();
+    if unprotect {
+        plan.push(vec![
+            "rbd".into(),
+            "snap".into(),
+            "unprotect".into(),
+            full.clone(),
+        ]);
+    }
+    plan.push(vec!["rbd".into(), "snap".into(), "rm".into(), full]);
+    Ok(plan)
+}
+
+/// Clone argv and resulting child `pool/image` handle.
+pub fn rbd_clone_command_plan(
+    parent_handle: &str,
+    parent_snapshot: &str,
+    child_image: &str,
+) -> Result<(String, Vec<Vec<String>>), StorageError> {
+    let parent = validate_rbd_pool_image_handle(parent_handle)?;
+    let snap = parent_snapshot.trim();
+    let child = sanitize_volume_name(child_image.trim());
+    if snap.is_empty() || child.is_empty() {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "parent_snapshot and child_image are required",
+        ));
+    }
+    let pool = parent.split_once('/').map(|(p, _)| p).ok_or_else(|| {
+        StorageError::new(
+            ErrorKind::InvalidArgument,
+            "parent_handle must be pool/image",
+        )
+    })?;
+    let child_handle = format!("{pool}/{child}");
+    let plan = vec![vec![
+        "rbd".into(),
+        "clone".into(),
+        format!("{parent}@{snap}"),
+        child_handle.clone(),
+        "--image-feature".into(),
+        "layering".into(),
+    ]];
+    Ok((child_handle, plan))
+}
+
 fn run_cmd(program: &str, args: &[&str], err_kind: ErrorKind) -> Result<(), StorageError> {
     let out = Command::new(program).args(args).output().map_err(|e| {
         StorageError::new(
@@ -639,6 +752,94 @@ fn run_cmd(program: &str, args: &[&str], err_kind: ErrorKind) -> Result<(), Stor
         ));
     }
     Ok(())
+}
+
+/// Ceph RBD snapshot create (+ optional protect). `backend_handle` is `pool/image`.
+pub fn ceph_snapshot_volume(
+    backend_handle: &str,
+    snapshot_name: &str,
+    protect: bool,
+) -> Result<String, StorageError> {
+    let full = rbd_snap_full_name(backend_handle, snapshot_name)?;
+    let plan = rbd_snapshot_command_plan(backend_handle, snapshot_name, protect)?;
+    run_argv_plan(&plan, ErrorKind::Internal)?;
+    Ok(full)
+}
+
+pub fn ceph_delete_snapshot(
+    backend_handle: &str,
+    snapshot_name: &str,
+    unprotect: bool,
+) -> Result<(), StorageError> {
+    let plan = rbd_delete_snapshot_command_plan(backend_handle, snapshot_name, unprotect)?;
+    run_argv_plan(&plan, ErrorKind::Internal)
+}
+
+pub fn ceph_clone_volume(
+    parent_handle: &str,
+    parent_snapshot: &str,
+    child_image: &str,
+) -> Result<String, StorageError> {
+    let (child_handle, plan) = rbd_clone_command_plan(parent_handle, parent_snapshot, child_image)?;
+    run_argv_plan(&plan, ErrorKind::Internal)?;
+    Ok(child_handle)
+}
+
+pub fn ceph_rollback_volume(backend_handle: &str, snapshot_name: &str) -> Result<(), StorageError> {
+    let handle = backend_handle.trim();
+    let snap = snapshot_name.trim();
+    if handle.is_empty() || snap.is_empty() {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "backend_handle and snapshot_name are required",
+        ));
+    }
+    run_cmd(
+        "rbd",
+        &["snap", "rollback", &format!("{handle}@{snap}")],
+        ErrorKind::Internal,
+    )
+}
+
+pub fn ceph_flatten_volume(backend_handle: &str) -> Result<(), StorageError> {
+    let handle = backend_handle.trim();
+    if handle.is_empty() {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "backend_handle is required",
+        ));
+    }
+    run_cmd("rbd", &["flatten", handle], ErrorKind::Internal)
+}
+
+pub fn ceph_resize_volume(
+    backend_handle: &str,
+    size_bytes: i64,
+    allow_shrink: bool,
+) -> Result<i64, StorageError> {
+    let handle = backend_handle.trim();
+    if handle.is_empty() {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "backend_handle is required",
+        ));
+    }
+    if size_bytes <= 0 {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "size_bytes must be positive",
+        ));
+    }
+    let size_mib = crate::ceph_bootstrap::rbd_size_mib(size_bytes)
+        .map_err(|e| StorageError::new(ErrorKind::InvalidArgument, e))?;
+    let size_arg = format!("{size_mib}M");
+    let mut args = vec!["resize", "--size", &size_arg];
+    if allow_shrink {
+        args.push("--allow-shrink");
+    }
+    args.push(handle);
+    run_cmd("rbd", &args, ErrorKind::Internal)?;
+    Ok(i64::try_from(size_mib.saturating_mul(1024 * 1024)).unwrap_or(i64::MAX))
 }
 
 fn validate_volume_create_inputs(req: &CreateVolumeRequest) -> Result<(), StorageError> {
@@ -1474,7 +1675,29 @@ mod tests {
         assert!(PathBuf::from(result.path).exists());
     }
 
+    /// Lab flow: guest marker at t0 → protected snap → clone child (no real Ceph).
     #[test]
+    fn snap_protect_then_clone_rbd_argv_order_matches_marker_semantics() {
+        let parent = "kcore-vms/kcore-vol-deadbeef";
+        let snap = "s1";
+        let snap_plan = rbd_snapshot_command_plan(parent, snap, true).expect("snap plan");
+        assert_eq!(snap_plan.len(), 2);
+        assert_eq!(snap_plan[0][2], "create");
+        assert_eq!(snap_plan[0][3], format!("{parent}@{snap}"));
+        assert_eq!(snap_plan[1][2], "protect");
+
+        let (child, clone_plan) =
+            rbd_clone_command_plan(parent, snap, "kcore-vol-clone01").expect("clone plan");
+        assert_eq!(child, "kcore-vms/kcore-vol-clone01");
+        assert_eq!(clone_plan[0][1], "clone");
+        assert_eq!(clone_plan[0][2], format!("{parent}@{snap}"));
+        assert_eq!(clone_plan[0][3], child);
+
+        let del_blocked = rbd_delete_snapshot_command_plan(parent, snap, true).expect("del");
+        assert_eq!(del_blocked[0][2], "unprotect");
+        assert_eq!(del_blocked[1][2], "rm");
+    }
+
     fn ensure_image_keeps_existing_file_when_hash_diverged() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cache_dir = temp.path().join("images");

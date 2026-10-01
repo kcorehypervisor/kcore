@@ -11,17 +11,21 @@ mod console;
 mod discovery;
 mod disk;
 mod grpc;
+mod guest_ops;
 mod issue_screen;
 mod live_migrate;
 mod path_safety;
 mod pki;
+mod rate_limit;
 mod registration;
 mod runtime;
 mod storage;
 mod vmm;
+mod volume_crypto;
 
 use clap::{Args, Parser, Subcommand};
 use tokio::signal;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
@@ -148,37 +152,53 @@ async fn main() -> anyhow::Result<()> {
     }
 
     loop {
-        let compute_svc = proto::node_compute_server::NodeComputeServer::with_interceptor(
-            grpc::ComputeService::new(vm_client.clone()),
-            pki::revocation::interceptor(revocation.clone()),
+        let limiter = rate_limit::RateLimiter::from_config(&cfg.rate_limit);
+        let compute_svc = InterceptedService::new(
+            proto::node_compute_server::NodeComputeServer::with_interceptor(
+                grpc::ComputeService::new(vm_client.clone()),
+                pki::revocation::interceptor(revocation.clone()),
+            ),
+            limiter.interceptor(),
         );
-        let info_svc = proto::node_info_server::NodeInfoServer::with_interceptor(
-            grpc::InfoService::new(cfg.node_id.clone()),
-            pki::revocation::interceptor(revocation.clone()),
+        let info_svc = InterceptedService::new(
+            proto::node_info_server::NodeInfoServer::with_interceptor(
+                grpc::InfoService::new(cfg.node_id.clone()),
+                pki::revocation::interceptor(revocation.clone()),
+            ),
+            limiter.interceptor(),
         );
-        let container_svc = proto::node_container_server::NodeContainerServer::with_interceptor(
-            grpc::ContainerService::new(),
-            pki::revocation::interceptor(revocation.clone()),
+        let container_svc = InterceptedService::new(
+            proto::node_container_server::NodeContainerServer::with_interceptor(
+                grpc::ContainerService::new(),
+                pki::revocation::interceptor(revocation.clone()),
+            ),
+            limiter.interceptor(),
         );
         // Message-size overrides live on the generated server, so it is built
-        // first and wrapped in the interceptor afterwards.
-        let admin_svc = tonic::service::interceptor::InterceptedService::new(
-            proto::node_admin_server::NodeAdminServer::new(
-                grpc::AdminService::new_with_storage(
-                    cfg.nix_config_path.clone(),
-                    cfg.vm_socket_dir.clone(),
-                    storage.clone(),
-                    live_migrate_state.clone(),
+        // first and wrapped in revocation, then the rate limit.
+        let admin_svc = InterceptedService::new(
+            InterceptedService::new(
+                proto::node_admin_server::NodeAdminServer::new(
+                    grpc::AdminService::new_with_storage(
+                        cfg.nix_config_path.clone(),
+                        cfg.vm_socket_dir.clone(),
+                        storage.clone(),
+                        live_migrate_state.clone(),
+                    )
+                    .with_pki(cfg.clone(), reload.clone()),
                 )
-                .with_pki(cfg.clone(), reload.clone()),
-            )
-            .max_decoding_message_size(1024 * 1024 * 1024)
-            .max_encoding_message_size(64 * 1024 * 1024),
-            pki::revocation::interceptor(revocation.clone()),
+                .max_decoding_message_size(1024 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
+                pki::revocation::interceptor(revocation.clone()),
+            ),
+            limiter.interceptor(),
         );
-        let storage_svc = proto::node_storage_server::NodeStorageServer::with_interceptor(
-            grpc::StorageService::new_with_storage(storage.clone()),
-            pki::revocation::interceptor(revocation.clone()),
+        let storage_svc = InterceptedService::new(
+            proto::node_storage_server::NodeStorageServer::with_interceptor(
+                grpc::StorageService::new_with_storage(storage.clone()),
+                pki::revocation::interceptor(revocation.clone()),
+            ),
+            limiter.interceptor(),
         );
 
         let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();

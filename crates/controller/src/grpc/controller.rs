@@ -33,10 +33,17 @@ use crate::config::{NetworkConfig, ReplicationConfig};
 use crate::controller_proto;
 use crate::db::{
     CephClusterRow, CephClusterStatusRow, ClusterUpdateNodeRow, ClusterUpdateRow, Database,
-    DiskLayoutRow, DiskLayoutStatusRow, NetworkRow, NodeRow, OperatorRow, PostgresqlRow,
-    SecurityGroupRow, SecurityGroupRuleRow, VmRow, VolumeRow, WorkloadRow,
+    DiskLayoutRow, DiskLayoutStatusRow, NetworkRow, NodeRow, ObjectStoreRow, ObjectStoreStatusRow,
+    ObjectUserRow, OperatorRow, PostgresqlRow, SecurityGroupRow, SecurityGroupRuleRow,
+    SharedFilesystemRow, SharedFilesystemStatusRow, SnapshotPolicyRow, VmNicRow, VmOperationRow,
+    VmRow, VolumeRow, VolumeSnapshotRow, WorkloadRow,
 };
+#[cfg(test)]
+use crate::db::{IssuedCertRow, CERT_STATUS_ACTIVE, CERT_STATUS_REVOKED};
 use crate::node_proto;
+use crate::object_store_spec;
+use crate::shared_filesystem_spec;
+use crate::volume_snapshot;
 use crate::{nixgen, node_client::NodeClients, scheduler};
 use kcore_sanitize::sanitize_nix_attr_key;
 use std::collections::HashMap;
@@ -47,6 +54,63 @@ use super::helpers::{
     parse_datetime_to_timestamp, parse_port_list, receive_state_from_node, short_vm_id_seed,
     state_fallback_without_runtime, status_with_context, vm_backend_handle,
 };
+
+fn chrono_like_now() -> String {
+    // RFC3339-ish UTC from unix seconds; guest_checked_at is informational.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix:{secs}")
+}
+
+/// Virtio serial the guest sees for this volume.
+/// Ceph root disks use `serial=root-<runtimeName>` in ch-vm; data disks use
+/// `VolumeRow.serial`.
+fn guest_virtio_serial(vol: &VolumeRow, runtime_vm_name: &str) -> String {
+    if vol.role == VolumeRow::ROLE_ROOT {
+        format!("root-{runtime_vm_name}")
+    } else {
+        vol.serial.clone()
+    }
+}
+
+#[cfg(test)]
+mod guest_serial_tests {
+    use super::*;
+
+    #[test]
+    fn root_uses_ch_vm_root_prefix() {
+        let mut vol = VolumeRow::new_root("vm-1", "app-1", 10 * 1024 * 1024 * 1024);
+        vol.serial = "deadbeef".into();
+        assert_eq!(guest_virtio_serial(&vol, "app-1"), "root-app-1");
+    }
+
+    #[test]
+    fn data_uses_volume_serial() {
+        let mut vol = VolumeRow::new_data("pgdata", 1024);
+        vol.serial = "abcdef012345".into();
+        assert_eq!(guest_virtio_serial(&vol, "app-1"), "abcdef012345");
+    }
+}
+
+/// Shallow-merge `extra` object keys into `base` JSON object (both may be empty).
+fn merge_detail_json(base: &str, extra: &str) -> String {
+    let mut map = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+        if base.trim().is_empty() { "{}" } else { base },
+    ) {
+        Ok(m) => m,
+        Err(_) => serde_json::Map::new(),
+    };
+    if let Ok(extra_map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(extra)
+    {
+        for (k, v) in extra_map {
+            map.insert(k, v);
+        }
+    }
+    serde_json::Value::Object(map).to_string()
+}
 use super::rbac_matrix;
 use super::signing;
 use super::validation::{
@@ -66,6 +130,7 @@ type PushHook = std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + S
 struct LiveMigrateFailure {
     send_succeeded: bool,
     status: Status,
+    operation_id: String,
 }
 
 /// Whether a node may be handed a VM that is moving off another node.
@@ -114,6 +179,12 @@ fn accepts_migrated_vms(node: &NodeRow) -> Result<(), Status> {
             node.id, node.approval_status
         )));
     }
+    if node.status == "cordoned" {
+        return Err(Status::failed_precondition(format!(
+            "node '{}' is cordoned; it will not accept VMs until it is uncordoned",
+            node.id
+        )));
+    }
     if matches!(node.status.as_str(), "draining" | "drained") {
         return Err(Status::failed_precondition(format!(
             "node '{}' is being evacuated (status {}); moving a VM onto it would undo the drain",
@@ -121,6 +192,29 @@ fn accepts_migrated_vms(node: &NodeRow) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+/// Options for [`ControllerService::drain_node_vms`], shared by `DrainNode` RPC
+/// and DiskLayout evacuate reconciliation.
+pub struct NodeDrainOptions {
+    /// When true, set the source node status to `draining` before moving VMs.
+    pub mark_draining_at_start: bool,
+    /// When true, set the source node to `drained` or `draining` after work.
+    pub update_final_node_status: bool,
+}
+
+impl Default for NodeDrainOptions {
+    fn default() -> Self {
+        Self {
+            mark_draining_at_start: true,
+            update_final_node_status: true,
+        }
+    }
+}
+
+pub struct NodeDrainOutcome {
+    pub migrated: i32,
+    pub errors: Vec<String>,
 }
 
 /// Whether a node's receive-session report describes something that may still
@@ -240,9 +334,19 @@ const EVT_SECURITY_GROUP_DELETE: &str = "security_group.delete";
 const EVT_SECURITY_GROUP_ATTACH: &str = "security_group.attach";
 const EVT_SECURITY_GROUP_DETACH: &str = "security_group.detach";
 const EVT_NODE_DRAIN: &str = "node.drain";
+const EVT_NODE_CORDON: &str = "node.cordon";
+const EVT_NODE_UNCORDON: &str = "node.uncordon";
+const EVT_NODE_DELETE: &str = "node.delete";
 const EVT_VM_MIGRATE: &str = "vm.migrate";
 const EVT_SSH_KEY_CREATE: &str = "ssh_key.create";
 const EVT_SSH_KEY_DELETE: &str = "ssh_key.delete";
+const EVT_VOLUME_CREATE: &str = "volume.create";
+const EVT_VOLUME_DELETE: &str = "volume.delete";
+const EVT_VOLUME_ATTACH: &str = "volume.attach";
+const EVT_VOLUME_DETACH: &str = "volume.detach";
+const EVT_VOLUME_ENCRYPT: &str = "volume.encrypt";
+const EVT_VOLUME_SNAPSHOT_CREATE: &str = "volume_snapshot.create";
+const EVT_VOLUME_SNAPSHOT_DELETE: &str = "volume_snapshot.delete";
 const EVT_DISK_LAYOUT_CREATE: &str = "disk_layout.create";
 const EVT_DISK_LAYOUT_DELETE: &str = "disk_layout.delete";
 const EVT_CLUSTER_UPDATE_CREATE: &str = "cluster_update.create";
@@ -339,6 +443,7 @@ impl Default for PkiRuntime {
     }
 }
 
+#[derive(Clone)]
 pub struct ControllerService {
     db: Database,
     clients: NodeClients,
@@ -350,11 +455,141 @@ pub struct ControllerService {
     /// When true, legacy `CN=kctl` keeps cluster-admin after operators exist (escape hatch).
     bootstrap_kctl: bool,
     pki: PkiRuntime,
+    rate_limit: crate::config::RateLimitConfig,
+    sbom: crate::config::SbomConfig,
+    revocation_fail_mode: String,
+    webhooks: crate::webhooks::Dispatcher,
+    overcommit: crate::scheduler::Overcommit,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
 }
 
+fn network_policies_by_name(
+    db: &crate::db::Database,
+    node_id: &str,
+) -> Result<std::collections::HashMap<String, crate::db::NetworkPolicyRow>, Status> {
+    let rows = db
+        .list_network_policies_for_node(node_id)
+        .map_err(|e| Status::internal(format!("listing network policy: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.name.clone(), row))
+        .collect())
+}
+
+fn vm_ipv6_by_vm(
+    db: &crate::db::Database,
+    vms: &[VmRow],
+) -> Result<std::collections::HashMap<String, Vec<crate::db::VmIpv6Row>>, Status> {
+    let mut out = std::collections::HashMap::new();
+    for vm in vms {
+        let rows = db
+            .list_vm_ipv6(&vm.id)
+            .map_err(|e| Status::internal(format!("listing IPv6 addresses: {e}")))?;
+        if !rows.is_empty() {
+            out.insert(vm.id.clone(), rows);
+        }
+    }
+    Ok(out)
+}
+
+fn explicit_net_policy(
+    req: &controller_proto::CreateNetworkRequest,
+) -> Result<Option<(String, String, bool)>, Status> {
+    let prefix = req.ipv6_prefix.trim();
+    let gateway = req.ipv6_gateway.trim();
+    if prefix.is_empty() != gateway.is_empty() {
+        return Err(Status::invalid_argument(
+            "ipv6_prefix and ipv6_gateway must both be set, or both left empty",
+        ));
+    }
+    if !prefix.is_empty() {
+        crate::net_policy::validate_ipv6_network(prefix, gateway)
+            .map_err(Status::invalid_argument)?;
+    }
+    if prefix.is_empty() && !req.east_west_firewall {
+        return Ok(None);
+    }
+    Ok(Some((
+        prefix.to_string(),
+        gateway.to_string(),
+        req.east_west_firewall,
+    )))
+}
+
+fn extra_nics_by_vm(
+    db: &Database,
+    vms: &[VmRow],
+) -> std::collections::HashMap<String, Vec<VmNicRow>> {
+    let mut out = std::collections::HashMap::new();
+    for vm in vms {
+        if let Ok(nics) = db.list_vm_nics(&vm.id) {
+            if !nics.is_empty() {
+                out.insert(vm.id.clone(), nics);
+            }
+        }
+    }
+    out
+}
+
 impl ControllerService {
+    fn assign_ipv6_if_configured(
+        &self,
+        node_id: &str,
+        network: &str,
+        vm_id: &str,
+        position: i32,
+    ) -> Result<(), Status> {
+        let policy = self
+            .db
+            .get_network_policy(node_id, network)
+            .map_err(|e| Status::internal(format!("reading network policy: {e}")))?;
+        if policy.ipv6_prefix.is_empty() {
+            return Ok(());
+        }
+        let global = self
+            .db
+            .get_network_for_node(node_id, network)
+            .map_err(|e| Status::internal(format!("reading network: {e}")))?
+            .map(|net| net.network_type == "vxlan")
+            .unwrap_or(false);
+        self.db
+            .allocate_vm_ipv6(node_id, network, vm_id, position, global)
+            .map_err(|e| Status::internal(format!("allocating IPv6 address: {e}")))?;
+        Ok(())
+    }
+
+    fn allocate_nic_address(
+        &self,
+        node_id: &str,
+        network: &str,
+        vm_id: &str,
+    ) -> Result<String, Status> {
+        if network == "default" {
+            return self.reserve_nat_vm_ip_for_network(
+                node_id,
+                network,
+                vm_id,
+                &self.default_network.gateway_ip,
+            );
+        }
+        let Some(net) = self
+            .db
+            .get_network_for_node(node_id, network)
+            .map_err(|e| Status::internal(format!("fetching network: {e}")))?
+        else {
+            return Ok(String::new());
+        };
+        match net.network_type.as_str() {
+            "vxlan" => self
+                .db
+                .allocate_vm_ip_global(network)
+                .map_err(|e| Status::internal(format!("allocating VM IP: {e}"))),
+            "nat" => self.reserve_nat_vm_ip_for_network(node_id, network, vm_id, &net.gateway_ip),
+            _ => Ok(String::new()),
+        }
+    }
+
     fn reserve_nat_vm_ip_for_network(
         &self,
         node_id: &str,
@@ -406,6 +641,21 @@ impl ControllerService {
                 used_hosts.insert(host);
             }
         }
+        if let Ok(ips) = self.db.list_nic_ips_on_node_network(node_id, vm_network) {
+            for ip in ips {
+                let mut octets = ip.split('.');
+                let Some(v0) = octets.next() else { continue };
+                let Some(v1) = octets.next() else { continue };
+                let Some(v2) = octets.next() else { continue };
+                let Some(v3) = octets.next() else { continue };
+                if format!("{v0}.{v1}.{v2}") != prefix {
+                    continue;
+                }
+                if let Ok(host) = v3.parse::<u16>() {
+                    used_hosts.insert(host);
+                }
+            }
+        }
 
         // Keep .1 for gateway and reserve lower addresses for infra.
         const MIN_HOST: u16 = 10;
@@ -450,6 +700,11 @@ impl ControllerService {
             require_manual_approval,
             bootstrap_kctl,
             pki: PkiRuntime::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
+            sbom: crate::config::SbomConfig::default(),
+            revocation_fail_mode: crate::config::RevocationConfig::default().fail_mode,
+            webhooks: crate::webhooks::Dispatcher::noop(),
+            overcommit: crate::scheduler::Overcommit::default(),
             #[cfg(test)]
             test_push_hook: None,
         }
@@ -462,6 +717,31 @@ impl ControllerService {
 
     pub fn with_pki(mut self, pki: PkiRuntime) -> Self {
         self.pki = pki;
+        self
+    }
+
+    pub fn with_security(
+        mut self,
+        rate_limit: crate::config::RateLimitConfig,
+        sbom: crate::config::SbomConfig,
+        revocation_fail_mode: String,
+    ) -> Self {
+        self.rate_limit = rate_limit;
+        self.sbom = sbom;
+        self.revocation_fail_mode = revocation_fail_mode;
+        self
+    }
+
+    pub fn with_webhooks(mut self, webhooks: crate::webhooks::Dispatcher) -> Self {
+        self.webhooks = webhooks;
+        self
+    }
+
+    pub fn with_scheduler(mut self, scheduler: &crate::config::SchedulerConfig) -> Self {
+        self.overcommit = crate::scheduler::Overcommit {
+            cpu: scheduler.cpu_overcommit,
+            memory: scheduler.memory_overcommit,
+        };
         self
     }
 
@@ -485,6 +765,41 @@ impl ControllerService {
         {
             warn!(%error, node_id = %node_id, "failed to record issued certificate in inventory");
         }
+    }
+
+    /// Revoke every still-valid certificate issued to `node_id`.
+    ///
+    /// Reason code 5 is RFC 5280 `cessationOfOperation`. The revocation cache
+    /// and CRL are updated the same way as `RevokeCertificate`.
+    fn revoke_node_certificates(&self, node_id: &str) -> Result<i32, Status> {
+        let serials = self
+            .db
+            .find_revocable_serials("", node_id)
+            .map_err(internal_db)?;
+        let revoked_at = crate::pki::format_ts(time::OffsetDateTime::now_utc());
+        let mut revoked = 0i32;
+        for serial in &serials {
+            let row = self
+                .db
+                .revoke_certificate_by_serial(serial, 5, &revoked_at)
+                .map_err(internal_db)?;
+            if let Some(row) = row {
+                self.pki.revocation.insert_revoked(&row.serial_hex);
+                revoked += 1;
+            }
+        }
+        let sub_ca = self.sub_ca_snapshot()?;
+        if let Err(error) = crate::pki::crl::ensure_current(
+            &self.db,
+            &sub_ca,
+            &self.pki.crl_cache,
+            time::Duration::hours(self.pki.pki.crl_validity_hours),
+            time::Duration::hours(self.pki.pki.crl_refresh_before_hours),
+            true,
+        ) {
+            warn!(%error, node_id, "node certificates revoked but CRL regeneration failed");
+        }
+        Ok(revoked)
     }
 
     /// Serials a revoke request refers to.
@@ -562,6 +877,11 @@ impl ControllerService {
             require_manual_approval: false,
             bootstrap_kctl,
             pki: PkiRuntime::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
+            sbom: crate::config::SbomConfig::default(),
+            revocation_fail_mode: crate::config::RevocationConfig::default().fail_mode,
+            webhooks: crate::webhooks::Dispatcher::noop(),
+            overcommit: crate::scheduler::Overcommit::default(),
             test_push_hook: Some(hook),
         }
     }
@@ -582,7 +902,7 @@ impl ControllerService {
     /// running; use [`Self::push_config_and_await_apply`] when the next step
     /// depends on the new configuration being live.
     async fn push_config_to_node(&self, node: &NodeRow) -> Result<(), Status> {
-        self.push_config_to_node_inner(node, false).await
+        self.push_config_to_node_inner(node, false, None).await
     }
 
     /// Push this node's Nix configuration and block until the node reports the
@@ -597,13 +917,14 @@ impl ControllerService {
     /// `apply_id`. There is nothing to poll then, so the caller carries on with
     /// the old fire-and-forget behaviour rather than failing the operation.
     async fn push_config_and_await_apply(&self, node: &NodeRow) -> Result<(), Status> {
-        self.push_config_to_node_inner(node, true).await
+        self.push_config_to_node_inner(node, true, None).await
     }
 
     async fn push_config_to_node_inner(
         &self,
         node: &NodeRow,
         await_apply: bool,
+        incoming: Option<&VmRow>,
     ) -> Result<(), Status> {
         #[cfg(test)]
         if let Some(hook) = &self.test_push_hook {
@@ -615,10 +936,26 @@ impl ControllerService {
             .db
             .list_vms_for_node(&node.id)
             .map_err(|e| Status::internal(format!("listing vms: {e}")))?;
+        let mut vms = vms;
+        let mut incoming_ids = std::collections::HashSet::new();
+        if let Some(vm) = incoming {
+            incoming_ids.insert(vm.id.clone());
+            if !vms.iter().any(|existing| existing.id == vm.id) {
+                vms.push(vm.clone());
+            }
+        }
         let networks = self
             .db
             .list_networks_for_node(&node.id)
             .map_err(|e| Status::internal(format!("listing networks: {e}")))?;
+        if let Some(vm) = incoming {
+            if !networks.iter().any(|net| net.name == vm.network) {
+                return Err(Status::failed_precondition(format!(
+                    "destination node {} has no network '{}' for VM '{}'",
+                    node.id, vm.network, vm.name
+                )));
+            }
+        }
 
         let iface = if node.gateway_interface.is_empty() {
             &self.default_network.gateway_interface
@@ -638,6 +975,11 @@ impl ControllerService {
         }
 
         let node_ip = node.address.split(':').next().unwrap_or("").to_string();
+        let all_nodes = self
+            .db
+            .list_nodes()
+            .map_err(|e| Status::internal(format!("listing nodes for vxlan peers: {e}")))?;
+        let eligible_peers = crate::net_policy::vxlan_peer_nodes(&all_nodes, &node.id);
 
         let mut vxlan_peers: std::collections::HashMap<String, nixgen::VxlanMeta> =
             std::collections::HashMap::new();
@@ -647,17 +989,20 @@ impl ControllerService {
                     .db
                     .list_networks_by_name(&net.name)
                     .map_err(|e| Status::internal(format!("listing vxlan peers: {e}")))?;
-                let peers: Vec<String> = all_with_name
+                let member_ids: std::collections::HashSet<&str> =
+                    all_with_name.iter().map(|n| n.node_id.as_str()).collect();
+                let mut seen_ips = std::collections::HashSet::new();
+                let peers: Vec<String> = eligible_peers
                     .iter()
-                    .filter(|n| n.node_id != node.id)
-                    .filter_map(|n| {
-                        self.db
-                            .get_node(&n.node_id)
-                            .ok()
-                            .flatten()
-                            .map(|nd| nd.address.split(':').next().unwrap_or("").to_string())
+                    .filter(|peer| member_ids.contains(peer.id.as_str()))
+                    .filter_map(|peer| {
+                        let ip = peer.address.split(':').next().unwrap_or("").to_string();
+                        if ip.is_empty() || !seen_ips.insert(ip.clone()) {
+                            None
+                        } else {
+                            Some(ip)
+                        }
                     })
-                    .filter(|ip| !ip.is_empty())
                     .collect();
                 vxlan_peers.insert(
                     net.name.clone(),
@@ -743,8 +1088,9 @@ impl ControllerService {
             package: row.package.clone(),
             port: row.port,
         });
+        let guest_ops_keys = crate::guest_ops::all_guest_ops_keys(&self.db);
         let nix_config = nixgen::with_postgresql(
-            nixgen::generate_node_config_with_security_groups(
+            nixgen::generate_node_config_inner(
                 &vms,
                 iface,
                 &self.default_network,
@@ -752,6 +1098,15 @@ impl ControllerService {
                 &vm_ssh_keys,
                 &vxlan_peers,
                 &security_group_rules,
+                &incoming_ids,
+                &self
+                    .db
+                    .list_volumes()
+                    .map_err(|e| Status::internal(format!("listing volumes for nixgen: {e}")))?,
+                &guest_ops_keys,
+                &extra_nics_by_vm(&self.db, &vms),
+                &network_policies_by_name(&self.db, &node.id)?,
+                &vm_ipv6_by_vm(&self.db, &vms)?,
             ),
             postgresql_nix.as_ref(),
         );
@@ -783,6 +1138,32 @@ impl ControllerService {
                 downloaded = ensure.downloaded,
                 "ensured vm image on node"
             );
+        }
+
+        // E2: unlock host LUKS for encrypted volumes before the VM unit starts.
+        if let Ok(vols) = self.db.list_volumes() {
+            let on_node: Vec<_> = vols
+                .into_iter()
+                .filter(|v| v.encrypted && v.is_attached() && vms.iter().any(|vm| vm.id == v.vm_id))
+                .collect();
+            if !on_node.is_empty() {
+                if self.clients.get_storage(&node.address).is_none() {
+                    let _ = self.clients.connect(&node.address).await;
+                }
+                if let Some(mut storage) = self.clients.get_storage(&node.address) {
+                    if let Ok(keys) = self.encrypted_volume_keys_for_vols(&on_node) {
+                        for key in keys {
+                            let _ = storage
+                                .unlock_encrypted_volume(node_proto::UnlockEncryptedVolumeRequest {
+                                    rbd_device: format!("{}/{}", key.pool, key.image),
+                                    dek: key.dek,
+                                    mapper_name: key.mapper_name,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
         }
 
         let apply_id = Uuid::new_v4().to_string();
@@ -986,6 +1367,82 @@ impl ControllerService {
             .ok_or_else(|| Status::not_found(format!("node {node_id} not found")))
     }
 
+    fn ensure_explicit_placement(
+        &self,
+        node: &NodeRow,
+        required_labels: &[String],
+        anti_affinity: &str,
+    ) -> Result<(), Status> {
+        if !required_labels.is_empty() {
+            let have = self
+                .db
+                .get_node_labels(&node.id)
+                .map_err(|e| Status::internal(format!("listing node labels: {e}")))?;
+            let missing: Vec<&str> = required_labels
+                .iter()
+                .filter(|want| !have.iter().any(|got| got == *want))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "node '{}' is missing label(s) {}",
+                    node.id,
+                    missing.join(", ")
+                )));
+            }
+        }
+        if !anti_affinity.is_empty() {
+            let groups = self
+                .db
+                .anti_affinity_groups_by_node()
+                .map_err(|e| Status::internal(format!("listing anti-affinity groups: {e}")))?;
+            if groups
+                .get(&node.id)
+                .map(|existing| existing.iter().any(|group| group == anti_affinity))
+                .unwrap_or(false)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "node '{}' already hosts anti-affinity group '{anti_affinity}'",
+                    node.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn select_scheduled_node(
+        &self,
+        nodes: &[NodeRow],
+        cpu: i32,
+        memory: i64,
+        dc: &str,
+        required_labels: &[String],
+        anti_affinity: &str,
+    ) -> Result<Option<NodeRow>, Status> {
+        let label_rows = self
+            .db
+            .get_all_node_labels()
+            .map_err(|e| Status::internal(format!("listing node labels: {e}")))?;
+        let mut node_labels: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (node_id, label) in label_rows {
+            node_labels.entry(node_id).or_default().push(label);
+        }
+        let groups = self
+            .db
+            .anti_affinity_groups_by_node()
+            .map_err(|e| Status::internal(format!("listing anti-affinity groups: {e}")))?;
+        let constraints = crate::scheduler::Constraints {
+            overcommit: self.overcommit,
+            dc,
+            required_labels,
+            node_labels: &node_labels,
+            anti_affinity,
+            groups_on_node: &groups,
+        };
+        Ok(crate::scheduler::select_with_constraints(nodes, cpu, memory, &constraints).cloned())
+    }
+
     fn preflight_vm_create_on_node(
         &self,
         node: &NodeRow,
@@ -1022,9 +1479,12 @@ impl ControllerService {
             )));
         }
 
-        let available_cpu = node.cpu_cores - node.cpu_used;
-        let available_memory = node.memory_bytes - node.memory_used;
-        if available_cpu < spec.cpu || available_memory < spec.memory_bytes {
+        let available_cpu = crate::scheduler::schedulable_cpu(node.cpu_cores, self.overcommit.cpu)
+            - i64::from(node.cpu_used);
+        let available_memory =
+            crate::scheduler::schedulable_memory(node.memory_bytes, self.overcommit.memory)
+                - node.memory_used;
+        if available_cpu < i64::from(spec.cpu) || available_memory < spec.memory_bytes {
             return Err(Status::unavailable(format!(
                 "node '{}' lacks capacity for request (need cpu={} mem={}, available cpu={} mem={}){}",
                 node.id, spec.cpu, spec.memory_bytes, available_cpu, available_memory, hint
@@ -1050,8 +1510,7 @@ impl ControllerService {
                     && self.node_supports_backend(n, requested_storage_backend)
                     && n.approval_status == "approved"
                     && n.status == "ready"
-                    && (n.cpu_cores - n.cpu_used) >= cpu
-                    && (n.memory_bytes - n.memory_used) >= memory_bytes
+                    && crate::scheduler::node_has_capacity(n, cpu, memory_bytes, self.overcommit)
             })
             .collect()
     }
@@ -1124,6 +1583,361 @@ impl ControllerService {
             }
         }
         Ok(false)
+    }
+
+    fn resolve_vm_row(&self, key: &str) -> Result<Option<VmRow>, Status> {
+        match self.resolve_vm(key) {
+            Ok(vm) => Ok(Some(vm)),
+            Err(e) if e.code() == tonic::Code::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn resolve_volume_row(&self, key: &str) -> Result<Option<VolumeRow>, Status> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(Status::invalid_argument("volume name is required"));
+        }
+        if let Some(v) = self
+            .db
+            .get_volume_by_name(key)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Ok(Some(v));
+        }
+        self.db
+            .get_volume_by_id(key)
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+
+    fn volume_info_from_row(
+        &self,
+        vol: &VolumeRow,
+        vm: Option<&VmRow>,
+    ) -> controller_proto::VolumeInfo {
+        controller_proto::VolumeInfo {
+            id: vol.id.clone(),
+            name: vol.name.clone(),
+            role: vol.role.clone(),
+            attach_state: vol.attach_state.clone(),
+            serial: vol.serial.clone(),
+            pool: vol.pool.clone(),
+            image: vol.image.clone(),
+            slot: vol.slot,
+            vm_id: vol.vm_id.clone(),
+            vm_name: vm.map(|v| v.name.clone()).unwrap_or_default(),
+            node_id: vm.map(|v| v.node_id.clone()).unwrap_or_default(),
+            storage_backend: if vol.storage_class.is_empty() {
+                "ceph".into()
+            } else {
+                vol.storage_class.clone()
+            },
+            storage_size_bytes: vol.size_bytes,
+            backend_handle: if vol.encrypted {
+                format!(
+                    "/dev/mapper/{}",
+                    crate::volume_crypto::mapper_name_for_serial(&vol.serial)
+                )
+            } else {
+                format!("/dev/rbd/{}/{}", vol.pool, vol.image)
+            },
+            image_format: "raw".into(),
+            vm_state: vm
+                .map(|v| state_fallback_without_runtime(v.auto_start))
+                .unwrap_or(0),
+            guest_visible_bytes: vol.guest_visible_bytes,
+            guest_checked_at: vol.guest_checked_at.clone(),
+            encrypted: vol.encrypted,
+        }
+    }
+
+    async fn require_vm_stopped_for_volume_change(&self, vm: &VmRow) -> Result<(), Status> {
+        if self.vm_is_live(vm).await? {
+            return Err(Status::failed_precondition(format!(
+                "VM '{}' must be stopped for this volume operation",
+                vm.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// True when the guest VMM reports Running/Paused (hotplug path).
+    async fn vm_is_live(&self, vm: &VmRow) -> Result<bool, Status> {
+        if !vm.auto_start {
+            return Ok(false);
+        }
+        let node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+        if self.clients.get_compute(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        if let Some(mut compute) = self.clients.get_compute(&node.address) {
+            if let Ok(Ok(resp)) = tokio::time::timeout(
+                Duration::from_secs(3),
+                compute.get_vm(node_proto::GetVmRequest {
+                    vm_id: vm.name.clone(),
+                }),
+            )
+            .await
+            {
+                if let Some(status) = resp.into_inner().status {
+                    let state = controller_state_from_node_state(status.state);
+                    return Ok(state == controller_proto::VmState::Running as i32
+                        || state == controller_proto::VmState::Paused as i32);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn guest_fs_freeze_for_vm(&self, vm: &VmRow, freeze: bool) -> Result<(), Status> {
+        let node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+        if self.clients.get_admin(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut admin = self.clients.get_admin(&node.address).ok_or_else(|| {
+            Status::failed_precondition(
+                "quiesced snapshot requires GuestOps SSH to the guest; node admin client unavailable",
+            )
+        })?;
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        admin
+            .guest_fs_freeze(node_proto::GuestFsFreezeRequest {
+                vm_name: runtime_name,
+                network: vm.network.clone(),
+                ssh_user: String::new(),
+                port: 22,
+                timeout_ms: 60_000,
+                freeze,
+            })
+            .await
+            .map_err(|e| {
+                Status::failed_precondition(format!(
+                    "quiesced snapshot requires GuestOps SSH to the guest: {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn hotplug_add_volume_disk(&self, vm: &VmRow, vol: &VolumeRow) -> Result<(), Status> {
+        let node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        if self.clients.get_admin(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        // Map (+ unlock if encrypted) before CH add-disk.
+        if let Some(mut storage) = self.clients.get_storage(&node.address) {
+            if vol.encrypted {
+                let keys = self.encrypted_volume_keys_for_vols(std::slice::from_ref(vol))?;
+                for key in keys {
+                    storage
+                        .unlock_encrypted_volume(node_proto::UnlockEncryptedVolumeRequest {
+                            rbd_device: format!("{}/{}", key.pool, key.image),
+                            dek: key.dek,
+                            mapper_name: key.mapper_name,
+                        })
+                        .await
+                        .map_err(|e| Status::internal(format!("unlock for hotplug: {e}")))?;
+                }
+            } else {
+                storage
+                    .attach_volume(node_proto::AttachVolumeRequest {
+                        backend_handle: format!("{}/{}", vol.pool, vol.image),
+                        vm_id: vm.id.clone(),
+                        target_device: String::new(),
+                        bus: "virtio".into(),
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("rbd map for hotplug: {e}")))?;
+            }
+        }
+        let path = if vol.encrypted {
+            format!(
+                "/dev/mapper/{}",
+                crate::volume_crypto::mapper_name_for_serial(&vol.serial)
+            )
+        } else {
+            format!("/dev/rbd/{}/{}", vol.pool, vol.image)
+        };
+        let mut admin = self
+            .clients
+            .get_admin(&node.address)
+            .ok_or_else(|| Status::unavailable("admin client unavailable for hotplug"))?;
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        admin
+            .hot_add_disk(node_proto::HotAddDiskRequest {
+                vm_name: runtime_name,
+                path,
+                serial: vol.serial.clone(),
+                readonly: false,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("hot-add disk: {e}")))?;
+        Ok(())
+    }
+
+    async fn hotplug_remove_volume_disk(&self, vm: &VmRow, vol: &VolumeRow) -> Result<(), Status> {
+        let node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+        if self.clients.get_admin(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut admin = self
+            .clients
+            .get_admin(&node.address)
+            .ok_or_else(|| Status::unavailable("admin client unavailable for hotplug"))?;
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        admin
+            .hot_remove_disk(node_proto::HotRemoveDiskRequest {
+                vm_name: runtime_name,
+                disk_id: vol.serial.clone(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("hot-remove disk: {e}")))?;
+        Ok(())
+    }
+
+    async fn pick_healthy_ceph_node(&self) -> Result<NodeRow, String> {
+        let nodes = self.db.list_nodes().map_err(|e| e.to_string())?;
+        for node in nodes {
+            if self
+                .is_healthy_ceph_member(&node.id)
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(node);
+            }
+        }
+        Err("no healthy CephCluster member is registered".into())
+    }
+
+    fn vm_operation_to_proto(row: &VmOperationRow) -> controller_proto::VmOperation {
+        controller_proto::VmOperation {
+            id: row.id.clone(),
+            vm_id: row.vm_id.clone(),
+            kind: row.kind.clone(),
+            phase: row.phase.clone(),
+            source_node: row.source_node.clone(),
+            target_node: row.target_node.clone(),
+            cancel_requested: row.cancel_requested,
+            send_succeeded: row.send_succeeded,
+            detail_json: row.detail_json.clone(),
+            started_at: parse_datetime_to_timestamp(&row.started_at),
+            updated_at: parse_datetime_to_timestamp(&row.updated_at),
+            finished_at: if row.finished_at.is_empty() {
+                None
+            } else {
+                parse_datetime_to_timestamp(&row.finished_at)
+            },
+        }
+    }
+
+    /// Best-effort progress estimate for an open live migrate (CH has no byte
+    /// counter). Queries the destination receive session.
+    async fn live_migrate_progress_json(&self, op: &VmOperationRow) -> Result<String, String> {
+        let vm = self
+            .db
+            .get_vm(&op.vm_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "VM missing".to_string())?;
+        let target = self
+            .db
+            .get_node(&op.target_node)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "target missing".to_string())?;
+        if self.clients.get_admin(&target.address).is_none() {
+            let _ = self.clients.connect(&target.address).await;
+        }
+        let mut admin = self
+            .clients
+            .get_admin(&target.address)
+            .ok_or_else(|| "admin unavailable".to_string())?;
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        let prog = admin
+            .get_live_migrate_progress(node_proto::GetLiveMigrateProgressRequest {
+                vm_name: runtime_name,
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .into_inner();
+        Ok(format!(
+            r#"{{"progress":{{"estimate":{},"elapsedSeconds":{},"memoryBytes":{},"message":"{}"}}}}"#,
+            prog.estimate,
+            prog.elapsed_seconds,
+            prog.memory_bytes,
+            prog.message.replace('"', "'").replace('\n', " ")
+        ))
+    }
+
+    fn volume_snapshot_to_proto(
+        &self,
+        row: &VolumeSnapshotRow,
+        vol: Option<&VolumeRow>,
+    ) -> controller_proto::VolumeSnapshotInfo {
+        controller_proto::VolumeSnapshotInfo {
+            id: row.id.clone(),
+            name: row.name.clone(),
+            volume_id: row.volume_id.clone(),
+            volume_name: vol.map(|v| v.name.clone()).unwrap_or_default(),
+            rbd_snap: row.rbd_snap.clone(),
+            protected: row.protected,
+            size_bytes: row.size_bytes,
+            consistency: row.consistency.clone(),
+            created_at: parse_datetime_to_timestamp(&row.created_at),
+        }
+    }
+
+    fn snapshot_policy_to_proto(row: &SnapshotPolicyRow) -> controller_proto::SnapshotPolicy {
+        controller_proto::SnapshotPolicy {
+            name: row.name.clone(),
+            selector_vm: row.selector_vm.clone(),
+            selector_volume: row.selector_volume.clone(),
+            schedule: row.schedule.clone(),
+            keep: row.keep,
+            enabled: row.enabled,
+            last_run_at: row.last_run_at.clone(),
+            last_message: row.last_message.clone(),
+        }
+    }
+
+    fn encrypted_volume_keys_for_vols(
+        &self,
+        vols: &[VolumeRow],
+    ) -> Result<Vec<node_proto::EncryptedVolumeKey>, Status> {
+        let enc: Vec<&VolumeRow> = vols.iter().filter(|v| v.encrypted).collect();
+        if enc.is_empty() {
+            return Ok(vec![]);
+        }
+        let master = crate::volume_crypto::MasterKeyStore::default()
+            .load_or_create()
+            .map_err(|e| Status::failed_precondition(format!("volume master key: {e}")))?;
+        let mut out = Vec::with_capacity(enc.len());
+        for v in enc {
+            let dek = crate::volume_crypto::unwrap_dek(&master, &v.wrapped_dek)
+                .map_err(|e| Status::internal(format!("unwrap dek for {}: {e}", v.name)))?;
+            out.push(node_proto::EncryptedVolumeKey {
+                pool: v.pool.clone(),
+                image: v.image.clone(),
+                mapper_name: crate::volume_crypto::mapper_name_for_serial(&v.serial),
+                dek,
+            });
+        }
+        Ok(out)
     }
 
     /// Look a VM up by id, falling back to its name the way the other
@@ -1234,6 +2048,75 @@ impl ControllerService {
         Ok(healthy)
     }
 
+    /// Guest-visible flags that must not disappear across a live migration.
+    /// Host virtualization bits (`vmx`/`svm`) are not in this set.
+    fn cpu_flags_missing_on_dest(source: &[String], dest: &[String]) -> Vec<String> {
+        const FLAGS: &[&str] = &[
+            "sse4_1",
+            "sse4_2",
+            "ssse3",
+            "popcnt",
+            "aes",
+            "avx",
+            "avx2",
+            "xsave",
+            "pclmulqdq",
+        ];
+        let have: std::collections::HashSet<&str> = dest.iter().map(String::as_str).collect();
+        FLAGS
+            .iter()
+            .copied()
+            .filter(|flag| source.iter().any(|got| got == flag) && !have.contains(flag))
+            .map(str::to_string)
+            .collect()
+    }
+
+    async fn ensure_live_migrate_cpu(
+        &self,
+        source_admin: &mut node_proto::node_admin_client::NodeAdminClient<
+            tonic::transport::Channel,
+        >,
+        dest_admin: &mut node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>,
+        source: &NodeRow,
+        target: &NodeRow,
+    ) -> Result<(), Status> {
+        let source_flags = match source_admin
+            .get_host_cpu_flags(node_proto::GetHostCpuFlagsRequest {})
+            .await
+        {
+            Ok(resp) => resp.into_inner().flags,
+            Err(e)
+                if e.code() == tonic::Code::Unimplemented
+                    || e.code() == tonic::Code::Unavailable =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        if source_flags.is_empty() {
+            return Ok(());
+        }
+        let dest_flags = match dest_admin
+            .get_host_cpu_flags(node_proto::GetHostCpuFlagsRequest {})
+            .await
+        {
+            Ok(resp) => resp.into_inner().flags,
+            Err(e) if e.code() == tonic::Code::Unimplemented => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let missing = Self::cpu_flags_missing_on_dest(&source_flags, &dest_flags);
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(format!(
+                "cannot live-migrate from {} to {}: destination CPU is missing {}",
+                source.id,
+                target.id,
+                missing.join(", ")
+            )))
+        }
+    }
+
     async fn live_migrate_vm(
         &self,
         vm: &VmRow,
@@ -1242,13 +2125,86 @@ impl ControllerService {
         volume: &VolumeRow,
         runtime_name: &str,
         dest_host: &str,
-    ) -> Result<(), LiveMigrateFailure> {
+    ) -> Result<String, LiveMigrateFailure> {
+        if let Ok(Some(open)) = self.db.get_open_vm_operation(&vm.id) {
+            return Err(LiveMigrateFailure {
+                send_succeeded: false,
+                status: Status::failed_precondition(format!(
+                    "VM '{}' already has open operation {} in phase {}",
+                    vm.name, open.id, open.phase
+                )),
+                operation_id: open.id,
+            });
+        }
+        let op_id = Uuid::new_v4().to_string();
+        if let Err(e) = self.db.insert_vm_operation(&VmOperationRow {
+            id: op_id.clone(),
+            vm_id: vm.id.clone(),
+            kind: VmOperationRow::KIND_LIVE_MIGRATE.into(),
+            phase: VmOperationRow::PHASE_PREPARING.into(),
+            source_node: source.id.clone(),
+            target_node: target.id.clone(),
+            cancel_requested: false,
+            send_succeeded: false,
+            detail_json: "{}".into(),
+            started_at: String::new(),
+            updated_at: String::new(),
+            finished_at: String::new(),
+        }) {
+            return Err(LiveMigrateFailure {
+                send_succeeded: false,
+                status: Status::internal(format!("recording migrate operation: {e}")),
+                operation_id: op_id,
+            });
+        }
+        let attached =
+            self.db
+                .list_attached_volumes_for_vm(&vm.id)
+                .map_err(|e| LiveMigrateFailure {
+                    send_succeeded: false,
+                    status: Status::internal(e.to_string()),
+                    operation_id: op_id.clone(),
+                })?;
+        let rbd_volumes: Vec<node_proto::RbdImageRef> = if attached.is_empty() {
+            vec![node_proto::RbdImageRef {
+                pool: volume.pool.clone(),
+                image: volume.image.clone(),
+            }]
+        } else {
+            attached
+                .iter()
+                .map(|v| node_proto::RbdImageRef {
+                    pool: v.pool.clone(),
+                    image: v.image.clone(),
+                })
+                .collect()
+        };
+        let encrypted_volumes = self
+            .encrypted_volume_keys_for_vols(if attached.is_empty() {
+                std::slice::from_ref(&volume)
+            } else {
+                attached.as_slice()
+            })
+            .map_err(|status| LiveMigrateFailure {
+                send_succeeded: false,
+                status,
+                operation_id: op_id.clone(),
+            })?;
+        let root_pool = rbd_volumes
+            .first()
+            .map(|v| v.pool.clone())
+            .unwrap_or_else(|| volume.pool.clone());
+        let root_image = rbd_volumes
+            .first()
+            .map(|v| v.image.clone())
+            .unwrap_or_else(|| volume.image.clone());
         let mut dest_admin = self
             .ensure_admin_client_for_node(target)
             .await
             .map_err(|status| LiveMigrateFailure {
                 send_succeeded: false,
                 status,
+                operation_id: op_id.clone(),
             })?;
         let mut source_admin =
             self.ensure_admin_client_for_node(source)
@@ -1256,14 +2212,68 @@ impl ControllerService {
                 .map_err(|status| LiveMigrateFailure {
                     send_succeeded: false,
                     status,
+                    operation_id: op_id.clone(),
                 })?;
+        if let Err(status) = self
+            .ensure_live_migrate_cpu(&mut source_admin, &mut dest_admin, source, target)
+            .await
+        {
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_FAILED,
+                Some(false),
+                None,
+                true,
+            );
+            return Err(LiveMigrateFailure {
+                send_succeeded: false,
+                status,
+                operation_id: op_id,
+            });
+        }
+        self.push_config_to_node_inner(target, true, Some(vm))
+            .await
+            .map_err(|status| {
+                let _ = self.db.update_vm_operation_phase(
+                    &op_id,
+                    VmOperationRow::PHASE_FAILED,
+                    Some(false),
+                    None,
+                    true,
+                );
+                LiveMigrateFailure {
+                    send_succeeded: false,
+                    status,
+                    operation_id: op_id.clone(),
+                }
+            })?;
+        // The destination rebuild restarts its agent. Reconnect before prepare.
+        dest_admin = self
+            .ensure_admin_client_for_node(target)
+            .await
+            .map_err(|status| {
+                let _ = self.db.update_vm_operation_phase(
+                    &op_id,
+                    VmOperationRow::PHASE_FAILED,
+                    Some(false),
+                    None,
+                    true,
+                );
+                LiveMigrateFailure {
+                    send_succeeded: false,
+                    status,
+                    operation_id: op_id.clone(),
+                }
+            })?;
 
         let prep = dest_admin
             .prepare_live_migrate_receive(node_proto::PrepareLiveMigrateReceiveRequest {
                 vm_name: runtime_name.to_string(),
-                rbd_pool: volume.pool.clone(),
-                rbd_image: volume.image.clone(),
+                rbd_pool: root_pool.clone(),
+                rbd_image: root_image.clone(),
                 listen_port: 0,
+                rbd_volumes: rbd_volumes.clone(),
+                encrypted_volumes: encrypted_volumes.clone(),
             })
             .await
             .map_err(|e| LiveMigrateFailure {
@@ -1272,14 +2282,64 @@ impl ControllerService {
                     &e,
                     &format!("preparing node {} to receive VM '{}'", target.id, vm.name),
                 ),
+                operation_id: op_id.clone(),
             })?
             .into_inner();
         if !prep.success || prep.listen_port <= 0 {
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_FAILED,
+                Some(false),
+                None,
+                true,
+            );
             return Err(LiveMigrateFailure {
                 send_succeeded: false,
                 status: Status::internal(format!("prepare receive failed: {}", prep.message)),
+                operation_id: op_id,
             });
         }
+
+        if self
+            .db
+            .get_vm_operation(&op_id)
+            .ok()
+            .flatten()
+            .map(|o| o.cancel_requested)
+            .unwrap_or(false)
+        {
+            let _ = dest_admin
+                .abort_live_migrate_receive(node_proto::AbortLiveMigrateReceiveRequest {
+                    vm_name: runtime_name.to_string(),
+                    rbd_pool: root_pool.clone(),
+                    rbd_image: root_image.clone(),
+                    rbd_volumes: rbd_volumes.clone(),
+                })
+                .await;
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_CANCELLED,
+                Some(false),
+                None,
+                true,
+            );
+            return Err(LiveMigrateFailure {
+                send_succeeded: false,
+                status: Status::cancelled(format!(
+                    "live migrate of '{}' cancelled before send",
+                    vm.name
+                )),
+                operation_id: op_id,
+            });
+        }
+
+        let _ = self.db.update_vm_operation_phase(
+            &op_id,
+            VmOperationRow::PHASE_SENDING,
+            None,
+            None,
+            false,
+        );
         // The destination knows which of its addresses the migration listener
         // is reachable on; only fall back to the host part of its gRPC address
         // when it declines to say (empty or a wildcard bind).
@@ -1298,10 +2358,18 @@ impl ControllerService {
             let _ = dest_admin
                 .abort_live_migrate_receive(node_proto::AbortLiveMigrateReceiveRequest {
                     vm_name: runtime_name.to_string(),
-                    rbd_pool: volume.pool.clone(),
-                    rbd_image: volume.image.clone(),
+                    rbd_pool: root_pool.clone(),
+                    rbd_image: root_image.clone(),
+                    rbd_volumes: rbd_volumes.clone(),
                 })
                 .await;
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_FAILED,
+                Some(false),
+                None,
+                true,
+            );
             return Err(LiveMigrateFailure {
                 send_succeeded: false,
                 status: status_with_context(
@@ -1311,9 +2379,17 @@ impl ControllerService {
                         vm.name, source.id
                     ),
                 ),
+                operation_id: op_id,
             });
         }
 
+        let _ = self.db.update_vm_operation_phase(
+            &op_id,
+            VmOperationRow::PHASE_WAITING,
+            Some(true),
+            None,
+            false,
+        );
         // After a successful send, the source VMM is gone — do not abort the
         // destination receive session on wait errors (that would kill the only
         // remaining guest process).
@@ -1324,43 +2400,113 @@ impl ControllerService {
                 timeout_seconds: 600,
             })
             .await
-            .map_err(|e| LiveMigrateFailure {
-                send_succeeded: true,
-                status: status_with_context(
-                    &e,
-                    &format!(
-                        "waiting for VM '{}' to finish arriving on node {}",
-                        vm.name, target.id
+            .map_err(|e| {
+                let _ = self.db.update_vm_operation_phase(
+                    &op_id,
+                    VmOperationRow::PHASE_FAILED,
+                    Some(true),
+                    None,
+                    true,
+                );
+                LiveMigrateFailure {
+                    send_succeeded: true,
+                    status: status_with_context(
+                        &e,
+                        &format!(
+                            "waiting for VM '{}' to finish arriving on node {}",
+                            vm.name, target.id
+                        ),
                     ),
-                ),
+                    operation_id: op_id.clone(),
+                }
             })?
             .into_inner();
         if !wait.success {
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_FAILED,
+                Some(true),
+                None,
+                true,
+            );
             return Err(LiveMigrateFailure {
                 send_succeeded: true,
                 status: Status::internal(format!(
                     "node {} did not complete the receive for VM '{}': {}",
                     target.id, vm.name, wait.message
                 )),
+                operation_id: op_id,
             });
         }
 
-        self.reassign_vm_node(vm, &target.id)
-            .map_err(|status| LiveMigrateFailure {
+        let _ = self.db.update_vm_operation_phase(
+            &op_id,
+            VmOperationRow::PHASE_REASSIGNED,
+            Some(true),
+            None,
+            false,
+        );
+        self.reassign_vm_node(vm, &target.id).map_err(|status| {
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_FAILED,
+                Some(true),
+                None,
+                true,
+            );
+            LiveMigrateFailure {
                 send_succeeded: true,
                 status,
-            })?;
+                operation_id: op_id.clone(),
+            }
+        })?;
 
-        if let Err(e) = self.push_config_to_node(source).await {
-            warn!(node = %source.id, error = %e, "push after live migrate (source)");
-        }
+        self.push_config_and_await_apply(source)
+            .await
+            .map_err(|status| {
+                let _ = self.db.update_vm_operation_phase(
+                    &op_id,
+                    VmOperationRow::PHASE_FAILED,
+                    Some(true),
+                    None,
+                    true,
+                );
+                LiveMigrateFailure {
+                    send_succeeded: true,
+                    status: status_with_context(
+                        &status,
+                        &format!(
+                            "removing VM '{}' from node {} after live migrate",
+                            vm.name, source.id
+                        ),
+                    ),
+                    operation_id: op_id.clone(),
+                }
+            })?;
         // `finalize_live_migrate_dest` starts the generated VM unit, so the
         // destination rebuild has to have activated before we ask for it.
+        let _ = self.db.update_vm_operation_phase(
+            &op_id,
+            VmOperationRow::PHASE_FINALIZING_DEST,
+            Some(true),
+            None,
+            false,
+        );
         self.push_config_and_await_apply(target)
             .await
-            .map_err(|status| LiveMigrateFailure {
-                send_succeeded: true,
-                status,
+            .map_err(|status| {
+                let _ = self.db.update_vm_operation_phase(
+                    &op_id,
+                    VmOperationRow::PHASE_FAILED,
+                    Some(true),
+                    None,
+                    true,
+                );
+                LiveMigrateFailure {
+                    send_succeeded: true,
+                    status,
+                    operation_id: op_id.clone(),
+                }
             })?;
 
         dest_admin
@@ -1368,47 +2514,97 @@ impl ControllerService {
                 vm_name: runtime_name.to_string(),
             })
             .await
-            .map_err(|e| LiveMigrateFailure {
-                send_succeeded: true,
-                status: status_with_context(
-                    &e,
-                    &format!(
-                        "adopting migrated VM '{}' into systemd on node {}",
-                        vm.name, target.id
+            .map_err(|e| {
+                let _ = self.db.update_vm_operation_phase(
+                    &op_id,
+                    VmOperationRow::PHASE_FAILED,
+                    Some(true),
+                    None,
+                    true,
+                );
+                LiveMigrateFailure {
+                    send_succeeded: true,
+                    status: status_with_context(
+                        &e,
+                        &format!(
+                            "adopting migrated VM '{}' into systemd on node {}",
+                            vm.name, target.id
+                        ),
                     ),
-                ),
+                    operation_id: op_id.clone(),
+                }
             })?;
 
-        // The guest already runs on the destination, so a source that has not
-        // fully let go is a leak to clean up later, not a reason to fail the
-        // migration — but it must be visible.
-        match source_admin
-            .finalize_live_migrate_source(node_proto::FinalizeLiveMigrateSourceRequest {
-                vm_name: runtime_name.to_string(),
-                rbd_pool: volume.pool.clone(),
-                rbd_image: volume.image.clone(),
-            })
-            .await
-        {
-            Ok(resp) => {
-                let resp = resp.into_inner();
-                if !resp.vmm_stopped || !resp.rbd_unmapped {
-                    warn!(
-                        node = %source.id,
-                        vm = %vm.name,
-                        vmm_stopped = resp.vmm_stopped,
-                        rbd_unmapped = resp.rbd_unmapped,
-                        message = %resp.message,
-                        "source node did not fully release the migrated VM"
+        let _ = self.db.update_vm_operation_phase(
+            &op_id,
+            VmOperationRow::PHASE_FINALIZING_SOURCE,
+            Some(true),
+            None,
+            false,
+        );
+        // The guest already runs on the destination. Retry the source release;
+        // a source that keeps the RBD mapped will start a second writer on its
+        // next boot if its unit is still installed.
+        let mut released = false;
+        let mut last_detail = String::new();
+        for attempt in 1..=3 {
+            match source_admin
+                .finalize_live_migrate_source(node_proto::FinalizeLiveMigrateSourceRequest {
+                    vm_name: runtime_name.to_string(),
+                    rbd_pool: root_pool.clone(),
+                    rbd_image: root_image.clone(),
+                    rbd_volumes: rbd_volumes.clone(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let resp = resp.into_inner();
+                    if resp.vmm_stopped && resp.rbd_unmapped {
+                        released = true;
+                        break;
+                    }
+                    last_detail = format!(
+                        "vmm_stopped={} rbd_unmapped={} {}",
+                        resp.vmm_stopped, resp.rbd_unmapped, resp.message
                     );
                 }
+                Err(e) => {
+                    last_detail = e.to_string();
+                    if let Ok(fresh) = self.ensure_admin_client_for_node(source).await {
+                        source_admin = fresh;
+                    }
+                }
             }
-            Err(e) => {
-                warn!(node = %source.id, error = %e, "finalize source after live migrate");
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
+        if !released {
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_FAILED,
+                Some(true),
+                None,
+                true,
+            );
+            return Err(LiveMigrateFailure {
+                send_succeeded: true,
+                status: Status::failed_precondition(format!(
+                    "VM '{}' is on {} but {} did not release the RBD image: {last_detail}",
+                    vm.name, target.id, source.id
+                )),
+                operation_id: op_id,
+            });
+        }
 
-        Ok(())
+        let _ = self.db.update_vm_operation_phase(
+            &op_id,
+            VmOperationRow::PHASE_DONE,
+            Some(true),
+            None,
+            true,
+        );
+        Ok(op_id)
     }
 
     /// Stop a Ceph-backed VM and unmap its RBD image on the node that owns it
@@ -1430,17 +2626,20 @@ impl ControllerService {
         if vm.storage_backend != "ceph" {
             return Ok(());
         }
-        let volume = self
+        let attached = self
             .db
-            .get_volume_by_vm(&vm.id)
+            .list_attached_volumes_for_vm(&vm.id)
             .map_err(|e| Status::internal(e.to_string()))?;
-        let (pool, image) = match volume {
-            Some(v) => (v.pool, v.image),
+        let rbd_volumes: Vec<node_proto::RbdImageRef> = attached
+            .iter()
+            .map(|v| node_proto::RbdImageRef {
+                pool: v.pool.clone(),
+                image: v.image.clone(),
+            })
+            .collect();
+        let (pool, image) = match rbd_volumes.first() {
+            Some(v) => (v.pool.clone(), v.image.clone()),
             None => {
-                // Without an image name the node cannot report `rbd unmapped`
-                // for anything specific, so the barrier degrades to "the VM
-                // unit is stopped" — which does still run the unit's
-                // `ExecStopPost` unmap. Say so rather than hide it.
                 warn!(
                     vm = %vm.name,
                     node = %source.id,
@@ -1468,6 +2667,7 @@ impl ControllerService {
                 vm_name: runtime_name,
                 rbd_pool: pool,
                 rbd_image: image,
+                rbd_volumes,
             })
             .await
         {
@@ -1755,6 +2955,7 @@ impl ControllerService {
             mode: "cold".into(),
             source_node: source_node.id,
             target_node: target.id,
+            operation_id: String::new(),
         }))
     }
 
@@ -1982,6 +3183,42 @@ impl ControllerService {
                 );
             if !same {
                 diff.immutable.push("gpu".into());
+            }
+        }
+        if spec.nics.len() > 1 {
+            let stored_extras = self
+                .db
+                .list_vm_nics(&stored.id)
+                .map_err(|e| Status::internal(format!("listing extra NICs: {e}")))?;
+            let incoming: Vec<String> = spec
+                .nics
+                .iter()
+                .skip(1)
+                .map(|nic| nic.network.trim().to_string())
+                .collect();
+            let stored_nets: Vec<String> = stored_extras
+                .iter()
+                .map(|nic| nic.network.clone())
+                .collect();
+            if incoming != stored_nets {
+                return Err(Status::invalid_argument(format!(
+                    "cannot change immutable field(s) on VM '{}': nics (delete the VM and recreate)",
+                    stored.name
+                )));
+            }
+        }
+        let incoming_group = crate::scheduler::normalize_anti_affinity(&req.anti_affinity)
+            .map_err(Status::invalid_argument)?;
+        if !incoming_group.is_empty() {
+            let stored_group = self
+                .db
+                .get_vm_anti_affinity(&stored.id)
+                .map_err(|e| Status::internal(format!("reading anti-affinity: {e}")))?;
+            if stored_group != incoming_group {
+                return Err(Status::invalid_argument(format!(
+                    "cannot change immutable field(s) on VM '{}': anti_affinity (delete the VM and recreate)",
+                    stored.name
+                )));
             }
         }
 
@@ -2347,6 +3584,7 @@ impl ControllerService {
             .get_disk_layout(&name)
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let incoming_evacuate = incoming.evacuate;
         let (action, changed_fields, generation) = if let Some(existing) = existing.as_ref() {
             if existing.node_id != node_id {
                 return Err(Status::invalid_argument(format!(
@@ -2354,16 +3592,23 @@ impl ControllerService {
                      (delete the disk layout and recreate)"
                 )));
             }
-            if existing.layout_nix == layout_nix {
+            if existing.layout_nix == layout_nix && existing.evacuate == incoming_evacuate {
                 (
                     controller_proto::ApplyAction::Unchanged as i32,
                     Vec::<String>::new(),
                     existing.generation,
                 )
             } else {
+                let mut changed = Vec::new();
+                if existing.layout_nix != layout_nix {
+                    changed.push("layout_nix".to_string());
+                }
+                if existing.evacuate != incoming_evacuate {
+                    changed.push("evacuate".to_string());
+                }
                 (
                     controller_proto::ApplyAction::Updated as i32,
-                    vec!["layout_nix".to_string()],
+                    changed,
                     existing.generation.saturating_add(1),
                 )
             }
@@ -2396,6 +3641,7 @@ impl ControllerService {
             node_id: node_id.clone(),
             generation,
             layout_nix: layout_nix.clone(),
+            evacuate: incoming_evacuate,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -2427,6 +3673,7 @@ impl ControllerService {
                 "nodeId": node_id,
                 "generation": generation,
                 "layoutNix": layout_nix,
+                "evacuate": incoming_evacuate,
                 "action": match action {
                     x if x == controller_proto::ApplyAction::Created as i32 => "created",
                     x if x == controller_proto::ApplyAction::Updated as i32 => "updated",
@@ -2589,6 +3836,7 @@ fn disk_layout_to_proto(row: &DiskLayoutRow) -> controller_proto::DiskLayout {
         layout_nix: row.layout_nix.clone(),
         created_at: parse_datetime_to_timestamp(&row.created_at),
         updated_at: parse_datetime_to_timestamp(&row.updated_at),
+        evacuate: row.evacuate,
     }
 }
 
@@ -2607,6 +3855,91 @@ fn disk_layout_status_to_proto(row: &DiskLayoutStatusRow) -> controller_proto::D
         message: row.message.clone(),
         last_transition_at: parse_datetime_to_timestamp(&row.last_transition_at),
     }
+}
+
+fn shared_filesystem_phase_to_proto(phase: &str) -> i32 {
+    match phase {
+        "pending" => controller_proto::SharedFilesystemPhase::Pending as i32,
+        "bootstrapping" => controller_proto::SharedFilesystemPhase::Bootstrapping as i32,
+        "healthy" => controller_proto::SharedFilesystemPhase::Healthy as i32,
+        "degraded" => controller_proto::SharedFilesystemPhase::Degraded as i32,
+        "failed" => controller_proto::SharedFilesystemPhase::Failed as i32,
+        _ => controller_proto::SharedFilesystemPhase::Unspecified as i32,
+    }
+}
+
+fn shared_filesystem_to_proto(
+    row: &SharedFilesystemRow,
+    status: Option<SharedFilesystemStatusRow>,
+) -> Result<controller_proto::SharedFilesystem, Status> {
+    let status = status.map(|s| controller_proto::SharedFilesystemStatus {
+        observed_generation: s.observed_generation,
+        phase: shared_filesystem_phase_to_proto(&s.phase),
+        health_message: s.health_message,
+        last_transition_at: parse_datetime_to_timestamp(&s.last_transition_at),
+    });
+    Ok(controller_proto::SharedFilesystem {
+        name: row.name.clone(),
+        generation: row.generation,
+        spec: Some(
+            shared_filesystem_spec::spec_from_json(&row.spec_json)
+                .map_err(|e| Status::internal(format!("decode shared filesystem spec: {e}")))?,
+        ),
+        status,
+        created_at: parse_datetime_to_timestamp(&row.created_at),
+        updated_at: parse_datetime_to_timestamp(&row.updated_at),
+    })
+}
+
+fn object_store_phase_to_proto(phase: &str) -> i32 {
+    match phase {
+        "pending" => controller_proto::ObjectStorePhase::Pending as i32,
+        "bootstrapping" => controller_proto::ObjectStorePhase::Bootstrapping as i32,
+        "healthy" => controller_proto::ObjectStorePhase::Healthy as i32,
+        "degraded" => controller_proto::ObjectStorePhase::Degraded as i32,
+        "failed" => controller_proto::ObjectStorePhase::Failed as i32,
+        _ => controller_proto::ObjectStorePhase::Unspecified as i32,
+    }
+}
+
+fn object_store_to_proto(
+    row: &ObjectStoreRow,
+    status: Option<ObjectStoreStatusRow>,
+) -> Result<controller_proto::ObjectStore, Status> {
+    let status = status.map(|s| controller_proto::ObjectStoreStatus {
+        observed_generation: s.observed_generation,
+        phase: object_store_phase_to_proto(&s.phase),
+        health_message: s.health_message,
+        last_transition_at: parse_datetime_to_timestamp(&s.last_transition_at),
+    });
+    Ok(controller_proto::ObjectStore {
+        name: row.name.clone(),
+        generation: row.generation,
+        spec: Some(
+            object_store_spec::spec_from_json(&row.spec_json)
+                .map_err(|e| Status::internal(format!("decode object store spec: {e}")))?,
+        ),
+        status,
+        created_at: parse_datetime_to_timestamp(&row.created_at),
+        updated_at: parse_datetime_to_timestamp(&row.updated_at),
+    })
+}
+
+fn object_user_to_proto(row: &ObjectUserRow) -> controller_proto::ObjectUser {
+    controller_proto::ObjectUser {
+        name: row.name.clone(),
+        spec: Some(controller_proto::ObjectUserSpec {
+            store: row.store_name.clone(),
+        }),
+        access_key: row.access_key.clone(),
+        created_at: parse_datetime_to_timestamp(&row.created_at),
+    }
+}
+
+fn new_object_user_credentials() -> (String, String) {
+    let access_key = format!("KC{}", Uuid::new_v4().simple());
+    let secret = Uuid::new_v4().to_string().replace('-', "");
+    (access_key, secret)
 }
 
 fn ceph_cluster_to_proto(
@@ -2726,6 +4059,436 @@ fn postgresql_replication_body(row: &PostgresqlRow) -> serde_json::Value {
         "port": row.port,
         "nodeId": row.node_id,
     })
+}
+
+impl ControllerService {
+    /// Move every VM off `node_id` using the same live-then-cold paths as
+    /// [`Controller::drain_node`]. Used by DiskLayout evacuate reconciliation.
+    pub async fn drain_node_vms(
+        &self,
+        node_id: &str,
+        target_node: &str,
+        options: NodeDrainOptions,
+    ) -> Result<NodeDrainOutcome, Status> {
+        let source_node = self
+            .db
+            .get_node(node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node '{node_id}' not found")))?;
+
+        if options.mark_draining_at_start {
+            self.db
+                .update_node_status(node_id, "draining")
+                .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
+        }
+
+        let vms = self
+            .db
+            .list_vms_for_node(node_id)
+            .map_err(|e| Status::internal(format!("listing vms: {e}")))?;
+
+        if vms.is_empty() {
+            if options.update_final_node_status {
+                self.db
+                    .update_node_status(node_id, "drained")
+                    .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
+            }
+            return Ok(NodeDrainOutcome {
+                migrated: 0,
+                errors: Vec::new(),
+            });
+        }
+
+        let all_nodes = self
+            .db
+            .list_nodes()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut migrated = 0i32;
+        let mut errors = Vec::new();
+        let eligible_nodes: Vec<NodeRow> = all_nodes
+            .iter()
+            .filter(|n| n.id != node_id)
+            .cloned()
+            .collect();
+
+        let mut destination_node_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for vm in &vms {
+            if !vm.pci_devices.is_empty()
+                || self
+                    .vm_gpu_names(&vm.id)
+                    .ok()
+                    .is_some_and(|names| !names.is_empty())
+            {
+                let mut gpu_targets: Vec<NodeRow> = eligible_nodes
+                    .iter()
+                    .filter(|n| {
+                        target_node.is_empty() || n.id == target_node || n.address == target_node
+                    })
+                    .filter(|n| self.node_supports_backend(n, &vm.storage_backend))
+                    .filter(|n| accepts_migrated_vms(n).is_ok())
+                    .cloned()
+                    .collect();
+                if vm.storage_backend == "ceph" {
+                    if let Ok(healthy) = self.healthy_ceph_members(&gpu_targets) {
+                        gpu_targets = healthy;
+                    }
+                }
+                let mut moved_gpu = false;
+                let mut gpu_error = String::new();
+                for target in &gpu_targets {
+                    let previous_pci = vm.pci_devices.clone();
+                    let previous_gpu = self.vm_gpu_names(&vm.id).unwrap_or_default().join(",");
+                    if let Err(e) = self.retarget_vm_gpus(vm, target, &[]) {
+                        gpu_error = e.message().to_string();
+                        continue;
+                    }
+                    if let Err(e) = self.cold_release_ceph_vm(vm, &source_node).await {
+                        self.restore_vm_gpu(&vm.id, &previous_pci, &previous_gpu);
+                        gpu_error = e.message().to_string();
+                        continue;
+                    }
+                    if let Err(e) = self.reassign_vm_node(vm, &target.id) {
+                        self.restore_vm_gpu(&vm.id, &previous_pci, &previous_gpu);
+                        gpu_error = e.message().to_string();
+                        continue;
+                    }
+                    migrated += 1;
+                    destination_node_ids.insert(target.id.clone());
+                    moved_gpu = true;
+                    break;
+                }
+                if !moved_gpu {
+                    if gpu_error.is_empty() {
+                        gpu_error = "no node with a free compatible GPU".into();
+                    }
+                    errors.push(format!("VM '{}': {gpu_error}", vm.name));
+                }
+                continue;
+            }
+            let mut backend_eligible: Vec<NodeRow> = eligible_nodes
+                .iter()
+                .filter(|n| self.node_supports_backend(n, &vm.storage_backend))
+                .filter(|n| accepts_migrated_vms(n).is_ok())
+                .cloned()
+                .collect();
+            if vm.storage_backend == "ceph" {
+                match self.healthy_ceph_members(&backend_eligible) {
+                    Ok(healthy) => backend_eligible = healthy,
+                    Err(e) => {
+                        errors.push(format!("VM '{}': {e}", vm.name));
+                        continue;
+                    }
+                }
+            }
+            let target = if !target_node.is_empty() {
+                match backend_eligible
+                    .iter()
+                    .find(|n| n.id == target_node || n.address == target_node)
+                {
+                    Some(n) => n.clone(),
+                    None => {
+                        errors.push(format!(
+                            "target node '{target_node}' cannot take VM '{}' (storage backend '{}')",
+                            vm.name, vm.storage_backend
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                match self.select_scheduled_node(
+                    &backend_eligible,
+                    vm.cpu,
+                    vm.memory_bytes,
+                    "",
+                    &[],
+                    &self.db.get_vm_anti_affinity(&vm.id).unwrap_or_default(),
+                ) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => {
+                        errors.push(format!(
+                            "no node with capacity and compatible storage for VM '{}' ({})",
+                            vm.name, vm.storage_backend
+                        ));
+                        continue;
+                    }
+                    Err(err) => {
+                        errors.push(format!("VM '{}': {err}", vm.name));
+                        continue;
+                    }
+                }
+            };
+
+            if vm.storage_backend == "ceph" {
+                if let Some(volume) = self
+                    .db
+                    .get_volume_by_vm(&vm.id)
+                    .map_err(|e| Status::internal(e.to_string()))
+                    .ok()
+                    .flatten()
+                {
+                    let runtime_name = sanitize_nix_attr_key(&vm.name);
+                    let dest_host = grpc_address_host(&target.address);
+                    match self
+                        .live_migrate_vm(
+                            vm,
+                            &source_node,
+                            &target,
+                            &volume,
+                            &runtime_name,
+                            &dest_host,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            migrated += 1;
+                            destination_node_ids.insert(target.id.clone());
+                            continue;
+                        }
+                        Err(err) if err.send_succeeded => {
+                            errors.push(format!(
+                                "VM '{}' left mid-migration from {} to {}: {}",
+                                vm.name, source_node.id, target.id, err.status
+                            ));
+                            destination_node_ids.insert(target.id.clone());
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(
+                                vm = %vm.name,
+                                error = %err.status,
+                                "live migrate during drain failed before send; falling back to cold"
+                            );
+                        }
+                    }
+                }
+            }
+
+            if let Err(e) = self.cold_release_ceph_vm(vm, &source_node).await {
+                errors.push(format!("VM '{}' left on {}: {e}", vm.name, source_node.id));
+                continue;
+            }
+
+            if let Err(e) = self.reassign_vm_node(vm, &target.id) {
+                errors.push(format!("VM '{}': {e}", vm.name));
+                continue;
+            }
+
+            migrated += 1;
+            destination_node_ids.insert(target.id.clone());
+        }
+
+        if let Err(e) = self.push_config_and_await_apply(&source_node).await {
+            warn!(node = %node_id, error = %e, "failed to apply config on drained node");
+            errors.push(format!(
+                "node {node_id} did not apply its post-drain configuration: {e}",
+            ));
+        }
+
+        for target_id in &destination_node_ids {
+            match self.db.get_node(target_id) {
+                Ok(Some(target_node)) => {
+                    if let Err(e) = self.push_config_and_await_apply(&target_node).await {
+                        warn!(node = %target_id, error = %e, "failed to apply config on target node");
+                        errors.push(format!(
+                            "target node {target_id} did not apply the migrated VM configuration: {e}"
+                        ));
+                    }
+                }
+                Ok(None) => errors.push(format!(
+                    "target node {target_id} disappeared before its configuration was applied"
+                )),
+                Err(e) => errors.push(format!("looking up target node {target_id}: {e}")),
+            }
+        }
+
+        if options.update_final_node_status {
+            let final_status = if errors.is_empty() {
+                "drained"
+            } else {
+                "draining"
+            };
+            self.db
+                .update_node_status(node_id, final_status)
+                .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
+        }
+
+        Ok(NodeDrainOutcome { migrated, errors })
+    }
+
+    /// Move Ceph VMs off a node that has already been marked `not-ready`.
+    ///
+    /// Local-disk VMs stay, because their disks are on the failed host. The
+    /// source is not contacted: it already missed the heartbeat deadline, and
+    /// a connect attempt would only delay the move. The destination receives
+    /// the VM unit. The source is recorded so its next successful heartbeat
+    /// pushes a config that no longer starts the moved guests.
+    pub async fn failover_unreachable_node(
+        &self,
+        node_id: &str,
+    ) -> Result<NodeDrainOutcome, Status> {
+        let source = self
+            .db
+            .get_node(node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node '{node_id}' not found")))?;
+        if source.status != "not-ready" {
+            return Ok(NodeDrainOutcome {
+                migrated: 0,
+                errors: Vec::new(),
+            });
+        }
+
+        let vms = self
+            .db
+            .list_vms_for_node(node_id)
+            .map_err(|e| Status::internal(format!("listing vms: {e}")))?;
+        let all_nodes = self
+            .db
+            .list_nodes()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let eligible: Vec<NodeRow> = all_nodes
+            .iter()
+            .filter(|n| n.id != node_id)
+            .cloned()
+            .collect();
+
+        let mut migrated = 0i32;
+        let mut errors = Vec::new();
+        for vm in &vms {
+            if vm.storage_backend != "ceph" {
+                errors.push(format!(
+                    "VM '{}' uses {} storage on failed node {node_id}; it stays until the node returns",
+                    vm.name, vm.storage_backend
+                ));
+                continue;
+            }
+            let mut candidates: Vec<NodeRow> = eligible
+                .iter()
+                .filter(|n| self.node_supports_backend(n, "ceph"))
+                .filter(|n| accepts_migrated_vms(n).is_ok())
+                .cloned()
+                .collect();
+            match self.healthy_ceph_members(&candidates) {
+                Ok(healthy) => candidates = healthy,
+                Err(e) => {
+                    errors.push(format!("VM '{}': {e}", vm.name));
+                    continue;
+                }
+            }
+            let target = match self.select_scheduled_node(
+                &candidates,
+                vm.cpu,
+                vm.memory_bytes,
+                "",
+                &[],
+                &self.db.get_vm_anti_affinity(&vm.id).unwrap_or_default(),
+            ) {
+                Ok(Some(node)) => node,
+                Ok(None) => {
+                    errors.push(format!(
+                        "no healthy Ceph node can take VM '{}' from failed node {node_id}",
+                        vm.name
+                    ));
+                    continue;
+                }
+                Err(err) => {
+                    errors.push(format!("VM '{}': {err}", vm.name));
+                    continue;
+                }
+            };
+
+            if let Err(e) = self.reassign_vm_node(vm, &target.id) {
+                errors.push(format!("VM '{}': {e}", vm.name));
+                continue;
+            }
+            migrated += 1;
+            if let Err(e) = self.db.mark_node_config_push(node_id) {
+                warn!(node_id, error = %e, "failed to record config refresh for failed node");
+            }
+            let _ = self.log_replication_event_required(
+                "controller",
+                Some("FailoverVm"),
+                EVT_VM_MIGRATE,
+                &format!("vm/{}", vm.id),
+                serde_json::json!({
+                    "vmId": vm.id,
+                    "vmName": vm.name,
+                    "sourceNode": node_id,
+                    "targetNode": target.id,
+                    "mode": "failover",
+                }),
+            );
+            if let Err(e) = self.push_config_and_await_apply(&target).await {
+                errors.push(format!(
+                    "VM '{}' is assigned to {} but that node did not apply its configuration: {e}",
+                    vm.name, target.id
+                ));
+            }
+            info!(
+                vm = %vm.name,
+                source = %node_id,
+                target = %target.id,
+                "moved Ceph VM off unreachable node"
+            );
+        }
+
+        Ok(NodeDrainOutcome { migrated, errors })
+    }
+
+    /// One pass of automatic failover for every node currently `not-ready`.
+    ///
+    /// `announced` remembers errors already logged for a node so a VM that
+    /// cannot move does not warn on every pass. Entries are dropped once the
+    /// node is no longer `not-ready`.
+    pub async fn failover_not_ready_nodes(
+        &self,
+        announced: &mut std::collections::HashSet<String>,
+    ) {
+        let nodes = match self.db.list_nodes() {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                warn!(error = %e, "failover could not list nodes");
+                return;
+            }
+        };
+        let not_ready: std::collections::HashSet<String> = nodes
+            .iter()
+            .filter(|node| node.status == "not-ready")
+            .map(|node| node.id.clone())
+            .collect();
+        announced.retain(|key| {
+            not_ready
+                .iter()
+                .any(|id| key.starts_with(&format!("{id}/")))
+        });
+        for node_id in not_ready {
+            match self.failover_unreachable_node(&node_id).await {
+                Ok(outcome) => {
+                    if outcome.migrated > 0 {
+                        info!(
+                            node_id,
+                            migrated = outcome.migrated,
+                            "automatic failover moved Ceph VMs"
+                        );
+                    }
+                    for err in outcome.errors {
+                        if announced.insert(format!("{node_id}/{err}")) {
+                            warn!(node_id, "{err}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    if announced.insert(format!("{node_id}/{err}")) {
+                        warn!(node_id, error = %err, "automatic failover failed");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -2913,6 +4676,22 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
 
         if let Ok(Some(node)) = self.db.get_node(&req.node_id) {
+            if node.status == "ready" && self.db.node_needs_config_push(&node.id).unwrap_or(false) {
+                match self.push_config_to_node(&node).await {
+                    Ok(()) => {
+                        if let Err(e) = self.db.clear_node_config_push(&node.id) {
+                            warn!(node_id = %node.id, error = %e, "config refreshed but the pending flag remains");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            node_id = %node.id,
+                            error = %e,
+                            "node is ready again but the config push that drops failed-over VMs failed"
+                        );
+                    }
+                }
+            }
             let labels = self.db.get_node_labels(&req.node_id).unwrap_or_default();
             self.log_replication_event_required(
                 &actor,
@@ -2971,10 +4750,23 @@ impl controller_proto::controller_server::Controller for ControllerService {
             };
             match self
                 .db
-                .update_vm_runtime_state(&req.node_id, &vm.name, state_str)
+                .apply_vm_runtime_state(&req.node_id, &vm.name, state_str)
             {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(crate::db::VmRuntimeApply::Changed(change)) => {
+                    self.webhooks.emit(
+                        crate::webhooks::EVENT_VM_STATE_CHANGED,
+                        format!("vm/{}", change.name),
+                        serde_json::json!({
+                            "vmId": change.vm_id,
+                            "name": change.name,
+                            "nodeId": change.node_id,
+                            "previousState": change.previous,
+                            "state": change.current,
+                        }),
+                    );
+                }
+                Ok(crate::db::VmRuntimeApply::Unchanged) => {}
+                Ok(crate::db::VmRuntimeApply::Missing) => {
                     warn!(
                         node_id = %req.node_id,
                         vm_name = %vm.name,
@@ -3057,6 +4849,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "pass devices by name (--gpu radeon0, --nic nic0, --nvme nvme0) or by raw PCI address, not both",
             ));
         }
+        let required_labels = req
+            .node_labels
+            .iter()
+            .map(|label| crate::scheduler::normalize_label(label).map_err(Status::invalid_argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let anti_affinity = crate::scheduler::normalize_anti_affinity(&req.anti_affinity)
+            .map_err(Status::invalid_argument)?;
 
         // Upsert: if a VM with the requested name already exists, diff the
         // incoming spec against the stored row and apply any mutable changes
@@ -3085,11 +4884,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         let target_node_requested = !req.target_node.is_empty();
         let mut node = if target_node_requested {
-            self.db
+            let node = self
+                .db
                 .get_node_by_address(&req.target_node)
                 .map_err(|e| Status::internal(e.to_string()))?
                 .or_else(|| self.db.get_node(&req.target_node).ok().flatten())
-                .ok_or_else(|| Status::not_found(format!("node {} not found", req.target_node)))?
+                .ok_or_else(|| Status::not_found(format!("node {} not found", req.target_node)))?;
+            self.ensure_explicit_placement(&node, &required_labels, &anti_affinity)?;
+            node
         } else {
             let nodes = self
                 .db
@@ -3100,19 +4902,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .filter(|n| self.node_supports_backend(n, &requested_storage_backend))
                 .collect();
             let target_dc = req.target_dc.trim();
-            if target_dc.is_empty() {
-                scheduler::select_node_for_vm(&compatible_nodes, spec.cpu, spec.memory_bytes)
-            } else {
-                scheduler::select_node_for_vm_in_dc(
-                    &compatible_nodes,
-                    spec.cpu,
-                    spec.memory_bytes,
-                    target_dc,
-                )
-            }
-            .cloned()
+            self.select_scheduled_node(
+                &compatible_nodes,
+                spec.cpu,
+                spec.memory_bytes,
+                target_dc,
+                &required_labels,
+                &anti_affinity,
+            )?
             .ok_or_else(|| {
-                if target_dc.is_empty() {
+                if !anti_affinity.is_empty() {
+                    Status::unavailable(format!(
+                        "no ready node can place another VM in anti-affinity group '{anti_affinity}'"
+                    ))
+                } else if !required_labels.is_empty() {
+                    Status::unavailable(format!(
+                        "no ready node with labels [{}] has sufficient capacity",
+                        required_labels.join(", ")
+                    ))
+                } else if target_dc.is_empty() {
                     Status::unavailable(
                         "no ready node with sufficient capacity matching requested storage backend",
                     )
@@ -3139,17 +4947,21 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 if !pci_devices.is_empty() || wants_gpu {
                     return Err(err);
                 }
-                if let Some(fallback) = scheduler::select_node_for_vm(
-                    &self.alternative_vm_create_nodes(
-                        &node.id,
-                        &requested_storage_backend,
+                if let Some(fallback) = self
+                    .select_scheduled_node(
+                        &self.alternative_vm_create_nodes(
+                            &node.id,
+                            &requested_storage_backend,
+                            spec.cpu,
+                            spec.memory_bytes,
+                        ),
                         spec.cpu,
                         spec.memory_bytes,
-                    ),
-                    spec.cpu,
-                    spec.memory_bytes,
-                )
-                .cloned()
+                        "",
+                        &required_labels,
+                        &anti_affinity,
+                    )?
+                    .clone()
                 {
                     warn!(
                         vm_name = %spec.name,
@@ -3277,52 +5089,23 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 image_path, conflict.name, node.id
             )));
         }
-        let vm_network = spec
-            .nics
-            .first()
-            .map(|n| n.network.clone())
-            .unwrap_or_else(|| "default".into());
-        if vm_network != "default"
-            && self
-                .db
-                .get_network_for_node(&node.id, &vm_network)
-                .map_err(|e| Status::internal(format!("checking network: {e}")))?
-                .is_none()
-        {
-            return Err(Status::failed_precondition(format!(
-                "network '{}' is not configured on node '{}'",
-                vm_network, node.id
-            )));
-        }
-
-        let vm_ip = if vm_network == "default" {
-            self.reserve_nat_vm_ip_for_network(
-                &node.id,
-                &vm_network,
-                &vm_id,
-                &self.default_network.gateway_ip,
-            )?
-        } else if let Some(net) = self
-            .db
-            .get_network_for_node(&node.id, &vm_network)
-            .map_err(|e| Status::internal(format!("fetching network: {e}")))?
-        {
-            match net.network_type.as_str() {
-                "vxlan" => self
+        let declared = crate::vm_nics::normalize_declared_nics(&spec.nics)?;
+        for nic in &declared {
+            if nic.network != "default"
+                && self
                     .db
-                    .allocate_vm_ip_global(&vm_network)
-                    .map_err(|e| Status::internal(format!("allocating VM IP: {e}")))?,
-                "nat" => self.reserve_nat_vm_ip_for_network(
-                    &node.id,
-                    &vm_network,
-                    &vm_id,
-                    &net.gateway_ip,
-                )?,
-                _ => String::new(),
+                    .get_network_for_node(&node.id, &nic.network)
+                    .map_err(|e| Status::internal(format!("checking network: {e}")))?
+                    .is_none()
+            {
+                return Err(Status::failed_precondition(format!(
+                    "network '{}' is not configured on node '{}'",
+                    nic.network, node.id
+                )));
             }
-        } else {
-            String::new()
-        };
+        }
+        let vm_network = declared[0].network.clone();
+        let vm_ip = self.allocate_nic_address(&node.id, &vm_network, &vm_id)?;
 
         // Honor declarative desired_state when supplied; default to running.
         let desired_auto_start =
@@ -3395,15 +5178,48 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 return Err(Status::internal(format!("storing GPU assignment: {e}")));
             }
         }
-        if vm.storage_backend == "ceph" {
-            if let Err(e) = self.db.upsert_volume(&VolumeRow {
-                id: Uuid::new_v4().to_string(),
-                vm_id: vm.id.clone(),
-                pool: "kcore-vms".into(),
-                image: format!("kcore-{}", vm.id),
-                size_bytes: vm.storage_size_bytes,
-                created_at: String::new(),
+        if let Err(e) = self.assign_ipv6_if_configured(&node.id, &vm.network, &vm_id, 0) {
+            self.rollback_created_vm(&node, &vm).await;
+            return Err(e);
+        }
+        for (index, nic) in declared.iter().skip(1).enumerate() {
+            let ip = match self.allocate_nic_address(&node.id, &nic.network, &vm_id) {
+                Ok(ip) => ip,
+                Err(e) => {
+                    self.rollback_created_vm(&node, &vm).await;
+                    return Err(e);
+                }
+            };
+            let position = (index + 1) as i32;
+            if let Err(e) = self.db.insert_vm_nic(&VmNicRow {
+                vm_id: vm_id.clone(),
+                position,
+                network: nic.network.clone(),
+                mac_address: nic.mac_address.clone(),
+                model: nic.model.clone(),
+                ip_address: ip,
             }) {
+                self.rollback_created_vm(&node, &vm).await;
+                return Err(Status::internal(format!("storing extra NIC: {e}")));
+            }
+            if let Err(e) = self.assign_ipv6_if_configured(&node.id, &nic.network, &vm_id, position)
+            {
+                self.rollback_created_vm(&node, &vm).await;
+                return Err(e);
+            }
+        }
+        if !anti_affinity.is_empty() {
+            if let Err(e) = self.db.set_vm_anti_affinity(&vm_id, &anti_affinity) {
+                self.rollback_created_vm(&node, &vm).await;
+                return Err(Status::internal(format!("storing anti-affinity: {e}")));
+            }
+        }
+        if vm.storage_backend == "ceph" {
+            if let Err(e) = self.db.upsert_volume(&VolumeRow::new_root(
+                &vm.id,
+                &vm.name,
+                vm.storage_size_bytes,
+            )) {
                 self.rollback_created_vm(&node, &vm).await;
                 return Err(Status::internal(format!("storing Ceph volume: {e}")));
             }
@@ -3455,6 +5271,34 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .db
             .get_vm_ssh_key_names(&vm_id)
             .map_err(|e| Status::internal(format!("listing VM SSH keys for replication: {e}")))?;
+        let extra_nics = self
+            .db
+            .list_vm_nics(&vm_id)
+            .map_err(|e| Status::internal(format!("listing extra NICs for replication: {e}")))?;
+        let extra_nic_body: Vec<serde_json::Value> = extra_nics
+            .iter()
+            .map(|nic| {
+                serde_json::json!({
+                    "position": nic.position,
+                    "network": nic.network,
+                    "macAddress": nic.mac_address,
+                    "model": nic.model,
+                    "ipAddress": nic.ip_address,
+                })
+            })
+            .collect();
+        let ipv6_body: Vec<serde_json::Value> = self
+            .db
+            .list_vm_ipv6(&vm_id)
+            .map_err(|e| Status::internal(format!("listing IPv6 addresses for replication: {e}")))?
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "position": row.position,
+                    "address": row.address,
+                })
+            })
+            .collect();
 
         self.log_replication_event(
             &actor,
@@ -3482,6 +5326,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "pciDevices": crate::pci::split_pci_devices(&vm.pci_devices),
                 "gpuName": assigned_gpus,
                 "sshKeyNames": ssh_key_names,
+                "extraNics": extra_nic_body,
+                "ipv6Addresses": ipv6_body,
+                "antiAffinity": anti_affinity,
             }),
         );
 
@@ -3569,9 +5416,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     .and_then(|rows| rows.into_iter().find(|v| v.name == req.vm_id))
             })
             .ok_or_else(|| Status::not_found(format!("VM '{}' not found", req.vm_id)))?;
-        let volume = self
+        let volumes = self
             .db
-            .get_volume_by_vm(&db_vm.id)
+            .list_volumes_for_vm(&db_vm.id)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // `rbd rm` cannot remove an image the owning node still has mapped, and
@@ -3589,24 +5436,40 @@ impl controller_proto::controller_server::Controller for ControllerService {
         if !deleted {
             return Err(Status::not_found(format!("VM '{}' not found", req.vm_id)));
         }
-        if let Some(vol) = volume {
+
+        let delete_data = req.delete_data_volumes;
+        if !volumes.is_empty() {
             if self.clients.get_storage(&node.address).is_none() {
                 let _ = self.clients.connect(&node.address).await;
             }
             if let Some(mut storage) = self.clients.get_storage(&node.address) {
-                let handle = format!("{}/{}", vol.pool, vol.image);
-                if let Err(e) = storage
-                    .delete_volume(node_proto::DeleteVolumeRequest {
-                        backend_handle: handle,
-                    })
-                    .await
-                {
-                    warn!(vm_id = %db_vm.id, error = %e, "failed to delete RBD volume");
+                for vol in &volumes {
+                    if vol.role == VolumeRow::ROLE_DATA && !delete_data {
+                        continue;
+                    }
+                    let handle = format!("{}/{}", vol.pool, vol.image);
+                    if let Err(e) = storage
+                        .delete_volume(node_proto::DeleteVolumeRequest {
+                            backend_handle: handle,
+                        })
+                        .await
+                    {
+                        warn!(vm_id = %db_vm.id, volume = %vol.name, error = %e, "failed to delete RBD volume");
+                    }
                 }
             }
-            self.db
-                .delete_volume_by_vm(&db_vm.id)
-                .map_err(|e| Status::internal(format!("deleting volume row: {e}")))?;
+            if delete_data {
+                self.db
+                    .delete_volume_by_vm(&db_vm.id)
+                    .map_err(|e| Status::internal(format!("deleting volume rows: {e}")))?;
+            } else {
+                self.db
+                    .detach_data_volumes_for_vm(&db_vm.id)
+                    .map_err(|e| Status::internal(format!("detaching data volumes: {e}")))?;
+                self.db
+                    .delete_root_volume_by_vm(&db_vm.id)
+                    .map_err(|e| Status::internal(format!("deleting root volume row: {e}")))?;
+            }
         }
 
         info!(vm_id = %db_vm.id, node_id = %node.id, "deleted VM, pushing config");
@@ -3716,11 +5579,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         bus: String::new(),
                         device: String::new(),
                     }],
-                    nics: vec![controller_proto::Nic {
-                        network: db_vm.network.clone(),
-                        model: "virtio".to_string(),
-                        mac_address: String::new(),
-                    }],
+                    nics: crate::vm_nics::spec_nics(
+                        &db_vm.network,
+                        &self.db.list_vm_nics(&db_vm.id).unwrap_or_default(),
+                    ),
                     storage_backend: db_vm.storage_backend.clone(),
                     storage_size_bytes: db_vm.storage_size_bytes,
                     desired_state: if db_vm.auto_start {
@@ -3797,14 +5659,32 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 })
                 .collect();
             if nics.is_empty() || nics.iter().all(|n| n.network.trim().is_empty()) {
-                nics = vec![controller_proto::Nic {
-                    network: db_vm.network.clone(),
-                    model: "virtio".to_string(),
-                    mac_address: nics
-                        .first()
-                        .map(|n| n.mac_address.clone())
-                        .unwrap_or_default(),
-                }];
+                nics = crate::vm_nics::spec_nics(
+                    &db_vm.network,
+                    &self.db.list_vm_nics(&db_vm.id).unwrap_or_default(),
+                );
+            } else if self
+                .db
+                .list_vm_nics(&db_vm.id)
+                .map(|rows| !rows.is_empty())
+                .unwrap_or(false)
+            {
+                let stored = crate::vm_nics::spec_nics(
+                    &db_vm.network,
+                    &self.db.list_vm_nics(&db_vm.id).unwrap_or_default(),
+                );
+                nics = stored
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mut nic)| {
+                        if let Some(runtime) = nics.get(index) {
+                            if !runtime.mac_address.is_empty() {
+                                nic.mac_address = runtime.mac_address.clone();
+                            }
+                        }
+                        nic
+                    })
+                    .collect();
             }
 
             controller_proto::VmSpec {
@@ -4092,6 +5972,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         storage_backend: req.storage_backend,
                         storage_size_bytes: req.storage_size_bytes,
                         target_dc: String::new(),
+                        node_labels: Vec::new(),
+                        anti_affinity: String::new(),
                     }))
                     .await?
                     .into_inner();
@@ -4379,6 +6261,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     .delete_vm(Request::new(controller_proto::DeleteVmRequest {
                         vm_id: req.workload_id.clone(),
                         target_node: req.target_node.clone(),
+                        delete_data_volumes: false,
                     }))
                     .await?;
                 let _ = self.db.delete_workload_by_id_or_name(&req.workload_id);
@@ -4725,6 +6608,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = validate_network_name(&req.name)?;
+        let policy = explicit_net_policy(&req)?;
         let external_ip = validate_ipv4(&req.external_ip, "external_ip")?;
         let gateway_ip = validate_ipv4(&req.gateway_ip, "gateway_ip")?;
         let internal_netmask = if req.internal_netmask.trim().is_empty() {
@@ -4788,6 +6672,23 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     node.id,
                     diff.immutable.join(", ")
                 )));
+            }
+            if let Some((prefix, gateway, east_west)) = &policy {
+                let stored = self
+                    .db
+                    .get_network_policy(&node.id, &name)
+                    .map_err(|e| Status::internal(format!("reading network policy: {e}")))?;
+                if &stored.ipv6_prefix != prefix
+                    || &stored.ipv6_gateway != gateway
+                    || stored.east_west != *east_west
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "cannot change immutable field(s) on network '{name}' on node '{}': \
+                         ipv6Prefix, ipv6Gateway, eastWestFirewall \
+                         (delete the network and recreate)",
+                        node.id
+                    )));
+                }
             }
             return Ok(Response::new(controller_proto::CreateNetworkResponse {
                 success: true,
@@ -4854,6 +6755,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
             })
             .map_err(|e| Status::internal(format!("storing network: {e}")))?;
 
+        if let Some((prefix, gateway, east_west)) = &policy {
+            self.db
+                .upsert_network_policy(&crate::db::NetworkPolicyRow {
+                    node_id: node.id.clone(),
+                    name: name.clone(),
+                    east_west: *east_west,
+                    ipv6_prefix: prefix.clone(),
+                    ipv6_gateway: gateway.clone(),
+                    ipv6_next: 2,
+                })
+                .map_err(|e| Status::internal(format!("storing network policy: {e}")))?;
+        }
+
         self.push_config_to_node(&node).await?;
 
         if network_type == "vxlan" {
@@ -4878,6 +6792,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "enableOutboundNat": enable_outbound_nat,
                 "vni": vni,
                 "nextIp": 2,
+                "ipv6Prefix": policy.as_ref().map(|(prefix, _, _)| prefix.clone()).unwrap_or_default(),
+                "ipv6Gateway": policy.as_ref().map(|(_, gateway, _)| gateway.clone()).unwrap_or_default(),
+                "eastWestFirewall": policy.as_ref().map(|(_, _, east)| *east).unwrap_or(false),
             }),
         );
 
@@ -5011,22 +6928,31 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .map_err(|e| Status::internal(format!("listing networks for node: {e}")))?
         };
 
+        let mut networks = Vec::with_capacity(rows.len());
+        for n in rows {
+            let policy = self
+                .db
+                .get_network_policy(&n.node_id, &n.name)
+                .map_err(|e| Status::internal(format!("reading network policy: {e}")))?;
+            networks.push(controller_proto::NetworkInfo {
+                name: n.name,
+                external_ip: n.external_ip,
+                gateway_ip: n.gateway_ip,
+                internal_netmask: n.internal_netmask,
+                node_id: n.node_id,
+                allowed_tcp_ports: parse_port_list(&n.allowed_tcp_ports),
+                allowed_udp_ports: parse_port_list(&n.allowed_udp_ports),
+                vlan_id: n.vlan_id,
+                network_type: n.network_type,
+                enable_outbound_nat: n.enable_outbound_nat,
+                ipv6_prefix: policy.ipv6_prefix,
+                ipv6_gateway: policy.ipv6_gateway,
+                east_west_firewall: policy.east_west,
+            });
+        }
+
         Ok(Response::new(controller_proto::ListNetworksResponse {
-            networks: rows
-                .into_iter()
-                .map(|n| controller_proto::NetworkInfo {
-                    name: n.name,
-                    external_ip: n.external_ip,
-                    gateway_ip: n.gateway_ip,
-                    internal_netmask: n.internal_netmask,
-                    node_id: n.node_id,
-                    allowed_tcp_ports: parse_port_list(&n.allowed_tcp_ports),
-                    allowed_udp_ports: parse_port_list(&n.allowed_udp_ports),
-                    vlan_id: n.vlan_id,
-                    network_type: n.network_type,
-                    enable_outbound_nat: n.enable_outbound_nat,
-                })
-                .collect(),
+            networks,
         }))
     }
 
@@ -6128,213 +8054,22 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
-        let source_node = self
-            .db
-            .get_node(&req.node_id)
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
+        let outcome = self
+            .drain_node_vms(&req.node_id, &req.target_node, NodeDrainOptions::default())
+            .await?;
 
-        self.db
-            .update_node_status(&req.node_id, "draining")
-            .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
-
-        let vms = self
-            .db
-            .list_vms_for_node(&req.node_id)
-            .map_err(|e| Status::internal(format!("listing vms: {e}")))?;
-
-        if vms.is_empty() {
-            self.db
-                .update_node_status(&req.node_id, "drained")
-                .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
-            return Ok(Response::new(controller_proto::DrainNodeResponse {
-                success: true,
-                vms_migrated: 0,
-                message: "node has no VMs, marked as drained".into(),
-            }));
-        }
-
-        let all_nodes = self
-            .db
-            .list_nodes()
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let mut migrated = 0i32;
-        let mut errors = Vec::new();
-        let eligible_nodes: Vec<NodeRow> = all_nodes
-            .iter()
-            .filter(|n| n.id != req.node_id)
-            .cloned()
-            .collect();
-
-        let mut destination_node_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        for vm in &vms {
-            if !vm.pci_devices.is_empty()
-                || self
-                    .vm_gpu_names(&vm.id)
-                    .ok()
-                    .is_some_and(|names| !names.is_empty())
-            {
-                let mut gpu_targets: Vec<NodeRow> = eligible_nodes
-                    .iter()
-                    .filter(|n| {
-                        req.target_node.is_empty()
-                            || n.id == req.target_node
-                            || n.address == req.target_node
-                    })
-                    .filter(|n| self.node_supports_backend(n, &vm.storage_backend))
-                    .filter(|n| accepts_migrated_vms(n).is_ok())
-                    .cloned()
-                    .collect();
-                if vm.storage_backend == "ceph" {
-                    if let Ok(healthy) = self.healthy_ceph_members(&gpu_targets) {
-                        gpu_targets = healthy;
-                    }
-                }
-                let mut moved_gpu = false;
-                let mut gpu_error = String::new();
-                for target in &gpu_targets {
-                    let previous_pci = vm.pci_devices.clone();
-                    let previous_gpu = self.vm_gpu_names(&vm.id).unwrap_or_default().join(",");
-                    if let Err(e) = self.retarget_vm_gpus(vm, target, &[]) {
-                        gpu_error = e.message().to_string();
-                        continue;
-                    }
-                    if let Err(e) = self.cold_release_ceph_vm(vm, &source_node).await {
-                        self.restore_vm_gpu(&vm.id, &previous_pci, &previous_gpu);
-                        gpu_error = e.message().to_string();
-                        continue;
-                    }
-                    if let Err(e) = self.reassign_vm_node(vm, &target.id) {
-                        self.restore_vm_gpu(&vm.id, &previous_pci, &previous_gpu);
-                        gpu_error = e.message().to_string();
-                        continue;
-                    }
-                    migrated += 1;
-                    destination_node_ids.insert(target.id.clone());
-                    moved_gpu = true;
-                    break;
-                }
-                if !moved_gpu {
-                    if gpu_error.is_empty() {
-                        gpu_error = "no node with a free compatible GPU".into();
-                    }
-                    errors.push(format!("VM '{}': {gpu_error}", vm.name));
-                }
-                continue;
-            }
-            let mut backend_eligible: Vec<NodeRow> = eligible_nodes
-                .iter()
-                .filter(|n| self.node_supports_backend(n, &vm.storage_backend))
-                .filter(|n| accepts_migrated_vms(n).is_ok())
-                .cloned()
-                .collect();
-            if vm.storage_backend == "ceph" {
-                match self.healthy_ceph_members(&backend_eligible) {
-                    Ok(healthy) => backend_eligible = healthy,
-                    Err(e) => {
-                        errors.push(format!("VM '{}': {e}", vm.name));
-                        continue;
-                    }
-                }
-            }
-            // Every failure below has to be recorded and skipped rather than
-            // returned: VMs earlier in the loop have already been reassigned in
-            // the DB and no config has been pushed yet, so bailing out here
-            // would leave the cluster disagreeing with the database.
-            let target = if !req.target_node.is_empty() {
-                match backend_eligible
-                    .iter()
-                    .find(|n| n.id == req.target_node || n.address == req.target_node)
-                {
-                    Some(n) => n,
-                    None => {
-                        errors.push(format!(
-                            "target node '{}' cannot take VM '{}' (storage backend '{}')",
-                            req.target_node, vm.name, vm.storage_backend
-                        ));
-                        continue;
-                    }
-                }
+        let msg = if outcome.errors.is_empty() {
+            if outcome.migrated == 0 {
+                "node has no VMs, marked as drained".into()
             } else {
-                match scheduler::select_node_for_vm(&backend_eligible, vm.cpu, vm.memory_bytes) {
-                    Some(n) => n,
-                    None => {
-                        errors.push(format!(
-                            "no node with capacity and compatible storage for VM '{}' ({})",
-                            vm.name, vm.storage_backend
-                        ));
-                        continue;
-                    }
-                }
-            };
-
-            // Stop the guest and unmap the shared RBD on the source before the
-            // destination is allowed to map it. Skipping a VM here is far
-            // better than two nodes writing the same image.
-            if let Err(e) = self.cold_release_ceph_vm(vm, &source_node).await {
-                errors.push(format!("VM '{}' left on {}: {e}", vm.name, source_node.id));
-                continue;
+                format!("{} VMs migrated successfully", outcome.migrated)
             }
-
-            if let Err(e) = self.reassign_vm_node(vm, &target.id) {
-                errors.push(format!("VM '{}': {e}", vm.name));
-                continue;
-            }
-
-            migrated += 1;
-            destination_node_ids.insert(target.id.clone());
-        }
-
-        // A node is only drained once its own rebuild has actually removed the
-        // VM units, so wait for the verdict and treat a failure as an
-        // incomplete evacuation rather than logging it and claiming success.
-        if let Err(e) = self.push_config_and_await_apply(&source_node).await {
-            warn!(node = %req.node_id, error = %e, "failed to apply config on drained node");
-            errors.push(format!(
-                "node {} did not apply its post-drain configuration: {e}",
-                req.node_id
-            ));
-        }
-
-        for target_id in &destination_node_ids {
-            match self.db.get_node(target_id) {
-                Ok(Some(target_node)) => {
-                    if let Err(e) = self.push_config_and_await_apply(&target_node).await {
-                        warn!(node = %target_id, error = %e, "failed to apply config on target node");
-                        errors.push(format!(
-                            "target node {target_id} did not apply the migrated VM configuration: {e}"
-                        ));
-                    }
-                }
-                Ok(None) => errors.push(format!(
-                    "target node {target_id} disappeared before its configuration was applied"
-                )),
-                Err(e) => errors.push(format!("looking up target node {target_id}: {e}")),
-            }
-        }
-
-        // Only claim the node is drained when nothing was left running on it;
-        // otherwise it stays `draining` so operators (and the reconciler) can
-        // see the evacuation is incomplete.
-        let final_status = if errors.is_empty() {
-            "drained"
-        } else {
-            "draining"
-        };
-        self.db
-            .update_node_status(&req.node_id, final_status)
-            .map_err(|e| Status::internal(format!("updating node status: {e}")))?;
-
-        let msg = if errors.is_empty() {
-            format!("{migrated} VMs migrated successfully")
         } else {
             format!(
-                "{migrated} VMs migrated, {} errors: {}",
-                errors.len(),
-                errors.join("; ")
+                "{} VMs migrated, {} errors: {}",
+                outcome.migrated,
+                outcome.errors.len(),
+                outcome.errors.join("; ")
             )
         };
         self.log_replication_event_required(
@@ -6345,14 +8080,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
             serde_json::json!({
                 "nodeId": req.node_id,
                 "targetNode": req.target_node,
-                "migrated": migrated,
-                "errors": errors,
+                "migrated": outcome.migrated,
+                "errors": outcome.errors,
             }),
         )?;
 
         Ok(Response::new(controller_proto::DrainNodeResponse {
-            success: errors.is_empty(),
-            vms_migrated: migrated,
+            success: outcome.errors.is_empty(),
+            vms_migrated: outcome.migrated,
             message: msg,
         }))
     }
@@ -6452,7 +8187,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )
             .await
         {
-            Ok(()) => {
+            Ok(operation_id) => {
                 self.log_replication_event_required(
                     &actor,
                     Some("MigrateVm"),
@@ -6464,6 +8199,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         "sourceNode": source_node.id,
                         "targetNode": target.id,
                         "mode": "live",
+                        "operationId": operation_id,
                     }),
                 )?;
                 return Ok(Response::new(controller_proto::MigrateVmResponse {
@@ -6475,12 +8211,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     mode: "live".into(),
                     source_node: source_node.id,
                     target_node: target.id.clone(),
+                    operation_id,
                 }));
             }
             Err(live_err) => {
                 warn!(
                     vm = %vm.name,
                     send_succeeded = live_err.send_succeeded,
+                    operation_id = %live_err.operation_id,
                     error = %live_err.status,
                     "live migrate failed"
                 );
@@ -6513,6 +8251,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         "targetNode": target.id,
                         "mode": "cold",
                         "liveError": live_err.status.to_string(),
+                        "operationId": live_err.operation_id,
                     }),
                 )?;
                 Ok(Response::new(controller_proto::MigrateVmResponse {
@@ -6524,6 +8263,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     mode: "cold".into(),
                     source_node: source_node.id,
                     target_node: target.id.clone(),
+                    operation_id: live_err.operation_id,
                 }))
             }
         }
@@ -6664,6 +8404,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 vm_name: runtime_name.clone(),
                 rbd_pool: volume.as_ref().map(|v| v.pool.clone()).unwrap_or_default(),
                 rbd_image: volume.as_ref().map(|v| v.image.clone()).unwrap_or_default(),
+                rbd_volumes: vec![],
             })
             .await
             .map_err(|e| {
@@ -6818,6 +8559,278 @@ impl controller_proto::controller_server::Controller for ControllerService {
         Ok(Response::new(controller_proto::RejectNodeResponse {
             success: true,
             message: format!("node '{}' rejected", req.node_id),
+        }))
+    }
+
+    async fn cordon_node(
+        &self,
+        request: Request<controller_proto::CordonNodeRequest>,
+    ) -> Result<Response<controller_proto::CordonNodeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let node = self
+            .db
+            .get_node(&req.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
+
+        if matches!(node.status.as_str(), "cordoned" | "draining" | "drained") {
+            return Ok(Response::new(controller_proto::CordonNodeResponse {
+                success: true,
+                message: format!(
+                    "node '{}' is already unschedulable ({})",
+                    node.id, node.status
+                ),
+            }));
+        }
+
+        self.db
+            .update_node_status(&node.id, "cordoned")
+            .map_err(|e| Status::internal(format!("cordoning node: {e}")))?;
+        self.log_replication_event_required(
+            &actor,
+            Some("CordonNode"),
+            EVT_NODE_CORDON,
+            &format!("node/{}", node.id),
+            serde_json::json!({ "nodeId": node.id }),
+        )?;
+        info!(node_id = %node.id, "node cordoned");
+        Ok(Response::new(controller_proto::CordonNodeResponse {
+            success: true,
+            message: format!(
+                "node '{}' cordoned; existing VMs stay, new placement will not use it",
+                node.id
+            ),
+        }))
+    }
+
+    async fn uncordon_node(
+        &self,
+        request: Request<controller_proto::UncordonNodeRequest>,
+    ) -> Result<Response<controller_proto::UncordonNodeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let node = self
+            .db
+            .get_node(&req.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
+
+        if node.status != "cordoned" {
+            return Ok(Response::new(controller_proto::UncordonNodeResponse {
+                success: true,
+                message: format!("node '{}' is not cordoned ({})", node.id, node.status),
+            }));
+        }
+        if node.approval_status != "approved" {
+            return Err(Status::failed_precondition(format!(
+                "node '{}' is not approved ({}); approve it before uncordoning",
+                node.id, node.approval_status
+            )));
+        }
+
+        self.db
+            .update_node_status(&node.id, "ready")
+            .map_err(|e| Status::internal(format!("uncordoning node: {e}")))?;
+        self.log_replication_event_required(
+            &actor,
+            Some("UncordonNode"),
+            EVT_NODE_UNCORDON,
+            &format!("node/{}", node.id),
+            serde_json::json!({ "nodeId": node.id }),
+        )?;
+        info!(node_id = %node.id, "node uncordoned");
+        Ok(Response::new(controller_proto::UncordonNodeResponse {
+            success: true,
+            message: format!("node '{}' is schedulable again", node.id),
+        }))
+    }
+
+    async fn delete_node(
+        &self,
+        request: Request<controller_proto::DeleteNodeRequest>,
+    ) -> Result<Response<controller_proto::DeleteNodeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let node = self
+            .db
+            .get_node(&req.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
+
+        let vms = self
+            .db
+            .list_vms_for_node(&node.id)
+            .map_err(|e| Status::internal(format!("listing VMs: {e}")))?;
+        if !vms.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "node '{}' still hosts {} VM(s); drain them before deleting the node",
+                node.id,
+                vms.len()
+            )));
+        }
+        let networks = self
+            .db
+            .list_networks_for_node(&node.id)
+            .map_err(|e| Status::internal(format!("listing networks: {e}")))?;
+        if !networks.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "node '{}' still has {} network(s); delete them before deleting the node",
+                node.id,
+                networks.len()
+            )));
+        }
+        let workloads = self
+            .db
+            .count_workloads_for_node(&node.id)
+            .map_err(|e| Status::internal(format!("listing workloads: {e}")))?;
+        if workloads > 0 {
+            return Err(Status::failed_precondition(format!(
+                "node '{}' still hosts {workloads} workload(s); remove them before deleting the node",
+                node.id
+            )));
+        }
+
+        self.db
+            .update_node_status(&node.id, "cordoned")
+            .map_err(|e| Status::internal(format!("cordoning node: {e}")))?;
+
+        let revoked = self.revoke_node_certificates(&node.id)?;
+
+        let removed = self.db.delete_node(&node.id).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("FOREIGN KEY") {
+                Status::failed_precondition(format!(
+                    "node '{}' still has dependent records; remove them before deleting the node",
+                    node.id
+                ))
+            } else {
+                Status::internal(format!("deleting node: {e}"))
+            }
+        })?;
+        if !removed {
+            return Err(Status::not_found(format!("node '{}' not found", node.id)));
+        }
+
+        self.log_replication_event_required(
+            &actor,
+            Some("DeleteNode"),
+            EVT_NODE_DELETE,
+            &format!("node/{}", node.id),
+            serde_json::json!({
+                "nodeId": node.id,
+                "certificatesRevoked": revoked,
+            }),
+        )?;
+        info!(node_id = %node.id, certificates_revoked = revoked, "node deleted");
+        Ok(Response::new(controller_proto::DeleteNodeResponse {
+            success: true,
+            message: format!(
+                "node '{}' deleted; {revoked} certificate(s) revoked",
+                node.id
+            ),
+            certificates_revoked: revoked,
+        }))
+    }
+
+    async fn get_cluster_health(
+        &self,
+        request: Request<controller_proto::GetClusterHealthRequest>,
+    ) -> Result<Response<controller_proto::GetClusterHealthResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let _ = request;
+        let nodes = self.db.list_nodes().map_err(internal_db)?;
+        let vms = self.db.list_vms().map_err(internal_db)?;
+        let conflicts = self
+            .db
+            .count_unresolved_replication_conflicts()
+            .map_err(internal_db)?;
+        let now = crate::pki::format_ts(time::OffsetDateTime::now_utc());
+        let warn = crate::pki::format_ts(
+            time::OffsetDateTime::now_utc()
+                + time::Duration::days(crate::cluster_health::CERT_EXPIRY_WARN_DAYS as i64),
+        );
+        let inventory_expiring = self
+            .db
+            .count_certificates(&now, &warn)
+            .map(|counts| counts.4)
+            .unwrap_or(0);
+        let health = crate::cluster_health::assess(&nodes, &vms, conflicts, inventory_expiring);
+        Ok(Response::new(controller_proto::GetClusterHealthResponse {
+            status: health.status,
+            ready_nodes: health.ready_nodes,
+            not_ready_nodes: health.not_ready_nodes,
+            unschedulable_nodes: health.unschedulable_nodes,
+            pending_nodes: health.pending_nodes,
+            vm_count: health.vm_count,
+            vms_on_not_ready_nodes: health.vms_on_not_ready_nodes,
+            replication_conflicts: health.replication_conflicts,
+            certificates_expiring_soon: health.certificates_expiring_soon,
+            conditions: health.conditions,
+        }))
+    }
+
+    async fn backup_cluster(
+        &self,
+        request: Request<controller_proto::BackupClusterRequest>,
+    ) -> Result<Response<controller_proto::BackupClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let _ = request;
+        let (sqlite, schema_version) = self
+            .db
+            .snapshot_sqlite()
+            .map_err(|e| Status::internal(format!("backup: {e}")))?;
+        self.record_audit(
+            &actor,
+            "BackupCluster",
+            "cluster/database",
+            &format!("schema {schema_version}, {} bytes", sqlite.len()),
+        );
+        Ok(Response::new(controller_proto::BackupClusterResponse {
+            sqlite,
+            schema_version,
+        }))
+    }
+
+    async fn restore_cluster(
+        &self,
+        request: Request<controller_proto::RestoreClusterRequest>,
+    ) -> Result<Response<controller_proto::RestoreClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition(
+                "restore replaces the controller database; set confirm=true",
+            ));
+        }
+        let schema_version = self.db.restore_sqlite(&req.sqlite).map_err(|e| {
+            if e.contains("not a SQLite") || e.contains("schema version") || e.contains("empty") {
+                Status::invalid_argument(e)
+            } else {
+                Status::internal(format!("restore: {e}"))
+            }
+        })?;
+        if let Err(error) = self.pki.revocation.refresh(&self.db) {
+            warn!(%error, "database restored but the revocation cache did not refresh");
+        }
+        self.record_audit(
+            &actor,
+            "RestoreCluster",
+            "cluster/database",
+            &format!("restored schema {schema_version}"),
+        );
+        info!(schema_version, "controller database restored from snapshot");
+        Ok(Response::new(controller_proto::RestoreClusterResponse {
+            success: true,
+            message: format!(
+                "restored controller database at schema {schema_version}; restart peer controllers so they do not keep the previous copy"
+            ),
+            schema_version,
         }))
     }
 
@@ -7463,12 +9476,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut backend_filesystem_nodes: i32 = 0;
         let mut backend_lvm_nodes: i32 = 0;
         let mut backend_zfs_nodes: i32 = 0;
+        let mut backend_ceph_nodes: i32 = 0;
         let mut backend_unspecified_nodes: i32 = 0;
         for n in &approved {
             match n.storage_backend.as_str() {
                 "filesystem" => backend_filesystem_nodes += 1,
                 "lvm" => backend_lvm_nodes += 1,
                 "zfs" => backend_zfs_nodes += 1,
+                "ceph" => backend_ceph_nodes += 1,
                 _ => backend_unspecified_nodes += 1,
             }
         }
@@ -7626,6 +9641,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 backend_lvm_nodes,
                 backend_zfs_nodes,
                 backend_unspecified_nodes,
+                backend_ceph_nodes,
                 nodes_luks_tpm2,
                 nodes_luks_keyfile,
                 nodes_luks_unknown,
@@ -7640,94 +9656,1400 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::ListVolumesRequest>,
     ) -> Result<Response<controller_proto::ListVolumesResponse>, Status> {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
-        let _ = request.into_inner();
+        let filter_vm = request.into_inner().vm.trim().to_string();
 
         let vms = self
             .db
             .list_vms()
             .map_err(|e| Status::internal(e.to_string()))?;
-        let ceph_volumes: HashMap<String, VolumeRow> = self
+        let vm_by_id: HashMap<String, VmRow> = vms.into_iter().map(|v| (v.id.clone(), v)).collect();
+
+        let mut rows = self
             .db
             .list_volumes()
-            .map_err(|e| Status::internal(e.to_string()))?
-            .into_iter()
-            .map(|v| (v.vm_id.clone(), v))
-            .collect();
-
-        let node_address_by_id: std::collections::HashMap<String, String> = self
-            .db
-            .list_nodes()
-            .map_err(|e| Status::internal(e.to_string()))?
-            .into_iter()
-            .map(|n| (n.id, n.address))
-            .collect();
-
-        let vm_count = vms.len();
-        let mut fallback_states: Vec<i32> = Vec::with_capacity(vm_count);
-        let mut set = tokio::task::JoinSet::new();
-
-        for (idx, vm) in vms.iter().enumerate() {
-            fallback_states.push(state_fallback_without_runtime(vm.auto_start));
-            if let Some(node_address) = node_address_by_id.get(&vm.node_id) {
-                if self.clients.get_compute(node_address).is_none() {
-                    let _ = self.clients.connect(node_address).await;
-                }
-                if let Some(mut compute) = self.clients.get_compute(node_address) {
-                    let vm_name = vm.name.clone();
-                    set.spawn(async move {
-                        let result = tokio::time::timeout(
-                            Duration::from_secs(3),
-                            compute.get_vm(node_proto::GetVmRequest {
-                                vm_id: vm_name.clone(),
-                            }),
-                        )
-                        .await;
-                        (idx, result)
-                    });
-                }
-            }
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !filter_vm.is_empty() {
+            let want_id = vm_by_id
+                .values()
+                .find(|v| v.id == filter_vm || v.name == filter_vm)
+                .map(|v| v.id.clone())
+                .unwrap_or_else(|| filter_vm.clone());
+            rows.retain(|v| v.vm_id == want_id || v.name == filter_vm || v.id == filter_vm);
         }
 
-        let mut live_states: Vec<Option<i32>> = vec![None; vm_count];
-        while let Some(Ok((idx, result))) = set.join_next().await {
-            if let Ok(Ok(resp)) = result {
-                if let Some(status) = resp.into_inner().status {
-                    live_states[idx] = Some(controller_state_from_node_state(status.state));
-                }
-            }
-        }
-
-        let volumes: Vec<_> = vms
+        let volumes: Vec<_> = rows
             .into_iter()
-            .enumerate()
-            .map(|(i, vm)| {
-                let state = live_states[i].unwrap_or(fallback_states[i]);
-                let ceph = ceph_volumes.get(&vm.id);
-                controller_proto::VolumeInfo {
-                    vm_id: vm.id.clone(),
-                    vm_name: vm.name.clone(),
-                    node_id: vm.node_id.clone(),
-                    storage_backend: vm.storage_backend.clone(),
-                    storage_size_bytes: ceph.map(|v| v.size_bytes).unwrap_or(vm.storage_size_bytes),
-                    backend_handle: ceph
-                        .map(|v| format!("/dev/rbd/{}/{}", v.pool, v.image))
-                        .unwrap_or_else(|| vm_backend_handle(&vm)),
-                    image_format: if vm.storage_backend == "lvm"
-                        || vm.storage_backend == "zfs"
-                        || vm.storage_backend == "ceph"
-                    {
-                        "raw".to_string()
-                    } else {
-                        vm.image_format.clone()
-                    },
-                    vm_state: state,
-                }
+            .map(|vol| {
+                let vm = vm_by_id.get(&vol.vm_id);
+                self.volume_info_from_row(&vol, vm)
             })
             .collect();
 
         Ok(Response::new(controller_proto::ListVolumesResponse {
             volumes,
         }))
+    }
+
+    async fn create_volume(
+        &self,
+        request: Request<controller_proto::CreateVolumeRequest>,
+    ) -> Result<Response<controller_proto::CreateVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = req.name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("volume name is required"));
+        }
+        let from_snap = req.from_snapshot.trim().to_string();
+        if from_snap.is_empty() && req.size_bytes <= 0 {
+            return Err(Status::invalid_argument("size_bytes must be positive"));
+        }
+        if req.encrypt && !from_snap.is_empty() {
+            return Err(Status::invalid_argument(
+                "encrypt cannot be combined with --from-snapshot in this release",
+            ));
+        }
+        let storage_class = if req.storage_class.trim().is_empty() {
+            "ceph"
+        } else {
+            req.storage_class.trim()
+        };
+        if storage_class != "ceph" {
+            return Err(Status::invalid_argument(
+                "only storage_class=ceph is supported for CreateVolume in this release",
+            ));
+        }
+        if self
+            .db
+            .get_volume_by_name(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_some()
+        {
+            return Err(Status::already_exists(format!(
+                "volume '{name}' already exists"
+            )));
+        }
+
+        let parent_snap = if from_snap.is_empty() {
+            None
+        } else {
+            Some(
+                self.db
+                    .get_volume_snapshot_by_name(&from_snap)
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .or(self
+                        .db
+                        .get_volume_snapshot_by_id(&from_snap)
+                        .map_err(|e| Status::internal(e.to_string()))?)
+                    .ok_or_else(|| {
+                        Status::not_found(format!("snapshot '{from_snap}' not found"))
+                    })?,
+            )
+        };
+
+        let size = if let Some(ref snap) = parent_snap {
+            snap.size_bytes
+        } else {
+            req.size_bytes
+        };
+        let mut row = VolumeRow::new_data(name, size);
+        if !req.guest_format_json.trim().is_empty() {
+            row.guest_format_json = req.guest_format_json;
+        }
+        if let Some(ref snap) = parent_snap {
+            row.parent_snapshot_id = snap.id.clone();
+            row.source_json = format!(
+                r#"{{"snapshotId":"{}","snapshotName":"{}"}}"#,
+                snap.id, snap.name
+            );
+        }
+
+        let node = self
+            .pick_healthy_ceph_node()
+            .await
+            .map_err(|e| Status::failed_precondition(e))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            self.clients
+                .connect(&node.address)
+                .await
+                .map_err(|e| Status::unavailable(format!("connecting to Ceph node: {e}")))?;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+        if let Some(ref snap) = parent_snap {
+            let parent_vol = self
+                .db
+                .get_volume_by_id(&snap.volume_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("parent volume for snapshot missing"))?;
+            storage
+                .clone_volume(node_proto::CloneVolumeRequest {
+                    parent_handle: format!("{}/{}", parent_vol.pool, parent_vol.image),
+                    parent_snapshot: snap.rbd_snap.clone(),
+                    child_image: row.image.clone(),
+                })
+                .await
+                .map_err(|e| Status::internal(format!("cloning RBD volume: {e}")))?;
+        } else {
+            storage
+                .create_volume(node_proto::CreateVolumeRequest {
+                    volume_id: row.image.clone(),
+                    storage_class: "ceph".into(),
+                    size_bytes: row.size_bytes,
+                    parameters: HashMap::new(),
+                })
+                .await
+                .map_err(|e| Status::internal(format!("creating RBD volume: {e}")))?;
+        }
+
+        if req.encrypt {
+            let master = crate::volume_crypto::MasterKeyStore::default()
+                .load_or_create()
+                .map_err(|e| Status::failed_precondition(format!("volume master key: {e}")))?;
+            let dek = crate::volume_crypto::generate_dek()
+                .map_err(|e| Status::internal(format!("generate dek: {e}")))?;
+            let mapper = crate::volume_crypto::mapper_name_for_serial(&row.serial);
+            storage
+                .format_encrypted_volume(node_proto::FormatEncryptedVolumeRequest {
+                    rbd_device: format!("{}/{}", row.pool, row.image),
+                    dek: dek.clone(),
+                    mapper_name: mapper.clone(),
+                })
+                .await
+                .map_err(|e| Status::internal(format!("format encrypted volume: {e}")))?;
+            // Close mapper after format so the volume can stay detached.
+            let _ = storage
+                .lock_encrypted_volume(node_proto::LockEncryptedVolumeRequest {
+                    mapper_name: mapper,
+                })
+                .await;
+            row.encrypted = true;
+            row.wrapped_dek = crate::volume_crypto::wrap_dek(&master, &dek)
+                .map_err(|e| Status::internal(format!("wrap dek: {e}")))?;
+        }
+
+        let attach_vm = req.vm.trim().to_string();
+        if !attach_vm.is_empty() {
+            let vm = self
+                .resolve_vm_row(&attach_vm)?
+                .ok_or_else(|| Status::not_found(format!("VM '{attach_vm}' not found")))?;
+            if vm.storage_backend != "ceph" {
+                return Err(Status::failed_precondition(
+                    "can only attach Ceph volumes to Ceph-backed VMs",
+                ));
+            }
+            let slot = self
+                .db
+                .next_data_slot_for_vm(&vm.id)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            row.vm_id = vm.id.clone();
+            row.slot = slot;
+            row.attach_state = VolumeRow::ATTACH_ATTACHED.into();
+            let live = self.vm_is_live(&vm).await?;
+            if live {
+                self.hotplug_add_volume_disk(&vm, &row).await?;
+            }
+            self.db
+                .upsert_volume(&row)
+                .map_err(|e| Status::internal(format!("storing volume: {e}")))?;
+            let node = self
+                .db
+                .get_node(&vm.node_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+            self.push_config_and_await_apply(&node).await?;
+        } else {
+            self.db
+                .upsert_volume(&row)
+                .map_err(|e| Status::internal(format!("storing volume: {e}")))?;
+        }
+
+        self.log_replication_event(
+            &actor,
+            Some("volume.create"),
+            EVT_VOLUME_CREATE,
+            &format!("volume/{}", row.name),
+            serde_json::json!({
+                "id": row.id,
+                "name": row.name,
+                "role": row.role,
+                "pool": row.pool,
+                "image": row.image,
+                "sizeBytes": row.size_bytes,
+                "vmId": row.vm_id,
+                "attachState": row.attach_state,
+                "encrypted": row.encrypted,
+                "parentSnapshotId": row.parent_snapshot_id,
+                "serial": row.serial,
+                "slot": row.slot,
+                "storageClass": row.storage_class,
+                "sourceJson": row.source_json,
+            }),
+        );
+
+        let vm = if row.vm_id.is_empty() {
+            None
+        } else {
+            self.db
+                .get_vm(&row.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+        Ok(Response::new(controller_proto::CreateVolumeResponse {
+            success: true,
+            volume: Some(self.volume_info_from_row(&row, vm.as_ref())),
+            message: format!("volume '{name}' created"),
+        }))
+    }
+
+    async fn get_volume(
+        &self,
+        request: Request<controller_proto::GetVolumeRequest>,
+    ) -> Result<Response<controller_proto::GetVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let name = request.into_inner().name.trim().to_string();
+        let row = self
+            .resolve_volume_row(&name)?
+            .ok_or_else(|| Status::not_found(format!("volume '{name}' not found")))?;
+        let vm = if row.vm_id.is_empty() {
+            None
+        } else {
+            self.db
+                .get_vm(&row.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+        Ok(Response::new(controller_proto::GetVolumeResponse {
+            volume: Some(self.volume_info_from_row(&row, vm.as_ref())),
+        }))
+    }
+
+    async fn attach_volume(
+        &self,
+        request: Request<controller_proto::AttachVolumeRequest>,
+    ) -> Result<Response<controller_proto::AttachVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let mut row = self
+            .resolve_volume_row(req.name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.name)))?;
+        if row.role == VolumeRow::ROLE_ROOT {
+            return Err(Status::failed_precondition(
+                "root volumes cannot be re-attached",
+            ));
+        }
+        if row.attach_state == VolumeRow::ATTACH_ATTACHED && !row.vm_id.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "volume '{}' is already attached to {}",
+                row.name, row.vm_id
+            )));
+        }
+        let vm = self
+            .resolve_vm_row(req.vm.trim())?
+            .ok_or_else(|| Status::not_found(format!("VM '{}' not found", req.vm)))?;
+        if vm.storage_backend != "ceph" {
+            return Err(Status::failed_precondition(
+                "can only attach Ceph volumes to Ceph-backed VMs",
+            ));
+        }
+        let live = self.vm_is_live(&vm).await?;
+        let slot = self
+            .db
+            .next_data_slot_for_vm(&vm.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        row.vm_id = vm.id.clone();
+        row.slot = slot;
+        row.attach_state = VolumeRow::ATTACH_ATTACHED.into();
+        row.generation += 1;
+        if live {
+            self.hotplug_add_volume_disk(&vm, &row).await?;
+        }
+        self.db
+            .upsert_volume(&row)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+        // Persist disk in Nix even after hotplug so reboot keeps the attach.
+        self.push_config_and_await_apply(&node).await?;
+        self.log_replication_event(
+            &actor,
+            Some("volume.attach"),
+            EVT_VOLUME_ATTACH,
+            &format!("volume/{}", row.name),
+            serde_json::json!({
+                "id": row.id,
+                "name": row.name,
+                "vmId": row.vm_id,
+                "slot": row.slot,
+                "attachState": row.attach_state,
+                "generation": row.generation,
+            }),
+        );
+        let how = if live { "hot-attached" } else { "attached" };
+        Ok(Response::new(controller_proto::AttachVolumeResponse {
+            success: true,
+            message: format!("{how} '{}' to '{}'", row.name, vm.name),
+            volume: Some(self.volume_info_from_row(&row, Some(&vm))),
+        }))
+    }
+
+    async fn detach_volume(
+        &self,
+        request: Request<controller_proto::DetachVolumeRequest>,
+    ) -> Result<Response<controller_proto::DetachVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let name = request.into_inner().name;
+        let mut row = self
+            .resolve_volume_row(name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{name}' not found")))?;
+        if row.role == VolumeRow::ROLE_ROOT {
+            return Err(Status::failed_precondition(
+                "root volumes cannot be detached; delete the VM instead",
+            ));
+        }
+        if row.vm_id.is_empty() || row.attach_state == VolumeRow::ATTACH_DETACHED {
+            return Ok(Response::new(controller_proto::DetachVolumeResponse {
+                success: true,
+                message: format!("volume '{}' already detached", row.name),
+                volume: Some(self.volume_info_from_row(&row, None)),
+            }));
+        }
+        let vm = self
+            .db
+            .get_vm(&row.vm_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("attached VM missing"))?;
+        let live = self.vm_is_live(&vm).await?;
+        let node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+        if live {
+            self.hotplug_remove_volume_disk(&vm, &row).await?;
+        }
+        row.vm_id = String::new();
+        row.slot = 0;
+        row.attach_state = VolumeRow::ATTACH_DETACHED.into();
+        row.generation += 1;
+        self.db
+            .upsert_volume(&row)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.push_config_and_await_apply(&node).await?;
+        self.log_replication_event(
+            &actor,
+            Some("volume.detach"),
+            EVT_VOLUME_DETACH,
+            &format!("volume/{}", row.name),
+            serde_json::json!({
+                "id": row.id,
+                "name": row.name,
+                "attachState": row.attach_state,
+                "generation": row.generation,
+            }),
+        );
+        let how = if live { "hot-detached" } else { "detached" };
+        Ok(Response::new(controller_proto::DetachVolumeResponse {
+            success: true,
+            message: format!("{how} '{}'", row.name),
+            volume: Some(self.volume_info_from_row(&row, None)),
+        }))
+    }
+
+    async fn delete_volume(
+        &self,
+        request: Request<controller_proto::DeleteVolumeRequest>,
+    ) -> Result<Response<controller_proto::DeleteVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let name = request.into_inner().name;
+        let row = self
+            .resolve_volume_row(name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{name}' not found")))?;
+        if row.role == VolumeRow::ROLE_ROOT {
+            return Err(Status::failed_precondition(
+                "root volumes are deleted with the VM",
+            ));
+        }
+        if row.attach_state != VolumeRow::ATTACH_DETACHED || !row.vm_id.is_empty() {
+            return Err(Status::failed_precondition(
+                "detach the volume before deleting it",
+            ));
+        }
+        let node = self
+            .pick_healthy_ceph_node()
+            .await
+            .map_err(|e| Status::failed_precondition(e))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        if let Some(mut storage) = self.clients.get_storage(&node.address) {
+            let handle = format!("{}/{}", row.pool, row.image);
+            storage
+                .delete_volume(node_proto::DeleteVolumeRequest {
+                    backend_handle: handle,
+                })
+                .await
+                .map_err(|e| Status::internal(format!("deleting RBD image: {e}")))?;
+        }
+        self.db
+            .delete_volume_by_id(&row.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.log_replication_event(
+            &actor,
+            Some("volume.delete"),
+            EVT_VOLUME_DELETE,
+            &format!("volume/{}", row.name),
+            serde_json::json!({
+                "id": row.id,
+                "name": row.name,
+            }),
+        );
+        Ok(Response::new(controller_proto::DeleteVolumeResponse {
+            success: true,
+            message: format!("deleted volume '{}'", row.name),
+        }))
+    }
+
+    async fn list_vm_operations(
+        &self,
+        request: Request<controller_proto::ListVmOperationsRequest>,
+    ) -> Result<Response<controller_proto::ListVmOperationsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        let mut ops = self
+            .db
+            .list_vm_operations(req.include_finished)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !req.vm_id.trim().is_empty() {
+            let key = req.vm_id.trim();
+            let vm_id = self
+                .resolve_vm_row(key)?
+                .map(|v| v.id)
+                .unwrap_or_else(|| key.to_string());
+            ops.retain(|o| o.vm_id == vm_id);
+        }
+        Ok(Response::new(controller_proto::ListVmOperationsResponse {
+            operations: ops.iter().map(Self::vm_operation_to_proto).collect(),
+        }))
+    }
+
+    async fn get_vm_operation(
+        &self,
+        request: Request<controller_proto::GetVmOperationRequest>,
+    ) -> Result<Response<controller_proto::GetVmOperationResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let id = request.into_inner().id;
+        let mut op = self
+            .db
+            .get_vm_operation(id.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("operation '{id}' not found")))?;
+        if op.kind == VmOperationRow::KIND_LIVE_MIGRATE && op.finished_at.is_empty() {
+            if let Ok(progress_json) = self.live_migrate_progress_json(&op).await {
+                op.detail_json = merge_detail_json(&op.detail_json, &progress_json);
+            }
+        }
+        Ok(Response::new(controller_proto::GetVmOperationResponse {
+            operation: Some(Self::vm_operation_to_proto(&op)),
+        }))
+    }
+
+    async fn cancel_vm_operation(
+        &self,
+        request: Request<controller_proto::CancelVmOperationRequest>,
+    ) -> Result<Response<controller_proto::CancelVmOperationResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let id = request.into_inner().id;
+        let op = self
+            .db
+            .get_vm_operation(id.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("operation '{id}' not found")))?;
+        if !op.finished_at.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "operation '{id}' already finished in phase {}",
+                op.phase
+            )));
+        }
+        if !crate::vm_operation_policy::cancel_allowed(&op.phase, op.send_succeeded) {
+            return Err(Status::failed_precondition(format!(
+                "cancel refused in phase {} (send_succeeded={}; only Preparing before send is cancellable; after send the guest may already be on the destination)",
+                op.phase, op.send_succeeded
+            )));
+        }
+        self.db
+            .request_cancel_vm_operation(&op.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let updated = self
+            .db
+            .get_vm_operation(&op.id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .unwrap_or(op);
+        Ok(Response::new(controller_proto::CancelVmOperationResponse {
+            success: true,
+            message: format!(
+                "cancel requested for operation {}; migrate will abort if still Preparing",
+                updated.id
+            ),
+            operation: Some(Self::vm_operation_to_proto(&updated)),
+        }))
+    }
+
+    async fn create_volume_snapshot(
+        &self,
+        request: Request<controller_proto::CreateVolumeSnapshotRequest>,
+    ) -> Result<Response<controller_proto::CreateVolumeSnapshotResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let vol = self
+            .resolve_volume_row(req.volume.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume)))?;
+        if !vol.vm_id.is_empty() {
+            if let Ok(Some(open)) = self.db.get_open_vm_operation(&vol.vm_id) {
+                return Err(Status::failed_precondition(format!(
+                    "refusing snapshot while VM has open operation {} ({})",
+                    open.id, open.phase
+                )));
+            }
+        }
+        let snap_name = if req.name.trim().is_empty() {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("{}-{secs}", vol.name)
+        } else {
+            req.name.trim().to_string()
+        };
+        if self
+            .db
+            .get_volume_snapshot_by_name(&snap_name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_some()
+        {
+            return Err(Status::already_exists(format!(
+                "snapshot '{snap_name}' already exists"
+            )));
+        }
+        let consistency = volume_snapshot::normalize_snapshot_consistency(&req.consistency)
+            .map_err(|m| Status::invalid_argument(m))?;
+        let vm_for_quiesce = if vol.vm_id.is_empty() {
+            None
+        } else {
+            self.db
+                .get_vm(&vol.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+        let vm_live = if let Some(ref vm_row) = vm_for_quiesce {
+            self.vm_is_live(vm_row).await?
+        } else {
+            false
+        };
+        let needs_quiesce =
+            volume_snapshot::snapshot_needs_guest_quiesce(&consistency, &vol, vm_live);
+        let mut guest_frozen = false;
+        if needs_quiesce {
+            let vm_row = vm_for_quiesce.as_ref().expect("attached volume has vm");
+            self.guest_fs_freeze_for_vm(vm_row, true).await?;
+            guest_frozen = true;
+        }
+        let rbd_snap = VolumeRow::serial_from_id(&Uuid::new_v4().to_string());
+        let node = self
+            .pick_healthy_ceph_node()
+            .await
+            .map_err(|e| Status::failed_precondition(e))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+        let snap_result = storage
+            .snapshot_volume(node_proto::SnapshotVolumeRequest {
+                backend_handle: format!("{}/{}", vol.pool, vol.image),
+                snapshot_name: rbd_snap.clone(),
+                protect: true,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("rbd snap create: {e}")));
+        if guest_frozen {
+            if let Some(ref vm_row) = vm_for_quiesce {
+                if let Err(unfreeze_err) = self.guest_fs_freeze_for_vm(vm_row, false).await {
+                    warn!(
+                        vm = %vm_row.name,
+                        error = %unfreeze_err,
+                        "guest fs unfreeze after snapshot failed"
+                    );
+                }
+            }
+        }
+        snap_result?;
+        let row = VolumeSnapshotRow {
+            id: Uuid::new_v4().to_string(),
+            name: snap_name.clone(),
+            volume_id: vol.id.clone(),
+            rbd_snap,
+            protected: true,
+            size_bytes: vol.size_bytes,
+            consistency,
+            created_at: String::new(),
+        };
+        self.db
+            .insert_volume_snapshot(&row)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.log_replication_event(
+            &actor,
+            Some("volume_snapshot.create"),
+            EVT_VOLUME_SNAPSHOT_CREATE,
+            &format!("volume_snapshot/{}", row.name),
+            serde_json::json!({
+                "id": row.id,
+                "name": row.name,
+                "volumeId": row.volume_id,
+                "rbdSnap": row.rbd_snap,
+                "protected": row.protected,
+                "sizeBytes": row.size_bytes,
+                "consistency": row.consistency,
+            }),
+        );
+        Ok(Response::new(
+            controller_proto::CreateVolumeSnapshotResponse {
+                success: true,
+                message: format!("snapshot '{snap_name}' created"),
+                snapshot: Some(self.volume_snapshot_to_proto(&row, Some(&vol))),
+            },
+        ))
+    }
+
+    async fn list_volume_snapshots(
+        &self,
+        request: Request<controller_proto::ListVolumeSnapshotsRequest>,
+    ) -> Result<Response<controller_proto::ListVolumeSnapshotsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let filter = request.into_inner().volume.trim().to_string();
+        let volume_id = if filter.is_empty() {
+            None
+        } else {
+            Some(
+                self.resolve_volume_row(&filter)?
+                    .map(|v| v.id)
+                    .unwrap_or(filter),
+            )
+        };
+        let snaps = self
+            .db
+            .list_volume_snapshots(volume_id.as_deref())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut out = Vec::with_capacity(snaps.len());
+        for s in snaps {
+            let vol = self
+                .db
+                .get_volume_by_id(&s.volume_id)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            out.push(self.volume_snapshot_to_proto(&s, vol.as_ref()));
+        }
+        Ok(Response::new(
+            controller_proto::ListVolumeSnapshotsResponse { snapshots: out },
+        ))
+    }
+
+    async fn delete_volume_snapshot(
+        &self,
+        request: Request<controller_proto::DeleteVolumeSnapshotRequest>,
+    ) -> Result<Response<controller_proto::DeleteVolumeSnapshotResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let key = request.into_inner().name.trim().to_string();
+        let snap = self
+            .db
+            .get_volume_snapshot_by_name(&key)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or(self
+                .db
+                .get_volume_snapshot_by_id(&key)
+                .map_err(|e| Status::internal(e.to_string()))?)
+            .ok_or_else(|| Status::not_found(format!("snapshot '{key}' not found")))?;
+        let children = self
+            .db
+            .count_volumes_with_parent_snapshot(&snap.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if children > 0 {
+            return Err(Status::failed_precondition(format!(
+                "snapshot '{}' still has {children} unflattened clone(s); flatten or delete them first",
+                snap.name
+            )));
+        }
+        let vol = self
+            .db
+            .get_volume_by_id(&snap.volume_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("parent volume missing"))?;
+        let node = self
+            .pick_healthy_ceph_node()
+            .await
+            .map_err(|e| Status::failed_precondition(e))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        if let Some(mut storage) = self.clients.get_storage(&node.address) {
+            storage
+                .delete_volume_snapshot(node_proto::DeleteVolumeSnapshotRequest {
+                    backend_handle: format!("{}/{}", vol.pool, vol.image),
+                    snapshot_name: snap.rbd_snap.clone(),
+                    unprotect: snap.protected,
+                })
+                .await
+                .map_err(|e| Status::internal(format!("rbd snap rm: {e}")))?;
+        }
+        self.db
+            .delete_volume_snapshot(&snap.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.log_replication_event(
+            &actor,
+            Some("volume_snapshot.delete"),
+            EVT_VOLUME_SNAPSHOT_DELETE,
+            &format!("volume_snapshot/{}", snap.name),
+            serde_json::json!({
+                "id": snap.id,
+                "name": snap.name,
+                "volumeId": snap.volume_id,
+            }),
+        );
+        Ok(Response::new(
+            controller_proto::DeleteVolumeSnapshotResponse {
+                success: true,
+                message: format!("deleted snapshot '{}'", snap.name),
+            },
+        ))
+    }
+
+    async fn restore_volume(
+        &self,
+        request: Request<controller_proto::RestoreVolumeRequest>,
+    ) -> Result<Response<controller_proto::RestoreVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let req = request.into_inner();
+        let mut vol = self
+            .resolve_volume_row(req.volume.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume)))?;
+        let snap = self
+            .db
+            .get_volume_snapshot_by_name(req.snapshot.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or(self
+                .db
+                .get_volume_snapshot_by_id(req.snapshot.trim())
+                .map_err(|e| Status::internal(e.to_string()))?)
+            .ok_or_else(|| Status::not_found(format!("snapshot '{}' not found", req.snapshot)))?;
+        if snap.volume_id != vol.id {
+            return Err(Status::invalid_argument(
+                "snapshot does not belong to this volume",
+            ));
+        }
+        if !vol.vm_id.is_empty() {
+            let vm = self
+                .db
+                .get_vm(&vol.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("attached VM missing"))?;
+            self.require_vm_stopped_for_volume_change(&vm).await?;
+            let node = self
+                .db
+                .get_node(&vm.node_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+            // Unmap via cold release so rbd rollback has no watchers.
+            self.cold_release_ceph_vm(&vm, &node).await?;
+        } else if vol.attach_state != VolumeRow::ATTACH_DETACHED {
+            return Err(Status::failed_precondition(
+                "volume must be detached (or its VM stopped) before in-place restore",
+            ));
+        }
+        let node = self
+            .pick_healthy_ceph_node()
+            .await
+            .map_err(|e| Status::failed_precondition(e))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+        storage
+            .rollback_volume(node_proto::RollbackVolumeRequest {
+                backend_handle: format!("{}/{}", vol.pool, vol.image),
+                snapshot_name: snap.rbd_snap.clone(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("rbd snap rollback: {e}")))?;
+        vol.generation += 1;
+        self.db
+            .upsert_volume(&vol)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(controller_proto::RestoreVolumeResponse {
+            success: true,
+            message: format!(
+                "restored volume '{}' from snapshot '{}'",
+                vol.name, snap.name
+            ),
+        }))
+    }
+
+    async fn flatten_volume(
+        &self,
+        request: Request<controller_proto::FlattenVolumeRequest>,
+    ) -> Result<Response<controller_proto::FlattenVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let name = request.into_inner().name;
+        let mut vol = self
+            .resolve_volume_row(name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{name}' not found")))?;
+        if vol.parent_snapshot_id.is_empty() {
+            return Err(Status::failed_precondition(
+                "volume is not a clone (no parent_snapshot_id)",
+            ));
+        }
+        if !vol.vm_id.is_empty() {
+            let vm = self
+                .db
+                .get_vm(&vol.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("attached VM missing"))?;
+            self.require_vm_stopped_for_volume_change(&vm).await?;
+        }
+        let node = self
+            .pick_healthy_ceph_node()
+            .await
+            .map_err(|e| Status::failed_precondition(e))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+        storage
+            .flatten_volume(node_proto::FlattenVolumeRequest {
+                backend_handle: format!("{}/{}", vol.pool, vol.image),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("rbd flatten: {e}")))?;
+        vol.parent_snapshot_id.clear();
+        vol.source_json = "{}".into();
+        vol.generation += 1;
+        self.db
+            .upsert_volume(&vol)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(controller_proto::FlattenVolumeResponse {
+            success: true,
+            message: format!("flattened volume '{}'", vol.name),
+        }))
+    }
+
+    async fn encrypt_volume(
+        &self,
+        request: Request<controller_proto::EncryptVolumeRequest>,
+    ) -> Result<Response<controller_proto::EncryptVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if !req.destroy_data {
+            return Err(Status::invalid_argument(
+                "in-place encryption formats LUKS on the RBD image and destroys all existing \
+                 plaintext data; offline migration is not supported — set destroy_data=true \
+                 to acknowledge",
+            ));
+        }
+        let mut vol = self
+            .resolve_volume_row(req.name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.name)))?;
+        if vol.encrypted {
+            return Err(Status::failed_precondition(format!(
+                "volume '{}' is already encrypted",
+                vol.name
+            )));
+        }
+        let mut push_node: Option<NodeRow> = None;
+        if !vol.vm_id.is_empty() {
+            let vm = self
+                .db
+                .get_vm(&vol.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("attached VM missing"))?;
+            self.require_vm_stopped_for_volume_change(&vm).await?;
+            let node = self
+                .db
+                .get_node(&vm.node_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+            self.cold_release_ceph_vm(&vm, &node).await?;
+            push_node = Some(node);
+        } else if vol.is_attached() {
+            return Err(Status::failed_precondition(
+                "volume must be detached (or its VM stopped) before in-place encryption",
+            ));
+        }
+        let node = self
+            .pick_healthy_ceph_node()
+            .await
+            .map_err(|e| Status::failed_precondition(e))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            self.clients
+                .connect(&node.address)
+                .await
+                .map_err(|e| Status::unavailable(format!("connecting to Ceph node: {e}")))?;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+        let master = crate::volume_crypto::MasterKeyStore::default()
+            .load_or_create()
+            .map_err(|e| Status::failed_precondition(format!("volume master key: {e}")))?;
+        let dek = crate::volume_crypto::generate_dek()
+            .map_err(|e| Status::internal(format!("generate dek: {e}")))?;
+        let mapper = crate::volume_crypto::mapper_name_for_serial(&vol.serial);
+        storage
+            .format_encrypted_volume(node_proto::FormatEncryptedVolumeRequest {
+                rbd_device: format!("{}/{}", vol.pool, vol.image),
+                dek: dek.clone(),
+                mapper_name: mapper.clone(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("format encrypted volume: {e}")))?;
+        let _ = storage
+            .lock_encrypted_volume(node_proto::LockEncryptedVolumeRequest {
+                mapper_name: mapper,
+            })
+            .await;
+        vol.encrypted = true;
+        vol.wrapped_dek = crate::volume_crypto::wrap_dek(&master, &dek)
+            .map_err(|e| Status::internal(format!("wrap dek: {e}")))?;
+        vol.guest_visible_bytes = -1;
+        vol.guest_checked_at.clear();
+        vol.generation += 1;
+        self.db
+            .upsert_volume(&vol)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(node) = push_node {
+            self.push_config_and_await_apply(&node).await?;
+        }
+        self.log_replication_event(
+            &actor,
+            Some("volume.encrypt"),
+            EVT_VOLUME_ENCRYPT,
+            &format!("volume/{}", vol.name),
+            serde_json::json!({
+                "id": vol.id,
+                "name": vol.name,
+                "destroyDataAcknowledged": true,
+            }),
+        );
+        let vm = if vol.vm_id.is_empty() {
+            None
+        } else {
+            self.db
+                .get_vm(&vol.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+        let message = format!(
+            "encrypted volume '{}' (LUKS formatted on RBD — prior plaintext data was destroyed)",
+            vol.name
+        );
+        Ok(Response::new(controller_proto::EncryptVolumeResponse {
+            success: true,
+            message,
+            volume: Some(self.volume_info_from_row(&vol, vm.as_ref())),
+        }))
+    }
+
+    async fn resize_volume(
+        &self,
+        request: Request<controller_proto::ResizeVolumeRequest>,
+    ) -> Result<Response<controller_proto::ResizeVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let req = request.into_inner();
+        let mut vol = self
+            .resolve_volume_row(req.name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.name)))?;
+        let shrinking = req.size_bytes < vol.size_bytes;
+        if req.size_bytes == vol.size_bytes {
+            return Err(Status::invalid_argument(
+                "size_bytes equals current provisioned size; no change",
+            ));
+        }
+        if shrinking {
+            if !req.allow_shrink {
+                return Err(Status::invalid_argument(
+                    "shrink refused; pass allow_shrink=true to shrink a detached volume via \
+                     rbd resize --allow-shrink (destroys the tail of the image)",
+                ));
+            }
+            if !vol.vm_id.is_empty() {
+                let vm = self
+                    .db
+                    .get_vm(&vol.vm_id)
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::failed_precondition("attached VM missing"))?;
+                if self.vm_is_live(&vm).await? {
+                    return Err(Status::failed_precondition(format!(
+                        "refusing shrink while VM '{}' is running; stop the VM and detach the \
+                         volume first",
+                        vm.name
+                    )));
+                }
+                return Err(Status::failed_precondition(
+                    "shrink requires the volume to be detached (detach data volumes before \
+                     shrinking)",
+                ));
+            }
+            if vol.is_attached() {
+                return Err(Status::failed_precondition(
+                    "shrink requires the volume to be detached",
+                ));
+            }
+        } else if req.size_bytes <= vol.size_bytes {
+            return Err(Status::invalid_argument(
+                "size_bytes must be greater than the current provisioned size (or use \
+                 allow_shrink to shrink)",
+            ));
+        }
+        if !vol.vm_id.is_empty() {
+            if let Ok(Some(open)) = self.db.get_open_vm_operation(&vol.vm_id) {
+                return Err(Status::failed_precondition(format!(
+                    "refusing resize while VM has open operation {} ({})",
+                    open.id, open.phase
+                )));
+            }
+        }
+        let op_id = if vol.vm_id.is_empty() {
+            String::new()
+        } else {
+            let id = Uuid::new_v4().to_string();
+            self.db
+                .insert_vm_operation(&VmOperationRow {
+                    id: id.clone(),
+                    vm_id: vol.vm_id.clone(),
+                    kind: "resize".into(),
+                    phase: VmOperationRow::PHASE_PREPARING.into(),
+                    source_node: String::new(),
+                    target_node: String::new(),
+                    cancel_requested: false,
+                    send_succeeded: false,
+                    detail_json: format!(
+                        r#"{{"volume":"{}","size":{}}}"#,
+                        vol.name, req.size_bytes
+                    ),
+                    started_at: String::new(),
+                    updated_at: String::new(),
+                    finished_at: String::new(),
+                })
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            id
+        };
+        let node = self
+            .pick_healthy_ceph_node()
+            .await
+            .map_err(|e| Status::failed_precondition(e))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+        let resized = storage
+            .resize_volume(node_proto::ResizeVolumeRequest {
+                backend_handle: format!("{}/{}", vol.pool, vol.image),
+                size_bytes: req.size_bytes,
+                allow_shrink: shrinking,
+            })
+            .await
+            .map_err(|e| {
+                if !op_id.is_empty() {
+                    let _ = self.db.update_vm_operation_phase(
+                        &op_id,
+                        VmOperationRow::PHASE_FAILED,
+                        None,
+                        None,
+                        true,
+                    );
+                }
+                Status::internal(format!("rbd resize: {e}"))
+            })?
+            .into_inner();
+        vol.size_bytes = if resized.size_bytes > 0 {
+            resized.size_bytes
+        } else {
+            req.size_bytes
+        };
+        vol.guest_visible_bytes = -1;
+        vol.guest_checked_at.clear();
+        vol.generation += 1;
+        self.db
+            .upsert_volume(&vol)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !op_id.is_empty() {
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_DONE,
+                None,
+                None,
+                true,
+            );
+        }
+        let vm = if vol.vm_id.is_empty() {
+            None
+        } else {
+            self.db
+                .get_vm(&vol.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
+        let guest_status_note = if vol.role == VolumeRow::ROLE_ROOT {
+            "Cloud Hypervisor has no vm.resize-disk; the root disk cannot be hot-removed. \
+             guestVisibleBytes may remain unknown until the VM reboots (data volumes may \
+             hot-replug)."
+                .into()
+        } else {
+            String::new()
+        };
+        let mut message = if shrinking {
+            let mut m = format!(
+                "shrank '{}' to {} bytes via rbd resize --allow-shrink",
+                vol.name, vol.size_bytes
+            );
+            if vol.guest_visible_bytes >= 0 && req.size_bytes < vol.guest_visible_bytes {
+                m.push_str("; new size is below last observed guest visible size — tail destroyed");
+            }
+            m
+        } else {
+            format!(
+                "resized '{}' to {} bytes (guestVisibleBytes still unknown until next check)",
+                vol.name, vol.size_bytes
+            )
+        };
+        if !guest_status_note.is_empty() && !shrinking {
+            message.push_str(&format!("; {guest_status_note}"));
+        }
+        if let Some(ref vm_row) = vm {
+            if vm_row.auto_start {
+                if let Ok(Some(node)) = self.db.get_node(&vm_row.node_id) {
+                    if self.clients.get_admin(&node.address).is_none() {
+                        let _ = self.clients.connect(&node.address).await;
+                    }
+                    if let Some(mut admin) = self.clients.get_admin(&node.address) {
+                        let runtime_name = sanitize_nix_attr_key(&vm_row.name);
+                        let disk_serial = guest_virtio_serial(&vol, &runtime_name);
+                        let guest_result = if req.grow_filesystem {
+                            admin
+                                .guest_grow_filesystem(node_proto::GuestGrowFilesystemRequest {
+                                    vm_name: runtime_name.clone(),
+                                    network: vm_row.network.clone(),
+                                    disk_serial: disk_serial.clone(),
+                                    ssh_user: String::new(),
+                                    port: 22,
+                                    timeout_ms: 60_000,
+                                })
+                                .await
+                                .map(|r| {
+                                    let i = r.into_inner();
+                                    (i.success, i.message, i.size_bytes, i.device)
+                                })
+                        } else {
+                            admin
+                                .guest_disk_probe(node_proto::GuestDiskProbeRequest {
+                                    vm_name: runtime_name,
+                                    network: vm_row.network.clone(),
+                                    disk_serial,
+                                    ssh_user: String::new(),
+                                    port: 22,
+                                    timeout_ms: 30_000,
+                                })
+                                .await
+                                .map(|r| {
+                                    let i = r.into_inner();
+                                    (i.success, i.message, i.size_bytes, i.device)
+                                })
+                        };
+                        match guest_result {
+                            Ok((success, gmsg, size_bytes, device)) => {
+                                if success && size_bytes > 0 {
+                                    vol.guest_visible_bytes = size_bytes;
+                                    vol.guest_checked_at = chrono_like_now();
+                                    let _ = self.db.upsert_volume(&vol);
+                                    message = format!(
+                                        "resized '{}' to {} bytes; guest sees {} bytes on {} ({})",
+                                        vol.name,
+                                        vol.size_bytes,
+                                        size_bytes,
+                                        device,
+                                        if req.grow_filesystem {
+                                            "grew"
+                                        } else {
+                                            "probed"
+                                        }
+                                    );
+                                } else {
+                                    message.push_str(&format!(
+                                        "; GuestOps: {}",
+                                        if gmsg.is_empty() {
+                                            "no size reported"
+                                        } else {
+                                            &gmsg
+                                        }
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                message.push_str(&format!("; GuestOps unavailable: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Response::new(controller_proto::ResizeVolumeResponse {
+            success: true,
+            message,
+            volume: Some(self.volume_info_from_row(&vol, vm.as_ref())),
+            operation_id: op_id,
+            guest_status_note,
+        }))
+    }
+
+    async fn create_snapshot_policy(
+        &self,
+        request: Request<controller_proto::CreateSnapshotPolicyRequest>,
+    ) -> Result<Response<controller_proto::CreateSnapshotPolicyResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let policy = request
+            .into_inner()
+            .policy
+            .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+        let name = policy.name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("policy name is required"));
+        }
+        if policy.keep <= 0 {
+            return Err(Status::invalid_argument("keep must be positive"));
+        }
+        if policy.selector_vm.trim().is_empty() && policy.selector_volume.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "selector_vm or selector_volume is required",
+            ));
+        }
+        let existing = self
+            .db
+            .get_snapshot_policy(name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        // Proto3 bool defaults to false; on first create treat unset as enabled.
+        let enabled = if existing.is_some() {
+            policy.enabled
+        } else {
+            true
+        };
+        let row = SnapshotPolicyRow {
+            name: name.into(),
+            selector_vm: policy.selector_vm.trim().into(),
+            selector_volume: policy.selector_volume.trim().into(),
+            schedule: if policy.schedule.trim().is_empty() {
+                "@daily".into()
+            } else {
+                policy.schedule.trim().into()
+            },
+            keep: policy.keep,
+            enabled,
+            last_run_at: existing
+                .as_ref()
+                .map(|e| e.last_run_at.clone())
+                .unwrap_or_default(),
+            last_message: existing
+                .as_ref()
+                .map(|e| e.last_message.clone())
+                .unwrap_or_default(),
+            created_at: existing
+                .as_ref()
+                .map(|e| e.created_at.clone())
+                .unwrap_or_default(),
+            updated_at: String::new(),
+        };
+        self.db
+            .upsert_snapshot_policy(&row)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(
+            controller_proto::CreateSnapshotPolicyResponse {
+                success: true,
+                policy: Some(Self::snapshot_policy_to_proto(&row)),
+                message: format!("snapshot policy '{name}' upserted"),
+            },
+        ))
+    }
+
+    async fn get_snapshot_policy(
+        &self,
+        request: Request<controller_proto::GetSnapshotPolicyRequest>,
+    ) -> Result<Response<controller_proto::GetSnapshotPolicyResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let name = request.into_inner().name;
+        let row = self
+            .db
+            .get_snapshot_policy(name.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("snapshot policy '{name}' not found")))?;
+        Ok(Response::new(controller_proto::GetSnapshotPolicyResponse {
+            policy: Some(Self::snapshot_policy_to_proto(&row)),
+        }))
+    }
+
+    async fn list_snapshot_policies(
+        &self,
+        request: Request<controller_proto::ListSnapshotPoliciesRequest>,
+    ) -> Result<Response<controller_proto::ListSnapshotPoliciesResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let _ = request.into_inner();
+        let policies = self
+            .db
+            .list_snapshot_policies()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .iter()
+            .map(Self::snapshot_policy_to_proto)
+            .collect();
+        Ok(Response::new(
+            controller_proto::ListSnapshotPoliciesResponse { policies },
+        ))
+    }
+
+    async fn delete_snapshot_policy(
+        &self,
+        request: Request<controller_proto::DeleteSnapshotPolicyRequest>,
+    ) -> Result<Response<controller_proto::DeleteSnapshotPolicyResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let name = request.into_inner().name;
+        if !self
+            .db
+            .delete_snapshot_policy(name.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::not_found(format!(
+                "snapshot policy '{name}' not found"
+            )));
+        }
+        Ok(Response::new(
+            controller_proto::DeleteSnapshotPolicyResponse {
+                success: true,
+                message: format!("deleted snapshot policy '{name}'"),
+            },
+        ))
     }
 
     async fn get_compliance_report(
@@ -7814,23 +11136,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
         Ok(Response::new(
             controller_proto::GetComplianceReportResponse {
                 controller_version: env!("CARGO_PKG_VERSION").to_string(),
-                crypto_library: "aws-lc-rs (AWS-LC, FIPS 140-3 #4816)".into(),
-                tls13_cipher_suites: vec![
-                    "TLS_AES_256_GCM_SHA384".into(),
-                    "TLS_AES_128_GCM_SHA256".into(),
-                ],
-                tls12_cipher_suites: vec![
-                    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384".into(),
-                    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256".into(),
-                    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".into(),
-                    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".into(),
-                ],
-                kx_groups: vec!["secp384r1 (P-384)".into(), "secp256r1 (P-256)".into()],
-                excluded_algorithms: vec![
-                    "ChaCha20-Poly1305".into(),
-                    "X25519".into(),
-                    "RSA key exchange".into(),
-                ],
+                crypto_library: crate::crypto_profile::CRYPTO_LIBRARY.into(),
+                tls13_cipher_suites: crate::crypto_profile::tls13_cipher_suites(),
+                tls12_cipher_suites: crate::crypto_profile::tls12_cipher_suites(),
+                kx_groups: crate::crypto_profile::kx_groups(),
+                excluded_algorithms: crate::crypto_profile::excluded_algorithms(),
                 mtls_enabled: self.tls_paths.is_some(),
                 access_control,
                 total_nodes,
@@ -7895,6 +11205,48 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .collect();
         Ok(Response::new(controller_proto::ListAuditEventsResponse {
             events,
+        }))
+    }
+
+    async fn get_crypto_config(
+        &self,
+        request: Request<controller_proto::GetCryptoConfigRequest>,
+    ) -> Result<Response<controller_proto::GetCryptoConfigResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        Ok(Response::new(controller_proto::GetCryptoConfigResponse {
+            controller_version: env!("CARGO_PKG_VERSION").to_string(),
+            crypto_library: crate::crypto_profile::CRYPTO_LIBRARY.into(),
+            fips_certificate: crate::crypto_profile::FIPS_CERTIFICATE.into(),
+            tls13_cipher_suites: crate::crypto_profile::tls13_cipher_suites(),
+            tls12_cipher_suites: crate::crypto_profile::tls12_cipher_suites(),
+            kx_groups: crate::crypto_profile::kx_groups(),
+            excluded_algorithms: crate::crypto_profile::excluded_algorithms(),
+            mtls_enabled: self.tls_paths.is_some(),
+            rate_limit_enabled: self.rate_limit.enabled,
+            rate_limit_requests_per_second: self.rate_limit.requests_per_second,
+            rate_limit_burst: self.rate_limit.burst,
+            revocation_fail_mode: self.revocation_fail_mode.clone(),
+            signing_scheme: crate::crypto_profile::SIGNING_SCHEME.into(),
+        }))
+    }
+
+    async fn export_sbom(
+        &self,
+        request: Request<controller_proto::ExportSbomRequest>,
+    ) -> Result<Response<controller_proto::ExportSbomResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let kind = request.into_inner().kind;
+        let doc = crate::sbom::load(&kind, &self.sbom)?;
+        Ok(Response::new(controller_proto::ExportSbomResponse {
+            format: doc.format,
+            spec_version: doc.spec_version,
+            filename: doc.filename,
+            sha256: doc.sha256,
+            document: doc.document,
+            source: doc.source,
+            generator: doc.generator,
+            signature_present: doc.signature_present,
+            signing_scheme: doc.signing_scheme,
         }))
     }
 
@@ -7996,6 +11348,29 @@ impl controller_proto::controller_server::Controller for ControllerService {
             ),
             None => (controller_proto::ApplyAction::Created as i32, 1, vec![]),
         };
+        if let Some(prev) = existing.as_ref() {
+            if prev.spec_json != spec_json {
+                if let Ok(old) = ceph_cluster_spec::spec_from_json(&prev.spec_json) {
+                    if old.encrypt_osds != spec.encrypt_osds {
+                        return Err(Status::failed_precondition(
+                            "encryptOsds is immutable after the CephCluster exists; rotate encryption by replacing OSD devices",
+                        ));
+                    }
+                    for node in &old.nodes {
+                        if !spec.nodes.iter().any(|n| n.node_id == node.node_id) {
+                            self.db
+                                .add_retired_ceph_node(&name, &node.node_id)
+                                .map_err(|e| Status::internal(e.to_string()))?;
+                        }
+                    }
+                    for node in &spec.nodes {
+                        self.db
+                            .clear_retired_ceph_node(&name, &node.node_id)
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                    }
+                }
+            }
+        }
         let row = if action == controller_proto::ApplyAction::Unchanged as i32 {
             existing.expect("unchanged requires existing")
         } else {
@@ -8090,8 +11465,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::DeleteCephClusterRequest>,
     ) -> Result<Response<controller_proto::DeleteCephClusterResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
-        let name = request.into_inner().name;
-        let name = name.trim();
+        let req = request.into_inner();
+        let force = req.force;
+        let name_owned = req.name.trim().to_string();
+        let name = name_owned.as_str();
         // Deleting the CephCluster record strands every RBD-backed VM that
         // lives on its members: the reconciler stops managing the cluster, and
         // `node_supports_backend` stops recognising those nodes as Ceph-capable
@@ -8104,11 +11481,505 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 in_use.join(", ")
             )));
         }
+        if let Some(row) = self
+            .db
+            .get_ceph_cluster(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            let mut members = Vec::new();
+            if let Ok(spec) = ceph_cluster_spec::spec_from_json(&row.spec_json) {
+                members.extend(spec.nodes.iter().map(|n| n.node_id.clone()));
+            }
+            if let Ok(retired) = self.db.list_retired_ceph_nodes(name) {
+                for node_id in retired {
+                    if !members.contains(&node_id) {
+                        members.push(node_id);
+                    }
+                }
+            }
+            let mut teardown_errors = Vec::new();
+            for node_id in &members {
+                let Some(node) = self
+                    .db
+                    .get_node(node_id)
+                    .map_err(|e| Status::internal(e.to_string()))?
+                else {
+                    teardown_errors.push(format!("{node_id} is not registered"));
+                    continue;
+                };
+                let mut admin = match self.ensure_admin_client_for_node(&node).await {
+                    Ok(admin) => admin,
+                    Err(e) => {
+                        teardown_errors.push(format!("{node_id}: {e}"));
+                        continue;
+                    }
+                };
+                match admin
+                    .teardown_ceph_node(node_proto::TeardownCephNodeRequest {})
+                    .await
+                {
+                    Ok(resp) => {
+                        let resp = resp.into_inner();
+                        if !resp.success {
+                            teardown_errors.push(format!("{node_id}: {}", resp.message));
+                            continue;
+                        }
+                        if !resp.apply_id.is_empty() {
+                            if let Err(e) = self
+                                .await_nix_apply(&node, &resp.apply_id, &mut admin)
+                                .await
+                            {
+                                teardown_errors.push(format!("{node_id}: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => teardown_errors.push(format!("{node_id}: {e}")),
+                }
+            }
+            if !teardown_errors.is_empty() && !force {
+                return Err(Status::failed_precondition(format!(
+                    "CephCluster '{name}' was not deleted; could not stop every member (pass force to delete the record anyway): {}",
+                    teardown_errors.join("; ")
+                )));
+            }
+        }
         let success = self
             .db
             .delete_ceph_cluster(name)
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(controller_proto::DeleteCephClusterResponse {
+            success,
+        }))
+    }
+
+    async fn create_shared_filesystem(
+        &self,
+        request: Request<controller_proto::CreateSharedFilesystemRequest>,
+    ) -> Result<Response<controller_proto::CreateSharedFilesystemResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let incoming = request
+            .into_inner()
+            .shared_filesystem
+            .ok_or_else(|| Status::invalid_argument("shared_filesystem is required"))?;
+        let name = validate_network_name(&incoming.name)?;
+        let spec = incoming
+            .spec
+            .ok_or_else(|| Status::invalid_argument("shared_filesystem.spec is required"))?;
+        shared_filesystem_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
+        if self
+            .db
+            .get_ceph_cluster(spec.ceph_cluster.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_none()
+        {
+            return Err(Status::failed_precondition(format!(
+                "cephCluster '{}' is not registered",
+                spec.ceph_cluster.trim()
+            )));
+        }
+        let spec_json = shared_filesystem_spec::spec_to_json(&spec)
+            .map_err(|e| Status::internal(format!("encode spec: {e}")))?;
+        let existing = self
+            .db
+            .get_shared_filesystem(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let (action, generation) = match existing.as_ref() {
+            Some(e) if e.spec_json == spec_json => (
+                controller_proto::ApplyAction::Unchanged as i32,
+                e.generation,
+            ),
+            Some(e) => (
+                controller_proto::ApplyAction::Updated as i32,
+                e.generation.saturating_add(1),
+            ),
+            None => (controller_proto::ApplyAction::Created as i32, 1),
+        };
+        let row = if action == controller_proto::ApplyAction::Unchanged as i32 {
+            existing.expect("unchanged requires existing")
+        } else {
+            let row = SharedFilesystemRow {
+                name: name.clone(),
+                generation,
+                spec_json,
+                created_at: existing
+                    .as_ref()
+                    .map(|e| e.created_at.clone())
+                    .unwrap_or_default(),
+                updated_at: String::new(),
+            };
+            self.db
+                .upsert_shared_filesystem(&row)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.db
+                .upsert_shared_filesystem_status(&SharedFilesystemStatusRow {
+                    name: name.clone(),
+                    observed_generation: 0,
+                    phase: "pending".into(),
+                    health_message: String::new(),
+                    last_transition_at: String::new(),
+                })
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.db
+                .get_shared_filesystem(&name)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .unwrap()
+        };
+        self.record_audit(
+            &actor,
+            "CreateSharedFilesystem",
+            &name,
+            format!("action={action}"),
+        );
+        let status = self
+            .db
+            .get_shared_filesystem_status(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(
+            controller_proto::CreateSharedFilesystemResponse {
+                success: true,
+                shared_filesystem: Some(shared_filesystem_to_proto(&row, status)?),
+                action,
+                changed_fields: vec![],
+            },
+        ))
+    }
+
+    async fn get_shared_filesystem(
+        &self,
+        request: Request<controller_proto::GetSharedFilesystemRequest>,
+    ) -> Result<Response<controller_proto::GetSharedFilesystemResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let name = request.into_inner().name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_shared_filesystem(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("SharedFilesystem '{name}' not found")))?;
+        let status = self
+            .db
+            .get_shared_filesystem_status(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(
+            controller_proto::GetSharedFilesystemResponse {
+                shared_filesystem: Some(shared_filesystem_to_proto(&row, status)?),
+            },
+        ))
+    }
+
+    async fn list_shared_filesystems(
+        &self,
+        request: Request<controller_proto::ListSharedFilesystemsRequest>,
+    ) -> Result<Response<controller_proto::ListSharedFilesystemsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let mut out = Vec::new();
+        for row in self
+            .db
+            .list_shared_filesystems()
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            let status = self
+                .db
+                .get_shared_filesystem_status(&row.name)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            out.push(shared_filesystem_to_proto(&row, status)?);
+        }
+        Ok(Response::new(
+            controller_proto::ListSharedFilesystemsResponse {
+                shared_filesystems: out,
+            },
+        ))
+    }
+
+    async fn delete_shared_filesystem(
+        &self,
+        request: Request<controller_proto::DeleteSharedFilesystemRequest>,
+    ) -> Result<Response<controller_proto::DeleteSharedFilesystemResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let name = validate_network_name(&request.into_inner().name)?;
+        let success = self
+            .db
+            .delete_shared_filesystem(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if success {
+            self.record_audit(&actor, "DeleteSharedFilesystem", &name, "");
+        }
+        Ok(Response::new(
+            controller_proto::DeleteSharedFilesystemResponse { success },
+        ))
+    }
+
+    async fn create_object_store(
+        &self,
+        request: Request<controller_proto::CreateObjectStoreRequest>,
+    ) -> Result<Response<controller_proto::CreateObjectStoreResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let incoming = request
+            .into_inner()
+            .object_store
+            .ok_or_else(|| Status::invalid_argument("object_store is required"))?;
+        let name = validate_network_name(&incoming.name)?;
+        let spec = incoming
+            .spec
+            .ok_or_else(|| Status::invalid_argument("object_store.spec is required"))?;
+        object_store_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
+        if self
+            .db
+            .get_ceph_cluster(spec.ceph_cluster.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_none()
+        {
+            return Err(Status::failed_precondition(format!(
+                "cephCluster '{}' is not registered",
+                spec.ceph_cluster.trim()
+            )));
+        }
+        for member in &spec.members {
+            if self
+                .db
+                .get_node(member.trim())
+                .map_err(|e| Status::internal(e.to_string()))?
+                .is_none()
+            {
+                return Err(Status::not_found(format!(
+                    "member node '{}' is not registered",
+                    member.trim()
+                )));
+            }
+        }
+        let spec_json = object_store_spec::spec_to_json(&spec)
+            .map_err(|e| Status::internal(format!("encode spec: {e}")))?;
+        let existing = self
+            .db
+            .get_object_store(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let (action, generation) = match existing.as_ref() {
+            Some(e) if e.spec_json == spec_json => (
+                controller_proto::ApplyAction::Unchanged as i32,
+                e.generation,
+            ),
+            Some(e) => (
+                controller_proto::ApplyAction::Updated as i32,
+                e.generation.saturating_add(1),
+            ),
+            None => (controller_proto::ApplyAction::Created as i32, 1),
+        };
+        let row = if action == controller_proto::ApplyAction::Unchanged as i32 {
+            existing.expect("unchanged requires existing")
+        } else {
+            let row = ObjectStoreRow {
+                name: name.clone(),
+                generation,
+                spec_json,
+                created_at: existing
+                    .as_ref()
+                    .map(|e| e.created_at.clone())
+                    .unwrap_or_default(),
+                updated_at: String::new(),
+            };
+            self.db
+                .upsert_object_store(&row)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.db
+                .upsert_object_store_status(&ObjectStoreStatusRow {
+                    name: name.clone(),
+                    observed_generation: 0,
+                    phase: "pending".into(),
+                    health_message: String::new(),
+                    last_transition_at: String::new(),
+                })
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.db
+                .get_object_store(&name)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .unwrap()
+        };
+        self.record_audit(
+            &actor,
+            "CreateObjectStore",
+            &name,
+            format!("action={action}"),
+        );
+        let status = self
+            .db
+            .get_object_store_status(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(controller_proto::CreateObjectStoreResponse {
+            success: true,
+            object_store: Some(object_store_to_proto(&row, status)?),
+            action,
+            changed_fields: vec![],
+        }))
+    }
+
+    async fn get_object_store(
+        &self,
+        request: Request<controller_proto::GetObjectStoreRequest>,
+    ) -> Result<Response<controller_proto::GetObjectStoreResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let name = request.into_inner().name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_object_store(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("ObjectStore '{name}' not found")))?;
+        let status = self
+            .db
+            .get_object_store_status(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(controller_proto::GetObjectStoreResponse {
+            object_store: Some(object_store_to_proto(&row, status)?),
+        }))
+    }
+
+    async fn list_object_stores(
+        &self,
+        request: Request<controller_proto::ListObjectStoresRequest>,
+    ) -> Result<Response<controller_proto::ListObjectStoresResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let mut out = Vec::new();
+        for row in self
+            .db
+            .list_object_stores()
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            let status = self
+                .db
+                .get_object_store_status(&row.name)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            out.push(object_store_to_proto(&row, status)?);
+        }
+        Ok(Response::new(controller_proto::ListObjectStoresResponse {
+            object_stores: out,
+        }))
+    }
+
+    async fn delete_object_store(
+        &self,
+        request: Request<controller_proto::DeleteObjectStoreRequest>,
+    ) -> Result<Response<controller_proto::DeleteObjectStoreResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let name = validate_network_name(&request.into_inner().name)?;
+        let users = self
+            .db
+            .list_object_users_for_store(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !users.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "ObjectStore '{name}' still has {} user(s); delete them first",
+                users.len()
+            )));
+        }
+        let success = self
+            .db
+            .delete_object_store(&name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if success {
+            self.record_audit(&actor, "DeleteObjectStore", &name, "");
+        }
+        Ok(Response::new(controller_proto::DeleteObjectStoreResponse {
+            success,
+        }))
+    }
+
+    async fn create_object_user(
+        &self,
+        request: Request<controller_proto::CreateObjectUserRequest>,
+    ) -> Result<Response<controller_proto::CreateObjectUserResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let incoming = request
+            .into_inner()
+            .object_user
+            .ok_or_else(|| Status::invalid_argument("object_user is required"))?;
+        let name = validate_network_name(&incoming.name)?;
+        let spec = incoming
+            .spec
+            .ok_or_else(|| Status::invalid_argument("object_user.spec is required"))?;
+        let store = spec.store.trim();
+        if store.is_empty() {
+            return Err(Status::invalid_argument(
+                "object_user.spec.store is required",
+            ));
+        }
+        if self
+            .db
+            .get_object_store(store)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_none()
+        {
+            return Err(Status::not_found(format!(
+                "ObjectStore '{store}' not found"
+            )));
+        }
+        if self
+            .db
+            .get_object_user(&name, store)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_some()
+        {
+            return Err(Status::already_exists(format!(
+                "ObjectUser '{name}' already exists on store '{store}'"
+            )));
+        }
+        let (access_key, secret) = new_object_user_credentials();
+        let row = ObjectUserRow {
+            name: name.clone(),
+            store_name: store.to_string(),
+            access_key,
+            secret: secret.clone(),
+            created_at: String::new(),
+        };
+        self.db
+            .insert_object_user(&row)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.record_audit(
+            &actor,
+            "CreateObjectUser",
+            &format!("{store}/{name}"),
+            "secret issued once",
+        );
+        let stored = self
+            .db
+            .get_object_user(&name, store)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .unwrap();
+        Ok(Response::new(controller_proto::CreateObjectUserResponse {
+            success: true,
+            object_user: Some(object_user_to_proto(&stored)),
+            secret,
+        }))
+    }
+
+    async fn delete_object_user(
+        &self,
+        request: Request<controller_proto::DeleteObjectUserRequest>,
+    ) -> Result<Response<controller_proto::DeleteObjectUserResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = validate_network_name(&req.name)?;
+        let store = req.store.trim();
+        if store.is_empty() {
+            return Err(Status::invalid_argument("store is required"));
+        }
+        let success = self
+            .db
+            .delete_object_user(&name, store)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if success {
+            self.record_audit(&actor, "DeleteObjectUser", &format!("{store}/{name}"), "");
+        }
+        Ok(Response::new(controller_proto::DeleteObjectUserResponse {
             success,
         }))
     }
@@ -9240,6 +13111,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let err =
@@ -9295,6 +13168,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let err =
@@ -9354,6 +13229,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let err =
@@ -9408,6 +13285,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let err =
@@ -9469,6 +13348,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Zfs as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let resp =
@@ -9524,6 +13405,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let err =
@@ -9585,6 +13468,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let resp =
@@ -9639,6 +13524,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let err =
@@ -9981,6 +13868,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
         let err =
             <ControllerService as controller_proto::controller_server::Controller>::create_vm(
@@ -10009,6 +13898,32 @@ mod tests {
     /// Builds two Ceph-capable nodes plus one Ceph-backed VM with a volume row
     /// on `node-a`. The CephCluster has no status row, so callers decide
     /// whether it counts as healthy.
+
+    fn test_root_volume(id: &str, vm_id: &str, vm_name: &str, size_bytes: i64) -> VolumeRow {
+        VolumeRow {
+            id: id.into(),
+            name: format!("{vm_name}-root"),
+            vm_id: vm_id.into(),
+            role: VolumeRow::ROLE_ROOT.into(),
+            slot: 0,
+            pool: "kcore-vms".into(),
+            image: format!("kcore-{vm_id}"),
+            size_bytes,
+            storage_class: "ceph".into(),
+            attach_state: VolumeRow::ATTACH_ATTACHED.into(),
+            serial: VolumeRow::serial_from_id(id),
+            source_json: "{}".into(),
+            guest_format_json: String::new(),
+            generation: 1,
+            parent_snapshot_id: String::new(),
+            guest_visible_bytes: -1,
+            guest_checked_at: String::new(),
+            encrypted: false,
+            wrapped_dek: String::new(),
+            created_at: String::new(),
+        }
+    }
+
     fn ceph_two_node_fixture() -> (Database, VmRow) {
         let db = Database::open(":memory:").expect("open db");
         let mut node_a = test_node();
@@ -10036,14 +13951,12 @@ mod tests {
         vm.name = "ceph-1".into();
         vm.storage_backend = "ceph".into();
         db.insert_vm(&vm).unwrap();
-        db.upsert_volume(&VolumeRow {
-            id: "vol-ceph-1".into(),
-            vm_id: vm.id.clone(),
-            pool: "kcore-vms".into(),
-            image: format!("kcore-{}", vm.id),
-            size_bytes: 8 * 1024 * 1024 * 1024,
-            created_at: String::new(),
-        })
+        db.upsert_volume(&test_root_volume(
+            "vol-ceph-1",
+            &vm.id,
+            &vm.name,
+            8 * 1024 * 1024 * 1024,
+        ))
         .unwrap();
         (db, vm)
     }
@@ -10664,13 +14577,32 @@ mod tests {
         assert_eq!(nix_apply_progress(9999), NixApplyProgress::Pending);
     }
 
+    #[test]
+    fn live_migrate_cpu_check_requires_flags_the_source_guest_can_see() {
+        let source = ["sse4_2", "avx", "vmx"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let dest = ["sse4_2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let missing = ControllerService::cpu_flags_missing_on_dest(&source, &dest);
+        assert!(missing.contains(&"avx".to_string()));
+        assert!(!missing.iter().any(|flag| flag == "vmx"));
+        assert!(ControllerService::cpu_flags_missing_on_dest(&source, &source).is_empty());
+    }
+
     #[tokio::test]
     async fn delete_ceph_cluster_refuses_while_ceph_vms_still_use_it() {
         let (db, vm) = ceph_two_node_fixture();
         let svc = svc_for(&db);
         let err = <ControllerService as controller_proto::controller_server::Controller>::delete_ceph_cluster(
             &svc,
-            Request::new(controller_proto::DeleteCephClusterRequest { name: "lab".into() }),
+            Request::new(controller_proto::DeleteCephClusterRequest {
+                name: "lab".into(),
+                force: false,
+            }),
         )
         .await
         .expect_err("deleting a cluster under a live VM must be refused");
@@ -10690,7 +14622,10 @@ mod tests {
         let svc = svc_for(&db);
         let resp = <ControllerService as controller_proto::controller_server::Controller>::delete_ceph_cluster(
             &svc,
-            Request::new(controller_proto::DeleteCephClusterRequest { name: "lab".into() }),
+            Request::new(controller_proto::DeleteCephClusterRequest {
+                name: "lab".into(),
+                force: true,
+            }),
         )
         .await
         .expect("delete should succeed with no Ceph VMs")
@@ -10712,7 +14647,10 @@ mod tests {
         let svc = svc_for(&db);
         let resp = <ControllerService as controller_proto::controller_server::Controller>::delete_ceph_cluster(
             &svc,
-            Request::new(controller_proto::DeleteCephClusterRequest { name: "lab".into() }),
+            Request::new(controller_proto::DeleteCephClusterRequest {
+                name: "lab".into(),
+                force: true,
+            }),
         )
         .await
         .expect("an LVM VM must not block cluster deletion")
@@ -10750,14 +14688,12 @@ mod tests {
         vm.name = "mig-1".into();
         vm.storage_backend = "ceph".into();
         db.insert_vm(&vm).unwrap();
-        db.upsert_volume(&VolumeRow {
-            id: "vol-1".into(),
-            vm_id: vm.id.clone(),
-            pool: "kcore-vms".into(),
-            image: format!("kcore-{}", vm.id),
-            size_bytes: 8 * 1024 * 1024 * 1024,
-            created_at: String::new(),
-        })
+        db.upsert_volume(&test_root_volume(
+            "vol-1",
+            &vm.id,
+            &vm.name,
+            8 * 1024 * 1024 * 1024,
+        ))
         .unwrap();
 
         let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
@@ -10799,15 +14735,8 @@ mod tests {
         vm.name = "del-by-name".into();
         vm.storage_backend = "ceph".into();
         db.insert_vm(&vm).unwrap();
-        db.upsert_volume(&VolumeRow {
-            id: "vol-del".into(),
-            vm_id: vm.id.clone(),
-            pool: "kcore-vms".into(),
-            image: format!("kcore-{}", vm.id),
-            size_bytes: 1024,
-            created_at: String::new(),
-        })
-        .unwrap();
+        db.upsert_volume(&test_root_volume("vol-del", &vm.id, &vm.name, 1024))
+            .unwrap();
         let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
         let svc = ControllerService::new_with_test_push_hook(
             db.clone(),
@@ -10823,6 +14752,7 @@ mod tests {
                 Request::new(controller_proto::DeleteVmRequest {
                     vm_id: "del-by-name".into(),
                     target_node: String::new(),
+                    delete_data_volumes: false,
                 }),
             )
             .await
@@ -10845,15 +14775,8 @@ mod tests {
         vm.id = "vm-rb".into();
         vm.storage_backend = "ceph".into();
         db.insert_vm(&vm).unwrap();
-        db.upsert_volume(&VolumeRow {
-            id: "vol-rb".into(),
-            vm_id: vm.id.clone(),
-            pool: "kcore-vms".into(),
-            image: format!("kcore-{}", vm.id),
-            size_bytes: 1024,
-            created_at: String::new(),
-        })
-        .unwrap();
+        db.upsert_volume(&test_root_volume("vol-rb", &vm.id, &vm.name, 1024))
+            .unwrap();
         let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
         let svc = ControllerService::new_with_test_push_hook(
             db.clone(),
@@ -10902,6 +14825,7 @@ mod tests {
                     vlan_id: 0,
                     network_type: "vxlan".to_string(),
                     enable_outbound_nat: true,
+                    ..Default::default()
                 }),
             )
             .await
@@ -10918,6 +14842,68 @@ mod tests {
         assert!(net.vni >= 10000 && net.vni <= 15999, "vni={}", net.vni);
         assert!(net.enable_outbound_nat);
         assert_eq!(net.next_ip, 2);
+    }
+
+    #[tokio::test]
+    async fn create_network_stores_ipv6_and_east_west() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        let hook: PushHook = Arc::new(|_n: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::create_network(
+                &svc,
+                Request::new(controller_proto::CreateNetworkRequest {
+                    name: "overlay-6".into(),
+                    external_ip: "203.0.113.10".into(),
+                    gateway_ip: "10.250.0.1".into(),
+                    internal_netmask: "255.255.255.0".into(),
+                    target_node: node.id.clone(),
+                    network_type: "vxlan".into(),
+                    ipv6_prefix: "fd00:10:240::/64".into(),
+                    ipv6_gateway: "fd00:10:240::1".into(),
+                    east_west_firewall: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create")
+            .into_inner();
+        assert!(resp.success);
+        let policy = db
+            .get_network_policy(&node.id, "overlay-6")
+            .expect("policy");
+        assert!(policy.east_west);
+        assert_eq!(policy.ipv6_prefix, "fd00:10:240::/64");
+        assert_eq!(policy.ipv6_gateway, "fd00:10:240::1");
+
+        let err =
+            <ControllerService as controller_proto::controller_server::Controller>::create_network(
+                &svc,
+                Request::new(controller_proto::CreateNetworkRequest {
+                    name: "overlay-6".into(),
+                    external_ip: "203.0.113.10".into(),
+                    gateway_ip: "10.250.0.1".into(),
+                    internal_netmask: "255.255.255.0".into(),
+                    target_node: node.id.clone(),
+                    network_type: "vxlan".into(),
+                    ipv6_prefix: "fd00:10:240::/64".into(),
+                    ipv6_gateway: "fd00:10:240::2".into(),
+                    east_west_firewall: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("bad gateway");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -10950,6 +14936,7 @@ mod tests {
                     vlan_id: 0,
                     network_type: "wireguard".to_string(),
                     enable_outbound_nat: false,
+                    ..Default::default()
                 }),
             )
             .await
@@ -10987,6 +14974,7 @@ mod tests {
                 vlan_id: 0,
                 network_type: "vxlan".to_string(),
                 enable_outbound_nat: true,
+                ..Default::default()
             }),
         )
         .await
@@ -11025,6 +15013,8 @@ mod tests {
                     image_path: String::new(),
                     image_format: String::new(),
                     target_dc: String::new(),
+                    node_labels: Vec::new(),
+                    anti_affinity: String::new(),
                 }),
             )
             .await
@@ -11067,6 +15057,7 @@ mod tests {
                     vlan_id: 0,
                     network_type: "vxlan".to_string(),
                     enable_outbound_nat: false,
+                    ..Default::default()
                 }),
             )
             .await
@@ -11107,6 +15098,7 @@ mod tests {
                     vlan_id: 0,
                     network_type: "nat".to_string(),
                     enable_outbound_nat: false,
+                    ..Default::default()
                 }),
             )
             .await
@@ -11409,6 +15401,276 @@ mod tests {
         let n = db.get_node("node-1").expect("get").expect("exists");
         assert_eq!(n.approval_status, "rejected");
         assert_eq!(n.status, "rejected");
+    }
+
+    #[tokio::test]
+    async fn cluster_health_reports_a_ready_node() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).expect("insert");
+        let svc = svc_for(&db);
+        let resp = <ControllerService as controller_proto::controller_server::Controller>::get_cluster_health(
+            &svc,
+            Request::new(controller_proto::GetClusterHealthRequest {}),
+        )
+        .await
+        .expect("health")
+        .into_inner();
+        assert_eq!(resp.status, "healthy");
+        assert_eq!(resp.ready_nodes, 1);
+    }
+
+    #[tokio::test]
+    async fn backup_and_restore_round_trip_through_the_rpc() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).expect("insert");
+        let svc = svc_for(&db);
+        let snap =
+            <ControllerService as controller_proto::controller_server::Controller>::backup_cluster(
+                &svc,
+                Request::new(controller_proto::BackupClusterRequest {}),
+            )
+            .await
+            .expect("backup")
+            .into_inner();
+        assert!(snap.schema_version >= 1);
+
+        let refused = <ControllerService as controller_proto::controller_server::Controller>::restore_cluster(
+            &svc,
+            Request::new(controller_proto::RestoreClusterRequest {
+                sqlite: snap.sqlite.clone(),
+                confirm: false,
+            }),
+        )
+        .await
+        .expect_err("confirm required");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+
+        db.delete_node("node-1").expect("delete");
+        assert!(db.get_node("node-1").expect("get").is_none());
+        let restored = <ControllerService as controller_proto::controller_server::Controller>::restore_cluster(
+            &svc,
+            Request::new(controller_proto::RestoreClusterRequest {
+                sqlite: snap.sqlite,
+                confirm: true,
+            }),
+        )
+        .await
+        .expect("restore")
+        .into_inner();
+        assert!(restored.success);
+        assert!(db.get_node("node-1").expect("get").is_some());
+    }
+
+    #[tokio::test]
+    async fn failover_moves_ceph_vms_and_leaves_local_disks() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-a", "not-ready").expect("mark");
+        let mut local = test_vm("node-a");
+        local.id = "vm-local".into();
+        local.name = "local-disk".into();
+        local.storage_backend = "filesystem".into();
+        db.insert_vm(&local).expect("local vm");
+        let svc = svc_for(&db);
+
+        let outcome = svc
+            .failover_unreachable_node("node-a")
+            .await
+            .expect("failover");
+        assert_eq!(outcome.migrated, 1);
+        assert!(outcome.errors.iter().any(|e| e.contains("local-disk")));
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("ceph").node_id,
+            "node-b"
+        );
+        assert_eq!(
+            db.get_vm("vm-local").expect("get").expect("local").node_id,
+            "node-a"
+        );
+        assert!(db.node_needs_config_push("node-a").expect("flag"));
+        assert_eq!(
+            db.get_node("node-a").expect("get").expect("source").status,
+            "not-ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn cordon_blocks_scheduling_and_heartbeat_keeps_it() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert");
+        db.insert_vm(&test_vm(&node.id)).expect("insert vm");
+        let svc = svc_for(&db);
+
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::cordon_node(
+                &svc,
+                Request::new(controller_proto::CordonNodeRequest {
+                    node_id: node.id.clone(),
+                }),
+            )
+            .await
+            .expect("cordon")
+            .into_inner();
+        assert!(resp.success);
+
+        let n = db.get_node(&node.id).expect("get").expect("exists");
+        assert_eq!(n.status, "cordoned");
+        assert!(scheduler::select_node(&[n.clone()]).is_none());
+        let vm = db.get_vm("vm-1").expect("get vm").expect("vm stays");
+        assert_eq!(vm.node_id, node.id);
+
+        db.update_heartbeat(&node.id, 1, 2, 30, "tpm2")
+            .expect("heartbeat");
+        let n = db.get_node(&node.id).expect("get").expect("exists");
+        assert_eq!(n.status, "cordoned");
+
+        let again =
+            <ControllerService as controller_proto::controller_server::Controller>::cordon_node(
+                &svc,
+                Request::new(controller_proto::CordonNodeRequest {
+                    node_id: node.id.clone(),
+                }),
+            )
+            .await
+            .expect("cordon again")
+            .into_inner();
+        assert!(again.message.contains("already unschedulable"));
+
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::uncordon_node(
+                &svc,
+                Request::new(controller_proto::UncordonNodeRequest {
+                    node_id: node.id.clone(),
+                }),
+            )
+            .await
+            .expect("uncordon")
+            .into_inner();
+        assert!(resp.success);
+        let n = db.get_node(&node.id).expect("get").expect("exists");
+        assert_eq!(n.status, "ready");
+        assert!(scheduler::select_node(&[n]).is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_node_revokes_certificates_and_refuses_while_busy() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert");
+        db.record_issued_certificate(&IssuedCertRow {
+            serial_hex: "0A0B".to_string(),
+            subject_cn: "kcore-node-node-1".to_string(),
+            identity_kind: "node".to_string(),
+            node_id: node.id.clone(),
+            issuer_cn: "kcore-sub-ca".to_string(),
+            fingerprint_sha256: "aa".to_string(),
+            not_before: "2026-01-01T00:00:00Z".to_string(),
+            not_after: "2027-01-01T00:00:00Z".to_string(),
+            issued_at: "2026-01-01T00:00:00Z".to_string(),
+            status: CERT_STATUS_ACTIVE.to_string(),
+            revocation_reason: -1,
+            revoked_at: String::new(),
+        })
+        .expect("record cert");
+        db.upsert_node_labels(&node.id, &["dc=DC1".to_string()])
+            .expect("labels");
+        db.insert_vm(&test_vm(&node.id)).expect("insert vm");
+        let svc = svc_for(&db);
+
+        let busy =
+            <ControllerService as controller_proto::controller_server::Controller>::delete_node(
+                &svc,
+                Request::new(controller_proto::DeleteNodeRequest {
+                    node_id: node.id.clone(),
+                }),
+            )
+            .await
+            .expect_err("busy node");
+        assert_eq!(busy.code(), tonic::Code::FailedPrecondition);
+        assert!(db.get_node(&node.id).expect("get").is_some());
+        let cert = db
+            .get_issued_certificate("0A0B")
+            .expect("cert")
+            .expect("still active");
+        assert_eq!(cert.status, CERT_STATUS_ACTIVE);
+
+        db.delete_vm_by_id_or_name("vm-1").expect("delete vm");
+        db.insert_network(&NetworkRow {
+            name: "frontend".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            gateway_ip: "10.240.10.1".to_string(),
+            internal_netmask: "255.255.255.0".to_string(),
+            node_id: node.id.clone(),
+            allowed_tcp_ports: String::new(),
+            allowed_udp_ports: String::new(),
+            vlan_id: 0,
+            network_type: "nat".to_string(),
+            enable_outbound_nat: true,
+            vni: 0,
+            next_ip: 2,
+        })
+        .expect("insert network");
+        let networked =
+            <ControllerService as controller_proto::controller_server::Controller>::delete_node(
+                &svc,
+                Request::new(controller_proto::DeleteNodeRequest {
+                    node_id: node.id.clone(),
+                }),
+            )
+            .await
+            .expect_err("network remains");
+        assert_eq!(networked.code(), tonic::Code::FailedPrecondition);
+        db.delete_network(&node.id, "frontend")
+            .expect("delete network");
+
+        db.upsert_workload(&WorkloadRow {
+            id: "wl-1".to_string(),
+            name: "workload-1".to_string(),
+            kind: "container".to_string(),
+            node_id: node.id.clone(),
+            runtime_state: "running".to_string(),
+            desired_state: "running".to_string(),
+            vm_id: String::new(),
+            container_image: "nginx:alpine".to_string(),
+            network: "default".to_string(),
+            storage_backend: "filesystem".to_string(),
+            storage_size_bytes: 1024,
+            created_at: String::new(),
+        })
+        .expect("insert workload");
+        let loaded =
+            <ControllerService as controller_proto::controller_server::Controller>::delete_node(
+                &svc,
+                Request::new(controller_proto::DeleteNodeRequest {
+                    node_id: node.id.clone(),
+                }),
+            )
+            .await
+            .expect_err("workload remains");
+        assert_eq!(loaded.code(), tonic::Code::FailedPrecondition);
+        db.delete_workload_by_id_or_name("wl-1")
+            .expect("delete workload");
+
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::delete_node(
+                &svc,
+                Request::new(controller_proto::DeleteNodeRequest {
+                    node_id: node.id.clone(),
+                }),
+            )
+            .await
+            .expect("delete")
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.certificates_revoked, 1);
+        assert!(db.get_node(&node.id).expect("get").is_none());
+        let cert = db
+            .get_issued_certificate("0A0B")
+            .expect("cert")
+            .expect("revoked row remains");
+        assert_eq!(cert.status, CERT_STATUS_REVOKED);
+        assert_eq!(cert.revocation_reason, 5);
     }
 
     #[test]
@@ -11734,6 +15996,8 @@ mod tests {
             storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
             storage_size_bytes: 8 * 1024 * 1024 * 1024,
             target_dc: String::new(),
+            node_labels: Vec::new(),
+            anti_affinity: String::new(),
         };
 
         let first =
@@ -12108,6 +16372,7 @@ mod tests {
             size: 3,
             min_size: 2,
             force_wipe: false,
+            encrypt_osds: true,
             nodes: node_ids
                 .iter()
                 .enumerate()
@@ -12118,6 +16383,7 @@ mod tests {
                     public_iface: "eth1".into(),
                     cluster_iface: "eth2".into(),
                     osd_device: "/dev/nvme0n1".into(),
+                    osd_devices: vec![],
                 })
                 .collect(),
         }
@@ -12344,6 +16610,7 @@ mod tests {
             &svc,
             Request::new(controller_proto::DeleteCephClusterRequest {
                 name: "lab".into(),
+                force: true,
             }),
         )
         .await
@@ -12355,6 +16622,7 @@ mod tests {
             &svc,
             Request::new(controller_proto::DeleteCephClusterRequest {
                 name: "lab".into(),
+                force: false,
             }),
         )
         .await

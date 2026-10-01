@@ -208,6 +208,75 @@ Per-VM options under `ch-vm.vms.virtualMachines.<name>`:
 | `network` | string | `"default"` | Network name (must match a key in `networks`) |
 | `macAddress` | null or string | `null` | Manual MAC; auto-generated from VM name if null |
 | `cloudInitNetworkConfigFile` | null or path | `null` | Custom cloud-init network config (overrides default) |
+| `extraNics` | list | `[]` | Additional virtio NICs. Only NIC 0 installs the guest default route |
+
+## Multi-homed VMs
+
+A VM can join more than one named network. NIC 0 is `network` and owns the
+default route. Each `extraNics` entry is another interface on a different
+network:
+
+```nix
+virtualMachines.web = {
+  network = "frontend";
+  extraNics = [
+    { network = "backend"; ipv4 = "10.241.0.10"; }
+  ];
+};
+```
+
+`kctl create vm web --network frontend --extra-network backend` sends the same
+shape. The controller stores NIC 0 on `vms.network` / `vms.vm_ip` and later
+NICs in `vm_nics`. NAT extras get a DHCP reservation. VXLAN extras get a
+static address and no gateway. Secondary DHCP interfaces set
+`dhcp4-overrides.use-routes: false`, so they do not replace the default route.
+
+The first NIC keeps the historical TAP name `tap-${sha256(vmName)[0:8]}` and
+MAC. Later NICs hash `vmName#index`. A VM can have at most eight NICs, and
+two NICs cannot join the same network.
+
+## IPv6
+
+IPv4 behaviour is unchanged when a network has no IPv6 prefix. Set a /64
+whose host bits are clear and a gateway of `prefix::1`:
+
+```
+kctl create network overlay \
+  --external-ip 0.0.0.0 \
+  --gateway-ip 10.240.0.1 \
+  --type vxlan \
+  --ipv6-prefix fd00:10:240::/64 \
+  --ipv6-gateway fd00:10:240::1
+```
+
+The controller gives each NIC on that network the next host address, starting
+at `::2`, and stores it in `vm_ipv6`. The bridge receives the gateway with
+`ip -6 addr`. Cloud-init adds the address beside IPv4. There is no DHCPv6.
+Deleting the VM returns the address to a free list for that prefix.
+
+## East-west firewall
+
+`kctl create network ... --east-west-firewall` (or `eastWestFirewall = true`
+in the Nix network) installs an nftables bridge filter. It accepts
+established flows, traffic to and from the gateway, DHCP (UDP 67/68), and
+security-group rules that name a `targetIp`. Other VM-to-VM traffic inside
+the network is dropped. On a `255.255.255.0` mask that drop is the /24. On
+any other mask it is the set of known VM addresses. IPv6 uses the same
+pattern inside `ipv6Prefix` when a prefix is set. The filter is off unless
+the network asks for it, so existing bridges stay open.
+
+## VXLAN addresses and peers
+
+Deleting a VM returns its VXLAN IPv4 address to `vxlan_released_ips`. The
+next allocation on that overlay takes the lowest free address that is not
+still assigned, and leaves `next_ip` alone. An address that is still on a
+live VM is skipped.
+
+Peer FDB entries include only other nodes that are ready and approved and
+that have the same network. They are sorted by node id, with one entry per
+address. A node that is no longer ready drops out of the FDB on the next
+config push. Creating or deleting the network still re-pushes the other
+members immediately.
 
 ## How VMs get network connectivity
 
@@ -668,22 +737,18 @@ networks share a VNI, enabling cross-host connectivity.
 
 ## Limitations
 
-- **Single NIC per VM**: Cloud Hypervisor is invoked with one `--net`
-  argument. Multi-homed VMs are not supported through the kcore API.
-- **IPv4 only**: All validation and configuration is IPv4. No IPv6 support.
 - **DNAT targets the bridge gateway**: Port forwarding (nat only) sends
   traffic to `gatewayIP`, not to a specific VM IP.
-- **No east-west firewall**: VMs on the same bridge can freely
-  communicate. There is no micro-segmentation within a network.
+- **East-west filtering is off unless requested**: A bridge stays open
+  between VMs until the network sets `eastWestFirewall`.
+- **IPv6 is a /64 beside IPv4**: There is no DHCPv6 and no IPv6 default
+  route on secondary NICs. A network without `ipv6Prefix` stays IPv4-only.
 - **Fixed DNS**: All VMs get `1.1.1.1` and `8.8.8.8`.
 - **DHCP range**: Fixed `.100`–`.199` range (100 VMs per NAT network).
-- **VXLAN IP allocation is monotonic**: IPs allocated for VXLAN VMs are
-  not reclaimed when VMs are deleted. The `next_ip` counter only
-  increments.
-- **VXLAN peer discovery is push-based**: Peer FDB entries are updated
-  during `push_config_to_node`. Adding a new node to an existing VXLAN
-  network requires the controller to re-push configs to all participating
-  nodes.
+- **VXLAN peer updates follow the next config push**: A node that leaves
+  the ready set is omitted from FDB entries the next time a member's
+  config is generated. Join and leave of the network itself re-push the
+  other members immediately.
 - **Port forwarding not exposed in kctl**: The `--allowed-tcp-ports` and
   `--allowed-udp-ports` fields exist in the proto API but are not yet
   wired to kctl flags.

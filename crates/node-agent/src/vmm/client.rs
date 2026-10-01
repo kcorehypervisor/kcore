@@ -89,6 +89,28 @@ impl Client {
         put_json(&self.socket_path(name), "/api/v1/vm.send-migration", &body).await
     }
 
+    /// Hot-add a block disk to a running VM (Cloud Hypervisor `vm.add-disk`).
+    pub async fn add_disk(
+        &self,
+        name: &str,
+        path: &str,
+        serial: &str,
+        readonly: bool,
+    ) -> Result<(), String> {
+        let body = AddDiskBody {
+            path: path.to_string(),
+            readonly: Some(readonly),
+            serial: Some(serial.to_string()),
+        };
+        put_json(&self.socket_path(name), "/api/v1/vm.add-disk", &body).await
+    }
+
+    /// Hot-remove a disk by virtio id/serial (Cloud Hypervisor `vm.remove-device`).
+    pub async fn remove_disk(&self, name: &str, id: &str) -> Result<(), String> {
+        let body = RemoveDeviceBody { id: id.to_string() };
+        put_json(&self.socket_path(name), "/api/v1/vm.remove-device", &body).await
+    }
+
     /// Wait until the API socket answers `vm.info` (or timeout).
     pub async fn wait_api_ready(&self, name: &str, timeout: Duration) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -114,6 +136,20 @@ struct SendMigrationBody {
     destination_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     local: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct AddDiskBody {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readonly: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serial: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RemoveDeviceBody {
+    id: String,
 }
 
 async fn query_vm_info(socket_path: &Path) -> Option<VmInfo> {

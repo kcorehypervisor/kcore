@@ -5,6 +5,7 @@
 //! every member after the first node generates them with `ceph-authtool`.
 
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -173,6 +174,13 @@ pub fn write_keyring_files(pkg: &BootstrapPackage) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     // Combined mon keyring used only for mkfs; keep a copy for operators.
     std::fs::write("/etc/ceph/ceph.mon.keyring", &pkg.mon_keyring).map_err(|e| e.to_string())?;
+    for path in [
+        "/etc/ceph/ceph.client.admin.keyring",
+        "/etc/ceph/ceph.mon.keyring",
+        "/var/lib/ceph/bootstrap-osd/ceph.keyring",
+    ] {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     let _ = run(
         "chown",
         &[
@@ -199,6 +207,58 @@ pub fn mon_already_initialized(daemon_id: &str) -> bool {
         || Path::new(&mon_data_dir(daemon_id)).join("done").exists()
 }
 
+/// A cluster that already has quorum must learn this mon before mkfs.
+/// Building a fresh monmap here gives the new daemon a different epoch, so it
+/// never joins. Returns true when `monmap_path` holds the cluster's map.
+fn adopt_running_monmap(
+    daemon_id: &str,
+    mons: &[MonMember],
+    monmap_path: &Path,
+) -> Result<bool, String> {
+    let Some(me) = mons.iter().find(|m| m.id == daemon_id) else {
+        return Ok(false);
+    };
+    let addr = format!("{}:6789", me.addr);
+    let add_ok = match Command::new("timeout")
+        .args(["10", "ceph", "mon", "add", daemon_id, &addr])
+        .output()
+    {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            out.status.success() || stderr.contains("already")
+        }
+        Err(_) => false,
+    };
+    let get_ok = match Command::new("timeout")
+        .args(["10", "ceph", "mon", "getmap", "-o"])
+        .arg(monmap_path)
+        .output()
+    {
+        Ok(out) => out.status.success() && monmap_path.is_file(),
+        Err(_) => false,
+    };
+    if add_ok && !get_ok {
+        return Err(format!(
+            "registered mon.{daemon_id} with the cluster but could not fetch the monmap"
+        ));
+    }
+    if !get_ok {
+        return Ok(false);
+    }
+    let printed = Command::new("monmaptool")
+        .arg("--print")
+        .arg(monmap_path)
+        .output()
+        .map_err(|e| format!("monmaptool --print: {e}"))?;
+    let text = String::from_utf8_lossy(&printed.stdout);
+    if !text.contains(&format!("mon.{daemon_id}")) {
+        return Err(format!(
+            "cluster monmap does not include mon.{daemon_id}; refusing to mkfs a divergent map"
+        ));
+    }
+    Ok(true)
+}
+
 pub fn mkfs_mon(pkg: &BootstrapPackage, daemon_id: &str, mons: &[MonMember]) -> Result<(), String> {
     if mon_already_initialized(daemon_id) {
         return Ok(());
@@ -217,11 +277,13 @@ pub fn mkfs_mon(pkg: &BootstrapPackage, daemon_id: &str, mons: &[MonMember]) -> 
     for m in mons {
         args.push("--add".into());
         args.push(m.id.clone());
-        args.push(m.addr.clone());
+        args.push(format!("{}:6789", m.addr));
     }
     args.push(monmap.display().to_string());
-    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    run("monmaptool", &args_ref)?;
+    if !adopt_running_monmap(daemon_id, mons, &monmap)? {
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        run("monmaptool", &args_ref)?;
+    }
 
     let data = mon_data_dir(daemon_id);
     std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
@@ -278,6 +340,137 @@ pub fn ensure_mgr_keyring(daemon_id: &str) -> Result<(), String> {
     Err(format!(
         "timed out creating mgr.{daemon_id} keyring (is ceph-mon up?)"
     ))
+}
+
+pub const BOOTSTRAP_STATE_PATH: &str = "/var/lib/kcore/ceph-bootstrap.json";
+
+/// One OSD as reported by `ceph-volume lvm list --format json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedOsd {
+    pub id: String,
+    pub devices: Vec<String>,
+}
+
+/// Reuse a package the controller already distributed, else the copy this node
+/// wrote before a previous attempt died, else generate a new one.
+///
+/// Generating on every empty request is what split a cluster: the first apply
+/// created keys, `nixos-rebuild switch` killed the agent before it could return
+/// them, and the retry minted a second set over a mon that had already been
+/// mkfs'd with the first.
+pub fn resolve_bootstrap_package(fsid: &str, provided: &[u8]) -> Result<BootstrapPackage, String> {
+    resolve_bootstrap_package_at(Path::new(BOOTSTRAP_STATE_PATH), fsid, provided)
+}
+
+pub fn resolve_bootstrap_package_at(
+    path: &Path,
+    fsid: &str,
+    provided: &[u8],
+) -> Result<BootstrapPackage, String> {
+    if !provided.is_empty() {
+        let pkg = decode_package(provided)?;
+        if pkg.fsid != fsid {
+            return Err(format!(
+                "bootstrap package fsid {} does not match request fsid {fsid}",
+                pkg.fsid
+            ));
+        }
+        store_package_at(path, &pkg)?;
+        return Ok(pkg);
+    }
+    if let Some(pkg) = load_package_at(path)? {
+        if pkg.fsid != fsid {
+            return Err(format!(
+                "stored bootstrap fsid {} does not match request fsid {fsid}",
+                pkg.fsid
+            ));
+        }
+        return Ok(pkg);
+    }
+    let pkg = generate_bootstrap_package(fsid)?;
+    store_package_at(path, &pkg)?;
+    Ok(pkg)
+}
+
+fn load_package_at(path: &Path) -> Result<Option<BootstrapPackage>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(decode_package(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+fn store_package_at(path: &Path, pkg: &BootstrapPackage) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+    let bytes = encode_package(pkg)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("renaming bootstrap package: {e}"))?;
+    Ok(())
+}
+
+pub fn parse_ceph_volume_lvm_list(json: &str) -> Result<Vec<ListedOsd>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("ceph-volume list JSON: {e}"))?;
+    let Some(obj) = value.as_object() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (key, val) in obj {
+        let entries: Vec<&serde_json::Value> = match val {
+            serde_json::Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        for entry in entries {
+            let id = entry
+                .get("osd_id")
+                .and_then(|v| {
+                    v.as_i64()
+                        .map(|n| n.to_string())
+                        .or_else(|| v.as_str().map(str::to_string))
+                })
+                .or_else(|| {
+                    entry
+                        .pointer("/tags/ceph.osd_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| key.clone());
+            let devices = entry
+                .get("devices")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if devices.is_empty() {
+                continue;
+            }
+            out.push(ListedOsd { id, devices });
+        }
+    }
+    Ok(out)
+}
+
+/// True when `device` is the same block device as `wanted`.
+///
+/// `canonicalize` follows `/dev/disk/by-id` links so a later reconcile that
+/// names the kernel path does not retire an OSD it just created under the
+/// by-id path. When either path cannot be resolved, only an exact string
+/// match counts — a failed stat must not look like "different disk".
+pub fn same_block_device(device: &str, wanted: &str) -> bool {
+    if device == wanted {
+        return true;
+    }
+    match (std::fs::canonicalize(device), std::fs::canonicalize(wanted)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 pub fn rbd_size_mib(size_bytes: i64) -> Result<u64, String> {
@@ -344,6 +537,41 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bootstrap_package_reuses_stored_keys_for_the_same_fsid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ceph-bootstrap.json");
+        let pkg = BootstrapPackage {
+            version: 1,
+            fsid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            admin_keyring: "admin".into(),
+            mon_keyring: "mon".into(),
+            bootstrap_osd_keyring: "boot".into(),
+        };
+        let bytes = encode_package(&pkg).unwrap();
+        let first = resolve_bootstrap_package_at(&path, &pkg.fsid, &bytes).unwrap();
+        assert_eq!(first, pkg);
+        let again = resolve_bootstrap_package_at(&path, &pkg.fsid, &[]).unwrap();
+        assert_eq!(again, pkg);
+        let err = resolve_bootstrap_package_at(&path, "other-fsid", &[]).unwrap_err();
+        assert!(err.contains("does not match"));
+    }
+
+    #[test]
+    fn parse_ceph_volume_lvm_list_reads_osd_id_and_devices() {
+        let json = r#"{"0":[{"osd_id":0,"devices":["/dev/nvme0n1"]}]}"#;
+        let listed = parse_ceph_volume_lvm_list(json).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "0");
+        assert_eq!(listed[0].devices, vec!["/dev/nvme0n1".to_string()]);
+        assert!(parse_ceph_volume_lvm_list("{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_block_device_does_not_treat_a_prefix_as_the_same_disk() {
+        assert!(same_block_device("/dev/sda", "/dev/sda"));
+        assert!(!same_block_device("/dev/sda", "/dev/sda1"));
+    }
+
     fn parse_osd_counters_supports_both_json_shapes() {
         let modern = serde_json::json!({"osdmap":{"num_up_osds":3,"num_in_osds":3}});
         assert_eq!(parse_osd_counters(&modern), (3, 3));

@@ -150,7 +150,7 @@ impl Controller for MockController {
                 memory_bytes: 512 * 1024 * 1024,
                 node_id: "node-mock-a".into(),
                 created_at: None,
-                storage_backend: String::new(),
+                storage_backend: "lvm".into(),
                 storage_size_bytes: 0,
             }],
         }))
@@ -210,18 +210,36 @@ impl Controller for MockController {
         _: Request<ListNetworksRequest>,
     ) -> Result<Response<ListNetworksResponse>, Status> {
         Ok(Response::new(ListNetworksResponse {
-            networks: vec![NetworkInfo {
-                name: "mock-net-stub".into(),
-                external_ip: "203.0.113.1".into(),
-                gateway_ip: "10.0.0.1".into(),
-                internal_netmask: "255.255.255.0".into(),
-                node_id: "node-mock-a".into(),
-                allowed_tcp_ports: vec![],
-                allowed_udp_ports: vec![],
-                vlan_id: 0,
-                network_type: "nat".into(),
-                enable_outbound_nat: true,
-            }],
+            networks: vec![
+                NetworkInfo {
+                    name: "mock-net-stub".into(),
+                    external_ip: "203.0.113.1".into(),
+                    gateway_ip: "10.0.0.1".into(),
+                    internal_netmask: "255.255.255.0".into(),
+                    node_id: "node-mock-a".into(),
+                    allowed_tcp_ports: vec![],
+                    allowed_udp_ports: vec![],
+                    vlan_id: 0,
+                    network_type: "nat".into(),
+                    enable_outbound_nat: true,
+                    ..Default::default()
+                },
+                NetworkInfo {
+                    name: "mock-overlay".into(),
+                    external_ip: String::new(),
+                    gateway_ip: "10.50.0.1".into(),
+                    internal_netmask: "255.255.255.0".into(),
+                    node_id: "node-mock-a".into(),
+                    allowed_tcp_ports: vec![22],
+                    allowed_udp_ports: vec![],
+                    vlan_id: 0,
+                    network_type: "vxlan".into(),
+                    enable_outbound_nat: false,
+                    ipv6_prefix: "fd00:10::/64".into(),
+                    ipv6_gateway: "fd00:10::1".into(),
+                    east_west_firewall: true,
+                },
+            ],
         }))
     }
 
@@ -379,6 +397,48 @@ impl Controller for MockController {
         Err(unimp("reject_node"))
     }
 
+    async fn cordon_node(
+        &self,
+        _: Request<CordonNodeRequest>,
+    ) -> Result<Response<CordonNodeResponse>, Status> {
+        Err(unimp("cordon_node"))
+    }
+
+    async fn uncordon_node(
+        &self,
+        _: Request<UncordonNodeRequest>,
+    ) -> Result<Response<UncordonNodeResponse>, Status> {
+        Err(unimp("uncordon_node"))
+    }
+
+    async fn delete_node(
+        &self,
+        _: Request<DeleteNodeRequest>,
+    ) -> Result<Response<DeleteNodeResponse>, Status> {
+        Err(unimp("delete_node"))
+    }
+
+    async fn get_cluster_health(
+        &self,
+        _: Request<GetClusterHealthRequest>,
+    ) -> Result<Response<GetClusterHealthResponse>, Status> {
+        Err(unimp("get_cluster_health"))
+    }
+
+    async fn backup_cluster(
+        &self,
+        _: Request<BackupClusterRequest>,
+    ) -> Result<Response<BackupClusterResponse>, Status> {
+        Err(unimp("backup_cluster"))
+    }
+
+    async fn restore_cluster(
+        &self,
+        _: Request<RestoreClusterRequest>,
+    ) -> Result<Response<RestoreClusterResponse>, Status> {
+        Err(unimp("restore_cluster"))
+    }
+
     async fn renew_node_cert(
         &self,
         _: Request<RenewNodeCertRequest>,
@@ -484,6 +544,13 @@ impl Controller for MockController {
                         addresses: vec![],
                     },
                     NetworkInterfaceDetail {
+                        name: "vxlan100".into(),
+                        mac_address: "aa:bb:cc:dd:ee:04".into(),
+                        state: "UP".into(),
+                        mtu: 1450,
+                        addresses: vec!["10.50.0.1/24".into()],
+                    },
+                    NetworkInterfaceDetail {
                         name: "lo".into(),
                         mac_address: "00:00:00:00:00:00".into(),
                         state: "UP".into(),
@@ -505,6 +572,7 @@ impl Controller for MockController {
             backend_filesystem_nodes: 0,
             backend_lvm_nodes: 1,
             backend_zfs_nodes: 0,
+            backend_ceph_nodes: 0,
             backend_unspecified_nodes: 0,
             nodes_luks_tpm2: 0,
             nodes_luks_keyfile: 1,
@@ -587,22 +655,216 @@ impl Controller for MockController {
         _: Request<ListAuditEventsRequest>,
     ) -> Result<Response<ListAuditEventsResponse>, Status> {
         Ok(Response::new(ListAuditEventsResponse {
-            events: vec![AuditEvent {
-                id: 1,
-                actor: "kctl".into(),
-                action: "CreateVm".into(),
-                resource: "vm/web-01".into(),
-                created_at: "2026-08-04T12:00:00.000Z".into(),
-                detail: String::new(),
-            }],
+            events: vec![
+                AuditEvent {
+                    id: 2,
+                    actor: "kctl".into(),
+                    action: "CreateVm".into(),
+                    resource: "vm/web-01".into(),
+                    created_at: "2026-08-04T12:00:00.000Z".into(),
+                    detail: String::new(),
+                },
+                AuditEvent {
+                    id: 1,
+                    actor: "kcore-node-a".into(),
+                    action: "RegisterNode".into(),
+                    resource: "node/node-mock-a".into(),
+                    created_at: "2026-08-01T00:00:00.000Z".into(),
+                    detail: "joined".into(),
+                },
+            ],
         }))
+    }
+
+    async fn get_crypto_config(
+        &self,
+        _: Request<GetCryptoConfigRequest>,
+    ) -> Result<Response<GetCryptoConfigResponse>, Status> {
+        Ok(Response::new(GetCryptoConfigResponse::default()))
+    }
+
+    async fn export_sbom(
+        &self,
+        _: Request<ExportSbomRequest>,
+    ) -> Result<Response<ExportSbomResponse>, Status> {
+        Ok(Response::new(ExportSbomResponse::default()))
     }
 
     async fn list_volumes(
         &self,
         _: Request<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
-        Err(unimp("list_volumes"))
+        Ok(Response::new(ListVolumesResponse {
+            volumes: vec![VolumeInfo {
+                id: "vol-mock-1".into(),
+                name: "mock-pgdata".into(),
+                role: "data".into(),
+                attach_state: "attached".into(),
+                serial: "abc123".into(),
+                pool: "kcore-vms".into(),
+                image: "kcore-vol-abc123".into(),
+                slot: 1,
+                vm_id: "vm-mock-1".into(),
+                vm_name: "mock-vm".into(),
+                node_id: "node-mock-a".into(),
+                storage_backend: "ceph".into(),
+                storage_size_bytes: 10 * 1024 * 1024 * 1024,
+                backend_handle: "/dev/rbd/kcore-vms/kcore-vol-abc123".into(),
+                image_format: "raw".into(),
+                vm_state: 0,
+                guest_visible_bytes: -1,
+                guest_checked_at: String::new(),
+                encrypted: false,
+            }],
+        }))
+    }
+
+    async fn create_volume(
+        &self,
+        _: Request<CreateVolumeRequest>,
+    ) -> Result<Response<CreateVolumeResponse>, Status> {
+        Err(unimp("create_volume"))
+    }
+
+    async fn get_volume(
+        &self,
+        _: Request<GetVolumeRequest>,
+    ) -> Result<Response<GetVolumeResponse>, Status> {
+        Err(unimp("get_volume"))
+    }
+
+    async fn attach_volume(
+        &self,
+        _: Request<AttachVolumeRequest>,
+    ) -> Result<Response<AttachVolumeResponse>, Status> {
+        Err(unimp("attach_volume"))
+    }
+
+    async fn detach_volume(
+        &self,
+        _: Request<DetachVolumeRequest>,
+    ) -> Result<Response<DetachVolumeResponse>, Status> {
+        Err(unimp("detach_volume"))
+    }
+
+    async fn delete_volume(
+        &self,
+        _: Request<DeleteVolumeRequest>,
+    ) -> Result<Response<DeleteVolumeResponse>, Status> {
+        Err(unimp("delete_volume"))
+    }
+
+    async fn list_vm_operations(
+        &self,
+        _: Request<ListVmOperationsRequest>,
+    ) -> Result<Response<ListVmOperationsResponse>, Status> {
+        Ok(Response::new(ListVmOperationsResponse {
+            operations: vec![VmOperation {
+                id: "op-mock-1".into(),
+                vm_id: "vm-mock-1".into(),
+                kind: "live_migrate".into(),
+                phase: "Preparing".into(),
+                source_node: "node-mock-a".into(),
+                target_node: "node-mock-b".into(),
+                cancel_requested: false,
+                send_succeeded: false,
+                detail_json: "{}".into(),
+                started_at: None,
+                updated_at: None,
+                finished_at: None,
+            }],
+        }))
+    }
+
+    async fn get_vm_operation(
+        &self,
+        _: Request<GetVmOperationRequest>,
+    ) -> Result<Response<GetVmOperationResponse>, Status> {
+        Err(unimp("get_vm_operation"))
+    }
+
+    async fn cancel_vm_operation(
+        &self,
+        _: Request<CancelVmOperationRequest>,
+    ) -> Result<Response<CancelVmOperationResponse>, Status> {
+        Err(unimp("cancel_vm_operation"))
+    }
+
+    async fn create_volume_snapshot(
+        &self,
+        _: Request<CreateVolumeSnapshotRequest>,
+    ) -> Result<Response<CreateVolumeSnapshotResponse>, Status> {
+        Err(unimp("create_volume_snapshot"))
+    }
+
+    async fn list_volume_snapshots(
+        &self,
+        _: Request<ListVolumeSnapshotsRequest>,
+    ) -> Result<Response<ListVolumeSnapshotsResponse>, Status> {
+        Err(unimp("list_volume_snapshots"))
+    }
+
+    async fn delete_volume_snapshot(
+        &self,
+        _: Request<DeleteVolumeSnapshotRequest>,
+    ) -> Result<Response<DeleteVolumeSnapshotResponse>, Status> {
+        Err(unimp("delete_volume_snapshot"))
+    }
+
+    async fn restore_volume(
+        &self,
+        _: Request<RestoreVolumeRequest>,
+    ) -> Result<Response<RestoreVolumeResponse>, Status> {
+        Err(unimp("restore_volume"))
+    }
+
+    async fn flatten_volume(
+        &self,
+        _: Request<FlattenVolumeRequest>,
+    ) -> Result<Response<FlattenVolumeResponse>, Status> {
+        Err(unimp("flatten_volume"))
+    }
+
+    async fn resize_volume(
+        &self,
+        _: Request<ResizeVolumeRequest>,
+    ) -> Result<Response<ResizeVolumeResponse>, Status> {
+        Err(unimp("resize_volume"))
+    }
+
+    async fn encrypt_volume(
+        &self,
+        _: Request<EncryptVolumeRequest>,
+    ) -> Result<Response<EncryptVolumeResponse>, Status> {
+        Err(unimp("encrypt_volume"))
+    }
+
+    async fn create_snapshot_policy(
+        &self,
+        _: Request<CreateSnapshotPolicyRequest>,
+    ) -> Result<Response<CreateSnapshotPolicyResponse>, Status> {
+        Err(unimp("create_snapshot_policy"))
+    }
+
+    async fn get_snapshot_policy(
+        &self,
+        _: Request<GetSnapshotPolicyRequest>,
+    ) -> Result<Response<GetSnapshotPolicyResponse>, Status> {
+        Err(unimp("get_snapshot_policy"))
+    }
+
+    async fn list_snapshot_policies(
+        &self,
+        _: Request<ListSnapshotPoliciesRequest>,
+    ) -> Result<Response<ListSnapshotPoliciesResponse>, Status> {
+        Err(unimp("list_snapshot_policies"))
+    }
+
+    async fn delete_snapshot_policy(
+        &self,
+        _: Request<DeleteSnapshotPolicyRequest>,
+    ) -> Result<Response<DeleteSnapshotPolicyResponse>, Status> {
+        Err(unimp("delete_snapshot_policy"))
     }
 
     async fn create_disk_layout(
@@ -658,7 +920,33 @@ impl Controller for MockController {
         &self,
         _: Request<ListCephClustersRequest>,
     ) -> Result<Response<ListCephClustersResponse>, Status> {
-        Err(unimp("list_ceph_clusters"))
+        Ok(Response::new(ListCephClustersResponse {
+            ceph_clusters: vec![CephCluster {
+                name: "mock-ceph".into(),
+                generation: 2,
+                spec: Some(CephClusterSpec {
+                    fsid: "11111111-2222-3333-4444-555555555555".into(),
+                    public_network: "10.20.0.0/24".into(),
+                    cluster_network: "10.21.0.0/24".into(),
+                    size: 3,
+                    min_size: 2,
+                    encrypt_osds: true,
+                    nodes: vec![CephClusterNodeSpec {
+                        node_id: "node-mock-a".into(),
+                        mon_addr: "10.20.0.10:6789".into(),
+                        osd_device: "/dev/sdb".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                status: Some(CephClusterStatus {
+                    phase: CephClusterPhase::Healthy as i32,
+                    health_message: "HEALTH_OK".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }))
     }
 
     async fn delete_ceph_cluster(
@@ -666,6 +954,112 @@ impl Controller for MockController {
         _: Request<DeleteCephClusterRequest>,
     ) -> Result<Response<DeleteCephClusterResponse>, Status> {
         Err(unimp("delete_ceph_cluster"))
+    }
+
+    async fn create_shared_filesystem(
+        &self,
+        _: Request<CreateSharedFilesystemRequest>,
+    ) -> Result<Response<CreateSharedFilesystemResponse>, Status> {
+        Err(unimp("create_shared_filesystem"))
+    }
+
+    async fn get_shared_filesystem(
+        &self,
+        _: Request<GetSharedFilesystemRequest>,
+    ) -> Result<Response<GetSharedFilesystemResponse>, Status> {
+        Err(unimp("get_shared_filesystem"))
+    }
+
+    async fn list_shared_filesystems(
+        &self,
+        _: Request<ListSharedFilesystemsRequest>,
+    ) -> Result<Response<ListSharedFilesystemsResponse>, Status> {
+        Ok(Response::new(ListSharedFilesystemsResponse {
+            shared_filesystems: vec![SharedFilesystem {
+                name: "mock-home".into(),
+                spec: Some(SharedFilesystemSpec {
+                    ceph_cluster: "mock-ceph".into(),
+                    quota_bytes: 100 * 1024 * 1024 * 1024,
+                    clients: vec![SharedFilesystemClientSpec {
+                        name: "desk".into(),
+                        paths: vec!["/".into()],
+                    }],
+                    ..Default::default()
+                }),
+                status: Some(SharedFilesystemStatus {
+                    phase: SharedFilesystemPhase::Healthy as i32,
+                    health_message: "HEALTH_OK".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }))
+    }
+
+    async fn delete_shared_filesystem(
+        &self,
+        _: Request<DeleteSharedFilesystemRequest>,
+    ) -> Result<Response<DeleteSharedFilesystemResponse>, Status> {
+        Err(unimp("delete_shared_filesystem"))
+    }
+
+    async fn create_object_store(
+        &self,
+        _: Request<CreateObjectStoreRequest>,
+    ) -> Result<Response<CreateObjectStoreResponse>, Status> {
+        Err(unimp("create_object_store"))
+    }
+
+    async fn get_object_store(
+        &self,
+        _: Request<GetObjectStoreRequest>,
+    ) -> Result<Response<GetObjectStoreResponse>, Status> {
+        Err(unimp("get_object_store"))
+    }
+
+    async fn list_object_stores(
+        &self,
+        _: Request<ListObjectStoresRequest>,
+    ) -> Result<Response<ListObjectStoresResponse>, Status> {
+        Ok(Response::new(ListObjectStoresResponse {
+            object_stores: vec![ObjectStore {
+                name: "mock-s3".into(),
+                spec: Some(ObjectStoreSpec {
+                    ceph_cluster: "mock-ceph".into(),
+                    members: vec!["node-mock-a".into()],
+                    port: 7480,
+                    tls: true,
+                    ..Default::default()
+                }),
+                status: Some(ObjectStoreStatus {
+                    phase: ObjectStorePhase::Healthy as i32,
+                    health_message: "HEALTH_OK".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }))
+    }
+
+    async fn delete_object_store(
+        &self,
+        _: Request<DeleteObjectStoreRequest>,
+    ) -> Result<Response<DeleteObjectStoreResponse>, Status> {
+        Err(unimp("delete_object_store"))
+    }
+
+    async fn create_object_user(
+        &self,
+        _: Request<CreateObjectUserRequest>,
+    ) -> Result<Response<CreateObjectUserResponse>, Status> {
+        Err(unimp("create_object_user"))
+    }
+
+    async fn delete_object_user(
+        &self,
+        _: Request<DeleteObjectUserRequest>,
+    ) -> Result<Response<DeleteObjectUserResponse>, Status> {
+        Err(unimp("delete_object_user"))
     }
 
     async fn create_cluster_update(

@@ -26,7 +26,13 @@ schema_version
 
 ## Current schema version
 
-**6** (as of March 2026)
+**49**
+
+Versions 7 through 49 are applied by `Database::migrate()` in
+`crates/controller/src/db.rs`. The table below records the original
+migrations through 6, PCI/GPU/PostgreSQL in 34–37, and the placement and
+networking tables in 46–49. Ceph volume, snapshot, and object-store
+migrations are 38–45 in that file.
 
 ## Migration history
 
@@ -38,6 +44,14 @@ schema_version
 | 3 → 4 | New `ssh_keys` and `vm_ssh_keys` tables. | SSH public key management — store keys centrally, reference by name when creating VMs, inject into cloud-init. |
 | 4 → 5 | Added `storage_backend` to `nodes` and `vms`; added `storage_size_bytes` to `vms`. | Track storage backend preferences per node and VM. |
 | 5 → 6 | Added `vlan_id` to `networks`. | 802.1Q VLAN tagging — place VM networks on VLAN sub-interfaces of the upstream NIC. |
+| 33 → 34 | Added `pci_devices` to `vms`. | Store VFIO addresses assigned to a VM. |
+| 34 → 35 | New `node_gpus` and `vm_gpu_bindings` tables. | Inventory assignable GPUs and bind one VM to a named device. |
+| 35 → 36 | Extra columns on `node_gpus` (`kind`, `role`, `class_code`, `characteristics`, `driver`). | Distinguish GPUs from NIC, NVMe, and raw PCI companions. |
+| 36 → 37 | New `postgresql_instances` table. | One NixOS PostgreSQL database per node. |
+| 45 → 46 | New `vm_nics` table. | Extra NICs for a multi-homed VM. NIC 0 stays on `vms.network` / `vms.vm_ip`. |
+| 46 → 47 | New `vm_placement` table. | Hard anti-affinity group for a VM, without a column on `vms`. |
+| 47 → 48 | New `network_policy`, `vm_ipv6`, `vxlan_released_ips`, and `ipv6_released` tables. | Optional IPv6 /64, east-west firewall flag, and reuse of VXLAN and IPv6 addresses after a VM is deleted. |
+| 48 → 49 | New `pending_node_config_push` table. | After automatic failover, the failed node's next heartbeat pushes a config that no longer starts the moved guests. |
 
 ## Adding a new migration
 

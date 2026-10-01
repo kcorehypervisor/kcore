@@ -46,8 +46,8 @@ in
   environment.etc."issue".text = staticIssue;
   environment.etc."issue.kcore-static".text = staticIssue;
 
-  # SSH banner
-  services.openssh.banner = ''
+  # SSH banner. settings.Banner is a path, not the banner text.
+  environment.etc."kcore/ssh-banner".text = ''
     ██╗  ██╗ ██████╗  ██████╗ ██████╗ ███████╗
     ██║ ██╔╝██╔════╝ ██╔═══██╗██╔══██╗██╔════╝
     █████╔╝ ██║      ██║   ██║██████╔╝█████╗
@@ -58,6 +58,7 @@ in
     Welcome to kcoreOS
     This system is managed by kcore.
   '';
+  services.openssh.settings.Banner = "/etc/kcore/ssh-banner";
 
   # MOTD
   environment.etc."motd".text = ''

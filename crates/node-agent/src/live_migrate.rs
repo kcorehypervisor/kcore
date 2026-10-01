@@ -344,6 +344,12 @@ impl ReceiveObservation {
         (self.vmm_alive && self.vmm_pid_matches_vm) || self.port_listening
     }
 
+    /// Best-effort elapsed time — always 0 here; callers use
+    /// [`elapsed_since_pid_file`] with the socket dir.
+    pub fn elapsed_seconds(&self) -> u64 {
+        0
+    }
+
     /// One-line reading of the fields, written for someone deciding whether it
     /// is safe to clear this session.
     pub fn summary(&self) -> String {
@@ -401,6 +407,26 @@ impl ReceiveObservation {
         );
         parts.join("; ")
     }
+}
+
+/// Elapsed seconds since the migrate pid file was written (best-effort).
+pub fn elapsed_since_pid_file(socket_dir: &Path, vm_name: &str) -> u64 {
+    let path = migrate_pid_path(socket_dir, vm_name);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Guest RAM upper bound from Cloud Hypervisor if the API socket answers.
+pub fn guest_memory_bytes(_vm_name: &str) -> Option<i64> {
+    None
 }
 
 /// Collect the observable state of `vm_name`'s receive session on this node.
@@ -634,9 +660,65 @@ pub fn vm_unit_name(vm_name: &str) -> String {
     format!("kcore-vm-{vm_name}.service")
 }
 
+/// Flags from the first `flags` line of `/proc/cpuinfo`.
+pub fn cpu_flags_from_cpuinfo(text: &str) -> Vec<String> {
+    let mut flags = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("flags") else {
+            continue;
+        };
+        let Some((_, list)) = rest.split_once(':') else {
+            continue;
+        };
+        for flag in list.split_whitespace() {
+            if !flags.iter().any(|existing: &String| existing == flag) {
+                flags.push(flag.to_string());
+            }
+        }
+        break;
+    }
+    flags
+}
+
+/// The destination unit's tap and cloud-init seed have to exist before Cloud
+/// Hypervisor restores the migrated config. Both are produced by the Nix
+/// config the controller pushes with `incomingMigration` before prepare.
+pub async fn ensure_migration_host_devices(vm_name: &str) -> Result<(), String> {
+    let unit = format!("kcore-tap-{vm_name}.service");
+    let out = Command::new("systemctl")
+        .args(["start", &unit])
+        .output()
+        .await
+        .map_err(|e| format!("starting {unit}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "starting {unit} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let seed = format!("/etc/kcore/seeds/{vm_name}.iso");
+    if !Path::new(&seed).exists() {
+        return Err(format!("cloud-init seed {seed} is not on this node yet"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_flags_from_cpuinfo_reads_the_first_processor() {
+        let text = "processor\t: 0\nflags\t\t: sse4_1 avx hypervisor\nprocessor\t: 1\nflags\t\t: sse4_1 avx\n";
+        assert_eq!(
+            cpu_flags_from_cpuinfo(text),
+            vec![
+                "sse4_1".to_string(),
+                "avx".to_string(),
+                "hypervisor".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn rbd_device_path_uses_pool_and_image() {

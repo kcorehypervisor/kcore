@@ -13,6 +13,10 @@ struct StoredSpec {
     min_size: i32,
     #[serde(default)]
     force_wipe: bool,
+    /// OSD dm-crypt. Missing in pre-E1 JSON → false (legacy plain OSDs).
+    /// New clusters set true via kctl / create path.
+    #[serde(default)]
+    encrypt_osds: bool,
     nodes: Vec<StoredNode>,
 }
 
@@ -25,6 +29,8 @@ struct StoredNode {
     public_iface: String,
     cluster_iface: String,
     osd_device: String,
+    #[serde(default)]
+    osd_devices: Vec<String>,
 }
 
 pub fn validate_spec(spec: &CephClusterSpec) -> Result<(), String> {
@@ -45,11 +51,39 @@ pub fn validate_spec(spec: &CephClusterSpec) -> Result<(), String> {
                 node.node_id
             ));
         }
-        if !Path::new(node.osd_device.trim()).is_absolute() {
-            return Err(format!("osdDevice for {} must be absolute", node.node_id));
+        let devices = osd_devices(node);
+        if devices.is_empty() {
+            return Err(format!("osdDevice for {} is required", node.node_id));
+        }
+        for device in &devices {
+            if !Path::new(device).is_absolute() {
+                return Err(format!(
+                    "osdDevice for {} must be absolute: {device}",
+                    node.node_id
+                ));
+            }
         }
     }
     Ok(())
+}
+
+/// Kernel paths this node should have OSDs on.
+///
+/// `osd_device` is the original single-disk field. `osd_devices` adds more
+/// without dropping it, so a manifest can grow a second disk in place.
+pub fn osd_devices(node: &CephClusterNodeSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    let primary = node.osd_device.trim();
+    if !primary.is_empty() {
+        out.push(primary.to_string());
+    }
+    for device in &node.osd_devices {
+        let device = device.trim();
+        if !device.is_empty() && !out.iter().any(|existing| existing == device) {
+            out.push(device.to_string());
+        }
+    }
+    out
 }
 
 pub fn spec_to_json(spec: &CephClusterSpec) -> Result<String, serde_json::Error> {
@@ -60,6 +94,7 @@ pub fn spec_to_json(spec: &CephClusterSpec) -> Result<String, serde_json::Error>
         size: spec.size,
         min_size: spec.min_size,
         force_wipe: spec.force_wipe,
+        encrypt_osds: spec.encrypt_osds,
         nodes: spec
             .nodes
             .iter()
@@ -70,6 +105,7 @@ pub fn spec_to_json(spec: &CephClusterSpec) -> Result<String, serde_json::Error>
                 public_iface: n.public_iface.clone(),
                 cluster_iface: n.cluster_iface.clone(),
                 osd_device: n.osd_device.clone(),
+                osd_devices: n.osd_devices.clone(),
             })
             .collect(),
     })
@@ -84,6 +120,7 @@ pub fn spec_from_json(json: &str) -> Result<CephClusterSpec, serde_json::Error> 
         size: s.size,
         min_size: s.min_size,
         force_wipe: s.force_wipe,
+        encrypt_osds: s.encrypt_osds,
         nodes: s
             .nodes
             .into_iter()
@@ -94,6 +131,7 @@ pub fn spec_from_json(json: &str) -> Result<CephClusterSpec, serde_json::Error> 
                 public_iface: n.public_iface,
                 cluster_iface: n.cluster_iface,
                 osd_device: n.osd_device,
+                osd_devices: n.osd_devices,
             })
             .collect(),
     })
@@ -111,6 +149,7 @@ mod tests {
             public_iface: "eth1".into(),
             cluster_iface: "eth2".into(),
             osd_device: "/dev/nvme0n1".into(),
+            osd_devices: Vec::new(),
         }
     }
 
@@ -122,6 +161,7 @@ mod tests {
             size: 3,
             min_size: 2,
             force_wipe: false,
+            encrypt_osds: true,
             nodes: vec![
                 valid_node("dell-1"),
                 valid_node("dell-2"),
@@ -189,6 +229,24 @@ mod tests {
     }
 
     #[test]
+    fn osd_devices_keeps_the_primary_and_appends_more() {
+        let mut node = valid_node("dell-1");
+        node.osd_devices = vec!["/dev/nvme1n1".into(), "/dev/nvme0n1".into()];
+        assert_eq!(
+            osd_devices(&node),
+            vec!["/dev/nvme0n1".to_string(), "/dev/nvme1n1".to_string()]
+        );
+        let mut spec = valid_spec();
+        spec.nodes[0] = node;
+        validate_spec(&spec).expect("two disks");
+        let back = spec_from_json(&spec_to_json(&spec).unwrap()).unwrap();
+        assert_eq!(
+            back.nodes[0].osd_devices,
+            vec!["/dev/nvme1n1".to_string(), "/dev/nvme0n1".to_string()]
+        );
+    }
+
+    #[test]
     fn json_round_trip_preserves_camel_case_fields() {
         let spec = valid_spec();
         let json = spec_to_json(&spec).expect("encode");
@@ -203,6 +261,7 @@ mod tests {
         assert_eq!(back.size, spec.size);
         assert_eq!(back.min_size, spec.min_size);
         assert_eq!(back.force_wipe, spec.force_wipe);
+        assert_eq!(back.encrypt_osds, spec.encrypt_osds);
         assert_eq!(back.nodes.len(), 3);
         assert_eq!(back.nodes[0].node_id, "dell-1");
         assert_eq!(back.nodes[0].osd_device, "/dev/nvme0n1");
@@ -218,5 +277,18 @@ mod tests {
         }"#;
         let spec = spec_from_json(json).expect("decode");
         assert!(!spec.force_wipe);
+        // Pre-E1 JSON has no encryptOsds → legacy plain OSDs.
+        assert!(!spec.encrypt_osds);
+    }
+
+    #[test]
+    fn json_preserves_encrypt_osds() {
+        let mut spec = valid_spec();
+        spec.encrypt_osds = true;
+        let back = spec_from_json(&spec_to_json(&spec).unwrap()).unwrap();
+        assert!(back.encrypt_osds);
+        spec.encrypt_osds = false;
+        let back = spec_from_json(&spec_to_json(&spec).unwrap()).unwrap();
+        assert!(!back.encrypt_osds);
     }
 }

@@ -49,8 +49,8 @@ cluster.
 | Area | Kubernetes | kcore |
 |------|-----------|-------|
 | Admission | Node CSR must be approved (automatically or manually). Node object is created only after approval. | New nodes register as `pending` and require operator approval (`kctl node approve`). Rejected nodes cannot participate. |
-| Heartbeat | kubelet sends periodic leases. After `node-monitor-grace-period` (40s default) the node is marked `NotReady`. Pods get evicted after `pod-eviction-timeout`. | Heartbeat mechanism exists but there is no automatic VM migration when a node becomes unreachable. |
-| Graceful removal | `kubectl drain` cordons the node and evicts pods respecting PodDisruptionBudgets. `kubectl delete node` removes the identity. | `kctl drain node` migrates VMs but there is no cordon (prevent new scheduling without draining). Removing a node from the DB does not invalidate its certificate on its own — `kctl revoke cert --node <id>` is the step that does, and it takes effect on that node's next RPC. |
+| Heartbeat | kubelet sends periodic leases. After `node-monitor-grace-period` (40s default) the node is marked `NotReady`. Pods get evicted after `pod-eviction-timeout`. | A node that misses heartbeats for 90 seconds is marked `not-ready`. Ceph VMs on that node are cold-moved to another healthy Ceph member. Local-disk VMs stay, because the disk is on the failed host. `failover.enabled: false` leaves every VM in place. |
+| Graceful removal | `kubectl drain` cordons the node and evicts pods respecting PodDisruptionBudgets. `kubectl delete node` removes the identity. | `kctl node cordon` marks the node unschedulable and leaves its VMs in place. `kctl drain node` still migrates them. `kctl node delete` refuses while the node hosts a VM, workload, or network, then revokes every certificate issued to that node (RFC 5280 reason 5, cessation of operation) and removes the row. `kctl revoke cert --node <id>` remains the way to invalidate a certificate without deleting the node. |
 
 ---
 
@@ -168,10 +168,14 @@ every node out of its own cluster. `hard-fail` inverts that trade and returns
 serial already known to be revoked is rejected however stale the data is:
 stale data can miss new revocations, it can never invent them.
 
-### Planned improvements
+### Shipped since the comparison above
 
-1. **SBOM and signed releases** -- `ExportSbom` / `GetCryptoConfig` and
-   signed release artifacts for regulated environments.
+- **SBOM and signed releases.** `make release` publishes CycloneDX SBOMs and
+  signs `SHA256SUMS` with Sigstore keyless signing. A running controller
+  serves them through `ExportSbom` (`kctl get sbom`) and reports the crypto
+  posture through `GetCryptoConfig` (`kctl get crypto-config`).
+- **gRPC rate limiting.** Controller and node-agent RPCs share a per-identity
+  token bucket (default 100 req/s, burst 200). Health checks are not counted.
 
 ### Not planned (Kubernetes-specific complexity)
 

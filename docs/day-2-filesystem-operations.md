@@ -59,7 +59,9 @@ Before running `disko --mode format,mount`, the node-agent snapshots `lsblk -J -
 
 When a classifier refuses, `ApplyDiskLayoutResponse.refusal_reason` contains the stable code above and `message` contains the human-readable detail. If lsblk itself cannot be inspected, the agent fails closed with `refusal_reason = "lsblk_probe_failed"`.
 
-The controller is never expected to drain, stop, migrate, or reboot VMs. The operator quiesces workloads (manually today; via live migration once that lands) before submitting a `DiskLayout`.
+By default the controller does not drain, stop, migrate, or reboot VMs when applying a `DiskLayout`. The reconciler refuses the apply while that node still hosts VMs (set `spec.evacuate: true` on the manifest to opt in). Without evacuate, drain guests first (`kctl drain node` live-migrates Ceph guests).
+
+When `spec.evacuate: true`, the controller marks the node `draining` and moves its VMs with the same live-then-cold paths as `kctl drain node`, applies the layout, then returns the node to `ready`. If any guest cannot move, the layout stays `refused` with the drain errors in `status.message` and no disk apply is attempted. That evacuate status is separate from `kctl node cordon`, which only stops new placement and leaves guests where they are.
 
 ## Recommended workflow: declarative `DiskLayout` resource
 
@@ -75,6 +77,7 @@ metadata:
   name: prod-data-pool
 spec:
   nodeId: node-prod-01
+  evacuate: false   # optional; default refuses apply while VMs remain on the node
   diskLayout:
     disks:
       - name: data1
