@@ -177,6 +177,7 @@ impl AdminService {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn guest_disk_op(
         &self,
         vm_name: &str,
@@ -211,7 +212,7 @@ impl AdminService {
         let remote = if grow {
             crate::guest_ops::grow_script(serial)
         } else {
-            format!("lsblk -bno NAME,SIZE,SERIAL,TYPE")
+            "lsblk -bno NAME,SIZE,SERIAL,TYPE".to_string()
         };
         let stdout =
             crate::guest_ops::ssh_exec(&paths.identity_file(), user, &ip, port, &remote, timeout)

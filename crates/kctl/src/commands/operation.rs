@@ -16,8 +16,8 @@ pub async fn list(info: &ConnectionInfo, include_finished: bool, vm: Option<Stri
         return Ok(());
     }
     println!(
-        "{:<36}  {:<14}  {:<16}  {:<12}  {:<12}  {}",
-        "ID", "KIND", "PHASE", "SOURCE", "TARGET", "VM"
+        "{:<36}  {:<14}  {:<16}  {:<12}  {:<12}  VM",
+        "ID", "KIND", "PHASE", "SOURCE", "TARGET"
     );
     for op in resp.operations {
         println!(

@@ -1893,11 +1893,11 @@ async fn main() {
             resource: RestoreResource::Controller { file, confirm },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::cluster_ops::restore(&info, &file, *confirm).await
+            commands::cluster_ops::restore(&info, file, *confirm).await
         }
         Command::Backup { output } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::cluster_ops::backup(&info, &output).await
+            commands::cluster_ops::backup(&info, output).await
         }
         Command::Flatten {
             resource: FlattenResource::Volume { name },
