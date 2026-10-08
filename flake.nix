@@ -225,13 +225,11 @@
             kcore-ceph = cephModule;
           };
 
-          nixosConfigurations.kcore-iso = inputs.nixpkgs.lib.nixosSystem {
-            system = "x86_64-linux";
-            modules = [
-              "${inputs.nixpkgs}/nixos/modules/installer/cd-dvd/iso-image.nix"
-              ./modules/kcore-minimal.nix
-              ./modules/kcore-branding.nix
-              (
+          nixosConfigurations =
+            let
+              # Shared by the ISO and the netboot image; media-specific options live in
+              # the per-target modules below.
+              kcoreInstallerModule = (
                 {
                   pkgs,
                   lib,
@@ -1451,15 +1449,74 @@
                     ];
                     mode = "0644";
                   };
+                }
+              );
 
+              kcoreIsoModule =
+                { ... }:
+                {
                   isoImage.volumeID = "KCORE";
                   isoImage.makeUsbBootable = true;
                   isoImage.makeEfiBootable = true;
                   image.fileName = "kcoreos-${kcoreVersion}-x86_64-linux.iso";
-                }
-              )
-            ];
-          };
+                };
+
+              # PXE / UEFI HTTP Boot: kernel + one initrd that embeds the squashfs nix store
+              # (the ISO initrd looks for it on a LABEL=KCORE volume, which a network boot
+              # does not have). The provisioning server serves vmlinuz and initrd.img and
+              # must pass `init=<contents of init>` on the kernel command line.
+              kcoreNetbootModule =
+                {
+                  config,
+                  pkgs,
+                  ...
+                }:
+                {
+                  image.fileName = "kcoreos-${kcoreVersion}-x86_64-netboot";
+                  # zstd -19 over the full closure is slow to build; -10 keeps the
+                  # image size within ~10% and cuts build time substantially.
+                  netboot.squashfsCompression = "zstd -Xcompression-level 10";
+                  # The squashfs is already compressed; do not compress it again.
+                  boot.initrd.compressor = "cat";
+                  boot.initrd.compressorArgs = [ ];
+                  # Serial console first so iDRAC/IPMI Serial-over-LAN shows stage 1 errors.
+                  boot.kernelParams = [
+                    "console=tty0"
+                    "console=ttyS0,115200n8"
+                  ];
+
+                  system.build.kcoreNetbootTree = pkgs.runCommand "kcore-netboot-tree" { } ''
+                    mkdir -p $out
+                    ln -s ${config.system.build.kernel}/${config.system.boot.loader.kernelFile} $out/vmlinuz
+                    ln -s ${config.system.build.netbootRamdisk}/initrd $out/initrd.img
+                    printf '%s\n' "${config.system.build.toplevel}/init" > $out/init
+                    printf '%s\n' "${toString config.boot.kernelParams}" > $out/kernel-params
+                  '';
+                };
+            in
+            {
+              kcore-iso = inputs.nixpkgs.lib.nixosSystem {
+                system = "x86_64-linux";
+                modules = [
+                  "${inputs.nixpkgs}/nixos/modules/installer/cd-dvd/iso-image.nix"
+                  ./modules/kcore-minimal.nix
+                  ./modules/kcore-branding.nix
+                  kcoreInstallerModule
+                  kcoreIsoModule
+                ];
+              };
+
+              kcore-netboot = inputs.nixpkgs.lib.nixosSystem {
+                system = "x86_64-linux";
+                modules = [
+                  "${inputs.nixpkgs}/nixos/modules/installer/netboot/netboot.nix"
+                  ./modules/kcore-minimal.nix
+                  ./modules/kcore-branding.nix
+                  kcoreInstallerModule
+                  kcoreNetbootModule
+                ];
+              };
+            };
         };
     };
 }
