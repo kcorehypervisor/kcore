@@ -64,6 +64,13 @@ let
       outdir=/run/kcore/disk-check
       mkdir -p "$outdir"
 
+      # The unit can start before DHCP has finished on every NIC, so the
+      # first POST often has no route yet.
+      post() {
+        curl -fsS --max-time 20 --retry 30 --retry-delay 5 --retry-all-errors --retry-connrefused \
+          -H 'Content-Type: application/json' --data-binary @- "$report" >/dev/null
+      }
+
       failures=0
       n=0
       IFS=','
@@ -79,9 +86,7 @@ let
         if [ -s "$out" ]; then
           echo "KCORE-DISK-CHECK rc=$rc $(tr -d '\n' <"$out")"
           if [ -n "$report" ]; then
-            curl -fsS --max-time 20 -H 'Content-Type: application/json' \
-              --data-binary @"$out" "$report" >/dev/null \
-              || echo "could not POST report for $dev to $report" >&2
+            post <"$out" || echo "could not POST report for $dev to $report" >&2
           fi
         else
           echo "KCORE-DISK-CHECK rc=$rc device=$dev no report produced" >&2
@@ -94,8 +99,7 @@ let
         # Marks the end of the run so the caller knows no more reports are coming.
         printf '{"done":true,"phase":"%s","nonce":"%s","machine_id":"%s","devices":%d,"failures":%d}\n' \
           "$phase" "$nonce" "$machine_id" "$n" "$failures" \
-          | curl -fsS --max-time 20 -H 'Content-Type: application/json' \
-              --data-binary @- "$report" >/dev/null \
+          | post \
           || echo "could not POST completion marker to $report" >&2
       fi
       [ "$failures" -eq 0 ]
