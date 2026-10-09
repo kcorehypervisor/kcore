@@ -123,6 +123,15 @@
               KCORE_GIT_REV = kcoreGitRev;
             }
           );
+
+          kcore-disk-verify = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "kcore-disk-verify";
+              cargoExtraArgs = "-p kcore-disk-verify";
+            }
+          );
         in
         {
           packages = {
@@ -133,6 +142,7 @@
               kctl
               kcore-dashboard
               kcore-console
+              kcore-disk-verify
               ;
           };
 
@@ -143,6 +153,7 @@
               kctl
               kcore-dashboard
               kcore-console
+              kcore-disk-verify
               ;
             clippy = craneLib.cargoClippy (
               commonArgs
@@ -247,6 +258,12 @@
                   kcoreCephModule = ./modules/kcore-ceph.nix;
                 in
                 {
+                  imports = [
+                    (import ./modules/kcore-disk-check.nix {
+                      diskVerify = inputs.self.packages.x86_64-linux.kcore-disk-verify;
+                    })
+                  ];
+
                   system.stateVersion = "25.05";
                   nixpkgs.config.allowUnfree = true;
                   nixpkgs.overlays = [
