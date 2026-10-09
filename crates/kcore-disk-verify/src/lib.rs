@@ -15,6 +15,7 @@
 //! power cycle except the nonce.
 
 pub mod device;
+pub mod wipe;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -163,14 +164,14 @@ pub fn plan(
 }
 
 /// A 4 KiB-aligned scratch buffer without `unsafe`: over-allocate and slice.
-struct AlignedBuf {
+pub(crate) struct AlignedBuf {
     storage: Vec<u8>,
     start: usize,
     len: usize,
 }
 
 impl AlignedBuf {
-    fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize) -> Self {
         let storage = vec![0u8; len + ALIGN as usize];
         let start = storage.as_ptr().align_offset(ALIGN as usize);
         Self {
@@ -180,11 +181,11 @@ impl AlignedBuf {
         }
     }
 
-    fn as_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut(&mut self) -> &mut [u8] {
         &mut self.storage[self.start..self.start + self.len]
     }
 
-    fn as_ref(&self) -> &[u8] {
+    pub(crate) fn as_ref(&self) -> &[u8] {
         &self.storage[self.start..self.start + self.len]
     }
 }

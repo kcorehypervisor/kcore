@@ -5,8 +5,12 @@ let
   # Driven entirely by the kernel command line, so the provisioning server can
   # request a check per machine through SetBootTarget boot_params:
   #
-  #   kcore.disk_check=write|verify   required; the unit is skipped without it
-  #   kcore.disk_nonce=RUN            required; same value for write and verify
+  #   kcore.disk_check=write|verify|wipe
+  #                                   required; the unit is skipped without it
+  #   kcore.disk_nonce=RUN            required for write and verify, same value
+  #                                   for both; not used by wipe
+  #   kcore.disk_wipe_mode=quick|full wipe only (default quick): zero the first
+  #                                   and last 32 MiB, or the whole disk
   #   kcore.disk_devices=A,B          optional; /dev/... or by-serial:SERIAL
   #                                   (default: every non-removable disk)
   #   kcore.disk_report=http://...    optional; each JSON report is POSTed here
@@ -38,14 +42,21 @@ let
       phase=$(param disk_check)
       nonce=$(param disk_nonce)
       devices=$(param disk_devices)
+      wipe_mode=$(param disk_wipe_mode)
       report=$(param disk_report)
       machine_id=$(param machine_id)
 
       case "$phase" in
         write | verify) ;;
-        *) echo "kcore.disk_check must be write or verify, got '$phase'" >&2; exit 1 ;;
+        wipe)
+          case "''${wipe_mode:-quick}" in
+            quick | full) ;;
+            *) echo "kcore.disk_wipe_mode must be quick or full, got '$wipe_mode'" >&2; exit 1 ;;
+          esac
+          ;;
+        *) echo "kcore.disk_check must be write, verify or wipe, got '$phase'" >&2; exit 1 ;;
       esac
-      if [ -z "$nonce" ]; then
+      if [ "$phase" != wipe ] && [ -z "$nonce" ]; then
         echo "kcore.disk_nonce is required" >&2
         exit 1
       fi
@@ -77,9 +88,11 @@ let
       for dev in $devices; do
         n=$((n + 1))
         out="$outdir/$phase-$n.json"
-        args=("$phase" --device "$dev" --nonce "$nonce")
+        args=("$phase" --device "$dev")
+        [ "$phase" != wipe ] && args+=(--nonce "$nonce")
         [ -n "$machine_id" ] && args+=(--machine-id "$machine_id")
         [ "$phase" = write ] && args+=(--yes)
+        [ "$phase" = wipe ] && args+=(--yes --mode "''${wipe_mode:-quick}")
 
         rc=0
         kcore-disk-verify "''${args[@]}" >"$out" || rc=$?
