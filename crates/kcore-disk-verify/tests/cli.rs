@@ -99,3 +99,72 @@ fn bad_arguments_are_rejected() {
         assert_eq!(out.status.code(), Some(1), "{args:?}");
     }
 }
+
+fn wipe(dev: &str, extra: &[&str]) -> (i32, serde_json::Value, String) {
+    let out = bin()
+        .args([
+            "wipe",
+            "--device",
+            dev,
+            "--serial",
+            "SER1",
+            "--allow-file",
+            "--no-direct",
+        ])
+        .args(extra)
+        .output()
+        .unwrap();
+    let json = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+    (
+        out.status.code().unwrap(),
+        json,
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn wipe_zeroes_the_disk_and_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let dev = image(&dir, 48);
+    std::fs::write(&dev, vec![0xEEu8; (48 * MIB) as usize]).unwrap();
+
+    let (code, r, err) = wipe(&dev, &["--yes", "--mode", "full", "--machine-id", "m-1"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(r["phase"], "wipe");
+    assert_eq!(r["mode"], "full");
+    assert_eq!(r["passed"], true);
+    assert_eq!(r["machine_id"], "m-1");
+    assert!(std::fs::read(&dev).unwrap().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn wipe_defaults_to_quick_and_needs_no_nonce() {
+    let dir = tempfile::tempdir().unwrap();
+    let dev = image(&dir, 48);
+    let (code, r, err) = wipe(&dev, &["--yes"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(r["mode"], "quick");
+}
+
+#[test]
+fn wipe_requires_confirmation_and_leaves_data_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let dev = image(&dir, 48);
+    std::fs::write(&dev, vec![0xEEu8; (48 * MIB) as usize]).unwrap();
+    let (code, _, err) = wipe(&dev, &[]);
+    assert_eq!(code, 1);
+    assert!(err.contains("--yes"), "{err}");
+    assert!(std::fs::read(&dev).unwrap().iter().all(|&b| b == 0xEE));
+}
+
+#[test]
+fn wipe_rejects_unknown_modes_and_mode_on_other_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let dev = image(&dir, 48);
+    assert_eq!(wipe(&dev, &["--yes", "--mode", "secure"]).0, 1);
+    let out = bin()
+        .args(["verify", "--device", &dev, "--nonce", "n", "--mode", "full"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}

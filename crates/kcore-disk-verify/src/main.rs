@@ -10,14 +10,19 @@
 //! the check, 1 the tool could not run.
 
 use anyhow::{bail, Context, Result};
+use kcore_disk_verify::wipe::{wipe, WipeMode, WipeParams};
 use kcore_disk_verify::{device, run_phase, Params, Phase, DEFAULT_REGIONS, DEFAULT_REGION_LEN};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
 Usage: kcore-disk-verify <write|verify> --device DEV --nonce NONCE [options]
+       kcore-disk-verify wipe --device DEV --yes [--mode quick|full] [options]
 
   write   Destroys data on DEV. Needs --yes. DEV must not be mounted.
   verify  Read-only. Run it after a full power cycle, with the same NONCE.
+  wipe    Destroys data on DEV. Needs --yes. quick zeroes the first and last
+          32 MiB (default); full zeroes the whole disk. Reads the zeros back.
+          No --nonce needed.
 
 Options:
   --device DEV        /dev/... or by-serial:SERIAL
@@ -26,12 +31,14 @@ Options:
   --machine-id ID     Include in the JSON, ready for RecordDiskVerification
   --regions N         Regions to test (default 32)
   --region-kib N      Region size in KiB, multiple of 4 (default 1024)
-  --yes               Confirm that write destroys data
+  --mode MODE         wipe only: quick (default) or full
+  --yes               Confirm that write or wipe destroys data
   --allow-file        Allow a regular file instead of a block device (testing)
   --no-direct         Do not use O_DIRECT (testing on tmpfs)
 ";
 
 struct Cli {
+    wipe: Option<WipeMode>,
     phase: Phase,
     device: String,
     nonce: String,
@@ -46,13 +53,16 @@ struct Cli {
 
 fn parse_args(args: &[String]) -> Result<Cli> {
     let mut it = args.iter();
-    let phase = match it.next().map(|s| s.as_str()) {
-        Some("write") => Phase::Write,
-        Some("verify") => Phase::Verify,
-        _ => bail!("first argument must be write or verify"),
+    let (phase, is_wipe) = match it.next().map(|s| s.as_str()) {
+        Some("write") => (Phase::Write, false),
+        Some("verify") => (Phase::Verify, false),
+        Some("wipe") => (Phase::Write, true),
+        _ => bail!("first argument must be write, verify or wipe"),
     };
+    let mut wipe_mode = is_wipe.then_some(WipeMode::Quick);
 
     let mut cli = Cli {
+        wipe: None,
         phase,
         device: String::new(),
         nonce: String::new(),
@@ -81,6 +91,13 @@ fn parse_args(args: &[String]) -> Result<Cli> {
                 let kib: u64 = value("--region-kib")?.parse().context("--region-kib")?;
                 cli.region_len = kib.checked_mul(1024).context("--region-kib too large")?;
             }
+            "--mode" => {
+                if !is_wipe {
+                    bail!("--mode only applies to wipe");
+                }
+                let m = value("--mode")?;
+                wipe_mode = Some(WipeMode::parse(&m).context("--mode must be quick or full")?);
+            }
             "--yes" => cli.yes = true,
             "--allow-file" => cli.allow_file = true,
             "--no-direct" => cli.no_direct = true,
@@ -88,8 +105,12 @@ fn parse_args(args: &[String]) -> Result<Cli> {
         }
     }
 
+    cli.wipe = wipe_mode;
     if cli.device.is_empty() {
         bail!("--device is required");
+    }
+    if is_wipe {
+        return Ok(cli);
     }
     let nonce_ok = !cli.nonce.is_empty()
         && cli.nonce.len() <= 64
@@ -125,7 +146,8 @@ fn run(args: &[String]) -> Result<bool> {
     if cli.phase == Phase::Write {
         if !cli.yes {
             bail!(
-                "write destroys data on {}; pass --yes to confirm",
+                "{} destroys data on {}; pass --yes to confirm",
+                if cli.wipe.is_some() { "wipe" } else { "write" },
                 device_path
             );
         }
@@ -140,6 +162,19 @@ fn run(args: &[String]) -> Result<bool> {
     };
 
     let mut file = device::open(&device_path, cli.phase == Phase::Write, !cli.no_direct)?;
+    if let Some(mode) = cli.wipe {
+        let report = wipe(
+            &mut file,
+            &WipeParams {
+                device: &device_path,
+                serial: &serial,
+                machine_id: cli.machine_id.as_deref(),
+                mode,
+            },
+        )?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(report.passed);
+    }
     let report = run_phase(
         &mut file,
         cli.phase,
