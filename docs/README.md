@@ -17,6 +17,7 @@
 | Release verification (SBOMs + Sigstore) | [release-verification.md](./release-verification.md) |
 | Formal methods | [formal-methods-and-verification.md](./formal-methods-and-verification.md) |
 | Heartbeat | [heartbeat.md](./heartbeat.md) |
+| Host metrics (node_exporter / VictoriaMetrics) | [host-metrics.md](./host-metrics.md) |
 | Webhooks and events | [webhooks.md](./webhooks.md) |
 | kctl workflows | [kctl-commands-and-workflows.md](./kctl-commands-and-workflows.md) |
 | Migrations | [migrations.md](./migrations.md) |

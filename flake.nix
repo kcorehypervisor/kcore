@@ -215,6 +215,7 @@
           chVmModule = ./modules/ch-vm;
           dashboardModule = ./modules/kcore-dashboard.nix;
           cephModule = ./modules/kcore-ceph.nix;
+          metricsModule = ./modules/kcore-metrics.nix;
         in
         {
           nixosModules = {
@@ -223,6 +224,7 @@
             kcore-disko = ./modules/kcore-disko.nix;
             kcore-dashboard = dashboardModule;
             kcore-ceph = cephModule;
+            kcore-metrics = metricsModule;
           };
 
           nixosConfigurations.kcore-iso = inputs.nixpkgs.lib.nixosSystem {
@@ -247,6 +249,7 @@
                   kcoreDiskoModule = ./modules/kcore-disko.nix;
                   kcoreBrandingModule = ./modules/kcore-branding.nix;
                   kcoreCephModule = ./modules/kcore-ceph.nix;
+                  kcoreMetricsModule = ./modules/kcore-metrics.nix;
                 in
                 {
                   system.stateVersion = "25.05";
@@ -567,6 +570,8 @@
                                                                     printf "%-14s %s\n" "node-agent" "$(service_status kcore-node-agent.service 9091)"
                                                                     printf "%-14s %s\n" "controller" "$(service_status kcore-controller.service 9090)"
                                                                     printf "%-14s %s\n" "dashboard" "$(service_status kcore-dashboard.service 8080)"
+                                                                    printf "%-14s %s\n" "metrics" "$(service_status prometheus-node-exporter.service 9100)"
+                                                                    printf "%-14s %s\n" "victoriametrics" "$(service_status victoriametrics.service 8428)"
                                                                     printf "\nAccess\n"
                                                                     printf "%s\n" "SSH only (no local login)"
                                                                     printf "%s\n" "Use kctl from operator host"
@@ -926,6 +931,7 @@
                                                                 cp ${kcoreDiskoModule} /mnt/etc/nixos/modules/kcore-disko.nix
                                                                 cp ${kcoreBrandingModule} /mnt/etc/nixos/modules/kcore-branding.nix
                                                                 cp ${kcoreCephModule} /mnt/etc/nixos/modules/kcore-ceph.nix
+                                                                cp ${kcoreMetricsModule} /mnt/etc/nixos/modules/kcore-metrics.nix
                                                                 printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-ceph.nix
                                                                 # The format already happened. The saved graph must not point at
                                                                 # /tmp, which is gone after reboot.
@@ -1084,6 +1090,10 @@
                         keyFile: /etc/kcore/certs/controller.key
                         subCaCertFile: /etc/kcore/certs/sub-ca.crt
                         subCaKeyFile: /etc/kcore/certs/sub-ca.key
+                      metrics:
+                        enabled: true
+                        fileSdPath: /etc/kcore/metrics/file_sd/nodes.json
+                        scrapePort: 9100
                       CTRLEOF
 
                                                                   # Always write replication config so the controller emits
@@ -1135,6 +1145,29 @@
                                                                 fi
                                                                 if [ "$DISABLE_VXLAN" != "true" ]; then
                                                                   EXTRA_UDP_PORTS="4789"
+                                                                fi
+
+                                                                # node_exporter scrape allowlist: known controller IPs + this node's /24.
+                                                                # Never open 9100 on allowedTCPPorts (world-reachable).
+                                                                METRICS_SCRAPE_SOURCES="\"127.0.0.1\""
+                                                                _METRICS_SEEN="|127.0.0.1|"
+                                                                for ctrl in "''${CONTROLLER_ENDPOINTS[@]}"; do
+                                                                  ctrl_host="''${ctrl%%:*}"
+                                                                  if [ -n "$ctrl_host" ] && [[ "$_METRICS_SEEN" != *"|$ctrl_host|"* ]]; then
+                                                                    METRICS_SCRAPE_SOURCES="$METRICS_SCRAPE_SOURCES \"$ctrl_host\""
+                                                                    _METRICS_SEEN="$_METRICS_SEEN$ctrl_host|"
+                                                                  fi
+                                                                done
+                                                                if [[ "$EXTERNAL_IP" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                                                                  _LAN_CIDR="''${BASH_REMATCH[1]}.''${BASH_REMATCH[2]}.''${BASH_REMATCH[3]}.0/24"
+                                                                  if [[ "$_METRICS_SEEN" != *"|$_LAN_CIDR|"* ]]; then
+                                                                    METRICS_SCRAPE_SOURCES="$METRICS_SCRAPE_SOURCES \"$_LAN_CIDR\""
+                                                                  fi
+                                                                fi
+                                                                if [ "$RUN_CONTROLLER" = "true" ]; then
+                                                                  METRICS_SERVER_ENABLE="true"
+                                                                else
+                                                                  METRICS_SERVER_ENABLE="false"
                                                                 fi
 
                                                                 # Build controller service block conditionally
@@ -1243,6 +1276,7 @@
                           ./modules/ch-vm
                           ./modules/kcore-branding.nix
                           ./modules/kcore-ceph.nix
+                          ./modules/kcore-metrics.nix
                           ./kcore-ceph.nix
                           ./kcore-vms.nix
                         ];
@@ -1268,6 +1302,12 @@
                         networking.firewall.enable = true;
                         networking.firewall.allowedTCPPorts = [ 22 9091 $EXTRA_TCP_PORTS ];
                         networking.firewall.allowedUDPPorts = [ $EXTRA_UDP_PORTS ];
+
+                        kcore.metrics = {
+                          enable = true;
+                          allowedScrapeSources = [ $METRICS_SCRAPE_SOURCES ];
+                          server.enable = $METRICS_SERVER_ENABLE;
+                        };
 
                         users.users.root = {
                           initialPassword = "kcore";

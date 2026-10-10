@@ -26,9 +26,10 @@ Administrator account baked into the image, not the cloud-init user.
 ## Build the image
 
 Use the public recipe at [kcorehypervisor/windows-guest](https://github.com/kcorehypervisor/windows-guest).
-It installs Windows Server 2022 once under QEMU with virtio drivers pinned to
-0.1.240, enables OpenSSH and the serial console (SAC), then shuts the guest
-down. Do not publish the ISO, the disk, or the Administrator password.
+`./build.sh` installs Windows Server 2022. `./build-win10.sh` installs Windows 10
+with the `w10` virtio drivers. Both pin virtio-win 0.1.240, enable OpenSSH, and
+shut the guest down. Server also enables the serial console (SAC). Do not
+publish the ISO, the disk, or the Administrator password.
 
 Newer virtio-win builds break on Cloud Hypervisor (NetKVM on the virtio-net
 control queue, and viostor when discard is advertised). Stay on the pin in
@@ -36,6 +37,24 @@ that recipe.
 
 Microsoft evaluation images must reach the internet to activate within 10 days,
 and they expire after 180 days.
+
+## Windows 11
+
+Windows 11 uses the same node configuration and the same `kctl create vm` or
+`kcore_vm` resource. Change the image path. kcore does not grow a guest-type
+field for it.
+
+Windows 11 Setup stops when it cannot see a TPM 2.0 and Secure Boot. kcore
+does not attach either device to the guest. A lab image can skip those two
+checks in the answer file and then boot on the same Cloud Hypervisor command
+line as Server 2022. That install is not a Microsoft-supported configuration:
+some later feature updates refuse to run without a TPM. The
+[windows-guest](https://github.com/kcorehypervisor/windows-guest) recipe
+builds Server 2022 today. A Windows 11 disk is the same scripts with the
+edition name and the `w11` virtio driver directory from the pinned virtio ISO.
+
+Give the guest at least 2 CPUs and 4 GB of RAM. That is already the size used
+for the Server example.
 
 ## Create the VM
 

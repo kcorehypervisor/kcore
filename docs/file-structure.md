@@ -91,6 +91,7 @@ kcore-rust/
 │   │   ├── cloud-init.nix           generates cloud-init seed ISOs (user-data/meta-data) per VM
 │   │   └── helpers.nix              utility functions (deterministic TAP name generation)
 │   ├── kcore-branding.nix           OS branding: login banner, MOTD, NixOS label, issue text
+│   ├── kcore-metrics.nix            node_exporter + optional VictoriaMetrics (host metrics)
 │   └── kcore-minimal.nix            minimal base config: no docs, en_US locale, lean package set
 │
 ├── tests/
@@ -117,6 +118,7 @@ kcore-rust/
     ├── networking.md                VM network model, examples, and operational guidance
     ├── migrations.md                DB/API migration notes and rollout guidance
     ├── heartbeat.md                 controller/node heartbeat behavior and liveness semantics
+    ├── host-metrics.md              node_exporter + VictoriaMetrics scrape/store path
     ├── scheduler.md                 scheduling strategy and node selection behavior
     ├── storage.md                   storage backend model, commands, generated config, and file map
     ├── security.md                  PKI, CN authorization, input validation, async safety, auditing
@@ -192,6 +194,7 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `crates/controller/build.rs` — proto compilation hook; generates Rust bindings for controller server traits and node client stubs at build time.
 - `crates/controller/src/main.rs` — controller runtime bootstrap; parses CLI/config, initializes DB/clients/services, configures TLS, and starts gRPC serving loop.
 - `crates/controller/src/config.rs` — typed configuration model; handles defaults, deserialization, and validation for listener, network defaults, and certificate file paths.
+- `crates/controller/src/metrics_targets.rs` — writes Prometheus `file_sd` JSON from the node inventory for VictoriaMetrics scrapes.
 - `crates/controller/src/db.rs` — persistence core; owns schema migrations, CRUD methods, typed row conversion, and transactional update patterns for cluster state.
 - `crates/controller/src/scheduler.rs` — scheduling logic; chooses eligible nodes based on readiness and available capacity for create/drain workflows.
 - `crates/controller/src/nixgen.rs` — declarative config renderer; converts DB VM/network/storage state into escaped Nix module configuration text.
@@ -251,6 +254,7 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `modules/ch-vm/helpers.nix` — deterministic helper functions for naming, tap derivation, and MAC generation.
 - `modules/kcore-branding.nix` — branding layer; defines MOTD, labels, and identity-related presentation settings.
 - `modules/kcore-minimal.nix` — baseline hardening/minimal profile; trims nonessential packages/features for appliance-style use.
+- `modules/kcore-metrics.nix` — host metrics; enables `node_exporter` on every node and optional VictoriaMetrics on controllers (see [host-metrics.md](./host-metrics.md)).
 
 ### Tests & Scripts
 
