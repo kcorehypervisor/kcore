@@ -62,9 +62,9 @@ The console pages are:
 
 | Page | Purpose |
 | --- | --- |
-| Overview | Product, node, version, API endpoint, management URL, health, uptime, local-login status |
-| Network | NIC inventory: interface, state, MAC, IPv4/IPv6, MTU, speed, driver, default-route and management markers |
-| Storage | Disk inventory: device, path, model, serial, size, SSD/HDD/NVMe, read-only flag, mountpoints, health, role |
+| Overview | Node status card (identity, health, API, management) with a System log panel underneath |
+| Network | NIC table: interface (bridge master when enslaved), state, MAC, IPv4/IPv6, speed/flags; columns adapt to width |
+| Storage | Disk table: device, path, size, kind, health, role; columns adapt to width |
 | Diagnostics | Local kcore service status for node-agent, controller, and dashboard |
 | Help | Security model and operator reminders |
 
