@@ -87,6 +87,9 @@ jobs:
       - name: Nix flake evaluation
         run: nix flake show --json > /dev/null
 
+      - name: Ceph module eval (kcore.ceph.enable + firewall)
+        run: nix build --no-link .#checks.x86_64-linux.ceph-module-eval
+
       - name: Nix format check
         run: nix build --no-link .#checks.x86_64-linux.fmt-nix
 
