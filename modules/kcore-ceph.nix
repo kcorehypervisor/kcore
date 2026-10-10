@@ -159,10 +159,13 @@ in
       }
     ];
     nixpkgs.overlays = [ (_final: _prev: { ceph = cfg.package; }) ];
+    # rbd-nbd maps images (kernel krbd cannot use Ceph 20 aes256k keys).
     boot.kernelModules = [
       "rbd"
       "ceph"
+      "nbd"
     ];
+    boot.extraModprobeConfig = "options nbd nbds_max=128 max_part=0";
     environment.systemPackages = [ cfg.package ];
 
     # Minimal networking fallback so Ceph works before / without NodeNetwork.
