@@ -66,8 +66,23 @@ let
         "path=${path},image_type=raw,serial=${disk.serial}${ro}"
       ) vmCfg.dataDisks;
 
+      # The declared format comes from the image URL/extension, which is wrong for
+      # qcow2 cloud images named *.img. A qcow2 magic header always wins over a
+      # declared "raw", otherwise the qcow2 bytes would be copied onto the disk verbatim.
+      srcFormatFn = ''
+        src_format() {
+          local PATH="${pkgs.coreutils}/bin:$PATH"
+          if [ "$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "514649fb" ]; then
+            echo qcow2
+          else
+            echo "$2"
+          fi
+        }
+      '';
+
       lvmProvisionScript = pkgs.writeShellScript "lvm-provision-${vmName}" ''
         set -e
+        ${srcFormatFn}
         LV_DEVICE="${lvDevice}"
         VG="${cfg.lvmVgName}"
         LV="${lvName}"
@@ -82,7 +97,7 @@ let
         if [ ! -f "$SEED_MARKER" ]; then
           echo "Converting source image to LV..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
-            -f ${vmCfg.imageFormat} -O raw \
+            -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
             ${toString vmCfg.image} "$LV_DEVICE"
           mkdir -p "$(dirname "$SEED_MARKER")"
           touch "$SEED_MARKER"
@@ -94,6 +109,7 @@ let
 
       zfsProvisionScript = pkgs.writeShellScript "zfs-provision-${vmName}" ''
         set -e
+        ${srcFormatFn}
         ZVOL_DATASET="${zvolDataset}"
         ZVOL_DEVICE="${zvolDevice}"
         SIZE_BYTES="${toString vmCfg.storageSizeBytes}"
@@ -115,7 +131,7 @@ let
         if [ ! -f "$SEED_MARKER" ]; then
           echo "Converting source image to zvol..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
-            -f ${vmCfg.imageFormat} -O raw \
+            -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
             ${toString vmCfg.image} "$ZVOL_DEVICE"
           mkdir -p "$(dirname "$SEED_MARKER")"
           touch "$SEED_MARKER"
@@ -134,12 +150,13 @@ let
         nbd_dev() {
           rbd device list -t nbd --format json 2>/dev/null \
             | jq -r --arg p "''${1%%/*}" --arg i "''${1#*/}" \
-              '[.[] | select(.pool == $p and .image == $i and ((.snap // "-") == "-"))][0].device // empty'
+              '[.[] | select(.pool == $p and .image == $i and ((.snap // "") | . == "" or . == "-"))][0].device // empty'
         }
       '';
 
       cephMapScript = pkgs.writeShellScript "ceph-map-${vmName}" ''
         set -e
+        ${srcFormatFn}
         ${rbdNbdFunctions}
         map_one() {
           local IMAGE="$1"
@@ -179,7 +196,7 @@ let
           test -e "$SOURCE" || { echo "missing source image: $SOURCE"; exit 1; }
           echo "Seeding RBD $IMAGE from $SOURCE..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
-            -f ${vmCfg.imageFormat} -O raw \
+            -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
             "$SOURCE" "$RBD_DEV"
           ${pkgs.ceph}/bin/rbd image-meta set "$IMAGE" kcore.seeded 1
           mkdir -p "$(dirname "$LOCAL_MARKER")"
