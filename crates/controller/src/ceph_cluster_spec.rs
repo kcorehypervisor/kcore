@@ -63,8 +63,25 @@ pub fn validate_spec(spec: &CephClusterSpec) -> Result<(), String> {
                 ));
             }
         }
+        if node.public_iface.trim().is_empty() || node.cluster_iface.trim().is_empty() {
+            return Err(format!(
+                "publicIface and clusterIface are required for {}",
+                node.node_id
+            ));
+        }
     }
     Ok(())
+}
+
+/// Loud plan notice for encryptOsds (immutable after create).
+pub fn encrypt_osds_notice(encrypt: bool) -> String {
+    if encrypt {
+        "encryptOsds=true (DEFAULT): every OSD will be LUKS-encrypted via ceph-volume --dmcrypt. \
+This is immutable after create — set encryptOsds: false explicitly only for labs."
+            .into()
+    } else {
+        "encryptOsds=false: OSD disks will NOT be encrypted. Immutable after create.".into()
+    }
 }
 
 /// Kernel paths this node should have OSDs on.
@@ -226,6 +243,22 @@ mod tests {
         spec.nodes[0].osd_device = "nvme0n1".into();
         let err = validate_spec(&spec).expect_err("relative osd");
         assert!(err.contains("absolute"));
+    }
+
+    #[test]
+    fn encrypt_osds_notice_is_loud_for_default_true() {
+        let notice = encrypt_osds_notice(true);
+        assert!(notice.contains("encryptOsds=true"));
+        assert!(notice.to_ascii_lowercase().contains("immutable"));
+        let plain = encrypt_osds_notice(false);
+        assert!(plain.contains("encryptOsds=false"));
+    }
+
+    #[test]
+    fn validate_accepts_by_id_osd_device() {
+        let mut spec = valid_spec();
+        spec.nodes[0].osd_device = "/dev/disk/by-id/ata-Micron_1300_SATA_512GB_2144329E98F2".into();
+        validate_spec(&spec).expect("by-id path");
     }
 
     #[test]
