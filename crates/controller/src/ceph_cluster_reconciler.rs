@@ -409,8 +409,8 @@ pub(crate) fn generate_ceph_nix(
     publicNetwork = "{public_network}";
     clusterNetwork = "{cluster_network}";
     monAddress = "{mon_host}";
-    // Only this daemon — listing peers that are not yet in the monmap makes
-    // ceph.conf invent 0.0.0.0 placeholders and keeps the mon in "probing".
+    # Only this daemon — listing peers that are not yet in the monmap makes
+    # ceph.conf invent 0.0.0.0 placeholders and keeps the mon in "probing".
     monInitialMembers = "{daemon_id}";
     publicAddr = "{public_addr}";
     clusterAddr = "{cluster_addr}";
@@ -506,6 +506,10 @@ mod tests {
         assert!(nix.contains("monAddress = \"10.10.0.11,10.10.0.12\";"));
         // Local daemon only — peers join via ceph mon add, not initial-members.
         assert!(nix.contains("monInitialMembers = \"dell-tower-1\";"));
+        assert!(
+            !nix.lines().any(|l| l.trim_start().starts_with("//")),
+            "Nix comments use #; // is the update operator"
+        );
         assert!(!nix.contains("monInitialMembers = \"dell-tower-1,dell-2\";"));
         assert!(nix.contains("publicAddr = \"10.10.0.11\";"));
         assert!(nix.contains("clusterAddr = \"10.20.0.11\";"));
