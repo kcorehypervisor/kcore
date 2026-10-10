@@ -714,7 +714,47 @@ async fn prepare_osd_device(device: &str, force_wipe: bool, encrypt: bool) -> Re
     Ok(())
 }
 
-async fn retire_osd(osd: &crate::ceph_bootstrap::ListedOsd) -> Result<(), Status> {
+/// Remove everything a deleted cluster left on this node so a later cluster
+/// (even with the same fsid) starts clean: OSD tmpfs mounts, daemon data, the
+/// stored bootstrap keys and any saved monmap.
+async fn wipe_local_ceph_state() {
+    if let Ok(mut dir) = tokio::fs::read_dir("/var/lib/ceph/osd").await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let _ = Command::new("umount").arg(entry.path()).output().await;
+        }
+    }
+    for sub in ["mon", "mgr", "osd"] {
+        let base = format!("/var/lib/ceph/{sub}");
+        if let Ok(mut dir) = tokio::fs::read_dir(&base).await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+            }
+        }
+    }
+    let _ = tokio::fs::remove_file(crate::ceph_bootstrap::BOOTSTRAP_STATE_PATH).await;
+    if let Ok(mut dir) = tokio::fs::read_dir("/var/lib/kcore").await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ceph-monmap-")
+            {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+    for f in ["ceph.client.admin.keyring", "ceph.mon.keyring"] {
+        let _ = tokio::fs::remove_file(format!("/etc/ceph/{f}")).await;
+    }
+}
+
+/// `require_purge` is false when the whole cluster is being deleted: the OSD's
+/// map entry dies with the cluster, so an unreachable quorum must not stop the
+/// disk from being zapped.
+async fn retire_osd(
+    osd: &crate::ceph_bootstrap::ListedOsd,
+    require_purge: bool,
+) -> Result<(), Status> {
     let id = osd.id.trim();
     if id.is_empty() {
         return Err(Status::internal("ceph-volume listed an OSD with no id"));
@@ -728,7 +768,8 @@ async fn retire_osd(osd: &crate::ceph_bootstrap::ListedOsd) -> Result<(), Status
         .await
         .map_err(|e| Status::internal(format!("ceph osd purge: {e}")))?;
     let purge_err = String::from_utf8_lossy(&purge.stderr);
-    if !purge.status.success()
+    if require_purge
+        && !purge.status.success()
         && !purge_err.contains("does not exist")
         && !purge_err.contains("not present")
     {
@@ -2315,7 +2356,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             if still_wanted {
                 continue;
             }
-            retire_osd(osd).await?;
+            retire_osd(osd, true).await?;
             retired.push(format!("osd.{} ({})", osd.id, osd.devices.join(",")));
         }
         Ok(Response::new(proto::ReconcileCephOsdsResponse {
@@ -2338,7 +2379,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let daemon_id = daemon_id_from_ceph_nix(&nix);
         let prepared = list_prepared_osds().await?;
         for osd in &prepared {
-            retire_osd(osd).await?;
+            retire_osd(osd, false).await?;
         }
         if !daemon_id.is_empty() {
             let _ = Command::new("systemctl")
@@ -2350,6 +2391,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 .output()
                 .await;
         }
+        wipe_local_ceph_state().await;
         tokio::fs::write(CEPH_NIX_PATH, "{ ... }: {}\n")
             .await
             .map_err(|e| Status::internal(format!("clearing {CEPH_NIX_PATH}: {e}")))?;
