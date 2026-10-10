@@ -47,6 +47,21 @@ pub fn run_ceph(args: &[&str]) -> Result<String, CephCliError> {
     }
 }
 
+/// Parse `ceph --version` / `ceph version` output. Ceph 20 (Tentacle) and 19
+/// (Squid) both use `ceph version X.Y.Z ...`.
+pub fn parse_ceph_version_line(line: &str) -> Option<(u32, u32, u32)> {
+    // Examples:
+    //   ceph version 20.2.4 (....) tentacle (stable)
+    //   ceph version 19.2.3 (....) squid (stable)
+    let rest = line.trim().strip_prefix("ceph version ")?;
+    let ver = rest.split_whitespace().next()?;
+    let mut parts = ver.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
 pub fn run_rados(args: &[&str]) -> Result<String, CephCliError> {
     if !Command::new("rados")
         .arg("--version")
@@ -70,5 +85,23 @@ pub fn run_rados(args: &[&str]) -> Result<String, CephCliError> {
         } else {
             stderr
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ceph_version_line;
+
+    #[test]
+    fn parses_ceph_20_tentacle_and_19_squid() {
+        assert_eq!(
+            parse_ceph_version_line("ceph version 20.2.4 (abcdef) tentacle (stable)"),
+            Some((20, 2, 4))
+        );
+        assert_eq!(
+            parse_ceph_version_line("ceph version 19.2.3 (deadbeef) squid (stable)"),
+            Some((19, 2, 3))
+        );
+        assert!(parse_ceph_version_line("not a version").is_none());
     }
 }

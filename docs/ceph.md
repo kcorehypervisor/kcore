@@ -51,26 +51,62 @@ spec:
       clusterAddr: "10.20.0.11"
       publicIface: eth1
       clusterIface: eth2
-      osdDevice: /dev/nvme0n1
+      # Prefer by-id — /dev/sdX renames when USB disks shift names.
+      osdDevice: /dev/disk/by-id/ata-Micron_1300_SATA_512GB_2144329E98F2
     # … additional members
-  # encryptOsds: true   # default; LUKS per OSD via ceph-volume --dmcrypt
+  # encryptOsds: true   # DEFAULT; LUKS per OSD via ceph-volume --dmcrypt
   # encryptOsds: false  # labs only; set on first create — immutable afterwards
 ```
 
 ```bash
-kctl apply -f lab-san-ceph.yaml
+kctl diff -f lab-san-ceph.yaml    # preflight + loud encryptOsds notice
+kctl apply -f lab-san-ceph.yaml   # plan first, then persist if ok
 kctl get ceph-cluster
 kctl describe ceph-cluster lab-san
 ```
 
+**Mon addresses must be static** (or DHCP reservations). Preflight fails when the
+public iface for `monAddr` looks DHCP-managed — a lease change silently breaks
+quorum. Lab mons use reservations (e.g. `192.168.40.103:6789`).
+
+**Do not use hardware RAID virtual disks** (PERC / MegaRAID / "Virtual Disk") as
+`osdDevice`. Preflight refuses those models.
+
+### Nixpkgs Ceph package
+
+Nodes pin nixpkgs `b40629ef`, where in-tree `ceph` 19.2.3 does not evaluate
+(`sphinx` 9.1.0 needs Python ≥ 3.12). [`modules/kcore-ceph.nix`](../modules/kcore-ceph.nix)
+overlays `pkgs.ceph` with **Ceph 20.2.4** from a pinned newer revision that is
+in `cache.nixos.org`. Remove the overlay once the base flake pin evaluates
+`nixpkgs#ceph` cleanly. CI check: `nix build .#checks.x86_64-linux.ceph-module-eval`.
+
+`ApplyCephConfig` also refreshes `/etc/nixos/modules/kcore-ceph.nix` from the
+agent build so module fixes reach already-installed nodes without a manual copy.
+
+### Firewall and cluster address (without NodeNetwork)
+
+The module opens TCP **3300**, **6789**, and **6800–7568** on the host (and on
+`publicIface` when set), trusts `clusterIface`, and can assign a static
+`clusterAddr` on that iface from `clusterNetwork`'s prefix. Prefer a
+`NodeNetwork` claim when that resource is available; the module path is the
+fallback so Ceph bring-up does not require hand-edited `configuration.nix`.
+
 ### Reconciler sequence
 
-1. Persist spec + generation.
-2. `ApplyCephConfig` — write `/etc/nixos/kcore-ceph.nix`, rebuild; cluster name is always `ceph`; `mon_host` lists every member.
-3. First eligible node builds mon/admin/bootstrap-osd keyrings (`ceph-authtool`); controller redistributes the package; peers run `ceph-mon --mkfs` / mgr auth.
-4. `BootstrapCephOsd` — `ceph-volume lvm create` on `osdDevice` (with `--dmcrypt` when `encryptOsds` is true; refuses non-empty disks unless `forceWipe: true`), activate units (no `--no-systemd`).
-5. `EnsureCephPool` for `kcore-vms` (size/min_size, RBD application, `rbd pool init`).
-6. Poll health until `HEALTH_OK`; otherwise requeue.
+1. **Preflight** on every member (`nixos-rebuild dry-build`, OSD device exists /
+   not mounted / not RAID, addresses present, nixpkgs pin resolves, mon not on
+   DHCP). `kctl apply` / `kctl diff` print per-node results and refuse on failure.
+2. Persist spec + generation (encryptOsds notice is printed loudly; default is
+   `true` and immutable after create).
+3. `ApplyCephConfig` — sync module + write `/etc/nixos/kcore-ceph.nix`, rebuild;
+   cluster name is always `ceph`; `mon_host` lists every member.
+4. First eligible node builds mon/admin/bootstrap-osd keyrings (`ceph-authtool`);
+   controller redistributes the package; peers run `ceph-mon --mkfs` / mgr auth.
+5. `BootstrapCephOsd` — `ceph-volume lvm create` on `osdDevice` (with `--dmcrypt`
+   when `encryptOsds` is true; refuses non-empty disks unless `forceWipe: true`),
+   activate units (no `--no-systemd`). Compatible with Ceph 20.x (Tentacle).
+6. `EnsureCephPool` for `kcore-vms` (size/min_size, RBD application, `rbd pool init`).
+7. Poll health until `HEALTH_OK`; otherwise requeue.
 
 OSD dm-crypt protects disk theft/RMA; it does **not** protect a compromised mon or host. Keys live in the mon config-key store. Enabling encryption on an existing plain cluster means replacing OSD devices (remove → backfill → re-add with dmcrypt).
 
