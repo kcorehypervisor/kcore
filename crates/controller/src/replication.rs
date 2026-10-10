@@ -3403,6 +3403,7 @@ mod tests {
             webhooks: Default::default(),
             scheduler: Default::default(),
             failover: Default::default(),
+            metrics: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 
@@ -3444,6 +3445,7 @@ mod tests {
             webhooks: Default::default(),
             scheduler: Default::default(),
             failover: Default::default(),
+            metrics: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 

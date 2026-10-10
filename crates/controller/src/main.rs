@@ -20,6 +20,7 @@ mod db;
 mod disk_reconciler;
 mod grpc;
 mod guest_ops;
+mod metrics_targets;
 mod net_policy;
 mod nixgen;
 mod node_client;
@@ -215,6 +216,8 @@ async fn main() -> anyhow::Result<()> {
             webhooks: webhooks.clone(),
         },
     );
+
+    metrics_targets::spawn_file_sd_writer(database.clone(), cfg.metrics.clone());
 
     if cfg.pki.http_enabled {
         match cfg.pki.http_listen_addr.parse::<std::net::SocketAddr>() {
