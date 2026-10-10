@@ -738,6 +738,7 @@ async fn wipe_local_ceph_state() {
         }
     }
     let _ = tokio::fs::remove_file(crate::ceph_bootstrap::BOOTSTRAP_STATE_PATH).await;
+    let _ = tokio::fs::remove_file("/var/lib/ceph/bootstrap-osd/ceph.keyring").await;
     if let Ok(mut dir) = tokio::fs::read_dir("/var/lib/kcore").await {
         while let Ok(Some(entry)) = dir.next_entry().await {
             if entry
