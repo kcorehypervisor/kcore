@@ -127,16 +127,46 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::CephClusterSpec {
 pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
     let manifest = parse_manifest(file)?;
     let mut client = client::controller_client(info).await?;
+    let cluster = controller_proto::CephCluster {
+        name: manifest.metadata.name.clone(),
+        generation: 0,
+        spec: Some(to_proto_spec(&manifest.spec)),
+        status: None,
+        created_at: None,
+        updated_at: None,
+    };
+
+    let plan = client
+        .plan_ceph_cluster(controller_proto::PlanCephClusterRequest {
+            ceph_cluster: Some(cluster.clone()),
+        })
+        .await
+        .context("plan_ceph_cluster rpc")?
+        .into_inner();
+
+    println!("=== CephCluster plan: {} ===", manifest.metadata.name);
+    println!();
+    println!("!!! {} !!!", plan.encrypt_osds_notice);
+    println!();
+    for node in &plan.nodes {
+        let mark = if node.ok { "ok" } else { "FAIL" };
+        println!("node {} [{mark}]", node.node_id);
+        for issue in &node.issues {
+            println!("  - {issue}");
+        }
+    }
+    for issue in &plan.cluster_issues {
+        println!("cluster: {issue}");
+    }
+    if !plan.ok {
+        bail!("CephCluster preflight failed; refuse to apply (fix the issues above)");
+    }
+    println!();
+    println!("preflight ok — applying");
+
     let resp = client
         .create_ceph_cluster(controller_proto::CreateCephClusterRequest {
-            ceph_cluster: Some(controller_proto::CephCluster {
-                name: manifest.metadata.name.clone(),
-                generation: 0,
-                spec: Some(to_proto_spec(&manifest.spec)),
-                status: None,
-                created_at: None,
-                updated_at: None,
-            }),
+            ceph_cluster: Some(cluster),
         })
         .await
         .context("create_ceph_cluster rpc")?
@@ -147,6 +177,43 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
         "{}",
         render_apply_summary(resp.action, &resp.changed_fields, &label)
     );
+    Ok(())
+}
+
+pub async fn plan_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
+    let manifest = parse_manifest(file)?;
+    let mut client = client::controller_client(info).await?;
+    let plan = client
+        .plan_ceph_cluster(controller_proto::PlanCephClusterRequest {
+            ceph_cluster: Some(controller_proto::CephCluster {
+                name: manifest.metadata.name.clone(),
+                generation: 0,
+                spec: Some(to_proto_spec(&manifest.spec)),
+                status: None,
+                created_at: None,
+                updated_at: None,
+            }),
+        })
+        .await
+        .context("plan_ceph_cluster rpc")?
+        .into_inner();
+    println!("=== CephCluster plan: {} ===", manifest.metadata.name);
+    println!();
+    println!("!!! {} !!!", plan.encrypt_osds_notice);
+    println!();
+    for node in &plan.nodes {
+        let mark = if node.ok { "ok" } else { "FAIL" };
+        println!("node {} [{mark}]", node.node_id);
+        for issue in &node.issues {
+            println!("  - {issue}");
+        }
+    }
+    for issue in &plan.cluster_issues {
+        println!("cluster: {issue}");
+    }
+    if !plan.ok {
+        bail!("CephCluster preflight failed");
+    }
     Ok(())
 }
 

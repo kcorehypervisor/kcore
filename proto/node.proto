@@ -135,6 +135,9 @@ service NodeAdmin {
   rpc RollbackSystemUpdate(RollbackSystemUpdateRequest) returns (RollbackSystemUpdateResponse);
 
   // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
+  // Preflight checks (dry-build, OSD device, RAID, addresses, nixpkgs, DHCP mon)
+  // before CreateCephCluster mutates anything.
+  rpc CheckCephPreflight(CheckCephPreflightRequest) returns (CheckCephPreflightResponse);
   rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
   rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
   // Create every OSD in osd_devices that is not already prepared, and retire
@@ -1008,6 +1011,28 @@ message RollbackSystemUpdateRequest {
 message RollbackSystemUpdateResponse {
   bool success = 1;
   string message = 2;
+}
+
+message CheckCephPreflightRequest {
+  string ceph_nix = 1;
+  string public_addr = 2;
+  string cluster_addr = 3;
+  string public_iface = 4;
+  string cluster_iface = 5;
+  repeated string osd_devices = 6;
+  // Full mon endpoint (ip:port); used to detect DHCP on the public iface.
+  string mon_addr = 7;
+}
+
+message CephPreflightIssue {
+  string check = 1;
+  string message = 2;
+  bool blocking = 3;
+}
+
+message CheckCephPreflightResponse {
+  bool ok = 1;
+  repeated CephPreflightIssue issues = 2;
 }
 
 message ApplyCephConfigRequest {

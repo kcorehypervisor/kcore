@@ -3388,6 +3388,127 @@ impl ControllerService {
             .ok_or_else(|| Status::unavailable(format!("no connection to node {}", node.address)))
     }
 
+    async fn plan_ceph_cluster_spec(
+        &self,
+        spec: &controller_proto::CephClusterSpec,
+    ) -> Result<controller_proto::PlanCephClusterResponse, Status> {
+        ceph_cluster_spec::validate_spec(spec).map_err(Status::invalid_argument)?;
+        let cluster_issues = Vec::new();
+        let mut node_results = Vec::new();
+        let mon_map = crate::ceph_cluster_reconciler::mon_map_string(spec);
+        for (index, node) in spec.nodes.iter().enumerate() {
+            let Some(node_row) = self
+                .db
+                .get_node(&node.node_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+            else {
+                node_results.push(controller_proto::CephNodePlanResult {
+                    node_id: node.node_id.clone(),
+                    ok: false,
+                    issues: vec![format!("node '{}' is not registered", node.node_id)],
+                });
+                continue;
+            };
+            let daemon_id =
+                crate::ceph_cluster_reconciler::sanitize_daemon_id(&node.node_id, index);
+            let ceph_nix =
+                crate::ceph_cluster_reconciler::generate_ceph_nix(spec, node, &daemon_id, &mon_map);
+            let devices = ceph_cluster_spec::osd_devices(node);
+            let mut admin = match self.ensure_admin_client_for_node(&node_row).await {
+                Ok(c) => c,
+                Err(e) => {
+                    #[cfg(test)]
+                    {
+                        let _ = e;
+                        node_results.push(controller_proto::CephNodePlanResult {
+                            node_id: node.node_id.clone(),
+                            ok: true,
+                            issues: vec![
+                                "preflight skipped in unit test (node agent unreachable)".into()
+                            ],
+                        });
+                        continue;
+                    }
+                    #[cfg(not(test))]
+                    {
+                        node_results.push(controller_proto::CephNodePlanResult {
+                            node_id: node.node_id.clone(),
+                            ok: false,
+                            issues: vec![e.message().to_string()],
+                        });
+                        continue;
+                    }
+                }
+            };
+            match admin
+                .check_ceph_preflight(Request::new(node_proto::CheckCephPreflightRequest {
+                    ceph_nix,
+                    public_addr: node
+                        .mon_addr
+                        .split(':')
+                        .next()
+                        .unwrap_or(&node.mon_addr)
+                        .to_string(),
+                    cluster_addr: node.cluster_addr.clone(),
+                    public_iface: node.public_iface.clone(),
+                    cluster_iface: node.cluster_iface.clone(),
+                    osd_devices: devices,
+                    mon_addr: node.mon_addr.clone(),
+                }))
+                .await
+            {
+                Ok(resp) => {
+                    let inner = resp.into_inner();
+                    let issues: Vec<String> = inner
+                        .issues
+                        .into_iter()
+                        .map(|i| {
+                            format!(
+                                "[{}]{} {}",
+                                i.check,
+                                if i.blocking { " BLOCKING" } else { "" },
+                                i.message
+                            )
+                        })
+                        .collect();
+                    node_results.push(controller_proto::CephNodePlanResult {
+                        node_id: node.node_id.clone(),
+                        ok: inner.ok,
+                        issues,
+                    });
+                }
+                Err(e) => {
+                    #[cfg(test)]
+                    {
+                        let _ = e;
+                        node_results.push(controller_proto::CephNodePlanResult {
+                            node_id: node.node_id.clone(),
+                            ok: true,
+                            issues: vec![
+                                "preflight skipped in unit test (preflight rpc failed)".into()
+                            ],
+                        });
+                    }
+                    #[cfg(not(test))]
+                    {
+                        node_results.push(controller_proto::CephNodePlanResult {
+                            node_id: node.node_id.clone(),
+                            ok: false,
+                            issues: vec![format!("preflight rpc failed: {e}")],
+                        });
+                    }
+                }
+            }
+        }
+        let ok = node_results.iter().all(|n| n.ok) && cluster_issues.is_empty();
+        Ok(controller_proto::PlanCephClusterResponse {
+            ok,
+            encrypt_osds_notice: ceph_cluster_spec::encrypt_osds_notice(spec.encrypt_osds),
+            nodes: node_results,
+            cluster_issues,
+        })
+    }
+
     async fn ensure_compute_client_for_address(
         &self,
         address: &str,
@@ -11286,6 +11407,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .await
     }
 
+    async fn plan_ceph_cluster(
+        &self,
+        request: Request<controller_proto::PlanCephClusterRequest>,
+    ) -> Result<Response<controller_proto::PlanCephClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let incoming = request
+            .into_inner()
+            .ceph_cluster
+            .ok_or_else(|| Status::invalid_argument("ceph_cluster is required"))?;
+        let mut spec = incoming
+            .spec
+            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        if spec.fsid.trim().is_empty() {
+            spec.fsid = "00000000-0000-0000-0000-000000000000".into();
+        }
+        let plan = self.plan_ceph_cluster_spec(&spec).await?;
+        Ok(Response::new(plan))
+    }
+
     async fn create_ceph_cluster(
         &self,
         request: Request<controller_proto::CreateCephClusterRequest>,
@@ -11348,6 +11488,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
             ),
             None => (controller_proto::ApplyAction::Created as i32, 1, vec![]),
         };
+        // Preflight before any mutation (skip when the apply is a no-op).
+        if action != controller_proto::ApplyAction::Unchanged as i32 {
+            let plan = self.plan_ceph_cluster_spec(&spec).await?;
+            if !plan.ok {
+                let mut lines = vec![plan.encrypt_osds_notice];
+                for n in &plan.nodes {
+                    if !n.ok {
+                        lines.push(format!("node {}: {}", n.node_id, n.issues.join("; ")));
+                    }
+                }
+                for c in &plan.cluster_issues {
+                    lines.push(c.clone());
+                }
+                return Err(Status::failed_precondition(format!(
+                    "CephCluster preflight failed:\n{}",
+                    lines.join("\n")
+                )));
+            }
+        }
         if let Some(prev) = existing.as_ref() {
             if prev.spec_json != spec_json {
                 if let Ok(old) = ceph_cluster_spec::spec_from_json(&prev.spec_json) {
