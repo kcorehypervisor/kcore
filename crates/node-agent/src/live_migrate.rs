@@ -185,61 +185,15 @@ pub fn rbd_device(pool: &str, image: &str) -> PathBuf {
 }
 
 pub fn rbd_is_mapped(pool: &str, image: &str) -> bool {
-    rbd_device(pool, image).exists()
+    crate::rbd_nbd::mapped_device(pool, image).is_some()
 }
 
 pub fn ensure_rbd_mapped(pool: &str, image: &str) -> Result<(), String> {
-    let dev = rbd_device(pool, image);
-    if dev.exists() {
-        return Ok(());
-    }
-    let handle = format!("{pool}/{image}");
-    let out = std::process::Command::new("rbd")
-        .args(["map", &handle])
-        .output()
-        .map_err(|e| format!("rbd map: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "rbd map failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    for _ in 0..50 {
-        if dev.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!(
-        "rbd device {} did not appear after map",
-        dev.display()
-    ))
+    crate::rbd_nbd::map(pool, image).map(|_| ())
 }
 
 pub fn ensure_rbd_unmapped(pool: &str, image: &str) -> Result<(), String> {
-    let dev = rbd_device(pool, image);
-    if !dev.exists() {
-        return Ok(());
-    }
-    let out = std::process::Command::new("rbd")
-        .args(["unmap", &dev.display().to_string()])
-        .output()
-        .map_err(|e| format!("rbd unmap: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        // Already unmapped is fine.
-        if err.contains("not mapped") || err.contains("No such file") {
-            return Ok(());
-        }
-        return Err(format!("rbd unmap failed: {}", err.trim()));
-    }
-    if dev.exists() {
-        return Err(format!(
-            "rbd device {} still present after unmap",
-            dev.display()
-        ));
-    }
-    Ok(())
+    crate::rbd_nbd::unmap(pool, image)
 }
 
 pub fn handoff_marker_path(socket_dir: &Path, vm_name: &str) -> PathBuf {

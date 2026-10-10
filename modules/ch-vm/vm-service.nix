@@ -125,18 +125,38 @@ let
         fi
       '';
 
+      # Ceph 20 issues aes256k cephx keys, which the kernel libceph client
+      # rejects ("secret too big 32"), so images are mapped with rbd-nbd and
+      # exposed under the stable /dev/rbd/<pool>/<image> symlink. The nbd daemon
+      # runs in its own transient scope so it outlives this unit's cgroup.
+      rbdNbdFunctions = ''
+        export PATH="${pkgs.ceph}/bin:${pkgs.jq}/bin:${pkgs.kmod}/bin:$PATH"
+        nbd_dev() {
+          rbd device list -t nbd --format json 2>/dev/null \
+            | jq -r --arg p "''${1%%/*}" --arg i "''${1#*/}" \
+              '[.[] | select(.pool == $p and .image == $i and ((.snap // "-") == "-"))][0].device // empty'
+        }
+      '';
+
       cephMapScript = pkgs.writeShellScript "ceph-map-${vmName}" ''
         set -e
+        ${rbdNbdFunctions}
         map_one() {
           local IMAGE="$1"
           local RBD_DEV="/dev/rbd/$IMAGE"
-          if ! ${pkgs.ceph}/bin/rbd info "$IMAGE" >/dev/null 2>&1; then
+          if ! rbd info "$IMAGE" >/dev/null 2>&1; then
             echo "ERROR: RBD image $IMAGE does not exist; create/attach the volume via kctl first"
             exit 1
           fi
-          if [ ! -b "$RBD_DEV" ]; then
-            ${pkgs.ceph}/bin/rbd map "$IMAGE"
+          local DEV
+          DEV="$(nbd_dev "$IMAGE")"
+          if [ -z "$DEV" ]; then
+            modprobe nbd || true
+            DEV="$(${pkgs.systemd}/bin/systemd-run --scope --quiet --collect -- \
+              rbd device map -t nbd "$IMAGE" | tail -1)"
           fi
+          mkdir -p "$(dirname "$RBD_DEV")"
+          ln -sfn "$DEV" "$RBD_DEV"
           test -b "$RBD_DEV"
         }
         IMAGE="${cfg.rbdPool}/${rbdImage}"
@@ -171,9 +191,18 @@ let
       '';
 
       cephUnmapScript = pkgs.writeShellScript "ceph-unmap-${vmName}" ''
-        ${pkgs.ceph}/bin/rbd unmap ${rbdDevice} || true
+        ${rbdNbdFunctions}
+        unmap_one() {
+          local DEV
+          DEV="$(nbd_dev "$1")"
+          if [ -n "$DEV" ]; then
+            rbd device unmap -t nbd "$DEV" || true
+          fi
+          rm -f "/dev/rbd/$1"
+        }
+        unmap_one "${cfg.rbdPool}/${rbdImage}"
         ${lib.concatMapStrings (disk: ''
-          ${pkgs.ceph}/bin/rbd unmap /dev/rbd/${cfg.rbdPool}/${disk.rbdImage} || true
+          unmap_one "${cfg.rbdPool}/${disk.rbdImage}"
         '') vmCfg.dataDisks}
       '';
 

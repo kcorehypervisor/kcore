@@ -596,18 +596,17 @@ impl StorageAdapter for CephAdapter {
 
     fn attach_volume(&self, req: AttachVolumeRequest) -> Result<(), StorageError> {
         validate_attach_request(&req)?;
-        self.image(&req.backend_handle)?;
-        run_cmd("rbd", &["map", &req.backend_handle], ErrorKind::Internal)
+        let image = self.image(&req.backend_handle)?;
+        crate::rbd_nbd::map(&self.pool, image)
+            .map(|_| ())
+            .map_err(|e| StorageError::new(ErrorKind::Internal, e))
     }
 
     fn detach_volume(&self, req: DetachVolumeRequest) -> Result<(), StorageError> {
         validate_detach_request(&req)?;
         let image = self.image(&req.backend_handle)?;
-        run_cmd(
-            "rbd",
-            &["unmap", &format!("/dev/rbd/{}/{image}", self.pool)],
-            ErrorKind::Internal,
-        )
+        crate::rbd_nbd::unmap(&self.pool, image)
+            .map_err(|e| StorageError::new(ErrorKind::Internal, e))
     }
 
     fn ensure_image(&self, req: EnsureImageRequest) -> Result<EnsureImageResult, StorageError> {
