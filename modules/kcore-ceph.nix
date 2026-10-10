@@ -289,6 +289,8 @@ in
         "network-online.target"
       ];
       wants = [ "network-online.target" ];
+      # Boot-time only: re-running it on `switch` would re-prime live OSDs.
+      restartIfChanged = false;
       path = [
         pkgs.util-linux
         pkgs.lvm2
@@ -305,7 +307,7 @@ in
           for dir in /var/lib/ceph/osd/ceph-*; do
             id="''${dir##*/ceph-}"
             if [[ -f "$dir/fsid" ]]; then
-              systemctl start "ceph-osd@''${id}.service" || true
+              systemctl start --no-block "ceph-osd@''${id}.service" || true
             fi
           done
         '';
