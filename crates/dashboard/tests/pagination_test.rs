@@ -651,6 +651,13 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    async fn plan_ceph_cluster(
+        &self,
+        _: TRequest<PlanCephClusterRequest>,
+    ) -> Result<Response<PlanCephClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
     async fn create_ceph_cluster(
         &self,
         _: TRequest<CreateCephClusterRequest>,
