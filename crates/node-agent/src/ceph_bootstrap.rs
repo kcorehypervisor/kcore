@@ -259,6 +259,11 @@ pub fn may_found_cluster(daemon_id: &str, mons: &[MonMember]) -> bool {
     mons.first().is_some_and(|m| m.id == daemon_id)
 }
 
+/// Both messenger versions, so a mon never joins as v1-only.
+pub fn mon_addrvec(ip: &str) -> String {
+    format!("[v2:{ip}:3300,v1:{ip}:6789]")
+}
+
 fn saved_monmap_path(daemon_id: &str) -> String {
     format!("/var/lib/kcore/ceph-monmap-{daemon_id}.bin")
 }
@@ -279,7 +284,7 @@ fn adopt_running_monmap(
     let Some(me) = mons.iter().find(|m| m.id == daemon_id) else {
         return Ok(false);
     };
-    let addr = format!("{}:6789", me.addr);
+    let addr = mon_addrvec(&me.addr);
     let saved = saved_monmap_path(daemon_id);
 
     let fetched = match Command::new("timeout")
@@ -312,7 +317,7 @@ fn adopt_running_monmap(
         run(
             "monmaptool",
             &[
-                "--add",
+                "--addv",
                 daemon_id,
                 &addr,
                 &monmap_path.display().to_string(),
@@ -358,9 +363,9 @@ pub fn mkfs_mon(pkg: &BootstrapPackage, daemon_id: &str, mons: &[MonMember]) -> 
                 "--fsid",
                 &pkg.fsid,
                 "--clobber",
-                "--add",
+                "--addv",
                 &me.id,
-                &format!("{}:6789", me.addr),
+                &mon_addrvec(&me.addr),
                 &monmap.display().to_string(),
             ],
         )?;
@@ -590,6 +595,14 @@ mod tests {
     fn parse_mon_map_rejects_empty() {
         assert!(parse_mon_map("").is_err());
         assert!(parse_mon_map("bad").is_err());
+    }
+
+    #[test]
+    fn mon_addrvec_carries_both_messenger_versions() {
+        assert_eq!(
+            mon_addrvec("10.0.0.1"),
+            "[v2:10.0.0.1:3300,v1:10.0.0.1:6789]"
+        );
     }
 
     #[test]
