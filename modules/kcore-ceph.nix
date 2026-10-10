@@ -7,6 +7,15 @@
 let
   cfg = config.kcore.ceph;
   nonEmpty = value: value != "";
+  # nixpkgs b40629ef (the revision nodes are installed with) cannot evaluate its
+  # own `ceph` 19.2.3: the python3.11 environment pulls in sphinx 9.1.0, which
+  # requires python >= 3.12. Take only the ceph package from a newer pinned
+  # revision whose ceph (20.2.4) evaluates and is in cache.nixos.org, so nodes
+  # download it instead of compiling. Drop this once the base pin is bumped.
+  cephNixpkgs = import (builtins.fetchTarball {
+    url = "https://github.com/NixOS/nixpkgs/archive/e7439b6b14ad3cc35d05608ebca9bce01a25f5f8.tar.gz";
+    sha256 = "19y4py973w62z4qb7gzn0chjs67ihxy8rbjb7g71iyk8yz7z5k8z";
+  }) { system = "x86_64-linux"; };
 in
 {
   options.kcore.ceph = {
@@ -79,6 +88,12 @@ in
       default = 7480;
       description = "Client port when enableRgw is true.";
     };
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = cephNixpkgs.ceph;
+      defaultText = lib.literalMD "`ceph` from a pinned newer nixpkgs revision";
+      description = "Ceph package used for the daemons, CLI, and Ceph-backed VM disks (`pkgs.ceph` is overridden to this).";
+    };
     poolSize = lib.mkOption {
       type = lib.types.ints.positive;
       default = 3;
@@ -112,11 +127,12 @@ in
         message = "kcore.ceph.daemonId is required when the mon is enabled";
       }
     ];
+    nixpkgs.overlays = [ (_final: _prev: { ceph = cfg.package; }) ];
     boot.kernelModules = [
       "rbd"
       "ceph"
     ];
-    environment.systemPackages = [ pkgs.ceph ];
+    environment.systemPackages = [ cfg.package ];
     # Option names match nixos/modules/services/network-filesystems/ceph.nix
     # (camelCase). The previous mapping used public_network / mon_host / cluster,
     # which are not options, so `nixos-rebuild` rejected the whole Ceph config
