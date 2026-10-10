@@ -902,6 +902,13 @@ impl Controller for MockController {
         Err(unimp("classify_disk_layout"))
     }
 
+    async fn plan_ceph_cluster(
+        &self,
+        _: Request<PlanCephClusterRequest>,
+    ) -> Result<Response<PlanCephClusterResponse>, Status> {
+        Err(unimp("plan_ceph_cluster"))
+    }
+
     async fn create_ceph_cluster(
         &self,
         _: Request<CreateCephClusterRequest>,

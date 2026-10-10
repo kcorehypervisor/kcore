@@ -12,7 +12,7 @@ Status: **Phases 1–2 + live migration shipped; volumes, snapshots, resize, and
 |---------|----------|-----------|
 | Ceph packages / units | NixOS | `services.ceph` via [`modules/kcore-ceph.nix`](../modules/kcore-ceph.nix) |
 | FSID, keyrings, monmap | Controller + node-agent | Bootstrap package redistributed to members |
-| OSD prepare / activate | Node-agent | `BootstrapCephOsd` → `ceph-volume lvm create` (+ systemd activate) |
+| OSD prepare / activate | Node-agent + NixOS | `ceph-volume lvm create --no-systemd`, then `ceph-osd@ID`; boot via `ceph-volume-activate` |
 | Pool / RBD init | Node-agent (reconciler-driven) | `EnsureCephPool` → pool `kcore-vms` |
 | Health / phase | Controller reconciler | `GetCephHealth` until `HEALTH_OK` |
 | VM RBD create/delete | Node storage adapter | `rbd create` / `rbd rm` (`layering` only) |
@@ -102,11 +102,20 @@ fallback so Ceph bring-up does not require hand-edited `configuration.nix`.
    cluster name is always `ceph`; `mon_host` lists every member.
 4. First eligible node builds mon/admin/bootstrap-osd keyrings (`ceph-authtool`);
    controller redistributes the package; peers run `ceph-mon --mkfs` / mgr auth.
-5. `BootstrapCephOsd` — `ceph-volume lvm create` on `osdDevice` (with `--dmcrypt`
-   when `encryptOsds` is true; refuses non-empty disks unless `forceWipe: true`),
-   activate units (no `--no-systemd`). Compatible with Ceph 20.x (Tentacle).
+5. `BootstrapCephOsd` — `ceph-volume lvm create --no-systemd` on `osdDevice`
+   (with `--dmcrypt` when `encryptOsds` is true; refuses non-empty disks unless
+   `forceWipe: true`), then `systemctl start ceph-osd@ID`. NixOS cannot let
+   ceph-volume enable units into read-only `/etc/systemd/system`;
+   `modules/kcore-ceph.nix` ships `ceph-osd@` and a boot
+   `ceph-volume-activate` oneshot (`lvm activate --all --no-systemd`).
+   Compatible with Ceph 20.x (Tentacle).
 6. `EnsureCephPool` for `kcore-vms` (size/min_size, RBD application, `rbd pool init`).
 7. Poll health until `HEALTH_OK`; otherwise requeue.
+
+The first mon mkfs uses a **self-only** monmap (and `monInitialMembers` lists only
+that daemon). Peers join with `ceph mon add` + the running monmap. Listing all
+future members up front left 0.0.0.0 placeholders and kept the mon probing so
+`ensure_mgr_keyring` never returned. All `ceph` CLI calls use a wall-clock timeout.
 
 OSD dm-crypt protects disk theft/RMA; it does **not** protect a compromised mon or host. Keys live in the mon config-key store. Enabling encryption on an existing plain cluster means replacing OSD devices (remove → backfill → re-add with dmcrypt).
 

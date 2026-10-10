@@ -614,6 +614,16 @@ fn daemon_id_from_ceph_nix(text: &str) -> String {
     String::new()
 }
 
+/// Run `ceph …` under `timeout(1)` so missing quorum cannot hang the agent.
+async fn run_ceph_cmd(args: &[&str]) -> Result<std::process::Output, std::io::Error> {
+    Command::new("timeout")
+        .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+        .arg("ceph")
+        .args(args)
+        .output()
+        .await
+}
+
 async fn list_prepared_osds() -> Result<Vec<crate::ceph_bootstrap::ListedOsd>, Status> {
     let listed = Command::new("ceph-volume")
         .args(["lvm", "list", "--format", "json"])
@@ -659,7 +669,10 @@ async fn prepare_osd_device(device: &str, force_wipe: bool, encrypt: bool) -> Re
             ));
         }
     }
-    let mut args = vec!["lvm", "create", "--data", device];
+    // NixOS cannot `systemctl enable` into the read-only /etc/systemd/system
+    // symlink. Prepare without systemd integration; kcore-ceph.nix ships
+    // ceph-osd@.service and we start the unit ourselves.
+    let mut args = vec!["lvm", "create", "--no-systemd", "--data", device];
     if encrypt {
         args.push("--dmcrypt");
     }
@@ -674,6 +687,30 @@ async fn prepare_osd_device(device: &str, force_wipe: bool, encrypt: bool) -> Re
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    let listed = Command::new("ceph-volume")
+        .args(["lvm", "list", "--format", "json"])
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("ceph-volume lvm list: {e}")))?;
+    if listed.status.success() {
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        if let Ok(osds) = crate::ceph_bootstrap::parse_ceph_volume_lvm_list(&stdout) {
+            if let Some(osd) = osds.iter().find(|o| osd_matches_device(o, device)) {
+                let unit = format!("ceph-osd@{}", osd.id);
+                let start = Command::new("systemctl")
+                    .args(["start", &unit])
+                    .output()
+                    .await
+                    .map_err(|e| Status::internal(format!("starting {unit}: {e}")))?;
+                if !start.status.success() {
+                    return Err(Status::internal(format!(
+                        "systemctl start {unit} failed: {}",
+                        String::from_utf8_lossy(&start.stderr).trim()
+                    )));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -682,14 +719,12 @@ async fn retire_osd(osd: &crate::ceph_bootstrap::ListedOsd) -> Result<(), Status
     if id.is_empty() {
         return Err(Status::internal("ceph-volume listed an OSD with no id"));
     }
-    let _ = Command::new("ceph").args(["osd", "out", id]).output().await;
+    let _ = run_ceph_cmd(&["osd", "out", id]).await;
     let _ = Command::new("systemctl")
         .args(["stop", &format!("ceph-osd@{id}")])
         .output()
         .await;
-    let purge = Command::new("ceph")
-        .args(["osd", "purge", id, "--yes-i-really-mean-it"])
-        .output()
+    let purge = run_ceph_cmd(&["osd", "purge", id, "--yes-i-really-mean-it"])
         .await
         .map_err(|e| Status::internal(format!("ceph osd purge: {e}")))?;
     let purge_err = String::from_utf8_lossy(&purge.stderr);
@@ -2344,13 +2379,16 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if daemon_id.is_empty() {
             return Err(Status::invalid_argument("daemon_id is required"));
         }
-        let out = Command::new("ceph")
-            .args(["mon", "rm", daemon_id])
-            .output()
+        let out = run_ceph_cmd(&["mon", "rm", daemon_id])
             .await
             .map_err(|e| Status::internal(format!("ceph mon rm: {e}")))?;
         let stderr = String::from_utf8_lossy(&out.stderr);
         let missing = stderr.contains("does not exist") || stderr.contains("no such");
+        if out.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded(format!(
+                "ceph mon rm {daemon_id} timed out"
+            )));
+        }
         if !out.status.success() && !missing {
             return Err(Status::internal(format!(
                 "ceph mon rm {daemon_id} failed: {}",
@@ -2387,11 +2425,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
     ) -> Result<Response<proto::GetCephHealthResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let _ = request.into_inner();
-        let out = Command::new("ceph")
-            .args(["-s", "--format", "json"])
-            .output()
+        let out = run_ceph_cmd(&["-s", "--format", "json"])
             .await
             .map_err(|e| Status::internal(format!("starting ceph (is Ceph installed?): {e}")))?;
+        if out.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("ceph status timed out"));
+        }
         if !out.status.success() {
             return Err(Status::internal(format!(
                 "ceph status failed: {}",
@@ -2425,11 +2464,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if pool.is_empty() {
             return Err(Status::invalid_argument("pool is required"));
         }
-        let listed = Command::new("ceph")
-            .args(["osd", "pool", "ls"])
-            .output()
+        let listed = run_ceph_cmd(&["osd", "pool", "ls"])
             .await
             .map_err(|e| Status::internal(format!("ceph osd pool ls: {e}")))?;
+        if listed.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("ceph osd pool ls timed out"));
+        }
         if !listed.status.success() {
             return Err(Status::internal(format!(
                 "ceph osd pool ls failed: {}",
@@ -2441,11 +2481,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             .any(|l| l.trim() == pool);
         let mut created = false;
         if !exists {
-            let out = Command::new("ceph")
-                .args(["osd", "pool", "create", pool, "32"])
-                .output()
+            let out = run_ceph_cmd(&["osd", "pool", "create", pool, "32"])
                 .await
                 .map_err(|e| Status::internal(format!("ceph osd pool create: {e}")))?;
+            if out.status.code() == Some(124) {
+                return Err(Status::deadline_exceeded("ceph osd pool create timed out"));
+            }
             if !out.status.success() {
                 return Err(Status::internal(format!(
                     "ceph osd pool create failed: {}",
@@ -2455,33 +2496,23 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             created = true;
         }
         if req.size > 0 {
-            let _ = Command::new("ceph")
-                .args(["osd", "pool", "set", pool, "size", &req.size.to_string()])
-                .output()
-                .await;
+            let size = req.size.to_string();
+            let _ = run_ceph_cmd(&["osd", "pool", "set", pool, "size", &size]).await;
         }
         if req.min_size > 0 {
-            let _ = Command::new("ceph")
-                .args([
-                    "osd",
-                    "pool",
-                    "set",
-                    pool,
-                    "min_size",
-                    &req.min_size.to_string(),
-                ])
-                .output()
-                .await;
+            let min_size = req.min_size.to_string();
+            let _ = run_ceph_cmd(&["osd", "pool", "set", pool, "min_size", &min_size]).await;
         }
-        let _ = Command::new("ceph")
-            .args(["osd", "pool", "application", "enable", pool, "rbd"])
-            .output()
-            .await;
-        let init = Command::new("rbd")
-            .args(["pool", "init", pool])
+        let _ = run_ceph_cmd(&["osd", "pool", "application", "enable", pool, "rbd"]).await;
+        let init = Command::new("timeout")
+            .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+            .args(["rbd", "pool", "init", pool])
             .output()
             .await
             .map_err(|e| Status::internal(format!("rbd pool init: {e}")))?;
+        if init.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("rbd pool init timed out"));
+        }
         if !init.status.success() {
             let err = String::from_utf8_lossy(&init.stderr);
             if !err.contains("already initialized") && !err.is_empty() {

@@ -60,7 +60,12 @@ in
     monInitialMembers = lib.mkOption {
       type = lib.types.str;
       default = "";
-      description = "Comma-separated mon daemon ids that form the initial quorum.";
+      description = ''
+        This node's mon daemon id for ceph.conf mon_initial_members.
+        Use only the local daemon — listing peers that are not yet in the
+        monmap makes Ceph invent 0.0.0.0 placeholders and keeps the mon probing.
+        Later members join via `ceph mon add`.
+      '';
     };
     publicAddr = lib.mkOption {
       type = lib.types.str;
@@ -97,7 +102,7 @@ in
     enableOsd = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Install Ceph so ceph-volume can create OSD units. The NixOS osd daemon list stays empty: those units are not hostname-scoped.";
+      description = "Install Ceph tools and ship ceph-osd@ + ceph-volume-activate units for --no-systemd OSD prepare.";
     };
     enableMds = lib.mkOption {
       type = lib.types.bool;
@@ -222,10 +227,9 @@ in
         daemons = lib.optionals cfg.enableMgr [ cfg.daemonId ];
       };
       osd = {
-        # NixOS refuses `osd.enable` with an empty daemon list, and its OSD
-        # units are keyed by OSD id, which does not exist until ceph-volume
-        # creates them. Leave the module OSD list off; ceph-volume installs
-        # `ceph-osd@<id>` itself.
+        # NixOS refuses `osd.enable` with an empty daemon list, and its
+        # hostname-scoped units do not match ceph-volume's ceph-osd@ID
+        # instances. Leave this off; we ship a template + activate unit below.
         enable = false;
         daemons = [ ];
       };
@@ -236,6 +240,69 @@ in
       rgw = {
         enable = cfg.enableRgw;
         daemons = lib.optionals cfg.enableRgw [ cfg.daemonId ];
+      };
+    };
+
+    # ceph-volume cannot `systemctl enable` into NixOS's read-only
+    # /etc/systemd/system. Prepare with --no-systemd and run OSDs via this
+    # template; the activate oneshot brings LVs up at boot and starts instances.
+    systemd.services."ceph-osd@" = lib.mkIf cfg.enableOsd {
+      description = "Ceph object storage daemon %i";
+      after = [
+        "network-online.target"
+        "time-sync.target"
+        "local-fs.target"
+        "ceph-volume-activate.service"
+      ];
+      wants = [
+        "network-online.target"
+        "time-sync.target"
+        "ceph-volume-activate.service"
+      ];
+      unitConfig.ConditionPathExists = "/var/lib/ceph/osd/ceph-%i/fsid";
+      startLimitBurst = 30;
+      startLimitIntervalSec = 1800;
+      serviceConfig = {
+        Type = "simple";
+        User = "ceph";
+        Group = "disk";
+        LimitNOFILE = 1048576;
+        LimitNPROC = 1048576;
+        Environment = "CLUSTER=${cfg.clusterName}";
+        ExecStartPre = "${cfg.package.lib}/libexec/ceph/ceph-osd-prestart.sh --id %i --cluster ${cfg.clusterName}";
+        ExecStart = "${cfg.package}/bin/ceph-osd -f --cluster ${cfg.clusterName} --id %i";
+        ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
+        Restart = "on-failure";
+        RestartSec = "10s";
+        PrivateDevices = false;
+        PrivateTmp = true;
+        ProtectHome = true;
+        ProtectSystem = "full";
+      };
+    };
+
+    systemd.services.ceph-volume-activate = lib.mkIf cfg.enableOsd {
+      description = "Activate Ceph OSDs prepared by ceph-volume (no systemd integration)";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "local-fs.target"
+        "network-online.target"
+      ];
+      wants = [ "network-online.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = pkgs.writeShellScript "ceph-volume-activate-all" ''
+          set -euo pipefail
+          ${cfg.package}/bin/ceph-volume lvm activate --all --no-systemd
+          shopt -s nullglob
+          for dir in /var/lib/ceph/osd/ceph-*; do
+            id="''${dir##*/ceph-}"
+            if [[ -f "$dir/fsid" ]]; then
+              systemctl start "ceph-osd@''${id}.service" || true
+            fi
+          done
+        '';
       };
     };
   };

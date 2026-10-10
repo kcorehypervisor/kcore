@@ -63,6 +63,10 @@ pub fn encode_package(pkg: &BootstrapPackage) -> Result<Vec<u8>, String> {
     serde_json::to_vec(pkg).map_err(|e| format!("encode bootstrap package: {e}"))
 }
 
+/// Default wall-clock limit for `ceph` / `rados` CLI calls that can hang when
+/// quorum is missing.
+pub const CEPH_CLI_TIMEOUT_SECS: &str = "30";
+
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(program)
         .args(args)
@@ -76,6 +80,47 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Run a program under `timeout(1)` so missing quorum cannot block forever.
+fn run_timeout(secs: &str, program: &str, args: &[&str]) -> Result<String, String> {
+    let mut full = Vec::with_capacity(args.len() + 2);
+    full.push(secs);
+    full.push(program);
+    full.extend_from_slice(args);
+    let out = Command::new("timeout")
+        .args(&full)
+        .output()
+        .map_err(|e| format!("starting timeout {program}: {e}"))?;
+    if !out.status.success() {
+        let code = out.status.code();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if code == Some(124) {
+            return Err(format!(
+                "{program} {} timed out after {secs}s",
+                args.join(" ")
+            ));
+        }
+        return Err(format!("{program} {} failed: {stderr}", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn run_ceph(args: &[&str]) -> Result<String, String> {
+    run_timeout(CEPH_CLI_TIMEOUT_SECS, "ceph", args)
+}
+
+/// Members to put in a *fresh* monmap for `daemon_id`.
+///
+/// The first mon must mkfs with only itself so it can form a single-member
+/// quorum; later members adopt the running map via `ceph mon add`.
+pub fn fresh_monmap_member<'a>(
+    daemon_id: &str,
+    mons: &'a [MonMember],
+) -> Result<&'a MonMember, String> {
+    mons.iter()
+        .find(|m| m.id == daemon_id)
+        .ok_or_else(|| format!("daemon {daemon_id} missing from mon_map"))
 }
 
 /// Generate mon/admin/bootstrap-osd keyrings with `ceph-authtool` (requires Ceph tools).
@@ -268,21 +313,25 @@ pub fn mkfs_mon(pkg: &BootstrapPackage, daemon_id: &str, mons: &[MonMember]) -> 
     let mon_kr = tmp.path().join("mon.keyring");
     std::fs::write(&mon_kr, &pkg.mon_keyring).map_err(|e| e.to_string())?;
 
-    let mut args: Vec<String> = vec![
-        "--create".into(),
-        "--fsid".into(),
-        pkg.fsid.clone(),
-        "--clobber".into(),
-    ];
-    for m in mons {
-        args.push("--add".into());
-        args.push(m.id.clone());
-        args.push(format!("{}:6789", m.addr));
-    }
-    args.push(monmap.display().to_string());
     if !adopt_running_monmap(daemon_id, mons, &monmap)? {
-        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-        run("monmaptool", &args_ref)?;
+        // First mon: single-member monmap so this daemon can form quorum alone.
+        // Listing every future member here left them as 0.0.0.0 placeholders and
+        // the mon stayed in "probing" forever — blocking ensure_mgr_keyring and
+        // the reconciler loop before peers were ever applied.
+        let me = fresh_monmap_member(daemon_id, mons)?;
+        run(
+            "monmaptool",
+            &[
+                "--create",
+                "--fsid",
+                &pkg.fsid,
+                "--clobber",
+                "--add",
+                &me.id,
+                &format!("{}:6789", me.addr),
+                &monmap.display().to_string(),
+            ],
+        )?;
     }
 
     let data = mon_data_dir(daemon_id);
@@ -312,24 +361,21 @@ pub fn ensure_mgr_keyring(daemon_id: &str) -> Result<(), String> {
         return Ok(());
     }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Wait briefly for mon quorum after mkfs+start.
+    // Wait briefly for mon quorum after mkfs+start. Each ceph call is bounded.
     for _ in 0..30 {
-        if run(
-            "ceph",
-            &[
-                "auth",
-                "get-or-create",
-                "-o",
-                &keyring,
-                &format!("mgr.{daemon_id}"),
-                "mon",
-                "allow profile mgr",
-                "osd",
-                "allow *",
-                "mds",
-                "allow *",
-            ],
-        )
+        if run_ceph(&[
+            "auth",
+            "get-or-create",
+            "-o",
+            &keyring,
+            &format!("mgr.{daemon_id}"),
+            "mon",
+            "allow profile mgr",
+            "osd",
+            "allow *",
+            "mds",
+            "allow *",
+        ])
         .is_ok()
         {
             let _ = run("chown", &["-R", "ceph:ceph", &dir]);
@@ -512,6 +558,17 @@ mod tests {
     fn parse_mon_map_rejects_empty() {
         assert!(parse_mon_map("").is_err());
         assert!(parse_mon_map("bad").is_err());
+    }
+
+    #[test]
+    fn fresh_monmap_member_is_only_the_local_daemon() {
+        let mons = parse_mon_map("dell-1=10.10.0.11,dell-2=10.10.0.12,dell-3=10.10.0.13").unwrap();
+        let me = fresh_monmap_member("dell-2", &mons).unwrap();
+        assert_eq!(me.id, "dell-2");
+        assert_eq!(me.addr, "10.10.0.12");
+        // First-mon path must never expand to the full membership list.
+        assert_eq!(fresh_monmap_member("dell-1", &mons).unwrap().id, "dell-1");
+        assert!(fresh_monmap_member("missing", &mons).is_err());
     }
 
     #[test]

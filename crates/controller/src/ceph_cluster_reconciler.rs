@@ -394,11 +394,6 @@ pub(crate) fn generate_ceph_nix(
         .filter_map(|p| p.split_once('=').map(|(_, ip)| ip.trim().to_string()))
         .collect::<Vec<_>>()
         .join(",");
-    let mon_ids: String = mon_map
-        .split(',')
-        .filter_map(|p| p.split_once('=').map(|(id, _)| id.trim().to_string()))
-        .collect::<Vec<_>>()
-        .join(",");
     let public_addr = node
         .mon_addr
         .split(':')
@@ -414,7 +409,9 @@ pub(crate) fn generate_ceph_nix(
     publicNetwork = "{public_network}";
     clusterNetwork = "{cluster_network}";
     monAddress = "{mon_host}";
-    monInitialMembers = "{mon_ids}";
+    // Only this daemon — listing peers that are not yet in the monmap makes
+    // ceph.conf invent 0.0.0.0 placeholders and keeps the mon in "probing".
+    monInitialMembers = "{daemon_id}";
     publicAddr = "{public_addr}";
     clusterAddr = "{cluster_addr}";
     publicIface = "{public_iface}";
@@ -438,7 +435,6 @@ pub(crate) fn generate_ceph_nix(
         size = spec.size,
         min_size = spec.min_size,
         mon_host = nix_escape(&mon_host),
-        mon_ids = nix_escape(&mon_ids),
         public_addr = nix_escape(public_addr),
         daemon_id = nix_escape(daemon_id),
     )
@@ -508,7 +504,9 @@ mod tests {
         assert!(nix.contains("clusterName = \"ceph\";"));
         assert!(!nix.contains("clusterName = \"lab\""));
         assert!(nix.contains("monAddress = \"10.10.0.11,10.10.0.12\";"));
-        assert!(nix.contains("monInitialMembers = \"dell-tower-1,dell-2\";"));
+        // Local daemon only — peers join via ceph mon add, not initial-members.
+        assert!(nix.contains("monInitialMembers = \"dell-tower-1\";"));
+        assert!(!nix.contains("monInitialMembers = \"dell-tower-1,dell-2\";"));
         assert!(nix.contains("publicAddr = \"10.10.0.11\";"));
         assert!(nix.contains("clusterAddr = \"10.20.0.11\";"));
         assert!(nix.contains("publicIface = \"eth1\";"));

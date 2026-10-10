@@ -51,6 +51,11 @@ assert lib.elem "enp6s0d1" cfg.networking.firewall.trustedInterfaces;
 assert (builtins.head cfg.networking.interfaces.enp6s0d1.ipv4.addresses).address == "192.168.47.2";
 # Touch the overlaid package so evaluation fails if the pinned overlay breaks.
 assert cfg.kcore.ceph.package.pname or cfg.kcore.ceph.package.name != "";
+# OSD path uses --no-systemd + these units (not ceph-volume's systemctl enable).
+assert cfg.systemd.services ? "ceph-osd@";
+assert cfg.systemd.services ? "ceph-volume-activate";
+assert cfg.systemd.services."ceph-osd@".serviceConfig.ExecStart != null;
+assert cfg.systemd.services.ceph-volume-activate.serviceConfig.ExecStart != null;
 pkgs.runCommand "ceph-module-eval-ok" { } ''
   echo ok > "$out"
 ''
