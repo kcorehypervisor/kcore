@@ -4,6 +4,7 @@ pub mod api;
 pub mod diagnostics;
 pub mod disk;
 pub mod format;
+pub mod logs;
 pub mod network;
 pub mod route;
 pub mod system;
@@ -17,6 +18,7 @@ pub struct Snapshot {
     pub nics: Vec<network::Nic>,
     pub disks: Vec<disk::Disk>,
     pub diag: Vec<diagnostics::ServiceLine>,
+    pub logs: Vec<logs::LogLine>,
 }
 
 /// Collects inventory (may be partially empty on errors).
@@ -25,11 +27,13 @@ pub fn load_snapshot() -> Snapshot {
     let nics = network::list_nics();
     let disks = disk::list_disks();
     let diag = diagnostics::kcore_diagnostics();
+    let logs = logs::recent_system_logs(80);
     let meta = system::load_meta(&api);
     Snapshot {
         meta,
         nics,
         disks,
         diag,
+        logs,
     }
 }
