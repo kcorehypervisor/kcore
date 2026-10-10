@@ -136,8 +136,8 @@ pub fn draw(f: &mut Frame<'_>, app: &AppState) {
 fn carve_logo_area(area: Rect) -> (Rect, Option<Rect>) {
     const LOGO_WIDTH: u16 = 52;
     const LOGO_HEIGHT: u16 = 6;
-
-    if area.width < 64 || area.height < 20 {
+    // Hide on short/narrow frames (80x25 and similar) so tables keep full height.
+    if area.width < 100 || area.height < 24 {
         return (area, None);
     }
 
@@ -293,179 +293,218 @@ fn draw_overview(f: &mut Frame<'_>, area: Rect, app: &AppState) {
     );
 }
 
-fn table_header_net() -> Row<'static> {
-    Row::new(vec![
-        Cell::from("Iface"),
-        Cell::from("State"),
-        Cell::from("MAC"),
-        Cell::from("IPv4"),
-        Cell::from("IPv6"),
-        Cell::from("MTU"),
-        Cell::from("Speed"),
-        Cell::from("Driver"),
-        Cell::from("def"),
-        Cell::from("mgmt"),
-    ])
+fn draw_network(f: &mut Frame<'_>, app: &AppState, area: Rect) {
+    use super::cols::{net_columns_for_width, net_iface_shows_master_suffix, NetColumn};
+
+    let show_detail = area.height >= 8;
+    let chunks = if show_detail {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0)])
+            .split(area)
+    };
+    let table_area = chunks[0];
+
+    // Inner width ≈ area minus border columns.
+    let inner_w = table_area.width.saturating_sub(2);
+    let cols = net_columns_for_width(inner_w);
+    let narrow_flags = inner_w < 110;
+    let master_suffix = net_iface_shows_master_suffix(cols);
+    let constraints: Vec<Constraint> = cols.iter().map(|c| c.constraint(narrow_flags)).collect();
+
+    let header = Row::new(cols.iter().map(|c| {
+        let h = if narrow_flags && matches!(c, NetColumn::Def | NetColumn::Mgmt) {
+            match c {
+                NetColumn::Def => "d",
+                NetColumn::Mgmt => "m",
+                _ => c.header(),
+            }
+        } else {
+            c.header()
+        };
+        Cell::from(h)
+    }))
     .style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(theme::accent()),
     )
-    .height(1)
-}
+    .height(1);
 
-fn table_rows_net(app: &AppState) -> Vec<Row<'_>> {
-    app.snapshot
-        .nics
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            let style = if i == app.network_sel {
-                Style::default().fg(theme::text()).bg(theme::selection_bg())
+    let flag = |on: bool| -> &'static str {
+        if narrow_flags {
+            if on {
+                "•"
             } else {
-                Style::default().fg(theme::text())
-            };
-            Row::new(vec![
-                Cell::from(n.name.clone()),
-                Cell::from(n.oper_state.clone()),
-                Cell::from(n.mac.clone()),
-                Cell::from(n.ipv4.clone()),
-                Cell::from(n.ipv6.clone()),
-                Cell::from(n.mtu.clone()),
-                Cell::from(n.speed.clone()),
-                Cell::from(n.driver.clone()),
-                Cell::from(if n.default_route { "•" } else { "—" }),
-                Cell::from(if n.management { "•" } else { "—" }),
-            ])
-            .style(style)
-        })
-        .collect()
-}
-
-fn draw_network(f: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let rows = table_rows_net(app);
-    let trows = if rows.is_empty() {
-        vec![Row::new(
-            (0..10).map(|_| Cell::from("—")).collect::<Vec<_>>(),
-        )]
-    } else {
-        rows
+                " "
+            }
+        } else if on {
+            "•"
+        } else {
+            "—"
+        }
     };
-    let table = Table::new(
-        trows,
-        [
-            Constraint::Min(6),
-            Constraint::Min(5),
-            Constraint::Min(14),
-            Constraint::Min(10),
-            Constraint::Min(14),
-            Constraint::Min(4),
-            Constraint::Min(10),
-            Constraint::Min(6),
-            Constraint::Min(3),
-            Constraint::Min(3),
-        ],
-    )
-    .header(table_header_net());
-    f.render_widget(
-        table
-            .block(
+
+    let rows: Vec<Row<'_>> = if app.snapshot.nics.is_empty() {
+        vec![Row::new(cols.iter().map(|_| Cell::from("—")).collect::<Vec<_>>()).height(1)]
+    } else {
+        app.snapshot
+            .nics
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let style = if i == app.network_sel {
+                    Style::default().fg(theme::text()).bg(theme::selection_bg())
+                } else {
+                    Style::default().fg(theme::text())
+                };
+                let (ipv6_primary, ipv6_extra) = n.primary_ipv6_display();
+                let ipv6_cell = if ipv6_extra > 0 {
+                    format!("{ipv6_primary} +{ipv6_extra}")
+                } else {
+                    ipv6_primary
+                };
+                let cells: Vec<Cell<'_>> = cols
+                    .iter()
+                    .map(|c| {
+                        let text = match c {
+                            NetColumn::Iface => n.iface_label(master_suffix),
+                            NetColumn::State => n.oper_state.clone(),
+                            NetColumn::Mac => n.mac.clone(),
+                            NetColumn::Ipv4 => n.ipv4.clone(),
+                            NetColumn::Ipv6 => ipv6_cell.clone(),
+                            NetColumn::Mtu => n.mtu.clone(),
+                            NetColumn::Speed => n.speed.clone(),
+                            NetColumn::Driver => n.driver.clone(),
+                            NetColumn::Master => {
+                                if n.master.is_empty() {
+                                    "—".into()
+                                } else {
+                                    n.master.clone()
+                                }
+                            }
+                            NetColumn::Def => flag(n.default_route).into(),
+                            NetColumn::Mgmt => flag(n.management).into(),
+                        };
+                        Cell::from(text)
+                    })
+                    .collect();
+                Row::new(cells).style(style).height(1)
+            })
+            .collect()
+    };
+
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .column_spacing(1)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Network inventory ")
+                .title_style(theme::title_style())
+                .border_style(Style::default().fg(theme::accent())),
+        );
+    f.render_widget(table, table_area);
+
+    if show_detail {
+        let detail = network_detail_line(app);
+        f.render_widget(
+            Paragraph::new(detail).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Network inventory ")
+                    .title(" Selected ")
                     .title_style(theme::title_style())
                     .border_style(Style::default().fg(theme::accent())),
-            )
-            .column_spacing(1),
-        area,
-    );
+            ),
+            chunks[1],
+        );
+    }
 }
 
-fn table_header_disk() -> Row<'static> {
-    Row::new(vec![
-        Cell::from("Name"),
-        Cell::from("Path"),
-        Cell::from("Model"),
-        Cell::from("Serial"),
-        Cell::from("Size"),
-        Cell::from("Kind"),
-        Cell::from("RO"),
-        Cell::from("Mounts"),
-        Cell::from("Health"),
-        Cell::from("Role"),
+fn network_detail_line(app: &AppState) -> Line<'static> {
+    let Some(n) = app.snapshot.nics.get(app.network_sel) else {
+        return Line::from(Span::styled("No interface selected", theme::muted()));
+    };
+    let master = if n.master.is_empty() {
+        String::new()
+    } else {
+        format!("  master={}", n.master)
+    };
+    Line::from(vec![
+        Span::styled(n.name.clone(), theme::text()),
+        Span::styled(master, theme::muted()),
+        Span::styled("  IPv6: ", theme::muted()),
+        Span::styled(n.ipv6.clone(), theme::text()),
     ])
-    .style(
-        Style::default()
-            .add_modifier(Modifier::BOLD)
-            .fg(theme::accent()),
-    )
-}
-
-fn table_rows_disk(app: &AppState) -> Vec<Row<'_>> {
-    app.snapshot
-        .disks
-        .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let style = if i == app.storage_sel {
-                Style::default().fg(theme::text()).bg(theme::selection_bg())
-            } else {
-                Style::default().fg(theme::text())
-            };
-            Row::new(vec![
-                Cell::from(d.name.clone()),
-                Cell::from(d.path.clone()),
-                Cell::from(d.model.clone()),
-                Cell::from(d.serial.clone()),
-                Cell::from(d.size_text.clone()),
-                Cell::from(d.kind.clone()),
-                Cell::from(d.ro.clone()),
-                Cell::from(d.mountpoints.clone()),
-                Cell::from(d.health.clone()),
-                Cell::from(d.usage_role.clone()),
-            ])
-            .style(style)
-        })
-        .collect()
 }
 
 fn draw_storage(f: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let rows = table_rows_disk(app);
-    let trows = if rows.is_empty() {
-        vec![Row::new(
-            (0..10).map(|_| Cell::from("—")).collect::<Vec<_>>(),
-        )]
+    use super::cols::{disk_columns_for_width, DiskColumn};
+
+    let inner_w = area.width.saturating_sub(2);
+    let cols = disk_columns_for_width(inner_w);
+    let constraints: Vec<Constraint> = cols.iter().map(|c| c.constraint()).collect();
+
+    let header = Row::new(cols.iter().map(|c| Cell::from(c.header())))
+        .style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(theme::accent()),
+        )
+        .height(1);
+
+    let rows: Vec<Row<'_>> = if app.snapshot.disks.is_empty() {
+        vec![Row::new(cols.iter().map(|_| Cell::from("—")).collect::<Vec<_>>()).height(1)]
     } else {
-        rows
+        app.snapshot
+            .disks
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let style = if i == app.storage_sel {
+                    Style::default().fg(theme::text()).bg(theme::selection_bg())
+                } else {
+                    Style::default().fg(theme::text())
+                };
+                let cells: Vec<Cell<'_>> = cols
+                    .iter()
+                    .map(|c| {
+                        let text = match c {
+                            DiskColumn::Name => d.name.clone(),
+                            DiskColumn::Path => d.path.clone(),
+                            DiskColumn::Model => d.model.clone(),
+                            DiskColumn::Serial => d.serial.clone(),
+                            DiskColumn::Size => d.size_text.clone(),
+                            DiskColumn::Kind => d.kind.clone(),
+                            DiskColumn::Ro => d.ro.clone(),
+                            DiskColumn::Mounts => d.mountpoints.clone(),
+                            DiskColumn::Health => d.health.clone(),
+                            DiskColumn::Role => d.usage_role.clone(),
+                        };
+                        Cell::from(text)
+                    })
+                    .collect();
+                Row::new(cells).style(style).height(1)
+            })
+            .collect()
     };
-    let table = Table::new(
-        trows,
-        [
-            Constraint::Min(6),
-            Constraint::Min(8),
-            Constraint::Min(10),
-            Constraint::Min(8),
-            Constraint::Min(9),
-            Constraint::Min(5),
-            Constraint::Min(2),
-            Constraint::Min(12),
-            Constraint::Min(5),
-            Constraint::Min(8),
-        ],
-    )
-    .header(table_header_disk());
-    f.render_widget(
-        table
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Storage inventory ")
-                    .title_style(theme::title_style())
-                    .border_style(Style::default().fg(theme::accent())),
-            )
-            .column_spacing(1),
-        area,
-    );
+
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .column_spacing(1)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Storage inventory ")
+                .title_style(theme::title_style())
+                .border_style(Style::default().fg(theme::accent())),
+        );
+    f.render_widget(table, area);
 }
 
 fn draw_diagnostics(f: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -489,6 +528,10 @@ fn draw_help(f: &mut Frame<'_>, area: Rect, _dev: bool) {
     let t = "KCORE hypervisor appliance — local display is read-only.\
         \nUse the management URL and kcorectl from a trusted machine.\
         \nReboot, shutdown, and root shell are intentionally unavailable here.\
+        \n\nNetwork: tables adapt to console width. IPv4 is never truncated.\
+        \nIPv6 shows the first global address (else link-local) and +N when more\
+        \nexist; the full list is on the Selected detail line under the table.\
+        \nBridge members show as \"iface -> br0\" (or a master column when wide).\
         \n\nSecurity: protect boot (UEFI, GRUB), mask extra getty, prefer SSH.\
         \nSee: docs/appliance-console.md in the kcore source tree.\n";
     f.render_widget(
@@ -506,6 +549,11 @@ fn draw_help(f: &mut Frame<'_>, area: Rect, _dev: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{AppState, Page};
+    use crate::inventory::network::Nic;
+    use crate::inventory::Snapshot;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn logo_area_is_reserved_at_bottom_right() {
@@ -528,12 +576,131 @@ mod tests {
     }
 
     #[test]
-    fn logo_area_is_available_on_standard_tty_size() {
+    fn logo_area_is_skipped_on_80x25_body() {
+        // 80-col body is below the width threshold so tables keep height.
         let area = Rect::new(0, 0, 80, 22);
 
         let (content, logo) = carve_logo_area(area);
 
-        assert_eq!(content, Rect::new(0, 0, 80, 16));
-        assert_eq!(logo, Some(Rect::new(28, 16, 52, 6)));
+        assert_eq!(content, area);
+        assert_eq!(logo, None);
+    }
+
+    #[test]
+    fn logo_area_is_available_on_128x48_body() {
+        let area = Rect::new(0, 0, 128, 45);
+
+        let (content, logo) = carve_logo_area(area);
+
+        assert_eq!(content.height, 39);
+        assert_eq!(logo, Some(Rect::new(76, 39, 52, 6)));
+    }
+
+    fn sample_network_snapshot() -> Snapshot {
+        Snapshot {
+            nics: vec![
+                Nic {
+                    name: "eno1".into(),
+                    mac: "aa:bb:cc:dd:ee:01".into(),
+                    oper_state: "UP".into(),
+                    ipv4: "—".into(),
+                    ipv6: "—".into(),
+                    mtu: "1500".into(),
+                    speed: "1000 Mbps".into(),
+                    driver: "igb".into(),
+                    default_route: false,
+                    management: false,
+                    master: "br0".into(),
+                },
+                Nic {
+                    name: "br0".into(),
+                    mac: "aa:bb:cc:dd:ee:01".into(),
+                    oper_state: "UP".into(),
+                    ipv4: "192.168.40.143/24".into(),
+                    ipv6: "2a02:ef8:1000:1d00:7d1d:ca86:5156:8dd8/64, fe80::7d1d:ca86:5156:8dd8/64"
+                        .into(),
+                    mtu: "1500".into(),
+                    speed: "—".into(),
+                    driver: "bridge".into(),
+                    default_route: true,
+                    management: true,
+                    master: String::new(),
+                },
+                Nic {
+                    name: "enp6s0d1".into(),
+                    mac: "11:22:33:44:55:66".into(),
+                    oper_state: "UP".into(),
+                    ipv4: "192.168.47.3/24".into(),
+                    ipv6: "—".into(),
+                    mtu: "9000".into(),
+                    speed: "10000 Mbps".into(),
+                    driver: "mlx5_core".into(),
+                    default_route: false,
+                    management: false,
+                    master: String::new(),
+                },
+            ],
+            ..Snapshot::default()
+        }
+    }
+
+    fn buffer_line(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        let mut s = String::new();
+        for x in 0..buf.area.width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s
+    }
+
+    fn buffer_contains_on_one_line(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
+        for y in 0..buf.area.height {
+            if buffer_line(buf, y).contains(needle) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn render_network_at(width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut app = AppState::new(true, sample_network_snapshot());
+        app.page = Page::Network;
+        // Select br0 so the detail line is exercised.
+        app.network_sel = 1;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, &app)).expect("draw network page");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn network_ipv4_complete_at_200x56() {
+        let buf = render_network_at(200, 56);
+        assert!(
+            buffer_contains_on_one_line(&buf, "192.168.40.143/24"),
+            "IPv4 must appear intact on one row at 200x56"
+        );
+    }
+
+    #[test]
+    fn network_ipv4_complete_at_128x48() {
+        let buf = render_network_at(128, 48);
+        assert!(
+            buffer_contains_on_one_line(&buf, "192.168.40.143/24"),
+            "IPv4 must appear intact on one row at 128x48"
+        );
+        assert!(
+            buffer_contains_on_one_line(&buf, "eno1 -> br0")
+                || buffer_contains_on_one_line(&buf, "master"),
+            "bridge membership must be visible at 128x48"
+        );
+    }
+
+    #[test]
+    fn network_ipv4_complete_at_80x25() {
+        let buf = render_network_at(80, 25);
+        assert!(
+            buffer_contains_on_one_line(&buf, "192.168.40.143/24"),
+            "IPv4 must appear intact on one row at 80x25"
+        );
     }
 }
