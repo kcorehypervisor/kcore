@@ -252,9 +252,25 @@ pub fn mon_already_initialized(daemon_id: &str) -> bool {
         || Path::new(&mon_data_dir(daemon_id)).join("done").exists()
 }
 
+/// Only the first mon in the spec may create a brand-new single-member
+/// monmap. Any other member that cannot reach a running cluster must fail
+/// instead of founding a second cluster with the same fsid.
+pub fn may_found_cluster(daemon_id: &str, mons: &[MonMember]) -> bool {
+    mons.first().is_some_and(|m| m.id == daemon_id)
+}
+
+fn saved_monmap_path(daemon_id: &str) -> String {
+    format!("/var/lib/kcore/ceph-monmap-{daemon_id}.bin")
+}
+
 /// A cluster that already has quorum must learn this mon before mkfs.
 /// Building a fresh monmap here gives the new daemon a different epoch, so it
 /// never joins. Returns true when `monmap_path` holds the cluster's map.
+///
+/// The map is fetched *before* `ceph mon add`: going from one mon to two makes
+/// quorum need both, so once the new mon is registered but not yet running no
+/// `ceph` command can answer. The fetched map is kept on disk so a retry after
+/// that point can still mkfs from it.
 fn adopt_running_monmap(
     daemon_id: &str,
     mons: &[MonMember],
@@ -264,42 +280,58 @@ fn adopt_running_monmap(
         return Ok(false);
     };
     let addr = format!("{}:6789", me.addr);
-    let add_ok = match Command::new("timeout")
-        .args(["10", "ceph", "mon", "add", daemon_id, &addr])
-        .output()
-    {
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            out.status.success() || stderr.contains("already")
-        }
-        Err(_) => false,
-    };
-    let get_ok = match Command::new("timeout")
-        .args(["10", "ceph", "mon", "getmap", "-o"])
+    let saved = saved_monmap_path(daemon_id);
+
+    let fetched = match Command::new("timeout")
+        .args(["15", "ceph", "mon", "getmap", "-o"])
         .arg(monmap_path)
         .output()
     {
         Ok(out) => out.status.success() && monmap_path.is_file(),
         Err(_) => false,
     };
-    if add_ok && !get_ok {
-        return Err(format!(
-            "registered mon.{daemon_id} with the cluster but could not fetch the monmap"
-        ));
-    }
-    if !get_ok {
+    if fetched {
+        let _ = std::fs::create_dir_all("/var/lib/kcore");
+        std::fs::copy(monmap_path, &saved).map_err(|e| format!("save monmap: {e}"))?;
+    } else if Path::new(&saved).is_file() {
+        std::fs::copy(&saved, monmap_path).map_err(|e| format!("restore saved monmap: {e}"))?;
+    } else if may_found_cluster(daemon_id, mons) {
         return Ok(false);
-    }
-    let printed = Command::new("monmaptool")
-        .arg("--print")
-        .arg(monmap_path)
-        .output()
-        .map_err(|e| format!("monmaptool --print: {e}"))?;
-    let text = String::from_utf8_lossy(&printed.stdout);
-    if !text.contains(&format!("mon.{daemon_id}")) {
+    } else {
         return Err(format!(
-            "cluster monmap does not include mon.{daemon_id}; refusing to mkfs a divergent map"
+            "no running Ceph cluster answered `ceph mon getmap` and mon.{daemon_id} is not the \
+             first mon; refusing to create a second cluster with the same fsid"
         ));
+    }
+
+    let printed = run(
+        "monmaptool",
+        &["--print", &monmap_path.display().to_string()],
+    )?;
+    if !printed.contains(&format!("mon.{daemon_id}")) {
+        run(
+            "monmaptool",
+            &[
+                "--add",
+                daemon_id,
+                &addr,
+                &monmap_path.display().to_string(),
+            ],
+        )?;
+    }
+
+    let out = Command::new("timeout")
+        .args(["20", "ceph", "mon", "add", daemon_id, &addr])
+        .output()
+        .map_err(|e| format!("ceph mon add: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let already = stderr.contains("already") || stdout.contains("already");
+    // A hung `mon add` on retry means it was registered earlier and quorum is
+    // waiting for this mon; the saved map is enough to continue.
+    let timed_out = out.status.code() == Some(124);
+    if !out.status.success() && !already && !timed_out {
+        return Err(format!("ceph mon add {daemon_id} {addr} failed: {stderr}"));
     }
     Ok(true)
 }
@@ -558,6 +590,15 @@ mod tests {
     fn parse_mon_map_rejects_empty() {
         assert!(parse_mon_map("").is_err());
         assert!(parse_mon_map("bad").is_err());
+    }
+
+    #[test]
+    fn only_the_first_mon_may_found_a_cluster() {
+        let mons = parse_mon_map("dell-1=10.10.0.11,dell-2=10.10.0.12,dell-3=10.10.0.13").unwrap();
+        assert!(may_found_cluster("dell-1", &mons));
+        assert!(!may_found_cluster("dell-2", &mons));
+        assert!(!may_found_cluster("dell-3", &mons));
+        assert!(!may_found_cluster("dell-1", &[]));
     }
 
     #[test]
