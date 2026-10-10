@@ -80,7 +80,7 @@ async fn admin_for(
         .ok_or_else(|| format!("no admin client for {}", node.address))
 }
 
-fn mon_map_string(spec: &crate::controller_proto::CephClusterSpec) -> String {
+pub(crate) fn mon_map_string(spec: &crate::controller_proto::CephClusterSpec) -> String {
     spec.nodes
         .iter()
         .map(|n| {
@@ -417,6 +417,8 @@ pub(crate) fn generate_ceph_nix(
     monInitialMembers = "{mon_ids}";
     publicAddr = "{public_addr}";
     clusterAddr = "{cluster_addr}";
+    publicIface = "{public_iface}";
+    clusterIface = "{cluster_iface}";
     daemonId = "{daemon_id}";
     enableMon = true;
     enableMgr = true;
@@ -431,6 +433,8 @@ pub(crate) fn generate_ceph_nix(
         public_network = nix_escape(&spec.public_network),
         cluster_network = nix_escape(&spec.cluster_network),
         cluster_addr = nix_escape(&node.cluster_addr),
+        public_iface = nix_escape(&node.public_iface),
+        cluster_iface = nix_escape(&node.cluster_iface),
         size = spec.size,
         min_size = spec.min_size,
         mon_host = nix_escape(&mon_host),
@@ -507,6 +511,8 @@ mod tests {
         assert!(nix.contains("monInitialMembers = \"dell-tower-1,dell-2\";"));
         assert!(nix.contains("publicAddr = \"10.10.0.11\";"));
         assert!(nix.contains("clusterAddr = \"10.20.0.11\";"));
+        assert!(nix.contains("publicIface = \"eth1\";"));
+        assert!(nix.contains("clusterIface = \"eth2\";"));
         assert!(nix.contains("daemonId = \"dell-tower-1\";"));
         assert!(nix.contains("poolSize = 3;"));
     }

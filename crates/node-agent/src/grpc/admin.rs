@@ -53,6 +53,9 @@ const DISK_MODE_CONTROLLER_MANAGED: &str = "controller-managed";
 const DISK_LAYOUT_DIR: &str = "/etc/kcore/disk";
 const DISK_LAYOUT_CURRENT_PATH: &str = "/etc/kcore/disk/current.nix";
 const CEPH_NIX_PATH: &str = "/etc/nixos/kcore-ceph.nix";
+/// Installed copy of `modules/kcore-ceph.nix` (installer seeds it; apply keeps it current).
+const CEPH_MODULE_PATH: &str = "/etc/nixos/modules/kcore-ceph.nix";
+const BUNDLED_CEPH_MODULE: &str = include_str!("../../../../modules/kcore-ceph.nix");
 /// Rebuild verdicts live on tmpfs so they survive the node-agent restart that
 /// `nixos-rebuild switch` performs, but not a reboot (after which there is
 /// nothing in flight to report on anyway).
@@ -463,6 +466,77 @@ fn validate_apply_ceph_config_args(ceph_nix: &str, fsid: &str) -> Result<(), Sta
         return Err(Status::invalid_argument("ceph_nix and fsid are required"));
     }
     Ok(())
+}
+
+async fn sync_bundled_ceph_module() -> Result<(), Status> {
+    if let Some(parent) = Path::new(CEPH_MODULE_PATH).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| Status::internal(format!("creating {}: {e}", parent.display())))?;
+    }
+    let current = tokio::fs::read_to_string(CEPH_MODULE_PATH)
+        .await
+        .unwrap_or_default();
+    if current != BUNDLED_CEPH_MODULE {
+        tokio::fs::write(CEPH_MODULE_PATH, BUNDLED_CEPH_MODULE)
+            .await
+            .map_err(|e| Status::internal(format!("writing {CEPH_MODULE_PATH}: {e}")))?;
+    }
+    Ok(())
+}
+
+async fn run_ceph_dry_build(ceph_nix: &str) -> Result<(), String> {
+    sync_bundled_ceph_module()
+        .await
+        .map_err(|e| e.message().to_string())?;
+    let previous = tokio::fs::read_to_string(CEPH_NIX_PATH)
+        .await
+        .unwrap_or_default();
+    tokio::fs::write(CEPH_NIX_PATH, ceph_nix.as_bytes())
+        .await
+        .map_err(|e| format!("writing {CEPH_NIX_PATH} for dry-build: {e}"))?;
+    let nixpkgs = resolve_nixpkgs_path()
+        .await
+        .ok_or_else(|| {
+            "pinned nixpkgs path unresolved (resolve_nixpkgs_path); refusing dry-build that would pull unstable"
+                .to_string()
+        })?;
+    let out = Command::new("nixos-rebuild")
+        .args(["dry-build"])
+        .env(
+            "NIX_PATH",
+            format!("nixos-config={NIXOS_CONFIG_PATH}:nixpkgs={nixpkgs}"),
+        )
+        .output()
+        .await
+        .map_err(|e| format!("starting nixos-rebuild dry-build: {e}"))?;
+    let _ = tokio::fs::write(CEPH_NIX_PATH, previous.as_bytes()).await;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(format!(
+            "nixos-rebuild dry-build failed: {}",
+            stderr
+                .lines()
+                .chain(stdout.lines())
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    Ok(())
+}
+
+fn issue(check: &str, message: impl Into<String>, blocking: bool) -> proto::CephPreflightIssue {
+    proto::CephPreflightIssue {
+        check: check.into(),
+        message: message.into(),
+        blocking,
+    }
 }
 
 fn validate_bootstrap_osd_device(osd_device: &str) -> Result<(), Status> {
@@ -1879,6 +1953,187 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn check_ceph_preflight(
+        &self,
+        request: Request<proto::CheckCephPreflightRequest>,
+    ) -> Result<Response<proto::CheckCephPreflightResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let mut issues = Vec::new();
+
+        if req.ceph_nix.trim().is_empty() {
+            issues.push(issue("ceph_nix", "ceph_nix fragment is empty", true));
+        }
+
+        match resolve_nixpkgs_path().await {
+            Some(p) => {
+                if !Path::new(&p).exists() {
+                    issues.push(issue(
+                        "nixpkgs",
+                        format!("nixpkgs path does not exist: {p}"),
+                        true,
+                    ));
+                }
+            }
+            None => issues.push(issue(
+                "nixpkgs",
+                "pinned nixpkgs path unresolved; apply would fall back to unstable",
+                true,
+            )),
+        }
+
+        if !req.ceph_nix.trim().is_empty() {
+            if let Err(e) = run_ceph_dry_build(&req.ceph_nix).await {
+                issues.push(issue("dry_build", e, true));
+            }
+        }
+
+        let disks = match tokio::task::spawn_blocking(discovery::list_disks)
+            .await
+            .map_err(|e| Status::internal(format!("list_disks task: {e}")))?
+        {
+            Ok(d) => d,
+            Err(e) => {
+                issues.push(issue(
+                    "osd_device",
+                    format!("listing disks failed: {e}"),
+                    true,
+                ));
+                Vec::new()
+            }
+        };
+        for device in &req.osd_devices {
+            let device = device.trim();
+            if device.is_empty() {
+                continue;
+            }
+            if !Path::new(device).exists() {
+                issues.push(issue(
+                    "osd_device",
+                    format!("OSD device does not exist: {device}"),
+                    true,
+                ));
+                continue;
+            }
+            if !crate::ceph_preflight::prefers_by_id_path(device) {
+                issues.push(issue(
+                    "osd_device",
+                    format!(
+                        "prefer /dev/disk/by-id/... for {device} (kernel names like /dev/sdX rename)"
+                    ),
+                    false,
+                ));
+            }
+            let matched = disks.iter().find(|d| {
+                d.path == device
+                    || d.name == device.trim_start_matches("/dev/")
+                    || Path::new(&d.path)
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| Path::new(device).canonicalize().ok().map(|q| p == q))
+                        .unwrap_or(false)
+            });
+            if let Some(d) = matched {
+                if crate::ceph_preflight::is_hardware_raid_model(&d.model) {
+                    issues.push(issue(
+                        "raid",
+                        format!(
+                            "OSD device {device} looks like a hardware RAID virtual disk (model={})",
+                            d.model
+                        ),
+                        true,
+                    ));
+                }
+                if !d.mountpoint.is_empty() && d.mountpoint != "-" {
+                    issues.push(issue(
+                        "osd_device",
+                        format!("OSD device {device} is mounted at {}", d.mountpoint),
+                        true,
+                    ));
+                }
+            }
+        }
+
+        let ip_json = Command::new("ip")
+            .args(["-j", "addr", "show"])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|| "[]".into());
+
+        let public_ip = crate::ceph_preflight::mon_ip(&req.mon_addr);
+        if !req.public_iface.is_empty() && !public_ip.is_empty() {
+            match crate::ceph_preflight::iface_has_address(&ip_json, &req.public_iface, public_ip) {
+                Ok(true) => {}
+                Ok(false) => issues.push(issue(
+                    "address",
+                    format!(
+                        "public address {public_ip} is not assigned on {}",
+                        req.public_iface
+                    ),
+                    true,
+                )),
+                Err(e) => issues.push(issue("address", e, true)),
+            }
+            let lease = Path::new(&format!(
+                "/run/systemd/netif/leases/{}",
+                // networkd lease files are by ifindex; also check dhcpcd.
+                req.public_iface
+            ))
+            .exists()
+                || Path::new(&format!(
+                    "/var/lib/dhcpcd/dhcpcd-{}.lease",
+                    req.public_iface
+                ))
+                .exists();
+            let networkctl = Command::new("networkctl")
+                .args(["status", &req.public_iface])
+                .output()
+                .await
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            if crate::ceph_preflight::iface_appears_dhcp(&networkctl, lease) {
+                issues.push(issue(
+                    "dhcp_mon",
+                    format!(
+                        "mon address {public_ip} appears to be on DHCP interface {}; use a static address or DHCP reservation",
+                        req.public_iface
+                    ),
+                    true,
+                ));
+            }
+        }
+
+        if !req.cluster_iface.is_empty() && !req.cluster_addr.trim().is_empty() {
+            match crate::ceph_preflight::iface_has_address(
+                &ip_json,
+                &req.cluster_iface,
+                req.cluster_addr.trim(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => issues.push(issue(
+                    "address",
+                    format!(
+                        "cluster address {} is not assigned on {} (module will try to set it)",
+                        req.cluster_addr.trim(),
+                        req.cluster_iface
+                    ),
+                    false,
+                )),
+                Err(e) => issues.push(issue("address", e, true)),
+            }
+        }
+
+        let ok = !issues.iter().any(|i| i.blocking);
+        Ok(Response::new(proto::CheckCephPreflightResponse {
+            ok,
+            issues,
+        }))
+    }
+
     async fn apply_ceph_config(
         &self,
         request: Request<proto::ApplyCephConfigRequest>,
@@ -1886,6 +2141,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         validate_apply_ceph_config_args(&req.ceph_nix, &req.fsid)?;
+        // Keep /etc/nixos/modules/kcore-ceph.nix in sync with this agent build so
+        // overlay / firewall fixes reach existing nodes without a manual copy.
+        sync_bundled_ceph_module().await?;
         let previous = tokio::fs::read_to_string(CEPH_NIX_PATH)
             .await
             .unwrap_or_default();
