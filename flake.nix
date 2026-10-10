@@ -56,6 +56,8 @@
               path: type:
               (craneLib.filterCargoSources path type)
               || pkgs.lib.hasPrefix "${toString ./.}/proto/" (toString path)
+              || (toString path) == "${toString ./.}/modules"
+              || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/assets/" (toString path)
               || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path);
           };
