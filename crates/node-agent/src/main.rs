@@ -6,6 +6,7 @@
 
 mod auth;
 mod ceph_bootstrap;
+mod ceph_preflight;
 mod config;
 mod console;
 mod discovery;
