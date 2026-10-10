@@ -394,6 +394,16 @@ pub(crate) fn generate_ceph_nix(
         .filter_map(|p| p.split_once('=').map(|(_, ip)| ip.trim().to_string()))
         .collect::<Vec<_>>()
         .join(",");
+    let first_mon = mon_map
+        .split(',')
+        .next()
+        .and_then(|p| p.split_once('=').map(|(id, _)| id.trim()))
+        .unwrap_or_default();
+    let initial_members = if first_mon == daemon_id {
+        daemon_id
+    } else {
+        ""
+    };
     let public_addr = node
         .mon_addr
         .split(':')
@@ -409,9 +419,10 @@ pub(crate) fn generate_ceph_nix(
     publicNetwork = "{public_network}";
     clusterNetwork = "{cluster_network}";
     monAddress = "{mon_host}";
-    # Only this daemon — listing peers that are not yet in the monmap makes
-    # ceph.conf invent 0.0.0.0 placeholders and keeps the mon in "probing".
-    monInitialMembers = "{daemon_id}";
+    # Only the first mon names itself. Ceph prunes (or pads with 0.0.0.0
+    # placeholders) the monmap to match this list on first start, so a mon
+    # joining a running cluster must leave it empty to keep the adopted map.
+    monInitialMembers = "{initial_members}";
     publicAddr = "{public_addr}";
     clusterAddr = "{cluster_addr}";
     publicIface = "{public_iface}";
@@ -435,6 +446,7 @@ pub(crate) fn generate_ceph_nix(
         size = spec.size,
         min_size = spec.min_size,
         mon_host = nix_escape(&mon_host),
+        initial_members = nix_escape(initial_members),
         public_addr = nix_escape(public_addr),
         daemon_id = nix_escape(daemon_id),
     )
@@ -517,5 +529,14 @@ mod tests {
         assert!(nix.contains("clusterIface = \"eth2\";"));
         assert!(nix.contains("daemonId = \"dell-tower-1\";"));
         assert!(nix.contains("poolSize = 3;"));
+    }
+
+    #[test]
+    fn joining_mon_leaves_initial_members_empty() {
+        let spec = sample_spec();
+        let mon_map = mon_map_string(&spec);
+        let nix = generate_ceph_nix(&spec, &spec.nodes[1], "dell-2", &mon_map);
+        assert!(nix.contains("monInitialMembers = \"\";"));
+        assert!(nix.contains("daemonId = \"dell-2\";"));
     }
 }

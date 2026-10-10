@@ -289,6 +289,12 @@ in
         "network-online.target"
       ];
       wants = [ "network-online.target" ];
+      path = [
+        pkgs.util-linux
+        pkgs.lvm2
+        pkgs.coreutils
+        pkgs.systemd
+      ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
