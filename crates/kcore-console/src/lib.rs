@@ -83,8 +83,10 @@ pub fn run(opts: Options) -> io::Result<()> {
         })?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                // SIGWINCH / terminal resize: next loop iteration redraws with new area.
+                Event::Resize(_, _) => {}
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if key.code == KeyCode::Char('c')
                         && key
                             .modifiers
@@ -148,6 +150,7 @@ pub fn run(opts: Options) -> io::Result<()> {
                         }
                     }
                 }
+                _ => {}
             }
         }
     }
