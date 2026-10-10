@@ -154,6 +154,11 @@
             fmt-rust = craneLib.cargoFmt { inherit src; };
             vm-module = import ./tests/vm-module.nix { inherit pkgs; };
             disko-module = import ./tests/disko-module.nix { inherit pkgs; };
+            ceph-module-eval = import ./tests/ceph-module-eval.nix {
+              inherit pkgs;
+              lib = pkgs.lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
             fmt-nix =
               pkgs.runCommand "check-nix-fmt"
                 {

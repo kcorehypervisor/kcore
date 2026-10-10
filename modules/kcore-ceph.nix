@@ -11,11 +11,27 @@ let
   # own `ceph` 19.2.3: the python3.11 environment pulls in sphinx 9.1.0, which
   # requires python >= 3.12. Take only the ceph package from a newer pinned
   # revision whose ceph (20.2.4) evaluates and is in cache.nixos.org, so nodes
-  # download it instead of compiling. Drop this once the base pin is bumped.
+  # download it instead of compiling. Drop this once the base pin is bumped to a
+  # revision where `nix eval nixpkgs#ceph.drvPath` succeeds without an overlay.
   cephNixpkgs = import (builtins.fetchTarball {
     url = "https://github.com/NixOS/nixpkgs/archive/e7439b6b14ad3cc35d05608ebca9bce01a25f5f8.tar.gz";
     sha256 = "19y4py973w62z4qb7gzn0chjs67ihxy8rbjb7g71iyk8yz7z5k8z";
   }) { system = "x86_64-linux"; };
+  clusterPrefixLength =
+    let
+      parts = lib.splitString "/" cfg.clusterNetwork;
+    in
+    if builtins.length parts == 2 then lib.toInt (builtins.elemAt parts 1) else 24;
+  # Fallback when NodeNetwork is not managing interfaces: open Ceph ports and
+  # optionally pin a static address on the cluster iface.
+  cephPublicPorts = [
+    3300
+    6789
+  ];
+  cephDaemonRange = {
+    from = 6800;
+    to = 7568;
+  };
 in
 {
   options.kcore.ceph = {
@@ -55,6 +71,16 @@ in
       type = lib.types.str;
       default = "";
       description = "This node's cluster/replication address.";
+    };
+    publicIface = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "Public/client NIC name. Used for firewall rules when set.";
+    };
+    clusterIface = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "Cluster/replication NIC name. Trusted for OSD traffic; may receive a static clusterAddr.";
     };
     daemonId = lib.mkOption {
       type = lib.types.str;
@@ -133,6 +159,37 @@ in
       "ceph"
     ];
     environment.systemPackages = [ cfg.package ];
+
+    # Minimal networking fallback so Ceph works before / without NodeNetwork.
+    # Public: mon/msgr2 + daemon range. Cluster iface: daemon range + trust.
+    networking.firewall = {
+      allowedTCPPorts = cephPublicPorts ++ lib.optionals cfg.enableRgw [ cfg.rgwPort ];
+      allowedTCPPortRanges = [ cephDaemonRange ];
+      interfaces = lib.mkMerge [
+        (lib.mkIf (cfg.publicIface != "") {
+          ${cfg.publicIface} = {
+            allowedTCPPorts = cephPublicPorts ++ lib.optionals cfg.enableRgw [ cfg.rgwPort ];
+            allowedTCPPortRanges = [ cephDaemonRange ];
+          };
+        })
+        (lib.mkIf (cfg.clusterIface != "") {
+          ${cfg.clusterIface} = {
+            allowedTCPPortRanges = [ cephDaemonRange ];
+          };
+        })
+      ];
+      trustedInterfaces = lib.mkIf (cfg.clusterIface != "") [ cfg.clusterIface ];
+    };
+
+    networking.interfaces = lib.mkIf (cfg.clusterIface != "" && cfg.clusterAddr != "") {
+      ${cfg.clusterIface}.ipv4.addresses = [
+        {
+          address = cfg.clusterAddr;
+          prefixLength = clusterPrefixLength;
+        }
+      ];
+    };
+
     # Option names match nixos/modules/services/network-filesystems/ceph.nix
     # (camelCase). The previous mapping used public_network / mon_host / cluster,
     # which are not options, so `nixos-rebuild` rejected the whole Ceph config
