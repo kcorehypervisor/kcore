@@ -259,7 +259,9 @@ pub fn may_found_cluster(daemon_id: &str, mons: &[MonMember]) -> bool {
     mons.first().is_some_and(|m| m.id == daemon_id)
 }
 
-/// Both messenger versions, so a mon never joins as v1-only.
+/// Both messenger versions, so a mon never joins as v1-only. For `monmaptool
+/// --addv` only: `ceph mon add` rejects this form (its argument parser crashes
+/// on it in Ceph 20) and takes a bare IP, which also means v2 plus v1.
 pub fn mon_addrvec(ip: &str) -> String {
     format!("[v2:{ip}:3300,v1:{ip}:6789]")
 }
@@ -326,7 +328,7 @@ fn adopt_running_monmap(
     }
 
     let out = Command::new("timeout")
-        .args(["20", "ceph", "mon", "add", daemon_id, &addr])
+        .args(["20", "ceph", "mon", "add", daemon_id, &me.addr])
         .output()
         .map_err(|e| format!("ceph mon add: {e}"))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -336,7 +338,10 @@ fn adopt_running_monmap(
     // waiting for this mon; the saved map is enough to continue.
     let timed_out = out.status.code() == Some(124);
     if !out.status.success() && !already && !timed_out {
-        return Err(format!("ceph mon add {daemon_id} {addr} failed: {stderr}"));
+        return Err(format!(
+            "ceph mon add {daemon_id} {} failed: {stderr}",
+            me.addr
+        ));
     }
     Ok(true)
 }
