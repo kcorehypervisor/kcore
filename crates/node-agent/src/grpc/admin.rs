@@ -2495,6 +2495,17 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             }
             created = true;
         }
+        // Idempotent hardening so a fresh cluster reaches HEALTH_OK: mons added
+        // with a v1-only address, and the insecure global_id reclaim default.
+        let _ = run_ceph_cmd(&["mon", "enable-msgr2"]).await;
+        let _ = run_ceph_cmd(&[
+            "config",
+            "set",
+            "mon",
+            "auth_allow_insecure_global_id_reclaim",
+            "false",
+        ])
+        .await;
         if req.size > 0 {
             let size = req.size.to_string();
             let _ = run_ceph_cmd(&["osd", "pool", "set", pool, "size", &size]).await;
