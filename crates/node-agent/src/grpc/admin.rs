@@ -628,8 +628,14 @@ async fn list_prepared_osds() -> Result<Vec<crate::ceph_bootstrap::ListedOsd>, S
     let listed = Command::new("ceph-volume")
         .args(["lvm", "list", "--format", "json"])
         .output()
-        .await
-        .map_err(|e| Status::internal(format!("starting ceph-volume: {e}")))?;
+        .await;
+    let listed = match listed {
+        Ok(out) => out,
+        // Ceph tools are only on PATH while the module is enabled; once a node
+        // has been torn down there is nothing prepared to list.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Status::internal(format!("starting ceph-volume: {e}"))),
+    };
     if !listed.status.success() {
         return Err(Status::internal(format!(
             "ceph-volume lvm list failed: {}",
