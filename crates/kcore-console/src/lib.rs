@@ -65,11 +65,13 @@ pub fn run(opts: Options) -> io::Result<()> {
     let mut app = AppState::new(opts.dev, crate::inventory::Snapshot::default());
     app.clamp_network_selection();
     app.clamp_storage_selection();
-    if opts.dev {
+    // Never print diagnostics onto the managed TTY after attach — they overwrite the TUI.
+    if opts.dev && opts.tty.is_none() {
         eprintln!("[kcore-console] dev mode: q quits, Ctrl+C exits (best effort)");
     }
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    terminal.clear()?;
     loop {
         while let Ok(snapshot) = snapshot_rx.try_recv() {
             app.snapshot = snapshot;
@@ -83,8 +85,10 @@ pub fn run(opts: Options) -> io::Result<()> {
         })?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                // SIGWINCH / terminal resize: next loop iteration redraws with new area.
+                Event::Resize(_, _) => {}
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if key.code == KeyCode::Char('c')
                         && key
                             .modifiers
@@ -148,6 +152,7 @@ pub fn run(opts: Options) -> io::Result<()> {
                         }
                     }
                 }
+                _ => {}
             }
         }
     }
