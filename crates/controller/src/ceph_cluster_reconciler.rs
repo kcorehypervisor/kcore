@@ -279,6 +279,7 @@ async fn retire_removed_members(
                 .map_err(|e| e.to_string())?;
             continue;
         }
+        drain_member(db, clients, row, spec, &node_id).await?;
         let mut admin = admin_for(db, clients, &node_id).await?;
         let torn = admin
             .teardown_ceph_node(Request::new(node_proto::TeardownCephNodeRequest {}))
@@ -318,6 +319,67 @@ async fn retire_removed_members(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Mark the leaving member's OSDs out from a survivor and hold the removal
+/// until every PG is active+clean again. Returns the `NOT_HEALTHY_YET`
+/// error (after recording the wait in the cluster status) while data is
+/// still moving, so the next tick retries instead of tearing the host down
+/// with the only copy of something still on it.
+async fn drain_member(
+    db: &Database,
+    clients: &NodeClients,
+    row: &CephClusterRow,
+    spec: &crate::controller_proto::CephClusterSpec,
+    node_id: &str,
+) -> Result<(), String> {
+    let Some(survivor) = spec.nodes.first() else {
+        // Nothing survives: DeleteCephCluster, not a member removal.
+        return Ok(());
+    };
+    let host = db
+        .get_node(node_id)
+        .map_err(|e| e.to_string())?
+        .map(|n| n.hostname)
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| node_id.to_string());
+    let mut survivor_admin = admin_for(db, clients, &survivor.node_id).await?;
+    let drained = survivor_admin
+        .drain_ceph_host(Request::new(node_proto::DrainCephHostRequest {
+            host: host.clone(),
+        }))
+        .await
+        .map_err(|e| {
+            if e.code() == tonic::Code::Unimplemented {
+                format!(
+                    "survivor {} runs a node agent without DrainCephHost; update it before removing {node_id}",
+                    survivor.node_id
+                )
+            } else {
+                format!("drain {host} via {}: {e}", survivor.node_id)
+            }
+        })?
+        .into_inner();
+    if !drained.success {
+        return Err(format!("drain {host}: {}", drained.message));
+    }
+    if drained.clean {
+        return Ok(());
+    }
+    let message = format!(
+        "removing {node_id}: {} ({} PGs of {} still not active+clean)",
+        drained.message, drained.pgs_not_clean, drained.pgs_total
+    );
+    db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+        name: row.name.clone(),
+        observed_generation: 0,
+        phase: "degraded".into(),
+        health_message: message.clone(),
+        ceph_status_json: String::new(),
+        last_transition_at: String::new(),
+    })
+    .map_err(|e| e.to_string())?;
+    Err(format!("{NOT_HEALTHY_YET} {message}"))
 }
 
 async fn wait_for_nix_apply(

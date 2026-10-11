@@ -2112,6 +2112,11 @@ message PlanCephClusterResponse {
   string encrypt_osds_notice = 2;
   repeated CephNodePlanResult nodes = 3;
   repeated string cluster_issues = 4;
+  // Non-blocking notes, e.g. what retiring a member will do to the cluster.
+  repeated string cluster_warnings = 5;
+  // Members the applied spec drops; each is drained, purged and has its
+  // monitor removed by the reconciler, one apply at a time.
+  repeated string removing_members = 6;
 }
 
 message CreateCephClusterRequest { CephCluster ceph_cluster = 1; }

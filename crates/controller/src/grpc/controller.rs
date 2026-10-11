@@ -3525,12 +3525,80 @@ impl ControllerService {
             .ok_or_else(|| Status::unavailable(format!("no connection to node {}", node.address)))
     }
 
+    /// Health as a surviving member reports it, for deciding whether a host
+    /// may leave. `None` when no survivor answered.
+    async fn ceph_health_via_survivor(
+        &self,
+        survivors: &[&controller_proto::CephClusterNodeSpec],
+    ) -> Option<String> {
+        for node in survivors {
+            let Ok(Some(row)) = self.db.get_node(&node.node_id) else {
+                continue;
+            };
+            let Ok(mut admin) = self.ensure_admin_client_for_node(&row).await else {
+                continue;
+            };
+            match admin
+                .get_ceph_health(node_proto::GetCephHealthRequest {
+                    cluster_name: "ceph".into(),
+                })
+                .await
+            {
+                Ok(resp) => return Some(resp.into_inner().health_status),
+                Err(e) => {
+                    warn!(node = %node.node_id, error = %e, "ceph health via survivor failed");
+                }
+            }
+        }
+        None
+    }
+
+    /// Guard rails for the members `spec` drops from the stored cluster.
+    async fn plan_ceph_member_removal(
+        &self,
+        name: &str,
+        spec: &controller_proto::CephClusterSpec,
+    ) -> Result<ceph_cluster_spec::RemovalPlan, Status> {
+        let Some(existing) = self
+            .db
+            .get_ceph_cluster(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+        else {
+            return Ok(ceph_cluster_spec::RemovalPlan::default());
+        };
+        let old = ceph_cluster_spec::spec_from_json(&existing.spec_json)
+            .map_err(|e| Status::internal(format!("decode stored ceph spec: {e}")))?;
+        if ceph_cluster_spec::removed_members(&old, spec).is_empty() {
+            return Ok(ceph_cluster_spec::RemovalPlan::default());
+        }
+        let survivors: Vec<&controller_proto::CephClusterNodeSpec> = spec
+            .nodes
+            .iter()
+            .filter(|n| old.nodes.iter().any(|o| o.node_id == n.node_id))
+            .collect();
+        let health = self.ceph_health_via_survivor(&survivors).await;
+        let pending = self
+            .db
+            .list_retired_ceph_nodes(name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(ceph_cluster_spec::plan_member_removal(
+            &old,
+            spec,
+            &ceph_cluster_spec::RemovalContext {
+                health_status: health.as_deref(),
+                pending_removals: &pending,
+            },
+        ))
+    }
+
     async fn plan_ceph_cluster_spec(
         &self,
+        name: &str,
         spec: &controller_proto::CephClusterSpec,
     ) -> Result<controller_proto::PlanCephClusterResponse, Status> {
         ceph_cluster_spec::validate_spec(spec).map_err(Status::invalid_argument)?;
-        let cluster_issues = Vec::new();
+        let removal = self.plan_ceph_member_removal(name, spec).await?;
+        let cluster_issues = removal.issues;
         let mut node_results = Vec::new();
         let mon_map = crate::ceph_cluster_reconciler::mon_map_string(spec);
         for (index, node) in spec.nodes.iter().enumerate() {
@@ -3643,6 +3711,8 @@ impl ControllerService {
             encrypt_osds_notice: ceph_cluster_spec::encrypt_osds_notice(spec.encrypt_osds),
             nodes: node_results,
             cluster_issues,
+            cluster_warnings: removal.warnings,
+            removing_members: removal.removed,
         })
     }
 
@@ -11601,7 +11671,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         if spec.fsid.trim().is_empty() {
             spec.fsid = "00000000-0000-0000-0000-000000000000".into();
         }
-        let plan = self.plan_ceph_cluster_spec(&spec).await?;
+        let plan = self.plan_ceph_cluster_spec(&incoming.name, &spec).await?;
         Ok(Response::new(plan))
     }
 
@@ -11669,7 +11739,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         };
         // Preflight before any mutation (skip when the apply is a no-op).
         if action != controller_proto::ApplyAction::Unchanged as i32 {
-            let plan = self.plan_ceph_cluster_spec(&spec).await?;
+            let plan = self.plan_ceph_cluster_spec(&name, &spec).await?;
             if !plan.ok {
                 let mut lines = vec![plan.encrypt_osds_notice];
                 for n in &plan.nodes {

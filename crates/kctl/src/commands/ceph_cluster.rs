@@ -158,6 +158,12 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
     for issue in &plan.cluster_issues {
         println!("cluster: {issue}");
     }
+    for member in &plan.removing_members {
+        println!("removing member: {member}");
+    }
+    for warning in &plan.cluster_warnings {
+        println!("warning: {warning}");
+    }
     if !plan.ok {
         bail!("CephCluster preflight failed; refuse to apply (fix the issues above)");
     }
@@ -210,6 +216,12 @@ pub async fn plan_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
     }
     for issue in &plan.cluster_issues {
         println!("cluster: {issue}");
+    }
+    for member in &plan.removing_members {
+        println!("removing member: {member}");
+    }
+    for warning in &plan.cluster_warnings {
+        println!("warning: {warning}");
     }
     if !plan.ok {
         bail!("CephCluster preflight failed");
