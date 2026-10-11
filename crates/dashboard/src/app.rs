@@ -1513,8 +1513,6 @@ fn ceph_cluster_detail_view(detail: CephClusterDetailDto) -> impl IntoView {
         "badge badge-run"
     } else if health_status.contains("WARN") || detail.phase == "Degraded" {
         "badge badge-warn"
-    } else if health_status.contains("ERR") || detail.phase == "Failed" {
-        "badge badge-stop"
     } else {
         "badge badge-stop"
     };
