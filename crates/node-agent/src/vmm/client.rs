@@ -103,9 +103,19 @@ impl Client {
         put_json(&self.socket_path(name), "/api/v1/vm.add-disk", &body).await
     }
 
-    /// Hot-remove a disk by virtio id/serial (Cloud Hypervisor `vm.remove-device`).
-    pub async fn remove_disk(&self, name: &str, id: &str) -> Result<(), String> {
-        let body = RemoveDeviceBody { id: id.to_string() };
+    /// Hot-remove a disk by device id or virtio serial (Cloud Hypervisor
+    /// `vm.remove-device`).
+    ///
+    /// Cloud Hypervisor only knows device ids (`_disk2`); kcore names a disk
+    /// by its serial, so a serial is looked up in `vm.info` first.
+    pub async fn remove_disk(&self, name: &str, id_or_serial: &str) -> Result<(), String> {
+        let info = self
+            .get_vm_info(name)
+            .await
+            .ok_or_else(|| format!("VM {name} did not answer vm.info"))?;
+        let id = disk_device_id(&info, id_or_serial)
+            .ok_or_else(|| format!("VM {name} has no disk with id or serial '{id_or_serial}'"))?;
+        let body = RemoveDeviceBody { id };
         put_json(&self.socket_path(name), "/api/v1/vm.remove-device", &body).await
     }
 
@@ -157,6 +167,21 @@ struct RemoveDeviceBody {
 /// servicing its API thread must not stall the heartbeat that reports
 /// every other guest on the node.
 const VM_INFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn disk_device_id(info: &VmInfo, id_or_serial: &str) -> Option<String> {
+    let wanted = id_or_serial.trim();
+    info.config
+        .disks
+        .iter()
+        .find(|d| d.id.as_deref() == Some(wanted))
+        .or_else(|| {
+            info.config
+                .disks
+                .iter()
+                .find(|d| d.serial.as_deref() == Some(wanted))
+        })
+        .and_then(|d| d.id.clone())
+}
 
 /// VM name for an API socket path, `None` for anything else in the socket
 /// directory (serial consoles, stray files).
@@ -238,6 +263,24 @@ async fn put_json<T: Serialize>(socket_path: &Path, path: &str, body: &T) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_disk_resolves_a_serial_to_the_ch_device_id() {
+        let info: VmInfo = serde_json::from_str(
+            r#"{"state":"Running","config":{"disks":[
+                {"path":"/dev/rbd/kcore-vms/kcore-vm-a0d1e297","id":"_disk0","serial":"root-shatest-1"},
+                {"path":"/etc/kcore/seeds/shatest-1.iso","id":"_disk1"},
+                {"path":"/dev/rbd/kcore-vms/kcore-vol-2dc388df1143","id":"_disk2","serial":"2dc388df1143"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            disk_device_id(&info, "2dc388df1143").as_deref(),
+            Some("_disk2")
+        );
+        assert_eq!(disk_device_id(&info, "_disk1").as_deref(), Some("_disk1"));
+        assert_eq!(disk_device_id(&info, "nope"), None);
+    }
 
     #[test]
     fn socket_scan_ignores_serial_consoles_and_other_files() {
