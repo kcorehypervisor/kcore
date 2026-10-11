@@ -63,9 +63,24 @@ let
   mkSeedIso =
     vmName: vmCfg:
     let
+      guestOpsPart = pkgs.writeText "${vmName}-guest-ops-part.yaml" (
+        "#cloud-config\nusers:\n  - name: kcore\n    gecos: kcore GuestOps\n    groups: [sudo]\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n"
+        + lib.concatMapStrings (k: "      - ${builtins.toJSON k}\n") vmCfg.cloudInitGuestOpsKeys
+      );
+      mergedUserData = pkgs.runCommand "${vmName}-user-data-mime" { } ''
+        boundary="==KCORE-USER-DATA=="
+        {
+          printf 'Content-Type: multipart/mixed; boundary="%s"\nMIME-Version: 1.0\n\n' "$boundary"
+          printf -- '--%s\nContent-Type: text/cloud-config; charset="utf-8"\nMIME-Version: 1.0\n\n' "$boundary"
+          cat ${vmCfg.cloudInitUserConfigFile}
+          printf '\n--%s\nContent-Type: text/cloud-config; charset="utf-8"\nMIME-Version: 1.0\nMerge-Type: list(append)+dict(recurse_array)+str()\n\n' "$boundary"
+          cat ${guestOpsPart}
+          printf '\n--%s--\n' "$boundary"
+        } > "$out"
+      '';
       userData =
         if vmCfg.cloudInitUserConfigFile != null then
-          vmCfg.cloudInitUserConfigFile
+          (if vmCfg.cloudInitGuestOpsKeys != [ ] then mergedUserData else vmCfg.cloudInitUserConfigFile)
         else
           pkgs.writeText "${vmName}-user-data" ''
             #cloud-config
