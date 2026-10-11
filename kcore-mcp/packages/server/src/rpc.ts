@@ -10,6 +10,13 @@ const UNIMPLEMENTED = new Set([
   "node-compute/pullImage",
   "node-compute/createWorkload",
   "node-compute/deleteWorkload",
+  "provisioning/issueServerCertificate",
+  "provisioning/issueNodeCertificate",
+  "provisioning/getCertificate",
+  "provisioning/listCertificates",
+  "provisioning/revokeCertificate",
+  "provisioning/renewCertificate",
+  "provisioning/getCaBundle",
 ]);
 
 export type RpcMethod = {
