@@ -47,7 +47,9 @@ let
           rbdDevice
         else
           toString vmCfg.image;
-      actualFormat = if isBlockBackend then "raw" else vmCfg.imageFormat;
+      # Block backends are always seeded as raw. For an in-place image the real
+      # format is sniffed in the start script (see srcFormatFn).
+      actualFormat = if isBlockBackend then "raw" else "$ROOT_FMT";
 
       vmDiskArg =
         "path=${actualDisk},image_type=${actualFormat}"
@@ -348,6 +350,8 @@ let
           echo "Adopting live-migrated cloud-hypervisor pid $pid"
           exec ${pkgs.coreutils}/bin/tail --pid="$pid" -f /dev/null
         fi
+        ${srcFormatFn}
+        ROOT_FMT="$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})"
         exec ${chBin} ${chArgs}
       '';
     in
