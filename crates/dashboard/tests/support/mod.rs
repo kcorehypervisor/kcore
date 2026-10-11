@@ -963,6 +963,26 @@ impl Controller for MockController {
         Err(unimp("delete_ceph_cluster"))
     }
 
+    async fn get_ceph_cluster_capacity(
+        &self,
+        _: Request<GetCephClusterCapacityRequest>,
+    ) -> Result<Response<GetCephClusterCapacityResponse>, Status> {
+        Ok(Response::new(GetCephClusterCapacityResponse {
+            ok: true,
+            queried_node: "mock-node".into(),
+            total_bytes: 1_000,
+            used_bytes: 250,
+            avail_bytes: 750,
+            by_class: vec![CephDeviceClassCapacity {
+                device_class: "ssd".into(),
+                total_bytes: 1_000,
+                used_bytes: 250,
+                avail_bytes: 750,
+            }],
+            ..Default::default()
+        }))
+    }
+
     async fn create_shared_filesystem(
         &self,
         _: Request<CreateSharedFilesystemRequest>,
