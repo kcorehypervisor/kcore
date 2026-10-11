@@ -8822,10 +8822,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
 
-        if node.status != "cordoned" {
+        if !matches!(node.status.as_str(), "cordoned" | "draining" | "drained") {
             return Ok(Response::new(controller_proto::UncordonNodeResponse {
                 success: true,
-                message: format!("node '{}' is not cordoned ({})", node.id, node.status),
+                message: format!(
+                    "node '{}' is not cordoned or drained ({})",
+                    node.id, node.status
+                ),
             }));
         }
         if node.approval_status != "approved" {
