@@ -416,7 +416,7 @@ pub fn generate_node_config_inner(
             }
         }
         if !vm.cloud_init_user_data.is_empty() {
-            let escaped = nix_escape(&vm.cloud_init_user_data);
+            let escaped = super::nix_escape(&vm.cloud_init_user_data);
             out.push_str(&format!(
                 "      cloudInitUserConfigFile = pkgs.writeText \"{nix_name}-cloud-init.yaml\" \"{escaped}\";\n"
             ));
@@ -446,7 +446,7 @@ pub fn generate_node_config_inner(
                 ));
             }
             ci.push_str("ssh_pwauth: false\n");
-            let escaped = nix_escape(&ci);
+            let escaped = super::nix_escape(&ci);
             out.push_str(&format!(
                 "      cloudInitUserConfigFile = pkgs.writeText \"{nix_name}-cloud-init.yaml\" \"{escaped}\";\n"
             ));
@@ -469,7 +469,7 @@ pub fn generate_node_config_inner(
                         net_cfg.push_str("]\n");
                         net_cfg.push_str(&format!("    gateway4: \"{}\"\n", net.gateway_ip));
                         net_cfg.push_str("    nameservers:\n      addresses: [1.1.1.1, 8.8.8.8]\n");
-                        let escaped = nix_escape(&net_cfg);
+                        let escaped = super::nix_escape(&net_cfg);
                         out.push_str(&format!(
                             "      cloudInitNetworkConfigFile = pkgs.writeText \"{nix_name}-network-config.yaml\" \"{escaped}\";\n"
                         ));
@@ -1456,7 +1456,6 @@ mod tests {
 /// covered by example tests.
 #[cfg(test)]
 mod proptests {
-    use super::*;
     use proptest::prelude::*;
 
     /// Returns true iff `s`, when wrapped in `"…"`, is safe to embed
@@ -1494,7 +1493,7 @@ mod proptests {
         /// `nix_escape` never panics for any UTF-8 input.
         #[test]
         fn nix_escape_never_panics(s in ".{0,128}") {
-            let _ = nix_escape(&s);
+            let _ = super::nix_escape(&s);
         }
 
         /// **Soundness**: the output of `nix_escape` is always safe to
@@ -1502,7 +1501,7 @@ mod proptests {
         /// security-critical post-condition every caller relies on.
         #[test]
         fn nix_escape_output_is_always_safe(s in ".{0,128}") {
-            let escaped = nix_escape(&s);
+            let escaped = super::nix_escape(&s);
             prop_assert!(
                 is_safely_escaped(&escaped),
                 "nix_escape({s:?}) = {escaped:?} is not safely escaped"
@@ -1513,7 +1512,7 @@ mod proptests {
         /// `\`, `"`, or `${` is left unchanged.
         #[test]
         fn nix_escape_is_identity_on_safe_input(s in "[a-zA-Z0-9 _\\-./]{0,32}") {
-            prop_assert_eq!(nix_escape(&s), s);
+            prop_assert_eq!(super::nix_escape(&s), s);
         }
 
         /// `nix_escape` is **idempotent**: escaping an already-escaped
@@ -1530,8 +1529,8 @@ mod proptests {
         /// condition recursively instead.
         #[test]
         fn nix_escape_repeated_application_stays_safe(s in ".{0,64}") {
-            let once = nix_escape(&s);
-            let twice = nix_escape(&once);
+            let once = super::nix_escape(&s);
+            let twice = super::nix_escape(&once);
             prop_assert!(is_safely_escaped(&once));
             prop_assert!(is_safely_escaped(&twice));
         }
@@ -1541,7 +1540,7 @@ mod proptests {
         /// `[A-Za-z0-9_-]`.
         #[test]
         fn sanitize_nix_attr_key_charset(s in ".{0,32}") {
-            let out = sanitize_nix_attr_key(&s);
+            let out = super::sanitize_nix_attr_key(&s);
             prop_assert_eq!(out.chars().count(), s.chars().count());
             for c in out.chars() {
                 prop_assert!(
@@ -1559,7 +1558,7 @@ mod proptests {
             a in 0u8..=255, b in 0u8..=255, c in 0u8..=255, d in 0u8..=255,
         ) {
             let s = format!("{a}.{b}.{c}.{d}");
-            let n = netmask_to_cidr(&s);
+            let n = super::netmask_to_cidr(&s);
             prop_assert!(n <= 32, "netmask_to_cidr({s:?}) = {n} > 32");
             // Must also equal sum of octet popcounts.
             let expected = (a.count_ones() + b.count_ones() + c.count_ones() + d.count_ones()) as u8;
@@ -1571,7 +1570,7 @@ mod proptests {
         /        // remainder.
         #[test]
         fn netmask_to_cidr_never_panics_on_garbage(s in ".{0,32}") {
-            let _ = netmask_to_cidr(&s);
+            let _ = super::netmask_to_cidr(&s);
         }
     }
 }
@@ -1616,25 +1615,55 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
     out.push_str("  kcore.kubernetes = {\n");
     out.push_str("    enable = true;\n");
     out.push_str(&format!("    role = \"{}\";\n", nix_escape(&k8s.role)));
-    out.push_str(&format!("    clusterName = \"{}\";\n", nix_escape(&k8s.cluster_name)));
-    out.push_str(&format!("    clusterCidr = \"{}\";\n", nix_escape(&k8s.cluster_cidr)));
-    out.push_str(&format!("    serviceCidr = \"{}\";\n", nix_escape(&k8s.service_cidr)));
-    out.push_str(&format!("    clusterDns = \"{}\";\n", nix_escape(&k8s.cluster_dns)));
-    out.push_str(&format!("    advertiseAddress = \"{}\";\n", nix_escape(&k8s.advertise_address)));
+    out.push_str(&format!(
+        "    clusterName = \"{}\";\n",
+        nix_escape(&k8s.cluster_name)
+    ));
+    out.push_str(&format!(
+        "    clusterCidr = \"{}\";\n",
+        nix_escape(&k8s.cluster_cidr)
+    ));
+    out.push_str(&format!(
+        "    serviceCidr = \"{}\";\n",
+        nix_escape(&k8s.service_cidr)
+    ));
+    out.push_str(&format!(
+        "    clusterDns = \"{}\";\n",
+        nix_escape(&k8s.cluster_dns)
+    ));
+    out.push_str(&format!(
+        "    advertiseAddress = \"{}\";\n",
+        nix_escape(&k8s.advertise_address)
+    ));
     out.push_str(&format!("    iface = \"{}\";\n", nix_escape(&k8s.iface)));
-    out.push_str(&format!("    apiServerEndpoint = \"{}\";\n", nix_escape(&k8s.api_server_endpoint)));
+    out.push_str(&format!(
+        "    apiServerEndpoint = \"{}\";\n",
+        nix_escape(&k8s.api_server_endpoint)
+    ));
     out.push_str(&format!("    initialCluster = {};\n", k8s.initial_cluster));
-    
+
     if k8s.role == "control-plane" {
-        out.push_str(&format!("    etcdInitialCluster = \"{}\";\n", nix_escape(&k8s.etcd_initial_cluster)));
+        out.push_str(&format!(
+            "    etcdInitialCluster = \"{}\";\n",
+            nix_escape(&k8s.etcd_initial_cluster)
+        ));
     }
-    
+
     out.push_str(&format!("    cni = \"{}\";\n", nix_escape(&k8s.cni)));
-    out.push_str(&format!("    ciliumMode = \"{}\";\n", nix_escape(&k8s.cilium_mode)));
+    out.push_str(&format!(
+        "    ciliumMode = \"{}\";\n",
+        nix_escape(&k8s.cilium_mode)
+    ));
     out.push_str(&format!("    ciliumMtu = {};\n", k8s.cilium_mtu));
-    out.push_str(&format!("    ciliumTunnel = \"{}\";\n", nix_escape(&k8s.cilium_tunnel)));
-    out.push_str(&format!("    ciliumAutoDirectNodeRoutes = {};\n", k8s.cilium_auto_direct_routes));
-    
+    out.push_str(&format!(
+        "    ciliumTunnel = \"{}\";\n",
+        nix_escape(&k8s.cilium_tunnel)
+    ));
+    out.push_str(&format!(
+        "    ciliumAutoDirectNodeRoutes = {};\n",
+        k8s.cilium_auto_direct_routes
+    ));
+
     if !k8s.cilium_lb_ip_pools.is_empty() {
         out.push_str("    ciliumLoadBalancerIpPools = [\n");
         for pool in &k8s.cilium_lb_ip_pools {
@@ -1642,17 +1671,26 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
         }
         out.push_str("    ];\n");
     }
-    
+
     out.push_str(&format!("    haEnabled = {};\n", k8s.ha_enabled));
     if k8s.ha_enabled {
-        out.push_str(&format!("    vipAddress = \"{}\";\n", nix_escape(&k8s.vip_address)));
-        out.push_str(&format!("    vipInterface = \"{}\";\n", nix_escape(&k8s.vip_interface)));
+        out.push_str(&format!(
+            "    vipAddress = \"{}\";\n",
+            nix_escape(&k8s.vip_address)
+        ));
+        out.push_str(&format!(
+            "    vipInterface = \"{}\";\n",
+            nix_escape(&k8s.vip_interface)
+        ));
     }
-    
+
     if !k8s.kubeconfig_data.is_empty() {
-        out.push_str(&format!("    kubeconfigData = ''{}'';\n", k8s.kubeconfig_data));
+        out.push_str(&format!(
+            "    kubeconfigData = ''{}'';\n",
+            k8s.kubeconfig_data
+        ));
     }
-    
+
     out.push_str("  };\n");
     out.push_str("}\n");
     out
@@ -1686,7 +1724,7 @@ mod kubernetes_tests {
             vip_interface: "enp6s0".to_string(),
             kubeconfig_data: String::new(),
         };
-        
+
         let nix = generate_kubernetes_node_config(&config);
         assert!(nix.contains("enable = true"));
         assert!(nix.contains("role = \"control-plane\""));
@@ -1719,7 +1757,7 @@ mod kubernetes_tests {
             vip_interface: String::new(),
             kubeconfig_data: String::new(),
         };
-        
+
         let nix = generate_kubernetes_node_config(&config);
         assert!(nix.contains("enable = true"));
         assert!(nix.contains("role = \"worker\""));

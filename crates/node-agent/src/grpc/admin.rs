@@ -3877,11 +3877,11 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
     ) -> Result<Response<proto::ApplyKubernetesConfigResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
-        
+
         // Write kcore-kubernetes.nix module config
         let k8s_config_path = PathBuf::from("/etc/nixos/kcore-kubernetes.nix");
         let config_content = self.generate_k8s_nix_config(&req)?;
-        
+
         tokio::task::spawn_blocking({
             let path = k8s_config_path.clone();
             let content = config_content.clone();
@@ -3925,7 +3925,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let apply_lock = Arc::clone(&self.apply_lock);
         let spawned_id = apply_id.clone();
         let nix_config_path = self.nix_config_path.clone();
-        
+
         tokio::spawn(async move {
             let _guard = apply_lock.lock().await;
             Self::run_k8s_nixos_rebuild(nix_config_path, spawned_id).await;
@@ -3934,7 +3934,10 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         Ok(Response::new(proto::ApplyKubernetesConfigResponse {
             apply_id: apply_id.clone(),
             status: "started".to_string(),
-            message: format!("Kubernetes configuration written; nixos-rebuild started ({})", apply_id),
+            message: format!(
+                "Kubernetes configuration written; nixos-rebuild started ({})",
+                apply_id
+            ),
         }))
     }
 
@@ -3944,7 +3947,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
     ) -> Result<Response<proto::GetKubernetesStatusResponse>, Status> {
         // Check if kubernetes module is enabled
         let k8s_enabled = Path::new("/etc/nixos/kcore-kubernetes.nix").exists();
-        
+
         if !k8s_enabled {
             return Ok(Response::new(proto::GetKubernetesStatusResponse {
                 enabled: false,
@@ -3962,7 +3965,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let kubelet_active = Self::is_systemd_active("kubelet").await;
         let api_server_active = Self::is_systemd_active("kube-apiserver").await;
         let etcd_active = Self::is_systemd_active("etcd").await;
-        
+
         // Determine role from which services are running
         let role = if api_server_active {
             "control-plane".to_string()
@@ -4000,17 +4003,15 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
     ) -> Result<Response<proto::DrainKubernetesNodeResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
-        
+
         let hostname = hostname::get()
             .map_err(|e| Status::internal(format!("getting hostname: {e}")))?
             .to_string_lossy()
             .to_string();
 
         let mut cmd = tokio::process::Command::new("kubectl");
-        cmd.arg("drain")
-            .arg(&hostname)
-            .arg("--force");
-        
+        cmd.arg("drain").arg(&hostname).arg("--force");
+
         if req.delete_emptydir_data {
             cmd.arg("--delete-emptydir-data");
         }
@@ -4018,12 +4019,14 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             cmd.arg("--ignore-daemonsets");
         }
         if req.timeout_seconds > 0 {
-            cmd.arg("--timeout").arg(format!("{}s", req.timeout_seconds));
+            cmd.arg("--timeout")
+                .arg(format!("{}s", req.timeout_seconds));
         }
 
-        let output = cmd.output().await.map_err(|e| {
-            Status::internal(format!("kubectl drain failed: {e}"))
-        })?;
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("kubectl drain failed: {e}")))?;
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4042,9 +4045,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
 
 // Helper methods for Kubernetes operations
 impl AdminService {
-    fn generate_k8s_nix_config(&self, req: &proto::ApplyKubernetesConfigRequest) -> Result<String, Status> {
+    fn generate_k8s_nix_config(
+        &self,
+        req: &proto::ApplyKubernetesConfigRequest,
+    ) -> Result<String, Status> {
         use crate::nixgen_k8s::KubernetesNodeConfig;
-        
+
         let config = KubernetesNodeConfig {
             role: req.role.clone(),
             cluster_name: req.cluster_name.clone(),
@@ -4057,23 +4063,39 @@ impl AdminService {
             initial_cluster: req.initial_cluster,
             etcd_initial_cluster: req.etcd_initial_cluster.clone(),
             cni: req.cni.clone(),
-            cilium_mode: req.cilium_config.as_ref().map(|c| c.mode.clone()).unwrap_or_default(),
+            cilium_mode: req
+                .cilium_config
+                .as_ref()
+                .map(|c| c.mode.clone())
+                .unwrap_or_default(),
             cilium_mtu: req.cilium_config.as_ref().map(|c| c.mtu).unwrap_or(1500),
-            cilium_tunnel: req.cilium_config.as_ref().map(|c| c.tunnel.clone()).unwrap_or_default(),
-            cilium_auto_direct_routes: req.cilium_config.as_ref().map(|c| c.auto_direct_node_routes).unwrap_or(true),
-            cilium_lb_ip_pools: req.cilium_config.as_ref().map(|c| c.load_balancer_ip_pools.clone()).unwrap_or_default(),
+            cilium_tunnel: req
+                .cilium_config
+                .as_ref()
+                .map(|c| c.tunnel.clone())
+                .unwrap_or_default(),
+            cilium_auto_direct_routes: req
+                .cilium_config
+                .as_ref()
+                .map(|c| c.auto_direct_node_routes)
+                .unwrap_or(true),
+            cilium_lb_ip_pools: req
+                .cilium_config
+                .as_ref()
+                .map(|c| c.load_balancer_ip_pools.clone())
+                .unwrap_or_default(),
             ha_enabled: req.ha_enabled,
             vip_address: req.vip_address.clone(),
             vip_interface: req.vip_interface.clone(),
             kubeconfig_data: String::new(), // Written separately
         };
-        
+
         Ok(crate::nixgen_k8s::generate_kubernetes_node_config(&config))
     }
 
     async fn run_k8s_nixos_rebuild(config_path: PathBuf, apply_id: String) {
         write_apply_state(&apply_id, "rebuilding", "running nixos-rebuild test");
-        
+
         let test_result = tokio::process::Command::new("nixos-rebuild")
             .arg("test")
             .arg("--flake")
@@ -4085,7 +4107,7 @@ impl AdminService {
             Ok(output) if output.status.success() => {
                 info!(apply_id = %apply_id, "nixos-rebuild test succeeded");
                 write_apply_state(&apply_id, "activating", "running nixos-rebuild switch");
-                
+
                 let switch_result = tokio::process::Command::new("nixos-rebuild")
                     .arg("switch")
                     .arg("--flake")
@@ -4096,12 +4118,20 @@ impl AdminService {
                 match switch_result {
                     Ok(output) if output.status.success() => {
                         info!(apply_id = %apply_id, "nixos-rebuild switch succeeded");
-                        write_apply_state(&apply_id, "completed", "kubernetes configuration active");
+                        write_apply_state(
+                            &apply_id,
+                            "completed",
+                            "kubernetes configuration active",
+                        );
                     }
                     Ok(output) => {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         error!(apply_id = %apply_id, error = %stderr, "nixos-rebuild switch failed");
-                        write_apply_state(&apply_id, "failed", &format!("switch failed: {}", stderr));
+                        write_apply_state(
+                            &apply_id,
+                            "failed",
+                            &format!("switch failed: {}", stderr),
+                        );
                     }
                     Err(e) => {
                         error!(apply_id = %apply_id, error = %e, "failed to run nixos-rebuild switch");
