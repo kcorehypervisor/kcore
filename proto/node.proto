@@ -175,6 +175,12 @@ service NodeAdmin {
   // hardware TSC scaling). Cloud Hypervisor checks CPUID feature bits itself;
   // this covers what it does not report usefully.
   rpc GetHostCpuInfo(GetHostCpuInfoRequest) returns (GetHostCpuInfoResponse);
+  // Options the node's installed ch-vm Nix module understands, from
+  // /etc/kcore/ch-vm-features. The controller only emits newer options to
+  // nodes that list them; an older node (or agent) reports nothing and gets
+  // the baseline config.
+  rpc GetChVmModuleFeatures(GetChVmModuleFeaturesRequest)
+      returns (GetChVmModuleFeaturesResponse);
   rpc FinalizeLiveMigrateSource(FinalizeLiveMigrateSourceRequest)
       returns (FinalizeLiveMigrateSourceResponse);
   rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
@@ -1201,6 +1207,13 @@ message GetHostCpuInfoRequest {}
 
 message GetHostCpuInfoResponse {
   HostCpuInfo cpu = 1;
+}
+
+message GetChVmModuleFeaturesRequest {}
+
+message GetChVmModuleFeaturesResponse {
+  // e.g. "imageSha256", "cloudHypervisorPatches".
+  repeated string features = 1;
 }
 
 message WaitLiveMigrateReceiveRequest {

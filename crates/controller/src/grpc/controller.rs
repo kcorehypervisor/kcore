@@ -1096,6 +1096,8 @@ impl ControllerService {
             port: row.port,
         });
         let guest_ops_keys = crate::guest_ops::all_guest_ops_keys(&self.db);
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let module_features = self.ch_vm_module_features(node, &mut admin).await;
         let nix_config = nixgen::with_postgresql(
             nixgen::generate_node_config_inner(
                 &vms,
@@ -1114,11 +1116,10 @@ impl ControllerService {
                 &extra_nics_by_vm(&self.db, &vms),
                 &network_policies_by_name(&self.db, &node.id)?,
                 &vm_ipv6_by_vm(&self.db, &vms)?,
+                &module_features,
             ),
             postgresql_nix.as_ref(),
         );
-
-        let mut admin = self.ensure_admin_client_for_node(node).await?;
 
         for vm in &vms {
             if vm.image_url.is_empty() {
@@ -3478,6 +3479,34 @@ impl ControllerService {
             action: controller_proto::ApplyAction::Updated as i32,
             changed_fields,
         }))
+    }
+
+    /// Which newer ch-vm options this node's installed module accepts. A
+    /// node agent predating the RPC, or a module without the feature file,
+    /// gets the baseline so its evaluation keeps working.
+    async fn ch_vm_module_features(
+        &self,
+        node: &NodeRow,
+        admin: &mut node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>,
+    ) -> nixgen::ModuleFeatures {
+        match admin
+            .get_ch_vm_module_features(node_proto::GetChVmModuleFeaturesRequest {})
+            .await
+        {
+            Ok(resp) => {
+                let features = resp.into_inner().features;
+                debug!(node = %node.id, ?features, "ch-vm module features reported by node");
+                nixgen::ModuleFeatures::from_reported(&features)
+            }
+            Err(e) => {
+                info!(
+                    node = %node.id,
+                    code = ?e.code(),
+                    "node does not report ch-vm module features; emitting baseline options only"
+                );
+                nixgen::ModuleFeatures::default()
+            }
+        }
     }
 
     async fn ensure_admin_client_for_node(
