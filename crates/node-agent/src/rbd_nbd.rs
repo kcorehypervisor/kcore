@@ -17,6 +17,18 @@ use std::time::Duration;
 
 const RBD_DEV_ROOT: &str = "/dev/rbd";
 
+/// rbd-nbd runs librbd without its cache by default, so guests that issue small
+/// sequential reads under O_DIRECT (firmware/GRUB loading a kernel) crawl at
+/// ~10 MB/s. The writeback cache stays write-through until the guest first
+/// flushes, and rbd-nbd flushes it on unmap.
+pub const MAP_TUNING: [&str; 5] = [
+    "--rbd-cache=true",
+    "--rbd-cache-policy=writeback",
+    "--rbd-readahead-trigger-requests=1",
+    "--rbd-readahead-max-bytes=4194304",
+    "--rbd-readahead-disable-after-bytes=0",
+];
+
 pub fn device_link(pool: &str, image: &str) -> PathBuf {
     Path::new(RBD_DEV_ROOT).join(pool).join(image)
 }
@@ -81,8 +93,9 @@ pub fn map(pool: &str, image: &str) -> Result<PathBuf, String> {
             "map",
             "-t",
             "nbd",
-            &spec,
         ])
+        .args(MAP_TUNING)
+        .arg(&spec)
         .output()
         .map_err(|e| format!("rbd-nbd map: {e}"))?;
     if !out.status.success() {
