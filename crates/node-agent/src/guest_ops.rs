@@ -149,6 +149,8 @@ if [ -n "${{PART:-}}" ]; then
   fi
 fi
 if command -v resize2fs >/dev/null 2>&1 && $SUDO blkid -o value -s TYPE "$TARGET" 2>/dev/null | grep -Eq 'ext[234]'; then
+  # resize2fs refuses an unmounted filesystem that has not been checked since its last mount.
+  if ! findmnt -n "$TARGET" >/dev/null 2>&1; then $SUDO e2fsck -fp "$TARGET" >/dev/null 2>&1 || true; fi
   $SUDO resize2fs "$TARGET"
 elif command -v xfs_growfs >/dev/null 2>&1 && $SUDO blkid -o value -s TYPE "$TARGET" 2>/dev/null | grep -q xfs; then
   MP=$(findmnt -n -o TARGET "$TARGET" 2>/dev/null || true)
@@ -261,6 +263,7 @@ vdb1 107374182400 abcdef012345 part
         let s = grow_script("abc123");
         assert!(s.contains("abc123"));
         assert!(s.contains("growpart") || s.contains("resize2fs"));
+        assert!(s.contains("e2fsck -fp"));
     }
 
     #[test]
