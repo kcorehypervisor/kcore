@@ -64,18 +64,15 @@ pub fn from_cpuinfo(cpuinfo: &str, tsc_khz: u32) -> HostCpu {
             "model name" if cpu.model_name.is_empty() => cpu.model_name = value.to_string(),
             // Intel lists VMX capabilities on their own line; AMD puts the
             // SVM TSC ratio feature in the main flags line.
-            "vmx flags" => {
-                if value.split_whitespace().any(|f| f == "tsc_scaling") {
-                    cpu.tsc_scaling = true;
-                }
+            "vmx flags" if value.split_whitespace().any(|f| f == "tsc_scaling") => {
+                cpu.tsc_scaling = true;
             }
-            "flags" => {
+            "flags"
                 if value
                     .split_whitespace()
-                    .any(|f| f == "tsc_scale" || f == "tsc_scaling")
-                {
-                    cpu.tsc_scaling = true;
-                }
+                    .any(|f| f == "tsc_scale" || f == "tsc_scaling") =>
+            {
+                cpu.tsc_scaling = true;
             }
             _ => {}
         }

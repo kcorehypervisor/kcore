@@ -6,7 +6,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use crate::config::DashboardConfig;
 
 pub mod controller_proto {
-    #![allow(clippy::result_large_err)]
+    #![allow(clippy::result_large_err, clippy::double_must_use)]
     tonic::include_proto!("kcore.controller");
 }
 

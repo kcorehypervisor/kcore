@@ -10,31 +10,28 @@ let
     inherit (pkgs) system;
     modules = [
       ../modules/kcore-ceph.nix
-      (
-        { ... }:
-        {
-          networking.hostName = "ceph-eval";
-          system.stateVersion = "25.11";
-          boot.loader.grub.enable = false;
-          fileSystems."/" = {
-            device = "nodev";
-            fsType = "tmpfs";
-          };
-          kcore.ceph = {
-            enable = true;
-            fsid = "00000000-0000-0000-0000-000000000001";
-            publicNetwork = "192.168.40.0/24";
-            clusterNetwork = "192.168.47.0/24";
-            monAddress = "192.168.40.103";
-            monInitialMembers = "ceph-eval";
-            publicAddr = "192.168.40.103";
-            clusterAddr = "192.168.47.2";
-            publicIface = "enp6s0";
-            clusterIface = "enp6s0d1";
-            daemonId = "ceph-eval";
-          };
-        }
-      )
+      (_: {
+        networking.hostName = "ceph-eval";
+        system.stateVersion = "25.11";
+        boot.loader.grub.enable = false;
+        fileSystems."/" = {
+          device = "nodev";
+          fsType = "tmpfs";
+        };
+        kcore.ceph = {
+          enable = true;
+          fsid = "00000000-0000-0000-0000-000000000001";
+          publicNetwork = "192.168.40.0/24";
+          clusterNetwork = "192.168.47.0/24";
+          monAddress = "192.168.40.103";
+          monInitialMembers = "ceph-eval";
+          publicAddr = "192.168.40.103";
+          clusterAddr = "192.168.47.2";
+          publicIface = "enp6s0";
+          clusterIface = "enp6s0d1";
+          daemonId = "ceph-eval";
+        };
+      })
     ];
   };
   cfg = eval.config;

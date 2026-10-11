@@ -16,7 +16,7 @@ let
       short = "kb-${hash}";
     in
     if builtins.stringLength full <= 15 then full else short;
-  inherit (helpers) tapName vmInterfaces;
+  inherit (helpers) vmInterfaces;
   upstreamIface =
     _netName: netCfg:
     if netCfg.vlanId > 0 then
