@@ -169,6 +169,10 @@ pub fn device_in_use(dev: &str) -> bool {
         if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
+        // The rbd-nbd daemon keeps its own device node open for as long as it runs.
+        if std::fs::read_to_string(p.path().join("comm")).is_ok_and(|c| c.trim() == "rbd-nbd") {
+            continue;
+        }
         let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else {
             continue;
         };
