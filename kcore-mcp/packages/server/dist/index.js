@@ -72774,6 +72774,25 @@ function resolveConnection(options = {}) {
     timeoutMs: options.timeoutMs ?? 12e4
   };
 }
+function resolveProvisioning(options = {}) {
+  const configPath = options.config?.trim() || process.env.KCORE_CONFIG?.trim() || join(homedir(), ".kcore", "config");
+  const file = readContext(configPath);
+  const current = file?.["current-context"];
+  const entry = current && file?.contexts ? file.contexts[current] : void 0;
+  const address = options.provisioning?.trim() || process.env.KCORE_PROVISIONING?.trim() || entry?.provisioning?.trim() || "";
+  if (!address) {
+    throw new InputError(
+      "No provisioning controller address. Set connection.provisioning or KCORE_PROVISIONING to host:port."
+    );
+  }
+  const timeoutMs = options.timeoutMs ?? 12e4;
+  const checked = assertAddress(address, "provisioning");
+  if (options.provisioningInsecure === false) {
+    const base = resolveConnection(options);
+    return { ...base, address: checked, insecure: false, timeoutMs };
+  }
+  return { address: checked, insecure: true, timeoutMs };
+}
 function readContext(path) {
   try {
     const text2 = readFileSync(path, "utf8");
@@ -72837,7 +72856,8 @@ var SERVICE_NAMES = [
   "node-container",
   "node-storage",
   "node-info",
-  "node-admin"
+  "node-admin",
+  "provisioning"
 ];
 var loaded;
 function protoDir() {
@@ -72852,7 +72872,7 @@ function services() {
   if (loaded) return loaded;
   const dir = protoDir();
   const definition = protoLoader.loadSync(
-    [join2(dir, "controller.proto"), join2(dir, "node.proto")],
+    [join2(dir, "controller.proto"), join2(dir, "node.proto"), join2(dir, "provisioning.proto")],
     {
       keepCase: false,
       longs: String,
@@ -72870,7 +72890,8 @@ function services() {
     "node-container": pkg.kcore.node.NodeContainer,
     "node-storage": pkg.kcore.node.NodeStorage,
     "node-info": pkg.kcore.node.NodeInfo,
-    "node-admin": pkg.kcore.node.NodeAdmin
+    "node-admin": pkg.kcore.node.NodeAdmin,
+    provisioning: pkg.kcore.provisioning.Provisioning
   };
   return loaded;
 }
@@ -72901,6 +72922,10 @@ async function callNodeCompute(address, options, method, request) {
   return callApi("node-compute", address, options, method, request);
 }
 async function callApi(service, address, options, method, request) {
+  if (service === "provisioning") {
+    const conn2 = resolveProvisioning(options);
+    return callService(services().provisioning, conn2.address, conn2, method, request);
+  }
   const conn = resolveConnection(address ? { ...options, controller: address } : options);
   return callService(services()[service], conn.address, conn, method, request);
 }
@@ -72947,7 +72972,14 @@ var UNIMPLEMENTED = /* @__PURE__ */ new Set([
   "node-compute/rebootVm",
   "node-compute/pullImage",
   "node-compute/createWorkload",
-  "node-compute/deleteWorkload"
+  "node-compute/deleteWorkload",
+  "provisioning/issueServerCertificate",
+  "provisioning/issueNodeCertificate",
+  "provisioning/getCertificate",
+  "provisioning/listCertificates",
+  "provisioning/revokeCertificate",
+  "provisioning/renewCertificate",
+  "provisioning/getCaBundle"
 ]);
 function isServiceName(value) {
   return SERVICE_NAMES.includes(value);
@@ -73798,14 +73830,17 @@ Before every create, update, delete, migrate, drain, or node install:
 3. Call kcore_plan and show that plan.
 4. Call kcore_apply or kcore_delete only after the operator explicitly agrees, with confirm set to true.
 
-Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller or node method; pass confirm true before a method that is not a get, list, classify, check, or plan.`;
+Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller, node, or kcore-provisioning method. Provisioning covers images, machines, boot targets, Redfish discovery, BMC boot, and power control. Set connection.provisioning to that controller's host:port. Pass confirm true before a method that is not a get, list, classify, check, or plan.`;
 var connectionShape = {
   config: external_exports.string().optional().describe("Path to the kcore context file. Defaults to ~/.kcore/config."),
   controller: external_exports.string().optional().describe("Controller host:port override."),
   insecure: external_exports.boolean().optional().describe("Plain HTTP, skipping TLS client auth."),
   tlsServerName: external_exports.string().optional().describe("SNI / certificate name when dialing an IP."),
   operator: external_exports.string().optional().describe("Operator identity for --as."),
-  node: external_exports.string().optional().describe("Node-agent host:port for node-scoped commands.")
+  node: external_exports.string().optional().describe("Node-agent host:port for node-scoped commands."),
+  provisioning: external_exports.string().optional().describe("kcore-provisioning gRPC host:port. Also read from KCORE_PROVISIONING."),
+  provisioningInsecure: external_exports.boolean().optional().describe("Dial provisioning without TLS. Defaults to true."),
+  timeoutMs: external_exports.number().optional().describe("RPC deadline in milliseconds. Defaults to 120000.")
 };
 var specSchema = external_exports.record(external_exports.string(), external_exports.unknown()).optional();
 function connectionOf(input, controller) {
@@ -73815,7 +73850,9 @@ function connectionOf(input, controller) {
     insecure: input?.insecure,
     tlsServerName: input?.tlsServerName,
     operator: input?.operator,
-    timeoutMs: input?.timeoutMs
+    timeoutMs: input?.timeoutMs,
+    provisioning: input?.provisioning,
+    provisioningInsecure: input?.provisioningInsecure
   };
 }
 function dial(input, spec) {
@@ -73932,7 +73969,7 @@ function createServer() {
     "kcore_rpc",
     {
       title: "Call a kcore gRPC method",
-      description: "Call one implemented unary RPC on the controller or a node. Omit method to list them. Request fields use proto JSON names in camelCase. Streaming RPCs and node methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true.",
+      description: "Call one implemented unary RPC on the controller, a node, or kcore-provisioning. Omit method to list them. Provisioning methods need connection.provisioning. Request fields use proto JSON names in camelCase. Streaming RPCs and methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true.",
       inputSchema: {
         service: external_exports.enum(SERVICE_NAMES).optional().describe("gRPC service. Required when method is set."),
         method: external_exports.string().optional().describe("CamelCase RPC name, such as listNodes or getPkiStatus."),
