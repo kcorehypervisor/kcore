@@ -386,7 +386,10 @@ let
         # ExecStartPre copies the image onto the volume. The 90s default is
         # shorter than a Windows qcow2 convert, which then fails the unit.
         TimeoutStartSec = "15min";
-        Restart = if vmCfg.autoStart && !vmCfg.incomingMigration then "always" else "no";
+        # Must not depend on incomingMigration: the config that flips a VM from
+        # incoming to settled would otherwise change this unit, and the switch
+        # would restart the unit that just adopted the live-migrated guest.
+        Restart = if vmCfg.autoStart then "always" else "no";
         RestartSec = 5;
 
         Group = "kvm";

@@ -474,6 +474,17 @@ in
       netName: _netCfg: bridgeName netName
     ) cfg.networks;
 
+    # Live migration: Cloud Hypervisor on the destination listens on one port of
+    # this range (MIGRATE_PORT_BASE..+MIGRATE_PORT_COUNT in node-agent's
+    # live_migrate.rs). Only the management interface may reach it, never the
+    # VM bridges.
+    networking.firewall.interfaces.${cfg.gatewayInterface}.allowedTCPPortRanges = [
+      {
+        from = 18000;
+        to = 18127;
+      }
+    ];
+
     networking.firewall.allowedUDPPorts = lib.optional (lib.any (n: n.networkType == "vxlan") (
       lib.attrValues cfg.networks
     )) 4789;
