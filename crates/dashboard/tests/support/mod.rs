@@ -1237,6 +1237,62 @@ impl ControllerAdmin for MockController {
     ) -> Result<Response<ResolveReplicationConflictResponse>, Status> {
         Err(unimp("resolve_replication_conflict"))
     }
+
+    async fn plan_kubernetes_cluster(
+        &self,
+        _: Request<PlanKubernetesClusterRequest>,
+    ) -> Result<Response<PlanKubernetesClusterResponse>, Status> {
+        Err(unimp("plan_kubernetes_cluster"))
+    }
+
+    async fn create_kubernetes_cluster(
+        &self,
+        _: Request<CreateKubernetesClusterRequest>,
+    ) -> Result<Response<CreateKubernetesClusterResponse>, Status> {
+        Err(unimp("create_kubernetes_cluster"))
+    }
+
+    async fn update_kubernetes_cluster(
+        &self,
+        _: Request<UpdateKubernetesClusterRequest>,
+    ) -> Result<Response<UpdateKubernetesClusterResponse>, Status> {
+        Err(unimp("update_kubernetes_cluster"))
+    }
+
+    async fn get_kubernetes_cluster(
+        &self,
+        _: Request<GetKubernetesClusterRequest>,
+    ) -> Result<Response<GetKubernetesClusterResponse>, Status> {
+        Err(unimp("get_kubernetes_cluster"))
+    }
+
+    async fn list_kubernetes_clusters(
+        &self,
+        _: Request<ListKubernetesClustersRequest>,
+    ) -> Result<Response<ListKubernetesClustersResponse>, Status> {
+        Err(unimp("list_kubernetes_clusters"))
+    }
+
+    async fn delete_kubernetes_cluster(
+        &self,
+        _: Request<DeleteKubernetesClusterRequest>,
+    ) -> Result<Response<DeleteKubernetesClusterResponse>, Status> {
+        Err(unimp("delete_kubernetes_cluster"))
+    }
+
+    async fn scale_kubernetes_cluster(
+        &self,
+        _: Request<ScaleKubernetesClusterRequest>,
+    ) -> Result<Response<ScaleKubernetesClusterResponse>, Status> {
+        Err(unimp("scale_kubernetes_cluster"))
+    }
+
+    async fn get_kubernetes_cluster_health(
+        &self,
+        _: Request<GetKubernetesClusterHealthRequest>,
+    ) -> Result<Response<GetKubernetesClusterHealthResponse>, Status> {
+        Err(unimp("get_kubernetes_cluster_health"))
+    }
 }
 
 /// Binds an ephemeral port and serves the mock controller until the process exits.
