@@ -213,9 +213,26 @@ let
 
       cephUnmapScript = pkgs.writeShellScript "ceph-unmap-${vmName}" ''
         ${rbdNbdFunctions}
+        # A live-migrated guest runs outside this unit. If the unit's own
+        # start fails (and ExecStopPost runs), the device is still in use by
+        # that guest, and unmapping it would pull the disk from under it.
+        held_by_vmm() {
+          local fd pid
+          for fd in /proc/[0-9]*/fd/*; do
+            [ "$(readlink "$fd" 2>/dev/null)" = "$1" ] || continue
+            pid="''${fd#/proc/}"
+            pid="''${pid%%/*}"
+            [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "rbd-nbd" ] && continue
+            return 0
+          done
+          return 1
+        }
         unmap_one() {
           local DEV
           DEV="$(nbd_dev "$1")"
+          if [ -n "$DEV" ] && held_by_vmm "$DEV"; then
+            return 0
+          fi
           # An open LUKS mapper stacked on the nbd keeps it mapped; the node
           # agent unmaps it when the volume is locked on detach.
           if [ -n "$DEV" ] && [ -n "$(ls -A "/sys/block/$(basename "$DEV")/holders" 2>/dev/null)" ]; then
