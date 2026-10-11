@@ -341,6 +341,21 @@ let
         done
       '';
 
+      # A guest that is already running for this VM outside the unit (a
+      # live-migrated VMM the unit failed to adopt, or one left behind when the
+      # unit crashed) owns the sockets and the disk. Starting again would wipe
+      # its sockets, reseed its volume and launch a second writer, and the
+      # unit's failure path would then unmap the device under the live guest.
+      # Refuse with a status systemd will not retry.
+      refuseIfVmmRunning = ''
+        other_vmm="$(${pkgs.procps}/bin/pgrep -f -- "cloud-hypervisor.*--api-socket[= ]${socketPath}( |$)" | ${pkgs.gnugrep}/bin/grep -vx "$$" | ${pkgs.coreutils}/bin/head -n1 || true)"
+        if [ -n "$other_vmm" ]; then
+          echo "ERROR: a cloud-hypervisor (pid $other_vmm) already serves ${socketPath}; refusing to start a second instance for ${vmName}. Adopt it (live-migrated marker) or stop it explicitly."
+          exit ${toString vmmAlreadyRunningStatus}
+        fi
+      '';
+      vmmAlreadyRunningStatus = 75;
+
       # After a live receive, CH is already running outside systemd. Skip
       # destructive socket cleanup so the handoff ExecStart can adopt it.
       startPreScript = pkgs.writeShellScript "kcore-vm-${vmName}-pre" ''
@@ -349,6 +364,7 @@ let
           echo "live-migrated marker present; skipping socket wipe / cold provision"
           exit 0
         fi
+        ${refuseIfVmmRunning}
         ${pkgs.coreutils}/bin/rm -f ${socketPath} ${serialSocket}
         ${pkgs.bash}/bin/bash -euc 'test -f ${seedIso} || { echo "missing cloud-init seed: ${seedIso}"; exit 1; }'
         ${pkgs.bash}/bin/bash -euc 'test -f ${firmwarePath} || { echo "missing firmware: ${firmwarePath}"; exit 1; }'
@@ -382,6 +398,7 @@ let
           echo "Adopting live-migrated cloud-hypervisor pid $pid"
           exec ${pkgs.coreutils}/bin/tail --pid="$pid" -f /dev/null
         fi
+        ${refuseIfVmmRunning}
         ${srcFormatFn}
         ROOT_FMT="$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})"
         exec ${chBin} ${chArgs}
@@ -416,6 +433,9 @@ let
         # would restart the unit that just adopted the live-migrated guest.
         Restart = if vmCfg.autoStart then "always" else "no";
         RestartSec = 5;
+        # "another VMM already owns this VM" is not transient; retrying would
+        # keep running the failure path (ExecStopPost) next to a live guest.
+        RestartPreventExitStatus = toString vmmAlreadyRunningStatus;
 
         Group = "kvm";
         LimitMEMLOCK = "infinity";
