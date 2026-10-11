@@ -175,9 +175,10 @@ The controller first pushes the destination Nix with `incomingMigration = true` 
 **Handoff (destination systemd)** — `modules/ch-vm/vm-service.nix`
 
 - Ceph VMs: `--memory size=…M,shared=on` (CH live-migrate requirement).
-- `stopIfChanged` / `restartIfChanged` keep their NixOS defaults. `switch-to-configuration` only consults them for units that **already existed and changed**; the destination unit is brand new, so it is simply started and adopts the receive process. (Overriding them for Ceph would also have quietly stopped `cpu`/`memory`/`extraArgs` updates from ever taking effect.)
-- `ExecStartPre`: if `.live-migrated` exists, skip wiping the API socket and skip cold provision.
-- `ExecStart`: if marker present, `tail --pid=<migrate.pid> -f /dev/null` so systemd’s MainPID waits on the already-running CH; else cold-start the full CH CLI.
+- `stopIfChanged` / `restartIfChanged` keep their NixOS defaults, so `cpu`/`memory`/`extraArgs` updates keep taking effect for Ceph-backed VMs. The destination unit **already exists** at finalize time (the prepare step pushed it with `incomingMigration = true`), so if the settled unit file differs from that one in any way (a spec change in between, a module update, an option the controller only emits once the node reports it) `switch-to-configuration` restarts the unit right after the handoff. The scripts below make that restart harmless.
+- `ExecStartPre`: if `.live-migrated` exists, or a `cloud-hypervisor --api-socket /run/kcore/<vm>.sock` process is already running, skip wiping the sockets and skip cold provision.
+- `ExecStart`: if the marker is present, `tail --pid=<migrate.pid> -f /dev/null` so systemd’s MainPID waits on the already-running CH. Otherwise, if another CH serves the socket, ask it for `vm.info`: a guest in state `Running`/`Paused` is **adopted** the same way (`Adopting already-running (guest Running) cloud-hypervisor pid N` in the journal); a VMM without a running guest (a receiver whose migration never completed) makes the start exit `75`, which `RestartPreventExitStatus` keeps systemd from retrying. Only with no VMM at all is the full CH CLI cold-started.
+- `ExecStop`: press the ACPI power button, then wait up to 25 s for the VMM to exit and `SIGTERM` it if it has not. systemd only waits for processes inside the unit's cgroup; an adopted VMM is not in it, and without this wait a `systemctl restart` would report the unit stopped while the guest runs on, and the next start would adopt it again instead of applying the change.
 
 **Finalize**
 
