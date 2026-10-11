@@ -80,7 +80,7 @@ async fn admin_for(
         .ok_or_else(|| format!("no admin client for {}", node.address))
 }
 
-fn mon_map_string(spec: &crate::controller_proto::CephClusterSpec) -> String {
+pub(crate) fn mon_map_string(spec: &crate::controller_proto::CephClusterSpec) -> String {
     spec.nodes
         .iter()
         .map(|n| {
@@ -279,6 +279,7 @@ async fn retire_removed_members(
                 .map_err(|e| e.to_string())?;
             continue;
         }
+        drain_member(db, clients, row, spec, &node_id).await?;
         let mut admin = admin_for(db, clients, &node_id).await?;
         let torn = admin
             .teardown_ceph_node(Request::new(node_proto::TeardownCephNodeRequest {}))
@@ -318,6 +319,67 @@ async fn retire_removed_members(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Mark the leaving member's OSDs out from a survivor and hold the removal
+/// until every PG is active+clean again. Returns the `NOT_HEALTHY_YET`
+/// error (after recording the wait in the cluster status) while data is
+/// still moving, so the next tick retries instead of tearing the host down
+/// with the only copy of something still on it.
+async fn drain_member(
+    db: &Database,
+    clients: &NodeClients,
+    row: &CephClusterRow,
+    spec: &crate::controller_proto::CephClusterSpec,
+    node_id: &str,
+) -> Result<(), String> {
+    let Some(survivor) = spec.nodes.first() else {
+        // Nothing survives: DeleteCephCluster, not a member removal.
+        return Ok(());
+    };
+    let host = db
+        .get_node(node_id)
+        .map_err(|e| e.to_string())?
+        .map(|n| n.hostname)
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| node_id.to_string());
+    let mut survivor_admin = admin_for(db, clients, &survivor.node_id).await?;
+    let drained = survivor_admin
+        .drain_ceph_host(Request::new(node_proto::DrainCephHostRequest {
+            host: host.clone(),
+        }))
+        .await
+        .map_err(|e| {
+            if e.code() == tonic::Code::Unimplemented {
+                format!(
+                    "survivor {} runs a node agent without DrainCephHost; update it before removing {node_id}",
+                    survivor.node_id
+                )
+            } else {
+                format!("drain {host} via {}: {e}", survivor.node_id)
+            }
+        })?
+        .into_inner();
+    if !drained.success {
+        return Err(format!("drain {host}: {}", drained.message));
+    }
+    if drained.clean {
+        return Ok(());
+    }
+    let message = format!(
+        "removing {node_id}: {} ({} PGs of {} still not active+clean)",
+        drained.message, drained.pgs_not_clean, drained.pgs_total
+    );
+    db.upsert_ceph_cluster_status(&CephClusterStatusRow {
+        name: row.name.clone(),
+        observed_generation: 0,
+        phase: "degraded".into(),
+        health_message: message.clone(),
+        ceph_status_json: String::new(),
+        last_transition_at: String::new(),
+    })
+    .map_err(|e| e.to_string())?;
+    Err(format!("{NOT_HEALTHY_YET} {message}"))
 }
 
 async fn wait_for_nix_apply(
@@ -394,11 +456,16 @@ pub(crate) fn generate_ceph_nix(
         .filter_map(|p| p.split_once('=').map(|(_, ip)| ip.trim().to_string()))
         .collect::<Vec<_>>()
         .join(",");
-    let mon_ids: String = mon_map
+    let first_mon = mon_map
         .split(',')
-        .filter_map(|p| p.split_once('=').map(|(id, _)| id.trim().to_string()))
-        .collect::<Vec<_>>()
-        .join(",");
+        .next()
+        .and_then(|p| p.split_once('=').map(|(id, _)| id.trim()))
+        .unwrap_or_default();
+    let initial_members = if first_mon == daemon_id {
+        daemon_id
+    } else {
+        ""
+    };
     let public_addr = node
         .mon_addr
         .split(':')
@@ -414,9 +481,14 @@ pub(crate) fn generate_ceph_nix(
     publicNetwork = "{public_network}";
     clusterNetwork = "{cluster_network}";
     monAddress = "{mon_host}";
-    monInitialMembers = "{mon_ids}";
+    # Only the first mon names itself. Ceph prunes (or pads with 0.0.0.0
+    # placeholders) the monmap to match this list on first start, so a mon
+    # joining a running cluster must leave it empty to keep the adopted map.
+    monInitialMembers = "{initial_members}";
     publicAddr = "{public_addr}";
     clusterAddr = "{cluster_addr}";
+    publicIface = "{public_iface}";
+    clusterIface = "{cluster_iface}";
     daemonId = "{daemon_id}";
     enableMon = true;
     enableMgr = true;
@@ -431,10 +503,12 @@ pub(crate) fn generate_ceph_nix(
         public_network = nix_escape(&spec.public_network),
         cluster_network = nix_escape(&spec.cluster_network),
         cluster_addr = nix_escape(&node.cluster_addr),
+        public_iface = nix_escape(&node.public_iface),
+        cluster_iface = nix_escape(&node.cluster_iface),
         size = spec.size,
         min_size = spec.min_size,
         mon_host = nix_escape(&mon_host),
-        mon_ids = nix_escape(&mon_ids),
+        initial_members = nix_escape(initial_members),
         public_addr = nix_escape(public_addr),
         daemon_id = nix_escape(daemon_id),
     )
@@ -504,10 +578,27 @@ mod tests {
         assert!(nix.contains("clusterName = \"ceph\";"));
         assert!(!nix.contains("clusterName = \"lab\""));
         assert!(nix.contains("monAddress = \"10.10.0.11,10.10.0.12\";"));
-        assert!(nix.contains("monInitialMembers = \"dell-tower-1,dell-2\";"));
+        // Local daemon only — peers join via ceph mon add, not initial-members.
+        assert!(nix.contains("monInitialMembers = \"dell-tower-1\";"));
+        assert!(
+            !nix.lines().any(|l| l.trim_start().starts_with("//")),
+            "Nix comments use #; // is the update operator"
+        );
+        assert!(!nix.contains("monInitialMembers = \"dell-tower-1,dell-2\";"));
         assert!(nix.contains("publicAddr = \"10.10.0.11\";"));
         assert!(nix.contains("clusterAddr = \"10.20.0.11\";"));
+        assert!(nix.contains("publicIface = \"eth1\";"));
+        assert!(nix.contains("clusterIface = \"eth2\";"));
         assert!(nix.contains("daemonId = \"dell-tower-1\";"));
         assert!(nix.contains("poolSize = 3;"));
+    }
+
+    #[test]
+    fn joining_mon_leaves_initial_members_empty() {
+        let spec = sample_spec();
+        let mon_map = mon_map_string(&spec);
+        let nix = generate_ceph_nix(&spec, &spec.nodes[1], "dell-2", &mon_map);
+        assert!(nix.contains("monInitialMembers = \"\";"));
+        assert!(nix.contains("daemonId = \"dell-2\";"));
     }
 }

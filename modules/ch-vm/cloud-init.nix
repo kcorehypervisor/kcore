@@ -63,9 +63,48 @@ let
   mkSeedIso =
     vmName: vmCfg:
     let
+      # A shell-script part, not a second `users:` entry: cloud-init ignores a
+      # repeated user name, so keys for a `kcore` user the operator already
+      # defined would be dropped.
+      guestOpsPart = pkgs.writeText "${vmName}-guest-ops-part.sh" (
+        ''
+          #!/bin/sh
+          u=kcore
+          id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo "$u" || exit 0
+          home="$(getent passwd "$u" | cut -d: -f6)"
+          install -d -m 700 -o "$u" -g "$u" "$home/.ssh"
+          f="$home/.ssh/authorized_keys"
+          touch "$f"
+          while IFS= read -r k; do
+            [ -n "$k" ] && { grep -qxF "$k" "$f" || printf '%s\n' "$k" >> "$f"; }
+          done <<'KCORE_KEYS'
+        ''
+        + lib.concatMapStrings (k: "${k}\n") vmCfg.cloudInitGuestOpsKeys
+        + ''
+          KCORE_KEYS
+          chown "$u:$u" "$f"
+          chmod 600 "$f"
+          # GuestOps (probe, grow, fsfreeze) runs as this user and needs root.
+          if [ -d /etc/sudoers.d ]; then
+            printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" > /etc/sudoers.d/90-kcore-guest-ops
+            chmod 440 /etc/sudoers.d/90-kcore-guest-ops
+          fi
+        ''
+      );
+      mergedUserData = pkgs.runCommand "${vmName}-user-data-mime" { } ''
+        boundary="==KCORE-USER-DATA=="
+        {
+          printf 'Content-Type: multipart/mixed; boundary="%s"\nMIME-Version: 1.0\n\n' "$boundary"
+          printf -- '--%s\nContent-Type: text/cloud-config; charset="utf-8"\nMIME-Version: 1.0\n\n' "$boundary"
+          cat ${vmCfg.cloudInitUserConfigFile}
+          printf '\n--%s\nContent-Type: text/x-shellscript; charset="utf-8"\nMIME-Version: 1.0\n\n' "$boundary"
+          cat ${guestOpsPart}
+          printf '\n--%s--\n' "$boundary"
+        } > "$out"
+      '';
       userData =
         if vmCfg.cloudInitUserConfigFile != null then
-          vmCfg.cloudInitUserConfigFile
+          (if vmCfg.cloudInitGuestOpsKeys != [ ] then mergedUserData else vmCfg.cloudInitUserConfigFile)
         else
           pkgs.writeText "${vmName}-user-data" ''
             #cloud-config

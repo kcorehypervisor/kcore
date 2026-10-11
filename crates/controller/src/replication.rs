@@ -1032,13 +1032,17 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 .get("approvalStatus")
                 .and_then(Value::as_str)
                 .unwrap_or("pending");
-            let status = body.get("status").and_then(Value::as_str).unwrap_or(
-                if approval_status == "approved" {
-                    "ready"
-                } else {
-                    "pending"
-                },
-            );
+            // A drain/cordon is its own event; a re-register (from this or an
+            // older primary that still logged "ready") must not clear it.
+            let existing_status = existing.as_ref().map(|n| n.status.as_str());
+            let status = if existing_status.is_some_and(crate::db::is_operator_held_status) {
+                crate::db::node_status_after_register(existing_status, approval_status)
+            } else {
+                body.get("status")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| crate::db::node_status_after_register(None, approval_status))
+            };
             let node = NodeRow {
                 id: node_id.to_string(),
                 hostname: body
@@ -1064,7 +1068,7 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                     .and_then(Value::as_i64)
                     .or_else(|| existing.as_ref().map(|n| n.memory_bytes))
                     .unwrap_or(0),
-                status: status.to_string(),
+                status: status.clone(),
                 last_heartbeat: body
                     .get("lastHeartbeat")
                     .and_then(Value::as_str)
@@ -2441,6 +2445,54 @@ mod tests {
         assert_eq!(labels.len(), 2);
     }
 
+    /// A follower that already holds a drained node must not let a replicated
+    /// re-register (even one from an older primary that logged "ready") put
+    /// it back into scheduling; only node.uncordon does that.
+    #[test]
+    fn materializer_keeps_operator_held_status_across_node_register() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node = test_node("node-held");
+        node.status = "drained".to_string();
+        db.upsert_node(&node).expect("insert node");
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "node/node-held".to_string(),
+            last_op_id: "op-node-held".to_string(),
+            last_logical_ts_unix_ms: 100,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 13,
+            last_event_type: "node.register".to_string(),
+            last_body_json: r#"{"nodeId":"node-held","hostname":"node-held","address":"10.0.0.3:9091","cpuCores":8,"memoryBytes":17179869184,"status":"ready","gatewayInterface":"","storageBackend":1,"disableVxlan":false,"approvalStatus":"approved","certExpiryDays":30,"luksMethod":"tpm2","labels":[]}"#.to_string(),
+        })
+        .expect("upsert head");
+
+        assert!(process_materialization_once(&db).expect("materialize"));
+        let node = db.get_node("node-held").expect("db").expect("node");
+        assert_eq!(node.status, "drained");
+        assert_eq!(node.cpu_cores, 8, "capacity still refreshes");
+
+        db.upsert_replication_resource_head(&ReplicationResourceHeadRow {
+            resource_key: "node/node-held".to_string(),
+            last_op_id: "op-node-held-2".to_string(),
+            last_logical_ts_unix_ms: 200,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 14,
+            last_event_type: "node.uncordon".to_string(),
+            last_body_json: r#"{"nodeId":"node-held"}"#.to_string(),
+        })
+        .expect("upsert head");
+        assert!(process_materialization_once(&db).expect("materialize"));
+        let node = db.get_node("node-held").expect("db").expect("node");
+        assert_eq!(node.status, "ready");
+    }
+
     #[test]
     fn materializer_applies_node_heartbeat_snapshot() {
         let db = Database::open(":memory:").expect("open db");
@@ -3403,6 +3455,7 @@ mod tests {
             webhooks: Default::default(),
             scheduler: Default::default(),
             failover: Default::default(),
+            metrics: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 
@@ -3444,6 +3497,7 @@ mod tests {
             webhooks: Default::default(),
             scheduler: Default::default(),
             failover: Default::default(),
+            metrics: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 

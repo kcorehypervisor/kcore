@@ -44,6 +44,9 @@ pub struct Config {
     /// Move Ceph VMs off a node that has missed its heartbeat deadline.
     #[serde(default)]
     pub failover: FailoverConfig,
+    /// Prometheus file_sd targets written for VictoriaMetrics (host metrics).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 /// Automatic placement of shared-disk VMs when a node becomes unreachable.
@@ -61,6 +64,47 @@ impl Default for FailoverConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+/// Rewrite Prometheus `file_sd` targets so VictoriaMetrics scrapes every node.
+///
+/// Disabled by default so lab controllers without VictoriaMetrics leave the
+/// filesystem alone. Installs that co-locate the metrics server set
+/// `enabled: true` in `controller.yaml`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_file_sd_path")]
+    pub file_sd_path: String,
+    #[serde(default = "default_metrics_scrape_port")]
+    pub scrape_port: u16,
+    #[serde(default = "default_metrics_refresh_secs")]
+    pub refresh_interval_secs: u64,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            file_sd_path: default_metrics_file_sd_path(),
+            scrape_port: default_metrics_scrape_port(),
+            refresh_interval_secs: default_metrics_refresh_secs(),
+        }
+    }
+}
+
+fn default_metrics_file_sd_path() -> String {
+    "/etc/kcore/metrics/file_sd/nodes.json".to_string()
+}
+
+fn default_metrics_scrape_port() -> u16 {
+    9100
+}
+
+fn default_metrics_refresh_secs() -> u64 {
+    30
 }
 
 /// Ratios applied to physical CPU and memory when deciding whether a node
@@ -473,6 +517,15 @@ impl Config {
         }
         if self.default_network.gateway_ip.trim().is_empty() {
             anyhow::bail!("defaultNetwork.gatewayIp is required");
+        }
+        if self.metrics.enabled {
+            crate::path_safety::assert_safe_path(&self.metrics.file_sd_path, "metrics.fileSdPath")?;
+            if self.metrics.scrape_port == 0 {
+                anyhow::bail!("metrics.scrapePort must be greater than 0");
+            }
+            if self.metrics.refresh_interval_secs == 0 {
+                anyhow::bail!("metrics.refreshIntervalSecs must be greater than 0");
+            }
         }
         if let Some(replication) = &self.replication {
             if replication.dc_id.trim().is_empty() {
@@ -967,6 +1020,53 @@ defaultNetwork:
         assert!(cfg.webhooks.endpoints.is_empty());
         assert_eq!(cfg.webhooks.timeout_secs, 5);
         assert_eq!(cfg.webhooks.max_retries, 3);
+    }
+
+    #[test]
+    fn metrics_default_disabled_with_standard_paths() {
+        let cfg = load_with("metrics-default", "").expect("load");
+        assert!(!cfg.metrics.enabled);
+        assert_eq!(
+            cfg.metrics.file_sd_path,
+            "/etc/kcore/metrics/file_sd/nodes.json"
+        );
+        assert_eq!(cfg.metrics.scrape_port, 9100);
+        assert_eq!(cfg.metrics.refresh_interval_secs, 30);
+    }
+
+    #[test]
+    fn metrics_section_parses_and_rejects_bad_values() {
+        let cfg = load_with(
+            "metrics-ok",
+            r#"
+metrics:
+  enabled: true
+  fileSdPath: /var/lib/kcore/metrics/nodes.json
+  scrapePort: 9100
+  refreshIntervalSecs: 15
+"#,
+        )
+        .expect("load");
+        assert!(cfg.metrics.enabled);
+        assert_eq!(
+            cfg.metrics.file_sd_path,
+            "/var/lib/kcore/metrics/nodes.json"
+        );
+        assert_eq!(cfg.metrics.refresh_interval_secs, 15);
+
+        let err = load_with(
+            "metrics-zero-port",
+            "metrics:\n  enabled: true\n  scrapePort: 0\n",
+        )
+        .expect_err("must fail");
+        assert!(err.to_string().contains("scrapePort"), "{err}");
+
+        let err = load_with(
+            "metrics-parent",
+            "metrics:\n  enabled: true\n  fileSdPath: /etc/kcore/../evil.json\n",
+        )
+        .expect_err("must fail");
+        assert!(err.to_string().contains("fileSdPath"), "{err}");
     }
 
     #[test]

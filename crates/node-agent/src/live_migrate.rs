@@ -17,6 +17,7 @@ use crate::vmm;
 /// and the *same* API socket directory.
 pub const CH_BIN_PATH_FILE: &str = "/etc/kcore/cloud-hypervisor";
 pub const VM_SOCKET_DIR_FILE: &str = "/etc/kcore/vm-socket-dir";
+pub const CH_VM_FEATURES_FILE: &str = "/etc/kcore/ch-vm-features";
 
 /// Migration listeners are allocated from a fixed range that sits *below* the
 /// kernel's default local port range (32768-60999), so the kernel never hands
@@ -185,61 +186,15 @@ pub fn rbd_device(pool: &str, image: &str) -> PathBuf {
 }
 
 pub fn rbd_is_mapped(pool: &str, image: &str) -> bool {
-    rbd_device(pool, image).exists()
+    crate::rbd_nbd::mapped_device(pool, image).is_some()
 }
 
 pub fn ensure_rbd_mapped(pool: &str, image: &str) -> Result<(), String> {
-    let dev = rbd_device(pool, image);
-    if dev.exists() {
-        return Ok(());
-    }
-    let handle = format!("{pool}/{image}");
-    let out = std::process::Command::new("rbd")
-        .args(["map", &handle])
-        .output()
-        .map_err(|e| format!("rbd map: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "rbd map failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    for _ in 0..50 {
-        if dev.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!(
-        "rbd device {} did not appear after map",
-        dev.display()
-    ))
+    crate::rbd_nbd::map(pool, image).map(|_| ())
 }
 
 pub fn ensure_rbd_unmapped(pool: &str, image: &str) -> Result<(), String> {
-    let dev = rbd_device(pool, image);
-    if !dev.exists() {
-        return Ok(());
-    }
-    let out = std::process::Command::new("rbd")
-        .args(["unmap", &dev.display().to_string()])
-        .output()
-        .map_err(|e| format!("rbd unmap: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        // Already unmapped is fine.
-        if err.contains("not mapped") || err.contains("No such file") {
-            return Ok(());
-        }
-        return Err(format!("rbd unmap failed: {}", err.trim()));
-    }
-    if dev.exists() {
-        return Err(format!(
-            "rbd device {} still present after unmap",
-            dev.display()
-        ));
-    }
-    Ok(())
+    crate::rbd_nbd::unmap(pool, image)
 }
 
 pub fn handoff_marker_path(socket_dir: &Path, vm_name: &str) -> PathBuf {
@@ -248,6 +203,29 @@ pub fn handoff_marker_path(socket_dir: &Path, vm_name: &str) -> PathBuf {
 
 pub fn migrate_pid_path(socket_dir: &Path, vm_name: &str) -> PathBuf {
     socket_dir.join(format!("{vm_name}.migrate.pid"))
+}
+
+/// Same path `modules/ch-vm/vm-service.nix` passes as `--serial socket=`.
+pub fn serial_socket_path(socket_dir: &Path, vm_name: &str) -> PathBuf {
+    socket_dir.join(format!("{vm_name}.serial.sock"))
+}
+
+/// Remove socket paths a previous run of this VM left on this node.
+///
+/// The migrated config names `--serial socket=<dir>/<vm>.serial.sock` and
+/// Cloud Hypervisor binds it without unlinking first, so a guest that ran
+/// here, moved away and is now coming back failed the receive at the Config
+/// step with nothing more specific than "Failed to receive migratable
+/// component snapshot". The cold-start unit wipes the same two paths.
+pub fn clear_stale_vm_sockets(socket_dir: &Path, vm_name: &str) {
+    for path in [
+        socket_dir.join(format!("{vm_name}.sock")),
+        serial_socket_path(socket_dir, vm_name),
+    ] {
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// PID of a receive-mode Cloud Hypervisor recorded by `spawn_receive_vmm`.
@@ -464,13 +442,19 @@ pub async fn spawn_receive_vmm(
     ch_bin: &str,
 ) -> Result<u32, String> {
     let socket = client.socket_path(vm_name);
-    if socket.exists() {
-        let _ = std::fs::remove_file(&socket);
-    }
+    clear_stale_vm_sockets(client.socket_dir(), vm_name);
+    // A receiver that dies mid-stream only shows up to the source as a socket
+    // error; its own stderr is the one place the real cause is written.
+    let log_path = client.socket_dir().join(format!("{vm_name}.receive.log"));
+    let (out, err) =
+        match std::fs::File::create(&log_path).and_then(|f| f.try_clone().map(|g| (f, g))) {
+            Ok((f, g)) => (Stdio::from(f), Stdio::from(g)),
+            Err(_) => (Stdio::null(), Stdio::null()),
+        };
     let mut child = Command::new(ch_bin)
         .arg(format!("--api-socket={}", socket.display()))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .kill_on_drop(false)
         .spawn()
         .map_err(|e| format!("spawn cloud-hypervisor ({ch_bin}): {e}"))?;
@@ -519,20 +503,51 @@ pub async fn start_receive_task(
     })
 }
 
-pub async fn disable_unit_restart(unit: &str) -> Result<(), String> {
-    // Prevent systemd from restarting the source CH after send-migration exits.
+const RESTART_DROPIN_NAME: &str = "90-kcore-migrate.conf";
+
+fn restart_dropin_dir(unit: &str) -> std::path::PathBuf {
+    Path::new("/run/systemd/system").join(format!("{unit}.d"))
+}
+
+async fn daemon_reload() -> Result<(), String> {
     let out = Command::new("systemctl")
-        .args(["set-property", unit, "Restart=no"])
+        .arg("daemon-reload")
         .output()
         .await
-        .map_err(|e| format!("systemctl set-property: {e}"))?;
+        .map_err(|e| format!("systemctl daemon-reload: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "systemctl set-property Restart=no failed for {unit}: {}",
+            "systemctl daemon-reload failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     Ok(())
+}
+
+/// Stop systemd restarting the source CH after send-migration makes it exit.
+///
+/// Newer systemd refuses `set-property Restart=`, so this installs a runtime
+/// drop-in under `/run` instead. Pair every call with `enable_unit_restart`
+/// once the unit is stopped or the send failed, otherwise the VM would lose
+/// its auto-restart until the node reboots.
+pub async fn disable_unit_restart(unit: &str) -> Result<(), String> {
+    let dir = restart_dropin_dir(unit);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(RESTART_DROPIN_NAME);
+    std::fs::write(&path, "[Service]\nRestart=no\n")
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    daemon_reload().await
+}
+
+/// Undo `disable_unit_restart`.
+pub async fn enable_unit_restart(unit: &str) -> Result<(), String> {
+    let path = restart_dropin_dir(unit).join(RESTART_DROPIN_NAME);
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+    let _ = std::fs::remove_dir(restart_dropin_dir(unit));
+    daemon_reload().await
 }
 
 pub async fn stop_unit(unit: &str) -> Result<(), String> {
@@ -626,6 +641,25 @@ pub fn resolve_ch_bin() -> String {
         return from_nix;
     }
     "cloud-hypervisor".to_string()
+}
+
+/// Per-VM options the installed ch-vm module accepts, one per line in
+/// `/etc/kcore/ch-vm-features`. A module that predates the file reports none,
+/// and the controller then renders only the baseline options for this node.
+pub fn nix_module_features() -> Vec<String> {
+    parse_module_features(&std::fs::read_to_string(CH_VM_FEATURES_FILE).unwrap_or_default())
+}
+
+pub fn parse_module_features(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(ToString::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The socket directory the generated VM units use, when the Nix module
@@ -976,6 +1010,41 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn module_features_are_trimmed_sorted_and_deduplicated() {
+        assert_eq!(
+            parse_module_features(
+                "imageSha256\n# comment\n\n  cloudHypervisorPatches \nimageSha256\n"
+            ),
+            vec![
+                "cloudHypervisorPatches".to_string(),
+                "imageSha256".to_string()
+            ]
+        );
+        assert!(parse_module_features("").is_empty());
+    }
+
+    /// A guest coming back to a node it once ran on finds its old serial
+    /// socket path there; the receiver must not trip over it.
+    #[test]
+    fn clear_stale_vm_sockets_removes_api_and_serial_paths_only_for_that_vm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vm = "vm-back";
+        let api = dir.path().join("vm-back.sock");
+        let serial = serial_socket_path(dir.path(), vm);
+        let other = dir.path().join("vm-other.serial.sock");
+        for p in [&api, &serial, &other] {
+            std::os::unix::net::UnixListener::bind(p).expect("bind");
+        }
+        assert!(std::os::unix::net::UnixListener::bind(&serial).is_err());
+
+        clear_stale_vm_sockets(dir.path(), vm);
+
+        assert!(!api.exists() && !serial.exists());
+        assert!(other.exists(), "another VM's socket is not ours to remove");
+        assert!(std::os::unix::net::UnixListener::bind(&serial).is_ok());
     }
 
     /// PID reuse must not be mistaken for a live receive, or clearing would

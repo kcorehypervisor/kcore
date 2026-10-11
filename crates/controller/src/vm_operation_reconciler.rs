@@ -6,7 +6,8 @@
 //! - `Reassigned` / `FinalizingDest` / `FinalizingSource` → best-effort
 //!   finalize RPCs on dest/source; mark Done when source release succeeds.
 //!
-//! `Preparing` / `Sending` are left alone (cancel or operator reset-session).
+//! `Sending` is left alone (operator reset-session). A `Preparing` row that is
+//! cancelled and idle, or idle for 30 minutes, is closed because no RPC owns it.
 
 use std::time::Duration;
 
@@ -35,6 +36,11 @@ pub fn spawn_vm_operation_reconciler(db: Database, clients: NodeClients) {
 }
 
 async fn reconcile_once(db: &Database, clients: &NodeClients) -> Result<(), String> {
+    match db.expire_stale_preparing_operations(60, 30 * 60) {
+        Ok(0) => {}
+        Ok(n) => warn!(count = n, "closed stale Preparing live-migrate operations"),
+        Err(e) => warn!(error = %e, "expiring stale operations failed"),
+    }
     let open = db
         .list_vm_operations(false)
         .map_err(|e| format!("list open ops: {e}"))?;

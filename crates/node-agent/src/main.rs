@@ -6,17 +6,20 @@
 
 mod auth;
 mod ceph_bootstrap;
+mod ceph_preflight;
 mod config;
 mod console;
 mod discovery;
 mod disk;
 mod grpc;
 mod guest_ops;
+mod host_cpu;
 mod issue_screen;
 mod live_migrate;
 mod path_safety;
 mod pki;
 mod rate_limit;
+mod rbd_nbd;
 mod registration;
 mod runtime;
 mod storage;

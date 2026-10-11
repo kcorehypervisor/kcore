@@ -140,12 +140,6 @@ let
   natVmConfigsForNetwork =
     netName: lib.filterAttrs (_: vmCfg: vmCfg.network == netName) cfg.virtualMachines;
 
-  vmsUsingNetwork =
-    netName:
-    lib.filterAttrs (
-      _: vmCfg: vmCfg.network == netName || lib.any (nic: nic.network == netName) vmCfg.extraNics
-    ) cfg.virtualMachines;
-
   interfacesOnNetwork =
     netName:
     lib.concatLists (
@@ -160,19 +154,13 @@ let
   # VM-to-VM drop on the bridge. Gateway, DHCP, and security-group rules
   # that name a target IP are accepted first. A /24 uses one subnet drop.
   # Any other mask drops only the known VM addresses on this network.
-  eastWestNft =
+  eastWestRules =
     netName: netCfg:
     let
       ifaces = interfacesOnNetwork netName;
       knownV4 = lib.unique (lib.filter (ip: ip != null) (map (iface: iface.ipv4) ifaces));
-      pairDrops = lib.concatMapStrings (
-        src:
-        lib.concatMapStrings (
-          dst:
-          lib.optionalString (src != dst) ''
-            nft add rule bridge kcoreew-${netName} forward ip saddr ${src} ip daddr ${dst} drop
-          ''
-        ) knownV4
+      pairDrops = lib.concatMap (
+        src: map (dst: "ip saddr ${src} ip daddr ${dst} drop") (lib.filter (dst: dst != src) knownV4)
       ) knownV4;
       subnetDrop =
         if netCfg.internalNetmask == "255.255.255.0" then
@@ -180,39 +168,147 @@ let
             parts = lib.splitString "." netCfg.gatewayIP;
             cidr = "${builtins.elemAt parts 0}.${builtins.elemAt parts 1}.${builtins.elemAt parts 2}.0/24";
           in
-          ''
-            nft add rule bridge kcoreew-${netName} forward ip saddr ${cidr} ip daddr ${cidr} drop
-          ''
+          [ "ip saddr ${cidr} ip daddr ${cidr} drop" ]
         else
           pairDrops;
-      allows = lib.concatMapStrings (
+      allows = map (
         rule:
-        lib.optionalString (rule.targetIp != "") ''
-          nft add rule bridge kcoreew-${netName} forward ip saddr ${rule.sourceCidr} ip daddr ${rule.targetIp} ${rule.protocol} dport ${toString rule.targetPort} accept
-        ''
-      ) netCfg.securityGroupRules;
-      v6accept = lib.optionalString (netCfg.ipv6Prefix != "") ''
-        nft add rule bridge kcoreew-${netName} forward ip6 daddr ${netCfg.ipv6Gateway} accept
-        nft add rule bridge kcoreew-${netName} forward ip6 saddr ${netCfg.ipv6Gateway} accept
-      '';
-      v6drop = lib.optionalString (netCfg.ipv6Prefix != "") ''
-        nft add rule bridge kcoreew-${netName} forward ip6 saddr ${netCfg.ipv6Prefix} ip6 daddr ${netCfg.ipv6Prefix} drop
-      '';
+        "ip saddr ${rule.sourceCidr} ip daddr ${rule.targetIp} ${rule.protocol} dport ${toString rule.targetPort} accept"
+      ) (lib.filter (rule: rule.targetIp != "") netCfg.securityGroupRules);
+      v6accept = lib.optionals (netCfg.ipv6Prefix != "") [
+        "ip6 daddr ${netCfg.ipv6Gateway} accept"
+        "ip6 saddr ${netCfg.ipv6Gateway} accept"
+      ];
+      v6drop = lib.optionals (netCfg.ipv6Prefix != "") [
+        "ip6 saddr ${netCfg.ipv6Prefix} ip6 daddr ${netCfg.ipv6Prefix} drop"
+      ];
     in
-    ''
-      nft delete table bridge kcoreew-${netName} 2>/dev/null || true
-      nft add table bridge kcoreew-${netName}
-      nft add chain bridge kcoreew-${netName} forward '{ type filter hook forward priority 0; policy accept; }'
-      nft add rule bridge kcoreew-${netName} forward ct state established,related accept
-      nft add rule bridge kcoreew-${netName} forward ip daddr ${netCfg.gatewayIP} accept
-      nft add rule bridge kcoreew-${netName} forward ip saddr ${netCfg.gatewayIP} accept
-      nft add rule bridge kcoreew-${netName} forward udp dport 67 accept
-      nft add rule bridge kcoreew-${netName} forward udp dport 68 accept
-      ${allows}
-      ${v6accept}
-      ${subnetDrop}
-      ${v6drop}
-    '';
+    [
+      "ct state established,related accept"
+      "ip daddr ${netCfg.gatewayIP} accept"
+      "ip saddr ${netCfg.gatewayIP} accept"
+      "udp dport 67 accept"
+      "udp dport 68 accept"
+    ]
+    ++ allows
+    ++ v6accept
+    ++ subnetDrop
+    ++ v6drop;
+
+  # Host-side NAT and port forwarding for a NAT network: masquerade out of
+  # the upstream interface, DNAT allowed ports and security-group rules.
+  natChains =
+    netName: netCfg:
+    let
+      upstream = upstreamIface netName netCfg;
+      portForwards =
+        proto: ports:
+        lib.concatMap (port: [
+          {
+            chain = "prerouting";
+            rule = "ip daddr ${netCfg.externalIP} ${proto} dport ${toString port} dnat to ${netCfg.gatewayIP}";
+          }
+          {
+            chain = "forward";
+            rule = "iifname \"${upstream}\" ${proto} dport ${toString port} accept";
+          }
+        ]) ports;
+      sgRules = lib.concatMap (
+        rule:
+        if rule.enableDnat && rule.targetIp != "" then
+          [
+            {
+              chain = "prerouting";
+              rule = "ip daddr ${netCfg.externalIP} ${rule.protocol} dport ${toString rule.hostPort} ip saddr ${rule.sourceCidr} dnat to ${rule.targetIp}:${toString rule.targetPort}";
+            }
+            {
+              chain = "forward";
+              rule = "iifname \"${upstream}\" ip daddr ${rule.targetIp} ${rule.protocol} dport ${toString rule.targetPort} ip saddr ${rule.sourceCidr} accept";
+            }
+          ]
+        else
+          [
+            {
+              chain = "forward";
+              rule = "iifname \"${upstream}\" ${rule.protocol} dport ${toString rule.hostPort} ip saddr ${rule.sourceCidr} accept";
+            }
+          ]
+      ) netCfg.securityGroupRules;
+      entries =
+        portForwards "tcp" netCfg.allowedTCPPorts ++ portForwards "udp" netCfg.allowedUDPPorts ++ sgRules;
+      rulesFor = chain: map (e: e.rule) (lib.filter (e: e.chain == chain) entries);
+    in
+    {
+      postrouting = [ "oifname \"${upstream}\" masquerade" ];
+      prerouting = rulesFor "prerouting";
+      forward = rulesFor "forward";
+    };
+
+  indentRules = rules: lib.concatMapStrings (rule: "    ${rule}\n") rules;
+
+  # One `nft -f` transaction per network. `add table` then `delete table`
+  # makes the replacement atomic and idempotent: the old kcore tables for
+  # this network (and only those) are swapped for the new ones with no
+  # window where neither exists, whether or not they were there before.
+  firewallRuleset =
+    netName: netCfg:
+    let
+      isNat = netCfg.networkType == "nat";
+      isVxlan = netCfg.networkType == "vxlan";
+      natTable =
+        if isNat then
+          let
+            chains = natChains netName netCfg;
+          in
+          ''
+            add table ip kcore-${netName}
+            delete table ip kcore-${netName}
+            table ip kcore-${netName} {
+              chain postrouting {
+                type nat hook postrouting priority srcnat; policy accept;
+            ${indentRules chains.postrouting}  }
+              chain prerouting {
+                type nat hook prerouting priority dstnat; policy accept;
+            ${indentRules chains.prerouting}  }
+              chain forward {
+                type filter hook forward priority 0; policy accept;
+            ${indentRules chains.forward}  }
+            }
+          ''
+        else if isVxlan && netCfg.enableOutboundNat then
+          ''
+            add table ip kcore-${netName}
+            delete table ip kcore-${netName}
+            table ip kcore-${netName} {
+              chain postrouting {
+                type nat hook postrouting priority srcnat; policy accept;
+                oifname "${cfg.gatewayInterface}" masquerade
+              }
+            }
+          ''
+        else
+          ''
+            add table ip kcore-${netName}
+            delete table ip kcore-${netName}
+          '';
+      eastWestTable =
+        if netCfg.eastWestFirewall then
+          ''
+            add table bridge kcoreew-${netName}
+            delete table bridge kcoreew-${netName}
+            table bridge kcoreew-${netName} {
+              chain forward {
+                type filter hook forward priority 0; policy accept;
+            ${indentRules (eastWestRules netName netCfg)}  }
+            }
+          ''
+        else
+          ''
+            add table bridge kcoreew-${netName}
+            delete table bridge kcoreew-${netName}
+          '';
+    in
+    pkgs.writeText "kcore-firewall-${netName}.nft" (natTable + eastWestTable);
 in
 {
   config = lib.mkIf cfg.enable {
@@ -250,9 +346,11 @@ in
         lib.nameValuePair "kcore-bridge-${netName}" {
           description = "kcore bridge for network ${netName}";
           wantedBy = [ "multi-user.target" ];
-          before = lib.mapAttrsToList (vmName: _vmCfg: "kcore-vm-${vmName}.service") (
-            vmsUsingNetwork netName
-          );
+          # The bridge must never be restarted by a config switch: stopping it
+          # takes down every tap and VM on the network. Ordering against VMs
+          # comes from their tap units (`after` the bridge), so this unit does
+          # not list VMs and stays byte-identical when VMs are added.
+          restartIfChanged = false;
 
           serviceConfig = {
             Type = "oneshot";
@@ -303,8 +401,6 @@ in
                 ip -6 addr replace ${netCfg.ipv6Gateway}/64 dev "$bridge"
               ''}
 
-              ${lib.optionalString netCfg.eastWestFirewall (eastWestNft netName netCfg)}
-
               ${lib.optionalString isBridge ''
                 # Bridge mode: attach physical NIC (or VLAN sub-if) directly to bridge.
                 # VMs obtain IPs from the upstream DHCP server.
@@ -313,37 +409,6 @@ in
 
               ${lib.optionalString isNat ''
                 ip addr add ${netCfg.gatewayIP}/${netmaskToCidr netCfg.internalNetmask} dev "$bridge"
-
-                nft add table ip kcore-${netName} 2>/dev/null || true
-                nft add chain ip kcore-${netName} postrouting '{ type nat hook postrouting priority srcnat; }'
-                nft add rule ip kcore-${netName} postrouting oifname "${upstreamIface netName netCfg}" masquerade
-                nft add chain ip kcore-${netName} prerouting '{ type nat hook prerouting priority dstnat; }'
-                nft add chain ip kcore-${netName} forward '{ type filter hook forward priority 0; }'
-                ${lib.concatMapStringsSep "\n              "
-                  (port: ''
-                    nft add rule ip kcore-${netName} prerouting ip daddr ${netCfg.externalIP} tcp dport ${toString port} dnat to ${netCfg.gatewayIP}
-                                  nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" tcp dport ${toString port} accept'')
-                  netCfg.allowedTCPPorts
-                }
-                ${lib.concatMapStringsSep "\n              "
-                  (port: ''
-                    nft add rule ip kcore-${netName} prerouting ip daddr ${netCfg.externalIP} udp dport ${toString port} dnat to ${netCfg.gatewayIP}
-                                  nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" udp dport ${toString port} accept'')
-                  netCfg.allowedUDPPorts
-                }
-                ${lib.concatMapStringsSep "\n              " (rule: ''
-                  ${
-                    if rule.enableDnat && rule.targetIp != "" then
-                      ''
-                        nft add rule ip kcore-${netName} prerouting ip daddr ${netCfg.externalIP} ${rule.protocol} dport ${toString rule.hostPort} ip saddr ${rule.sourceCidr} dnat to ${rule.targetIp}:${toString rule.targetPort}
-                        nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" ip daddr ${rule.targetIp} ${rule.protocol} dport ${toString rule.targetPort} ip saddr ${rule.sourceCidr} accept
-                      ''
-                    else
-                      ''
-                        nft add rule ip kcore-${netName} forward iifname "${upstreamIface netName netCfg}" ${rule.protocol} dport ${toString rule.hostPort} ip saddr ${rule.sourceCidr} accept
-                      ''
-                  }
-                '') netCfg.securityGroupRules}
               ''}
 
               ${lib.optionalString isVxlan ''
@@ -356,12 +421,6 @@ in
                 '') netCfg.vxlanPeers}
                 ip link set vxlan${toString netCfg.vni} master "$bridge"
                 ip link set vxlan${toString netCfg.vni} up
-
-                ${lib.optionalString netCfg.enableOutboundNat ''
-                  nft add table ip kcore-${netName} 2>/dev/null || true
-                  nft add chain ip kcore-${netName} postrouting '{ type nat hook postrouting priority srcnat; }'
-                  nft add rule ip kcore-${netName} postrouting oifname "${cfg.gatewayInterface}" masquerade
-                ''}
               ''}
             '';
 
@@ -372,8 +431,6 @@ in
             in
             ''
               bridge="${bridgeName netName}"
-              nft delete table ip kcore-${netName} 2>/dev/null || true
-              nft delete table bridge kcoreew-${netName} 2>/dev/null || true
               ${lib.optionalString isVxlan ''
                 ip link delete vxlan${toString netCfg.vni} 2>/dev/null || true
               ''}
@@ -386,6 +443,34 @@ in
                 ip link delete "${cfg.gatewayInterface}.${toString netCfg.vlanId}" 2>/dev/null || true
               ''}
             '';
+        }
+      ) cfg.networks
+      // lib.mapAttrs' (
+        netName: netCfg:
+        lib.nameValuePair "kcore-firewall-${netName}" {
+          description = "kcore nftables rules for network ${netName}";
+          requires = [ "kcore-bridge-${netName}.service" ];
+          after = [
+            "kcore-bridge-${netName}.service"
+            "nftables.service"
+          ];
+          wantedBy = [ "multi-user.target" ];
+          # Rule changes (ports, security groups, VM addresses) are applied by
+          # reloading, which replaces the tables atomically; the unit is only
+          # stopped when the network itself goes away, and that is when the
+          # tables are deleted.
+          reloadIfChanged = true;
+          path = [ pkgs.nftables ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = "${pkgs.nftables}/bin/nft -f ${firewallRuleset netName netCfg}";
+            ExecReload = "${pkgs.nftables}/bin/nft -f ${firewallRuleset netName netCfg}";
+          };
+          preStop = ''
+            nft delete table ip kcore-${netName} 2>/dev/null || true
+            nft delete table bridge kcoreew-${netName} 2>/dev/null || true
+          '';
         }
       ) cfg.networks
       // lib.mapAttrs' (
@@ -477,6 +562,17 @@ in
     networking.firewall.trustedInterfaces = lib.mapAttrsToList (
       netName: _netCfg: bridgeName netName
     ) cfg.networks;
+
+    # Live migration: Cloud Hypervisor on the destination listens on one port of
+    # this range (MIGRATE_PORT_BASE..+MIGRATE_PORT_COUNT in node-agent's
+    # live_migrate.rs). Only the management interface may reach it, never the
+    # VM bridges.
+    networking.firewall.interfaces.${cfg.gatewayInterface}.allowedTCPPortRanges = [
+      {
+        from = 18000;
+        to = 18127;
+      }
+    ];
 
     networking.firewall.allowedUDPPorts = lib.optional (lib.any (n: n.networkType == "vxlan") (
       lib.attrValues cfg.networks

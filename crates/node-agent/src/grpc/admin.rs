@@ -53,6 +53,9 @@ const DISK_MODE_CONTROLLER_MANAGED: &str = "controller-managed";
 const DISK_LAYOUT_DIR: &str = "/etc/kcore/disk";
 const DISK_LAYOUT_CURRENT_PATH: &str = "/etc/kcore/disk/current.nix";
 const CEPH_NIX_PATH: &str = "/etc/nixos/kcore-ceph.nix";
+/// Installed copy of `modules/kcore-ceph.nix` (installer seeds it; apply keeps it current).
+const CEPH_MODULE_PATH: &str = "/etc/nixos/modules/kcore-ceph.nix";
+const BUNDLED_CEPH_MODULE: &str = include_str!("../../../../modules/kcore-ceph.nix");
 /// Rebuild verdicts live on tmpfs so they survive the node-agent restart that
 /// `nixos-rebuild switch` performs, but not a reboot (after which there is
 /// nothing in flight to report on anyway).
@@ -270,6 +273,7 @@ impl AdminService {
         vm_name: &str,
         images: &[(String, String)],
         port: u16,
+        warnings: Vec<String>,
     ) -> Result<Response<proto::PrepareLiveMigrateReceiveResponse>, Status> {
         live_migrate::ensure_migration_host_devices(vm_name)
             .await
@@ -328,6 +332,7 @@ impl AdminService {
             // Bound on every interface: the controller knows better than this
             // node which of its addresses the source can reach.
             listen_addr: "0.0.0.0".into(),
+            warnings,
         }))
     }
 
@@ -421,6 +426,24 @@ fn rbd_images_from_migrate_request(
     }
 }
 
+fn host_cpu_to_proto(cpu: &crate::host_cpu::HostCpu) -> proto::HostCpuInfo {
+    proto::HostCpuInfo {
+        vendor: cpu.vendor.clone(),
+        model_name: cpu.model_name.clone(),
+        tsc_khz: cpu.tsc_khz,
+        tsc_scaling: cpu.tsc_scaling,
+    }
+}
+
+fn host_cpu_from_proto(cpu: &proto::HostCpuInfo) -> crate::host_cpu::HostCpu {
+    crate::host_cpu::HostCpu {
+        vendor: cpu.vendor.clone(),
+        model_name: cpu.model_name.clone(),
+        tsc_khz: cpu.tsc_khz,
+        tsc_scaling: cpu.tsc_scaling,
+    }
+}
+
 fn receive_state_to_proto(
     obs: &live_migrate::ReceiveObservation,
 ) -> proto::LiveMigrateReceiveState {
@@ -463,6 +486,77 @@ fn validate_apply_ceph_config_args(ceph_nix: &str, fsid: &str) -> Result<(), Sta
         return Err(Status::invalid_argument("ceph_nix and fsid are required"));
     }
     Ok(())
+}
+
+async fn sync_bundled_ceph_module() -> Result<(), Status> {
+    if let Some(parent) = Path::new(CEPH_MODULE_PATH).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| Status::internal(format!("creating {}: {e}", parent.display())))?;
+    }
+    let current = tokio::fs::read_to_string(CEPH_MODULE_PATH)
+        .await
+        .unwrap_or_default();
+    if current != BUNDLED_CEPH_MODULE {
+        tokio::fs::write(CEPH_MODULE_PATH, BUNDLED_CEPH_MODULE)
+            .await
+            .map_err(|e| Status::internal(format!("writing {CEPH_MODULE_PATH}: {e}")))?;
+    }
+    Ok(())
+}
+
+async fn run_ceph_dry_build(ceph_nix: &str) -> Result<(), String> {
+    sync_bundled_ceph_module()
+        .await
+        .map_err(|e| e.message().to_string())?;
+    let previous = tokio::fs::read_to_string(CEPH_NIX_PATH)
+        .await
+        .unwrap_or_default();
+    tokio::fs::write(CEPH_NIX_PATH, ceph_nix.as_bytes())
+        .await
+        .map_err(|e| format!("writing {CEPH_NIX_PATH} for dry-build: {e}"))?;
+    let nixpkgs = resolve_nixpkgs_path()
+        .await
+        .ok_or_else(|| {
+            "pinned nixpkgs path unresolved (resolve_nixpkgs_path); refusing dry-build that would pull unstable"
+                .to_string()
+        })?;
+    let out = Command::new("nixos-rebuild")
+        .args(["dry-build"])
+        .env(
+            "NIX_PATH",
+            format!("nixos-config={NIXOS_CONFIG_PATH}:nixpkgs={nixpkgs}"),
+        )
+        .output()
+        .await
+        .map_err(|e| format!("starting nixos-rebuild dry-build: {e}"))?;
+    let _ = tokio::fs::write(CEPH_NIX_PATH, previous.as_bytes()).await;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(format!(
+            "nixos-rebuild dry-build failed: {}",
+            stderr
+                .lines()
+                .chain(stdout.lines())
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    Ok(())
+}
+
+fn issue(check: &str, message: impl Into<String>, blocking: bool) -> proto::CephPreflightIssue {
+    proto::CephPreflightIssue {
+        check: check.into(),
+        message: message.into(),
+        blocking,
+    }
 }
 
 fn validate_bootstrap_osd_device(osd_device: &str) -> Result<(), Status> {
@@ -540,12 +634,28 @@ fn daemon_id_from_ceph_nix(text: &str) -> String {
     String::new()
 }
 
+/// Run `ceph …` under `timeout(1)` so missing quorum cannot hang the agent.
+async fn run_ceph_cmd(args: &[&str]) -> Result<std::process::Output, std::io::Error> {
+    Command::new("timeout")
+        .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+        .arg("ceph")
+        .args(args)
+        .output()
+        .await
+}
+
 async fn list_prepared_osds() -> Result<Vec<crate::ceph_bootstrap::ListedOsd>, Status> {
     let listed = Command::new("ceph-volume")
         .args(["lvm", "list", "--format", "json"])
         .output()
-        .await
-        .map_err(|e| Status::internal(format!("starting ceph-volume: {e}")))?;
+        .await;
+    let listed = match listed {
+        Ok(out) => out,
+        // Ceph tools are only on PATH while the module is enabled; once a node
+        // has been torn down there is nothing prepared to list.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Status::internal(format!("starting ceph-volume: {e}"))),
+    };
     if !listed.status.success() {
         return Err(Status::internal(format!(
             "ceph-volume lvm list failed: {}",
@@ -585,7 +695,10 @@ async fn prepare_osd_device(device: &str, force_wipe: bool, encrypt: bool) -> Re
             ));
         }
     }
-    let mut args = vec!["lvm", "create", "--data", device];
+    // NixOS cannot `systemctl enable` into the read-only /etc/systemd/system
+    // symlink. Prepare without systemd integration; kcore-ceph.nix ships
+    // ceph-osd@.service and we start the unit ourselves.
+    let mut args = vec!["lvm", "create", "--no-systemd", "--data", device];
     if encrypt {
         args.push("--dmcrypt");
     }
@@ -600,26 +713,90 @@ async fn prepare_osd_device(device: &str, force_wipe: bool, encrypt: bool) -> Re
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    let listed = Command::new("ceph-volume")
+        .args(["lvm", "list", "--format", "json"])
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("ceph-volume lvm list: {e}")))?;
+    if listed.status.success() {
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        if let Ok(osds) = crate::ceph_bootstrap::parse_ceph_volume_lvm_list(&stdout) {
+            if let Some(osd) = osds.iter().find(|o| osd_matches_device(o, device)) {
+                let unit = format!("ceph-osd@{}", osd.id);
+                let start = Command::new("systemctl")
+                    .args(["start", &unit])
+                    .output()
+                    .await
+                    .map_err(|e| Status::internal(format!("starting {unit}: {e}")))?;
+                if !start.status.success() {
+                    return Err(Status::internal(format!(
+                        "systemctl start {unit} failed: {}",
+                        String::from_utf8_lossy(&start.stderr).trim()
+                    )));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
-async fn retire_osd(osd: &crate::ceph_bootstrap::ListedOsd) -> Result<(), Status> {
+/// Remove everything a deleted cluster left on this node so a later cluster
+/// (even with the same fsid) starts clean: OSD tmpfs mounts, daemon data, the
+/// stored bootstrap keys and any saved monmap.
+async fn wipe_local_ceph_state() {
+    if let Ok(mut dir) = tokio::fs::read_dir("/var/lib/ceph/osd").await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let _ = Command::new("umount").arg(entry.path()).output().await;
+        }
+    }
+    for sub in ["mon", "mgr", "osd"] {
+        let base = format!("/var/lib/ceph/{sub}");
+        if let Ok(mut dir) = tokio::fs::read_dir(&base).await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+            }
+        }
+    }
+    let _ = tokio::fs::remove_file(crate::ceph_bootstrap::BOOTSTRAP_STATE_PATH).await;
+    let _ = tokio::fs::remove_file("/var/lib/ceph/bootstrap-osd/ceph.keyring").await;
+    if let Ok(mut dir) = tokio::fs::read_dir("/var/lib/kcore").await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ceph-monmap-")
+            {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+    for f in ["ceph.client.admin.keyring", "ceph.mon.keyring"] {
+        let _ = tokio::fs::remove_file(format!("/etc/ceph/{f}")).await;
+    }
+}
+
+/// `require_purge` is false when the whole cluster is being deleted: the OSD's
+/// map entry dies with the cluster, so an unreachable quorum must not stop the
+/// disk from being zapped.
+async fn retire_osd(
+    osd: &crate::ceph_bootstrap::ListedOsd,
+    require_purge: bool,
+) -> Result<(), Status> {
     let id = osd.id.trim();
     if id.is_empty() {
         return Err(Status::internal("ceph-volume listed an OSD with no id"));
     }
-    let _ = Command::new("ceph").args(["osd", "out", id]).output().await;
+    let _ = run_ceph_cmd(&["osd", "out", id]).await;
     let _ = Command::new("systemctl")
         .args(["stop", &format!("ceph-osd@{id}")])
         .output()
         .await;
-    let purge = Command::new("ceph")
-        .args(["osd", "purge", id, "--yes-i-really-mean-it"])
-        .output()
+    let purge = run_ceph_cmd(&["osd", "purge", id, "--yes-i-really-mean-it"])
         .await
         .map_err(|e| Status::internal(format!("ceph osd purge: {e}")))?;
     let purge_err = String::from_utf8_lossy(&purge.stderr);
-    if !purge.status.success()
+    if require_purge
+        && !purge.status.success()
         && !purge_err.contains("does not exist")
         && !purge_err.contains("not present")
     {
@@ -726,6 +903,7 @@ async fn log_failed_kcore_units(context: &'static str) {
             "kcore-vm-*",
             "kcore-tap-*",
             "kcore-bridge-*",
+            "kcore-firewall-*",
             "kcore-dhcp-*",
         ])
         .output()
@@ -1045,7 +1223,8 @@ fn find_vm_ip_in_lease_file(path: &Path, vm_name: &str, vm_mac: Option<&str>) ->
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
     let target_mac = vm_mac.map(|m| m.to_ascii_lowercase());
-    let mut matched_ip: Option<String> = None;
+    // dnsmasq lists the most recently granted lease first, so the first match is
+    // the live one when a deleted VM left an older lease for the same MAC.
     for line in reader.lines().map_while(Result::ok) {
         let Some((mac, ip, hostname)) = parse_lease_entry(&line) else {
             continue;
@@ -1056,10 +1235,10 @@ fn find_vm_ip_in_lease_file(path: &Path, vm_name: &str, vm_mac: Option<&str>) ->
             .unwrap_or(false);
         let host_match = hostname == vm_name;
         if mac_match || host_match {
-            matched_ip = Some(ip.to_string());
+            return Some(ip.to_string());
         }
     }
-    matched_ip
+    None
 }
 
 fn vm_primary_mac(info: &crate::vmm::VmInfo) -> Option<String> {
@@ -1879,6 +2058,187 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn check_ceph_preflight(
+        &self,
+        request: Request<proto::CheckCephPreflightRequest>,
+    ) -> Result<Response<proto::CheckCephPreflightResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let mut issues = Vec::new();
+
+        if req.ceph_nix.trim().is_empty() {
+            issues.push(issue("ceph_nix", "ceph_nix fragment is empty", true));
+        }
+
+        match resolve_nixpkgs_path().await {
+            Some(p) => {
+                if !Path::new(&p).exists() {
+                    issues.push(issue(
+                        "nixpkgs",
+                        format!("nixpkgs path does not exist: {p}"),
+                        true,
+                    ));
+                }
+            }
+            None => issues.push(issue(
+                "nixpkgs",
+                "pinned nixpkgs path unresolved; apply would fall back to unstable",
+                true,
+            )),
+        }
+
+        if !req.ceph_nix.trim().is_empty() {
+            if let Err(e) = run_ceph_dry_build(&req.ceph_nix).await {
+                issues.push(issue("dry_build", e, true));
+            }
+        }
+
+        let disks = match tokio::task::spawn_blocking(discovery::list_disks)
+            .await
+            .map_err(|e| Status::internal(format!("list_disks task: {e}")))?
+        {
+            Ok(d) => d,
+            Err(e) => {
+                issues.push(issue(
+                    "osd_device",
+                    format!("listing disks failed: {e}"),
+                    true,
+                ));
+                Vec::new()
+            }
+        };
+        for device in &req.osd_devices {
+            let device = device.trim();
+            if device.is_empty() {
+                continue;
+            }
+            if !Path::new(device).exists() {
+                issues.push(issue(
+                    "osd_device",
+                    format!("OSD device does not exist: {device}"),
+                    true,
+                ));
+                continue;
+            }
+            if !crate::ceph_preflight::prefers_by_id_path(device) {
+                issues.push(issue(
+                    "osd_device",
+                    format!(
+                        "prefer /dev/disk/by-id/... for {device} (kernel names like /dev/sdX rename)"
+                    ),
+                    false,
+                ));
+            }
+            let matched = disks.iter().find(|d| {
+                d.path == device
+                    || d.name == device.trim_start_matches("/dev/")
+                    || Path::new(&d.path)
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| Path::new(device).canonicalize().ok().map(|q| p == q))
+                        .unwrap_or(false)
+            });
+            if let Some(d) = matched {
+                if crate::ceph_preflight::is_hardware_raid_model(&d.model) {
+                    issues.push(issue(
+                        "raid",
+                        format!(
+                            "OSD device {device} looks like a hardware RAID virtual disk (model={})",
+                            d.model
+                        ),
+                        true,
+                    ));
+                }
+                if !d.mountpoint.is_empty() && d.mountpoint != "-" {
+                    issues.push(issue(
+                        "osd_device",
+                        format!("OSD device {device} is mounted at {}", d.mountpoint),
+                        true,
+                    ));
+                }
+            }
+        }
+
+        let ip_json = Command::new("ip")
+            .args(["-j", "addr", "show"])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|| "[]".into());
+
+        let public_ip = crate::ceph_preflight::mon_ip(&req.mon_addr);
+        if !req.public_iface.is_empty() && !public_ip.is_empty() {
+            match crate::ceph_preflight::iface_has_address(&ip_json, &req.public_iface, public_ip) {
+                Ok(true) => {}
+                Ok(false) => issues.push(issue(
+                    "address",
+                    format!(
+                        "public address {public_ip} is not assigned on {}",
+                        req.public_iface
+                    ),
+                    true,
+                )),
+                Err(e) => issues.push(issue("address", e, true)),
+            }
+            let lease = Path::new(&format!(
+                "/run/systemd/netif/leases/{}",
+                // networkd lease files are by ifindex; also check dhcpcd.
+                req.public_iface
+            ))
+            .exists()
+                || Path::new(&format!(
+                    "/var/lib/dhcpcd/dhcpcd-{}.lease",
+                    req.public_iface
+                ))
+                .exists();
+            let networkctl = Command::new("networkctl")
+                .args(["status", &req.public_iface])
+                .output()
+                .await
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            if crate::ceph_preflight::iface_appears_dhcp(&networkctl, lease) {
+                issues.push(issue(
+                    "dhcp_mon",
+                    format!(
+                        "mon address {public_ip} appears to be on DHCP interface {}; use a static address or DHCP reservation",
+                        req.public_iface
+                    ),
+                    true,
+                ));
+            }
+        }
+
+        if !req.cluster_iface.is_empty() && !req.cluster_addr.trim().is_empty() {
+            match crate::ceph_preflight::iface_has_address(
+                &ip_json,
+                &req.cluster_iface,
+                req.cluster_addr.trim(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => issues.push(issue(
+                    "address",
+                    format!(
+                        "cluster address {} is not assigned on {} (module will try to set it)",
+                        req.cluster_addr.trim(),
+                        req.cluster_iface
+                    ),
+                    false,
+                )),
+                Err(e) => issues.push(issue("address", e, true)),
+            }
+        }
+
+        let ok = !issues.iter().any(|i| i.blocking);
+        Ok(Response::new(proto::CheckCephPreflightResponse {
+            ok,
+            issues,
+        }))
+    }
+
     async fn apply_ceph_config(
         &self,
         request: Request<proto::ApplyCephConfigRequest>,
@@ -1886,6 +2246,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         validate_apply_ceph_config_args(&req.ceph_nix, &req.fsid)?;
+        // Keep /etc/nixos/modules/kcore-ceph.nix in sync with this agent build so
+        // overlay / firewall fixes reach existing nodes without a manual copy.
+        sync_bundled_ceph_module().await?;
         let previous = tokio::fs::read_to_string(CEPH_NIX_PATH)
             .await
             .unwrap_or_default();
@@ -2022,7 +2385,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             if still_wanted {
                 continue;
             }
-            retire_osd(osd).await?;
+            retire_osd(osd, true).await?;
             retired.push(format!("osd.{} ({})", osd.id, osd.devices.join(",")));
         }
         Ok(Response::new(proto::ReconcileCephOsdsResponse {
@@ -2045,7 +2408,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let daemon_id = daemon_id_from_ceph_nix(&nix);
         let prepared = list_prepared_osds().await?;
         for osd in &prepared {
-            retire_osd(osd).await?;
+            retire_osd(osd, false).await?;
         }
         if !daemon_id.is_empty() {
             let _ = Command::new("systemctl")
@@ -2057,6 +2420,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 .output()
                 .await;
         }
+        wipe_local_ceph_state().await;
         tokio::fs::write(CEPH_NIX_PATH, "{ ... }: {}\n")
             .await
             .map_err(|e| Status::internal(format!("clearing {CEPH_NIX_PATH}: {e}")))?;
@@ -2086,13 +2450,16 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if daemon_id.is_empty() {
             return Err(Status::invalid_argument("daemon_id is required"));
         }
-        let out = Command::new("ceph")
-            .args(["mon", "rm", daemon_id])
-            .output()
+        let out = run_ceph_cmd(&["mon", "rm", daemon_id])
             .await
             .map_err(|e| Status::internal(format!("ceph mon rm: {e}")))?;
         let stderr = String::from_utf8_lossy(&out.stderr);
         let missing = stderr.contains("does not exist") || stderr.contains("no such");
+        if out.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded(format!(
+                "ceph mon rm {daemon_id} timed out"
+            )));
+        }
         if !out.status.success() && !missing {
             return Err(Status::internal(format!(
                 "ceph mon rm {daemon_id} failed: {}",
@@ -2106,6 +2473,90 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             } else {
                 format!("removed mon {daemon_id}")
             },
+        }))
+    }
+
+    async fn drain_ceph_host(
+        &self,
+        request: Request<proto::DrainCephHostRequest>,
+    ) -> Result<Response<proto::DrainCephHostResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let host = request.into_inner().host;
+        let host = host.trim();
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+        {
+            return Err(Status::invalid_argument("host must be a CRUSH host name"));
+        }
+        let tree = run_ceph_cmd(&["osd", "ls-tree", host, "--format", "json"])
+            .await
+            .map_err(|e| Status::internal(format!("ceph osd ls-tree: {e}")))?;
+        if tree.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("ceph osd ls-tree timed out"));
+        }
+        let stderr = String::from_utf8_lossy(&tree.stderr);
+        // A host with no OSDs left (or never any) has nothing to drain.
+        let osd_ids = if !tree.status.success() {
+            if stderr.contains("ENOENT") || stderr.contains("does not exist") {
+                Vec::new()
+            } else {
+                return Err(Status::internal(format!(
+                    "ceph osd ls-tree {host} failed: {}",
+                    stderr.trim()
+                )));
+            }
+        } else {
+            crate::ceph_bootstrap::parse_osd_ls_tree(&String::from_utf8_lossy(&tree.stdout))
+                .map_err(Status::internal)?
+        };
+        if !osd_ids.is_empty() {
+            let mut args = vec!["osd", "out"];
+            args.extend(osd_ids.iter().map(String::as_str));
+            let out = run_ceph_cmd(&args)
+                .await
+                .map_err(|e| Status::internal(format!("ceph osd out: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "ceph osd out {} failed: {}",
+                    osd_ids.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        let status = run_ceph_cmd(&["-s", "--format", "json"])
+            .await
+            .map_err(|e| Status::internal(format!("ceph status: {e}")))?;
+        if !status.status.success() {
+            return Err(Status::internal(format!(
+                "ceph status failed: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            )));
+        }
+        let json: JsonValue = serde_json::from_slice(&status.stdout)
+            .map_err(|e| Status::internal(format!("invalid ceph status JSON: {e}")))?;
+        let (pgs_total, pgs_not_clean) = crate::ceph_bootstrap::parse_pg_clean(&json);
+        let clean = pgs_not_clean == 0;
+        Ok(Response::new(proto::DrainCephHostResponse {
+            success: true,
+            message: if osd_ids.is_empty() {
+                format!("no OSDs under host {host}")
+            } else if clean {
+                format!(
+                    "osd {} out; all {pgs_total} PGs active+clean",
+                    osd_ids.join(",")
+                )
+            } else {
+                format!(
+                    "osd {} out; {pgs_not_clean}/{pgs_total} PGs not yet active+clean",
+                    osd_ids.join(",")
+                )
+            },
+            osd_ids,
+            clean,
+            pgs_total,
+            pgs_not_clean,
         }))
     }
 
@@ -2129,11 +2580,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
     ) -> Result<Response<proto::GetCephHealthResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let _ = request.into_inner();
-        let out = Command::new("ceph")
-            .args(["-s", "--format", "json"])
-            .output()
+        let out = run_ceph_cmd(&["-s", "--format", "json"])
             .await
             .map_err(|e| Status::internal(format!("starting ceph (is Ceph installed?): {e}")))?;
+        if out.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("ceph status timed out"));
+        }
         if !out.status.success() {
             return Err(Status::internal(format!(
                 "ceph status failed: {}",
@@ -2167,11 +2619,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if pool.is_empty() {
             return Err(Status::invalid_argument("pool is required"));
         }
-        let listed = Command::new("ceph")
-            .args(["osd", "pool", "ls"])
-            .output()
+        let listed = run_ceph_cmd(&["osd", "pool", "ls"])
             .await
             .map_err(|e| Status::internal(format!("ceph osd pool ls: {e}")))?;
+        if listed.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("ceph osd pool ls timed out"));
+        }
         if !listed.status.success() {
             return Err(Status::internal(format!(
                 "ceph osd pool ls failed: {}",
@@ -2183,11 +2636,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             .any(|l| l.trim() == pool);
         let mut created = false;
         if !exists {
-            let out = Command::new("ceph")
-                .args(["osd", "pool", "create", pool, "32"])
-                .output()
+            let out = run_ceph_cmd(&["osd", "pool", "create", pool, "32"])
                 .await
                 .map_err(|e| Status::internal(format!("ceph osd pool create: {e}")))?;
+            if out.status.code() == Some(124) {
+                return Err(Status::deadline_exceeded("ceph osd pool create timed out"));
+            }
             if !out.status.success() {
                 return Err(Status::internal(format!(
                     "ceph osd pool create failed: {}",
@@ -2196,34 +2650,35 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             }
             created = true;
         }
+        // Idempotent hardening so a fresh cluster reaches HEALTH_OK: mons added
+        // with a v1-only address, and the insecure global_id reclaim default.
+        let _ = run_ceph_cmd(&["mon", "enable-msgr2"]).await;
+        let _ = run_ceph_cmd(&[
+            "config",
+            "set",
+            "mon",
+            "auth_allow_insecure_global_id_reclaim",
+            "false",
+        ])
+        .await;
         if req.size > 0 {
-            let _ = Command::new("ceph")
-                .args(["osd", "pool", "set", pool, "size", &req.size.to_string()])
-                .output()
-                .await;
+            let size = req.size.to_string();
+            let _ = run_ceph_cmd(&["osd", "pool", "set", pool, "size", &size]).await;
         }
         if req.min_size > 0 {
-            let _ = Command::new("ceph")
-                .args([
-                    "osd",
-                    "pool",
-                    "set",
-                    pool,
-                    "min_size",
-                    &req.min_size.to_string(),
-                ])
-                .output()
-                .await;
+            let min_size = req.min_size.to_string();
+            let _ = run_ceph_cmd(&["osd", "pool", "set", pool, "min_size", &min_size]).await;
         }
-        let _ = Command::new("ceph")
-            .args(["osd", "pool", "application", "enable", pool, "rbd"])
-            .output()
-            .await;
-        let init = Command::new("rbd")
-            .args(["pool", "init", pool])
+        let _ = run_ceph_cmd(&["osd", "pool", "application", "enable", pool, "rbd"]).await;
+        let init = Command::new("timeout")
+            .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+            .args(["rbd", "pool", "init", pool])
             .output()
             .await
             .map_err(|e| Status::internal(format!("rbd pool init: {e}")))?;
+        if init.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("rbd pool init timed out"));
+        }
         if !init.status.success() {
             let err = String::from_utf8_lossy(&init.stderr);
             if !err.contains("already initialized") && !err.is_empty() {
@@ -2283,6 +2738,29 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         live_migrate::check_socket_dir_matches_nix(&self.vm_socket_dir)
             .map_err(Status::failed_precondition)?;
 
+        // Compare hosts before anything is mapped or spawned: a refusal here
+        // costs nothing to undo, one at restore time leaves a dead receiver.
+        let mut warnings = Vec::new();
+        if let Some(src) = req.source_cpu.as_ref() {
+            let source = host_cpu_from_proto(src);
+            let dest = crate::host_cpu::local();
+            match crate::host_cpu::check(&source, &dest) {
+                crate::host_cpu::Compat::Ok => {}
+                crate::host_cpu::Compat::Warn(w) => {
+                    for line in &w {
+                        warn!(%vm_name, source = %source, destination = %dest, "{line}");
+                    }
+                    warnings = w;
+                }
+                crate::host_cpu::Compat::Refuse(reason) => {
+                    return Err(Status::failed_precondition(format!(
+                        "{vm_name} cannot be live-migrated here: {reason} (source: {source}; \
+                         destination: {dest}); use a cold migration"
+                    )));
+                }
+            }
+        }
+
         // E2: unlock LUKS volumes after RBD map (prepare_receive maps images).
         for enc in &req.encrypted_volumes {
             let pool = enc.pool.trim();
@@ -2320,7 +2798,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 .map_err(Status::resource_exhausted)?
         };
 
-        let prepared = self.prepare_receive_session(vm_name, &images, port).await;
+        let prepared = self
+            .prepare_receive_session(vm_name, &images, port, warnings)
+            .await;
         if prepared.is_err() {
             self.live_migrate.release_port(port).await;
         }
@@ -2416,6 +2896,26 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn get_host_cpu_info(
+        &self,
+        request: Request<proto::GetHostCpuInfoRequest>,
+    ) -> Result<Response<proto::GetHostCpuInfoResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        Ok(Response::new(proto::GetHostCpuInfoResponse {
+            cpu: Some(host_cpu_to_proto(&crate::host_cpu::local())),
+        }))
+    }
+
+    async fn get_ch_vm_module_features(
+        &self,
+        request: Request<proto::GetChVmModuleFeaturesRequest>,
+    ) -> Result<Response<proto::GetChVmModuleFeaturesResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        Ok(Response::new(proto::GetChVmModuleFeaturesResponse {
+            features: live_migrate::nix_module_features(),
+        }))
+    }
+
     async fn get_live_migrate_progress(
         &self,
         request: Request<proto::GetLiveMigrateProgressRequest>,
@@ -2473,19 +2973,27 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             std::time::Duration::from_secs(600)
         };
         let send_fut = client.send_migration(vm_name, dest);
-        tokio::time::timeout(timeout, send_fut)
+        let sent = tokio::time::timeout(timeout, send_fut)
             .await
             .map_err(|_| {
                 Status::deadline_exceeded(format!(
                     "timed out after {}s sending {vm_name} to {dest}",
                     timeout.as_secs()
                 ))
-            })?
-            .map_err(|e| {
-                Status::internal(format!(
-                    "cloud-hypervisor refused to send {vm_name} to {dest}: {e}"
-                ))
-            })?;
+            })
+            .and_then(|r| {
+                r.map_err(|e| {
+                    Status::internal(format!(
+                        "cloud-hypervisor refused to send {vm_name} to {dest}: {e}"
+                    ))
+                })
+            });
+        if let Err(status) = sent {
+            if let Err(e) = live_migrate::enable_unit_restart(&unit).await {
+                warn!(error = %e, unit = %unit, "restoring restart policy after failed send");
+            }
+            return Err(status);
+        }
         Ok(Response::new(proto::SendLiveMigrateResponse {
             success: true,
             message: format!("sent migration for {vm_name} to {dest}"),
@@ -2507,6 +3015,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if let Err(e) = live_migrate::stop_unit(&unit).await {
             // Unit may already be inactive after CH exited on send.
             warn!(error = %e, unit = %unit, "finalize source stop");
+        }
+        if let Err(e) = live_migrate::enable_unit_restart(&unit).await {
+            warn!(error = %e, unit = %unit, "restoring restart policy after finalize");
         }
         let pool = req.rbd_pool.trim();
         let image = req.rbd_image.trim();
@@ -4556,6 +5067,21 @@ mod tests {
         let ip_by_mac =
             find_vm_ip_in_lease_file(&lease, "different-name", Some("52:54:00:4b:13:d6"));
         assert_eq!(ip_by_mac.as_deref(), Some("10.240.0.113"));
+    }
+
+    #[test]
+    fn find_vm_ip_prefers_newest_lease_for_recreated_vm() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lease = temp.path().join("dnsmasq-default.leases");
+        std::fs::write(
+            &lease,
+            "0 52:54:00:0d:cf:d4 10.240.0.173 labtest-8 *\n\
+             0 52:54:00:0d:cf:d4 10.240.0.100 * *\n\
+             0 52:54:00:0d:cf:d4 10.240.0.110 * *\n",
+        )
+        .expect("write lease");
+        let ip = find_vm_ip_in_lease_file(&lease, "labtest-8", Some("52:54:00:0d:cf:d4"));
+        assert_eq!(ip.as_deref(), Some("10.240.0.173"));
     }
 
     #[test]

@@ -180,6 +180,7 @@ service Controller {
   rpc RollbackClusterUpdate(RollbackClusterUpdateRequest) returns (RollbackClusterUpdateResponse);
 
   // CephCluster — declarative cluster-scoped Ceph SAN configuration.
+  rpc PlanCephCluster(PlanCephClusterRequest) returns (PlanCephClusterResponse);
   rpc CreateCephCluster(CreateCephClusterRequest) returns (CreateCephClusterResponse);
   rpc GetCephCluster(GetCephClusterRequest) returns (GetCephClusterResponse);
   rpc ListCephClusters(ListCephClustersRequest) returns (ListCephClustersResponse);
@@ -2097,6 +2098,25 @@ message CephCluster {
   CephClusterStatus status = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
+}
+
+message PlanCephClusterRequest { CephCluster ceph_cluster = 1; }
+message CephNodePlanResult {
+  string node_id = 1;
+  bool ok = 2;
+  repeated string issues = 3;
+}
+message PlanCephClusterResponse {
+  bool ok = 1;
+  // Loud notice about encryptOsds (default true / immutable after create).
+  string encrypt_osds_notice = 2;
+  repeated CephNodePlanResult nodes = 3;
+  repeated string cluster_issues = 4;
+  // Non-blocking notes, e.g. what retiring a member will do to the cluster.
+  repeated string cluster_warnings = 5;
+  // Members the applied spec drops; each is drained, purged and has its
+  // monitor removed by the reconciler, one apply at a time.
+  repeated string removing_members = 6;
 }
 
 message CreateCephClusterRequest { CephCluster ceph_cluster = 1; }

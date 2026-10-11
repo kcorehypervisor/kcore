@@ -17,6 +17,7 @@
 | Release verification (SBOMs + Sigstore) | [release-verification.md](./release-verification.md) |
 | Formal methods | [formal-methods-and-verification.md](./formal-methods-and-verification.md) |
 | Heartbeat | [heartbeat.md](./heartbeat.md) |
+| Host metrics (node_exporter / VictoriaMetrics) | [host-metrics.md](./host-metrics.md) |
 | Webhooks and events | [webhooks.md](./webhooks.md) |
 | kctl workflows | [kctl-commands-and-workflows.md](./kctl-commands-and-workflows.md) |
 | Migrations | [migrations.md](./migrations.md) |
@@ -28,9 +29,11 @@
 | Security | [security.md](./security.md) |
 | Security groups | [security-groups.md](./security-groups.md) |
 | k8s vs kcore security | [security-k8s-vs-kcore.md](./security-k8s-vs-kcore.md) |
+| Bare-metal Kubernetes (plan) | [bare-metal-kubernetes.md](./bare-metal-kubernetes.md) |
 | Storage | [storage.md](./storage.md) |
 | kcore SAN (Ceph) | [ceph.md](./ceph.md) |
 | VM migration (cold / live) | [vm-migration.md](./vm-migration.md) |
+| Ceph ops and VM movement: open gaps | [storage-and-mobility-gaps.md](./storage-and-mobility-gaps.md) |
 | Windows guests | [windows-guests.md](./windows-guests.md) |
 | Containerd support | [support-for-containerd.md](./support-for-containerd.md) |
 | Zero-external resolution | [zero-external-resolution-algorithm.md](./zero-external-resolution-algorithm.md) |

@@ -45,6 +45,7 @@ flowchart TB
 - `kcore-node-agent` writes the config file and applies it via `nixos-rebuild switch`.
 - `ch-vm` module realizes networking, TAP devices, seed ISOs, and VM systemd services.
 - `cloud-hypervisor` runs VMs; node-agent queries runtime state from API sockets.
+- Host metrics: every node runs `node_exporter`; controllers run VictoriaMetrics and rewrite Prometheus `file_sd` targets from the node inventory (see [host-metrics.md](./host-metrics.md)).
 
 ## Create/Delete VM lifecycle
 
