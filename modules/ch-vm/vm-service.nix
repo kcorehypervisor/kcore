@@ -501,6 +501,13 @@ in
     # unit later adopts a process it could not have started.
     environment.etc."kcore/cloud-hypervisor".text = chBin + "\n";
     environment.etc."kcore/vm-socket-dir".text = cfg.socketDir + "\n";
+    # Options the controller may only emit once this module version is
+    # installed on the node (an unknown option fails the whole evaluation).
+    # Append here when adding a per-VM option the controller renders.
+    environment.etc."kcore/ch-vm-features".text = ''
+      imageSha256
+      cloudHypervisorPatches
+    '';
 
     systemd.services = lib.mapAttrs' (
       vmName: vmCfg: lib.nameValuePair "kcore-vm-${vmName}" (mkVmService vmName vmCfg)

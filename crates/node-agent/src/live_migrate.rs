@@ -17,6 +17,7 @@ use crate::vmm;
 /// and the *same* API socket directory.
 pub const CH_BIN_PATH_FILE: &str = "/etc/kcore/cloud-hypervisor";
 pub const VM_SOCKET_DIR_FILE: &str = "/etc/kcore/vm-socket-dir";
+pub const CH_VM_FEATURES_FILE: &str = "/etc/kcore/ch-vm-features";
 
 /// Migration listeners are allocated from a fixed range that sits *below* the
 /// kernel's default local port range (32768-60999), so the kernel never hands
@@ -642,6 +643,25 @@ pub fn resolve_ch_bin() -> String {
     "cloud-hypervisor".to_string()
 }
 
+/// Per-VM options the installed ch-vm module accepts, one per line in
+/// `/etc/kcore/ch-vm-features`. A module that predates the file reports none,
+/// and the controller then renders only the baseline options for this node.
+pub fn nix_module_features() -> Vec<String> {
+    parse_module_features(&std::fs::read_to_string(CH_VM_FEATURES_FILE).unwrap_or_default())
+}
+
+pub fn parse_module_features(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(ToString::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The socket directory the generated VM units use, when the Nix module
 /// published one. `None` means the module predates this file and the node
 /// agent's own configuration is the only source available.
@@ -990,6 +1010,20 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn module_features_are_trimmed_sorted_and_deduplicated() {
+        assert_eq!(
+            parse_module_features(
+                "imageSha256\n# comment\n\n  cloudHypervisorPatches \nimageSha256\n"
+            ),
+            vec![
+                "cloudHypervisorPatches".to_string(),
+                "imageSha256".to_string()
+            ]
+        );
+        assert!(parse_module_features("").is_empty());
     }
 
     /// A guest coming back to a node it once ran on finds its old serial

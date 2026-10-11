@@ -2821,6 +2821,16 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn get_ch_vm_module_features(
+        &self,
+        request: Request<proto::GetChVmModuleFeaturesRequest>,
+    ) -> Result<Response<proto::GetChVmModuleFeaturesResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        Ok(Response::new(proto::GetChVmModuleFeaturesResponse {
+            features: live_migrate::nix_module_features(),
+        }))
+    }
+
     async fn get_live_migrate_progress(
         &self,
         request: Request<proto::GetLiveMigrateProgressRequest>,
