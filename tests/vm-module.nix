@@ -41,9 +41,34 @@ pkgs.testers.runNixOSTest {
             { address = "0000:03:00.1"; }
           ];
         };
+
+        # Seed-time digest check: the LV is only written when the cached
+        # image still hashes to what the operator pinned.
+        lvmVgName = "vg_test";
+        virtualMachines.lvm-badsha = {
+          image = testImage;
+          imageSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+          cores = 1;
+          memorySize = 256;
+          network = "default";
+          storageBackend = "lvm";
+          storageSizeBytes = 67108864;
+          autoStart = false;
+        };
+        virtualMachines.lvm-goodsha = {
+          image = testImage;
+          imageSha256 = builtins.hashFile "sha256" testImage;
+          cores = 1;
+          memorySize = 256;
+          network = "default";
+          storageBackend = "lvm";
+          storageSizeBytes = 67108864;
+          autoStart = false;
+        };
       };
 
       virtualisation.memorySize = 2048;
+      virtualisation.emptyDiskImages = [ 512 ];
     };
 
   testScript = ''
@@ -71,5 +96,36 @@ pkgs.testers.runNixOSTest {
     machine.succeed("systemctl cat kcore-vm-gpu-guest.service | grep -F -- '--device path=/sys/bus/pci/devices/0000:03:00.1,iommu=on'")
     machine.succeed("grep -q iommu=pt /proc/cmdline")
     machine.succeed("systemctl cat kcore-vm-gpu-guest.service | grep -F vfio-bind-gpu-guest")
+
+    # The node agent spawns the live-migration receiver from this file; it
+    # must be the same binary the units exec.
+    ch_bin = machine.succeed("cat /etc/kcore/cloud-hypervisor").strip()
+    machine.succeed(f"test -x {ch_bin}")
+    machine.succeed(f"grep -F -- '{ch_bin}' $(systemctl show -p ExecStart --value kcore-vm-gpu-guest.service | sed -n 's/.*path=\\([^ ;]*\\).*/\\1/p')")
+    machine.succeed("test \"$(cat /etc/kcore/vm-socket-dir)\" = /run/kcore")
+
+    # A pinned digest that does not match the cached image must stop the seed
+    # before anything is written to the volume.
+    machine.succeed("pvcreate /dev/vdb && vgcreate vg_test /dev/vdb")
+    machine.fail("systemctl start kcore-vm-lvm-badsha.service")
+    machine.succeed("journalctl -u kcore-vm-lvm-badsha.service | grep -F 'refusing to seed lvm-badsha'")
+    machine.fail("test -e /var/lib/kcore/volume-seeded/lvm-badsha")
+    # The matching digest seeds; ExecStart then fails only because the test
+    # VM has no KVM, which is after the part under test.
+    machine.execute("systemctl start kcore-vm-lvm-goodsha.service")
+    machine.succeed("journalctl -u kcore-vm-lvm-goodsha.service | grep -F 'Verifying'")
+    machine.succeed("test -e /var/lib/kcore/volume-seeded/lvm-goodsha")
+
+    # A VMM already serving this VM's API socket makes a start refuse with a
+    # status systemd does not retry, instead of wiping sockets and reseeding.
+    machine.succeed("systemctl cat kcore-vm-lvm-goodsha.service | grep -F 'RestartPreventExitStatus=75'")
+    # argv carries the same `cloud-hypervisor ... --api-socket <path>` shape
+    # the units and the node agent use; the process itself just sleeps.
+    machine.succeed("systemd-run --unit fake-vmm --quiet -- sh -c 'sleep 600' cloud-hypervisor --api-socket /run/kcore/lvm-goodsha.sock")
+    machine.succeed("pgrep -f -- 'cloud-hypervisor.*--api-socket /run/kcore/lvm-goodsha.sock'")
+    machine.fail("systemctl start kcore-vm-lvm-goodsha.service")
+    machine.succeed("journalctl -u kcore-vm-lvm-goodsha.service | grep -F 'refusing to start a second instance for lvm-goodsha'")
+    machine.succeed("systemctl show -p ExecStartPre kcore-vm-lvm-goodsha.service | grep -q 'status=75'")
+    machine.succeed("systemctl stop fake-vmm.service")
   '';
 }
