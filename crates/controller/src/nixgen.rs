@@ -382,6 +382,14 @@ pub fn generate_node_config_inner(
             out.push_str(&format!(
                 "      cloudInitUserConfigFile = pkgs.writeText \"{nix_name}-cloud-init.yaml\" \"{escaped}\";\n"
             ));
+            let ops_keys: Vec<&String> = guest_ops_keys.iter().filter(|k| !k.is_empty()).collect();
+            if !ops_keys.is_empty() {
+                out.push_str("      cloudInitGuestOpsKeys = [\n");
+                for pk in ops_keys {
+                    out.push_str(&format!("        \"{}\"\n", nix_escape(pk)));
+                }
+                out.push_str("      ];\n");
+            }
         } else if !ssh_keys.is_empty() {
             let mut ci = String::from("#cloud-config\n");
             ci.push_str(&format!("hostname: {}\n", nix_name));
@@ -811,6 +819,32 @@ mod tests {
         assert!(config.contains("ssh_authorized_keys"));
         assert!(config.contains("lock_passwd: true"));
         assert!(config.contains("ssh_pwauth: false"));
+    }
+
+    #[test]
+    fn custom_cloud_init_still_gets_guest_ops_keys() {
+        let mut v = vm(true, "web-01");
+        v.cloud_init_user_data = "#cloud-config\nhostname: web-01\n".to_string();
+        let ops = vec!["ssh-ed25519 AAAAops kcore-guest-ops".to_string()];
+        let none = std::collections::HashMap::new();
+        let config = generate_node_config_inner(
+            &[v],
+            "eno1",
+            &default_net(),
+            &[],
+            &none,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &[],
+            &ops,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(config.contains("cloudInitUserConfigFile"));
+        assert!(config.contains("cloudInitGuestOpsKeys"));
+        assert!(config.contains("ssh-ed25519 AAAAops kcore-guest-ops"));
     }
 
     #[test]

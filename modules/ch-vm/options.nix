@@ -233,6 +233,18 @@ let
         description = "Path to cloud-init user-data YAML file.";
       };
 
+      cloudInitGuestOpsKeys = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          Node GuestOps public keys to authorize for the `kcore` user in addition
+          to a user-supplied `cloudInitUserConfigFile`. Delivered as a second
+          cloud-config part that cloud-init merges into the user's document, so a
+          custom identity override does not lock GuestOps (volume resize, quiesced
+          snapshots) out of the guest.
+        '';
+      };
+
       cloudInitNetworkConfigFile = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
