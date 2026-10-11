@@ -197,10 +197,24 @@ fn select_volumes(db: &Database, policy: &SnapshotPolicyRow) -> Result<Vec<Volum
 
 fn pick_ceph_node(db: &Database) -> Result<crate::db::NodeRow, String> {
     let nodes = db.list_nodes().map_err(|e| e.to_string())?;
+    let clusters = db.list_ceph_clusters().map_err(|e| e.to_string())?;
+    let mut members = std::collections::HashSet::new();
+    for cluster in clusters {
+        let healthy = matches!(
+            db.get_ceph_cluster_status(&cluster.name),
+            Ok(Some(status)) if status.phase == "healthy"
+        );
+        if !healthy {
+            continue;
+        }
+        if let Ok(spec) = crate::ceph_cluster_spec::spec_from_json(&cluster.spec_json) {
+            members.extend(spec.nodes.into_iter().map(|n| n.node_id));
+        }
+    }
     nodes
         .into_iter()
-        .find(|n| n.approval_status == "approved")
-        .ok_or_else(|| "no approved node for Ceph storage RPC".into())
+        .find(|n| n.approval_status == "approved" && members.contains(&n.id))
+        .ok_or_else(|| "no approved healthy CephCluster member for storage RPC".into())
 }
 
 pub fn schedule_due(schedule: &str, last_run_at: &str) -> bool {
