@@ -1,0 +1,32 @@
+kind: KubernetesCluster
+metadata:
+  name: kcore-prod
+spec:
+  clusterCidr: 10.244.0.0/16
+  serviceCidr: 10.96.0.0/12
+  clusterDns: 10.96.0.10
+  apiServerEndpoint: 192.168.40.200:6443
+  cni: cilium
+  cilium:
+    mode: native-routing
+    mtu: 1500
+    tunnel: disabled
+    autoDirectNodeRoutes: true
+    loadBalancerIpPools:
+      - 192.168.40.220/29
+  controlPlaneNodes:
+    - nodeId: node-105
+      advertiseAddress: 192.168.40.105
+      iface: enp6s0
+      initialCluster: true
+    - nodeId: node-107
+      advertiseAddress: 192.168.40.107
+      iface: enp6s0
+    - nodeId: node-119
+      advertiseAddress: 192.168.40.119
+      iface: enp6s0
+  workerNodes: []
+  highAvailability:
+    enabled: true
+    vipAddress: 192.168.40.200
+    vipInterface: enp6s0
