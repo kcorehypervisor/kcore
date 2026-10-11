@@ -3865,6 +3865,31 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             }
         }
     }
+
+    // ============================================================================
+    // Kubernetes Node Configuration (Phase 1 stubs)
+    // ============================================================================
+
+    async fn apply_kubernetes_config(
+        &self,
+        _request: Request<proto::ApplyKubernetesConfigRequest>,
+    ) -> Result<Response<proto::ApplyKubernetesConfigResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes configuration not yet implemented"))
+    }
+
+    async fn get_kubernetes_status(
+        &self,
+        _request: Request<proto::GetKubernetesStatusRequest>,
+    ) -> Result<Response<proto::GetKubernetesStatusResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes configuration not yet implemented"))
+    }
+
+    async fn drain_kubernetes_node(
+        &self,
+        _request: Request<proto::DrainKubernetesNodeRequest>,
+    ) -> Result<Response<proto::DrainKubernetesNodeResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes configuration not yet implemented"))
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

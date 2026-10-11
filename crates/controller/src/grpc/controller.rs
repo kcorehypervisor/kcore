@@ -13184,6 +13184,66 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
+    // ============================================================================
+    // Kubernetes Cluster Management (Phase 1 stubs)
+    // ============================================================================
+
+    async fn plan_kubernetes_cluster(
+        &self,
+        _request: Request<controller_proto::PlanKubernetesClusterRequest>,
+    ) -> Result<Response<controller_proto::PlanKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+    }
+
+    async fn create_kubernetes_cluster(
+        &self,
+        _request: Request<controller_proto::CreateKubernetesClusterRequest>,
+    ) -> Result<Response<controller_proto::CreateKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+    }
+
+    async fn update_kubernetes_cluster(
+        &self,
+        _request: Request<controller_proto::UpdateKubernetesClusterRequest>,
+    ) -> Result<Response<controller_proto::UpdateKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+    }
+
+    async fn get_kubernetes_cluster(
+        &self,
+        _request: Request<controller_proto::GetKubernetesClusterRequest>,
+    ) -> Result<Response<controller_proto::GetKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+    }
+
+    async fn list_kubernetes_clusters(
+        &self,
+        _request: Request<controller_proto::ListKubernetesClustersRequest>,
+    ) -> Result<Response<controller_proto::ListKubernetesClustersResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+    }
+
+    async fn delete_kubernetes_cluster(
+        &self,
+        _request: Request<controller_proto::DeleteKubernetesClusterRequest>,
+    ) -> Result<Response<controller_proto::DeleteKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+    }
+
+    async fn scale_kubernetes_cluster(
+        &self,
+        _request: Request<controller_proto::ScaleKubernetesClusterRequest>,
+    ) -> Result<Response<controller_proto::ScaleKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+    }
+
+    async fn get_kubernetes_cluster_health(
+        &self,
+        _request: Request<controller_proto::GetKubernetesClusterHealthRequest>,
+    ) -> Result<Response<controller_proto::GetKubernetesClusterHealthResponse>, Status> {
+        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+    }
+
     async fn classify_disk_layout(
         &self,
         request: Request<controller_proto::ClassifyDiskLayoutRequest>,
