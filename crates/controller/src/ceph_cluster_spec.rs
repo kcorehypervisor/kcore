@@ -154,6 +154,101 @@ pub fn spec_from_json(json: &str) -> Result<CephClusterSpec, serde_json::Error> 
     })
 }
 
+/// Node ids present in `old` but not in `new`: the members an apply retires.
+pub fn removed_members(old: &CephClusterSpec, new: &CephClusterSpec) -> Vec<String> {
+    old.nodes
+        .iter()
+        .filter(|n| !new.nodes.iter().any(|m| m.node_id == n.node_id))
+        .map(|n| n.node_id.clone())
+        .collect()
+}
+
+/// What the cluster looked like when the operator asked to retire a member.
+pub struct RemovalContext<'a> {
+    /// `ceph -s` health of the cluster right now; `None` when no survivor
+    /// could be asked (treated as not healthy: a blind removal is refused).
+    pub health_status: Option<&'a str>,
+    /// Members whose earlier removal the reconciler has not finished.
+    pub pending_removals: &'a [String],
+}
+
+/// Verdict on retiring the members that `new` drops from `old`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RemovalPlan {
+    pub removed: Vec<String>,
+    /// Blocking: the apply is refused while any of these hold.
+    pub issues: Vec<String>,
+    /// Shown to the operator; the apply proceeds.
+    pub warnings: Vec<String>,
+}
+
+/// Each replica lives on a distinct host (the default CRUSH rule), so the
+/// survivors must still number at least `size`; the cluster must be
+/// HEALTH_OK so every PG is fully replicated before one copy leaves; and
+/// removals go one at a time so the drain of one host finishes before the
+/// next starts.
+pub fn plan_member_removal(
+    old: &CephClusterSpec,
+    new: &CephClusterSpec,
+    ctx: &RemovalContext<'_>,
+) -> RemovalPlan {
+    let removed = removed_members(old, new);
+    if removed.is_empty() {
+        return RemovalPlan::default();
+    }
+    let mut issues = Vec::new();
+    let mut warnings = Vec::new();
+    let leaving = removed.join(", ");
+    if removed.len() > 1 {
+        issues.push(format!(
+            "remove one member per apply so each host drains before the next leaves; this apply removes {}: {leaving}",
+            removed.len()
+        ));
+    }
+    let remaining = new.nodes.len();
+    if (remaining as i64) < i64::from(new.size) {
+        issues.push(format!(
+            "removing {leaving} leaves {remaining} host(s) for size {}: every replica needs its own host, so lower size (and minSize) first or add a member",
+            new.size
+        ));
+    }
+    if remaining == 2 {
+        warnings.push(
+            "2 monitors cannot survive losing either one (quorum needs a majority); plan to go back to 3+ members or down to 1"
+                .to_string(),
+        );
+    }
+    match ctx.health_status {
+        Some("HEALTH_OK") => {}
+        Some(status) => issues.push(format!(
+            "cluster is {status}; wait for HEALTH_OK so every placement group is fully replicated before a host leaves"
+        )),
+        None => issues.push(
+            "could not read ceph health from a surviving member; refusing to remove a host blind".to_string(),
+        ),
+    }
+    let still_pending: Vec<&str> = ctx
+        .pending_removals
+        .iter()
+        .filter(|id| !removed.contains(id))
+        .map(String::as_str)
+        .collect();
+    if !still_pending.is_empty() {
+        issues.push(format!(
+            "removal of {} is still in progress; wait for it to finish",
+            still_pending.join(", ")
+        ));
+    }
+    warnings.push(format!(
+        "{leaving} will be drained (OSDs marked out, wait for every PG to be active+clean), then its OSDs purged and its monitor removed"
+    ));
+    RemovalPlan {
+        removed,
+        issues,
+        warnings,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +418,82 @@ mod tests {
         spec.encrypt_osds = false;
         let back = spec_from_json(&spec_to_json(&spec).unwrap()).unwrap();
         assert!(!back.encrypt_osds);
+    }
+
+    fn without(spec: &CephClusterSpec, id: &str) -> CephClusterSpec {
+        let mut s = spec.clone();
+        s.nodes.retain(|n| n.node_id != id);
+        s
+    }
+
+    fn ctx<'a>(health: Option<&'a str>, pending: &'a [String]) -> RemovalContext<'a> {
+        RemovalContext {
+            health_status: health,
+            pending_removals: pending,
+        }
+    }
+
+    #[test]
+    fn removal_plan_is_empty_when_no_member_leaves() {
+        let old = valid_spec();
+        let plan = plan_member_removal(&old, &old, &ctx(None, &[]));
+        assert_eq!(plan, RemovalPlan::default());
+    }
+
+    #[test]
+    fn removal_needs_size_hosts_left_and_health_ok() {
+        let old = valid_spec();
+        let new = without(&old, "dell-3");
+        let plan = plan_member_removal(&old, &new, &ctx(Some("HEALTH_OK"), &[]));
+        assert_eq!(plan.removed, vec!["dell-3".to_string()]);
+        assert_eq!(plan.issues.len(), 1, "{:?}", plan.issues);
+        assert!(plan.issues[0].contains("leaves 2 host(s) for size 3"));
+
+        let mut shrunk = new.clone();
+        shrunk.size = 2;
+        let plan = plan_member_removal(&old, &shrunk, &ctx(Some("HEALTH_OK"), &[]));
+        assert!(plan.issues.is_empty(), "{:?}", plan.issues);
+        assert!(plan.warnings.iter().any(|w| w.contains("2 monitors")));
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|w| w.contains("dell-3 will be drained")));
+
+        let plan = plan_member_removal(&old, &shrunk, &ctx(Some("HEALTH_WARN"), &[]));
+        assert!(plan
+            .issues
+            .iter()
+            .any(|i| i.contains("cluster is HEALTH_WARN")));
+        let plan = plan_member_removal(&old, &shrunk, &ctx(None, &[]));
+        assert!(plan
+            .issues
+            .iter()
+            .any(|i| i.contains("refusing to remove a host blind")));
+    }
+
+    #[test]
+    fn removal_is_one_member_at_a_time() {
+        let old = valid_spec();
+        let mut new = without(&without(&old, "dell-3"), "dell-2");
+        new.size = 1;
+        new.min_size = 1;
+        let plan = plan_member_removal(&old, &new, &ctx(Some("HEALTH_OK"), &[]));
+        assert!(plan
+            .issues
+            .iter()
+            .any(|i| i.contains("remove one member per apply")));
+
+        let mut new = without(&old, "dell-3");
+        new.size = 2;
+        let pending = vec!["dell-2".to_string()];
+        let plan = plan_member_removal(&old, &new, &ctx(Some("HEALTH_OK"), &pending));
+        assert!(plan
+            .issues
+            .iter()
+            .any(|i| i.contains("removal of dell-2 is still in progress")));
+        // Re-applying the same removal is not blocked by its own pending entry.
+        let pending = vec!["dell-3".to_string()];
+        let plan = plan_member_removal(&old, &new, &ctx(Some("HEALTH_OK"), &pending));
+        assert!(plan.issues.is_empty(), "{:?}", plan.issues);
     }
 }

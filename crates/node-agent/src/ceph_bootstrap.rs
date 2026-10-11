@@ -583,9 +583,75 @@ pub fn parse_osd_counters(json: &serde_json::Value) -> (i32, i32) {
     (up, inn)
 }
 
+/// `ceph osd ls-tree <host> -f json`: a JSON array of OSD ids.
+pub fn parse_osd_ls_tree(stdout: &str) -> Result<Vec<String>, String> {
+    let ids: Vec<serde_json::Value> =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("osd ls-tree json: {e}"))?;
+    ids.iter()
+        .map(|v| match v {
+            serde_json::Value::Number(n) => Ok(n.to_string()),
+            serde_json::Value::String(s) => Ok(s.clone()),
+            other => Err(format!("unexpected osd id {other}")),
+        })
+        .collect()
+}
+
+/// Placement-group totals from `ceph -s --format json`: `(total, not active+clean)`.
+///
+/// Anything other than exactly `active+clean` (degraded, undersized,
+/// remapped, backfilling, peering...) still depends on an OSD somewhere, so
+/// a host whose OSDs were marked out is only free once this reaches zero.
+pub fn parse_pg_clean(json: &serde_json::Value) -> (i32, i32) {
+    let total = json
+        .pointer("/pgmap/num_pgs")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let clean = json
+        .pointer("/pgmap/pgs_by_state")
+        .and_then(|v| v.as_array())
+        .map(|states| {
+            states
+                .iter()
+                .filter(|s| s.get("state_name").and_then(|n| n.as_str()) == Some("active+clean"))
+                .filter_map(|s| s.get("count").and_then(|c| c.as_i64()))
+                .sum::<i64>()
+        })
+        .unwrap_or(0) as i32;
+    (total, (total - clean).max(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osd_ls_tree_accepts_numbers_and_strings() {
+        assert_eq!(parse_osd_ls_tree("[0,2]\n").unwrap(), vec!["0", "2"]);
+        assert_eq!(parse_osd_ls_tree("[]").unwrap(), Vec::<String>::new());
+        assert!(parse_osd_ls_tree("Error ENOENT").is_err());
+        assert!(parse_osd_ls_tree("[{}]").is_err());
+    }
+
+    #[test]
+    fn pg_clean_counts_only_active_clean() {
+        let json: serde_json::Value = serde_json::json!({
+            "pgmap": {
+                "num_pgs": 129,
+                "pgs_by_state": [
+                    {"state_name": "active+clean", "count": 100},
+                    {"state_name": "active+undersized+degraded", "count": 20},
+                    {"state_name": "active+remapped+backfilling", "count": 9}
+                ]
+            }
+        });
+        assert_eq!(parse_pg_clean(&json), (129, 29));
+        let json: serde_json::Value = serde_json::json!({
+            "pgmap": {"num_pgs": 33, "pgs_by_state": [{"state_name": "active+clean", "count": 33}]}
+        });
+        assert_eq!(parse_pg_clean(&json), (33, 0));
+        // No PGs at all (fresh cluster with no pools) counts as clean.
+        assert_eq!(parse_pg_clean(&serde_json::json!({})), (0, 0));
+    }
 
     #[test]
     fn parse_mon_map_strips_ports() {

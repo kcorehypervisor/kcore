@@ -2475,6 +2475,90 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn drain_ceph_host(
+        &self,
+        request: Request<proto::DrainCephHostRequest>,
+    ) -> Result<Response<proto::DrainCephHostResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let host = request.into_inner().host;
+        let host = host.trim();
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+        {
+            return Err(Status::invalid_argument("host must be a CRUSH host name"));
+        }
+        let tree = run_ceph_cmd(&["osd", "ls-tree", host, "--format", "json"])
+            .await
+            .map_err(|e| Status::internal(format!("ceph osd ls-tree: {e}")))?;
+        if tree.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("ceph osd ls-tree timed out"));
+        }
+        let stderr = String::from_utf8_lossy(&tree.stderr);
+        // A host with no OSDs left (or never any) has nothing to drain.
+        let osd_ids = if !tree.status.success() {
+            if stderr.contains("ENOENT") || stderr.contains("does not exist") {
+                Vec::new()
+            } else {
+                return Err(Status::internal(format!(
+                    "ceph osd ls-tree {host} failed: {}",
+                    stderr.trim()
+                )));
+            }
+        } else {
+            crate::ceph_bootstrap::parse_osd_ls_tree(&String::from_utf8_lossy(&tree.stdout))
+                .map_err(Status::internal)?
+        };
+        if !osd_ids.is_empty() {
+            let mut args = vec!["osd", "out"];
+            args.extend(osd_ids.iter().map(String::as_str));
+            let out = run_ceph_cmd(&args)
+                .await
+                .map_err(|e| Status::internal(format!("ceph osd out: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "ceph osd out {} failed: {}",
+                    osd_ids.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        let status = run_ceph_cmd(&["-s", "--format", "json"])
+            .await
+            .map_err(|e| Status::internal(format!("ceph status: {e}")))?;
+        if !status.status.success() {
+            return Err(Status::internal(format!(
+                "ceph status failed: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            )));
+        }
+        let json: JsonValue = serde_json::from_slice(&status.stdout)
+            .map_err(|e| Status::internal(format!("invalid ceph status JSON: {e}")))?;
+        let (pgs_total, pgs_not_clean) = crate::ceph_bootstrap::parse_pg_clean(&json);
+        let clean = pgs_not_clean == 0;
+        Ok(Response::new(proto::DrainCephHostResponse {
+            success: true,
+            message: if osd_ids.is_empty() {
+                format!("no OSDs under host {host}")
+            } else if clean {
+                format!(
+                    "osd {} out; all {pgs_total} PGs active+clean",
+                    osd_ids.join(",")
+                )
+            } else {
+                format!(
+                    "osd {} out; {pgs_not_clean}/{pgs_total} PGs not yet active+clean",
+                    osd_ids.join(",")
+                )
+            },
+            osd_ids,
+            clean,
+            pgs_total,
+            pgs_not_clean,
+        }))
+    }
+
     async fn get_host_cpu_flags(
         &self,
         request: Request<proto::GetHostCpuFlagsRequest>,

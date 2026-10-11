@@ -151,6 +151,10 @@ service NodeAdmin {
   rpc TeardownCephNode(TeardownCephNodeRequest) returns (TeardownCephNodeResponse);
   // `ceph mon rm` on a member that is still in quorum.
   rpc RemoveCephMon(RemoveCephMonRequest) returns (RemoveCephMonResponse);
+  // Run on a surviving member: mark every OSD under CRUSH host `host` out and
+  // report whether every placement group is active+clean again, i.e. the
+  // host's data has been re-replicated elsewhere and it can be torn down.
+  rpc DrainCephHost(DrainCephHostRequest) returns (DrainCephHostResponse);
   rpc GetHostCpuFlags(GetHostCpuFlagsRequest) returns (GetHostCpuFlagsResponse);
 
   // Live migration peer steps (controller orchestrates source + destination).
@@ -1142,6 +1146,19 @@ message RemoveCephMonRequest { string daemon_id = 1; }
 message RemoveCephMonResponse {
   bool success = 1;
   string message = 2;
+}
+
+message DrainCephHostRequest { string host = 1; }
+
+message DrainCephHostResponse {
+  bool success = 1;
+  string message = 2;
+  // OSD ids found under the host (empty when the host has none left).
+  repeated string osd_ids = 3;
+  // Every PG is active+clean, so nothing still depends on the host's OSDs.
+  bool clean = 4;
+  int32 pgs_total = 5;
+  int32 pgs_not_clean = 6;
 }
 
 message GetHostCpuFlagsRequest {}
