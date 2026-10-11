@@ -416,7 +416,7 @@ pub fn generate_node_config_inner(
             }
         }
         if !vm.cloud_init_user_data.is_empty() {
-            let escaped = super::nix_escape(&vm.cloud_init_user_data);
+            let escaped = nix_escape(&vm.cloud_init_user_data);
             out.push_str(&format!(
                 "      cloudInitUserConfigFile = pkgs.writeText \"{nix_name}-cloud-init.yaml\" \"{escaped}\";\n"
             ));
@@ -446,7 +446,7 @@ pub fn generate_node_config_inner(
                 ));
             }
             ci.push_str("ssh_pwauth: false\n");
-            let escaped = super::nix_escape(&ci);
+            let escaped = nix_escape(&ci);
             out.push_str(&format!(
                 "      cloudInitUserConfigFile = pkgs.writeText \"{nix_name}-cloud-init.yaml\" \"{escaped}\";\n"
             ));
@@ -469,7 +469,7 @@ pub fn generate_node_config_inner(
                         net_cfg.push_str("]\n");
                         net_cfg.push_str(&format!("    gateway4: \"{}\"\n", net.gateway_ip));
                         net_cfg.push_str("    nameservers:\n      addresses: [1.1.1.1, 8.8.8.8]\n");
-                        let escaped = super::nix_escape(&net_cfg);
+                        let escaped = nix_escape(&net_cfg);
                         out.push_str(&format!(
                             "      cloudInitNetworkConfigFile = pkgs.writeText \"{nix_name}-network-config.yaml\" \"{escaped}\";\n"
                         ));
