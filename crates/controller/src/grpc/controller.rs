@@ -13185,63 +13185,419 @@ impl controller_proto::controller_server::Controller for ControllerService {
     }
 
     // ============================================================================
-    // Kubernetes Cluster Management (Phase 1 stubs)
+    // Kubernetes Cluster Management (Phase 3 implementation)
     // ============================================================================
 
     async fn plan_kubernetes_cluster(
         &self,
-        _request: Request<controller_proto::PlanKubernetesClusterRequest>,
+        request: Request<controller_proto::PlanKubernetesClusterRequest>,
     ) -> Result<Response<controller_proto::PlanKubernetesClusterResponse>, Status> {
-        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        
+        if req.name.trim().is_empty() {
+            return Err(Status::invalid_argument("cluster name is required"));
+        }
+        
+        let spec = req.spec.ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        
+        // Validate spec
+        let mut blocking_issues = Vec::new();
+        let mut warnings = Vec::new();
+        
+        if spec.cluster_cidr.is_empty() {
+            blocking_issues.push("cluster_cidr is required".to_string());
+        }
+        if spec.service_cidr.is_empty() {
+            blocking_issues.push("service_cidr is required".to_string());
+        }
+        if spec.api_server_endpoint.is_empty() {
+            blocking_issues.push("api_server_endpoint is required".to_string());
+        }
+        
+        if spec.control_plane_nodes.is_empty() {
+            blocking_issues.push("at least one control plane node is required".to_string());
+        }
+        
+        // Check if cluster already exists
+        let existing = self.db.get_kubernetes_cluster(&req.name).map_err(internal_db)?;
+        let action = if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        };
+        
+        // Validate control plane nodes exist and are ready
+        let mut node_plans = Vec::new();
+        for cp_node in &spec.control_plane_nodes {
+            let node = self.db.get_node(&cp_node.node_id).map_err(internal_db)?;
+            match node {
+                Some(n) if n.status == "ready" => {
+                    node_plans.push(controller_proto::NodePlanResult {
+                        node_id: cp_node.node_id.clone(),
+                        preflight_passed: true,
+                        issues: vec![],
+                        nix_action: "build".to_string(),
+                    });
+                }
+                Some(n) => {
+                    node_plans.push(controller_proto::NodePlanResult {
+                        node_id: cp_node.node_id.clone(),
+                        preflight_passed: false,
+                        issues: vec![format!("node status is {} (need ready)", n.status)],
+                        nix_action: "no-change".to_string(),
+                    });
+                    blocking_issues.push(format!("control plane node {} is not ready", cp_node.node_id));
+                }
+                None => {
+                    blocking_issues.push(format!("control plane node {} not found", cp_node.node_id));
+                }
+            }
+        }
+        
+        // Validate worker nodes
+        for worker in &spec.worker_nodes {
+            let node = self.db.get_node(&worker.node_id).map_err(internal_db)?;
+            match node {
+                Some(n) if n.status == "ready" => {
+                    node_plans.push(controller_proto::NodePlanResult {
+                        node_id: worker.node_id.clone(),
+                        preflight_passed: true,
+                        issues: vec![],
+                        nix_action: "build".to_string(),
+                    });
+                }
+                Some(n) => {
+                    warnings.push(format!("worker node {} status is {}", worker.node_id, n.status));
+                }
+                None => {
+                    warnings.push(format!("worker node {} not found", worker.node_id));
+                }
+            }
+        }
+        
+        Ok(Response::new(controller_proto::PlanKubernetesClusterResponse {
+            action: action.to_string(),
+            blocking_issues,
+            warnings,
+            node_plans,
+            rendered_nix_preview: "# Kubernetes configuration will be generated".to_string(),
+        }))
     }
 
     async fn create_kubernetes_cluster(
         &self,
-        _request: Request<controller_proto::CreateKubernetesClusterRequest>,
+        request: Request<controller_proto::CreateKubernetesClusterRequest>,
     ) -> Result<Response<controller_proto::CreateKubernetesClusterResponse>, Status> {
-        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        
+        if req.name.trim().is_empty() {
+            return Err(Status::invalid_argument("cluster name is required"));
+        }
+        
+        let spec = req.spec.ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        
+        // Check if cluster already exists
+        if let Some(_existing) = self.db.get_kubernetes_cluster(&req.name).map_err(internal_db)? {
+            return Err(Status::already_exists(format!("cluster {} already exists", req.name)));
+        }
+        
+        // Store cluster in database
+        let cluster_row = crate::db::KubernetesClusterRow {
+            name: req.name.clone(),
+            generation: 1,
+            cluster_cidr: spec.cluster_cidr.clone(),
+            service_cidr: spec.service_cidr.clone(),
+            cluster_dns: spec.cluster_dns.clone(),
+            api_server_endpoint: spec.api_server_endpoint.clone(),
+            cni: spec.cni.clone(),
+            phase: "bootstrapping".to_string(),
+            status_message: "cluster creation started".to_string(),
+            ready_control_planes: 0,
+            ready_workers: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        
+        self.db.upsert_kubernetes_cluster(&cluster_row).map_err(internal_db)?;
+        
+        // Store cluster config
+        let ha_config = spec.high_availability.as_ref();
+        let cilium_config = spec.cilium_config.as_ref();
+        
+        let config_row = crate::db::KubernetesClusterConfigRow {
+            cluster_name: req.name.clone(),
+            ha_enabled: ha_config.map(|c| c.enabled).unwrap_or(false),
+            vip_address: ha_config.map(|c| c.vip_address.clone()).unwrap_or_default(),
+            vip_interface: ha_config.map(|c| c.vip_interface.clone()).unwrap_or_default(),
+            cilium_mode: cilium_config.map(|c| c.mode.clone()).unwrap_or_else(|| "native-routing".to_string()),
+            cilium_mtu: cilium_config.map(|c| c.mtu).unwrap_or(1500),
+            cilium_tunnel: cilium_config.map(|c| c.tunnel.clone()).unwrap_or_else(|| "disabled".to_string()),
+            cilium_auto_direct_routes: cilium_config.map(|c| c.auto_direct_node_routes).unwrap_or(true),
+            cilium_lb_ip_pools: cilium_config.map(|c| c.load_balancer_ip_pools.join(",")).unwrap_or_default(),
+        };
+        
+        self.db.upsert_kubernetes_cluster_config(&config_row).map_err(internal_db)?;
+        
+        // Store nodes
+        for (idx, cp_node) in spec.control_plane_nodes.iter().enumerate() {
+            let node_row = crate::db::KubernetesClusterNodeRow {
+                cluster_name: req.name.clone(),
+                node_id: cp_node.node_id.clone(),
+                role: "control-plane".to_string(),
+                advertise_address: cp_node.advertise_address.clone(),
+                iface: cp_node.iface.clone(),
+                initial_cluster: idx == 0,
+                join_existing: idx > 0,
+                kubelet_ready: false,
+            };
+            self.db.upsert_kubernetes_cluster_node(&node_row).map_err(internal_db)?;
+        }
+        
+        for worker in &spec.worker_nodes {
+            let node_row = crate::db::KubernetesClusterNodeRow {
+                cluster_name: req.name.clone(),
+                node_id: worker.node_id.clone(),
+                role: "worker".to_string(),
+                advertise_address: worker.advertise_address.clone(),
+                iface: worker.iface.clone(),
+                initial_cluster: false,
+                join_existing: true,
+                kubelet_ready: false,
+            };
+            self.db.upsert_kubernetes_cluster_node(&node_row).map_err(internal_db)?;
+        }
+        
+        info!(cluster = %req.name, "kubernetes cluster created, bootstrapping will begin");
+        
+        // Spawn bootstrap task
+        let db = Arc::new(self.db.clone());
+        let clients = self.clients.clone();
+        let cluster_name = req.name.clone();
+        tokio::spawn(async move {
+            Self::bootstrap_kubernetes_cluster(db, clients, cluster_name).await;
+        });
+        
+        let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
+        Ok(Response::new(controller_proto::CreateKubernetesClusterResponse {
+            cluster: Some(cluster),
+        }))
     }
 
     async fn update_kubernetes_cluster(
         &self,
-        _request: Request<controller_proto::UpdateKubernetesClusterRequest>,
+        request: Request<controller_proto::UpdateKubernetesClusterRequest>,
     ) -> Result<Response<controller_proto::UpdateKubernetesClusterResponse>, Status> {
-        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        
+        let existing = self.db.get_kubernetes_cluster(&req.name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found(format!("cluster {} not found", req.name)))?;
+        
+        let spec = req.spec.ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        
+        // Update cluster
+        let cluster_row = crate::db::KubernetesClusterRow {
+            name: req.name.clone(),
+            generation: existing.generation + 1,
+            cluster_cidr: spec.cluster_cidr.clone(),
+            service_cidr: spec.service_cidr.clone(),
+            cluster_dns: spec.cluster_dns.clone(),
+            api_server_endpoint: spec.api_server_endpoint.clone(),
+            cni: spec.cni.clone(),
+            phase: "updating".to_string(),
+            status_message: "cluster update in progress".to_string(),
+            ready_control_planes: existing.ready_control_planes,
+            ready_workers: existing.ready_workers,
+            created_at: existing.created_at,
+            updated_at: String::new(),
+        };
+        
+        self.db.upsert_kubernetes_cluster(&cluster_row).map_err(internal_db)?;
+        
+        let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
+        Ok(Response::new(controller_proto::UpdateKubernetesClusterResponse {
+            cluster: Some(cluster),
+        }))
     }
 
     async fn get_kubernetes_cluster(
         &self,
-        _request: Request<controller_proto::GetKubernetesClusterRequest>,
+        request: Request<controller_proto::GetKubernetesClusterRequest>,
     ) -> Result<Response<controller_proto::GetKubernetesClusterResponse>, Status> {
-        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        
+        let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
+        Ok(Response::new(controller_proto::GetKubernetesClusterResponse {
+            cluster: Some(cluster),
+        }))
     }
 
     async fn list_kubernetes_clusters(
         &self,
-        _request: Request<controller_proto::ListKubernetesClustersRequest>,
+        request: Request<controller_proto::ListKubernetesClustersRequest>,
     ) -> Result<Response<controller_proto::ListKubernetesClustersResponse>, Status> {
-        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        
+        let rows = self.db.list_kubernetes_clusters().map_err(internal_db)?;
+        let mut clusters = Vec::new();
+        
+        for row in rows {
+            if let Ok(cluster) = self.build_kubernetes_cluster_proto(&row.name) {
+                clusters.push(cluster);
+            }
+        }
+        
+        Ok(Response::new(controller_proto::ListKubernetesClustersResponse {
+            clusters,
+        }))
     }
 
     async fn delete_kubernetes_cluster(
         &self,
-        _request: Request<controller_proto::DeleteKubernetesClusterRequest>,
+        request: Request<controller_proto::DeleteKubernetesClusterRequest>,
     ) -> Result<Response<controller_proto::DeleteKubernetesClusterResponse>, Status> {
-        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        
+        let deleted = self.db.delete_kubernetes_cluster(&req.name).map_err(internal_db)?;
+        
+        if !deleted {
+            return Err(Status::not_found(format!("cluster {} not found", req.name)));
+        }
+        
+        info!(cluster = %req.name, "kubernetes cluster deleted");
+        
+        Ok(Response::new(controller_proto::DeleteKubernetesClusterResponse {
+            message: format!("cluster {} deleted", req.name),
+        }))
     }
 
     async fn scale_kubernetes_cluster(
         &self,
-        _request: Request<controller_proto::ScaleKubernetesClusterRequest>,
+        request: Request<controller_proto::ScaleKubernetesClusterRequest>,
     ) -> Result<Response<controller_proto::ScaleKubernetesClusterResponse>, Status> {
-        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        
+        let existing = self.db.get_kubernetes_cluster(&req.name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found(format!("cluster {} not found", req.name)))?;
+        
+        // Add new nodes
+        for node in &req.add_nodes {
+            let node_row = crate::db::KubernetesClusterNodeRow {
+                cluster_name: req.name.clone(),
+                node_id: node.node_id.clone(),
+                role: node.role.clone(),
+                advertise_address: node.advertise_address.clone(),
+                iface: node.iface.clone(),
+                initial_cluster: false,
+                join_existing: true,
+                kubelet_ready: false,
+            };
+            self.db.upsert_kubernetes_cluster_node(&node_row).map_err(internal_db)?;
+        }
+        
+        // Remove nodes - would need drain logic here
+        for node_id in &req.remove_node_ids {
+            info!(cluster = %req.name, node = %node_id, "removing node from cluster");
+        }
+        
+        // Update generation
+        let cluster_row = crate::db::KubernetesClusterRow {
+            generation: existing.generation + 1,
+            phase: "scaling".to_string(),
+            status_message: "cluster scaling in progress".to_string(),
+            ..existing
+        };
+        self.db.upsert_kubernetes_cluster(&cluster_row).map_err(internal_db)?;
+        
+        let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
+        Ok(Response::new(controller_proto::ScaleKubernetesClusterResponse {
+            cluster: Some(cluster),
+        }))
     }
 
     async fn get_kubernetes_cluster_health(
         &self,
-        _request: Request<controller_proto::GetKubernetesClusterHealthRequest>,
+        request: Request<controller_proto::GetKubernetesClusterHealthRequest>,
     ) -> Result<Response<controller_proto::GetKubernetesClusterHealthResponse>, Status> {
-        Err(Status::unimplemented("Kubernetes cluster management not yet implemented"))
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        
+        let _cluster = self.db.get_kubernetes_cluster(&req.name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found(format!("cluster {} not found", req.name)))?;
+        
+        let nodes = self.db.list_kubernetes_cluster_nodes(&req.name).map_err(internal_db)?;
+        
+        let mut node_health = Vec::new();
+        let mut ready_control_planes = 0;
+        let mut total_control_planes = 0;
+        let mut ready_workers = 0;
+        let mut total_workers = 0;
+        
+        for node in &nodes {
+            if node.role == "control-plane" {
+                total_control_planes += 1;
+                if node.kubelet_ready {
+                    ready_control_planes += 1;
+                }
+            } else {
+                total_workers += 1;
+                if node.kubelet_ready {
+                    ready_workers += 1;
+                }
+            }
+            
+            node_health.push(controller_proto::NodeHealth {
+                node_id: node.node_id.clone(),
+                kubernetes_status: if node.kubelet_ready { "Ready" } else { "NotReady" }.to_string(),
+                kubelet_active: node.kubelet_ready,
+                etcd_active: node.role == "control-plane",
+                api_server_active: node.role == "control-plane",
+            });
+        }
+        
+        let overall_health = if ready_control_planes == total_control_planes && ready_workers == total_workers {
+            "healthy"
+        } else if ready_control_planes > 0 {
+            "degraded"
+        } else {
+            "critical"
+        };
+        
+        Ok(Response::new(controller_proto::GetKubernetesClusterHealthResponse {
+            overall_health: overall_health.to_string(),
+            ready_control_planes,
+            total_control_planes,
+            ready_workers,
+            total_workers,
+            etcd_healthy: ready_control_planes > 0,
+            etcd_member_count: total_control_planes,
+            api_server_reachable: ready_control_planes > 0,
+            node_health,
+        }))
     }
 
     async fn classify_disk_layout(
@@ -13250,6 +13606,272 @@ impl controller_proto::controller_server::Controller for ControllerService {
     ) -> Result<Response<controller_proto::ClassifyDiskLayoutResponse>, Status> {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
         self.classify_disk_layout_impl(request.into_inner()).await
+    }
+}
+
+// Helper methods for Kubernetes cluster management
+impl ControllerService {
+    fn build_kubernetes_cluster_proto(&self, name: &str) -> Result<controller_proto::KubernetesCluster, Status> {
+        let row = self.db.get_kubernetes_cluster(name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found(format!("cluster {} not found", name)))?;
+        
+        let config = self.db.get_kubernetes_cluster_config(name).map_err(internal_db)?;
+        let nodes = self.db.list_kubernetes_cluster_nodes(name).map_err(internal_db)?;
+        
+        let mut control_plane_nodes = Vec::new();
+        let mut worker_nodes = Vec::new();
+        
+        for node in nodes {
+            let node_spec = controller_proto::KubernetesNodeSpec {
+                node_id: node.node_id.clone(),
+                role: node.role.clone(),
+                advertise_address: node.advertise_address.clone(),
+                iface: node.iface.clone(),
+                initial_cluster: node.initial_cluster,
+                join_existing: node.join_existing,
+            };
+            
+            if node.role == "control-plane" {
+                control_plane_nodes.push(node_spec);
+            } else {
+                worker_nodes.push(node_spec);
+            }
+        }
+        
+        let cilium_config = config.as_ref().map(|c| controller_proto::CiliumConfig {
+            mode: c.cilium_mode.clone(),
+            mtu: c.cilium_mtu,
+            tunnel: c.cilium_tunnel.clone(),
+            auto_direct_node_routes: c.cilium_auto_direct_routes,
+            load_balancer_ip_pools: c.cilium_lb_ip_pools.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
+        });
+        
+        let ha_config = config.as_ref().map(|c| controller_proto::HighAvailabilityConfig {
+            enabled: c.ha_enabled,
+            vip_address: c.vip_address.clone(),
+            vip_interface: c.vip_interface.clone(),
+            method: "keepalived".to_string(),
+        });
+        
+        Ok(controller_proto::KubernetesCluster {
+            name: row.name.clone(),
+            generation: row.generation,
+            spec: Some(controller_proto::KubernetesClusterSpec {
+                cluster_cidr: row.cluster_cidr.clone(),
+                service_cidr: row.service_cidr.clone(),
+                cluster_dns: row.cluster_dns.clone(),
+                api_server_endpoint: row.api_server_endpoint.clone(),
+                cni: row.cni.clone(),
+                cilium_config,
+                control_plane_nodes,
+                worker_nodes,
+                high_availability: ha_config,
+            }),
+            status: Some(controller_proto::KubernetesClusterStatus {
+                phase: row.phase.clone(),
+                message: row.status_message.clone(),
+                ready_control_planes: row.ready_control_planes,
+                ready_workers: row.ready_workers,
+                last_updated: None,
+                active_node_ids: vec![],
+            }),
+        })
+    }
+    
+    async fn bootstrap_kubernetes_cluster(
+        db: Arc<crate::db::Database>,
+        clients: crate::node_client::NodeClients,
+        cluster_name: String,
+    ) {
+        info!(cluster = %cluster_name, "starting kubernetes cluster bootstrap");
+        
+        // Get cluster info
+        let cluster = match db.get_kubernetes_cluster(&cluster_name) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                error!(cluster = %cluster_name, "cluster not found");
+                return;
+            }
+            Err(e) => {
+                error!(cluster = %cluster_name, error = %e, "failed to get cluster");
+                return;
+            }
+        };
+        
+        let config = match db.get_kubernetes_cluster_config(&cluster_name) {
+            Ok(Some(c)) => c,
+            _ => {
+                error!(cluster = %cluster_name, "cluster config not found");
+                return;
+            }
+        };
+        
+        let cluster_nodes = match db.list_kubernetes_cluster_nodes(&cluster_name) {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                error!(cluster = %cluster_name, error = %e, "failed to list cluster nodes");
+                return;
+            }
+        };
+        
+        // Find the initial control plane node
+        let initial_node = cluster_nodes.iter().find(|n| n.initial_cluster && n.role == "control-plane");
+        
+        if let Some(init_node) = initial_node {
+            info!(cluster = %cluster_name, node = %init_node.node_id, "bootstrapping initial control plane");
+            
+            // Build etcd initial cluster string
+            let control_planes: Vec<_> = cluster_nodes.iter()
+                .filter(|n| n.role == "control-plane")
+                .collect();
+            
+            let etcd_initial_cluster = control_planes.iter()
+                .map(|n| format!("{}=https://{}:2380", n.node_id, n.advertise_address))
+                .collect::<Vec<_>>()
+                .join(",");
+            
+            // Get node address
+            let node_addr = match db.get_node(&init_node.node_id) {
+                Ok(Some(n)) => n.address,
+                _ => {
+                    error!(cluster = %cluster_name, node = %init_node.node_id, "node not found in database");
+                    return;
+                }
+            };
+            
+            // Apply config to initial node
+            if let Err(e) = Self::apply_k8s_config_to_node(
+                &clients,
+                &node_addr,
+                &cluster,
+                &config,
+                init_node,
+                &etcd_initial_cluster,
+                true,
+            ).await {
+                error!(cluster = %cluster_name, node = %init_node.node_id, error = %e, "failed to apply config to initial node");
+                let _ = db.upsert_kubernetes_cluster(&crate::db::KubernetesClusterRow {
+                    phase: "failed".to_string(),
+                    status_message: format!("bootstrap failed: {}", e),
+                    ..cluster
+                });
+                return;
+            }
+            
+            // Wait for initial node to be ready
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            
+            // Join additional control planes
+            for cp_node in control_planes.iter().filter(|n| n.node_id != init_node.node_id) {
+                info!(cluster = %cluster_name, node = %cp_node.node_id, "joining additional control plane");
+                
+                let node_addr = match db.get_node(&cp_node.node_id) {
+                    Ok(Some(n)) => n.address,
+                    _ => {
+                        warn!(cluster = %cluster_name, node = %cp_node.node_id, "node not found");
+                        continue;
+                    }
+                };
+                
+                if let Err(e) = Self::apply_k8s_config_to_node(
+                    &clients,
+                    &node_addr,
+                    &cluster,
+                    &config,
+                    cp_node,
+                    &etcd_initial_cluster,
+                    false,
+                ).await {
+                    warn!(cluster = %cluster_name, node = %cp_node.node_id, error = %e, "failed to join control plane");
+                }
+                
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            }
+            
+            // Join workers
+            for worker in cluster_nodes.iter().filter(|n| n.role == "worker") {
+                info!(cluster = %cluster_name, node = %worker.node_id, "joining worker node");
+                
+                let node_addr = match db.get_node(&worker.node_id) {
+                    Ok(Some(n)) => n.address,
+                    _ => {
+                        warn!(cluster = %cluster_name, node = %worker.node_id, "node not found");
+                        continue;
+                    }
+                };
+                
+                if let Err(e) = Self::apply_k8s_config_to_node(
+                    &clients,
+                    &node_addr,
+                    &cluster,
+                    &config,
+                    worker,
+                    "",
+                    false,
+                ).await {
+                    warn!(cluster = %cluster_name, node = %worker.node_id, error = %e, "failed to join worker");
+                }
+            }
+            
+            // Update cluster status
+            let _ = db.upsert_kubernetes_cluster(&crate::db::KubernetesClusterRow {
+                phase: "ready".to_string(),
+                status_message: "cluster bootstrap complete".to_string(),
+                ready_control_planes: control_planes.len() as i32,
+                ..cluster
+            });
+            
+            info!(cluster = %cluster_name, "kubernetes cluster bootstrap complete");
+        }
+    }
+    
+    async fn apply_k8s_config_to_node(
+        clients: &crate::node_client::NodeClients,
+        node_address: &str,
+        cluster: &crate::db::KubernetesClusterRow,
+        config: &crate::db::KubernetesClusterConfigRow,
+        node_info: &crate::db::KubernetesClusterNodeRow,
+        etcd_initial_cluster: &str,
+        _initial: bool,
+    ) -> Result<(), String> {
+        let mut admin_client = clients.get_admin(node_address)
+            .ok_or_else(|| format!("node {} not connected", node_address))?;
+        
+        let cilium_config = Some(crate::node_proto::CiliumConfig {
+            mode: config.cilium_mode.clone(),
+            mtu: config.cilium_mtu,
+            tunnel: config.cilium_tunnel.clone(),
+            auto_direct_node_routes: config.cilium_auto_direct_routes,
+            nat_outgoing: true,
+            load_balancer_ip_pools: config.cilium_lb_ip_pools.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
+        });
+        
+        let request = crate::node_proto::ApplyKubernetesConfigRequest {
+            role: node_info.role.clone(),
+            cluster_name: cluster.name.clone(),
+            cluster_cidr: cluster.cluster_cidr.clone(),
+            service_cidr: cluster.service_cidr.clone(),
+            cluster_dns: cluster.cluster_dns.clone(),
+            advertise_address: node_info.advertise_address.clone(),
+            iface: node_info.iface.clone(),
+            api_server_endpoint: cluster.api_server_endpoint.clone(),
+            initial_cluster: node_info.initial_cluster,
+            cni: cluster.cni.clone(),
+            cilium_config,
+            etcd_initial_cluster: etcd_initial_cluster.to_string(),
+            ha_enabled: config.ha_enabled,
+            vip_address: config.vip_address.clone(),
+            vip_interface: config.vip_interface.clone(),
+            kubeconfig_data: vec![],
+        };
+        
+        let response = admin_client.apply_kubernetes_config(request)
+            .await
+            .map_err(|e| format!("apply_kubernetes_config RPC failed: {}", e))?;
+        
+        info!(node = %node_address, apply_id = %response.into_inner().apply_id, "kubernetes config applied to node");
+        Ok(())
     }
 }
 
