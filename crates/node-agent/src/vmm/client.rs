@@ -33,21 +33,19 @@ impl Client {
         self.socket_dir.join(format!("{name}.sock"))
     }
 
-    /// List all VM names by scanning for `*.sock` files in the socket directory.
+    /// List all VM names by scanning for API sockets (`<name>.sock`) in the
+    /// socket directory.
+    ///
+    /// The VM unit also binds `<name>.serial.sock`, the guest's serial
+    /// console. That is not an HTTP endpoint: a `vm.info` request written
+    /// into it arrives on the guest's console as keystrokes, every heartbeat.
     pub fn list_vm_names(&self) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(&self.socket_dir) else {
             return Vec::new();
         };
         entries
             .filter_map(Result::ok)
-            .filter_map(|e| {
-                let path = e.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("sock") {
-                    path.file_stem().and_then(|s| s.to_str()).map(String::from)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|e| vm_name_from_api_socket(&e.path()))
             .collect()
     }
 
@@ -155,21 +153,49 @@ struct RemoveDeviceBody {
     id: String,
 }
 
+/// Upper bound on one `vm.info` round trip. A VMM that has stopped
+/// servicing its API thread must not stall the heartbeat that reports
+/// every other guest on the node.
+const VM_INFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// VM name for an API socket path, `None` for anything else in the socket
+/// directory (serial consoles, stray files).
+fn vm_name_from_api_socket(path: &Path) -> Option<String> {
+    if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+        return None;
+    }
+    let stem = path.file_stem().and_then(|s| s.to_str())?;
+    if stem.is_empty() || stem.ends_with(".serial") {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
 async fn query_vm_info(socket_path: &Path) -> Option<VmInfo> {
     let client = HyperClient::unix();
     let uri = Uri::new(socket_path, "/api/v1/vm.info");
 
     let req = Request::get(uri).body(Empty::<Bytes>::new()).ok()?;
 
-    let resp = match client.request(req).await {
-        Ok(r) => r,
-        Err(e) => {
+    let round_trip = async {
+        let resp = client.request(req).await.map_err(|e| e.to_string())?;
+        resp.into_body()
+            .collect()
+            .await
+            .map(|b| b.to_bytes())
+            .map_err(|e| e.to_string())
+    };
+    let body = match tokio::time::timeout(VM_INFO_TIMEOUT, round_trip).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(e)) => {
             warn!(socket = %socket_path.display(), error = %e, "failed to query CH socket");
             return None;
         }
+        Err(_) => {
+            warn!(socket = %socket_path.display(), "CH socket did not answer vm.info within {VM_INFO_TIMEOUT:?}");
+            return None;
+        }
     };
-
-    let body = resp.into_body().collect().await.ok()?.to_bytes();
     serde_json::from_slice(&body).ok()
 }
 
@@ -212,6 +238,34 @@ async fn put_json<T: Serialize>(socket_path: &Path, path: &str, body: &T) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_scan_ignores_serial_consoles_and_other_files() {
+        let api = |p: &str| vm_name_from_api_socket(Path::new(p));
+        assert_eq!(
+            api("/run/kcore/labtest-9.sock").as_deref(),
+            Some("labtest-9")
+        );
+        assert_eq!(
+            api("/run/kcore/web.front-01.sock").as_deref(),
+            Some("web.front-01")
+        );
+        assert_eq!(api("/run/kcore/labtest-9.serial.sock"), None);
+        assert_eq!(api("/run/kcore/labtest-9.pid"), None);
+        assert_eq!(api("/run/kcore/.sock"), None);
+    }
+
+    #[test]
+    fn list_vm_names_skips_the_serial_socket_next_to_the_api_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["vm-a.sock", "vm-a.serial.sock", "vm-b.sock", "notes.txt"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let client = Client::new(dir.path().to_str().unwrap());
+        let mut names = client.list_vm_names();
+        names.sort();
+        assert_eq!(names, vec!["vm-a".to_string(), "vm-b".to_string()]);
+    }
 
     #[test]
     fn migration_bodies_serialize_expected_fields() {
