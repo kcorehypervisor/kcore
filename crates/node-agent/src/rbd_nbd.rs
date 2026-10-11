@@ -134,6 +134,27 @@ fn has_holders(dev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Close the `kcore-vol-*` LUKS mappers stacked on `dev`. `cryptsetup close`
+/// refuses a mapper that is still open, so a running guest keeps its disk.
+fn close_holder_mappers(dev: &str) -> Result<(), String> {
+    let Some(name) = Path::new(dev).file_name() else {
+        return Ok(());
+    };
+    let Ok(holders) = std::fs::read_dir(Path::new("/sys/block").join(name).join("holders")) else {
+        return Ok(());
+    };
+    for holder in holders.flatten() {
+        let Ok(dm_name) = std::fs::read_to_string(holder.path().join("dm/name")) else {
+            continue;
+        };
+        let dm_name = dm_name.trim();
+        if dm_name.starts_with("kcore-vol-") {
+            crate::volume_crypto::close_mapper_only(dm_name)?;
+        }
+    }
+    Ok(())
+}
+
 /// True when any process holds `dev` (a `/dev/nbdN` path) open, or a
 /// device-mapper target is stacked on it.
 pub fn device_in_use(dev: &str) -> bool {
@@ -163,6 +184,7 @@ pub fn device_in_use(dev: &str) -> bool {
 /// Unmap a mapped `/dev/nbdN` regardless of which image it carries and drop the
 /// `/dev/rbd/<pool>/<image>` links that point at it.
 pub fn unmap_device(dev: &str) -> Result<(), String> {
+    close_holder_mappers(dev)?;
     if device_in_use(dev) {
         return Err(format!("rbd device {dev} is still in use"));
     }
@@ -199,6 +221,7 @@ pub fn unmap(pool: &str, image: &str) -> Result<(), String> {
         let _ = std::fs::remove_file(&link);
         return Ok(());
     };
+    close_holder_mappers(&dev)?;
     if device_in_use(&dev) {
         return Err(format!(
             "rbd device {dev} for {pool}/{image} is still in use"
