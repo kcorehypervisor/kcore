@@ -1614,7 +1614,7 @@ fn ceph_cluster_detail_view(detail: CephClusterDetailDto) -> impl IntoView {
             </p>
         </div>
         {( !detail.capacity.pools.is_empty() ).then(|| view! {
-            <div class="table-wrap" style="margin-top: 1rem;">
+            <div class="table-wrap ceph-subtable">
                 <table class="data">
                     <thead>
                         <tr>
