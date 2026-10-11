@@ -4760,17 +4760,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
             req.dc_id.clone()
         };
 
+        // An agent restart re-registers; that must not undo a drain or cordon.
+        let status = crate::db::node_status_after_register(
+            existing.as_ref().map(|n| n.status.as_str()),
+            &approval_status,
+        );
         let node = NodeRow {
             id: req.node_id.clone(),
             hostname: req.hostname.clone(),
             address: req.address.clone(),
             cpu_cores: cpu,
             memory_bytes: mem,
-            status: if approval_status == "approved" {
-                "ready".into()
-            } else {
-                "pending".into()
-            },
+            status: status.clone(),
             last_heartbeat: String::new(),
             gateway_interface: String::new(),
             cpu_used: 0,
@@ -4804,7 +4805,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "address": req.address,
                 "cpuCores": req.capacity.as_ref().map(|c| c.cpu_cores).unwrap_or(0),
                 "memoryBytes": req.capacity.as_ref().map(|c| c.memory_bytes).unwrap_or(0),
-                "status": if approval_status == "approved" { "ready" } else { "pending" },
+                "status": status,
                 "gatewayInterface": "",
                 "storageBackend": req.storage_backend,
                 "disableVxlan": req.disable_vxlan,
@@ -15636,6 +15637,89 @@ mod tests {
         let n = db.get_node("node-1").expect("get").expect("exists");
         assert_eq!(n.approval_status, "approved");
         assert_eq!(n.status, "ready");
+    }
+
+    /// A node-agent restart re-registers the node. That used to overwrite a
+    /// drain or cordon with `ready`, so the node silently came back into
+    /// scheduling with no uncordon. Only `UncordonNode` may do that.
+    #[tokio::test]
+    async fn re_register_keeps_drained_and_cordoned_status_until_uncordon() {
+        for held in ["drained", "draining", "cordoned"] {
+            let db = Database::open(":memory:").expect("open db");
+            let mut node = test_node();
+            node.approval_status = "approved".to_string();
+            node.status = held.to_string();
+            db.upsert_node(&node).expect("insert");
+            let svc = ControllerService::new(
+                db.clone(),
+                NodeClients::new(None),
+                test_network(),
+                empty_sub_ca(),
+                Some(ReplicationConfig {
+                    controller_id: "ctrl-test".into(),
+                    dc_id: "DC1".into(),
+                    peers: vec![],
+                }),
+                false,
+                false,
+            );
+            let register = || controller_proto::RegisterNodeRequest {
+                node_id: "node-1".to_string(),
+                hostname: "node-1".to_string(),
+                address: "127.0.0.1:9091".to_string(),
+                capacity: Some(controller_proto::NodeCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                }),
+                labels: vec![],
+                storage_backend: 1,
+                disable_vxlan: false,
+                cert_expiry_days: 300,
+                luks_method: "tpm2".to_string(),
+                dc_id: String::new(),
+            };
+
+            <ControllerService as controller_proto::controller_server::Controller>::register_node(
+                &svc,
+                Request::new(register()),
+            )
+            .await
+            .expect("re-register");
+            let n = db.get_node("node-1").expect("get").expect("exists");
+            assert_eq!(n.status, held, "re-register must keep {held}");
+            assert_eq!(n.approval_status, "approved");
+
+            // The replicated event must carry the preserved status too, or a
+            // follower (and the next primary) would reset it on apply.
+            let events = db.list_replication_outbox_since(0, 10).expect("outbox");
+            let register_evt = events
+                .iter()
+                .find(|e| e.event_type == EVT_NODE_REGISTER)
+                .expect("node.register event logged");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&register_evt.payload).expect("payload json");
+            assert_eq!(payload["body"]["status"], held);
+
+            <ControllerService as controller_proto::controller_server::Controller>::uncordon_node(
+                &svc,
+                Request::new(controller_proto::UncordonNodeRequest {
+                    node_id: "node-1".to_string(),
+                }),
+            )
+            .await
+            .expect("uncordon");
+            let n = db.get_node("node-1").expect("get").expect("exists");
+            assert_eq!(n.status, "ready", "uncordon clears {held}");
+
+            <ControllerService as controller_proto::controller_server::Controller>::register_node(
+                &svc,
+                Request::new(register()),
+            )
+            .await
+            .expect("register after uncordon");
+            let n = db.get_node("node-1").expect("get").expect("exists");
+            assert_eq!(n.status, "ready");
+        }
     }
 
     #[tokio::test]

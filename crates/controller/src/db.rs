@@ -34,6 +34,24 @@ pub struct Database {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Node statuses an operator set on purpose. Only `UncordonNode` clears
+/// them: a re-register (agent restart, reboot, controller failover) or a
+/// heartbeat must never put a drained node back into scheduling.
+pub const OPERATOR_HELD_NODE_STATUSES: [&str; 3] = ["cordoned", "draining", "drained"];
+
+pub fn is_operator_held_status(status: &str) -> bool {
+    OPERATOR_HELD_NODE_STATUSES.contains(&status)
+}
+
+/// Status a (re-)registering node gets, given what it had before.
+pub fn node_status_after_register(existing_status: Option<&str>, approval_status: &str) -> String {
+    match existing_status {
+        Some(held) if is_operator_held_status(held) => held.to_string(),
+        _ if approval_status == "approved" => "ready".to_string(),
+        _ => "pending".to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeRow {
     pub id: String,
