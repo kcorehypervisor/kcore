@@ -74,6 +74,11 @@ assert cfg.environment.etc."kcore/vm-socket-dir".text == "/run/kcore\n";
 # A second VMM for the same VM is refused with a status systemd will not retry.
 assert cephUnit.serviceConfig.RestartPreventExitStatus == "75";
 assert lvmUnit.serviceConfig.RestartPreventExitStatus == "75";
+# Stop presses the power button and then waits for the VMM (an adopted one
+# lives outside the cgroup, so systemd alone would not), within TimeoutStopSec.
+assert lib.hasSuffix "-kcore-vm-ceph-guest-stop" cephUnit.serviceConfig.ExecStop;
+assert lib.hasSuffix "-kcore-vm-lvm-guest-stop" lvmUnit.serviceConfig.ExecStop;
+assert lib.hasSuffix "-kcore-vm-ceph-guest-start" cephUnit.serviceConfig.ExecStart;
 # Restart must not depend on incomingMigration (see vm-service.nix).
 assert cephUnit.serviceConfig.Restart == "always";
 assert lvmUnit.serviceConfig.Restart == "no";

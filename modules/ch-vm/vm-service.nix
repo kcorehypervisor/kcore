@@ -370,19 +370,25 @@ let
         done
       '';
 
-      # A guest that is already running for this VM outside the unit (a
-      # live-migrated VMM the unit failed to adopt, or one left behind when the
-      # unit crashed) owns the sockets and the disk. Starting again would wipe
-      # its sockets, reseed its volume and launch a second writer, and the
-      # unit's failure path would then unmap the device under the live guest.
-      # Refuse with a status systemd will not retry.
-      refuseIfVmmRunning = ''
-        other_vmm="$(${pkgs.procps}/bin/pgrep -f -- "cloud-hypervisor.*--api-socket[= ]${socketPath}( |$)" | ${pkgs.gnugrep}/bin/grep -vx "$$" | ${pkgs.coreutils}/bin/head -n1 || true)"
-        if [ -n "$other_vmm" ]; then
-          echo "ERROR: a cloud-hypervisor (pid $other_vmm) already serves ${socketPath}; refusing to start a second instance for ${vmName}. Adopt it (live-migrated marker) or stop it explicitly."
-          exit ${toString vmmAlreadyRunningStatus}
-        fi
+      # A VMM for this VM may already run outside the unit's cgroup: the
+      # receiver of a live migration (spawned by the node agent), or one the
+      # unit adopted earlier and lost when systemd restarted the unit because
+      # its file changed. Such a process owns the sockets and the disk, so a
+      # start must never wipe its sockets, reseed its volume or launch a second
+      # writer next to it.
+      vmmFunctions = ''
+        vmm_pid() {
+          ${pkgs.procps}/bin/pgrep -f -- "cloud-hypervisor.*--api-socket[= ]${socketPath}( |$)" \
+            | ${pkgs.gnugrep}/bin/grep -vx "$$" | ${pkgs.coreutils}/bin/head -n1 || true
+        }
+        vm_state() {
+          ${pkgs.curl}/bin/curl -s --max-time 5 --unix-socket ${socketPath} http://localhost/api/v1/vm.info 2>/dev/null \
+            | ${pkgs.gnused}/bin/sed -n 's/.*"state":"\([A-Za-z]*\)".*/\1/p'
+        }
       '';
+      # Exit status of ExecStart when another VMM serves the socket but has no
+      # guest to adopt. It is the main process' status, so
+      # RestartPreventExitStatus stops systemd from retrying into the same wall.
       vmmAlreadyRunningStatus = 75;
 
       # After a live receive, CH is already running outside systemd. Skip
@@ -393,7 +399,12 @@ let
           echo "live-migrated marker present; skipping socket wipe / cold provision"
           exit 0
         fi
-        ${refuseIfVmmRunning}
+        ${vmmFunctions}
+        other_vmm="$(vmm_pid)"
+        if [ -n "$other_vmm" ]; then
+          echo "cloud-hypervisor pid $other_vmm already serves ${socketPath}; leaving its sockets and volume alone"
+          exit 0
+        fi
         ${pkgs.coreutils}/bin/rm -f ${socketPath} ${serialSocket}
         ${pkgs.bash}/bin/bash -euc 'test -f ${seedIso} || { echo "missing cloud-init seed: ${seedIso}"; exit 1; }'
         ${pkgs.bash}/bin/bash -euc 'test -f ${firmwarePath} || { echo "missing firmware: ${firmwarePath}"; exit 1; }'
@@ -410,27 +421,65 @@ let
         }
       '';
 
-      # Adopt an in-flight receive-mode CH (tail --pid) or cold-start CH.
+      # Adopt a running CH (tail --pid) or cold-start one. Adoption covers the
+      # live-migration handoff (marker + pid file) and every later restart of
+      # the unit while that CH still runs the guest; only a VMM without a
+      # running guest (a receiver whose migration never completed) is refused.
       startScript = pkgs.writeShellScript "kcore-vm-${vmName}-start" ''
         set -e
+        ${vmmFunctions}
+        adopt() {
+          echo "$2 cloud-hypervisor pid $1"
+          exec ${pkgs.coreutils}/bin/tail --pid="$1" -f /dev/null
+        }
         if [ -f "${liveMigratedMarker}" ]; then
-          if [ ! -f "${migratePidFile}" ]; then
-            echo "ERROR: ${liveMigratedMarker} present but ${migratePidFile} missing"
-            exit 1
-          fi
-          pid="$(${pkgs.coreutils}/bin/cat "${migratePidFile}")"
-          if ! ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null; then
-            echo "ERROR: live-migrated cloud-hypervisor pid $pid is not running"
-            exit 1
-          fi
+          pid="$(${pkgs.coreutils}/bin/cat "${migratePidFile}" 2>/dev/null || true)"
           ${pkgs.coreutils}/bin/rm -f "${liveMigratedMarker}" "${migratePidFile}"
-          echo "Adopting live-migrated cloud-hypervisor pid $pid"
-          exec ${pkgs.coreutils}/bin/tail --pid="$pid" -f /dev/null
+          if [ -n "$pid" ] && ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null; then
+            adopt "$pid" "Adopting live-migrated"
+          fi
+          echo "live-migrated marker present but pid '$pid' is not running; checking the API socket"
         fi
-        ${refuseIfVmmRunning}
+        other_vmm="$(vmm_pid)"
+        if [ -n "$other_vmm" ]; then
+          state="$(vm_state)"
+          case "$state" in
+            Running | Paused)
+              adopt "$other_vmm" "Adopting already-running (guest $state)"
+              ;;
+            *)
+              echo "ERROR: cloud-hypervisor pid $other_vmm serves ${socketPath} without a running guest (state '$state'); refusing to start a second instance for ${vmName}. Finish or reset the migration, or stop that process explicitly."
+              exit ${toString vmmAlreadyRunningStatus}
+              ;;
+          esac
+        fi
         ${srcFormatFn}
         ROOT_FMT="$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})"
         exec ${chBin} ${chArgs}
+      '';
+
+      # Press the ACPI power button, then wait for the VMM to exit. systemd
+      # only waits for (and finally kills) processes inside the unit's cgroup,
+      # and an adopted VMM is not in it: without this wait the unit would be
+      # "stopped" while the guest runs on, and the next start would adopt it
+      # again instead of applying whatever the restart was meant to apply.
+      stopGraceSec = 25;
+      stopScript = pkgs.writeShellScript "kcore-vm-${vmName}-stop" ''
+        ${vmmFunctions}
+        pid="$(vmm_pid)"
+        ${pkgs.curl}/bin/curl -s --max-time 5 --unix-socket ${socketPath} -X PUT http://localhost/api/v1/vm.power-button || true
+        [ -n "$pid" ] || exit 0
+        for _ in $(${pkgs.coreutils}/bin/seq 1 ${toString stopGraceSec}); do
+          ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null || exit 0
+          ${pkgs.coreutils}/bin/sleep 1
+        done
+        echo "guest ${vmName} did not power off within ${toString stopGraceSec}s; terminating cloud-hypervisor pid $pid"
+        ${pkgs.coreutils}/bin/kill -TERM "$pid" 2>/dev/null || true
+        for _ in 1 2 3; do
+          ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null || exit 0
+          ${pkgs.coreutils}/bin/sleep 1
+        done
+        exit 0
       '';
     in
     {
@@ -438,12 +487,14 @@ let
       requires = map (iface: "${iface.unit}.service") ifaces;
       after = map (iface: "${iface.unit}.service") ifaces;
       wantedBy = lib.optionals (vmCfg.autoStart && !vmCfg.incomingMigration) [ "multi-user.target" ];
-      # A live-migrated CH survives the destination rebuild because the unit is
-      # *new* there: switch-to-configuration only consults
-      # stopIfChanged/restartIfChanged for units that already existed and
-      # changed, so the handoff needs no override here. Leaving the defaults on
-      # keeps VM spec updates (cpu/memory/extraArgs) actually taking effect for
-      # Ceph-backed VMs.
+      # stopIfChanged/restartIfChanged keep their NixOS defaults so VM spec
+      # updates (cpu/memory/extraArgs) take effect for Ceph-backed VMs too. The
+      # destination unit of a live migration already exists (it was pushed
+      # with incomingMigration = true before the receive), so any difference
+      # between that file and the settled one restarts it right after the
+      # handoff: the start script then re-adopts the running VMM instead of
+      # starting a second one, and the stop script sees the guest through to
+      # power-off when a restart really is meant to apply a change.
 
       serviceConfig = {
         Type = "simple";
@@ -451,7 +502,7 @@ let
           "${startPreScript}"
         ];
         ExecStart = "${startScript}";
-        ExecStop = "${pkgs.curl}/bin/curl --unix-socket ${socketPath} -s -X PUT http://localhost/api/v1/vm.power-button";
+        ExecStop = "${stopScript}";
         ExecStopPost = lib.optionalString isCeph "-${cephUnmapScript}";
         TimeoutStopSec = 30;
         # ExecStartPre copies the image onto the volume. The 90s default is
@@ -462,8 +513,9 @@ let
         # would restart the unit that just adopted the live-migrated guest.
         Restart = if vmCfg.autoStart then "always" else "no";
         RestartSec = 5;
-        # "another VMM already owns this VM" is not transient; retrying would
-        # keep running the failure path (ExecStopPost) next to a live guest.
+        # "another VMM owns this VM's socket and has nothing to adopt" is not
+        # transient; retrying would keep running the failure path
+        # (ExecStopPost) next to that process every few seconds.
         RestartPreventExitStatus = toString vmmAlreadyRunningStatus;
 
         Group = "kvm";
