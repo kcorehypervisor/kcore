@@ -29,6 +29,7 @@
 | Security | [security.md](./security.md) |
 | Security groups | [security-groups.md](./security-groups.md) |
 | k8s vs kcore security | [security-k8s-vs-kcore.md](./security-k8s-vs-kcore.md) |
+| Bare-metal Kubernetes (plan) | [bare-metal-kubernetes.md](./bare-metal-kubernetes.md) |
 | Storage | [storage.md](./storage.md) |
 | kcore SAN (Ceph) | [ceph.md](./ceph.md) |
 | VM migration (cold / live) | [vm-migration.md](./vm-migration.md) |
