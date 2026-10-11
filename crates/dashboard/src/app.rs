@@ -1,21 +1,21 @@
 use crate::api::{
-    get_compliance_dto, get_network_overview_dto, get_replication_status_dto,
-    get_storage_overview_dto, list_audit_events_dto, list_ceph_clusters_dto, list_networks_dto,
-    list_object_stores_dto, list_operations_dto, list_replication_conflicts_dto,
-    list_shared_filesystems_dto, list_vms_page, list_volumes_dto,
+    get_ceph_cluster_detail_dto, get_compliance_dto, get_network_overview_dto,
+    get_replication_status_dto, get_storage_overview_dto, list_audit_events_dto,
+    list_ceph_clusters_dto, list_networks_dto, list_object_stores_dto, list_operations_dto,
+    list_replication_conflicts_dto, list_shared_filesystems_dto, list_vms_page, list_volumes_dto,
 };
 use crate::dto::{
-    AuditEventDto, CephClusterRowDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto,
-    LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
-    NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto,
-    ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto,
-    VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
+    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ComplianceDto, HostInterfaceDto,
+    LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto,
+    NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto,
+    ReplicationConflictDto, ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto,
+    StorageOverviewDto, VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};
 use leptos_router::{
     components::{FlatRoutes, Route, Router},
-    hooks::use_query_map,
+    hooks::{use_params_map, use_query_map},
     path,
 };
 
@@ -74,6 +74,7 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/vms") view=VmsPage/>
                         <Route path=path!("/volumes") view=VolumesPage/>
                         <Route path=path!("/ceph") view=CephPage/>
+                        <Route path=path!("/ceph/:name") view=CephClusterDetailPage/>
                         <Route path=path!("/operations") view=OperationsPage/>
                         <Route path=path!("/audit") view=AuditPage/>
                         <Route path=path!("/networks") view=NetworksPage/>
@@ -1437,9 +1438,14 @@ fn ceph_clusters_table(rows: Vec<CephClusterRowDto>) -> impl IntoView {
                     {rows.into_iter().map(|c| {
                         let enc = if c.encrypt_osds { "yes" } else { "no" };
                         let health = if c.health_message.is_empty() { "—".to_string() } else { c.health_message.clone() };
+                        let href = format!("/ceph/{}", urlencoding_path(&c.name));
                         view! {
                             <tr>
-                                <td><strong>{c.name.clone()}</strong></td>
+                                <td>
+                                    <a href=href.clone() class="row-link">
+                                        <strong>{c.name.clone()}</strong>
+                                    </a>
+                                </td>
                                 <td>{c.phase.clone()}</td>
                                 <td>{health}</td>
                                 <td><code class="inline">{display_or_dash(&c.public_network)}</code></td>
@@ -1456,6 +1462,283 @@ fn ceph_clusters_table(rows: Vec<CephClusterRowDto>) -> impl IntoView {
         </div>
     }
     .into_any()
+}
+
+#[component]
+fn CephClusterDetailPage() -> impl IntoView {
+    let params = use_params_map();
+    let name = Memo::new(move |_| {
+        params
+            .get()
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    });
+    let res = Resource::new(
+        move || name.get(),
+        |n| async move {
+            if n.trim().is_empty() {
+                return Err(ServerFnError::new("missing cluster name"));
+            }
+            get_ceph_cluster_detail_dto(n).await
+        },
+    );
+    view! {
+        <Suspense fallback=move || view! { <p class="muted">"Loading Ceph cluster…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(detail) => ceph_cluster_detail_view(detail).into_any(),
+                    Err(e) => view! {
+                        <section class="hero">
+                            <p class="crumb"><a href="/ceph">"← Ceph"</a></p>
+                            <h1>"Ceph cluster"</h1>
+                        </section>
+                        <p class="err">{e.to_string()}</p>
+                    }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn ceph_cluster_detail_view(detail: CephClusterDetailDto) -> impl IntoView {
+    let enc = if detail.encrypt_osds { "yes" } else { "no" };
+    let wipe = if detail.force_wipe { "yes" } else { "no" };
+    let health_status = if detail.health.health_status.is_empty() {
+        detail.phase.clone()
+    } else {
+        detail.health.health_status.clone()
+    };
+    let badge_class = if health_status.contains("OK") || detail.phase == "Healthy" {
+        "badge badge-run"
+    } else if health_status.contains("WARN") || detail.phase == "Degraded" {
+        "badge badge-warn"
+    } else if health_status.contains("ERR") || detail.phase == "Failed" {
+        "badge badge-stop"
+    } else {
+        "badge badge-stop"
+    };
+    let source_note = match detail.capacity.source.as_str() {
+        "df" => {
+            if detail.capacity.queried_node.is_empty() {
+                "Capacity from live ceph df".to_string()
+            } else {
+                format!(
+                    "Capacity from live ceph df (via {})",
+                    detail.capacity.queried_node
+                )
+            }
+        }
+        "pgmap" => "Capacity from cached ceph status (pgmap)".to_string(),
+        _ => "Capacity not available yet".to_string(),
+    };
+    let class_legend: Vec<(String, String)> = detail
+        .capacity
+        .by_class
+        .iter()
+        .map(|c| {
+            (
+                c.device_class.clone(),
+                format!(
+                    "max {} · used {} ({}%) · avail {}",
+                    c.total_human, c.used_human, c.used_percent, c.avail_human
+                ),
+            )
+        })
+        .collect();
+    let cluster_pie = detail.cluster_pie_svg.clone();
+    let class_pie = detail.class_pie_svg.clone();
+
+    view! {
+        <section class="hero">
+            <p class="crumb"><a href="/ceph">"← Ceph"</a></p>
+            <h1>{detail.name.clone()}</h1>
+            <p class="muted">
+                <span class=badge_class>{health_status.clone()}</span>
+                " · phase "{detail.phase.clone()}
+                " · generation "{detail.generation}
+            </p>
+            <p class="muted">{display_or_dash(&detail.health_message)}</p>
+        </section>
+
+        <div class="stat-row ceph-stat-row">
+            <div class="stat"><div class="label">"Replication"</div><div class="value">{format!("{}/{}", detail.min_size, detail.size)}</div></div>
+            <div class="stat"><div class="label">"Total"</div><div class="value">{detail.capacity.total_human.clone()}</div></div>
+            <div class="stat"><div class="label">"Used"</div><div class="value">{detail.capacity.used_human.clone()}</div></div>
+            <div class="stat"><div class="label">"Available"</div><div class="value">{detail.capacity.avail_human.clone()}</div></div>
+            <div class="stat"><div class="label">"Used %"</div><div class="value">{format!("{}%", detail.capacity.used_percent)}</div></div>
+            <div class="stat"><div class="label">"OSD encrypt"</div><div class="value">{enc}</div></div>
+        </div>
+        <p class="muted capacity-note">{source_note}</p>
+        {( !detail.capacity.error.is_empty() ).then(|| view! { <p class="muted">{detail.capacity.error.clone()}</p> })}
+
+        <div class="ceph-charts">
+            <div class="ceph-chart-card">
+                <h2 class="section-title">"Cluster capacity"</h2>
+                <div class="ceph-chart-body">
+                    <div class="ceph-pie-wrap" inner_html=cluster_pie></div>
+                    <ul class="ceph-legend">
+                        <li><span class="swatch swatch-0"></span>"Used "{detail.capacity.used_human.clone()}</li>
+                        <li><span class="swatch swatch-1"></span>"Available "{detail.capacity.avail_human.clone()}</li>
+                    </ul>
+                </div>
+                <div class="usage-bar" aria-hidden="true">
+                    <div class="usage-bar-fill" style=format!("width: {}%", detail.capacity.used_percent.min(100))></div>
+                </div>
+            </div>
+            <div class="ceph-chart-card">
+                <h2 class="section-title">"Device classes (max size)"</h2>
+                <div class="ceph-chart-body">
+                    <div class="ceph-pie-wrap" inner_html=class_pie></div>
+                    <ul class="ceph-legend">
+                        {if class_legend.is_empty() {
+                            view! { <li class="muted">"No device-class breakdown (needs live ceph df)."</li> }.into_any()
+                        } else {
+                            class_legend.into_iter().enumerate().map(|(i, (name, text))| {
+                                let swatch = format!("swatch swatch-{}", i % 8);
+                                view! { <li><span class=swatch></span><strong>{name}</strong>" — "{text}</li> }
+                            }).collect_view().into_any()
+                        }}
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <h2 class="section-title">"Replication"</h2>
+        <div class="card">
+            <dl class="kv">
+                <dt>"Cluster size"</dt><dd>{detail.size}</dd>
+                <dt>"Cluster min size"</dt><dd>{detail.min_size}</dd>
+                <dt>"Default pool"</dt><dd><code class="inline">"kcore-vms"</code>" inherits size/minSize"</dd>
+            </dl>
+            <p class="muted">
+                "Pool size is the number of replicas Ceph keeps; minSize is the minimum replicas that must be up for I/O."
+            </p>
+        </div>
+        {( !detail.capacity.pools.is_empty() ).then(|| view! {
+            <div class="table-wrap" style="margin-top: 1rem;">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>"Pool"</th>
+                            <th>"Stored"</th>
+                            <th>"Objects"</th>
+                            <th>"% used"</th>
+                            <th>"Max avail"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {detail.capacity.pools.clone().into_iter().map(|p| {
+                            let pct = format!("{:.2}%", (p.percent_used_bp as f64) / 100.0);
+                            view! {
+                                <tr>
+                                    <td><code class="inline">{p.name.clone()}</code></td>
+                                    <td>{p.stored_human.clone()}</td>
+                                    <td>{p.objects}</td>
+                                    <td>{pct}</td>
+                                    <td>{p.max_avail_human.clone()}</td>
+                                </tr>
+                            }
+                        }).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        })}
+
+        <h2 class="section-title">"Health"</h2>
+        <div class="card">
+            <dl class="kv">
+                <dt>"Status"</dt><dd>{display_or_dash(&detail.health.health_status)}</dd>
+                <dt>"Mon quorum"</dt><dd>{display_or_dash(&detail.health.mon_quorum)}</dd>
+                <dt>"OSDs"</dt><dd>{format!(
+                    "{} total, {} up, {} in",
+                    detail.health.osd_total, detail.health.osd_up, detail.health.osd_in
+                )}</dd>
+                <dt>"PGs"</dt><dd>{detail.health.pgs_total}</dd>
+                <dt>"Flags"</dt><dd>{if detail.health.flags.is_empty() {
+                    "—".to_string()
+                } else {
+                    detail.health.flags.join(", ")
+                }}</dd>
+                <dt>"noout"</dt><dd>{if detail.health.noout { "set" } else { "unset" }}</dd>
+                <dt>"norebalance"</dt><dd>{if detail.health.norebalance { "set" } else { "unset" }}</dd>
+            </dl>
+            {( !detail.health.pgs_by_state.is_empty() ).then(|| view! {
+                <div class="table-wrap" style="margin-top: 1rem;">
+                    <table class="data">
+                        <thead><tr><th>"PG state"</th><th>"Count"</th></tr></thead>
+                        <tbody>
+                            {detail.health.pgs_by_state.clone().into_iter().map(|s| view! {
+                                <tr><td>{s.state_name.clone()}</td><td>{s.count}</td></tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            })}
+            {( !detail.health.checks.is_empty() ).then(|| view! {
+                <div class="table-wrap" style="margin-top: 1rem;">
+                    <table class="data">
+                        <thead><tr><th>"Check"</th><th>"Severity"</th><th>"Message"</th></tr></thead>
+                        <tbody>
+                            {detail.health.checks.clone().into_iter().map(|c| view! {
+                                <tr>
+                                    <td><code class="inline">{c.name.clone()}</code></td>
+                                    <td>{c.severity.clone()}</td>
+                                    <td>{c.message.clone()}</td>
+                                </tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            })}
+        </div>
+
+        <h2 class="section-title">"Members"</h2>
+        {if detail.members.is_empty() {
+            view! { <div class="empty-note">"No members in the cluster spec."</div> }.into_any()
+        } else {
+            view! {
+                <div class="table-wrap">
+                    <table class="data">
+                        <thead>
+                            <tr>
+                                <th>"Node"</th>
+                                <th>"Mon"</th>
+                                <th>"Cluster addr"</th>
+                                <th>"Public iface"</th>
+                                <th>"Cluster iface"</th>
+                                <th>"OSD devices"</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {detail.members.clone().into_iter().map(|m| view! {
+                                <tr>
+                                    <td><strong>{m.node_id.clone()}</strong></td>
+                                    <td><code class="inline">{display_or_dash(&m.mon_addr)}</code></td>
+                                    <td><code class="inline">{display_or_dash(&m.cluster_addr)}</code></td>
+                                    <td><code class="inline">{display_or_dash(&m.public_iface)}</code></td>
+                                    <td><code class="inline">{display_or_dash(&m.cluster_iface)}</code></td>
+                                    <td><code class="inline">{m.osd_devices.clone()}</code></td>
+                                </tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            }.into_any()
+        }}
+
+        <h2 class="section-title">"Spec"</h2>
+        <div class="card">
+            <dl class="kv">
+                <dt>"FSID"</dt><dd><code class="inline">{display_or_dash(&detail.fsid)}</code></dd>
+                <dt>"Public network"</dt><dd><code class="inline">{display_or_dash(&detail.public_network)}</code></dd>
+                <dt>"Cluster network"</dt><dd><code class="inline">{display_or_dash(&detail.cluster_network)}</code></dd>
+                <dt>"Force wipe"</dt><dd>{wipe}</dd>
+                <dt>"Created"</dt><dd>{detail.created_at.clone()}</dd>
+                <dt>"Updated"</dt><dd>{detail.updated_at.clone()}</dd>
+            </dl>
+        </div>
+    }
 }
 
 fn shared_filesystems_table(rows: Vec<SharedFilesystemRowDto>) -> impl IntoView {

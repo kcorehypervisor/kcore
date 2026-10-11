@@ -152,6 +152,8 @@ service NodeAdmin {
   // devices ceph-volume itself reports.
   rpc ReconcileCephOsds(ReconcileCephOsdsRequest) returns (ReconcileCephOsdsResponse);
   rpc GetCephHealth(GetCephHealthRequest) returns (GetCephHealthResponse);
+  // Cluster capacity from `ceph df --format json` (device classes + pools).
+  rpc GetCephDf(GetCephDfRequest) returns (GetCephDfResponse);
   rpc EnsureCephPool(EnsureCephPoolRequest) returns (EnsureCephPoolResponse);
   // Stop this node's mon/mgr, purge its OSDs, and queue a rebuild that drops
   // kcore.ceph from the system configuration.
@@ -1126,6 +1128,33 @@ message GetCephHealthResponse {
   string raw_status = 2;
   int32 osd_up = 3;
   int32 osd_in = 4;
+}
+
+message GetCephDfRequest { string cluster_name = 1; }
+
+message CephDeviceClassStats {
+  string device_class = 1;
+  int64 total_bytes = 2;
+  int64 used_bytes = 3;
+  int64 avail_bytes = 4;
+}
+
+message CephPoolUsageStats {
+  string name = 1;
+  int64 stored_bytes = 2;
+  int64 objects = 3;
+  // Percent used × 100 (e.g. 4250 = 42.50%). Avoids float in the wire type.
+  int32 percent_used_bp = 4;
+  int64 max_avail_bytes = 5;
+}
+
+message GetCephDfResponse {
+  string raw_df = 1;
+  int64 total_bytes = 2;
+  int64 used_bytes = 3;
+  int64 avail_bytes = 4;
+  repeated CephDeviceClassStats by_class = 5;
+  repeated CephPoolUsageStats pools = 6;
 }
 
 message EnsureCephPoolRequest {

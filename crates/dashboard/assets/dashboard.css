@@ -383,3 +383,104 @@ code.inline {
   flex: 0;
   min-width: 6rem;
 }
+
+/* Ceph cluster detail */
+.crumb {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+}
+.row-link {
+  color: inherit;
+  text-decoration: none;
+}
+.row-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.ceph-stat-row {
+  margin: 0 0 0.75rem;
+}
+.capacity-note {
+  margin: 0 0 1.25rem;
+  font-size: 0.85rem;
+}
+.ceph-charts {
+  display: grid;
+  gap: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+@media (min-width: 900px) {
+  .ceph-charts {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.ceph-chart-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem 1.25rem 1.25rem;
+}
+.ceph-chart-card .section-title {
+  margin-top: 0;
+  font-size: 1rem;
+}
+.ceph-chart-body {
+  display: flex;
+  gap: 1.25rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.ceph-pie-wrap {
+  flex: 0 0 140px;
+}
+.ceph-pie {
+  width: 140px;
+  height: 140px;
+  display: block;
+}
+.ceph-legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  flex: 1;
+  min-width: 12rem;
+}
+.ceph-legend li {
+  margin: 0.35rem 0;
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+.ceph-legend strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.swatch {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 2px;
+  display: inline-block;
+  flex: 0 0 auto;
+}
+.swatch-0 { background: #5eead4; }
+.swatch-1 { background: #60a5fa; }
+.swatch-2 { background: #c084fc; }
+.swatch-3 { background: #fbbf24; }
+.swatch-4 { background: #fb923c; }
+.swatch-5 { background: #f472b6; }
+.swatch-6 { background: #34d399; }
+.swatch-7 { background: #94a3b8; }
+.usage-bar {
+  margin-top: 0.85rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: #151821;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.usage-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+}
