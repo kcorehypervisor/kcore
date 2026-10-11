@@ -7,7 +7,7 @@
 let
   cfg = config.kcore.kubernetes;
   nonEmpty = value: value != "";
-  
+
   # Cilium ports
   ciliumPorts = {
     healthPort = 9879;
@@ -39,7 +39,10 @@ in
     enable = lib.mkEnableOption "kcore Kubernetes cluster services";
 
     role = lib.mkOption {
-      type = lib.types.enum [ "control-plane" "worker" ];
+      type = lib.types.enum [
+        "control-plane"
+        "worker"
+      ];
       default = "worker";
       description = "Node role in the Kubernetes cluster.";
     };
@@ -131,7 +134,7 @@ in
 
     ciliumLoadBalancerIpPools = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [];
+      default = [ ];
       description = "Cilium LoadBalancer IP pool CIDRs (e.g., ['192.168.40.220/29']).";
     };
 
@@ -187,7 +190,10 @@ in
     ];
 
     # Kernel modules for Kubernetes
-    boot.kernelModules = [ "br_netfilter" "overlay" ];
+    boot.kernelModules = [
+      "br_netfilter"
+      "overlay"
+    ];
 
     boot.kernel.sysctl = {
       "net.bridge.bridge-nf-call-iptables" = 1;
@@ -197,12 +203,15 @@ in
       "net.ipv6.conf.all.forwarding" = 1;
     };
 
-    environment.systemPackages = with pkgs; [
-      kubernetes
-      etcd
-      cilium-cli
-      kubectl
-    ] ++ lib.optionals cfg.haEnabled [ keepalived ];
+    environment.systemPackages =
+      with pkgs;
+      [
+        kubernetes
+        etcd
+        cilium-cli
+        kubectl
+      ]
+      ++ lib.optionals cfg.haEnabled [ keepalived ];
 
     # Firewall configuration
     networking.firewall = {
@@ -213,13 +222,19 @@ in
         k8sPorts.kubeletHealthz
         k8sPorts.etcdClient
         k8sPorts.etcdPeer
-      ] ++ lib.optionals (cfg.role == "control-plane") [
+      ]
+      ++ lib.optionals (cfg.role == "control-plane") [
         k8sPorts.kubeScheduler
         k8sPorts.kubeControllerManager
       ];
-      allowedUDPPorts = lib.optionals (cfg.ciliumTunnel == "vxlan") [ ciliumPorts.vxlanPort ]
+      allowedUDPPorts =
+        lib.optionals (cfg.ciliumTunnel == "vxlan") [ ciliumPorts.vxlanPort ]
         ++ lib.optionals (cfg.ciliumTunnel == "geneve") [ ciliumPorts.genevePort ];
-      trustedInterfaces = [ "cni0" "cilium_host" "cilium_net" ];
+      trustedInterfaces = [
+        "cni0"
+        "cilium_host"
+        "cilium_net"
+      ];
     };
 
     # Write kubeconfig if provided
@@ -245,7 +260,9 @@ in
             --listen-client-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdClient},https://127.0.0.1:${toString k8sPorts.etcdClient} \
             --advertise-client-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdClient} \
             --initial-advertise-peer-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdPeer} \
-            ${if cfg.initialCluster then "--initial-cluster-state=new" else "--initial-cluster-state=existing"} \
+            ${
+              if cfg.initialCluster then "--initial-cluster-state=new" else "--initial-cluster-state=existing"
+            } \
             --initial-cluster=${etcdInitialCluster} \
             --client-cert-auth=true \
             --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \
@@ -267,7 +284,10 @@ in
     systemd.services.kube-apiserver = lib.mkIf (cfg.role == "control-plane") {
       description = "Kubernetes API Server";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" "etcd.service" ];
+      after = [
+        "network-online.target"
+        "etcd.service"
+      ];
       wants = [ "network-online.target" ];
 
       serviceConfig = {
@@ -349,7 +369,10 @@ in
     systemd.services.kubelet = {
       description = "Kubernetes Kubelet";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" ] ++ lib.optionals (cfg.role == "control-plane") [ "kube-apiserver.service" ];
+      after = [
+        "network-online.target"
+      ]
+      ++ lib.optionals (cfg.role == "control-plane") [ "kube-apiserver.service" ];
       wants = [ "network-online.target" ];
 
       serviceConfig = {

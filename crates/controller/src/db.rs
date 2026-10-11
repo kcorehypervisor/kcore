@@ -6362,7 +6362,10 @@ impl Database {
     // Kubernetes Cluster Management
     // ============================================================================
 
-    pub fn upsert_kubernetes_cluster(&self, row: &KubernetesClusterRow) -> Result<(), rusqlite::Error> {
+    pub fn upsert_kubernetes_cluster(
+        &self,
+        row: &KubernetesClusterRow,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO kubernetes_clusters (
@@ -6384,16 +6387,27 @@ impl Database {
                 ready_workers=excluded.ready_workers,
                 updated_at=datetime('now')",
             params![
-                row.name, row.generation, row.cluster_cidr, row.service_cidr,
-                row.cluster_dns, row.api_server_endpoint, row.cni, row.phase,
-                row.status_message, row.ready_control_planes, row.ready_workers,
+                row.name,
+                row.generation,
+                row.cluster_cidr,
+                row.service_cidr,
+                row.cluster_dns,
+                row.api_server_endpoint,
+                row.cni,
+                row.phase,
+                row.status_message,
+                row.ready_control_planes,
+                row.ready_workers,
                 row.created_at
             ],
         )?;
         Ok(())
     }
 
-    pub fn get_kubernetes_cluster(&self, name: &str) -> Result<Option<KubernetesClusterRow>, rusqlite::Error> {
+    pub fn get_kubernetes_cluster(
+        &self,
+        name: &str,
+    ) -> Result<Option<KubernetesClusterRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT name, generation, cluster_cidr, service_cidr, cluster_dns,
@@ -6451,10 +6465,16 @@ impl Database {
 
     pub fn delete_kubernetes_cluster(&self, name: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.lock_conn()?;
-        Ok(conn.execute("DELETE FROM kubernetes_clusters WHERE name=?1", params![name])? > 0)
+        Ok(conn.execute(
+            "DELETE FROM kubernetes_clusters WHERE name=?1",
+            params![name],
+        )? > 0)
     }
 
-    pub fn upsert_kubernetes_cluster_node(&self, row: &KubernetesClusterNodeRow) -> Result<(), rusqlite::Error> {
+    pub fn upsert_kubernetes_cluster_node(
+        &self,
+        row: &KubernetesClusterNodeRow,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO kubernetes_cluster_nodes (
@@ -6469,14 +6489,23 @@ impl Database {
                 join_existing=excluded.join_existing,
                 kubelet_ready=excluded.kubelet_ready",
             params![
-                row.cluster_name, row.node_id, row.role, row.advertise_address,
-                row.iface, row.initial_cluster, row.join_existing, row.kubelet_ready
+                row.cluster_name,
+                row.node_id,
+                row.role,
+                row.advertise_address,
+                row.iface,
+                row.initial_cluster,
+                row.join_existing,
+                row.kubelet_ready
             ],
         )?;
         Ok(())
     }
 
-    pub fn list_kubernetes_cluster_nodes(&self, cluster_name: &str) -> Result<Vec<KubernetesClusterNodeRow>, rusqlite::Error> {
+    pub fn list_kubernetes_cluster_nodes(
+        &self,
+        cluster_name: &str,
+    ) -> Result<Vec<KubernetesClusterNodeRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT cluster_name, node_id, role, advertise_address, iface,
@@ -6498,7 +6527,10 @@ impl Database {
         rows.collect()
     }
 
-    pub fn upsert_kubernetes_cluster_config(&self, row: &KubernetesClusterConfigRow) -> Result<(), rusqlite::Error> {
+    pub fn upsert_kubernetes_cluster_config(
+        &self,
+        row: &KubernetesClusterConfigRow,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO kubernetes_cluster_config (
@@ -6516,15 +6548,24 @@ impl Database {
                 cilium_auto_direct_routes=excluded.cilium_auto_direct_routes,
                 cilium_lb_ip_pools=excluded.cilium_lb_ip_pools",
             params![
-                row.cluster_name, row.ha_enabled, row.vip_address, row.vip_interface,
-                row.cilium_mode, row.cilium_mtu, row.cilium_tunnel,
-                row.cilium_auto_direct_routes, row.cilium_lb_ip_pools
+                row.cluster_name,
+                row.ha_enabled,
+                row.vip_address,
+                row.vip_interface,
+                row.cilium_mode,
+                row.cilium_mtu,
+                row.cilium_tunnel,
+                row.cilium_auto_direct_routes,
+                row.cilium_lb_ip_pools
             ],
         )?;
         Ok(())
     }
 
-    pub fn get_kubernetes_cluster_config(&self, cluster_name: &str) -> Result<Option<KubernetesClusterConfigRow>, rusqlite::Error> {
+    pub fn get_kubernetes_cluster_config(
+        &self,
+        cluster_name: &str,
+    ) -> Result<Option<KubernetesClusterConfigRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT cluster_name, ha_enabled, vip_address, vip_interface,

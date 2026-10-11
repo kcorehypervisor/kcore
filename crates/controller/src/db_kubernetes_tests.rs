@@ -2,12 +2,14 @@
 
 #[cfg(test)]
 mod kubernetes_cluster_tests {
-    use crate::db::{Database, KubernetesClusterRow, KubernetesClusterNodeRow, KubernetesClusterConfigRow};
+    use crate::db::{
+        Database, KubernetesClusterConfigRow, KubernetesClusterNodeRow, KubernetesClusterRow,
+    };
 
     #[test]
     fn test_upsert_kubernetes_cluster() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         let row = KubernetesClusterRow {
             name: "test-cluster".to_string(),
             generation: 1,
@@ -23,9 +25,9 @@ mod kubernetes_cluster_tests {
             created_at: String::new(),
             updated_at: String::new(),
         };
-        
+
         db.upsert_kubernetes_cluster(&row).unwrap();
-        
+
         let retrieved = db.get_kubernetes_cluster("test-cluster").unwrap().unwrap();
         assert_eq!(retrieved.name, "test-cluster");
         assert_eq!(retrieved.generation, 1);
@@ -37,7 +39,7 @@ mod kubernetes_cluster_tests {
     #[test]
     fn test_upsert_kubernetes_cluster_updates_generation() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         let row1 = KubernetesClusterRow {
             name: "test-cluster".to_string(),
             generation: 1,
@@ -53,17 +55,17 @@ mod kubernetes_cluster_tests {
             created_at: String::new(),
             updated_at: String::new(),
         };
-        
+
         db.upsert_kubernetes_cluster(&row1).unwrap();
-        
+
         let row2 = KubernetesClusterRow {
             generation: 2,
             phase: "updating".to_string(),
             ..row1
         };
-        
+
         db.upsert_kubernetes_cluster(&row2).unwrap();
-        
+
         let retrieved = db.get_kubernetes_cluster("test-cluster").unwrap().unwrap();
         assert_eq!(retrieved.generation, 2);
         assert_eq!(retrieved.phase, "updating");
@@ -72,7 +74,7 @@ mod kubernetes_cluster_tests {
     #[test]
     fn test_list_kubernetes_clusters() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         for i in 1..=3 {
             let row = KubernetesClusterRow {
                 name: format!("cluster-{}", i),
@@ -91,7 +93,7 @@ mod kubernetes_cluster_tests {
             };
             db.upsert_kubernetes_cluster(&row).unwrap();
         }
-        
+
         let clusters = db.list_kubernetes_clusters().unwrap();
         assert_eq!(clusters.len(), 3);
         assert_eq!(clusters[0].name, "cluster-1");
@@ -101,7 +103,7 @@ mod kubernetes_cluster_tests {
     #[test]
     fn test_delete_kubernetes_cluster() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         let row = KubernetesClusterRow {
             name: "test-cluster".to_string(),
             generation: 1,
@@ -117,7 +119,7 @@ mod kubernetes_cluster_tests {
             created_at: String::new(),
             updated_at: String::new(),
         };
-        
+
         db.upsert_kubernetes_cluster(&row).unwrap();
         assert!(db.delete_kubernetes_cluster("test-cluster").unwrap());
         assert!(db.get_kubernetes_cluster("test-cluster").unwrap().is_none());
@@ -127,7 +129,7 @@ mod kubernetes_cluster_tests {
     #[test]
     fn test_kubernetes_cluster_nodes() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         // Create cluster first
         let cluster_row = KubernetesClusterRow {
             name: "test-cluster".to_string(),
@@ -145,7 +147,7 @@ mod kubernetes_cluster_tests {
             updated_at: String::new(),
         };
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
-        
+
         // Add node
         let node_row = KubernetesClusterNodeRow {
             cluster_name: "test-cluster".to_string(),
@@ -157,9 +159,9 @@ mod kubernetes_cluster_tests {
             join_existing: false,
             kubelet_ready: true,
         };
-        
+
         db.upsert_kubernetes_cluster_node(&node_row).unwrap();
-        
+
         let nodes = db.list_kubernetes_cluster_nodes("test-cluster").unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, "node-105");
@@ -171,7 +173,7 @@ mod kubernetes_cluster_tests {
     #[test]
     fn test_kubernetes_cluster_config() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         // Create cluster first
         let cluster_row = KubernetesClusterRow {
             name: "test-cluster".to_string(),
@@ -189,7 +191,7 @@ mod kubernetes_cluster_tests {
             updated_at: String::new(),
         };
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
-        
+
         let config_row = KubernetesClusterConfigRow {
             cluster_name: "test-cluster".to_string(),
             ha_enabled: true,
@@ -201,10 +203,13 @@ mod kubernetes_cluster_tests {
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: "192.168.40.220/29".to_string(),
         };
-        
+
         db.upsert_kubernetes_cluster_config(&config_row).unwrap();
-        
-        let config = db.get_kubernetes_cluster_config("test-cluster").unwrap().unwrap();
+
+        let config = db
+            .get_kubernetes_cluster_config("test-cluster")
+            .unwrap()
+            .unwrap();
         assert!(config.ha_enabled);
         assert_eq!(config.vip_address, "192.168.40.200");
         assert_eq!(config.cilium_mode, "native-routing");
@@ -215,7 +220,7 @@ mod kubernetes_cluster_tests {
     #[test]
     fn test_delete_cluster_cascades_to_nodes_and_config() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         // Create cluster
         let cluster_row = KubernetesClusterRow {
             name: "test-cluster".to_string(),
@@ -233,7 +238,7 @@ mod kubernetes_cluster_tests {
             updated_at: String::new(),
         };
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
-        
+
         // Add node
         let node_row = KubernetesClusterNodeRow {
             cluster_name: "test-cluster".to_string(),
@@ -246,7 +251,7 @@ mod kubernetes_cluster_tests {
             kubelet_ready: false,
         };
         db.upsert_kubernetes_cluster_node(&node_row).unwrap();
-        
+
         // Add config
         let config_row = KubernetesClusterConfigRow {
             cluster_name: "test-cluster".to_string(),
@@ -260,23 +265,39 @@ mod kubernetes_cluster_tests {
             cilium_lb_ip_pools: "192.168.40.220/29".to_string(),
         };
         db.upsert_kubernetes_cluster_config(&config_row).unwrap();
-        
+
         // Verify they exist
-        assert_eq!(db.list_kubernetes_cluster_nodes("test-cluster").unwrap().len(), 1);
-        assert!(db.get_kubernetes_cluster_config("test-cluster").unwrap().is_some());
-        
+        assert_eq!(
+            db.list_kubernetes_cluster_nodes("test-cluster")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .get_kubernetes_cluster_config("test-cluster")
+            .unwrap()
+            .is_some());
+
         // Delete cluster
         assert!(db.delete_kubernetes_cluster("test-cluster").unwrap());
-        
+
         // Verify nodes and config are gone (cascade)
-        assert_eq!(db.list_kubernetes_cluster_nodes("test-cluster").unwrap().len(), 0);
-        assert!(db.get_kubernetes_cluster_config("test-cluster").unwrap().is_none());
+        assert_eq!(
+            db.list_kubernetes_cluster_nodes("test-cluster")
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(db
+            .get_kubernetes_cluster_config("test-cluster")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn test_multiple_control_plane_nodes() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         let cluster_row = KubernetesClusterRow {
             name: "ha-cluster".to_string(),
             generation: 1,
@@ -293,7 +314,7 @@ mod kubernetes_cluster_tests {
             updated_at: String::new(),
         };
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
-        
+
         for (i, node_id) in ["node-105", "node-107", "node-119"].iter().enumerate() {
             let node_row = KubernetesClusterNodeRow {
                 cluster_name: "ha-cluster".to_string(),
@@ -307,14 +328,14 @@ mod kubernetes_cluster_tests {
             };
             db.upsert_kubernetes_cluster_node(&node_row).unwrap();
         }
-        
+
         let nodes = db.list_kubernetes_cluster_nodes("ha-cluster").unwrap();
         assert_eq!(nodes.len(), 3);
-        
+
         let initial_nodes: Vec<_> = nodes.iter().filter(|n| n.initial_cluster).collect();
         assert_eq!(initial_nodes.len(), 1);
         assert_eq!(initial_nodes[0].node_id, "node-105");
-        
+
         let joining_nodes: Vec<_> = nodes.iter().filter(|n| n.join_existing).collect();
         assert_eq!(joining_nodes.len(), 2);
     }
@@ -322,7 +343,7 @@ mod kubernetes_cluster_tests {
     #[test]
     fn test_update_node_readiness() {
         let db = Database::open(":memory:").expect("open db");
-        
+
         let cluster_row = KubernetesClusterRow {
             name: "test-cluster".to_string(),
             generation: 1,
@@ -339,7 +360,7 @@ mod kubernetes_cluster_tests {
             updated_at: String::new(),
         };
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
-        
+
         let node_row = KubernetesClusterNodeRow {
             cluster_name: "test-cluster".to_string(),
             node_id: "node-105".to_string(),
@@ -351,16 +372,16 @@ mod kubernetes_cluster_tests {
             kubelet_ready: false,
         };
         db.upsert_kubernetes_cluster_node(&node_row).unwrap();
-        
+
         let nodes = db.list_kubernetes_cluster_nodes("test-cluster").unwrap();
         assert!(!nodes[0].kubelet_ready);
-        
+
         let updated_node = KubernetesClusterNodeRow {
             kubelet_ready: true,
             ..node_row
         };
         db.upsert_kubernetes_cluster_node(&updated_node).unwrap();
-        
+
         let nodes = db.list_kubernetes_cluster_nodes("test-cluster").unwrap();
         assert!(nodes[0].kubelet_ready);
     }

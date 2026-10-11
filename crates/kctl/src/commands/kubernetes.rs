@@ -187,31 +187,41 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
     println!("=== KubernetesCluster plan: {} ===", manifest.metadata.name);
     println!();
     println!("Action: {}", plan.action);
-    
+
     if !plan.blocking_issues.is_empty() {
         println!("\n❌ Blocking issues:");
         for issue in &plan.blocking_issues {
             println!("  - {}", issue);
         }
-        bail!("cannot proceed: {} blocking issue(s)", plan.blocking_issues.len());
+        bail!(
+            "cannot proceed: {} blocking issue(s)",
+            plan.blocking_issues.len()
+        );
     }
-    
+
     if !plan.warnings.is_empty() {
         println!("\n⚠️  Warnings:");
         for warning in &plan.warnings {
             println!("  - {}", warning);
         }
     }
-    
+
     println!("\n✅ Node preflight checks:");
     for node_plan in &plan.node_plans {
-        let status = if node_plan.preflight_passed { "✓" } else { "✗" };
-        println!("  {} {} ({})", status, node_plan.node_id, node_plan.nix_action);
+        let status = if node_plan.preflight_passed {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "  {} {} ({})",
+            status, node_plan.node_id, node_plan.nix_action
+        );
         for issue in &node_plan.issues {
             println!("      - {}", issue);
         }
     }
-    
+
     println!("\n📝 Proceed? (y/n)");
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
@@ -255,14 +265,14 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
     if let Some(cluster) = response.cluster {
         println!("Name: {}", cluster.name);
         println!("Generation: {}", cluster.generation);
-        
+
         if let Some(spec) = cluster.spec {
             println!("\nSpec:");
             println!("  Cluster CIDR: {}", spec.cluster_cidr);
             println!("  Service CIDR: {}", spec.service_cidr);
             println!("  API Endpoint: {}", spec.api_server_endpoint);
             println!("  CNI: {}", spec.cni);
-            
+
             if let Some(ha) = spec.high_availability {
                 if ha.enabled {
                     println!("\nHigh Availability:");
@@ -270,21 +280,31 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
                     println!("  VIP Interface: {}", ha.vip_interface);
                 }
             }
-            
+
             println!("\nControl Plane Nodes:");
             for node in &spec.control_plane_nodes {
-                let init = if node.initial_cluster { " [initial]" } else { "" };
-                println!("  - {}{}: {} ({})", node.node_id, init, node.advertise_address, node.iface);
+                let init = if node.initial_cluster {
+                    " [initial]"
+                } else {
+                    ""
+                };
+                println!(
+                    "  - {}{}: {} ({})",
+                    node.node_id, init, node.advertise_address, node.iface
+                );
             }
-            
+
             if !spec.worker_nodes.is_empty() {
                 println!("\nWorker Nodes:");
                 for node in &spec.worker_nodes {
-                    println!("  - {}: {} ({})", node.node_id, node.advertise_address, node.iface);
+                    println!(
+                        "  - {}: {} ({})",
+                        node.node_id, node.advertise_address, node.iface
+                    );
                 }
             }
         }
-        
+
         if let Some(status) = cluster.status {
             println!("\nStatus:");
             println!("  Phase: {}", status.phase);
@@ -310,27 +330,44 @@ pub async fn list(info: &ConnectionInfo) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<15} {:<10} {:<5}/{:<5}", "NAME", "PHASE", "API ENDPOINT", "CP", "WORKERS");
+    println!(
+        "{:<20} {:<15} {:<10} {:<5}/{:<5}",
+        "NAME", "PHASE", "API ENDPOINT", "CP", "WORKERS"
+    );
     println!("{}", "-".repeat(70));
-    
+
     for cluster in response.clusters {
         let api = if let Some(spec) = &cluster.spec {
             &spec.api_server_endpoint
         } else {
             ""
         };
-        
+
         let (phase, cp, workers) = if let Some(status) = &cluster.status {
-            (status.phase.as_str(), status.ready_control_planes, status.ready_workers)
+            (
+                status.phase.as_str(),
+                status.ready_control_planes,
+                status.ready_workers,
+            )
         } else {
             ("unknown", 0, 0)
         };
-        
-        let cp_total = cluster.spec.as_ref().map(|s| s.control_plane_nodes.len() as i32).unwrap_or(0);
-        let worker_total = cluster.spec.as_ref().map(|s| s.worker_nodes.len() as i32).unwrap_or(0);
-        
-        println!("{:<20} {:<15} {:<10} {}/{:<5} {}/{}", 
-            cluster.name, phase, api, cp, cp_total, workers, worker_total);
+
+        let cp_total = cluster
+            .spec
+            .as_ref()
+            .map(|s| s.control_plane_nodes.len() as i32)
+            .unwrap_or(0);
+        let worker_total = cluster
+            .spec
+            .as_ref()
+            .map(|s| s.worker_nodes.len() as i32)
+            .unwrap_or(0);
+
+        println!(
+            "{:<20} {:<15} {:<10} {}/{:<5} {}/{}",
+            cluster.name, phase, api, cp, cp_total, workers, worker_total
+        );
     }
 
     Ok(())
@@ -375,19 +412,44 @@ pub async fn health(info: &ConnectionInfo, name: &str) -> Result<()> {
 
     println!("=== Kubernetes Cluster Health: {} ===\n", name);
     println!("Overall Health: {}", response.overall_health);
-    println!("Control Planes: {}/{}", response.ready_control_planes, response.total_control_planes);
-    println!("Workers: {}/{}", response.ready_workers, response.total_workers);
-    println!("etcd: {} ({} members)", 
-        if response.etcd_healthy { "healthy" } else { "unhealthy" }, 
-        response.etcd_member_count);
-    println!("API Server: {}", 
-        if response.api_server_reachable { "reachable" } else { "unreachable" });
-    
+    println!(
+        "Control Planes: {}/{}",
+        response.ready_control_planes, response.total_control_planes
+    );
+    println!(
+        "Workers: {}/{}",
+        response.ready_workers, response.total_workers
+    );
+    println!(
+        "etcd: {} ({} members)",
+        if response.etcd_healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        },
+        response.etcd_member_count
+    );
+    println!(
+        "API Server: {}",
+        if response.api_server_reachable {
+            "reachable"
+        } else {
+            "unreachable"
+        }
+    );
+
     if !response.node_health.is_empty() {
         println!("\nNode Health:");
         for node in &response.node_health {
             println!("  {}: {}", node.node_id, node.kubernetes_status);
-            println!("    kubelet: {}", if node.kubelet_active { "active" } else { "inactive" });
+            println!(
+                "    kubelet: {}",
+                if node.kubelet_active {
+                    "active"
+                } else {
+                    "inactive"
+                }
+            );
             if node.etcd_active {
                 println!("    etcd: active");
             }
@@ -400,25 +462,33 @@ pub async fn health(info: &ConnectionInfo, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn scale(info: &ConnectionInfo, name: &str, add_workers: Vec<String>, remove_workers: Vec<String>) -> Result<()> {
+pub async fn scale(
+    info: &ConnectionInfo,
+    name: &str,
+    add_workers: Vec<String>,
+    remove_workers: Vec<String>,
+) -> Result<()> {
     let mut client = client::controller_client(info).await?;
-    
-    let add_nodes = add_workers.into_iter().map(|node_id| {
-        // Parse node_id:address format
-        let parts: Vec<&str> = node_id.split(':').collect();
-        if parts.len() != 2 {
-            bail!("worker format must be node_id:address (e.g., node-110:192.168.40.110)");
-        }
-        Ok(controller_proto::KubernetesNodeSpec {
-            node_id: parts[0].to_string(),
-            role: "worker".to_string(),
-            advertise_address: parts[1].to_string(),
-            iface: "enp6s0".to_string(),
-            initial_cluster: false,
-            join_existing: true,
+
+    let add_nodes = add_workers
+        .into_iter()
+        .map(|node_id| {
+            // Parse node_id:address format
+            let parts: Vec<&str> = node_id.split(':').collect();
+            if parts.len() != 2 {
+                bail!("worker format must be node_id:address (e.g., node-110:192.168.40.110)");
+            }
+            Ok(controller_proto::KubernetesNodeSpec {
+                node_id: parts[0].to_string(),
+                role: "worker".to_string(),
+                advertise_address: parts[1].to_string(),
+                iface: "enp6s0".to_string(),
+                initial_cluster: false,
+                join_existing: true,
+            })
         })
-    }).collect::<Result<Vec<_>>>()?;
-    
+        .collect::<Result<Vec<_>>>()?;
+
     let _response = client
         .scale_kubernetes_cluster(controller_proto::ScaleKubernetesClusterRequest {
             name: name.to_string(),
