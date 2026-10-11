@@ -172,7 +172,9 @@ let
           if [ -z "$DEV" ]; then
             modprobe nbd || true
             DEV="$(${pkgs.systemd}/bin/systemd-run --scope --quiet --collect -- \
-              rbd device map -t nbd "$IMAGE" | tail -1)"
+              rbd device map -t nbd --rbd-cache=true --rbd-cache-policy=writeback \
+                --rbd-readahead-trigger-requests=1 --rbd-readahead-max-bytes=4194304 \
+                --rbd-readahead-disable-after-bytes=0 "$IMAGE" | tail -1)"
           fi
           mkdir -p "$(dirname "$RBD_DEV")"
           ln -sfn "$DEV" "$RBD_DEV"
