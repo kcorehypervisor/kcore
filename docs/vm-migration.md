@@ -18,6 +18,29 @@ Product docs: [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.
 
 RBAC: `DrainNode` → `cluster-admin`; `MigrateVm` → `vm-admin`.
 
+### Host CPU and TSC preflight (live)
+
+Before the destination spawns its receive VMM, the controller fetches the
+source's `GetHostCpuInfo` (vendor, model, TSC kHz, hardware TSC scaling)
+and passes it in `PrepareLiveMigrateReceive`. The destination refuses a
+vendor mismatch and otherwise returns `warnings`, which `kctl migrate vm`
+prints and the `vm.migrated` event records as `hostWarnings`:
+
+- different CPU model: fine as long as the guest's CPUID is satisfied
+  (`vm_check_cpuid_compatibility` still runs inside Cloud Hypervisor);
+- source TSC slower than destination without hardware TSC scaling: KVM cannot
+  run a guest TSC below the host rate and returns `EINVAL`. Stock Cloud
+  Hypervisor 51.1 aborts the receive there, which is why migrating off a
+  slower host (lab: node-118 at 3.30 GHz onto the 3.40 GHz nodes) failed.
+  `modules/ch-vm/patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch`
+  (applied through `ch-vm.vms.cloudHypervisorPatches`) logs and continues like
+  QEMU; kvm-clock and Hyper-V reference-TSC guests keep correct time.
+
+The receive also clears a stale `<vm>.sock` / `<vm>.serial.sock` left by a
+guest that previously ran on the destination; Cloud Hypervisor binds the
+serial socket without unlinking and would otherwise fail the Config step
+with the unhelpful "Failed to receive migratable component snapshot".
+
 ## Automatic failover
 
 When a node misses heartbeats for 90 seconds the controller marks it `not-ready` and, unless `failover.enabled` is false, moves each Ceph VM onto another healthy member of the same cluster. The move is a cold reassignment: the failed node is not contacted. Local `filesystem`, `lvm`, and `zfs` VMs stay on that node and show up in `kctl get cluster-health` as VMs on a not-ready node.

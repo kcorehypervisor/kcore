@@ -126,6 +126,28 @@ kctl --node <addr>:9091 node nics
 kctl --node <addr>:9091 node disks
 ```
 
+### Removing a member
+
+Drop the node from `spec.nodes` and `kctl apply` the manifest. The plan
+(and the apply, which runs the same plan) refuses unless:
+
+- the survivors still number at least `size` — every replica needs its own
+  host under the default CRUSH rule, so a 3-node `size: 3` cluster must lower
+  `size` (and `minSize`) first, in the same or an earlier apply;
+- the cluster is `HEALTH_OK` as a surviving member reports it, so every PG is
+  fully replicated before one copy leaves;
+- no earlier removal is still in progress, and only one member leaves per
+  apply.
+
+The plan lists the leaving member and warns when 2 monitors remain (no
+quorum tolerance). The reconciler then asks a survivor to `ceph osd out` the
+leaving host's OSDs (`DrainCephHost`) and holds the removal, with
+`health_message` reporting how many PGs are not yet `active+clean`, until
+the data has moved. Only then does the leaving node stop its mon/mgr, purge
+and zap its OSDs, drop `kcore.ceph` from its system configuration, and a
+survivor runs `ceph mon rm`. Re-adding the node to the spec before the
+teardown ran cancels the removal.
+
 ## Phase 2 — RBD VM disks
 
 ```bash
@@ -185,6 +207,7 @@ Prefer a dedicated fabric for `clusterNetwork` (replication) and a separate `pub
 - Never point `osdDevice` at the OS disk.
 - Default `forceWipe: false` refuses OSD prepare when signatures exist.
 - Keep Ceph replication off a congested management NIC.
+- Removing a member is refused while it would leave fewer hosts than `size`, while the cluster is not `HEALTH_OK`, or while another removal is draining; see [Removing a member](#removing-a-member).
 - Live migration needs TCP 18000–18127 open between members (see [`vm-migration.md`](./vm-migration.md)).
 - A migration that fails with `ALREADY_EXISTS` usually means a **stranded receive session** on the destination, left behind when the controller died mid-migration. There is no automatic reaping — a wrong liveness guess would destroy a live receive — so inspect with `kctl get migrate-session <vm>` and clear with `kctl migrate reset-session <vm> --node <id> --force`. See [Runbook: a stranded receive session](./vm-migration.md#runbook-a-stranded-receive-session).
 

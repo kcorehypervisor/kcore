@@ -32,6 +32,7 @@
 | Storage | [storage.md](./storage.md) |
 | kcore SAN (Ceph) | [ceph.md](./ceph.md) |
 | VM migration (cold / live) | [vm-migration.md](./vm-migration.md) |
+| Ceph ops and VM movement: open gaps | [storage-and-mobility-gaps.md](./storage-and-mobility-gaps.md) |
 | Windows guests | [windows-guests.md](./windows-guests.md) |
 | Containerd support | [support-for-containerd.md](./support-for-containerd.md) |
 | Zero-external resolution | [zero-external-resolution-algorithm.md](./zero-external-resolution-algorithm.md) |
