@@ -216,6 +216,11 @@ let
         unmap_one() {
           local DEV
           DEV="$(nbd_dev "$1")"
+          # An open LUKS mapper stacked on the nbd keeps it mapped; the node
+          # agent unmaps it when the volume is locked on detach.
+          if [ -n "$DEV" ] && [ -n "$(ls -A "/sys/block/$(basename "$DEV")/holders" 2>/dev/null)" ]; then
+            return 0
+          fi
           if [ -n "$DEV" ]; then
             blockdev --flushbufs "$DEV" || true
             rbd device unmap -t nbd "$DEV" || true
@@ -224,11 +229,6 @@ let
         }
         unmap_one "${cfg.rbdPool}/${rbdImage}"
         ${lib.concatMapStrings (disk: ''
-          ${lib.optionalString disk.encrypted ''
-            if [ -e "/dev/mapper/${disk.mapperName}" ]; then
-              ${pkgs.cryptsetup}/bin/cryptsetup close "${disk.mapperName}" || true
-            fi
-          ''}
           unmap_one "${cfg.rbdPool}/${disk.rbdImage}"
         '') vmCfg.dataDisks}
       '';

@@ -135,13 +135,36 @@ fn table_backing_device(table: &str) -> Option<(u64, u64)> {
     Some((maj.parse().ok()?, min.parse().ok()?))
 }
 
+/// `/dev/nbdN` under an open crypt mapper, if any.
+fn backing_nbd(mapper_name: &str) -> Option<String> {
+    let out = Command::new("dmsetup")
+        .args(["table", mapper_name.trim()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let (major, minor) = table_backing_device(&String::from_utf8_lossy(&out.stdout))?;
+    let link = std::fs::read_link(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    let name = link.file_name()?.to_str()?;
+    name.starts_with("nbd").then(|| format!("/dev/{name}"))
+}
+
+/// Close the mapper and release the nbd it was holding mapped.
 pub fn close(mapper_name: &str) -> Result<(), String> {
     validate_mapper_name(mapper_name)?;
     let mapped = mapper_path(mapper_name);
     if !std::path::Path::new(&mapped).exists() {
         return Ok(());
     }
-    run_cryptsetup(&["close", mapper_name.trim()])
+    let nbd = backing_nbd(mapper_name);
+    run_cryptsetup(&["close", mapper_name.trim()])?;
+    if let Some(dev) = nbd {
+        if let Err(e) = crate::rbd_nbd::unmap_device(&dev) {
+            tracing::warn!(device = %dev, error = %e, "nbd left mapped after closing mapper");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
