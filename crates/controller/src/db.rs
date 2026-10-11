@@ -668,6 +668,7 @@ pub const SCHEMA_VERSION: i32 = 49;
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+const OUTBOX_VACUUM_FREE_BYTES: i64 = 8 * 1024 * 1024;
 
 impl Database {
     pub fn open(path: &str) -> Result<Self> {
@@ -1895,6 +1896,41 @@ impl Database {
             }
         }
         Ok(rows)
+    }
+
+    /// Bound `replication_outbox` growth. Superseded heartbeats (all but the newest
+    /// per node) are dropped after `heartbeat_secs`; every other event is dropped
+    /// after `max_age_secs`. Returns the number of rows removed. When enough free
+    /// pages accumulate the file is vacuumed so snapshots shrink too.
+    pub fn prune_replication_outbox(
+        &self,
+        heartbeat_secs: i64,
+        max_age_secs: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let hb_cutoff = format!("-{} seconds", heartbeat_secs.max(0));
+        let age_cutoff = format!("-{} seconds", max_age_secs.max(0));
+        let mut removed = conn.execute(
+            "DELETE FROM replication_outbox
+             WHERE event_type = 'node.heartbeat'
+               AND created_at < datetime('now', ?1)
+               AND id NOT IN (
+                   SELECT MAX(id) FROM replication_outbox
+                   WHERE event_type = 'node.heartbeat'
+                   GROUP BY resource_key
+               )",
+            params![hb_cutoff],
+        )?;
+        removed += conn.execute(
+            "DELETE FROM replication_outbox WHERE created_at < datetime('now', ?1)",
+            params![age_cutoff],
+        )?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        if free_pages.saturating_mul(page_size) >= OUTBOX_VACUUM_FREE_BYTES {
+            conn.execute_batch("VACUUM")?;
+        }
+        Ok(removed)
     }
 
     pub fn replication_outbox_len(&self) -> Result<i64, rusqlite::Error> {
@@ -7142,6 +7178,45 @@ mod tests {
             .expect("append");
         assert!(id >= 1);
         assert_eq!(db.replication_outbox_len().expect("count"), 1);
+    }
+
+    #[test]
+    fn prune_replication_outbox_drops_superseded_heartbeats_and_old_rows() {
+        let db = Database::open(":memory:").expect("open db");
+        for _ in 0..3 {
+            db.append_replication_outbox("node.heartbeat", "node/a", b"{}")
+                .expect("hb a");
+        }
+        db.append_replication_outbox("node.heartbeat", "node/b", b"{}")
+            .expect("hb b");
+        db.append_replication_outbox("vm.create", "vm/v1", b"{}")
+            .expect("vm");
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE replication_outbox SET created_at = datetime('now', '-2 hours')
+                 WHERE event_type = 'node.heartbeat'",
+                [],
+            )
+            .expect("age");
+        }
+        let removed = db.prune_replication_outbox(3600, 7 * 86400).expect("prune");
+        assert_eq!(removed, 2);
+        assert_eq!(db.replication_outbox_len().expect("len"), 3);
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE replication_outbox SET created_at = datetime('now', '-8 days')
+                 WHERE event_type = 'vm.create'",
+                [],
+            )
+            .expect("age vm");
+        }
+        assert_eq!(
+            db.prune_replication_outbox(3600, 7 * 86400).expect("prune"),
+            1
+        );
+        assert_eq!(db.replication_outbox_len().expect("len"), 2);
     }
 
     #[test]
