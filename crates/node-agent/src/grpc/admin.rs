@@ -1202,7 +1202,8 @@ fn find_vm_ip_in_lease_file(path: &Path, vm_name: &str, vm_mac: Option<&str>) ->
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
     let target_mac = vm_mac.map(|m| m.to_ascii_lowercase());
-    let mut matched_ip: Option<String> = None;
+    // dnsmasq lists the most recently granted lease first, so the first match is
+    // the live one when a deleted VM left an older lease for the same MAC.
     for line in reader.lines().map_while(Result::ok) {
         let Some((mac, ip, hostname)) = parse_lease_entry(&line) else {
             continue;
@@ -1213,10 +1214,10 @@ fn find_vm_ip_in_lease_file(path: &Path, vm_name: &str, vm_mac: Option<&str>) ->
             .unwrap_or(false);
         let host_match = hostname == vm_name;
         if mac_match || host_match {
-            matched_ip = Some(ip.to_string());
+            return Some(ip.to_string());
         }
     }
-    matched_ip
+    None
 }
 
 fn vm_primary_mac(info: &crate::vmm::VmInfo) -> Option<String> {
@@ -4905,6 +4906,21 @@ mod tests {
         let ip_by_mac =
             find_vm_ip_in_lease_file(&lease, "different-name", Some("52:54:00:4b:13:d6"));
         assert_eq!(ip_by_mac.as_deref(), Some("10.240.0.113"));
+    }
+
+    #[test]
+    fn find_vm_ip_prefers_newest_lease_for_recreated_vm() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lease = temp.path().join("dnsmasq-default.leases");
+        std::fs::write(
+            &lease,
+            "0 52:54:00:0d:cf:d4 10.240.0.173 labtest-8 *\n\
+             0 52:54:00:0d:cf:d4 10.240.0.100 * *\n\
+             0 52:54:00:0d:cf:d4 10.240.0.110 * *\n",
+        )
+        .expect("write lease");
+        let ip = find_vm_ip_in_lease_file(&lease, "labtest-8", Some("52:54:00:0d:cf:d4"));
+        assert_eq!(ip.as_deref(), Some("10.240.0.173"));
     }
 
     #[test]
