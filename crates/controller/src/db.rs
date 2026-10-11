@@ -682,7 +682,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 49;
+pub const SCHEMA_VERSION: i32 = 50;
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -1694,6 +1694,50 @@ impl Database {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS pending_node_config_push (
                     node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE
+                );",
+            )?;
+        }
+
+        if version < 50 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
+                    name TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    cluster_cidr TEXT NOT NULL,
+                    service_cidr TEXT NOT NULL,
+                    cluster_dns TEXT NOT NULL,
+                    api_server_endpoint TEXT NOT NULL,
+                    cni TEXT NOT NULL DEFAULT 'cilium',
+                    phase TEXT NOT NULL DEFAULT 'pending',
+                    status_message TEXT NOT NULL DEFAULT '',
+                    ready_control_planes INTEGER NOT NULL DEFAULT 0,
+                    ready_workers INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS kubernetes_cluster_nodes (
+                    cluster_name TEXT NOT NULL REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    advertise_address TEXT NOT NULL,
+                    iface TEXT NOT NULL,
+                    initial_cluster INTEGER NOT NULL DEFAULT 0,
+                    join_existing INTEGER NOT NULL DEFAULT 0,
+                    kubelet_ready INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (cluster_name, node_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_cluster ON kubernetes_cluster_nodes(cluster_name);
+                CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_node ON kubernetes_cluster_nodes(node_id);
+                CREATE TABLE IF NOT EXISTS kubernetes_cluster_config (
+                    cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    ha_enabled INTEGER NOT NULL DEFAULT 0,
+                    vip_address TEXT NOT NULL DEFAULT '',
+                    vip_interface TEXT NOT NULL DEFAULT '',
+                    cilium_mode TEXT NOT NULL DEFAULT 'native-routing',
+                    cilium_mtu INTEGER NOT NULL DEFAULT 1500,
+                    cilium_tunnel TEXT NOT NULL DEFAULT 'disabled',
+                    cilium_auto_direct_routes INTEGER NOT NULL DEFAULT 1,
+                    cilium_lb_ip_pools TEXT NOT NULL DEFAULT ''
                 );",
             )?;
         }
