@@ -1842,7 +1842,7 @@ impl ControllerService {
                     .attach_volume(node_proto::AttachVolumeRequest {
                         backend_handle: format!("{}/{}", vol.pool, vol.image),
                         vm_id: vm.id.clone(),
-                        target_device: String::new(),
+                        target_device: vol.serial.clone(),
                         bus: "virtio".into(),
                     })
                     .await
