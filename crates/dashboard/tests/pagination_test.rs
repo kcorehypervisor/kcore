@@ -867,6 +867,62 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<GetPkiStatusResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+
+    async fn plan_kubernetes_cluster(
+        &self,
+        _: TRequest<PlanKubernetesClusterRequest>,
+    ) -> Result<Response<PlanKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn create_kubernetes_cluster(
+        &self,
+        _: TRequest<CreateKubernetesClusterRequest>,
+    ) -> Result<Response<CreateKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn update_kubernetes_cluster(
+        &self,
+        _: TRequest<UpdateKubernetesClusterRequest>,
+    ) -> Result<Response<UpdateKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_kubernetes_cluster(
+        &self,
+        _: TRequest<GetKubernetesClusterRequest>,
+    ) -> Result<Response<GetKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn list_kubernetes_clusters(
+        &self,
+        _: TRequest<ListKubernetesClustersRequest>,
+    ) -> Result<Response<ListKubernetesClustersResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn delete_kubernetes_cluster(
+        &self,
+        _: TRequest<DeleteKubernetesClusterRequest>,
+    ) -> Result<Response<DeleteKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn scale_kubernetes_cluster(
+        &self,
+        _: TRequest<ScaleKubernetesClusterRequest>,
+    ) -> Result<Response<ScaleKubernetesClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_kubernetes_cluster_health(
+        &self,
+        _: TRequest<GetKubernetesClusterHealthRequest>,
+    ) -> Result<Response<GetKubernetesClusterHealthResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
 }
 
 async fn spawn_many_vms_controller() -> SocketAddr {

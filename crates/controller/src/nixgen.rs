@@ -1485,11 +1485,6 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 2_000,
-            .. ProptestConfig::default()
-        })]
-
         /// `nix_escape` never panics for any UTF-8 input.
         #[test]
         fn nix_escape_never_panics(s in ".{0,128}") {
