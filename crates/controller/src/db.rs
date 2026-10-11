@@ -9199,3 +9199,7 @@ mod proptests {
         assert_eq!(keys[0].0, "n1");
     }
 }
+
+#[cfg(test)]
+#[path = "db_kubernetes_tests.rs"]
+mod kubernetes_tests;
