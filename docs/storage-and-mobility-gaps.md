@@ -55,6 +55,9 @@ blocks routine day-2 work, P2 is operational comfort.
 - Automatic failover blocklists the lost node's Ceph clients
   (`NodeStorage.FenceVolume`) before a Ceph VM is reassigned, and leaves the
   VM alone when the image is open from anywhere else.
+- `kctl attach volume` / `kctl detach volume` on a running Ceph VM
+  (hotplug) work: the map carries the volume serial, and hot-remove resolves
+  that serial to Cloud Hypervisor's device id.
 - The node agent only probes `<vm>.sock` for `vm.info`, never the serial
   console socket next to it, and gives up on a VMM after 5 s instead of
   stalling the heartbeat.
