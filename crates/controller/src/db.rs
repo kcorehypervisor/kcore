@@ -322,6 +322,48 @@ pub struct ObjectStoreRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct KubernetesClusterRow {
+    pub name: String,
+    pub generation: i64,
+    pub cluster_cidr: String,
+    pub service_cidr: String,
+    pub cluster_dns: String,
+    pub api_server_endpoint: String,
+    pub cni: String,
+    pub phase: String,
+    pub status_message: String,
+    pub ready_control_planes: i32,
+    pub ready_workers: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct KubernetesClusterNodeRow {
+    pub cluster_name: String,
+    pub node_id: String,
+    pub role: String,
+    pub advertise_address: String,
+    pub iface: String,
+    pub initial_cluster: bool,
+    pub join_existing: bool,
+    pub kubelet_ready: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct KubernetesClusterConfigRow {
+    pub cluster_name: String,
+    pub ha_enabled: bool,
+    pub vip_address: String,
+    pub vip_interface: String,
+    pub cilium_mode: String,
+    pub cilium_mtu: i32,
+    pub cilium_tunnel: String,
+    pub cilium_auto_direct_routes: bool,
+    pub cilium_lb_ip_pools: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ObjectStoreStatusRow {
     pub name: String,
     pub observed_generation: i64,
@@ -682,7 +724,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 49;
+pub const SCHEMA_VERSION: i32 = 50;
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -1694,6 +1736,50 @@ impl Database {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS pending_node_config_push (
                     node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE
+                );",
+            )?;
+        }
+
+        if version < 50 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
+                    name TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    cluster_cidr TEXT NOT NULL,
+                    service_cidr TEXT NOT NULL,
+                    cluster_dns TEXT NOT NULL,
+                    api_server_endpoint TEXT NOT NULL,
+                    cni TEXT NOT NULL DEFAULT 'cilium',
+                    phase TEXT NOT NULL DEFAULT 'pending',
+                    status_message TEXT NOT NULL DEFAULT '',
+                    ready_control_planes INTEGER NOT NULL DEFAULT 0,
+                    ready_workers INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS kubernetes_cluster_nodes (
+                    cluster_name TEXT NOT NULL REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    advertise_address TEXT NOT NULL,
+                    iface TEXT NOT NULL,
+                    initial_cluster INTEGER NOT NULL DEFAULT 0,
+                    join_existing INTEGER NOT NULL DEFAULT 0,
+                    kubelet_ready INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (cluster_name, node_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_cluster ON kubernetes_cluster_nodes(cluster_name);
+                CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_node ON kubernetes_cluster_nodes(node_id);
+                CREATE TABLE IF NOT EXISTS kubernetes_cluster_config (
+                    cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    ha_enabled INTEGER NOT NULL DEFAULT 0,
+                    vip_address TEXT NOT NULL DEFAULT '',
+                    vip_interface TEXT NOT NULL DEFAULT '',
+                    cilium_mode TEXT NOT NULL DEFAULT 'native-routing',
+                    cilium_mtu INTEGER NOT NULL DEFAULT 1500,
+                    cilium_tunnel TEXT NOT NULL DEFAULT 'disabled',
+                    cilium_auto_direct_routes INTEGER NOT NULL DEFAULT 1,
+                    cilium_lb_ip_pools TEXT NOT NULL DEFAULT ''
                 );",
             )?;
         }
@@ -6271,6 +6357,196 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // ============================================================================
+    // Kubernetes Cluster Management
+    // ============================================================================
+
+    pub fn upsert_kubernetes_cluster(&self, row: &KubernetesClusterRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO kubernetes_clusters (
+                name, generation, cluster_cidr, service_cidr, cluster_dns,
+                api_server_endpoint, cni, phase, status_message,
+                ready_control_planes, ready_workers, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                COALESCE(NULLIF(?12, ''), datetime('now')), datetime('now'))
+            ON CONFLICT(name) DO UPDATE SET
+                generation=excluded.generation,
+                cluster_cidr=excluded.cluster_cidr,
+                service_cidr=excluded.service_cidr,
+                cluster_dns=excluded.cluster_dns,
+                api_server_endpoint=excluded.api_server_endpoint,
+                cni=excluded.cni,
+                phase=excluded.phase,
+                status_message=excluded.status_message,
+                ready_control_planes=excluded.ready_control_planes,
+                ready_workers=excluded.ready_workers,
+                updated_at=datetime('now')",
+            params![
+                row.name, row.generation, row.cluster_cidr, row.service_cidr,
+                row.cluster_dns, row.api_server_endpoint, row.cni, row.phase,
+                row.status_message, row.ready_control_planes, row.ready_workers,
+                row.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_kubernetes_cluster(&self, name: &str) -> Result<Option<KubernetesClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, cluster_cidr, service_cidr, cluster_dns,
+                    api_server_endpoint, cni, phase, status_message,
+                    ready_control_planes, ready_workers, created_at, updated_at
+             FROM kubernetes_clusters WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(KubernetesClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                cluster_cidr: r.get(2)?,
+                service_cidr: r.get(3)?,
+                cluster_dns: r.get(4)?,
+                api_server_endpoint: r.get(5)?,
+                cni: r.get(6)?,
+                phase: r.get(7)?,
+                status_message: r.get(8)?,
+                ready_control_planes: r.get(9)?,
+                ready_workers: r.get(10)?,
+                created_at: r.get(11)?,
+                updated_at: r.get(12)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_kubernetes_clusters(&self) -> Result<Vec<KubernetesClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, cluster_cidr, service_cidr, cluster_dns,
+                    api_server_endpoint, cni, phase, status_message,
+                    ready_control_planes, ready_workers, created_at, updated_at
+             FROM kubernetes_clusters ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(KubernetesClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                cluster_cidr: r.get(2)?,
+                service_cidr: r.get(3)?,
+                cluster_dns: r.get(4)?,
+                api_server_endpoint: r.get(5)?,
+                cni: r.get(6)?,
+                phase: r.get(7)?,
+                status_message: r.get(8)?,
+                ready_control_planes: r.get(9)?,
+                ready_workers: r.get(10)?,
+                created_at: r.get(11)?,
+                updated_at: r.get(12)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_kubernetes_cluster(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute("DELETE FROM kubernetes_clusters WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn upsert_kubernetes_cluster_node(&self, row: &KubernetesClusterNodeRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO kubernetes_cluster_nodes (
+                cluster_name, node_id, role, advertise_address, iface,
+                initial_cluster, join_existing, kubelet_ready
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(cluster_name, node_id) DO UPDATE SET
+                role=excluded.role,
+                advertise_address=excluded.advertise_address,
+                iface=excluded.iface,
+                initial_cluster=excluded.initial_cluster,
+                join_existing=excluded.join_existing,
+                kubelet_ready=excluded.kubelet_ready",
+            params![
+                row.cluster_name, row.node_id, row.role, row.advertise_address,
+                row.iface, row.initial_cluster, row.join_existing, row.kubelet_ready
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_kubernetes_cluster_nodes(&self, cluster_name: &str) -> Result<Vec<KubernetesClusterNodeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT cluster_name, node_id, role, advertise_address, iface,
+                    initial_cluster, join_existing, kubelet_ready
+             FROM kubernetes_cluster_nodes WHERE cluster_name=?1 ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map(params![cluster_name], |r| {
+            Ok(KubernetesClusterNodeRow {
+                cluster_name: r.get(0)?,
+                node_id: r.get(1)?,
+                role: r.get(2)?,
+                advertise_address: r.get(3)?,
+                iface: r.get(4)?,
+                initial_cluster: r.get(5)?,
+                join_existing: r.get(6)?,
+                kubelet_ready: r.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn upsert_kubernetes_cluster_config(&self, row: &KubernetesClusterConfigRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO kubernetes_cluster_config (
+                cluster_name, ha_enabled, vip_address, vip_interface,
+                cilium_mode, cilium_mtu, cilium_tunnel, cilium_auto_direct_routes,
+                cilium_lb_ip_pools
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(cluster_name) DO UPDATE SET
+                ha_enabled=excluded.ha_enabled,
+                vip_address=excluded.vip_address,
+                vip_interface=excluded.vip_interface,
+                cilium_mode=excluded.cilium_mode,
+                cilium_mtu=excluded.cilium_mtu,
+                cilium_tunnel=excluded.cilium_tunnel,
+                cilium_auto_direct_routes=excluded.cilium_auto_direct_routes,
+                cilium_lb_ip_pools=excluded.cilium_lb_ip_pools",
+            params![
+                row.cluster_name, row.ha_enabled, row.vip_address, row.vip_interface,
+                row.cilium_mode, row.cilium_mtu, row.cilium_tunnel,
+                row.cilium_auto_direct_routes, row.cilium_lb_ip_pools
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_kubernetes_cluster_config(&self, cluster_name: &str) -> Result<Option<KubernetesClusterConfigRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT cluster_name, ha_enabled, vip_address, vip_interface,
+                    cilium_mode, cilium_mtu, cilium_tunnel, cilium_auto_direct_routes,
+                    cilium_lb_ip_pools
+             FROM kubernetes_cluster_config WHERE cluster_name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![cluster_name], |r| {
+            Ok(KubernetesClusterConfigRow {
+                cluster_name: r.get(0)?,
+                ha_enabled: r.get(1)?,
+                vip_address: r.get(2)?,
+                vip_interface: r.get(3)?,
+                cilium_mode: r.get(4)?,
+                cilium_mtu: r.get(5)?,
+                cilium_tunnel: r.get(6)?,
+                cilium_auto_direct_routes: r.get(7)?,
+                cilium_lb_ip_pools: r.get(8)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
 }
 
 const ISSUED_CERT_SELECT: &str = "SELECT serial_hex, subject_cn, identity_kind, node_id, issuer_cn,
@@ -8923,3 +9199,7 @@ mod proptests {
         assert_eq!(keys[0].0, "n1");
     }
 }
+
+#[cfg(test)]
+#[path = "db_kubernetes_tests.rs"]
+mod kubernetes_tests;

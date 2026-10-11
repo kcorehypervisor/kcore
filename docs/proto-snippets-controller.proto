@@ -1,0 +1,200 @@
+// ============================================================================
+// Kubernetes Cluster Management - Protocol Buffer Definitions
+// ============================================================================
+//
+// Add this section to proto/controller.proto in the Controller service
+// and the corresponding messages at the end of the file.
+//
+// Usage:
+// 1. Copy the RPC definitions to the Controller service block
+// 2. Copy the message definitions to the end of controller.proto
+// 3. Run: buf generate
+// 4. Verify: cargo check -p kcore-controller
+
+// ============================================================================
+// RPCs - Add to Controller service
+// ============================================================================
+
+// Kubernetes cluster lifecycle
+rpc PlanKubernetesCluster(PlanKubernetesClusterRequest) returns (PlanKubernetesClusterResponse);
+rpc CreateKubernetesCluster(CreateKubernetesClusterRequest) returns (CreateKubernetesClusterResponse);
+rpc UpdateKubernetesCluster(UpdateKubernetesClusterRequest) returns (UpdateKubernetesClusterResponse);
+rpc GetKubernetesCluster(GetKubernetesClusterRequest) returns (GetKubernetesClusterResponse);
+rpc ListKubernetesClusters(ListKubernetesClustersRequest) returns (ListKubernetesClustersResponse);
+rpc DeleteKubernetesCluster(DeleteKubernetesClusterRequest) returns (DeleteKubernetesClusterResponse);
+rpc ScaleKubernetesCluster(ScaleKubernetesClusterRequest) returns (ScaleKubernetesClusterResponse);
+rpc GetKubernetesClusterHealth(GetKubernetesClusterHealthRequest) returns (GetKubernetesClusterHealthResponse);
+
+// ============================================================================
+// Message Definitions - Add to end of controller.proto
+// ============================================================================
+
+// Calico CNI configuration
+message CalicoConfig {
+  string mode = 1;                  // "vxlan", "bgp", "vxlan-bgp"
+  int32 mtu = 2;                    // Default 1450 for VXLAN
+  string ipip_mode = 3;             // "Never", "Always", "CrossSubnet"
+  string vxlan_mode = 4;            // "Never", "Always", "CrossSubnet"
+  bool nat_outgoing = 5;            // SNAT for pod-to-external traffic
+  repeated string bgp_peers = 6;    // Format: "ASN:IP" e.g. "65000:192.168.40.1"
+}
+
+// Per-node Kubernetes configuration
+message KubernetesNodeSpec {
+  string node_id = 1;               // Must match existing kcore node ID
+  string role = 2;                  // "control-plane" or "worker"
+  string advertise_address = 3;     // Static IP this node advertises
+  string iface = 4;                 // Physical NIC (e.g., "enp6s0")
+  bool initial_cluster = 5;         // true only for bootstrap control plane
+  bool join_existing = 6;           // true for additional control planes
+}
+
+// High availability configuration
+message HighAvailabilityConfig {
+  bool enabled = 1;
+  string vip_address = 2;           // Virtual IP for kube-apiserver
+  string vip_interface = 3;         // NIC to bind VIP
+  string method = 4;                // "keepalived" (kcore-managed)
+}
+
+// Kubernetes cluster specification
+message KubernetesClusterSpec {
+  string cluster_cidr = 1;          // Pod network CIDR (e.g., "10.244.0.0/16")
+  string service_cidr = 2;          // Service CIDR (e.g., "10.96.0.0/12")
+  string cluster_dns = 3;           // DNS service IP (e.g., "10.96.0.10")
+  string api_server_endpoint = 4;   // VIP:port or first control plane
+  string cni = 5;                   // "calico" (not "flannel")
+  CalicoConfig calico_config = 6;
+  repeated KubernetesNodeSpec control_plane_nodes = 7;
+  repeated KubernetesNodeSpec worker_nodes = 8;
+  HighAvailabilityConfig high_availability = 9;
+}
+
+// Kubernetes cluster status
+message KubernetesClusterStatus {
+  string phase = 1;                 // pending, bootstrapping, scaling, ready, degraded, failed
+  string message = 2;               // Human-readable status
+  int32 ready_control_planes = 3;   // Count of Ready control planes
+  int32 ready_workers = 4;          // Count of Ready workers
+  google.protobuf.Timestamp last_updated = 5;
+  repeated string active_node_ids = 6;  // Node IDs currently in cluster
+}
+
+// Complete Kubernetes cluster resource
+message KubernetesCluster {
+  string name = 1;                  // Unique cluster name
+  int64 generation = 2;             // Incremented on each update
+  KubernetesClusterSpec spec = 3;
+  KubernetesClusterStatus status = 4;
+}
+
+// ============================================================================
+// Request/Response Messages
+// ============================================================================
+
+// Plan a Kubernetes cluster (dry-run)
+message PlanKubernetesClusterRequest {
+  string name = 1;
+  KubernetesClusterSpec spec = 2;
+}
+
+message NodePlanResult {
+  string node_id = 1;
+  bool preflight_passed = 2;        // All checks passed
+  repeated string issues = 3;       // Blocking issues found
+  string nix_action = 4;            // "build", "rebuild", "no-change"
+}
+
+message PlanKubernetesClusterResponse {
+  string action = 1;                // "create", "update", "replace", "unchanged"
+  repeated string blocking_issues = 2;
+  repeated string warnings = 3;
+  repeated NodePlanResult node_plans = 4;
+  string rendered_nix_preview = 5;  // Show operator what Nix will be applied
+}
+
+// Create a new Kubernetes cluster
+message CreateKubernetesClusterRequest {
+  string name = 1;
+  KubernetesClusterSpec spec = 2;
+  bool confirm = 3;                 // Must be true after successful plan
+}
+
+message CreateKubernetesClusterResponse {
+  KubernetesCluster cluster = 1;
+}
+
+// Update an existing Kubernetes cluster
+message UpdateKubernetesClusterRequest {
+  string name = 1;
+  KubernetesClusterSpec spec = 2;
+  bool confirm = 3;
+}
+
+message UpdateKubernetesClusterResponse {
+  KubernetesCluster cluster = 1;
+}
+
+// Get a Kubernetes cluster
+message GetKubernetesClusterRequest {
+  string name = 1;
+}
+
+message GetKubernetesClusterResponse {
+  KubernetesCluster cluster = 1;
+}
+
+// List all Kubernetes clusters
+message ListKubernetesClustersRequest {}
+
+message ListKubernetesClustersResponse {
+  repeated KubernetesCluster clusters = 1;
+}
+
+// Delete a Kubernetes cluster
+message DeleteKubernetesClusterRequest {
+  string name = 1;
+  bool confirm = 2;                 // Must be true
+  bool force = 3;                   // Delete even if nodes unreachable
+}
+
+message DeleteKubernetesClusterResponse {
+  string message = 1;
+}
+
+// Scale a Kubernetes cluster (add/remove nodes)
+message ScaleKubernetesClusterRequest {
+  string name = 1;
+  repeated KubernetesNodeSpec add_nodes = 2;
+  repeated string remove_node_ids = 3;
+  bool confirm = 4;
+}
+
+message ScaleKubernetesClusterResponse {
+  KubernetesCluster cluster = 1;
+}
+
+// Get cluster health status
+message GetKubernetesClusterHealthRequest {
+  string name = 1;
+}
+
+message NodeHealth {
+  string node_id = 1;
+  string kubernetes_status = 2;     // "Ready", "NotReady", "Unknown"
+  bool kubelet_active = 3;
+  bool etcd_active = 4;             // Only for control planes
+  bool api_server_active = 5;       // Only for control planes
+}
+
+message GetKubernetesClusterHealthResponse {
+  string overall_health = 1;        // "healthy", "degraded", "critical"
+  int32 ready_control_planes = 2;
+  int32 total_control_planes = 3;
+  int32 ready_workers = 4;
+  int32 total_workers = 5;
+  bool etcd_healthy = 6;
+  int32 etcd_member_count = 7;
+  bool api_server_reachable = 8;
+  repeated NodeHealth node_health = 9;
+}

@@ -1,0 +1,194 @@
+// ============================================================================
+// Node Agent Kubernetes Configuration - Protocol Buffer Definitions
+// ============================================================================
+//
+// Add this section to proto/node.proto in the NodeAdmin service
+// and the corresponding messages at the end of the file.
+//
+// Usage:
+// 1. Copy the RPC definitions to the NodeAdmin service block
+// 2. Copy the message definitions to the end of node.proto
+// 3. Run: buf generate
+// 4. Verify: cargo check -p kcore-node-agent
+
+// ============================================================================
+// RPCs - Add to NodeAdmin service
+// ============================================================================
+
+// Apply Kubernetes configuration to this node
+rpc ApplyKubernetesConfig(ApplyKubernetesConfigRequest) returns (ApplyKubernetesConfigResponse);
+
+// Get current Kubernetes status on this node
+rpc GetKubernetesStatus(GetKubernetesStatusRequest) returns (GetKubernetesStatusResponse);
+
+// Drain this Kubernetes node (move pods to other nodes)
+rpc DrainKubernetesNode(DrainKubernetesNodeRequest) returns (DrainKubernetesNodeResponse);
+
+// ============================================================================
+// Message Definitions - Add to end of node.proto
+// ============================================================================
+
+// Apply Kubernetes configuration (called by controller during create/update)
+message ApplyKubernetesConfigRequest {
+  // Node role
+  string role = 1;                  // "control-plane" or "worker"
+  
+  // Cluster identity
+  string cluster_name = 2;
+  string cluster_cidr = 3;          // Pod network CIDR
+  string service_cidr = 4;          // Service CIDR
+  string cluster_dns = 5;           // DNS service IP
+  
+  // Node-specific configuration
+  string advertise_address = 6;     // This node's IP
+  string iface = 7;                 // Physical NIC
+  string api_server_endpoint = 8;   // VIP:port or first control plane
+  bool initial_cluster = 9;         // true only for bootstrap control plane
+  
+  // CNI configuration
+  string cni = 10;                  // "calico"
+  CalicoConfig calico_config = 11;  // Calico-specific settings
+  
+  // etcd configuration (control plane only)
+  string etcd_initial_cluster = 12; // "node1=https://ip1:2380,node2=https://ip2:2380,..."
+  
+  // High availability (control plane only)
+  bool ha_enabled = 13;
+  string vip_address = 14;          // Virtual IP for keepalived
+  string vip_interface = 15;        // NIC to bind VIP
+  
+  // Bootstrap data
+  bytes kubeconfig_data = 16;       // For workers and additional control planes
+}
+
+// Note: CalicoConfig is defined in controller.proto, imported here
+message CalicoConfig {
+  string mode = 1;
+  int32 mtu = 2;
+  string ipip_mode = 3;
+  string vxlan_mode = 4;
+  bool nat_outgoing = 5;
+  repeated string bgp_peers = 6;
+}
+
+message ApplyKubernetesConfigResponse {
+  string apply_id = 1;              // Unique ID for this apply operation
+  string status = 2;                // "started", "completed", "failed"
+  string message = 3;               // Human-readable result
+}
+
+// Get Kubernetes status on this node
+message GetKubernetesStatusRequest {}
+
+message GetKubernetesStatusResponse {
+  bool enabled = 1;                 // Kubernetes enabled in NixOS config
+  string role = 2;                  // "control-plane", "worker", or ""
+  
+  // Service status
+  bool kubelet_active = 3;
+  bool api_server_active = 4;       // control-plane only
+  bool etcd_active = 5;             // control-plane only
+  bool calico_node_active = 6;
+  
+  // Kubernetes status
+  string node_status = 7;           // From kubectl get nodes (Ready/NotReady)
+  int32 running_pods = 8;           // Number of pods on this node
+}
+
+// Drain this node (cordon + evict pods)
+message DrainKubernetesNodeRequest {
+  bool delete_emptydir_data = 1;    // Allow deleting pods with emptyDir
+  bool ignore_daemonsets = 2;       // Ignore DaemonSet pods
+  int32 timeout_seconds = 3;        // Timeout for drain (default 300)
+}
+
+message DrainKubernetesNodeResponse {
+  string status = 1;                // "completed", "partial", "failed"
+  string message = 2;               // Details about drain result
+}
+
+// ============================================================================
+// Example Usage from Controller
+// ============================================================================
+
+// 1. Bootstrap first control plane:
+//
+// ApplyKubernetesConfigRequest {
+//   role: "control-plane",
+//   cluster_name: "lab-ha",
+//   cluster_cidr: "10.244.0.0/16",
+//   service_cidr: "10.96.0.0/12",
+//   cluster_dns: "10.96.0.10",
+//   advertise_address: "192.168.40.105",
+//   iface: "enp6s0",
+//   api_server_endpoint: "192.168.40.200:6443",
+//   initial_cluster: true,
+//   cni: "calico",
+//   calico_config: {
+//     mode: "vxlan",
+//     mtu: 1450,
+//     vxlan_mode: "Always",
+//     nat_outgoing: true,
+//   },
+//   etcd_initial_cluster: "node-105=https://192.168.40.105:2380,node-107=https://192.168.40.107:2380,node-119=https://192.168.40.119:2380",
+//   ha_enabled: true,
+//   vip_address: "192.168.40.200",
+//   vip_interface: "enp6s0",
+// }
+
+// 2. Join additional control plane:
+//
+// ApplyKubernetesConfigRequest {
+//   role: "control-plane",
+//   initial_cluster: false,
+//   kubeconfig_data: <bytes from bootstrap node>,
+//   etcd_initial_cluster: "...",
+//   // ... rest same as bootstrap
+// }
+
+// 3. Join worker:
+//
+// ApplyKubernetesConfigRequest {
+//   role: "worker",
+//   cluster_name: "lab-ha",
+//   advertise_address: "192.168.40.103",
+//   iface: "enp6s0",
+//   api_server_endpoint: "192.168.40.200:6443",
+//   initial_cluster: false,
+//   cni: "calico",
+//   calico_config: { ... },
+//   kubeconfig_data: <bytes from bootstrap node>,
+// }
+
+// ============================================================================
+// Node Agent Implementation Notes
+// ============================================================================
+
+// The node agent will:
+// 1. Validate all fields
+// 2. Generate /etc/nixos/kcore-kubernetes.nix from the request
+// 3. Copy modules/kcore-kubernetes.nix from embedded binary
+// 4. Write kubeconfig to /var/lib/kubernetes/admin.conf (if provided)
+// 5. Run nixos-rebuild test (under apply lock)
+// 6. Run nixos-rebuild switch
+// 7. Verify services are active (kubelet, apiserver, etcd)
+// 8. Return success/failure
+
+// All string fields are escaped through nix_escape() before writing to .nix file.
+// The apply lock prevents concurrent VM/Ceph/Kubernetes applies on the same node.
+
+// ============================================================================
+// Testing
+// ============================================================================
+
+// Unit tests:
+// - Test Nix rendering with various configurations
+// - Test escaping of special characters
+// - Test validation of required fields
+// - Test service verification logic
+
+// Integration tests:
+// - Mock controller calling ApplyKubernetesConfig
+// - Verify Nix files are written correctly
+// - Verify nixos-rebuild is called
+// - Verify service status checks

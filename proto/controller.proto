@@ -208,6 +208,16 @@ service Controller {
   rpc GrantOperatorRole(GrantOperatorRoleRequest) returns (GrantOperatorRoleResponse);
   rpc RevokeOperatorRole(RevokeOperatorRoleRequest) returns (RevokeOperatorRoleResponse);
   rpc IssueOperatorCert(IssueOperatorCertRequest) returns (IssueOperatorCertResponse);
+  
+  // Kubernetes cluster lifecycle
+  rpc PlanKubernetesCluster(PlanKubernetesClusterRequest) returns (PlanKubernetesClusterResponse);
+  rpc CreateKubernetesCluster(CreateKubernetesClusterRequest) returns (CreateKubernetesClusterResponse);
+  rpc UpdateKubernetesCluster(UpdateKubernetesClusterRequest) returns (UpdateKubernetesClusterResponse);
+  rpc GetKubernetesCluster(GetKubernetesClusterRequest) returns (GetKubernetesClusterResponse);
+  rpc ListKubernetesClusters(ListKubernetesClustersRequest) returns (ListKubernetesClustersResponse);
+  rpc DeleteKubernetesCluster(DeleteKubernetesClusterRequest) returns (DeleteKubernetesClusterResponse);
+  rpc ScaleKubernetesCluster(ScaleKubernetesClusterRequest) returns (ScaleKubernetesClusterResponse);
+  rpc GetKubernetesClusterHealth(GetKubernetesClusterHealthRequest) returns (GetKubernetesClusterHealthResponse);
 }
 
 message RegisterNodeRequest {
@@ -2421,4 +2431,161 @@ message GetPkiStatusResponse {
   string pki_http_base_url = 16;
   // Active certificates sorted by soonest not_after (at most 20 rows).
   repeated CertificateInfo soonest_expiring = 17;
+}
+
+// ============================================================================
+// Kubernetes Cluster Management
+// ============================================================================
+
+message CiliumConfig {
+  string mode = 1;                  // "native-routing", "tunnel"
+  int32 mtu = 2;                    // Default 1500
+  string tunnel = 3;                // "disabled", "vxlan", "geneve"
+  bool auto_direct_node_routes = 4; // true for native routing
+  repeated string load_balancer_ip_pools = 5;  // CIDR strings like "192.168.40.220/29"
+}
+
+message KubernetesNodeSpec {
+  string node_id = 1;
+  string role = 2;                  // "control-plane" or "worker"
+  string advertise_address = 3;     // Static IP for this node
+  string iface = 4;                 // Physical NIC (e.g., enp6s0)
+  bool initial_cluster = 5;         // true for the first control plane (etcd bootstrap)
+  bool join_existing = 6;           // true for additional control planes
+}
+
+message HighAvailabilityConfig {
+  bool enabled = 1;
+  string vip_address = 2;           // Virtual IP for kube-apiserver
+  string vip_interface = 3;         // NIC to bind VIP
+  string method = 4;                // "keepalived" (kcore-managed)
+}
+
+message KubernetesClusterSpec {
+  string cluster_cidr = 1;
+  string service_cidr = 2;
+  string cluster_dns = 3;
+  string api_server_endpoint = 4;   // VIP:port
+  string cni = 5;                   // "cilium"
+  CiliumConfig cilium_config = 6;
+  repeated KubernetesNodeSpec control_plane_nodes = 7;
+  repeated KubernetesNodeSpec worker_nodes = 8;
+  HighAvailabilityConfig high_availability = 9;
+}
+
+message KubernetesClusterStatus {
+  string phase = 1;                 // pending, bootstrapping, scaling, ready, degraded, failed
+  string message = 2;
+  int32 ready_control_planes = 3;
+  int32 ready_workers = 4;
+  google.protobuf.Timestamp last_updated = 5;
+  repeated string active_node_ids = 6;
+}
+
+message KubernetesCluster {
+  string name = 1;
+  int64 generation = 2;
+  KubernetesClusterSpec spec = 3;
+  KubernetesClusterStatus status = 4;
+}
+
+// RPCs
+
+message PlanKubernetesClusterRequest {
+  string name = 1;
+  KubernetesClusterSpec spec = 2;
+}
+
+message NodePlanResult {
+  string node_id = 1;
+  bool preflight_passed = 2;
+  repeated string issues = 3;
+  string nix_action = 4;            // "build", "rebuild", "no-change"
+}
+
+message PlanKubernetesClusterResponse {
+  string action = 1;                // "create", "update", "replace", "unchanged"
+  repeated string blocking_issues = 2;
+  repeated string warnings = 3;
+  repeated NodePlanResult node_plans = 4;
+  string rendered_nix_preview = 5;
+}
+
+message CreateKubernetesClusterRequest {
+  string name = 1;
+  KubernetesClusterSpec spec = 2;
+  bool confirm = 3;
+}
+
+message CreateKubernetesClusterResponse {
+  KubernetesCluster cluster = 1;
+}
+
+message UpdateKubernetesClusterRequest {
+  string name = 1;
+  KubernetesClusterSpec spec = 2;
+  bool confirm = 3;
+}
+
+message UpdateKubernetesClusterResponse {
+  KubernetesCluster cluster = 1;
+}
+
+message GetKubernetesClusterRequest {
+  string name = 1;
+}
+
+message GetKubernetesClusterResponse {
+  KubernetesCluster cluster = 1;
+}
+
+message ListKubernetesClustersRequest {}
+
+message ListKubernetesClustersResponse {
+  repeated KubernetesCluster clusters = 1;
+}
+
+message DeleteKubernetesClusterRequest {
+  string name = 1;
+  bool confirm = 2;
+  bool force = 3;
+}
+
+message DeleteKubernetesClusterResponse {
+  string message = 1;
+}
+
+message ScaleKubernetesClusterRequest {
+  string name = 1;
+  repeated KubernetesNodeSpec add_nodes = 2;
+  repeated string remove_node_ids = 3;
+  bool confirm = 4;
+}
+
+message ScaleKubernetesClusterResponse {
+  KubernetesCluster cluster = 1;
+}
+
+message GetKubernetesClusterHealthRequest {
+  string name = 1;
+}
+
+message NodeHealth {
+  string node_id = 1;
+  string kubernetes_status = 2;     // "Ready", "NotReady", "Unknown"
+  bool kubelet_active = 3;
+  bool etcd_active = 4;
+  bool api_server_active = 5;
+}
+
+message GetKubernetesClusterHealthResponse {
+  string overall_health = 1;        // "healthy", "degraded", "critical"
+  int32 ready_control_planes = 2;
+  int32 total_control_planes = 3;
+  int32 ready_workers = 4;
+  int32 total_workers = 5;
+  bool etcd_healthy = 6;
+  int32 etcd_member_count = 7;
+  bool api_server_reachable = 8;
+  repeated NodeHealth node_health = 9;
 }
