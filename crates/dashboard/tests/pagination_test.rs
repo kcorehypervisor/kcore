@@ -686,6 +686,13 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    async fn get_ceph_cluster_capacity(
+        &self,
+        _: TRequest<GetCephClusterCapacityRequest>,
+    ) -> Result<Response<GetCephClusterCapacityResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
     async fn create_shared_filesystem(
         &self,
         _: TRequest<CreateSharedFilesystemRequest>,
