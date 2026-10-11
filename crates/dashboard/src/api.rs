@@ -31,10 +31,14 @@ pub async fn get_compliance_dto() -> Result<ComplianceDto, ServerFnError> {
 }
 
 #[server(ListVmsPage, "/api")]
-pub async fn list_vms_page(page: u32) -> Result<VmsPageDto, ServerFnError> {
+pub async fn list_vms_page(page: u32, page_size: u32) -> Result<VmsPageDto, ServerFnError> {
     let cfg = dashboard_config();
     let vms = controller_client::list_vms(cfg).await.map_err(map_err)?;
-    Ok(vms_page_from_proto(vms, page))
+    Ok(vms_page_from_proto(
+        vms,
+        page,
+        crate::format::normalize_page_size(page_size),
+    ))
 }
 
 #[server(ListNetworks, "/api")]
