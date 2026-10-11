@@ -949,7 +949,7 @@ impl ControllerService {
             .list_networks_for_node(&node.id)
             .map_err(|e| Status::internal(format!("listing networks: {e}")))?;
         if let Some(vm) = incoming {
-            if !networks.iter().any(|net| net.name == vm.network) {
+            if vm.network != "default" && !networks.iter().any(|net| net.name == vm.network) {
                 return Err(Status::failed_precondition(format!(
                     "destination node {} has no network '{}' for VM '{}'",
                     node.id, vm.network, vm.name
