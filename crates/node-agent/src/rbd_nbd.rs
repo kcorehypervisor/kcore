@@ -26,7 +26,10 @@ pub fn parse_mapped_device(json: &str, pool: &str, image: &str) -> Option<String
     let entries: serde_json::Value = serde_json::from_str(json).ok()?;
     entries.as_array()?.iter().find_map(|e| {
         let same_image = e.get("pool")?.as_str()? == pool && e.get("image")?.as_str()? == image;
-        let head = matches!(e.get("snap").and_then(|s| s.as_str()), None | Some("-" | ""));
+        let head = matches!(
+            e.get("snap").and_then(|s| s.as_str()),
+            None | Some("-" | "")
+        );
         (same_image && head)
             .then(|| e.get("device").and_then(|d| d.as_str()).map(str::to_string))
             .flatten()
@@ -68,7 +71,18 @@ pub fn map(pool: &str, image: &str) -> Result<PathBuf, String> {
     let _ = Command::new("modprobe").arg("nbd").status();
     let spec = format!("{pool}/{image}");
     let out = Command::new("systemd-run")
-        .args(["--scope", "--quiet", "--collect", "--", "rbd", "device", "map", "-t", "nbd", &spec])
+        .args([
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--",
+            "rbd",
+            "device",
+            "map",
+            "-t",
+            "nbd",
+            &spec,
+        ])
         .output()
         .map_err(|e| format!("rbd-nbd map: {e}"))?;
     if !out.status.success() {
@@ -91,7 +105,10 @@ pub fn map(pool: &str, image: &str) -> Result<PathBuf, String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(format!("{} did not appear after map", device_link(pool, image).display()))
+    Err(format!(
+        "{} did not appear after map",
+        device_link(pool, image).display()
+    ))
 }
 
 /// True when any process holds `dev` (a `/dev/nbdN` path) open.
@@ -124,11 +141,15 @@ pub fn unmap(pool: &str, image: &str) -> Result<(), String> {
         return Ok(());
     };
     if device_in_use(&dev) {
-        return Err(format!("rbd device {dev} for {pool}/{image} is still in use"));
+        return Err(format!(
+            "rbd device {dev} for {pool}/{image} is still in use"
+        ));
     }
     // Dirty pages left in the host page cache would be lost once the nbd
     // socket is torn down.
-    let _ = Command::new("blockdev").args(["--flushbufs", &dev]).status();
+    let _ = Command::new("blockdev")
+        .args(["--flushbufs", &dev])
+        .status();
     let out = Command::new("rbd")
         .args(["device", "unmap", "-t", "nbd", &dev])
         .output()
