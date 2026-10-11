@@ -2328,7 +2328,7 @@ impl ControllerService {
                 }
             })?;
 
-        let prep = dest_admin
+        let prep = match dest_admin
             .prepare_live_migrate_receive(node_proto::PrepareLiveMigrateReceiveRequest {
                 vm_name: runtime_name.to_string(),
                 rbd_pool: root_pool.clone(),
@@ -2338,15 +2338,34 @@ impl ControllerService {
                 encrypted_volumes: encrypted_volumes.clone(),
             })
             .await
-            .map_err(|e| LiveMigrateFailure {
-                send_succeeded: false,
-                status: status_with_context(
-                    &e,
-                    &format!("preparing node {} to receive VM '{}'", target.id, vm.name),
-                ),
-                operation_id: op_id.clone(),
-            })?
-            .into_inner();
+        {
+            Ok(resp) => resp.into_inner(),
+            Err(e) => {
+                let _ = dest_admin
+                    .abort_live_migrate_receive(node_proto::AbortLiveMigrateReceiveRequest {
+                        vm_name: runtime_name.to_string(),
+                        rbd_pool: root_pool.clone(),
+                        rbd_image: root_image.clone(),
+                        rbd_volumes: rbd_volumes.clone(),
+                    })
+                    .await;
+                let _ = self.db.update_vm_operation_phase(
+                    &op_id,
+                    VmOperationRow::PHASE_FAILED,
+                    Some(false),
+                    None,
+                    true,
+                );
+                return Err(LiveMigrateFailure {
+                    send_succeeded: false,
+                    status: status_with_context(
+                        &e,
+                        &format!("preparing node {} to receive VM '{}'", target.id, vm.name),
+                    ),
+                    operation_id: op_id,
+                });
+            }
+        };
         if !prep.success || prep.listen_port <= 0 {
             let _ = self.db.update_vm_operation_phase(
                 &op_id,
