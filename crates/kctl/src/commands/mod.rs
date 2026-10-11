@@ -11,6 +11,7 @@ pub mod container;
 pub mod disk_layout;
 pub mod gpu;
 pub mod image;
+pub mod kubernetes;
 pub mod migrate_session;
 pub mod network;
 pub mod node;
