@@ -5,6 +5,7 @@ members = [
     "crates/kcore-disko-types",
     "crates/kcore-disk-layout-yaml",
     "crates/kcore-console",
+    "crates/kcore-disk-verify",
     "crates/node-agent",
     "crates/controller",
     "crates/kctl",

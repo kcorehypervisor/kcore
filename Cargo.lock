@@ -1916,6 +1916,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcore-disk-verify"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "kcore-disko-types"
 version = "0.3.0"
 dependencies = [
