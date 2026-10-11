@@ -124,8 +124,22 @@ pub fn map(pool: &str, image: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// True when any process holds `dev` (a `/dev/nbdN` path) open.
+/// True when a device-mapper target (LUKS) is stacked on `dev` (`/dev/nbdN`).
+fn has_holders(dev: &str) -> bool {
+    let Some(name) = Path::new(dev).file_name() else {
+        return false;
+    };
+    std::fs::read_dir(Path::new("/sys/block").join(name).join("holders"))
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+}
+
+/// True when any process holds `dev` (a `/dev/nbdN` path) open, or a
+/// device-mapper target is stacked on it.
 pub fn device_in_use(dev: &str) -> bool {
+    if has_holders(dev) {
+        return true;
+    }
     let Ok(procs) = std::fs::read_dir("/proc") else {
         return false;
     };

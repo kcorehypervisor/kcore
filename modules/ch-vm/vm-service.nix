@@ -224,6 +224,11 @@ let
         }
         unmap_one "${cfg.rbdPool}/${rbdImage}"
         ${lib.concatMapStrings (disk: ''
+          ${lib.optionalString disk.encrypted ''
+            if [ -e "/dev/mapper/${disk.mapperName}" ]; then
+              ${pkgs.cryptsetup}/bin/cryptsetup close "${disk.mapperName}" || true
+            fi
+          ''}
           unmap_one "${cfg.rbdPool}/${disk.rbdImage}"
         '') vmCfg.dataDisks}
       '';
