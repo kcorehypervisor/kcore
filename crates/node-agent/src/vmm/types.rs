@@ -16,6 +16,8 @@ pub struct VmConfig {
     pub memory: Option<MemoryConfig>,
     #[serde(default)]
     pub net: Vec<NetConfig>,
+    #[serde(default)]
+    pub disks: Vec<DiskConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,4 +35,12 @@ pub struct MemoryConfig {
 pub struct NetConfig {
     #[serde(default)]
     pub mac: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiskConfig {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub serial: Option<String>,
 }
