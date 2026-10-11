@@ -1249,6 +1249,7 @@ fn sdn_table(
 fn StoragePage() -> impl IntoView {
     let query = use_query_map();
     let paging = Memo::new(move |_| list_paging(&query.get()));
+    let disk_page = Memo::new(move |_| list_paging_named(&query.get(), "disk_page").0);
     let res = Resource::new(|| (), |_| get_storage_overview_dto());
     view! {
         <section class="hero">
@@ -1263,9 +1264,12 @@ fn StoragePage() -> impl IntoView {
         <Suspense fallback=move || view! { <p class="muted">"Loading storage overview…"</p> }>
             {move || {
                 let (page, per_page) = paging.get();
+                let disk_page = disk_page.get();
                 Suspend::new(async move {
                     match res.await {
-                        Ok(data) => storage_overview_view(data, page, per_page).into_any(),
+                        Ok(data) => {
+                            storage_overview_view(data, page, per_page, disk_page).into_any()
+                        }
                         Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
                     }
                 })
@@ -1274,7 +1278,12 @@ fn StoragePage() -> impl IntoView {
     }
 }
 
-fn storage_overview_view(data: StorageOverviewDto, page: u32, per_page: usize) -> impl IntoView {
+fn storage_overview_view(
+    data: StorageOverviewDto,
+    page: u32,
+    per_page: usize,
+    disk_page: u32,
+) -> impl IntoView {
     let nodes = data.nodes.clone();
     let has_nodes = !nodes.is_empty();
     let pv = paginate_by_name(nodes, |n| n.hostname.clone(), page, per_page);
@@ -1282,6 +1291,10 @@ fn storage_overview_view(data: StorageOverviewDto, page: u32, per_page: usize) -
     let page_size = pv.page_size;
     let total = pv.total;
     let page_nodes = pv.items;
+    let mut node_pager_extra = Vec::new();
+    if disk_page > 1 {
+        node_pager_extra.push(("disk_page".into(), disk_page.to_string()));
+    }
     view! {
         <h2 class="section-title">"Cluster"</h2>
         <div class="card-grid cols-2">
@@ -1319,8 +1332,11 @@ fn storage_overview_view(data: StorageOverviewDto, page: u32, per_page: usize) -
         <h2 class="section-title" style="margin-top: 1.5rem;">"Nodes"</h2>
         {if has_nodes {
             view! {
-                {page_nodes.into_iter().map(storage_node_card).collect_view()}
-                {list_pager("/storage", page, page_size, total, "nodes", &[])}
+                {page_nodes
+                    .into_iter()
+                    .map(|n| storage_node_card(n, page, per_page, disk_page))
+                    .collect_view()}
+                {list_pager("/storage", page, page_size, total, "nodes", &node_pager_extra)}
             }
             .into_any()
         } else {
@@ -1329,7 +1345,12 @@ fn storage_overview_view(data: StorageOverviewDto, page: u32, per_page: usize) -
     }
 }
 
-fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
+fn storage_node_card(
+    node: NodeStorageDto,
+    nodes_page: u32,
+    per_page: usize,
+    disk_page: u32,
+) -> impl IntoView {
     let inv_badge = if node.disk_inventory_ok {
         "badge badge-run"
     } else {
@@ -1341,7 +1362,6 @@ fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
         "unavailable"
     };
     let has_disks = !node.disks.is_empty();
-    let disks = node.disks.clone();
     let disk_inventory_ok = node.disk_inventory_ok;
     let luks_dd = if node.luks_method.is_empty() {
         "—".to_string()
@@ -1355,6 +1375,25 @@ fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
     let vgs = node.lvm_volume_groups.clone();
     let lvs = node.lvm_logical_volumes.clone();
     let pvs = node.lvm_physical_volumes.clone();
+
+    // Clamp so a high shared disk_page does not blank out short inventories.
+    let disk_total = node.disks.len();
+    let disk_total_pages = if disk_total == 0 {
+        1
+    } else {
+        disk_total.div_ceil(per_page.max(1)) as u32
+    };
+    let disk_page = disk_page.min(disk_total_pages).max(1);
+    let disk_pv = paginate_items(node.disks.clone(), disk_page, per_page);
+    let disk_page = disk_pv.page;
+    let disk_page_size = disk_pv.page_size;
+    let disk_total = disk_pv.total;
+    let disks = disk_pv.items;
+    let mut disk_extra = Vec::new();
+    if nodes_page > 1 {
+        disk_extra.push(("page".into(), nodes_page.to_string()));
+    }
+
     view! {
         <section class="card node-card">
             <div class="node-card-header">
@@ -1367,35 +1406,49 @@ fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
                 <dt>"LUKS"</dt><dd>{luks_dd}</dd>
                 <dt>"Disk inventory"</dt><dd><span class={inv_badge}>{inv_label}</span></dd>
             </dl>
-            <Show when=move || has_disks>
-                <div class="table-wrap" style="margin-top: 0.75rem;">
-                    <table class="data">
-                        <thead>
-                            <tr>
-                                <th>"Device"</th>
-                                <th>"Path"</th>
-                                <th>"Size"</th>
-                                <th>"Model"</th>
-                                <th>"FS"</th>
-                                <th>"Mount"</th>
-                                <th>"Hint"</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {disks.clone().into_iter().map(storage_disk_row).collect_view()}
-                        </tbody>
-                    </table>
-                </div>
-            </Show>
-            <Show when=move || !has_disks>
-                <p class="muted" style="margin-top: 0.5rem; font-size: 0.85rem;">
-                    {if disk_inventory_ok {
-                        "No top-level block devices reported."
-                    } else {
-                        "Could not list disks (node unreachable or RPC failed)."
-                    }}
-                </p>
-            </Show>
+            {if has_disks {
+                view! {
+                    <div class="table-wrap" style="margin-top: 0.75rem;">
+                        <table class="data">
+                            <thead>
+                                <tr>
+                                    <th>"Device"</th>
+                                    <th>"Path"</th>
+                                    <th>"Size"</th>
+                                    <th>"Model"</th>
+                                    <th>"FS"</th>
+                                    <th>"Mount"</th>
+                                    <th>"Hint"</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {disks.into_iter().map(storage_disk_row).collect_view()}
+                            </tbody>
+                        </table>
+                    </div>
+                    {list_pager_named(
+                        "/storage",
+                        "disk_page",
+                        disk_page,
+                        disk_page_size,
+                        disk_total,
+                        "disks",
+                        &disk_extra,
+                    )}
+                }
+                .into_any()
+            } else {
+                view! {
+                    <p class="muted" style="margin-top: 0.5rem; font-size: 0.85rem;">
+                        {if disk_inventory_ok {
+                            "No top-level block devices reported."
+                        } else {
+                            "Could not list disks (node unreachable or RPC failed)."
+                        }}
+                    </p>
+                }
+                .into_any()
+            }}
             <Show when=move || has_lvm>
                 {lvm_detail_view(vgs.clone(), lvs.clone(), pvs.clone())}
             </Show>
