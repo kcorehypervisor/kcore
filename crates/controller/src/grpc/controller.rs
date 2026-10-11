@@ -12018,6 +12018,102 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
+    async fn get_ceph_cluster_capacity(
+        &self,
+        request: Request<controller_proto::GetCephClusterCapacityRequest>,
+    ) -> Result<Response<controller_proto::GetCephClusterCapacityResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let name = request.into_inner().name;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_ceph_cluster(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("ceph cluster '{name}' not found")))?;
+        let spec = ceph_cluster_spec::spec_from_json(&row.spec_json)
+            .map_err(|e| Status::internal(format!("decode ceph spec: {e}")))?;
+        if spec.nodes.is_empty() {
+            return Ok(Response::new(
+                controller_proto::GetCephClusterCapacityResponse {
+                    ok: false,
+                    message: "cluster has no members".into(),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        let mut last_err = String::new();
+        for member in &spec.nodes {
+            let Ok(Some(node)) = self.db.get_node(&member.node_id) else {
+                last_err = format!("member {} is not registered", member.node_id);
+                continue;
+            };
+            let Ok(mut admin) = self.ensure_admin_client_for_node(&node).await else {
+                last_err = format!("cannot reach member {}", member.node_id);
+                continue;
+            };
+            match admin
+                .get_ceph_df(node_proto::GetCephDfRequest {
+                    cluster_name: "ceph".into(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let df = resp.into_inner();
+                    return Ok(Response::new(
+                        controller_proto::GetCephClusterCapacityResponse {
+                            ok: true,
+                            message: String::new(),
+                            queried_node: member.node_id.clone(),
+                            total_bytes: df.total_bytes,
+                            used_bytes: df.used_bytes,
+                            avail_bytes: df.avail_bytes,
+                            by_class: df
+                                .by_class
+                                .into_iter()
+                                .map(|c| controller_proto::CephDeviceClassCapacity {
+                                    device_class: c.device_class,
+                                    total_bytes: c.total_bytes,
+                                    used_bytes: c.used_bytes,
+                                    avail_bytes: c.avail_bytes,
+                                })
+                                .collect(),
+                            pools: df
+                                .pools
+                                .into_iter()
+                                .map(|p| controller_proto::CephPoolCapacity {
+                                    name: p.name,
+                                    stored_bytes: p.stored_bytes,
+                                    objects: p.objects,
+                                    percent_used_bp: p.percent_used_bp,
+                                    max_avail_bytes: p.max_avail_bytes,
+                                })
+                                .collect(),
+                        },
+                    ));
+                }
+                Err(e) => {
+                    last_err = format!("{}: {e}", member.node_id);
+                }
+            }
+        }
+
+        Ok(Response::new(
+            controller_proto::GetCephClusterCapacityResponse {
+                ok: false,
+                message: if last_err.is_empty() {
+                    "no Ceph member answered".into()
+                } else {
+                    last_err
+                },
+                ..Default::default()
+            },
+        ))
+    }
+
     async fn delete_ceph_cluster(
         &self,
         request: Request<controller_proto::DeleteCephClusterRequest>,

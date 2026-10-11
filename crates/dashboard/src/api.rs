@@ -4,13 +4,14 @@ use leptos::prelude::*;
 
 use crate::controller_client;
 use crate::dto::{
-    AuditEventDto, CephClusterRowDto, ComplianceDto, NetworkOverviewDto, NetworkRowDto,
-    ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto, SharedFilesystemRowDto,
-    StorageOverviewDto, VmOperationRowDto, VmsPageDto, VolumeRowDto,
+    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ComplianceDto, NetworkOverviewDto,
+    NetworkRowDto, ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto,
+    SharedFilesystemRowDto, StorageOverviewDto, VmOperationRowDto, VmsPageDto, VolumeRowDto,
 };
 use crate::mappers::{
-    audit_events_from_proto, ceph_clusters_from_proto, compliance_from_proto, conflicts_from_proto,
-    filter_audit_events, filter_vm_operations, network_overview_from_proto, networks_from_proto,
+    audit_events_from_proto, ceph_cluster_detail_from_proto, ceph_clusters_from_proto,
+    compliance_from_proto, conflicts_from_proto, filter_audit_events, filter_vm_operations,
+    merge_ceph_capacity, network_overview_from_proto, networks_from_proto,
     object_stores_from_proto, replication_status_from_proto, shared_filesystems_from_proto,
     storage_overview_from_proto, vm_operations_from_proto, vms_page_from_proto, volumes_from_proto,
 };
@@ -98,6 +99,46 @@ pub async fn list_ceph_clusters_dto() -> Result<Vec<CephClusterRowDto>, ServerFn
         .await
         .map_err(map_err)?;
     Ok(ceph_clusters_from_proto(clusters))
+}
+
+#[server(GetCephClusterDetail, "/api")]
+pub async fn get_ceph_cluster_detail_dto(
+    name: String,
+) -> Result<CephClusterDetailDto, ServerFnError> {
+    let cfg = dashboard_config();
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(ServerFnError::new("cluster name is required"));
+    }
+    let cluster = controller_client::get_ceph_cluster(cfg, &name)
+        .await
+        .map_err(map_err)?;
+    let mut detail = ceph_cluster_detail_from_proto(cluster);
+    match controller_client::get_ceph_cluster_capacity(cfg, &name).await {
+        Ok(cap) => {
+            detail.capacity = merge_ceph_capacity(detail.capacity, cap);
+            let cluster_slices = vec![
+                ("used".to_string(), detail.capacity.used_bytes),
+                ("available".to_string(), detail.capacity.avail_bytes),
+            ];
+            detail.cluster_pie_svg =
+                crate::ceph_status::pie_svg(&cluster_slices, "Cluster capacity");
+            let class_slices: Vec<(String, i64)> = detail
+                .capacity
+                .by_class
+                .iter()
+                .map(|c| (c.device_class.clone(), c.total_bytes))
+                .collect();
+            detail.class_pie_svg =
+                crate::ceph_status::pie_svg(&class_slices, "Device class capacity");
+        }
+        Err(e) => {
+            if detail.capacity.error.is_empty() {
+                detail.capacity.error = format!("live capacity unavailable: {e:#}");
+            }
+        }
+    }
+    Ok(detail)
 }
 
 #[server(ListSharedFilesystems, "/api")]
