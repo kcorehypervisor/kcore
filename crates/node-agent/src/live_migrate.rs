@@ -421,10 +421,18 @@ pub async fn spawn_receive_vmm(
     if socket.exists() {
         let _ = std::fs::remove_file(&socket);
     }
+    // A receiver that dies mid-stream only shows up to the source as a socket
+    // error; its own stderr is the one place the real cause is written.
+    let log_path = client.socket_dir().join(format!("{vm_name}.receive.log"));
+    let (out, err) =
+        match std::fs::File::create(&log_path).and_then(|f| f.try_clone().map(|g| (f, g))) {
+            Ok((f, g)) => (Stdio::from(f), Stdio::from(g)),
+            Err(_) => (Stdio::null(), Stdio::null()),
+        };
     let mut child = Command::new(ch_bin)
         .arg(format!("--api-socket={}", socket.display()))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .kill_on_drop(false)
         .spawn()
         .map_err(|e| format!("spawn cloud-hypervisor ({ch_bin}): {e}"))?;
