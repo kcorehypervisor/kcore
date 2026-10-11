@@ -170,6 +170,11 @@ service NodeAdmin {
   rpc GetLiveMigrateProgress(GetLiveMigrateProgressRequest)
       returns (GetLiveMigrateProgressResponse);
   rpc SendLiveMigrate(SendLiveMigrateRequest) returns (SendLiveMigrateResponse);
+  // Host CPU facts a live-migration destination compares against its own
+  // before it maps volumes and spawns a receiver (vendor, model, TSC rate,
+  // hardware TSC scaling). Cloud Hypervisor checks CPUID feature bits itself;
+  // this covers what it does not report usefully.
+  rpc GetHostCpuInfo(GetHostCpuInfoRequest) returns (GetHostCpuInfoResponse);
   rpc FinalizeLiveMigrateSource(FinalizeLiveMigrateSourceRequest)
       returns (FinalizeLiveMigrateSourceResponse);
   rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
@@ -1162,6 +1167,9 @@ message PrepareLiveMigrateReceiveRequest {
   repeated RbdImageRef rbd_volumes = 5;
   // Optional LUKS unlocks after RBD map (E2).
   repeated EncryptedVolumeKey encrypted_volumes = 6;
+  // CPU facts of the node the guest is leaving. Unset when the source agent
+  // predates GetHostCpuInfo; the destination then skips the comparison.
+  HostCpuInfo source_cpu = 7;
 }
 
 message PrepareLiveMigrateReceiveResponse {
@@ -1172,6 +1180,27 @@ message PrepareLiveMigrateReceiveResponse {
   // means the destination has no opinion and the caller should fall back to
   // the host part of the destination node's gRPC address.
   string listen_addr = 4;
+  // Non-fatal host differences the operator should know about, e.g. the
+  // guest TSC changing rate because the destination has no TSC scaling.
+  repeated string warnings = 5;
+}
+
+message HostCpuInfo {
+  // "GenuineIntel" / "AuthenticAMD".
+  string vendor = 1;
+  string model_name = 2;
+  // Nominal TSC rate from CPUID leaf 0x16 (processor base frequency); 0 when
+  // the CPU does not report it.
+  uint32 tsc_khz = 3;
+  // Hardware TSC scaling (Intel VMX "tsc_scaling", AMD SVM "tsc_scale"). Without
+  // it KVM only accepts a guest TSC rate at or above the host rate.
+  bool tsc_scaling = 4;
+}
+
+message GetHostCpuInfoRequest {}
+
+message GetHostCpuInfoResponse {
+  HostCpuInfo cpu = 1;
 }
 
 message WaitLiveMigrateReceiveRequest {

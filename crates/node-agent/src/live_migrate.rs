@@ -204,6 +204,29 @@ pub fn migrate_pid_path(socket_dir: &Path, vm_name: &str) -> PathBuf {
     socket_dir.join(format!("{vm_name}.migrate.pid"))
 }
 
+/// Same path `modules/ch-vm/vm-service.nix` passes as `--serial socket=`.
+pub fn serial_socket_path(socket_dir: &Path, vm_name: &str) -> PathBuf {
+    socket_dir.join(format!("{vm_name}.serial.sock"))
+}
+
+/// Remove socket paths a previous run of this VM left on this node.
+///
+/// The migrated config names `--serial socket=<dir>/<vm>.serial.sock` and
+/// Cloud Hypervisor binds it without unlinking first, so a guest that ran
+/// here, moved away and is now coming back failed the receive at the Config
+/// step with nothing more specific than "Failed to receive migratable
+/// component snapshot". The cold-start unit wipes the same two paths.
+pub fn clear_stale_vm_sockets(socket_dir: &Path, vm_name: &str) {
+    for path in [
+        socket_dir.join(format!("{vm_name}.sock")),
+        serial_socket_path(socket_dir, vm_name),
+    ] {
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// PID of a receive-mode Cloud Hypervisor recorded by `spawn_receive_vmm`.
 pub fn read_migrate_pid(socket_dir: &Path, vm_name: &str) -> Option<u32> {
     std::fs::read_to_string(migrate_pid_path(socket_dir, vm_name))
@@ -418,9 +441,7 @@ pub async fn spawn_receive_vmm(
     ch_bin: &str,
 ) -> Result<u32, String> {
     let socket = client.socket_path(vm_name);
-    if socket.exists() {
-        let _ = std::fs::remove_file(&socket);
-    }
+    clear_stale_vm_sockets(client.socket_dir(), vm_name);
     // A receiver that dies mid-stream only shows up to the source as a socket
     // error; its own stderr is the one place the real cause is written.
     let log_path = client.socket_dir().join(format!("{vm_name}.receive.log"));
@@ -969,6 +990,27 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// A guest coming back to a node it once ran on finds its old serial
+    /// socket path there; the receiver must not trip over it.
+    #[test]
+    fn clear_stale_vm_sockets_removes_api_and_serial_paths_only_for_that_vm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vm = "vm-back";
+        let api = dir.path().join("vm-back.sock");
+        let serial = serial_socket_path(dir.path(), vm);
+        let other = dir.path().join("vm-other.serial.sock");
+        for p in [&api, &serial, &other] {
+            std::os::unix::net::UnixListener::bind(p).expect("bind");
+        }
+        assert!(std::os::unix::net::UnixListener::bind(&serial).is_err());
+
+        clear_stale_vm_sockets(dir.path(), vm);
+
+        assert!(!api.exists() && !serial.exists());
+        assert!(other.exists(), "another VM's socket is not ours to remove");
+        assert!(std::os::unix::net::UnixListener::bind(&serial).is_ok());
     }
 
     /// PID reuse must not be mistaken for a live receive, or clearing would

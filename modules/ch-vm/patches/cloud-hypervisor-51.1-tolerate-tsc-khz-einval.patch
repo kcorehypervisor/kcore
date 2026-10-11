@@ -1,0 +1,29 @@
+Tolerate KVM_SET_TSC_KHZ failing with EINVAL on restore.
+
+Without hardware TSC scaling (Intel client / Coffee Lake Xeon E parts,
+anything before Skylake-SP), KVM accepts a guest TSC rate above the host rate
+(catch-up mode) but rejects one below it with EINVAL and logs
+"kvm: user requested TSC rate below hardware speed". Cloud Hypervisor turned
+that into a hard restore failure, so a live migration from a 3.3 GHz node to a
+3.4 GHz node always aborted at the State step while the reverse direction
+worked. QEMU warns and continues in this situation; do the same. Guests on
+kvm-clock or the Hyper-V reference TSC page keep correct time because the
+host recomputes the pvclock scale from the real TSC rate.
+
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -2838,7 +2838,13 @@
+     fn set_tsc_khz(&self, freq: u32) -> cpu::Result<()> {
+         match self.fd.set_tsc_khz(freq) {
+             Err(e) => {
+-                if e.errno() == libc::EIO {
++                if e.errno() == libc::EINVAL {
++                    warn!(
++                        "KVM refused guest TSC rate {freq} kHz (no TSC scaling on this host); \
++                         the guest TSC keeps the host rate"
++                    );
++                    Ok(())
++                } else if e.errno() == libc::EIO {
+                     Ok(())
+                 } else {
+                     Err(cpu::HypervisorCpuError::SetTscKhz(e.into()))

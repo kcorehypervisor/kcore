@@ -273,6 +273,7 @@ impl AdminService {
         vm_name: &str,
         images: &[(String, String)],
         port: u16,
+        warnings: Vec<String>,
     ) -> Result<Response<proto::PrepareLiveMigrateReceiveResponse>, Status> {
         live_migrate::ensure_migration_host_devices(vm_name)
             .await
@@ -331,6 +332,7 @@ impl AdminService {
             // Bound on every interface: the controller knows better than this
             // node which of its addresses the source can reach.
             listen_addr: "0.0.0.0".into(),
+            warnings,
         }))
     }
 
@@ -421,6 +423,24 @@ fn rbd_images_from_migrate_request(
         vec![(pool.to_string(), image.to_string())]
     } else {
         Vec::new()
+    }
+}
+
+fn host_cpu_to_proto(cpu: &crate::host_cpu::HostCpu) -> proto::HostCpuInfo {
+    proto::HostCpuInfo {
+        vendor: cpu.vendor.clone(),
+        model_name: cpu.model_name.clone(),
+        tsc_khz: cpu.tsc_khz,
+        tsc_scaling: cpu.tsc_scaling,
+    }
+}
+
+fn host_cpu_from_proto(cpu: &proto::HostCpuInfo) -> crate::host_cpu::HostCpu {
+    crate::host_cpu::HostCpu {
+        vendor: cpu.vendor.clone(),
+        model_name: cpu.model_name.clone(),
+        tsc_khz: cpu.tsc_khz,
+        tsc_scaling: cpu.tsc_scaling,
     }
 }
 
@@ -2633,6 +2653,29 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         live_migrate::check_socket_dir_matches_nix(&self.vm_socket_dir)
             .map_err(Status::failed_precondition)?;
 
+        // Compare hosts before anything is mapped or spawned: a refusal here
+        // costs nothing to undo, one at restore time leaves a dead receiver.
+        let mut warnings = Vec::new();
+        if let Some(src) = req.source_cpu.as_ref() {
+            let source = host_cpu_from_proto(src);
+            let dest = crate::host_cpu::local();
+            match crate::host_cpu::check(&source, &dest) {
+                crate::host_cpu::Compat::Ok => {}
+                crate::host_cpu::Compat::Warn(w) => {
+                    for line in &w {
+                        warn!(%vm_name, source = %source, destination = %dest, "{line}");
+                    }
+                    warnings = w;
+                }
+                crate::host_cpu::Compat::Refuse(reason) => {
+                    return Err(Status::failed_precondition(format!(
+                        "{vm_name} cannot be live-migrated here: {reason} (source: {source}; \
+                         destination: {dest}); use a cold migration"
+                    )));
+                }
+            }
+        }
+
         // E2: unlock LUKS volumes after RBD map (prepare_receive maps images).
         for enc in &req.encrypted_volumes {
             let pool = enc.pool.trim();
@@ -2670,7 +2713,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 .map_err(Status::resource_exhausted)?
         };
 
-        let prepared = self.prepare_receive_session(vm_name, &images, port).await;
+        let prepared = self
+            .prepare_receive_session(vm_name, &images, port, warnings)
+            .await;
         if prepared.is_err() {
             self.live_migrate.release_port(port).await;
         }
@@ -2763,6 +2808,16 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             success: true,
             message: observed.summary(),
             state: Some(receive_state_to_proto(&observed)),
+        }))
+    }
+
+    async fn get_host_cpu_info(
+        &self,
+        request: Request<proto::GetHostCpuInfoRequest>,
+    ) -> Result<Response<proto::GetHostCpuInfoResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        Ok(Response::new(proto::GetHostCpuInfoResponse {
+            cpu: Some(host_cpu_to_proto(&crate::host_cpu::local())),
         }))
     }
 

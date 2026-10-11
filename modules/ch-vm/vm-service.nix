@@ -9,6 +9,15 @@ let
   helpers = import ./helpers.nix { inherit lib; };
   inherit (helpers) vmInterfaces;
 
+  chPkg =
+    if cfg.cloudHypervisorPatches == [ ] then
+      cfg.cloudHypervisorPackage
+    else
+      cfg.cloudHypervisorPackage.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ cfg.cloudHypervisorPatches;
+      });
+  chBin = "${chPkg}/bin/cloud-hypervisor";
+
   mkVmService =
     vmName: vmCfg:
     let
@@ -19,7 +28,6 @@ let
       seedIso = "/etc/kcore/seeds/${vmName}.iso";
       firmwarePath =
         if cfg.firmwarePath != null then cfg.firmwarePath else "${pkgs.OVMF-cloud-hypervisor.firmware}";
-      chBin = "${cfg.cloudHypervisorPackage}/bin/cloud-hypervisor";
 
       isLvm = vmCfg.storageBackend == "lvm";
       isZfs = vmCfg.storageBackend == "zfs";
@@ -438,6 +446,12 @@ in
     boot.supportedFilesystems = lib.mkIf anyVmUsesZfs [ "zfs" ];
 
     services.lvm.enable = lib.mkIf anyVmUsesLvm true;
+
+    # The node agent spawns the receiving VMM for a live migration itself, so
+    # it must run the exact binary the units use (patched, same build), or the
+    # unit later adopts a process it could not have started.
+    environment.etc."kcore/cloud-hypervisor".text = chBin + "\n";
+    environment.etc."kcore/vm-socket-dir".text = cfg.socketDir + "\n";
 
     systemd.services = lib.mapAttrs' (
       vmName: vmCfg: lib.nameValuePair "kcore-vm-${vmName}" (mkVmService vmName vmCfg)
