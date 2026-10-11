@@ -349,13 +349,13 @@ pub fn generate_node_config_inner(
             ));
         }
         let incoming = incoming_vm_ids.contains(&vm.id);
+        // Keep autoStart identical across the incoming and settled configs.
+        // `incomingMigration` alone keeps systemd from starting the unit. If
+        // autoStart flipped too, the final config would change the unit and the
+        // switch would restart the unit that just adopted the migrated guest.
         out.push_str(&format!(
             "      autoStart = {};\n",
-            if vm.auto_start && !incoming {
-                "true"
-            } else {
-                "false"
-            }
+            if vm.auto_start { "true" } else { "false" }
         ));
         if incoming {
             out.push_str("      incomingMigration = true;\n");
