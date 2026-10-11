@@ -1727,6 +1727,32 @@ impl ControllerService {
         Ok(())
     }
 
+    /// Close the LUKS mapper (and release its nbd) on `node` for each encrypted
+    /// volume. Best effort: an unreachable node must not block detach/delete.
+    async fn lock_encrypted_volumes_on_node(&self, node: &NodeRow, vols: &[VolumeRow]) {
+        let encrypted: Vec<&VolumeRow> = vols.iter().filter(|v| v.encrypted).collect();
+        if encrypted.is_empty() {
+            return;
+        }
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let Some(mut storage) = self.clients.get_storage(&node.address) else {
+            return;
+        };
+        for vol in encrypted {
+            let mapper = crate::volume_crypto::mapper_name_for_serial(&vol.serial);
+            if let Err(e) = storage
+                .lock_encrypted_volume(node_proto::LockEncryptedVolumeRequest {
+                    mapper_name: mapper,
+                })
+                .await
+            {
+                warn!(volume = %vol.name, node = %node.id, error = %e, "failed to lock encrypted volume");
+            }
+        }
+    }
+
     /// After `rbd resize`, grow the LUKS mapper on the node that has it open.
     async fn grow_encrypted_mapper(&self, vol: &VolumeRow) -> Result<(), Status> {
         let vm = self
@@ -5586,6 +5612,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         // unmap first; an unreachable node is tolerated so a dead host can
         // still be cleaned up.
         self.cold_release_ceph_vm(&db_vm, &node).await?;
+        self.lock_encrypted_volumes_on_node(&node, &volumes).await;
 
         let deleted = self
             .db
@@ -10200,6 +10227,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .upsert_volume(&row)
             .map_err(|e| Status::internal(e.to_string()))?;
         self.push_config_and_await_apply(&node).await?;
+        self.lock_encrypted_volumes_on_node(&node, std::slice::from_ref(&row))
+            .await;
         self.log_replication_event(
             &actor,
             Some("volume.detach"),

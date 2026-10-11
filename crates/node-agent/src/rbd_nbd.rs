@@ -160,6 +160,38 @@ pub fn device_in_use(dev: &str) -> bool {
     false
 }
 
+/// Unmap a mapped `/dev/nbdN` regardless of which image it carries and drop the
+/// `/dev/rbd/<pool>/<image>` links that point at it.
+pub fn unmap_device(dev: &str) -> Result<(), String> {
+    if device_in_use(dev) {
+        return Err(format!("rbd device {dev} is still in use"));
+    }
+    let _ = Command::new("blockdev").args(["--flushbufs", dev]).status();
+    let out = Command::new("rbd")
+        .args(["device", "unmap", "-t", "nbd", dev])
+        .output()
+        .map_err(|e| format!("rbd-nbd unmap: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "rbd-nbd unmap {dev} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if let Ok(pools) = std::fs::read_dir(RBD_DEV_ROOT) {
+        for pool in pools.flatten() {
+            let Ok(images) = std::fs::read_dir(pool.path()) else {
+                continue;
+            };
+            for image in images.flatten() {
+                if std::fs::read_link(image.path()).is_ok_and(|t| t == Path::new(dev)) {
+                    let _ = std::fs::remove_file(image.path());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Unmap `pool/image` (idempotent). Fails while a process still has the device open.
 pub fn unmap(pool: &str, image: &str) -> Result<(), String> {
     let link = device_link(pool, image);
