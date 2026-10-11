@@ -473,20 +473,51 @@ pub async fn start_receive_task(
     })
 }
 
-pub async fn disable_unit_restart(unit: &str) -> Result<(), String> {
-    // Prevent systemd from restarting the source CH after send-migration exits.
+const RESTART_DROPIN_NAME: &str = "90-kcore-migrate.conf";
+
+fn restart_dropin_dir(unit: &str) -> std::path::PathBuf {
+    Path::new("/run/systemd/system").join(format!("{unit}.d"))
+}
+
+async fn daemon_reload() -> Result<(), String> {
     let out = Command::new("systemctl")
-        .args(["set-property", unit, "Restart=no"])
+        .arg("daemon-reload")
         .output()
         .await
-        .map_err(|e| format!("systemctl set-property: {e}"))?;
+        .map_err(|e| format!("systemctl daemon-reload: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "systemctl set-property Restart=no failed for {unit}: {}",
+            "systemctl daemon-reload failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     Ok(())
+}
+
+/// Stop systemd restarting the source CH after send-migration makes it exit.
+///
+/// Newer systemd refuses `set-property Restart=`, so this installs a runtime
+/// drop-in under `/run` instead. Pair every call with `enable_unit_restart`
+/// once the unit is stopped or the send failed, otherwise the VM would lose
+/// its auto-restart until the node reboots.
+pub async fn disable_unit_restart(unit: &str) -> Result<(), String> {
+    let dir = restart_dropin_dir(unit);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(RESTART_DROPIN_NAME);
+    std::fs::write(&path, "[Service]\nRestart=no\n")
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    daemon_reload().await
+}
+
+/// Undo `disable_unit_restart`.
+pub async fn enable_unit_restart(unit: &str) -> Result<(), String> {
+    let path = restart_dropin_dir(unit).join(RESTART_DROPIN_NAME);
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+    let _ = std::fs::remove_dir(restart_dropin_dir(unit));
+    daemon_reload().await
 }
 
 pub async fn stop_unit(unit: &str) -> Result<(), String> {

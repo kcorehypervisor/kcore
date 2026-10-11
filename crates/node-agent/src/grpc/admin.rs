@@ -2823,19 +2823,27 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             std::time::Duration::from_secs(600)
         };
         let send_fut = client.send_migration(vm_name, dest);
-        tokio::time::timeout(timeout, send_fut)
+        let sent = tokio::time::timeout(timeout, send_fut)
             .await
             .map_err(|_| {
                 Status::deadline_exceeded(format!(
                     "timed out after {}s sending {vm_name} to {dest}",
                     timeout.as_secs()
                 ))
-            })?
-            .map_err(|e| {
-                Status::internal(format!(
-                    "cloud-hypervisor refused to send {vm_name} to {dest}: {e}"
-                ))
-            })?;
+            })
+            .and_then(|r| {
+                r.map_err(|e| {
+                    Status::internal(format!(
+                        "cloud-hypervisor refused to send {vm_name} to {dest}: {e}"
+                    ))
+                })
+            });
+        if let Err(status) = sent {
+            if let Err(e) = live_migrate::enable_unit_restart(&unit).await {
+                warn!(error = %e, unit = %unit, "restoring restart policy after failed send");
+            }
+            return Err(status);
+        }
         Ok(Response::new(proto::SendLiveMigrateResponse {
             success: true,
             message: format!("sent migration for {vm_name} to {dest}"),
@@ -2857,6 +2865,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if let Err(e) = live_migrate::stop_unit(&unit).await {
             // Unit may already be inactive after CH exited on send.
             warn!(error = %e, unit = %unit, "finalize source stop");
+        }
+        if let Err(e) = live_migrate::enable_unit_restart(&unit).await {
+            warn!(error = %e, unit = %unit, "restoring restart policy after finalize");
         }
         let pool = req.rbd_pool.trim();
         let image = req.rbd_image.trim();

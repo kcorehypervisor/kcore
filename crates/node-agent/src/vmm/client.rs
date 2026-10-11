@@ -111,11 +111,14 @@ impl Client {
         put_json(&self.socket_path(name), "/api/v1/vm.remove-device", &body).await
     }
 
-    /// Wait until the API socket answers `vm.info` (or timeout).
+    /// Wait until the VMM answers on its API socket (or timeout).
+    ///
+    /// Uses `vmm.ping`, not `vm.info`: a receive-mode VMM has no VM yet, so
+    /// `vm.info` answers with an error body that never parses as `VmInfo`.
     pub async fn wait_api_ready(&self, name: &str, timeout: Duration) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.get_vm_info(name).await.is_some() {
+            if ping_vmm(&self.socket_path(name)).await {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -168,6 +171,15 @@ async fn query_vm_info(socket_path: &Path) -> Option<VmInfo> {
 
     let body = resp.into_body().collect().await.ok()?.to_bytes();
     serde_json::from_slice(&body).ok()
+}
+
+async fn ping_vmm(socket_path: &Path) -> bool {
+    let client = HyperClient::unix();
+    let uri = Uri::new(socket_path, "/api/v1/vmm.ping");
+    let Ok(req) = Request::get(uri).body(Empty::<Bytes>::new()) else {
+        return false;
+    };
+    matches!(client.request(req).await, Ok(resp) if resp.status().is_success())
 }
 
 async fn put_json<T: Serialize>(socket_path: &Path, path: &str, body: &T) -> Result<(), String> {
