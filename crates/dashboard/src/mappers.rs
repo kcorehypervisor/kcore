@@ -11,7 +11,7 @@ use crate::dto::{
     SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto,
     VmsPageDto, VolumeRowDto,
 };
-use crate::format::{self, paginate_by_name, VM_PAGE_SIZE};
+use crate::format::{self, paginate_by_name};
 
 pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -> ComplianceDto {
     ComplianceDto {
@@ -64,7 +64,11 @@ pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -
     }
 }
 
-pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> VmsPageDto {
+pub fn vms_page_from_proto(
+    vms: Vec<controller_proto::VmInfo>,
+    page: u32,
+    page_size: usize,
+) -> VmsPageDto {
     let rows: Vec<VmRowDto> = vms
         .into_iter()
         .map(|v| VmRowDto {
@@ -78,7 +82,8 @@ pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> Vms
         })
         .collect();
     let page = page.max(1);
-    let pv = paginate_by_name(rows, |r| r.name.clone(), page, VM_PAGE_SIZE);
+    let page_size = format::normalize_page_size(page_size as u32);
+    let pv = paginate_by_name(rows, |r| r.name.clone(), page, page_size);
     VmsPageDto {
         total_pages: pv.total_pages(),
         has_prev: pv.has_prev(),
@@ -848,7 +853,7 @@ mod tests {
                 storage_size_bytes: 0,
             },
         ];
-        let p = vms_page_from_proto(vms, 1);
+        let p = vms_page_from_proto(vms, 1, 10);
         assert_eq!(p.total, 2);
         assert_eq!(p.vms.len(), 2);
         assert_eq!(p.vms[0].name, "alpha");

@@ -1,5 +1,7 @@
 //! kcore web dashboard (Leptos SSR, controller gRPC).
 
+// Nested list tables + shared pagers produce deep Leptos view types.
+#![recursion_limit = "256"]
 // tonic::Status Err variants in generated gRPC stubs exceed clippy's size lint.
 #![allow(clippy::result_large_err)]
 
@@ -13,6 +15,7 @@ pub mod controller_client;
 pub mod dto;
 pub mod format;
 pub mod mappers;
+pub mod paging;
 pub mod state;
 
 pub use app::shell;
