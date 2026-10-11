@@ -133,6 +133,13 @@ struct LiveMigrateFailure {
     operation_id: String,
 }
 
+/// A finished live migration plus what the destination wanted the operator
+/// to know (host differences it tolerated, e.g. a TSC rate change).
+struct LiveMigrateOutcome {
+    operation_id: String,
+    warnings: Vec<String>,
+}
+
 /// Whether a node may be handed a VM that is moving off another node.
 ///
 /// `scheduler::select_node_for_vm` applies these rules when it picks a target,
@@ -2187,7 +2194,7 @@ impl ControllerService {
         volume: &VolumeRow,
         runtime_name: &str,
         dest_host: &str,
-    ) -> Result<String, LiveMigrateFailure> {
+    ) -> Result<LiveMigrateOutcome, LiveMigrateFailure> {
         if let Ok(Some(open)) = self.db.get_open_vm_operation(&vm.id) {
             return Err(LiveMigrateFailure {
                 send_succeeded: false,
@@ -2293,6 +2300,18 @@ impl ControllerService {
                 operation_id: op_id,
             });
         }
+        // The destination compares this against itself inside prepare. An
+        // agent without the RPC leaves it unset and the comparison is skipped.
+        let source_cpu = match source_admin
+            .get_host_cpu_info(node_proto::GetHostCpuInfoRequest {})
+            .await
+        {
+            Ok(resp) => resp.into_inner().cpu,
+            Err(e) => {
+                warn!(node = %source.id, error = %e, "source host CPU info unavailable; skipping host comparison");
+                None
+            }
+        };
         self.push_config_to_node_inner(target, true, Some(vm))
             .await
             .map_err(|status| {
@@ -2336,6 +2355,7 @@ impl ControllerService {
                 listen_port: 0,
                 rbd_volumes: rbd_volumes.clone(),
                 encrypted_volumes: encrypted_volumes.clone(),
+                source_cpu,
             })
             .await
         {
@@ -2379,6 +2399,10 @@ impl ControllerService {
                 status: Status::internal(format!("prepare receive failed: {}", prep.message)),
                 operation_id: op_id,
             });
+        }
+        let host_warnings = prep.warnings.clone();
+        for line in &host_warnings {
+            warn!(vm = %vm.name, source = %source.id, target = %target.id, "live migrate host difference: {line}");
         }
 
         if self
@@ -2685,7 +2709,10 @@ impl ControllerService {
             None,
             true,
         );
-        Ok(op_id)
+        Ok(LiveMigrateOutcome {
+            operation_id: op_id,
+            warnings: host_warnings,
+        })
     }
 
     /// Stop a Ceph-backed VM and unmap its RBD image on the node that owns it
@@ -8391,7 +8418,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )
             .await
         {
-            Ok(operation_id) => {
+            Ok(LiveMigrateOutcome {
+                operation_id,
+                warnings,
+            }) => {
                 self.log_replication_event_required(
                     &actor,
                     Some("MigrateVm"),
@@ -8404,14 +8434,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         "targetNode": target.id,
                         "mode": "live",
                         "operationId": operation_id,
+                        "hostWarnings": warnings,
                     }),
                 )?;
+                let mut message = format!(
+                    "live-migrated '{}' from {} to {}",
+                    vm.name, source_node.id, target.id
+                );
+                for line in &warnings {
+                    message.push_str("\nwarning: ");
+                    message.push_str(line);
+                }
                 return Ok(Response::new(controller_proto::MigrateVmResponse {
                     success: true,
-                    message: format!(
-                        "live-migrated '{}' from {} to {}",
-                        vm.name, source_node.id, target.id
-                    ),
+                    message,
                     mode: "live".into(),
                     source_node: source_node.id,
                     target_node: target.id.clone(),

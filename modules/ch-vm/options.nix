@@ -352,6 +352,19 @@ in
       description = "Cloud Hypervisor package to use.";
     };
 
+    cloudHypervisorPatches = lib.mkOption {
+      type = lib.types.listOf lib.types.path;
+      default = [ ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch ];
+      defaultText = lib.literalExpression "[ ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch ]";
+      description = ''
+        Patches applied on top of cloudHypervisorPackage. The default lets a
+        live migration restore a guest whose TSC rate is below the destination
+        host's on CPUs without hardware TSC scaling (KVM returns EINVAL there;
+        QEMU warns and continues, upstream Cloud Hypervisor aborts). Set to []
+        to run the package unmodified.
+      '';
+    };
+
     socketDir = lib.mkOption {
       type = lib.types.str;
       default = "/run/kcore";

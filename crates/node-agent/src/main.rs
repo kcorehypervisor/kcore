@@ -13,6 +13,7 @@ mod discovery;
 mod disk;
 mod grpc;
 mod guest_ops;
+mod host_cpu;
 mod issue_screen;
 mod live_migrate;
 mod path_safety;
