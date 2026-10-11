@@ -903,6 +903,7 @@ async fn log_failed_kcore_units(context: &'static str) {
             "kcore-vm-*",
             "kcore-tap-*",
             "kcore-bridge-*",
+            "kcore-firewall-*",
             "kcore-dhcp-*",
         ])
         .output()
