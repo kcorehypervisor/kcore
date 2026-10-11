@@ -45,6 +45,23 @@ with the unhelpful "Failed to receive migratable component snapshot".
 
 When a node misses heartbeats for 90 seconds the controller marks it `not-ready` and, unless `failover.enabled` is false, moves each Ceph VM onto another healthy member of the same cluster. The move is a cold reassignment: the failed node is not contacted. Local `filesystem`, `lvm`, and `zfs` VMs stay on that node and show up in `kctl get cluster-health` as VMs on a not-ready node.
 
+### Fencing before the move
+
+A node the controller cannot reach is not necessarily a node whose guests have stopped. Only the controller heartbeat is known to be missing; the guest may still be running and its rbd-nbd still writing. The RBD images are created with the `layering` feature only, so Ceph itself does not arbitrate writers: starting the guest on another node would give two kernels the same ext4 filesystem (this was observed in the lab and needed `fsck` to repair).
+
+Before reassigning each Ceph VM the controller therefore calls `NodeStorage.FenceVolume` through a healthy member of the cluster, once per attached volume. The member runs `rbd status --format json` (and `rbd lock ls`) on the image and adds every client listed from the lost node's addresses (its Ceph public address from the CephCluster spec and the host part of its gRPC address) to the OSD blocklist with `ceph osd blocklist add <addr:port/nonce> 604800`. From the next osdmap the lost node's rbd-nbd gets `EBLOCKLISTED` on every I/O; the guest there sees disk errors, nothing reaches the image. The blocklist entry lasts seven days and is tied to the client instance (address, port, nonce); a node that reboots comes back with new nonces, so the blocklist does not cover it. Its boot-time units are the remaining exposure, see below.
+
+The fence is a precondition, not best effort:
+
+- If the image is open from a host that is *not* the lost node, `FenceVolume` fails with `FAILED_PRECONDITION` naming that client, and the VM stays where the database says it is. The controller's placement is wrong in that case and moving the guest would cut off whoever is really running it.
+- If no healthy member answers, or the VM has no attached volume rows to name its images, the VM is not moved and the error is reported once in the controller log (`stays on <node>: its RBD images could not be fenced`). The next pass retries.
+- Blocklisted addresses are recorded on the `FailoverVm` replication event. `ceph osd blocklist ls` shows them; `ceph osd blocklist rm <addr>` lifts one early once the node is known to be down.
+
+Two cases are not covered by the blocklist and are listed in [`storage-and-mobility-gaps.md`](./storage-and-mobility-gaps.md):
+
+- An image with no watchers at all is treated as already fenced: there is no client to blocklist. A node that is partitioned from both the controller and the Ceph public network falls into this case once its watch has timed out (30 s), and it could resume writing if the partition heals before its config is refreshed.
+- A lost node that reboots still has the moved guest in its NixOS configuration (`autoStart` units are `wantedBy multi-user.target`) and starts it with a fresh Ceph client before the controller's first config push removes the unit.
+
 The failed node is recorded in `pending_node_config_push`. Its next successful heartbeat pushes a configuration that no longer starts the moved guests, so a node that comes back does not boot a second copy of a Ceph VM. `kctl get cluster-health` reports `healthy`, `degraded`, or `unhealthy` from node readiness, those leftover VMs, certificates inside 30 days, and unresolved replication conflicts.
 
 ```yaml

@@ -124,6 +124,10 @@ use super::validation::{
 
 #[cfg(test)]
 type PushHook = std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + Sync + 'static>;
+/// Test stand-in for `NodeStorage.FenceVolume`: (backend_handle, source_hosts).
+#[cfg(test)]
+type FenceHook =
+    std::sync::Arc<dyn Fn(&str, &[String]) -> Result<Vec<String>, Status> + Send + Sync + 'static>;
 
 /// Live migrate failed; `send_succeeded` means the guest may already run on dest
 /// and cold fallback must not start a second VMM on the shared RBD.
@@ -469,6 +473,8 @@ pub struct ControllerService {
     overcommit: crate::scheduler::Overcommit,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
+    #[cfg(test)]
+    test_fence_hook: Option<FenceHook>,
 }
 
 fn network_policies_by_name(
@@ -714,6 +720,8 @@ impl ControllerService {
             overcommit: crate::scheduler::Overcommit::default(),
             #[cfg(test)]
             test_push_hook: None,
+            #[cfg(test)]
+            test_fence_hook: None,
         }
     }
 
@@ -890,7 +898,14 @@ impl ControllerService {
             webhooks: crate::webhooks::Dispatcher::noop(),
             overcommit: crate::scheduler::Overcommit::default(),
             test_push_hook: Some(hook),
+            test_fence_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_test_fence_hook(mut self, hook: FenceHook) -> Self {
+        self.test_fence_hook = Some(hook);
+        self
     }
 
     #[inline]
@@ -4646,13 +4661,129 @@ impl ControllerService {
         Ok(NodeDrainOutcome { migrated, errors })
     }
 
+    /// Addresses under which `node` can appear as a Ceph client: its Ceph
+    /// public (mon) address from every CephCluster it belongs to, plus the
+    /// host part of its gRPC address.
+    fn ceph_client_hosts_for_node(&self, node: &NodeRow) -> Result<Vec<String>, Status> {
+        let mut hosts = vec![grpc_address_host(&node.address)];
+        for cluster in self
+            .db
+            .list_ceph_clusters()
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            let Ok(spec) = ceph_cluster_spec::spec_from_json(&cluster.spec_json) else {
+                continue;
+            };
+            for member in spec.nodes.iter().filter(|n| n.node_id == node.id) {
+                let addr = member.mon_addr.trim();
+                if !addr.is_empty() {
+                    hosts.push(grpc_address_host(addr));
+                }
+            }
+        }
+        hosts.retain(|h| !h.is_empty());
+        hosts.sort();
+        hosts.dedup();
+        Ok(hosts)
+    }
+
+    /// Blocklist the lost node's Ceph clients for every volume of `vm`, via
+    /// one of `members` (healthy CephCluster nodes), before the guest is
+    /// started anywhere else.
+    ///
+    /// The images carry no exclusive lock, so without this the rbd-nbd on the
+    /// unreachable node keeps writing after the guest restarts elsewhere and
+    /// the filesystem is torn apart by two kernels. Any failure here aborts
+    /// the failover of this VM: a guest that stays down is recoverable, a
+    /// corrupted disk is not. A member that cannot be reached is skipped; a
+    /// member that answers with an error ends the attempt, because that
+    /// answer (image open from the wrong host, blocklist refused) is the
+    /// cluster's verdict and not a transport problem.
+    async fn fence_vm_volumes(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        members: &[NodeRow],
+    ) -> Result<Vec<String>, Status> {
+        let volumes = self
+            .db
+            .list_attached_volumes_for_vm(&vm.id)
+            .map_err(|e| Status::internal(format!("listing volumes: {e}")))?;
+        if volumes.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "VM '{}' has no attached volume rows; cannot tell which RBD images to fence",
+                vm.name
+            )));
+        }
+        let hosts = self.ceph_client_hosts_for_node(source)?;
+        let mut blocklisted = Vec::new();
+        for vol in &volumes {
+            let handle = format!("{}/{}", vol.pool, vol.image);
+            #[cfg(test)]
+            if let Some(hook) = &self.test_fence_hook {
+                blocklisted.extend(hook(&handle, &hosts)?);
+                continue;
+            }
+            let mut last_err = Status::unavailable(format!(
+                "no healthy Ceph member reachable to fence {handle}"
+            ));
+            let mut fenced = false;
+            for member in members.iter().filter(|m| m.id != source.id) {
+                if self.clients.get_storage(&member.address).is_none() {
+                    if let Err(e) = self.clients.connect(&member.address).await {
+                        last_err = Status::unavailable(format!(
+                            "connecting to {} to fence {handle}: {e}",
+                            member.id
+                        ));
+                        continue;
+                    }
+                }
+                let Some(mut storage) = self.clients.get_storage(&member.address) else {
+                    continue;
+                };
+                match storage
+                    .fence_volume(node_proto::FenceVolumeRequest {
+                        backend_handle: handle.clone(),
+                        source_hosts: hosts.clone(),
+                    })
+                    .await
+                {
+                    Ok(resp) => {
+                        blocklisted.extend(resp.into_inner().blocklisted);
+                        fenced = true;
+                        break;
+                    }
+                    Err(e) if e.code() == tonic::Code::Unavailable => {
+                        last_err = Status::unavailable(format!(
+                            "{} did not answer FenceVolume for {handle}: {}",
+                            member.id,
+                            e.message()
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(Status::new(
+                            e.code(),
+                            format!("fencing {handle} via {}: {}", member.id, e.message()),
+                        ));
+                    }
+                }
+            }
+            if !fenced {
+                return Err(last_err);
+            }
+        }
+        Ok(blocklisted)
+    }
+
     /// Move Ceph VMs off a node that has already been marked `not-ready`.
     ///
     /// Local-disk VMs stay, because their disks are on the failed host. The
     /// source is not contacted: it already missed the heartbeat deadline, and
-    /// a connect attempt would only delay the move. The destination receives
-    /// the VM unit. The source is recorded so its next successful heartbeat
-    /// pushes a config that no longer starts the moved guests.
+    /// a connect attempt would only delay the move. Its Ceph clients are
+    /// fenced through a healthy member first, so whatever still runs there
+    /// can no longer write to the images. The destination receives the VM
+    /// unit. The source is recorded so its next successful heartbeat pushes a
+    /// config that no longer starts the moved guests.
     pub async fn failover_unreachable_node(
         &self,
         node_id: &str,
@@ -4728,6 +4859,24 @@ impl ControllerService {
                 }
             };
 
+            let blocklisted = match self.fence_vm_volumes(vm, &source, &candidates).await {
+                Ok(addrs) => addrs,
+                Err(e) => {
+                    errors.push(format!(
+                        "VM '{}' stays on {node_id}: its RBD images could not be fenced ({})",
+                        vm.name,
+                        e.message()
+                    ));
+                    continue;
+                }
+            };
+            info!(
+                vm = %vm.name,
+                source = %node_id,
+                blocklisted = ?blocklisted,
+                "fenced Ceph clients of unreachable node"
+            );
+
             if let Err(e) = self.reassign_vm_node(vm, &target.id) {
                 errors.push(format!("VM '{}': {e}", vm.name));
                 continue;
@@ -4747,6 +4896,7 @@ impl ControllerService {
                     "sourceNode": node_id,
                     "targetNode": target.id,
                     "mode": "failover",
+                    "blocklisted": blocklisted,
                 }),
             );
             if let Err(e) = self.push_config_and_await_apply(&target).await {
@@ -15952,7 +16102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failover_moves_ceph_vms_and_leaves_local_disks() {
+    async fn failover_fences_then_moves_ceph_vms_and_leaves_local_disks() {
         let (db, vm) = ceph_two_node_fixture();
         mark_ceph_cluster_healthy(&db, "lab");
         db.update_node_status("node-a", "not-ready").expect("mark");
@@ -15961,7 +16111,16 @@ mod tests {
         local.name = "local-disk".into();
         local.storage_backend = "filesystem".into();
         db.insert_vm(&local).expect("local vm");
-        let svc = svc_for(&db);
+        let fenced = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let record = Arc::clone(&fenced);
+        let hook: FenceHook = Arc::new(move |handle: &str, hosts: &[String]| {
+            record
+                .lock()
+                .unwrap()
+                .push((handle.to_string(), hosts.to_vec()));
+            Ok(vec!["127.0.0.1:0/4242".to_string()])
+        });
+        let svc = svc_for(&db).with_test_fence_hook(hook);
 
         let outcome = svc
             .failover_unreachable_node("node-a")
@@ -15981,6 +16140,76 @@ mod tests {
         assert_eq!(
             db.get_node("node-a").expect("get").expect("source").status,
             "not-ready"
+        );
+
+        // The root image was fenced, naming both the gRPC host and the Ceph
+        // public address of the lost node, before the VM changed hands.
+        let fenced = fenced.lock().unwrap();
+        assert_eq!(fenced.len(), 1, "{fenced:?}");
+        assert_eq!(fenced[0].0, format!("kcore-vms/kcore-{}", vm.id));
+        assert_eq!(
+            fenced[0].1,
+            vec!["10.10.0.11".to_string(), "127.0.0.1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_leaves_the_vm_in_place_when_fencing_fails() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-a", "not-ready").expect("mark");
+        let hook: FenceHook = Arc::new(|handle: &str, _hosts: &[String]| {
+            Err(Status::failed_precondition(format!(
+                "{handle} is open from 10.10.0.12:0/7 (host 10.10.0.12), which is not the node being fenced"
+            )))
+        });
+        let svc = svc_for(&db).with_test_fence_hook(hook);
+
+        let outcome = svc
+            .failover_unreachable_node("node-a")
+            .await
+            .expect("failover pass");
+        assert_eq!(outcome.migrated, 0);
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("could not be fenced") && e.contains("10.10.0.12:0/7")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("ceph").node_id,
+            "node-a"
+        );
+        assert!(!db.node_needs_config_push("node-a").expect("flag"));
+    }
+
+    #[tokio::test]
+    async fn failover_without_a_reachable_ceph_member_does_not_move_the_vm() {
+        // No fence hook: the controller really tries the members' gRPC
+        // addresses, none of which is listening.
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-a", "not-ready").expect("mark");
+        let svc = svc_for(&db);
+
+        let outcome = svc
+            .failover_unreachable_node("node-a")
+            .await
+            .expect("failover pass");
+        assert_eq!(outcome.migrated, 0);
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("could not be fenced")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("ceph").node_id,
+            "node-a"
         );
     }
 
