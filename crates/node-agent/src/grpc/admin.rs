@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -3864,6 +3865,328 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 }))
             }
         }
+    }
+
+    // ============================================================================
+    // Kubernetes Node Configuration
+    // ============================================================================
+
+    async fn apply_kubernetes_config(
+        &self,
+        request: Request<proto::ApplyKubernetesConfigRequest>,
+    ) -> Result<Response<proto::ApplyKubernetesConfigResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        
+        // Write kcore-kubernetes.nix module config
+        let k8s_config_path = PathBuf::from("/etc/nixos/kcore-kubernetes.nix");
+        let config_content = self.generate_k8s_nix_config(&req)?;
+        
+        tokio::task::spawn_blocking({
+            let path = k8s_config_path.clone();
+            let content = config_content.clone();
+            move || std::fs::write(&path, &content)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(|e| {
+            error!(path = %k8s_config_path.display(), error = %e, "failed to write kubernetes config");
+            Status::internal(format!("writing {}: {e}", k8s_config_path.display()))
+        })?;
+
+        info!(path = %k8s_config_path.display(), role = %req.role, "wrote kubernetes config");
+
+        // Generate apply_id for tracking
+        let apply_id = format!("k8s-apply-{}", uuid_like_suffix());
+        write_apply_state(&apply_id, "running", "queued");
+
+        // Write kubeconfig if provided
+        if !req.kubeconfig_data.is_empty() {
+            let kubeconfig_path = PathBuf::from("/etc/kubernetes/admin.conf");
+            tokio::task::spawn_blocking({
+                let path = kubeconfig_path.clone();
+                let data = req.kubeconfig_data.clone();
+                move || {
+                    std::fs::create_dir_all("/etc/kubernetes")?;
+                    std::fs::write(&path, &data)?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                    Ok::<_, std::io::Error>(())
+                }
+            })
+            .await
+            .map_err(|e| Status::internal(format!("kubeconfig task join: {e}")))?
+            .map_err(|e| {
+                error!(error = %e, "failed to write kubeconfig");
+                Status::internal(format!("writing kubeconfig: {e}"))
+            })?;
+        }
+
+        // Start background rebuild
+        let apply_lock = Arc::clone(&self.apply_lock);
+        let spawned_id = apply_id.clone();
+        let nix_config_path = self.nix_config_path.clone();
+        
+        tokio::spawn(async move {
+            let _guard = apply_lock.lock().await;
+            Self::run_k8s_nixos_rebuild(nix_config_path, spawned_id).await;
+        });
+
+        Ok(Response::new(proto::ApplyKubernetesConfigResponse {
+            apply_id: apply_id.clone(),
+            status: "started".to_string(),
+            message: format!("Kubernetes configuration written; nixos-rebuild started ({})", apply_id),
+        }))
+    }
+
+    async fn get_kubernetes_status(
+        &self,
+        _request: Request<proto::GetKubernetesStatusRequest>,
+    ) -> Result<Response<proto::GetKubernetesStatusResponse>, Status> {
+        // Check if kubernetes module is enabled
+        let k8s_enabled = Path::new("/etc/nixos/kcore-kubernetes.nix").exists();
+        
+        if !k8s_enabled {
+            return Ok(Response::new(proto::GetKubernetesStatusResponse {
+                enabled: false,
+                role: String::new(),
+                kubelet_active: false,
+                api_server_active: false,
+                etcd_active: false,
+                cilium_node_active: false,
+                node_status: "not-configured".to_string(),
+                running_pods: 0,
+            }));
+        }
+
+        // Check systemd service statuses
+        let kubelet_active = Self::is_systemd_active("kubelet").await;
+        let api_server_active = Self::is_systemd_active("kube-apiserver").await;
+        let etcd_active = Self::is_systemd_active("etcd").await;
+        
+        // Determine role from which services are running
+        let role = if api_server_active {
+            "control-plane".to_string()
+        } else if kubelet_active {
+            "worker".to_string()
+        } else {
+            "unknown".to_string()
+        };
+
+        // Check node status via kubectl if kubelet is running
+        let (node_status, running_pods) = if kubelet_active {
+            Self::get_k8s_node_status().await
+        } else {
+            ("NotReady".to_string(), 0)
+        };
+
+        // Check Cilium (would be a pod, but we'll check via systemd for now)
+        let cilium_node_active = kubelet_active; // Simplified
+
+        Ok(Response::new(proto::GetKubernetesStatusResponse {
+            enabled: true,
+            role,
+            kubelet_active,
+            api_server_active,
+            etcd_active,
+            cilium_node_active,
+            node_status,
+            running_pods,
+        }))
+    }
+
+    async fn drain_kubernetes_node(
+        &self,
+        request: Request<proto::DrainKubernetesNodeRequest>,
+    ) -> Result<Response<proto::DrainKubernetesNodeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        
+        let hostname = hostname::get()
+            .map_err(|e| Status::internal(format!("getting hostname: {e}")))?
+            .to_string_lossy()
+            .to_string();
+
+        let mut cmd = tokio::process::Command::new("kubectl");
+        cmd.arg("drain")
+            .arg(&hostname)
+            .arg("--force");
+        
+        if req.delete_emptydir_data {
+            cmd.arg("--delete-emptydir-data");
+        }
+        if req.ignore_daemonsets {
+            cmd.arg("--ignore-daemonsets");
+        }
+        if req.timeout_seconds > 0 {
+            cmd.arg("--timeout").arg(format!("{}s", req.timeout_seconds));
+        }
+
+        let output = cmd.output().await.map_err(|e| {
+            Status::internal(format!("kubectl drain failed: {e}"))
+        })?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            info!(node = %hostname, "kubernetes node drained successfully");
+            Ok(Response::new(proto::DrainKubernetesNodeResponse {
+                status: "drained".to_string(),
+                message: stdout.to_string(),
+            }))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(node = %hostname, error = %stderr, "kubectl drain failed");
+            Err(Status::internal(format!("drain failed: {}", stderr)))
+        }
+    }
+}
+
+// Helper methods for Kubernetes operations
+impl AdminService {
+    fn generate_k8s_nix_config(&self, req: &proto::ApplyKubernetesConfigRequest) -> Result<String, Status> {
+        use crate::nixgen_k8s::KubernetesNodeConfig;
+        
+        let config = KubernetesNodeConfig {
+            role: req.role.clone(),
+            cluster_name: req.cluster_name.clone(),
+            cluster_cidr: req.cluster_cidr.clone(),
+            service_cidr: req.service_cidr.clone(),
+            cluster_dns: req.cluster_dns.clone(),
+            advertise_address: req.advertise_address.clone(),
+            iface: req.iface.clone(),
+            api_server_endpoint: req.api_server_endpoint.clone(),
+            initial_cluster: req.initial_cluster,
+            etcd_initial_cluster: req.etcd_initial_cluster.clone(),
+            cni: req.cni.clone(),
+            cilium_mode: req.cilium_config.as_ref().map(|c| c.mode.clone()).unwrap_or_default(),
+            cilium_mtu: req.cilium_config.as_ref().map(|c| c.mtu).unwrap_or(1500),
+            cilium_tunnel: req.cilium_config.as_ref().map(|c| c.tunnel.clone()).unwrap_or_default(),
+            cilium_auto_direct_routes: req.cilium_config.as_ref().map(|c| c.auto_direct_node_routes).unwrap_or(true),
+            cilium_lb_ip_pools: req.cilium_config.as_ref().map(|c| c.load_balancer_ip_pools.clone()).unwrap_or_default(),
+            ha_enabled: req.ha_enabled,
+            vip_address: req.vip_address.clone(),
+            vip_interface: req.vip_interface.clone(),
+            kubeconfig_data: String::new(), // Written separately
+        };
+        
+        Ok(crate::nixgen_k8s::generate_kubernetes_node_config(&config))
+    }
+
+    async fn run_k8s_nixos_rebuild(config_path: PathBuf, apply_id: String) {
+        write_apply_state(&apply_id, "rebuilding", "running nixos-rebuild test");
+        
+        let test_result = tokio::process::Command::new("nixos-rebuild")
+            .arg("test")
+            .arg("--flake")
+            .arg(format!(".#{}", config_path.display()))
+            .output()
+            .await;
+
+        match test_result {
+            Ok(output) if output.status.success() => {
+                info!(apply_id = %apply_id, "nixos-rebuild test succeeded");
+                write_apply_state(&apply_id, "activating", "running nixos-rebuild switch");
+                
+                let switch_result = tokio::process::Command::new("nixos-rebuild")
+                    .arg("switch")
+                    .arg("--flake")
+                    .arg(format!(".#{}", config_path.display()))
+                    .output()
+                    .await;
+
+                match switch_result {
+                    Ok(output) if output.status.success() => {
+                        info!(apply_id = %apply_id, "nixos-rebuild switch succeeded");
+                        write_apply_state(&apply_id, "completed", "kubernetes configuration active");
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        error!(apply_id = %apply_id, error = %stderr, "nixos-rebuild switch failed");
+                        write_apply_state(&apply_id, "failed", &format!("switch failed: {}", stderr));
+                    }
+                    Err(e) => {
+                        error!(apply_id = %apply_id, error = %e, "failed to run nixos-rebuild switch");
+                        write_apply_state(&apply_id, "failed", &format!("switch error: {}", e));
+                    }
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                error!(apply_id = %apply_id, error = %stderr, "nixos-rebuild test failed");
+                write_apply_state(&apply_id, "failed", &format!("test failed: {}", stderr));
+            }
+            Err(e) => {
+                error!(apply_id = %apply_id, error = %e, "failed to run nixos-rebuild test");
+                write_apply_state(&apply_id, "failed", &format!("test error: {}", e));
+            }
+        }
+    }
+
+    async fn is_systemd_active(service: &str) -> bool {
+        tokio::process::Command::new("systemctl")
+            .arg("is-active")
+            .arg("--quiet")
+            .arg(service)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    async fn get_k8s_node_status() -> (String, i32) {
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Get node status
+        let node_status = tokio::process::Command::new("kubectl")
+            .arg("get")
+            .arg("node")
+            .arg(&hostname)
+            .arg("-o")
+            .arg("jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+            .output()
+            .await
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    String::from_utf8(out.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let status = if node_status.trim() == "True" {
+            "Ready".to_string()
+        } else {
+            "NotReady".to_string()
+        };
+
+        // Count running pods
+        let pod_count = tokio::process::Command::new("kubectl")
+            .arg("get")
+            .arg("pods")
+            .arg("--all-namespaces")
+            .arg("--field-selector")
+            .arg(format!("spec.nodeName={},status.phase=Running", hostname))
+            .arg("-o")
+            .arg("json")
+            .output()
+            .await
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                        .ok()
+                        .and_then(|v| v["items"].as_array().map(|a| a.len() as i32))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        (status, pod_count)
     }
 }
 

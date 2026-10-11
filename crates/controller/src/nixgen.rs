@@ -1568,10 +1568,162 @@ mod proptests {
 
         /// `netmask_to_cidr` on garbage input never panics; it just
         /// drops un-parseable octets and returns the popcount of the
-        /// remainder.
+        /        // remainder.
         #[test]
         fn netmask_to_cidr_never_panics_on_garbage(s in ".{0,32}") {
             let _ = netmask_to_cidr(&s);
         }
+    }
+}
+
+// ============================================================================
+// Kubernetes Cluster Code Generation
+// ============================================================================
+
+/// Kubernetes cluster node configuration parameters.
+#[derive(Debug, Clone)]
+pub struct KubernetesNodeConfig {
+    pub role: String,
+    pub cluster_name: String,
+    pub cluster_cidr: String,
+    pub service_cidr: String,
+    pub cluster_dns: String,
+    pub advertise_address: String,
+    pub iface: String,
+    pub api_server_endpoint: String,
+    pub initial_cluster: bool,
+    pub etcd_initial_cluster: String,
+    pub cni: String,
+    pub cilium_mode: String,
+    pub cilium_mtu: i32,
+    pub cilium_tunnel: String,
+    pub cilium_auto_direct_routes: bool,
+    pub cilium_lb_ip_pools: Vec<String>,
+    pub ha_enabled: bool,
+    pub vip_address: String,
+    pub vip_interface: String,
+    pub kubeconfig_data: String,
+}
+
+/// Generate the kcore.kubernetes NixOS module configuration for a node.
+///
+/// This produces a Nix attribute set that will be merged into the node's
+/// configuration.nix, enabling the Kubernetes services (etcd, kube-apiserver,
+/// controller-manager, scheduler, kubelet) based on the node's role.
+pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  kcore.kubernetes = {\n");
+    out.push_str("    enable = true;\n");
+    out.push_str(&format!("    role = \"{}\";\n", nix_escape(&k8s.role)));
+    out.push_str(&format!("    clusterName = \"{}\";\n", nix_escape(&k8s.cluster_name)));
+    out.push_str(&format!("    clusterCidr = \"{}\";\n", nix_escape(&k8s.cluster_cidr)));
+    out.push_str(&format!("    serviceCidr = \"{}\";\n", nix_escape(&k8s.service_cidr)));
+    out.push_str(&format!("    clusterDns = \"{}\";\n", nix_escape(&k8s.cluster_dns)));
+    out.push_str(&format!("    advertiseAddress = \"{}\";\n", nix_escape(&k8s.advertise_address)));
+    out.push_str(&format!("    iface = \"{}\";\n", nix_escape(&k8s.iface)));
+    out.push_str(&format!("    apiServerEndpoint = \"{}\";\n", nix_escape(&k8s.api_server_endpoint)));
+    out.push_str(&format!("    initialCluster = {};\n", k8s.initial_cluster));
+    
+    if k8s.role == "control-plane" {
+        out.push_str(&format!("    etcdInitialCluster = \"{}\";\n", nix_escape(&k8s.etcd_initial_cluster)));
+    }
+    
+    out.push_str(&format!("    cni = \"{}\";\n", nix_escape(&k8s.cni)));
+    out.push_str(&format!("    ciliumMode = \"{}\";\n", nix_escape(&k8s.cilium_mode)));
+    out.push_str(&format!("    ciliumMtu = {};\n", k8s.cilium_mtu));
+    out.push_str(&format!("    ciliumTunnel = \"{}\";\n", nix_escape(&k8s.cilium_tunnel)));
+    out.push_str(&format!("    ciliumAutoDirectNodeRoutes = {};\n", k8s.cilium_auto_direct_routes));
+    
+    if !k8s.cilium_lb_ip_pools.is_empty() {
+        out.push_str("    ciliumLoadBalancerIpPools = [\n");
+        for pool in &k8s.cilium_lb_ip_pools {
+            out.push_str(&format!("      \"{}\"\n", nix_escape(pool)));
+        }
+        out.push_str("    ];\n");
+    }
+    
+    out.push_str(&format!("    haEnabled = {};\n", k8s.ha_enabled));
+    if k8s.ha_enabled {
+        out.push_str(&format!("    vipAddress = \"{}\";\n", nix_escape(&k8s.vip_address)));
+        out.push_str(&format!("    vipInterface = \"{}\";\n", nix_escape(&k8s.vip_interface)));
+    }
+    
+    if !k8s.kubeconfig_data.is_empty() {
+        out.push_str(&format!("    kubeconfigData = ''{}'';\n", k8s.kubeconfig_data));
+    }
+    
+    out.push_str("  };\n");
+    out.push_str("}\n");
+    out
+}
+
+#[cfg(test)]
+mod kubernetes_tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_kubernetes_control_plane_config() {
+        let config = KubernetesNodeConfig {
+            role: "control-plane".to_string(),
+            cluster_name: "kcore-k8s".to_string(),
+            cluster_cidr: "10.244.0.0/16".to_string(),
+            service_cidr: "10.96.0.0/12".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            advertise_address: "192.168.40.105".to_string(),
+            iface: "enp6s0".to_string(),
+            api_server_endpoint: "192.168.40.200:6443".to_string(),
+            initial_cluster: true,
+            etcd_initial_cluster: "node-105=https://192.168.40.105:2380".to_string(),
+            cni: "cilium".to_string(),
+            cilium_mode: "native-routing".to_string(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".to_string(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+            ha_enabled: true,
+            vip_address: "192.168.40.200".to_string(),
+            vip_interface: "enp6s0".to_string(),
+            kubeconfig_data: String::new(),
+        };
+        
+        let nix = generate_kubernetes_node_config(&config);
+        assert!(nix.contains("enable = true"));
+        assert!(nix.contains("role = \"control-plane\""));
+        assert!(nix.contains("haEnabled = true"));
+        assert!(nix.contains("initialCluster = true"));
+        assert!(nix.contains("etcdInitialCluster"));
+    }
+
+    #[test]
+    fn test_generate_kubernetes_worker_config() {
+        let config = KubernetesNodeConfig {
+            role: "worker".to_string(),
+            cluster_name: "kcore-k8s".to_string(),
+            cluster_cidr: "10.244.0.0/16".to_string(),
+            service_cidr: "10.96.0.0/12".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            advertise_address: "192.168.40.110".to_string(),
+            iface: "enp6s0".to_string(),
+            api_server_endpoint: "192.168.40.200:6443".to_string(),
+            initial_cluster: false,
+            etcd_initial_cluster: String::new(),
+            cni: "cilium".to_string(),
+            cilium_mode: "native-routing".to_string(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".to_string(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: vec![],
+            ha_enabled: false,
+            vip_address: String::new(),
+            vip_interface: String::new(),
+            kubeconfig_data: String::new(),
+        };
+        
+        let nix = generate_kubernetes_node_config(&config);
+        assert!(nix.contains("enable = true"));
+        assert!(nix.contains("role = \"worker\""));
+        assert!(nix.contains("haEnabled = false"));
+        assert!(!nix.contains("etcdInitialCluster"));
     }
 }
