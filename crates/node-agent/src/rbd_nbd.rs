@@ -126,6 +126,9 @@ pub fn unmap(pool: &str, image: &str) -> Result<(), String> {
     if device_in_use(&dev) {
         return Err(format!("rbd device {dev} for {pool}/{image} is still in use"));
     }
+    // Dirty pages left in the host page cache would be lost once the nbd
+    // socket is torn down.
+    let _ = Command::new("blockdev").args(["--flushbufs", &dev]).status();
     let out = Command::new("rbd")
         .args(["device", "unmap", "-t", "nbd", &dev])
         .output()

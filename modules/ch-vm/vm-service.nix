@@ -51,7 +51,7 @@ let
 
       vmDiskArg =
         "path=${actualDisk},image_type=${actualFormat}"
-        + lib.optionalString isCeph ",serial=root-${vmName}";
+        + lib.optionalString isCeph ",direct=on,serial=root-${vmName}";
       seedDiskArg = "path=${seedIso},readonly=on,image_type=raw";
       dataDiskArgs = lib.concatMapStringsSep " " (
         disk:
@@ -63,7 +63,7 @@ let
             else
               "/dev/rbd/${cfg.rbdPool}/${disk.rbdImage}";
         in
-        "path=${path},image_type=raw,serial=${disk.serial}${ro}"
+        "path=${path},image_type=raw,direct=on,serial=${disk.serial}${ro}"
       ) vmCfg.dataDisks;
 
       # The declared format comes from the image URL/extension, which is wrong for
@@ -146,7 +146,7 @@ let
       # exposed under the stable /dev/rbd/<pool>/<image> symlink. The nbd daemon
       # runs in its own transient scope so it outlives this unit's cgroup.
       rbdNbdFunctions = ''
-        export PATH="${pkgs.ceph}/bin:${pkgs.jq}/bin:${pkgs.kmod}/bin:$PATH"
+        export PATH="${pkgs.ceph}/bin:${pkgs.jq}/bin:${pkgs.kmod}/bin:${pkgs.util-linux}/bin:$PATH"
         nbd_dev() {
           rbd device list -t nbd --format json 2>/dev/null \
             | jq -r --arg p "''${1%%/*}" --arg i "''${1#*/}" \
@@ -213,6 +213,7 @@ let
           local DEV
           DEV="$(nbd_dev "$1")"
           if [ -n "$DEV" ]; then
+            blockdev --flushbufs "$DEV" || true
             rbd device unmap -t nbd "$DEV" || true
           fi
           rm -f "/dev/rbd/$1"
