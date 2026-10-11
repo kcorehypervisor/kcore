@@ -1,4 +1,4 @@
-.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace test-replication-soak coverage test-controller test-node-agent test-kctl test-rust-filter loc iso iso-remote kctl clean install-hooks kani help release-tag release-build release-dist release-sign release-publish release sbom sbom-iso sbom-all verify-release
+.PHONY: all build check fmt clippy audit lint-nix test test-all test-rust test-nix test-vm test-tla test-tla-trace test-replication-soak coverage test-controller test-node-agent test-kctl test-rust-filter loc iso netboot iso-remote kctl clean install-hooks kani help release-tag release-build release-dist release-sign release-publish release sbom sbom-iso sbom-all verify-release
 
 VERSION := $(shell cat VERSION)
 V ?= v$(VERSION)
@@ -93,6 +93,13 @@ iso:
 	@ls -lh result-iso/iso/*.iso
 	@echo ""
 	@echo "ISO built under result-iso/iso/ (release-dist copies it to kcoreos-$(VERSION)-x86_64-linux.iso)"
+
+netboot:
+	@echo "Building kcore netboot tree (vmlinuz + initrd.img with embedded store, for PXE/UEFI HTTP Boot)..."
+	nix build .#nixosConfigurations.kcore-netboot.config.system.build.kcoreNetbootTree -o result-netboot
+	@echo ""
+	@ls -lhL result-netboot/vmlinuz result-netboot/initrd.img
+	@echo "Kernel init= parameter: $$(cat result-netboot/init)"
 
 iso-remote:
 	@echo "Building kcore ISO $(V) on remote Linux server..."
