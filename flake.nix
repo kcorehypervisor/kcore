@@ -161,6 +161,11 @@
               lib = pkgs.lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
+            ch-vm-module-eval = import ./tests/ch-vm-module-eval.nix {
+              inherit pkgs;
+              lib = pkgs.lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
             fmt-nix =
               pkgs.runCommand "check-nix-fmt"
                 {
