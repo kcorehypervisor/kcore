@@ -56,6 +56,9 @@ The fence is a precondition, not best effort:
 - If the image is open from a host that is *not* the lost node, `FenceVolume` fails with `FAILED_PRECONDITION` naming that client, and the VM stays where the database says it is. The controller's placement is wrong in that case and moving the guest would cut off whoever is really running it.
 - If no healthy member answers, or the VM has no attached volume rows to name its images, the VM is not moved and the error is reported once in the controller log (`stays on <node>: its RBD images could not be fenced`). The next pass retries.
 - Blocklisted addresses are recorded on the `FailoverVm` replication event. `ceph osd blocklist ls` shows them; `ceph osd blocklist rm <addr>` lifts one early once the node is known to be down.
+- Only storage is fenced. A guest that is still running on the lost node keeps its CPU and network; its disk returns errors (`block nbd0: Other side returned error (108)` on the host). It is stopped when the node's next heartbeat brings the configuration without it: the unit's `ExecStop` presses the power button, which a guest with a dead root disk usually ignores, and sends SIGTERM 25 s later.
+
+Lab run (node-103 lost its agent while `labtest-9` wrote one line per second): heartbeat deadline at +93 s, fence at +93.5 s, guest booted on node-118 at +113 s with `EXT4-fs: recovery complete`; the last line on the image was written one second before the fence. Node-103's copy was torn down 44 s after its agent returned.
 
 Two cases are not covered by the blocklist and are listed in [`storage-and-mobility-gaps.md`](./storage-and-mobility-gaps.md):
 
