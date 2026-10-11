@@ -5868,7 +5868,7 @@ impl Database {
     pub fn get_stale_nodes(&self, timeout_seconds: i64) -> Result<Vec<NodeRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used, storage_backend, disable_vxlan FROM nodes WHERE status = 'ready' AND last_heartbeat != '' AND (julianday('now') - julianday(last_heartbeat)) * 86400 > ?1",
+            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used, storage_backend, disable_vxlan, approval_status, cert_expiry_days, luks_method, dc_id FROM nodes WHERE status = 'ready' AND last_heartbeat != '' AND (julianday('now') - julianday(last_heartbeat)) * 86400 > ?1",
         )?;
         let rows = stmt.query_map(params![timeout_seconds], row_to_node)?;
         rows.collect()
@@ -8101,6 +8101,26 @@ mod tests {
         assert!(db.delete_volume_by_vm("vm-1").unwrap());
         assert!(db.get_volume_by_vm("vm-1").unwrap().is_none());
         assert!(!db.delete_volume_by_vm("vm-1").unwrap());
+    }
+
+    #[test]
+    fn stale_nodes_are_returned_once_the_heartbeat_deadline_passes() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).unwrap();
+        db.update_heartbeat("n1", 0, 0, -1, "").unwrap();
+        assert!(db.get_stale_nodes(90).unwrap().is_empty());
+
+        {
+            let conn = db.lock_conn().unwrap();
+            conn.execute(
+                "UPDATE nodes SET last_heartbeat = datetime('now', '-10 minutes') WHERE id = 'n1'",
+                [],
+            )
+            .unwrap();
+        }
+        let stale = db.get_stale_nodes(90).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, "n1");
     }
 
     #[test]
