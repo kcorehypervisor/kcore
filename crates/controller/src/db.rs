@@ -4601,6 +4601,31 @@ impl Database {
         )? > 0)
     }
 
+    /// Close `Preparing` live-migrate rows that no request is driving any more.
+    ///
+    /// `Preparing` is owned by an in-flight RPC. If the controller restarted or
+    /// the RPC died, nothing would ever finish the row and the VM would be
+    /// locked out of further operations. A cancelled row idles for
+    /// `cancelled_idle_secs`; any other row for `idle_secs`.
+    pub fn expire_stale_preparing_operations(
+        &self,
+        cancelled_idle_secs: i64,
+        idle_secs: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE vm_operations
+             SET phase = CASE WHEN cancel_requested = 1 THEN 'Cancelled' ELSE 'Failed' END,
+                 updated_at = datetime('now'),
+                 finished_at = datetime('now')
+             WHERE finished_at = '' AND kind = 'live_migrate' AND phase = 'Preparing'
+               AND ((cancel_requested = 1
+                     AND updated_at < datetime('now', ?1 || ' seconds'))
+                    OR updated_at < datetime('now', ?2 || ' seconds'))",
+            params![-cancelled_idle_secs, -idle_secs],
+        )
+    }
+
     fn map_vm_operation_row(r: &rusqlite::Row<'_>) -> Result<VmOperationRow, rusqlite::Error> {
         Ok(VmOperationRow {
             id: r.get(0)?,
@@ -8076,6 +8101,39 @@ mod tests {
         assert!(db.delete_volume_by_vm("vm-1").unwrap());
         assert!(db.get_volume_by_vm("vm-1").unwrap().is_none());
         assert!(!db.delete_volume_by_vm("vm-1").unwrap());
+    }
+
+    #[test]
+    fn stale_preparing_operations_are_closed() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).unwrap();
+        db.insert_vm(&test_vm("n1")).unwrap();
+        db.insert_vm_operation(&VmOperationRow {
+            id: "op-1".into(),
+            vm_id: "vm-1".into(),
+            kind: VmOperationRow::KIND_LIVE_MIGRATE.into(),
+            phase: VmOperationRow::PHASE_PREPARING.into(),
+            source_node: "n1".into(),
+            target_node: "n2".into(),
+            cancel_requested: false,
+            send_succeeded: false,
+            detail_json: "{}".into(),
+            started_at: String::new(),
+            updated_at: String::new(),
+            finished_at: String::new(),
+        })
+        .unwrap();
+
+        assert_eq!(db.expire_stale_preparing_operations(60, 1800).unwrap(), 0);
+        assert!(db.get_open_vm_operation("vm-1").unwrap().is_some());
+
+        db.request_cancel_vm_operation("op-1").unwrap();
+        assert_eq!(db.expire_stale_preparing_operations(60, 1800).unwrap(), 0);
+        assert_eq!(db.expire_stale_preparing_operations(-1, 1800).unwrap(), 1);
+        let closed = db.get_vm_operation("op-1").unwrap().unwrap();
+        assert_eq!(closed.phase, VmOperationRow::PHASE_CANCELLED);
+        assert!(!closed.finished_at.is_empty());
+        assert!(db.get_open_vm_operation("vm-1").unwrap().is_none());
     }
 
     #[test]
