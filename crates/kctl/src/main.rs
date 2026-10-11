@@ -2712,8 +2712,14 @@ async fn main() {
                     let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
                     commands::disk_layout::diff_from_file(&info, file).await
                 }
+                Some(ref k)
+                    if matches!(k.as_str(), "cephcluster" | "ceph-cluster" | "ceph_cluster") =>
+                {
+                    let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+                    commands::ceph_cluster::plan_from_file(&info, file).await
+                }
                 Some(other) => fatal(&format!(
-                    "kctl diff currently only supports kind: DiskLayout (got {other})"
+                    "kctl diff currently supports kind: DiskLayout or CephCluster (got {other})"
                 )),
                 None => fatal("manifest has no kind: field"),
             }

@@ -31,6 +31,32 @@ fn netmask_to_cidr(mask: &str) -> u8 {
 // using the unqualified names.
 use kcore_sanitize::{nix_escape, sanitize_nix_attr_key};
 
+/// Which newer per-VM options the destination node's installed ch-vm module
+/// understands (see `/etc/kcore/ch-vm-features`). Emitting an option an older
+/// module lacks fails that node's whole evaluation, so each one is gated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleFeatures {
+    pub image_sha256: bool,
+}
+
+impl ModuleFeatures {
+    pub const IMAGE_SHA256: &'static str = "imageSha256";
+
+    /// Everything on: what a node installed from this tree supports.
+    pub fn all() -> Self {
+        Self { image_sha256: true }
+    }
+
+    /// From the list the node agent reports. An agent without the RPC, or a
+    /// module without the file, yields the baseline (nothing on).
+    pub fn from_reported<S: AsRef<str>>(features: &[S]) -> Self {
+        let has = |name: &str| features.iter().any(|f| f.as_ref() == name);
+        Self {
+            image_sha256: has(Self::IMAGE_SHA256),
+        }
+    }
+}
+
 pub fn generate_node_config(
     vms: &[VmRow],
     gateway_interface: &str,
@@ -73,6 +99,7 @@ pub fn generate_node_config_with_security_groups(
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
+        &ModuleFeatures::all(),
     )
 }
 
@@ -102,6 +129,7 @@ pub fn generate_node_config_inner(
     extra_nics: &std::collections::HashMap<String, Vec<VmNicRow>>,
     network_policies: &std::collections::HashMap<String, crate::db::NetworkPolicyRow>,
     vm_ipv6: &std::collections::HashMap<String, Vec<crate::db::VmIpv6Row>>,
+    features: &ModuleFeatures,
 ) -> String {
     let mut out = String::from("{ pkgs, ... }: {\n");
     out.push_str("  ch-vm.vms = {\n");
@@ -271,6 +299,16 @@ pub fn generate_node_config_inner(
             "      imageFormat = \"{}\";\n",
             nix_escape(&vm.image_format)
         ));
+        // The provision scripts re-hash the cached image right before seeding.
+        // Only a well-formed digest is emitted; anything else would fail the
+        // module's strMatching type and take the whole config down with it.
+        let sha = vm.image_sha256.trim();
+        if features.image_sha256 && sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            out.push_str(&format!(
+                "      imageSha256 = \"{}\";\n",
+                sha.to_ascii_lowercase()
+            ));
+        }
         out.push_str(&format!(
             "      storageBackend = \"{}\";\n",
             nix_escape(&vm.storage_backend)
@@ -349,13 +387,13 @@ pub fn generate_node_config_inner(
             ));
         }
         let incoming = incoming_vm_ids.contains(&vm.id);
+        // Keep autoStart identical across the incoming and settled configs.
+        // `incomingMigration` alone keeps systemd from starting the unit. If
+        // autoStart flipped too, the final config would change the unit and the
+        // switch would restart the unit that just adopted the migrated guest.
         out.push_str(&format!(
             "      autoStart = {};\n",
-            if vm.auto_start && !incoming {
-                "true"
-            } else {
-                "false"
-            }
+            if vm.auto_start { "true" } else { "false" }
         ));
         if incoming {
             out.push_str("      incomingMigration = true;\n");
@@ -382,6 +420,14 @@ pub fn generate_node_config_inner(
             out.push_str(&format!(
                 "      cloudInitUserConfigFile = pkgs.writeText \"{nix_name}-cloud-init.yaml\" \"{escaped}\";\n"
             ));
+            let ops_keys: Vec<&String> = guest_ops_keys.iter().filter(|k| !k.is_empty()).collect();
+            if !ops_keys.is_empty() {
+                out.push_str("      cloudInitGuestOpsKeys = [\n");
+                for pk in ops_keys {
+                    out.push_str(&format!("        \"{}\"\n", nix_escape(pk)));
+                }
+                out.push_str("      ];\n");
+            }
         } else if !ssh_keys.is_empty() {
             let mut ci = String::from("#cloud-config\n");
             ci.push_str(&format!("hostname: {}\n", nix_name));
@@ -671,6 +717,68 @@ mod tests {
     }
 
     #[test]
+    fn image_sha256_is_rendered_only_when_well_formed() {
+        let render = |sha: &str| {
+            let mut v = vm(true, "sha");
+            v.image_sha256 = sha.into();
+            generate_node_config(
+                &[v],
+                "eno1",
+                &default_net(),
+                &[],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            )
+        };
+        let good = "A".repeat(32) + &"b".repeat(32);
+        let config = render(&good);
+        assert!(
+            config.contains(&format!("imageSha256 = \"{}\";", good.to_ascii_lowercase())),
+            "{config}"
+        );
+        for bad in [
+            "",
+            "abc",
+            &"g".repeat(64),
+            &format!("{}\"; evil = 1; x = \"", "a".repeat(64)),
+        ] {
+            let config = render(bad);
+            assert!(!config.contains("imageSha256"), "{bad:?} -> {config}");
+        }
+    }
+
+    #[test]
+    fn image_sha256_is_withheld_from_nodes_whose_module_lacks_it() {
+        let render = |features: &ModuleFeatures| {
+            let mut v = vm(true, "sha");
+            v.image_sha256 = "a".repeat(64);
+            generate_node_config_inner(
+                &[v],
+                "eno1",
+                &default_net(),
+                &[],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
+                &[],
+                &[],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                features,
+            )
+        };
+        assert!(render(&ModuleFeatures::all()).contains("imageSha256"));
+        assert!(!render(&ModuleFeatures::default()).contains("imageSha256"));
+
+        let reported = ModuleFeatures::from_reported(&["cloudHypervisorPatches", "imageSha256"]);
+        assert!(reported.image_sha256);
+        assert!(!ModuleFeatures::from_reported::<&str>(&[]).image_sha256);
+        assert!(!ModuleFeatures::from_reported(&["imagesha256"]).image_sha256);
+    }
+
+    #[test]
     fn image_format_is_rendered_for_qcow2() {
         let mut v = vm(true, "qcow");
         v.image_format = "qcow2".into();
@@ -811,6 +919,33 @@ mod tests {
         assert!(config.contains("ssh_authorized_keys"));
         assert!(config.contains("lock_passwd: true"));
         assert!(config.contains("ssh_pwauth: false"));
+    }
+
+    #[test]
+    fn custom_cloud_init_still_gets_guest_ops_keys() {
+        let mut v = vm(true, "web-01");
+        v.cloud_init_user_data = "#cloud-config\nhostname: web-01\n".to_string();
+        let ops = vec!["ssh-ed25519 AAAAops kcore-guest-ops".to_string()];
+        let none = std::collections::HashMap::new();
+        let config = generate_node_config_inner(
+            &[v],
+            "eno1",
+            &default_net(),
+            &[],
+            &none,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &[],
+            &ops,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &ModuleFeatures::all(),
+        );
+        assert!(config.contains("cloudInitUserConfigFile"));
+        assert!(config.contains("cloudInitGuestOpsKeys"));
+        assert!(config.contains("ssh-ed25519 AAAAops kcore-guest-ops"));
     }
 
     #[test]
@@ -975,6 +1110,7 @@ mod tests {
             &extras,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &ModuleFeatures::all(),
         );
         assert!(config.contains("extraNics"));
         assert!(!config.contains("eastWestFirewall"));
@@ -1042,6 +1178,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &policies,
             &addresses,
+            &ModuleFeatures::all(),
         );
         assert!(config.contains("eastWestFirewall = true;"));
         assert!(config.contains("ipv6Prefix = \"fd00:10:240::/64\";"));
@@ -1141,6 +1278,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &ModuleFeatures::all(),
         );
         assert!(
             config.contains("rbdImage = \"kcore-vol-clone01\""),

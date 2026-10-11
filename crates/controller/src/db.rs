@@ -34,6 +34,24 @@ pub struct Database {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Node statuses an operator set on purpose. Only `UncordonNode` clears
+/// them: a re-register (agent restart, reboot, controller failover) or a
+/// heartbeat must never put a drained node back into scheduling.
+pub const OPERATOR_HELD_NODE_STATUSES: [&str; 3] = ["cordoned", "draining", "drained"];
+
+pub fn is_operator_held_status(status: &str) -> bool {
+    OPERATOR_HELD_NODE_STATUSES.contains(&status)
+}
+
+/// Status a (re-)registering node gets, given what it had before.
+pub fn node_status_after_register(existing_status: Option<&str>, approval_status: &str) -> String {
+    match existing_status {
+        Some(held) if is_operator_held_status(held) => held.to_string(),
+        _ if approval_status == "approved" => "ready".to_string(),
+        _ => "pending".to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeRow {
     pub id: String,
@@ -668,6 +686,7 @@ pub const SCHEMA_VERSION: i32 = 49;
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+const OUTBOX_VACUUM_FREE_BYTES: i64 = 8 * 1024 * 1024;
 
 impl Database {
     pub fn open(path: &str) -> Result<Self> {
@@ -1895,6 +1914,41 @@ impl Database {
             }
         }
         Ok(rows)
+    }
+
+    /// Bound `replication_outbox` growth. Superseded heartbeats (all but the newest
+    /// per node) are dropped after `heartbeat_secs`; every other event is dropped
+    /// after `max_age_secs`. Returns the number of rows removed. When enough free
+    /// pages accumulate the file is vacuumed so snapshots shrink too.
+    pub fn prune_replication_outbox(
+        &self,
+        heartbeat_secs: i64,
+        max_age_secs: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let hb_cutoff = format!("-{} seconds", heartbeat_secs.max(0));
+        let age_cutoff = format!("-{} seconds", max_age_secs.max(0));
+        let mut removed = conn.execute(
+            "DELETE FROM replication_outbox
+             WHERE event_type = 'node.heartbeat'
+               AND created_at < datetime('now', ?1)
+               AND id NOT IN (
+                   SELECT MAX(id) FROM replication_outbox
+                   WHERE event_type = 'node.heartbeat'
+                   GROUP BY resource_key
+               )",
+            params![hb_cutoff],
+        )?;
+        removed += conn.execute(
+            "DELETE FROM replication_outbox WHERE created_at < datetime('now', ?1)",
+            params![age_cutoff],
+        )?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        if free_pages.saturating_mul(page_size) >= OUTBOX_VACUUM_FREE_BYTES {
+            conn.execute_batch("VACUUM")?;
+        }
+        Ok(removed)
     }
 
     pub fn replication_outbox_len(&self) -> Result<i64, rusqlite::Error> {
@@ -4565,6 +4619,31 @@ impl Database {
         )? > 0)
     }
 
+    /// Close `Preparing` live-migrate rows that no request is driving any more.
+    ///
+    /// `Preparing` is owned by an in-flight RPC. If the controller restarted or
+    /// the RPC died, nothing would ever finish the row and the VM would be
+    /// locked out of further operations. A cancelled row idles for
+    /// `cancelled_idle_secs`; any other row for `idle_secs`.
+    pub fn expire_stale_preparing_operations(
+        &self,
+        cancelled_idle_secs: i64,
+        idle_secs: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE vm_operations
+             SET phase = CASE WHEN cancel_requested = 1 THEN 'Cancelled' ELSE 'Failed' END,
+                 updated_at = datetime('now'),
+                 finished_at = datetime('now')
+             WHERE finished_at = '' AND kind = 'live_migrate' AND phase = 'Preparing'
+               AND ((cancel_requested = 1
+                     AND updated_at < datetime('now', ?1 || ' seconds'))
+                    OR updated_at < datetime('now', ?2 || ' seconds'))",
+            params![-cancelled_idle_secs, -idle_secs],
+        )
+    }
+
     fn map_vm_operation_row(r: &rusqlite::Row<'_>) -> Result<VmOperationRow, rusqlite::Error> {
         Ok(VmOperationRow {
             id: r.get(0)?,
@@ -5807,7 +5886,7 @@ impl Database {
     pub fn get_stale_nodes(&self, timeout_seconds: i64) -> Result<Vec<NodeRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used, storage_backend, disable_vxlan FROM nodes WHERE status = 'ready' AND last_heartbeat != '' AND (julianday('now') - julianday(last_heartbeat)) * 86400 > ?1",
+            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used, storage_backend, disable_vxlan, approval_status, cert_expiry_days, luks_method, dc_id FROM nodes WHERE status = 'ready' AND last_heartbeat != '' AND (julianday('now') - julianday(last_heartbeat)) * 86400 > ?1",
         )?;
         let rows = stmt.query_map(params![timeout_seconds], row_to_node)?;
         rows.collect()
@@ -7145,6 +7224,45 @@ mod tests {
     }
 
     #[test]
+    fn prune_replication_outbox_drops_superseded_heartbeats_and_old_rows() {
+        let db = Database::open(":memory:").expect("open db");
+        for _ in 0..3 {
+            db.append_replication_outbox("node.heartbeat", "node/a", b"{}")
+                .expect("hb a");
+        }
+        db.append_replication_outbox("node.heartbeat", "node/b", b"{}")
+            .expect("hb b");
+        db.append_replication_outbox("vm.create", "vm/v1", b"{}")
+            .expect("vm");
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE replication_outbox SET created_at = datetime('now', '-2 hours')
+                 WHERE event_type = 'node.heartbeat'",
+                [],
+            )
+            .expect("age");
+        }
+        let removed = db.prune_replication_outbox(3600, 7 * 86400).expect("prune");
+        assert_eq!(removed, 2);
+        assert_eq!(db.replication_outbox_len().expect("len"), 3);
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE replication_outbox SET created_at = datetime('now', '-8 days')
+                 WHERE event_type = 'vm.create'",
+                [],
+            )
+            .expect("age vm");
+        }
+        assert_eq!(
+            db.prune_replication_outbox(3600, 7 * 86400).expect("prune"),
+            1
+        );
+        assert_eq!(db.replication_outbox_len().expect("len"), 2);
+    }
+
+    #[test]
     fn audit_events_append_list_and_filters() {
         let db = Database::open(":memory:").expect("open db");
         let id1 = db
@@ -8001,6 +8119,59 @@ mod tests {
         assert!(db.delete_volume_by_vm("vm-1").unwrap());
         assert!(db.get_volume_by_vm("vm-1").unwrap().is_none());
         assert!(!db.delete_volume_by_vm("vm-1").unwrap());
+    }
+
+    #[test]
+    fn stale_nodes_are_returned_once_the_heartbeat_deadline_passes() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).unwrap();
+        db.update_heartbeat("n1", 0, 0, -1, "").unwrap();
+        assert!(db.get_stale_nodes(90).unwrap().is_empty());
+
+        {
+            let conn = db.lock_conn().unwrap();
+            conn.execute(
+                "UPDATE nodes SET last_heartbeat = datetime('now', '-10 minutes') WHERE id = 'n1'",
+                [],
+            )
+            .unwrap();
+        }
+        let stale = db.get_stale_nodes(90).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, "n1");
+    }
+
+    #[test]
+    fn stale_preparing_operations_are_closed() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_node(&test_node()).unwrap();
+        db.insert_vm(&test_vm("n1")).unwrap();
+        db.insert_vm_operation(&VmOperationRow {
+            id: "op-1".into(),
+            vm_id: "vm-1".into(),
+            kind: VmOperationRow::KIND_LIVE_MIGRATE.into(),
+            phase: VmOperationRow::PHASE_PREPARING.into(),
+            source_node: "n1".into(),
+            target_node: "n2".into(),
+            cancel_requested: false,
+            send_succeeded: false,
+            detail_json: "{}".into(),
+            started_at: String::new(),
+            updated_at: String::new(),
+            finished_at: String::new(),
+        })
+        .unwrap();
+
+        assert_eq!(db.expire_stale_preparing_operations(60, 1800).unwrap(), 0);
+        assert!(db.get_open_vm_operation("vm-1").unwrap().is_some());
+
+        db.request_cancel_vm_operation("op-1").unwrap();
+        assert_eq!(db.expire_stale_preparing_operations(60, 1800).unwrap(), 0);
+        assert_eq!(db.expire_stale_preparing_operations(-1, 1800).unwrap(), 1);
+        let closed = db.get_vm_operation("op-1").unwrap().unwrap();
+        assert_eq!(closed.phase, VmOperationRow::PHASE_CANCELLED);
+        assert!(!closed.finished_at.is_empty());
+        assert!(db.get_open_vm_operation("vm-1").unwrap().is_none());
     }
 
     #[test]

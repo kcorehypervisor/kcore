@@ -48,6 +48,13 @@ service NodeStorage {
   rpc FlattenVolume(FlattenVolumeRequest) returns (FlattenVolumeResponse);
   rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
 
+  // FenceVolume cuts every Ceph client that still has the image open from
+  // one of the given hosts off the cluster (`ceph osd blocklist add`), so a
+  // guest restarted on another node cannot share the image with a writer on
+  // a node the controller can no longer reach. It fails when the image is
+  // open from any other host; the caller must not move the guest then.
+  rpc FenceVolume(FenceVolumeRequest) returns (FenceVolumeResponse);
+
   // Host-side LUKS over a mapped RBD device (E2 per-volume encryption).
   rpc FormatEncryptedVolume(FormatEncryptedVolumeRequest)
       returns (FormatEncryptedVolumeResponse);
@@ -135,6 +142,9 @@ service NodeAdmin {
   rpc RollbackSystemUpdate(RollbackSystemUpdateRequest) returns (RollbackSystemUpdateResponse);
 
   // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
+  // Preflight checks (dry-build, OSD device, RAID, addresses, nixpkgs, DHCP mon)
+  // before CreateCephCluster mutates anything.
+  rpc CheckCephPreflight(CheckCephPreflightRequest) returns (CheckCephPreflightResponse);
   rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
   rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
   // Create every OSD in osd_devices that is not already prepared, and retire
@@ -148,6 +158,10 @@ service NodeAdmin {
   rpc TeardownCephNode(TeardownCephNodeRequest) returns (TeardownCephNodeResponse);
   // `ceph mon rm` on a member that is still in quorum.
   rpc RemoveCephMon(RemoveCephMonRequest) returns (RemoveCephMonResponse);
+  // Run on a surviving member: mark every OSD under CRUSH host `host` out and
+  // report whether every placement group is active+clean again, i.e. the
+  // host's data has been re-replicated elsewhere and it can be torn down.
+  rpc DrainCephHost(DrainCephHostRequest) returns (DrainCephHostResponse);
   rpc GetHostCpuFlags(GetHostCpuFlagsRequest) returns (GetHostCpuFlagsResponse);
 
   // Live migration peer steps (controller orchestrates source + destination).
@@ -167,6 +181,17 @@ service NodeAdmin {
   rpc GetLiveMigrateProgress(GetLiveMigrateProgressRequest)
       returns (GetLiveMigrateProgressResponse);
   rpc SendLiveMigrate(SendLiveMigrateRequest) returns (SendLiveMigrateResponse);
+  // Host CPU facts a live-migration destination compares against its own
+  // before it maps volumes and spawns a receiver (vendor, model, TSC rate,
+  // hardware TSC scaling). Cloud Hypervisor checks CPUID feature bits itself;
+  // this covers what it does not report usefully.
+  rpc GetHostCpuInfo(GetHostCpuInfoRequest) returns (GetHostCpuInfoResponse);
+  // Options the node's installed ch-vm Nix module understands, from
+  // /etc/kcore/ch-vm-features. The controller only emits newer options to
+  // nodes that list them; an older node (or agent) reports nothing and gets
+  // the baseline config.
+  rpc GetChVmModuleFeatures(GetChVmModuleFeaturesRequest)
+      returns (GetChVmModuleFeaturesResponse);
   rpc FinalizeLiveMigrateSource(FinalizeLiveMigrateSourceRequest)
       returns (FinalizeLiveMigrateSourceResponse);
   rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
@@ -539,6 +564,21 @@ message ResizeVolumeResponse {
   int64 size_bytes = 3;
 }
 
+message FenceVolumeRequest {
+  // pool/image
+  string backend_handle = 1;
+  // Every address the lost node may show up under in `rbd status`: its Ceph
+  // public address and the host part of its gRPC address. A watcher from any
+  // other host makes the call fail.
+  repeated string source_hosts = 2;
+}
+
+message FenceVolumeResponse {
+  // Entity addresses (`ip:port/nonce`) that were added to the OSD blocklist.
+  // Empty when nobody had the image open.
+  repeated string blocklisted = 1;
+}
+
 message FormatEncryptedVolumeRequest {
   // Mapped RBD path, e.g. /dev/rbd/kcore-vms/kcore-vol-abc
   string rbd_device = 1;
@@ -558,6 +598,9 @@ message UnlockEncryptedVolumeRequest {
   string rbd_device = 1;
   bytes dek = 2;
   string mapper_name = 3;
+  // When the mapper is already open, grow it to the current backing size
+  // (`cryptsetup resize`) instead of leaving it untouched.
+  bool resize = 4;
 }
 
 message UnlockEncryptedVolumeResponse {
@@ -1010,6 +1053,28 @@ message RollbackSystemUpdateResponse {
   string message = 2;
 }
 
+message CheckCephPreflightRequest {
+  string ceph_nix = 1;
+  string public_addr = 2;
+  string cluster_addr = 3;
+  string public_iface = 4;
+  string cluster_iface = 5;
+  repeated string osd_devices = 6;
+  // Full mon endpoint (ip:port); used to detect DHCP on the public iface.
+  string mon_addr = 7;
+}
+
+message CephPreflightIssue {
+  string check = 1;
+  string message = 2;
+  bool blocking = 3;
+}
+
+message CheckCephPreflightResponse {
+  bool ok = 1;
+  repeated CephPreflightIssue issues = 2;
+}
+
 message ApplyCephConfigRequest {
   string ceph_nix = 1;
   bool rebuild = 2;
@@ -1105,6 +1170,19 @@ message RemoveCephMonResponse {
   string message = 2;
 }
 
+message DrainCephHostRequest { string host = 1; }
+
+message DrainCephHostResponse {
+  bool success = 1;
+  string message = 2;
+  // OSD ids found under the host (empty when the host has none left).
+  repeated string osd_ids = 3;
+  // Every PG is active+clean, so nothing still depends on the host's OSDs.
+  bool clean = 4;
+  int32 pgs_total = 5;
+  int32 pgs_not_clean = 6;
+}
+
 message GetHostCpuFlagsRequest {}
 
 message GetHostCpuFlagsResponse { repeated string flags = 1; }
@@ -1134,6 +1212,9 @@ message PrepareLiveMigrateReceiveRequest {
   repeated RbdImageRef rbd_volumes = 5;
   // Optional LUKS unlocks after RBD map (E2).
   repeated EncryptedVolumeKey encrypted_volumes = 6;
+  // CPU facts of the node the guest is leaving. Unset when the source agent
+  // predates GetHostCpuInfo; the destination then skips the comparison.
+  HostCpuInfo source_cpu = 7;
 }
 
 message PrepareLiveMigrateReceiveResponse {
@@ -1144,6 +1225,34 @@ message PrepareLiveMigrateReceiveResponse {
   // means the destination has no opinion and the caller should fall back to
   // the host part of the destination node's gRPC address.
   string listen_addr = 4;
+  // Non-fatal host differences the operator should know about, e.g. the
+  // guest TSC changing rate because the destination has no TSC scaling.
+  repeated string warnings = 5;
+}
+
+message HostCpuInfo {
+  // "GenuineIntel" / "AuthenticAMD".
+  string vendor = 1;
+  string model_name = 2;
+  // Nominal TSC rate from CPUID leaf 0x16 (processor base frequency); 0 when
+  // the CPU does not report it.
+  uint32 tsc_khz = 3;
+  // Hardware TSC scaling (Intel VMX "tsc_scaling", AMD SVM "tsc_scale"). Without
+  // it KVM only accepts a guest TSC rate at or above the host rate.
+  bool tsc_scaling = 4;
+}
+
+message GetHostCpuInfoRequest {}
+
+message GetHostCpuInfoResponse {
+  HostCpuInfo cpu = 1;
+}
+
+message GetChVmModuleFeaturesRequest {}
+
+message GetChVmModuleFeaturesResponse {
+  // e.g. "imageSha256", "cloudHypervisorPatches".
+  repeated string features = 1;
 }
 
 message WaitLiveMigrateReceiveRequest {

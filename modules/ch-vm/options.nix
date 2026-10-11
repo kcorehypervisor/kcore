@@ -138,6 +138,17 @@ let
         description = "Path to the VM disk image.";
       };
 
+      imageSha256 = lib.mkOption {
+        type = lib.types.nullOr (lib.types.strMatching "[0-9a-fA-F]{64}");
+        default = null;
+        description = ''
+          Expected SHA-256 of `image`. Block backends (lvm, zfs, ceph) hash the
+          source right before seeding the volume and refuse to seed on a
+          mismatch, so a cached image that was corrupted or swapped after
+          download never reaches a disk. Null skips the check.
+        '';
+      };
+
       imageFormat = lib.mkOption {
         type = lib.types.enum [
           "raw"
@@ -231,6 +242,18 @@ let
         type = lib.types.nullOr lib.types.path;
         default = null;
         description = "Path to cloud-init user-data YAML file.";
+      };
+
+      cloudInitGuestOpsKeys = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = ''
+          Node GuestOps public keys to authorize for the `kcore` user in addition
+          to a user-supplied `cloudInitUserConfigFile`. Delivered as a second
+          cloud-config part that cloud-init merges into the user's document, so a
+          custom identity override does not lock GuestOps (volume resize, quiesced
+          snapshots) out of the guest.
+        '';
       };
 
       cloudInitNetworkConfigFile = lib.mkOption {
@@ -338,6 +361,19 @@ in
     cloudHypervisorPackage = lib.mkOption {
       type = lib.types.package;
       description = "Cloud Hypervisor package to use.";
+    };
+
+    cloudHypervisorPatches = lib.mkOption {
+      type = lib.types.listOf lib.types.path;
+      default = [ ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch ];
+      defaultText = lib.literalExpression "[ ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch ]";
+      description = ''
+        Patches applied on top of cloudHypervisorPackage. The default lets a
+        live migration restore a guest whose TSC rate is below the destination
+        host's on CPUs without hardware TSC scaling (KVM returns EINVAL there;
+        QEMU warns and continues, upstream Cloud Hypervisor aborts). Set to []
+        to run the package unmodified.
+      '';
     };
 
     socketDir = lib.mkOption {

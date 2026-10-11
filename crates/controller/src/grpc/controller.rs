@@ -115,15 +115,19 @@ use super::rbac_matrix;
 use super::signing;
 use super::validation::{
     derive_image_format, derive_image_format_from_path, derive_local_image_path,
-    normalize_image_format, normalize_storage_backend, storage_backend_to_proto,
-    validate_image_path, validate_image_sha256, validate_image_url, validate_ipv4,
-    validate_netmask, validate_network_name, validate_network_type, validate_postgresql_database,
-    validate_postgresql_name, validate_postgresql_package, validate_postgresql_port,
-    validate_storage_size_bytes,
+    image_used_in_place, normalize_image_format, normalize_storage_backend,
+    storage_backend_to_proto, validate_image_path, validate_image_sha256, validate_image_url,
+    validate_ipv4, validate_netmask, validate_network_name, validate_network_type,
+    validate_postgresql_database, validate_postgresql_name, validate_postgresql_package,
+    validate_postgresql_port, validate_storage_size_bytes,
 };
 
 #[cfg(test)]
 type PushHook = std::sync::Arc<dyn Fn(&NodeRow) -> Result<(), Status> + Send + Sync + 'static>;
+/// Test stand-in for `NodeStorage.FenceVolume`: (backend_handle, source_hosts).
+#[cfg(test)]
+type FenceHook =
+    std::sync::Arc<dyn Fn(&str, &[String]) -> Result<Vec<String>, Status> + Send + Sync + 'static>;
 
 /// Live migrate failed; `send_succeeded` means the guest may already run on dest
 /// and cold fallback must not start a second VMM on the shared RBD.
@@ -131,6 +135,13 @@ struct LiveMigrateFailure {
     send_succeeded: bool,
     status: Status,
     operation_id: String,
+}
+
+/// A finished live migration plus what the destination wanted the operator
+/// to know (host differences it tolerated, e.g. a TSC rate change).
+struct LiveMigrateOutcome {
+    operation_id: String,
+    warnings: Vec<String>,
 }
 
 /// Whether a node may be handed a VM that is moving off another node.
@@ -462,6 +473,8 @@ pub struct ControllerService {
     overcommit: crate::scheduler::Overcommit,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
+    #[cfg(test)]
+    test_fence_hook: Option<FenceHook>,
 }
 
 fn network_policies_by_name(
@@ -707,6 +720,8 @@ impl ControllerService {
             overcommit: crate::scheduler::Overcommit::default(),
             #[cfg(test)]
             test_push_hook: None,
+            #[cfg(test)]
+            test_fence_hook: None,
         }
     }
 
@@ -883,7 +898,14 @@ impl ControllerService {
             webhooks: crate::webhooks::Dispatcher::noop(),
             overcommit: crate::scheduler::Overcommit::default(),
             test_push_hook: Some(hook),
+            test_fence_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_test_fence_hook(mut self, hook: FenceHook) -> Self {
+        self.test_fence_hook = Some(hook);
+        self
     }
 
     #[inline]
@@ -949,7 +971,7 @@ impl ControllerService {
             .list_networks_for_node(&node.id)
             .map_err(|e| Status::internal(format!("listing networks: {e}")))?;
         if let Some(vm) = incoming {
-            if !networks.iter().any(|net| net.name == vm.network) {
+            if vm.network != "default" && !networks.iter().any(|net| net.name == vm.network) {
                 return Err(Status::failed_precondition(format!(
                     "destination node {} has no network '{}' for VM '{}'",
                     node.id, vm.network, vm.name
@@ -1089,6 +1111,8 @@ impl ControllerService {
             port: row.port,
         });
         let guest_ops_keys = crate::guest_ops::all_guest_ops_keys(&self.db);
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let module_features = self.ch_vm_module_features(node, &mut admin).await;
         let nix_config = nixgen::with_postgresql(
             nixgen::generate_node_config_inner(
                 &vms,
@@ -1107,11 +1131,10 @@ impl ControllerService {
                 &extra_nics_by_vm(&self.db, &vms),
                 &network_policies_by_name(&self.db, &node.id)?,
                 &vm_ipv6_by_vm(&self.db, &vms)?,
+                &module_features,
             ),
             postgresql_nix.as_ref(),
         );
-
-        let mut admin = self.ensure_admin_client_for_node(node).await?;
 
         for vm in &vms {
             if vm.image_url.is_empty() {
@@ -1158,6 +1181,7 @@ impl ControllerService {
                                     rbd_device: format!("{}/{}", key.pool, key.image),
                                     dek: key.dek,
                                     mapper_name: key.mapper_name,
+                                    resize: false,
                                 })
                                 .await;
                         }
@@ -1726,6 +1750,66 @@ impl ControllerService {
         Ok(())
     }
 
+    /// Close the LUKS mapper (and release its nbd) on `node` for each encrypted
+    /// volume. Best effort: an unreachable node must not block detach/delete.
+    async fn lock_encrypted_volumes_on_node(&self, node: &NodeRow, vols: &[VolumeRow]) {
+        let encrypted: Vec<&VolumeRow> = vols.iter().filter(|v| v.encrypted).collect();
+        if encrypted.is_empty() {
+            return;
+        }
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let Some(mut storage) = self.clients.get_storage(&node.address) else {
+            return;
+        };
+        for vol in encrypted {
+            let mapper = crate::volume_crypto::mapper_name_for_serial(&vol.serial);
+            if let Err(e) = storage
+                .lock_encrypted_volume(node_proto::LockEncryptedVolumeRequest {
+                    mapper_name: mapper,
+                })
+                .await
+            {
+                warn!(volume = %vol.name, node = %node.id, error = %e, "failed to lock encrypted volume");
+            }
+        }
+    }
+
+    /// After `rbd resize`, grow the LUKS mapper on the node that has it open.
+    async fn grow_encrypted_mapper(&self, vol: &VolumeRow) -> Result<(), Status> {
+        let vm = self
+            .db
+            .get_vm(&vol.vm_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("attached VM missing"))?;
+        let node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("storage client unavailable"))?;
+        let keys = self.encrypted_volume_keys_for_vols(std::slice::from_ref(vol))?;
+        for key in keys {
+            storage
+                .unlock_encrypted_volume(node_proto::UnlockEncryptedVolumeRequest {
+                    rbd_device: format!("{}/{}", key.pool, key.image),
+                    dek: key.dek,
+                    mapper_name: key.mapper_name,
+                    resize: true,
+                })
+                .await
+                .map_err(|e| Status::internal(format!("grow LUKS mapper: {e}")))?;
+        }
+        Ok(())
+    }
+
     async fn hotplug_add_volume_disk(&self, vm: &VmRow, vol: &VolumeRow) -> Result<(), Status> {
         let node = self
             .db
@@ -1748,6 +1832,7 @@ impl ControllerService {
                             rbd_device: format!("{}/{}", key.pool, key.image),
                             dek: key.dek,
                             mapper_name: key.mapper_name,
+                            resize: false,
                         })
                         .await
                         .map_err(|e| Status::internal(format!("unlock for hotplug: {e}")))?;
@@ -1757,7 +1842,7 @@ impl ControllerService {
                     .attach_volume(node_proto::AttachVolumeRequest {
                         backend_handle: format!("{}/{}", vol.pool, vol.image),
                         vm_id: vm.id.clone(),
-                        target_device: String::new(),
+                        target_device: vol.serial.clone(),
                         bus: "virtio".into(),
                     })
                     .await
@@ -2125,7 +2210,7 @@ impl ControllerService {
         volume: &VolumeRow,
         runtime_name: &str,
         dest_host: &str,
-    ) -> Result<String, LiveMigrateFailure> {
+    ) -> Result<LiveMigrateOutcome, LiveMigrateFailure> {
         if let Ok(Some(open)) = self.db.get_open_vm_operation(&vm.id) {
             return Err(LiveMigrateFailure {
                 send_succeeded: false,
@@ -2231,6 +2316,18 @@ impl ControllerService {
                 operation_id: op_id,
             });
         }
+        // The destination compares this against itself inside prepare. An
+        // agent without the RPC leaves it unset and the comparison is skipped.
+        let source_cpu = match source_admin
+            .get_host_cpu_info(node_proto::GetHostCpuInfoRequest {})
+            .await
+        {
+            Ok(resp) => resp.into_inner().cpu,
+            Err(e) => {
+                warn!(node = %source.id, error = %e, "source host CPU info unavailable; skipping host comparison");
+                None
+            }
+        };
         self.push_config_to_node_inner(target, true, Some(vm))
             .await
             .map_err(|status| {
@@ -2266,7 +2363,7 @@ impl ControllerService {
                 }
             })?;
 
-        let prep = dest_admin
+        let prep = match dest_admin
             .prepare_live_migrate_receive(node_proto::PrepareLiveMigrateReceiveRequest {
                 vm_name: runtime_name.to_string(),
                 rbd_pool: root_pool.clone(),
@@ -2274,17 +2371,37 @@ impl ControllerService {
                 listen_port: 0,
                 rbd_volumes: rbd_volumes.clone(),
                 encrypted_volumes: encrypted_volumes.clone(),
+                source_cpu,
             })
             .await
-            .map_err(|e| LiveMigrateFailure {
-                send_succeeded: false,
-                status: status_with_context(
-                    &e,
-                    &format!("preparing node {} to receive VM '{}'", target.id, vm.name),
-                ),
-                operation_id: op_id.clone(),
-            })?
-            .into_inner();
+        {
+            Ok(resp) => resp.into_inner(),
+            Err(e) => {
+                let _ = dest_admin
+                    .abort_live_migrate_receive(node_proto::AbortLiveMigrateReceiveRequest {
+                        vm_name: runtime_name.to_string(),
+                        rbd_pool: root_pool.clone(),
+                        rbd_image: root_image.clone(),
+                        rbd_volumes: rbd_volumes.clone(),
+                    })
+                    .await;
+                let _ = self.db.update_vm_operation_phase(
+                    &op_id,
+                    VmOperationRow::PHASE_FAILED,
+                    Some(false),
+                    None,
+                    true,
+                );
+                return Err(LiveMigrateFailure {
+                    send_succeeded: false,
+                    status: status_with_context(
+                        &e,
+                        &format!("preparing node {} to receive VM '{}'", target.id, vm.name),
+                    ),
+                    operation_id: op_id,
+                });
+            }
+        };
         if !prep.success || prep.listen_port <= 0 {
             let _ = self.db.update_vm_operation_phase(
                 &op_id,
@@ -2298,6 +2415,10 @@ impl ControllerService {
                 status: Status::internal(format!("prepare receive failed: {}", prep.message)),
                 operation_id: op_id,
             });
+        }
+        let host_warnings = prep.warnings.clone();
+        for line in &host_warnings {
+            warn!(vm = %vm.name, source = %source.id, target = %target.id, "live migrate host difference: {line}");
         }
 
         if self
@@ -2604,7 +2725,10 @@ impl ControllerService {
             None,
             true,
         );
-        Ok(op_id)
+        Ok(LiveMigrateOutcome {
+            operation_id: op_id,
+            warnings: host_warnings,
+        })
     }
 
     /// Stop a Ceph-backed VM and unmap its RBD image on the node that owns it
@@ -3372,6 +3496,34 @@ impl ControllerService {
         }))
     }
 
+    /// Which newer ch-vm options this node's installed module accepts. A
+    /// node agent predating the RPC, or a module without the feature file,
+    /// gets the baseline so its evaluation keeps working.
+    async fn ch_vm_module_features(
+        &self,
+        node: &NodeRow,
+        admin: &mut node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>,
+    ) -> nixgen::ModuleFeatures {
+        match admin
+            .get_ch_vm_module_features(node_proto::GetChVmModuleFeaturesRequest {})
+            .await
+        {
+            Ok(resp) => {
+                let features = resp.into_inner().features;
+                debug!(node = %node.id, ?features, "ch-vm module features reported by node");
+                nixgen::ModuleFeatures::from_reported(&features)
+            }
+            Err(e) => {
+                info!(
+                    node = %node.id,
+                    code = ?e.code(),
+                    "node does not report ch-vm module features; emitting baseline options only"
+                );
+                nixgen::ModuleFeatures::default()
+            }
+        }
+    }
+
     async fn ensure_admin_client_for_node(
         &self,
         node: &NodeRow,
@@ -3386,6 +3538,197 @@ impl ControllerService {
         self.clients
             .get_admin(&node.address)
             .ok_or_else(|| Status::unavailable(format!("no connection to node {}", node.address)))
+    }
+
+    /// Health as a surviving member reports it, for deciding whether a host
+    /// may leave. `None` when no survivor answered.
+    async fn ceph_health_via_survivor(
+        &self,
+        survivors: &[&controller_proto::CephClusterNodeSpec],
+    ) -> Option<String> {
+        for node in survivors {
+            let Ok(Some(row)) = self.db.get_node(&node.node_id) else {
+                continue;
+            };
+            let Ok(mut admin) = self.ensure_admin_client_for_node(&row).await else {
+                continue;
+            };
+            match admin
+                .get_ceph_health(node_proto::GetCephHealthRequest {
+                    cluster_name: "ceph".into(),
+                })
+                .await
+            {
+                Ok(resp) => return Some(resp.into_inner().health_status),
+                Err(e) => {
+                    warn!(node = %node.node_id, error = %e, "ceph health via survivor failed");
+                }
+            }
+        }
+        None
+    }
+
+    /// Guard rails for the members `spec` drops from the stored cluster.
+    async fn plan_ceph_member_removal(
+        &self,
+        name: &str,
+        spec: &controller_proto::CephClusterSpec,
+    ) -> Result<ceph_cluster_spec::RemovalPlan, Status> {
+        let Some(existing) = self
+            .db
+            .get_ceph_cluster(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+        else {
+            return Ok(ceph_cluster_spec::RemovalPlan::default());
+        };
+        let old = ceph_cluster_spec::spec_from_json(&existing.spec_json)
+            .map_err(|e| Status::internal(format!("decode stored ceph spec: {e}")))?;
+        if ceph_cluster_spec::removed_members(&old, spec).is_empty() {
+            return Ok(ceph_cluster_spec::RemovalPlan::default());
+        }
+        let survivors: Vec<&controller_proto::CephClusterNodeSpec> = spec
+            .nodes
+            .iter()
+            .filter(|n| old.nodes.iter().any(|o| o.node_id == n.node_id))
+            .collect();
+        let health = self.ceph_health_via_survivor(&survivors).await;
+        let pending = self
+            .db
+            .list_retired_ceph_nodes(name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(ceph_cluster_spec::plan_member_removal(
+            &old,
+            spec,
+            &ceph_cluster_spec::RemovalContext {
+                health_status: health.as_deref(),
+                pending_removals: &pending,
+            },
+        ))
+    }
+
+    async fn plan_ceph_cluster_spec(
+        &self,
+        name: &str,
+        spec: &controller_proto::CephClusterSpec,
+    ) -> Result<controller_proto::PlanCephClusterResponse, Status> {
+        ceph_cluster_spec::validate_spec(spec).map_err(Status::invalid_argument)?;
+        let removal = self.plan_ceph_member_removal(name, spec).await?;
+        let cluster_issues = removal.issues;
+        let mut node_results = Vec::new();
+        let mon_map = crate::ceph_cluster_reconciler::mon_map_string(spec);
+        for (index, node) in spec.nodes.iter().enumerate() {
+            let Some(node_row) = self
+                .db
+                .get_node(&node.node_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+            else {
+                node_results.push(controller_proto::CephNodePlanResult {
+                    node_id: node.node_id.clone(),
+                    ok: false,
+                    issues: vec![format!("node '{}' is not registered", node.node_id)],
+                });
+                continue;
+            };
+            let daemon_id =
+                crate::ceph_cluster_reconciler::sanitize_daemon_id(&node.node_id, index);
+            let ceph_nix =
+                crate::ceph_cluster_reconciler::generate_ceph_nix(spec, node, &daemon_id, &mon_map);
+            let devices = ceph_cluster_spec::osd_devices(node);
+            let mut admin = match self.ensure_admin_client_for_node(&node_row).await {
+                Ok(c) => c,
+                Err(e) => {
+                    #[cfg(test)]
+                    {
+                        let _ = e;
+                        node_results.push(controller_proto::CephNodePlanResult {
+                            node_id: node.node_id.clone(),
+                            ok: true,
+                            issues: vec![
+                                "preflight skipped in unit test (node agent unreachable)".into()
+                            ],
+                        });
+                        continue;
+                    }
+                    #[cfg(not(test))]
+                    {
+                        node_results.push(controller_proto::CephNodePlanResult {
+                            node_id: node.node_id.clone(),
+                            ok: false,
+                            issues: vec![e.message().to_string()],
+                        });
+                        continue;
+                    }
+                }
+            };
+            match admin
+                .check_ceph_preflight(Request::new(node_proto::CheckCephPreflightRequest {
+                    ceph_nix,
+                    public_addr: node
+                        .mon_addr
+                        .split(':')
+                        .next()
+                        .unwrap_or(&node.mon_addr)
+                        .to_string(),
+                    cluster_addr: node.cluster_addr.clone(),
+                    public_iface: node.public_iface.clone(),
+                    cluster_iface: node.cluster_iface.clone(),
+                    osd_devices: devices,
+                    mon_addr: node.mon_addr.clone(),
+                }))
+                .await
+            {
+                Ok(resp) => {
+                    let inner = resp.into_inner();
+                    let issues: Vec<String> = inner
+                        .issues
+                        .into_iter()
+                        .map(|i| {
+                            format!(
+                                "[{}]{} {}",
+                                i.check,
+                                if i.blocking { " BLOCKING" } else { "" },
+                                i.message
+                            )
+                        })
+                        .collect();
+                    node_results.push(controller_proto::CephNodePlanResult {
+                        node_id: node.node_id.clone(),
+                        ok: inner.ok,
+                        issues,
+                    });
+                }
+                Err(e) => {
+                    #[cfg(test)]
+                    {
+                        let _ = e;
+                        node_results.push(controller_proto::CephNodePlanResult {
+                            node_id: node.node_id.clone(),
+                            ok: true,
+                            issues: vec![
+                                "preflight skipped in unit test (preflight rpc failed)".into()
+                            ],
+                        });
+                    }
+                    #[cfg(not(test))]
+                    {
+                        node_results.push(controller_proto::CephNodePlanResult {
+                            node_id: node.node_id.clone(),
+                            ok: false,
+                            issues: vec![format!("preflight rpc failed: {e}")],
+                        });
+                    }
+                }
+            }
+        }
+        let ok = node_results.iter().all(|n| n.ok) && cluster_issues.is_empty();
+        Ok(controller_proto::PlanCephClusterResponse {
+            ok,
+            encrypt_osds_notice: ceph_cluster_spec::encrypt_osds_notice(spec.encrypt_osds),
+            nodes: node_results,
+            cluster_issues,
+            cluster_warnings: removal.warnings,
+            removing_members: removal.removed,
+        })
     }
 
     async fn ensure_compute_client_for_address(
@@ -4318,13 +4661,129 @@ impl ControllerService {
         Ok(NodeDrainOutcome { migrated, errors })
     }
 
+    /// Addresses under which `node` can appear as a Ceph client: its Ceph
+    /// public (mon) address from every CephCluster it belongs to, plus the
+    /// host part of its gRPC address.
+    fn ceph_client_hosts_for_node(&self, node: &NodeRow) -> Result<Vec<String>, Status> {
+        let mut hosts = vec![grpc_address_host(&node.address)];
+        for cluster in self
+            .db
+            .list_ceph_clusters()
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            let Ok(spec) = ceph_cluster_spec::spec_from_json(&cluster.spec_json) else {
+                continue;
+            };
+            for member in spec.nodes.iter().filter(|n| n.node_id == node.id) {
+                let addr = member.mon_addr.trim();
+                if !addr.is_empty() {
+                    hosts.push(grpc_address_host(addr));
+                }
+            }
+        }
+        hosts.retain(|h| !h.is_empty());
+        hosts.sort();
+        hosts.dedup();
+        Ok(hosts)
+    }
+
+    /// Blocklist the lost node's Ceph clients for every volume of `vm`, via
+    /// one of `members` (healthy CephCluster nodes), before the guest is
+    /// started anywhere else.
+    ///
+    /// The images carry no exclusive lock, so without this the rbd-nbd on the
+    /// unreachable node keeps writing after the guest restarts elsewhere and
+    /// the filesystem is torn apart by two kernels. Any failure here aborts
+    /// the failover of this VM: a guest that stays down is recoverable, a
+    /// corrupted disk is not. A member that cannot be reached is skipped; a
+    /// member that answers with an error ends the attempt, because that
+    /// answer (image open from the wrong host, blocklist refused) is the
+    /// cluster's verdict and not a transport problem.
+    async fn fence_vm_volumes(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        members: &[NodeRow],
+    ) -> Result<Vec<String>, Status> {
+        let volumes = self
+            .db
+            .list_attached_volumes_for_vm(&vm.id)
+            .map_err(|e| Status::internal(format!("listing volumes: {e}")))?;
+        if volumes.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "VM '{}' has no attached volume rows; cannot tell which RBD images to fence",
+                vm.name
+            )));
+        }
+        let hosts = self.ceph_client_hosts_for_node(source)?;
+        let mut blocklisted = Vec::new();
+        for vol in &volumes {
+            let handle = format!("{}/{}", vol.pool, vol.image);
+            #[cfg(test)]
+            if let Some(hook) = &self.test_fence_hook {
+                blocklisted.extend(hook(&handle, &hosts)?);
+                continue;
+            }
+            let mut last_err = Status::unavailable(format!(
+                "no healthy Ceph member reachable to fence {handle}"
+            ));
+            let mut fenced = false;
+            for member in members.iter().filter(|m| m.id != source.id) {
+                if self.clients.get_storage(&member.address).is_none() {
+                    if let Err(e) = self.clients.connect(&member.address).await {
+                        last_err = Status::unavailable(format!(
+                            "connecting to {} to fence {handle}: {e}",
+                            member.id
+                        ));
+                        continue;
+                    }
+                }
+                let Some(mut storage) = self.clients.get_storage(&member.address) else {
+                    continue;
+                };
+                match storage
+                    .fence_volume(node_proto::FenceVolumeRequest {
+                        backend_handle: handle.clone(),
+                        source_hosts: hosts.clone(),
+                    })
+                    .await
+                {
+                    Ok(resp) => {
+                        blocklisted.extend(resp.into_inner().blocklisted);
+                        fenced = true;
+                        break;
+                    }
+                    Err(e) if e.code() == tonic::Code::Unavailable => {
+                        last_err = Status::unavailable(format!(
+                            "{} did not answer FenceVolume for {handle}: {}",
+                            member.id,
+                            e.message()
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(Status::new(
+                            e.code(),
+                            format!("fencing {handle} via {}: {}", member.id, e.message()),
+                        ));
+                    }
+                }
+            }
+            if !fenced {
+                return Err(last_err);
+            }
+        }
+        Ok(blocklisted)
+    }
+
     /// Move Ceph VMs off a node that has already been marked `not-ready`.
     ///
     /// Local-disk VMs stay, because their disks are on the failed host. The
     /// source is not contacted: it already missed the heartbeat deadline, and
-    /// a connect attempt would only delay the move. The destination receives
-    /// the VM unit. The source is recorded so its next successful heartbeat
-    /// pushes a config that no longer starts the moved guests.
+    /// a connect attempt would only delay the move. Its Ceph clients are
+    /// fenced through a healthy member first, so whatever still runs there
+    /// can no longer write to the images. The destination receives the VM
+    /// unit. The source is recorded so its next successful heartbeat pushes a
+    /// config that no longer starts the moved guests.
     pub async fn failover_unreachable_node(
         &self,
         node_id: &str,
@@ -4400,6 +4859,24 @@ impl ControllerService {
                 }
             };
 
+            let blocklisted = match self.fence_vm_volumes(vm, &source, &candidates).await {
+                Ok(addrs) => addrs,
+                Err(e) => {
+                    errors.push(format!(
+                        "VM '{}' stays on {node_id}: its RBD images could not be fenced ({})",
+                        vm.name,
+                        e.message()
+                    ));
+                    continue;
+                }
+            };
+            info!(
+                vm = %vm.name,
+                source = %node_id,
+                blocklisted = ?blocklisted,
+                "fenced Ceph clients of unreachable node"
+            );
+
             if let Err(e) = self.reassign_vm_node(vm, &target.id) {
                 errors.push(format!("VM '{}': {e}", vm.name));
                 continue;
@@ -4419,6 +4896,7 @@ impl ControllerService {
                     "sourceNode": node_id,
                     "targetNode": target.id,
                     "mode": "failover",
+                    "blocklisted": blocklisted,
                 }),
             );
             if let Err(e) = self.push_config_and_await_apply(&target).await {
@@ -4531,17 +5009,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
             req.dc_id.clone()
         };
 
+        // An agent restart re-registers; that must not undo a drain or cordon.
+        let status = crate::db::node_status_after_register(
+            existing.as_ref().map(|n| n.status.as_str()),
+            &approval_status,
+        );
         let node = NodeRow {
             id: req.node_id.clone(),
             hostname: req.hostname.clone(),
             address: req.address.clone(),
             cpu_cores: cpu,
             memory_bytes: mem,
-            status: if approval_status == "approved" {
-                "ready".into()
-            } else {
-                "pending".into()
-            },
+            status: status.clone(),
             last_heartbeat: String::new(),
             gateway_interface: String::new(),
             cpu_used: 0,
@@ -4575,7 +5054,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "address": req.address,
                 "cpuCores": req.capacity.as_ref().map(|c| c.cpu_cores).unwrap_or(0),
                 "memoryBytes": req.capacity.as_ref().map(|c| c.memory_bytes).unwrap_or(0),
-                "status": if approval_status == "approved" { "ready" } else { "pending" },
+                "status": status,
                 "gatewayInterface": "",
                 "storageBackend": req.storage_backend,
                 "disableVxlan": req.disable_vxlan,
@@ -5080,10 +5559,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 node.id
             )));
         }
-        if let Some(conflict) = existing_on_node
-            .into_iter()
-            .find(|existing| existing.image_path == image_path)
-        {
+        if let Some(conflict) = existing_on_node.into_iter().find(|existing| {
+            existing.image_path == image_path
+                && image_used_in_place(&existing.storage_backend)
+                && image_used_in_place(&requested_storage_backend)
+        }) {
             return Err(Status::failed_precondition(format!(
                 "image path '{}' is already used by VM '{}' on node '{}'; duplicate writable disk usage is not supported",
                 image_path, conflict.name, node.id
@@ -5428,6 +5908,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         // unmap first; an unreachable node is tolerated so a dead host can
         // still be cleaned up.
         self.cold_release_ceph_vm(&db_vm, &node).await?;
+        self.lock_encrypted_volumes_on_node(&node, &volumes).await;
 
         let deleted = self
             .db
@@ -8187,7 +8668,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )
             .await
         {
-            Ok(operation_id) => {
+            Ok(LiveMigrateOutcome {
+                operation_id,
+                warnings,
+            }) => {
                 self.log_replication_event_required(
                     &actor,
                     Some("MigrateVm"),
@@ -8200,14 +8684,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         "targetNode": target.id,
                         "mode": "live",
                         "operationId": operation_id,
+                        "hostWarnings": warnings,
                     }),
                 )?;
+                let mut message = format!(
+                    "live-migrated '{}' from {} to {}",
+                    vm.name, source_node.id, target.id
+                );
+                for line in &warnings {
+                    message.push_str("\nwarning: ");
+                    message.push_str(line);
+                }
                 return Ok(Response::new(controller_proto::MigrateVmResponse {
                     success: true,
-                    message: format!(
-                        "live-migrated '{}' from {} to {}",
-                        vm.name, source_node.id, target.id
-                    ),
+                    message,
                     mode: "live".into(),
                     source_node: source_node.id,
                     target_node: target.id.clone(),
@@ -8618,10 +9108,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
 
-        if node.status != "cordoned" {
+        if !matches!(node.status.as_str(), "cordoned" | "draining" | "drained") {
             return Ok(Response::new(controller_proto::UncordonNodeResponse {
                 success: true,
-                message: format!("node '{}' is not cordoned ({})", node.id, node.status),
+                message: format!(
+                    "node '{}' is not cordoned or drained ({})",
+                    node.id, node.status
+                ),
             }));
         }
         if node.approval_status != "approved" {
@@ -10042,6 +10535,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .upsert_volume(&row)
             .map_err(|e| Status::internal(e.to_string()))?;
         self.push_config_and_await_apply(&node).await?;
+        self.lock_encrypted_volumes_on_node(&node, std::slice::from_ref(&row))
+            .await;
         self.log_replication_event(
             &actor,
             Some("volume.detach"),
@@ -10081,6 +10576,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
             return Err(Status::failed_precondition(
                 "detach the volume before deleting it",
             ));
+        }
+        let snapshots = self
+            .db
+            .list_volume_snapshots(Some(&row.id))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !snapshots.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "volume '{}' still has {} snapshot(s); delete them first (kctl delete volume-snapshot)",
+                row.name,
+                snapshots.len()
+            )));
         }
         let node = self
             .pick_healthy_ceph_node()
@@ -10799,6 +11305,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.db
             .upsert_volume(&vol)
             .map_err(|e| Status::internal(e.to_string()))?;
+        if vol.encrypted && !vol.vm_id.is_empty() {
+            if let Err(e) = self.grow_encrypted_mapper(&vol).await {
+                if !op_id.is_empty() {
+                    let _ = self.db.update_vm_operation_phase(
+                        &op_id,
+                        VmOperationRow::PHASE_FAILED,
+                        None,
+                        None,
+                        true,
+                    );
+                }
+                return Err(e);
+            }
+        }
         if !op_id.is_empty() {
             let _ = self.db.update_vm_operation_phase(
                 &op_id,
@@ -11286,6 +11806,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .await
     }
 
+    async fn plan_ceph_cluster(
+        &self,
+        request: Request<controller_proto::PlanCephClusterRequest>,
+    ) -> Result<Response<controller_proto::PlanCephClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let incoming = request
+            .into_inner()
+            .ceph_cluster
+            .ok_or_else(|| Status::invalid_argument("ceph_cluster is required"))?;
+        let mut spec = incoming
+            .spec
+            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        if spec.fsid.trim().is_empty() {
+            spec.fsid = "00000000-0000-0000-0000-000000000000".into();
+        }
+        let plan = self.plan_ceph_cluster_spec(&incoming.name, &spec).await?;
+        Ok(Response::new(plan))
+    }
+
     async fn create_ceph_cluster(
         &self,
         request: Request<controller_proto::CreateCephClusterRequest>,
@@ -11348,6 +11887,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
             ),
             None => (controller_proto::ApplyAction::Created as i32, 1, vec![]),
         };
+        // Preflight before any mutation (skip when the apply is a no-op).
+        if action != controller_proto::ApplyAction::Unchanged as i32 {
+            let plan = self.plan_ceph_cluster_spec(&name, &spec).await?;
+            if !plan.ok {
+                let mut lines = vec![plan.encrypt_osds_notice];
+                for n in &plan.nodes {
+                    if !n.ok {
+                        lines.push(format!("node {}: {}", n.node_id, n.issues.join("; ")));
+                    }
+                }
+                for c in &plan.cluster_issues {
+                    lines.push(c.clone());
+                }
+                return Err(Status::failed_precondition(format!(
+                    "CephCluster preflight failed:\n{}",
+                    lines.join("\n")
+                )));
+            }
+        }
         if let Some(prev) = existing.as_ref() {
             if prev.spec_json != spec_json {
                 if let Ok(old) = ceph_cluster_spec::spec_from_json(&prev.spec_json) {
@@ -15330,6 +15888,89 @@ mod tests {
         assert_eq!(n.status, "ready");
     }
 
+    /// A node-agent restart re-registers the node. That used to overwrite a
+    /// drain or cordon with `ready`, so the node silently came back into
+    /// scheduling with no uncordon. Only `UncordonNode` may do that.
+    #[tokio::test]
+    async fn re_register_keeps_drained_and_cordoned_status_until_uncordon() {
+        for held in ["drained", "draining", "cordoned"] {
+            let db = Database::open(":memory:").expect("open db");
+            let mut node = test_node();
+            node.approval_status = "approved".to_string();
+            node.status = held.to_string();
+            db.upsert_node(&node).expect("insert");
+            let svc = ControllerService::new(
+                db.clone(),
+                NodeClients::new(None),
+                test_network(),
+                empty_sub_ca(),
+                Some(ReplicationConfig {
+                    controller_id: "ctrl-test".into(),
+                    dc_id: "DC1".into(),
+                    peers: vec![],
+                }),
+                false,
+                false,
+            );
+            let register = || controller_proto::RegisterNodeRequest {
+                node_id: "node-1".to_string(),
+                hostname: "node-1".to_string(),
+                address: "127.0.0.1:9091".to_string(),
+                capacity: Some(controller_proto::NodeCapacity {
+                    cpu_cores: 4,
+                    memory_bytes: 8_000_000_000,
+                }),
+                labels: vec![],
+                storage_backend: 1,
+                disable_vxlan: false,
+                cert_expiry_days: 300,
+                luks_method: "tpm2".to_string(),
+                dc_id: String::new(),
+            };
+
+            <ControllerService as controller_proto::controller_server::Controller>::register_node(
+                &svc,
+                Request::new(register()),
+            )
+            .await
+            .expect("re-register");
+            let n = db.get_node("node-1").expect("get").expect("exists");
+            assert_eq!(n.status, held, "re-register must keep {held}");
+            assert_eq!(n.approval_status, "approved");
+
+            // The replicated event must carry the preserved status too, or a
+            // follower (and the next primary) would reset it on apply.
+            let events = db.list_replication_outbox_since(0, 10).expect("outbox");
+            let register_evt = events
+                .iter()
+                .find(|e| e.event_type == EVT_NODE_REGISTER)
+                .expect("node.register event logged");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&register_evt.payload).expect("payload json");
+            assert_eq!(payload["body"]["status"], held);
+
+            <ControllerService as controller_proto::controller_server::Controller>::uncordon_node(
+                &svc,
+                Request::new(controller_proto::UncordonNodeRequest {
+                    node_id: "node-1".to_string(),
+                }),
+            )
+            .await
+            .expect("uncordon");
+            let n = db.get_node("node-1").expect("get").expect("exists");
+            assert_eq!(n.status, "ready", "uncordon clears {held}");
+
+            <ControllerService as controller_proto::controller_server::Controller>::register_node(
+                &svc,
+                Request::new(register()),
+            )
+            .await
+            .expect("register after uncordon");
+            let n = db.get_node("node-1").expect("get").expect("exists");
+            assert_eq!(n.status, "ready");
+        }
+    }
+
     #[tokio::test]
     async fn approve_node_transitions_to_ready() {
         let db = Database::open(":memory:").expect("open db");
@@ -15461,7 +16102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failover_moves_ceph_vms_and_leaves_local_disks() {
+    async fn failover_fences_then_moves_ceph_vms_and_leaves_local_disks() {
         let (db, vm) = ceph_two_node_fixture();
         mark_ceph_cluster_healthy(&db, "lab");
         db.update_node_status("node-a", "not-ready").expect("mark");
@@ -15470,7 +16111,16 @@ mod tests {
         local.name = "local-disk".into();
         local.storage_backend = "filesystem".into();
         db.insert_vm(&local).expect("local vm");
-        let svc = svc_for(&db);
+        let fenced = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let record = Arc::clone(&fenced);
+        let hook: FenceHook = Arc::new(move |handle: &str, hosts: &[String]| {
+            record
+                .lock()
+                .unwrap()
+                .push((handle.to_string(), hosts.to_vec()));
+            Ok(vec!["127.0.0.1:0/4242".to_string()])
+        });
+        let svc = svc_for(&db).with_test_fence_hook(hook);
 
         let outcome = svc
             .failover_unreachable_node("node-a")
@@ -15490,6 +16140,76 @@ mod tests {
         assert_eq!(
             db.get_node("node-a").expect("get").expect("source").status,
             "not-ready"
+        );
+
+        // The root image was fenced, naming both the gRPC host and the Ceph
+        // public address of the lost node, before the VM changed hands.
+        let fenced = fenced.lock().unwrap();
+        assert_eq!(fenced.len(), 1, "{fenced:?}");
+        assert_eq!(fenced[0].0, format!("kcore-vms/kcore-{}", vm.id));
+        assert_eq!(
+            fenced[0].1,
+            vec!["10.10.0.11".to_string(), "127.0.0.1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_leaves_the_vm_in_place_when_fencing_fails() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-a", "not-ready").expect("mark");
+        let hook: FenceHook = Arc::new(|handle: &str, _hosts: &[String]| {
+            Err(Status::failed_precondition(format!(
+                "{handle} is open from 10.10.0.12:0/7 (host 10.10.0.12), which is not the node being fenced"
+            )))
+        });
+        let svc = svc_for(&db).with_test_fence_hook(hook);
+
+        let outcome = svc
+            .failover_unreachable_node("node-a")
+            .await
+            .expect("failover pass");
+        assert_eq!(outcome.migrated, 0);
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("could not be fenced") && e.contains("10.10.0.12:0/7")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("ceph").node_id,
+            "node-a"
+        );
+        assert!(!db.node_needs_config_push("node-a").expect("flag"));
+    }
+
+    #[tokio::test]
+    async fn failover_without_a_reachable_ceph_member_does_not_move_the_vm() {
+        // No fence hook: the controller really tries the members' gRPC
+        // addresses, none of which is listening.
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-a", "not-ready").expect("mark");
+        let svc = svc_for(&db);
+
+        let outcome = svc
+            .failover_unreachable_node("node-a")
+            .await
+            .expect("failover pass");
+        assert_eq!(outcome.migrated, 0);
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("could not be fenced")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("ceph").node_id,
+            "node-a"
         );
     }
 

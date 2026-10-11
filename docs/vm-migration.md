@@ -18,9 +18,52 @@ Product docs: [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.
 
 RBAC: `DrainNode` → `cluster-admin`; `MigrateVm` → `vm-admin`.
 
+### Host CPU and TSC preflight (live)
+
+Before the destination spawns its receive VMM, the controller fetches the
+source's `GetHostCpuInfo` (vendor, model, TSC kHz, hardware TSC scaling)
+and passes it in `PrepareLiveMigrateReceive`. The destination refuses a
+vendor mismatch and otherwise returns `warnings`, which `kctl migrate vm`
+prints and the `vm.migrated` event records as `hostWarnings`:
+
+- different CPU model: fine as long as the guest's CPUID is satisfied
+  (`vm_check_cpuid_compatibility` still runs inside Cloud Hypervisor);
+- source TSC slower than destination without hardware TSC scaling: KVM cannot
+  run a guest TSC below the host rate and returns `EINVAL`. Stock Cloud
+  Hypervisor 51.1 aborts the receive there, which is why migrating off a
+  slower host (lab: node-118 at 3.30 GHz onto the 3.40 GHz nodes) failed.
+  `modules/ch-vm/patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch`
+  (applied through `ch-vm.vms.cloudHypervisorPatches`) logs and continues like
+  QEMU; kvm-clock and Hyper-V reference-TSC guests keep correct time.
+
+The receive also clears a stale `<vm>.sock` / `<vm>.serial.sock` left by a
+guest that previously ran on the destination; Cloud Hypervisor binds the
+serial socket without unlinking and would otherwise fail the Config step
+with the unhelpful "Failed to receive migratable component snapshot".
+
 ## Automatic failover
 
 When a node misses heartbeats for 90 seconds the controller marks it `not-ready` and, unless `failover.enabled` is false, moves each Ceph VM onto another healthy member of the same cluster. The move is a cold reassignment: the failed node is not contacted. Local `filesystem`, `lvm`, and `zfs` VMs stay on that node and show up in `kctl get cluster-health` as VMs on a not-ready node.
+
+### Fencing before the move
+
+A node the controller cannot reach is not necessarily a node whose guests have stopped. Only the controller heartbeat is known to be missing; the guest may still be running and its rbd-nbd still writing. The RBD images are created with the `layering` feature only, so Ceph itself does not arbitrate writers: starting the guest on another node would give two kernels the same ext4 filesystem (this was observed in the lab and needed `fsck` to repair).
+
+Before reassigning each Ceph VM the controller therefore calls `NodeStorage.FenceVolume` through a healthy member of the cluster, once per attached volume. The member runs `rbd status --format json` (and `rbd lock ls`) on the image and adds every client listed from the lost node's addresses (its Ceph public address from the CephCluster spec and the host part of its gRPC address) to the OSD blocklist with `ceph osd blocklist add <addr:port/nonce> 604800`. From the next osdmap the lost node's rbd-nbd gets `EBLOCKLISTED` on every I/O; the guest there sees disk errors, nothing reaches the image. The blocklist entry lasts seven days and is tied to the client instance (address, port, nonce); a node that reboots comes back with new nonces, so the blocklist does not cover it. Its boot-time units are the remaining exposure, see below.
+
+The fence is a precondition, not best effort:
+
+- If the image is open from a host that is *not* the lost node, `FenceVolume` fails with `FAILED_PRECONDITION` naming that client, and the VM stays where the database says it is. The controller's placement is wrong in that case and moving the guest would cut off whoever is really running it.
+- If no healthy member answers, or the VM has no attached volume rows to name its images, the VM is not moved and the error is reported once in the controller log (`stays on <node>: its RBD images could not be fenced`). The next pass retries.
+- Blocklisted addresses are recorded on the `FailoverVm` replication event. `ceph osd blocklist ls` shows them; `ceph osd blocklist rm <addr>` lifts one early once the node is known to be down.
+- Only storage is fenced. A guest that is still running on the lost node keeps its CPU and network; its disk returns errors (`block nbd0: Other side returned error (108)` on the host). It is stopped when the node's next heartbeat brings the configuration without it: the unit's `ExecStop` presses the power button, which a guest with a dead root disk usually ignores, and sends SIGTERM 25 s later.
+
+Lab run (node-103 lost its agent while `labtest-9` wrote one line per second): heartbeat deadline at +93 s, fence at +93.5 s, guest booted on node-118 at +113 s with `EXT4-fs: recovery complete`; the last line on the image was written one second before the fence. Node-103's copy was torn down 44 s after its agent returned.
+
+Two cases are not covered by the blocklist and are listed in [`storage-and-mobility-gaps.md`](./storage-and-mobility-gaps.md):
+
+- An image with no watchers at all is treated as already fenced: there is no client to blocklist. A node that is partitioned from both the controller and the Ceph public network falls into this case once its watch has timed out (30 s), and it could resume writing if the partition heals before its config is refreshed.
+- A lost node that reboots still has the moved guest in its NixOS configuration (`autoStart` units are `wantedBy multi-user.target`) and starts it with a fresh Ceph client before the controller's first config push removes the unit.
 
 The failed node is recorded in `pending_node_config_push`. Its next successful heartbeat pushes a configuration that no longer starts the moved guests, so a node that comes back does not boot a second copy of a Ceph VM. `kctl get cluster-health` reports `healthy`, `degraded`, or `unhealthy` from node readiness, those leftover VMs, certificates inside 30 days, and unresolved replication conflicts.
 
@@ -152,9 +195,10 @@ The controller first pushes the destination Nix with `incomingMigration = true` 
 **Handoff (destination systemd)** — `modules/ch-vm/vm-service.nix`
 
 - Ceph VMs: `--memory size=…M,shared=on` (CH live-migrate requirement).
-- `stopIfChanged` / `restartIfChanged` keep their NixOS defaults. `switch-to-configuration` only consults them for units that **already existed and changed**; the destination unit is brand new, so it is simply started and adopts the receive process. (Overriding them for Ceph would also have quietly stopped `cpu`/`memory`/`extraArgs` updates from ever taking effect.)
-- `ExecStartPre`: if `.live-migrated` exists, skip wiping the API socket and skip cold provision.
-- `ExecStart`: if marker present, `tail --pid=<migrate.pid> -f /dev/null` so systemd’s MainPID waits on the already-running CH; else cold-start the full CH CLI.
+- `stopIfChanged` / `restartIfChanged` keep their NixOS defaults, so `cpu`/`memory`/`extraArgs` updates keep taking effect for Ceph-backed VMs. The destination unit **already exists** at finalize time (the prepare step pushed it with `incomingMigration = true`), so if the settled unit file differs from that one in any way (a spec change in between, a module update, an option the controller only emits once the node reports it) `switch-to-configuration` restarts the unit right after the handoff. The scripts below make that restart harmless.
+- `ExecStartPre`: if `.live-migrated` exists, or a `cloud-hypervisor --api-socket /run/kcore/<vm>.sock` process is already running, skip wiping the sockets and skip cold provision.
+- `ExecStart`: if the marker is present, `tail --pid=<migrate.pid> -f /dev/null` so systemd’s MainPID waits on the already-running CH. Otherwise, if another CH serves the socket, ask it for `vm.info`: a guest in state `Running`/`Paused` is **adopted** the same way (`Adopting already-running (guest Running) cloud-hypervisor pid N` in the journal); a VMM without a running guest (a receiver whose migration never completed) makes the start exit `75`, which `RestartPreventExitStatus` keeps systemd from retrying. Only with no VMM at all is the full CH CLI cold-started.
+- `ExecStop`: press the ACPI power button, then wait up to 25 s for the VMM to exit and `SIGTERM` it if it has not. systemd only waits for processes inside the unit's cgroup; an adopted VMM is not in it, and without this wait a `systemctl restart` would report the unit stopped while the guest runs on, and the next start would adopt it again instead of applying the change.
 
 **Finalize**
 

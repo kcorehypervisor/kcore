@@ -160,3 +160,9 @@ The drain process:
 2. For each VM, selects a target node (explicit or via scheduler) and moves it.
 3. Pushes updated NixOS configs to both source and target nodes.
 4. Sets the source node status to `drained`.
+
+## Relation to host metrics
+
+Host telemetry (`node_exporter` scraped by VictoriaMetrics) is separate from
+heartbeats. See [host-metrics.md](./host-metrics.md). Filling `NodeUsage` from
+real host load is a distinct change from enabling the exporter.

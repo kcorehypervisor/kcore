@@ -12,7 +12,7 @@ Status: **Phases 1–2 + live migration shipped; volumes, snapshots, resize, and
 |---------|----------|-----------|
 | Ceph packages / units | NixOS | `services.ceph` via [`modules/kcore-ceph.nix`](../modules/kcore-ceph.nix) |
 | FSID, keyrings, monmap | Controller + node-agent | Bootstrap package redistributed to members |
-| OSD prepare / activate | Node-agent | `BootstrapCephOsd` → `ceph-volume lvm create` (+ systemd activate) |
+| OSD prepare / activate | Node-agent + NixOS | `ceph-volume lvm create --no-systemd`, then `ceph-osd@ID`; boot via `ceph-volume-activate` |
 | Pool / RBD init | Node-agent (reconciler-driven) | `EnsureCephPool` → pool `kcore-vms` |
 | Health / phase | Controller reconciler | `GetCephHealth` until `HEALTH_OK` |
 | VM RBD create/delete | Node storage adapter | `rbd create` / `rbd rm` (`layering` only) |
@@ -51,26 +51,71 @@ spec:
       clusterAddr: "10.20.0.11"
       publicIface: eth1
       clusterIface: eth2
-      osdDevice: /dev/nvme0n1
+      # Prefer by-id — /dev/sdX renames when USB disks shift names.
+      osdDevice: /dev/disk/by-id/ata-Micron_1300_SATA_512GB_2144329E98F2
     # … additional members
-  # encryptOsds: true   # default; LUKS per OSD via ceph-volume --dmcrypt
+  # encryptOsds: true   # DEFAULT; LUKS per OSD via ceph-volume --dmcrypt
   # encryptOsds: false  # labs only; set on first create — immutable afterwards
 ```
 
 ```bash
-kctl apply -f lab-san-ceph.yaml
+kctl diff -f lab-san-ceph.yaml    # preflight + loud encryptOsds notice
+kctl apply -f lab-san-ceph.yaml   # plan first, then persist if ok
 kctl get ceph-cluster
 kctl describe ceph-cluster lab-san
 ```
 
+**Mon addresses must be static** (or DHCP reservations). Preflight fails when the
+public iface for `monAddr` looks DHCP-managed — a lease change silently breaks
+quorum. Lab mons use reservations (e.g. `192.168.40.103:6789`).
+
+**Do not use hardware RAID virtual disks** (PERC / MegaRAID / "Virtual Disk") as
+`osdDevice`. Preflight refuses those models.
+
+### Nixpkgs Ceph package
+
+Nodes pin nixpkgs `b40629ef`, where in-tree `ceph` 19.2.3 does not evaluate
+(`sphinx` 9.1.0 needs Python ≥ 3.12). [`modules/kcore-ceph.nix`](../modules/kcore-ceph.nix)
+overlays `pkgs.ceph` with **Ceph 20.2.4** from a pinned newer revision that is
+in `cache.nixos.org`. Remove the overlay once the base flake pin evaluates
+`nixpkgs#ceph` cleanly. CI check: `nix build .#checks.x86_64-linux.ceph-module-eval`.
+
+`ApplyCephConfig` also refreshes `/etc/nixos/modules/kcore-ceph.nix` from the
+agent build so module fixes reach already-installed nodes without a manual copy.
+
+### Firewall and cluster address (without NodeNetwork)
+
+The module opens TCP **3300**, **6789**, and **6800–7568** on the host (and on
+`publicIface` when set), trusts `clusterIface`, and can assign a static
+`clusterAddr` on that iface from `clusterNetwork`'s prefix. Prefer a
+`NodeNetwork` claim when that resource is available; the module path is the
+fallback so Ceph bring-up does not require hand-edited `configuration.nix`.
+
 ### Reconciler sequence
 
-1. Persist spec + generation.
-2. `ApplyCephConfig` — write `/etc/nixos/kcore-ceph.nix`, rebuild; cluster name is always `ceph`; `mon_host` lists every member.
-3. First eligible node builds mon/admin/bootstrap-osd keyrings (`ceph-authtool`); controller redistributes the package; peers run `ceph-mon --mkfs` / mgr auth.
-4. `BootstrapCephOsd` — `ceph-volume lvm create` on `osdDevice` (with `--dmcrypt` when `encryptOsds` is true; refuses non-empty disks unless `forceWipe: true`), activate units (no `--no-systemd`).
-5. `EnsureCephPool` for `kcore-vms` (size/min_size, RBD application, `rbd pool init`).
-6. Poll health until `HEALTH_OK`; otherwise requeue.
+1. **Preflight** on every member (`nixos-rebuild dry-build`, OSD device exists /
+   not mounted / not RAID, addresses present, nixpkgs pin resolves, mon not on
+   DHCP). `kctl apply` / `kctl diff` print per-node results and refuse on failure.
+2. Persist spec + generation (encryptOsds notice is printed loudly; default is
+   `true` and immutable after create).
+3. `ApplyCephConfig` — sync module + write `/etc/nixos/kcore-ceph.nix`, rebuild;
+   cluster name is always `ceph`; `mon_host` lists every member.
+4. First eligible node builds mon/admin/bootstrap-osd keyrings (`ceph-authtool`);
+   controller redistributes the package; peers run `ceph-mon --mkfs` / mgr auth.
+5. `BootstrapCephOsd` — `ceph-volume lvm create --no-systemd` on `osdDevice`
+   (with `--dmcrypt` when `encryptOsds` is true; refuses non-empty disks unless
+   `forceWipe: true`), then `systemctl start ceph-osd@ID`. NixOS cannot let
+   ceph-volume enable units into read-only `/etc/systemd/system`;
+   `modules/kcore-ceph.nix` ships `ceph-osd@` and a boot
+   `ceph-volume-activate` oneshot (`lvm activate --all --no-systemd`).
+   Compatible with Ceph 20.x (Tentacle).
+6. `EnsureCephPool` for `kcore-vms` (size/min_size, RBD application, `rbd pool init`).
+7. Poll health until `HEALTH_OK`; otherwise requeue.
+
+The first mon mkfs uses a **self-only** monmap (and `monInitialMembers` lists only
+that daemon). Peers join with `ceph mon add` + the running monmap. Listing all
+future members up front left 0.0.0.0 placeholders and kept the mon probing so
+`ensure_mgr_keyring` never returned. All `ceph` CLI calls use a wall-clock timeout.
 
 OSD dm-crypt protects disk theft/RMA; it does **not** protect a compromised mon or host. Keys live in the mon config-key store. Enabling encryption on an existing plain cluster means replacing OSD devices (remove → backfill → re-add with dmcrypt).
 
@@ -80,6 +125,28 @@ Discover hardware before writing the manifest:
 kctl --node <addr>:9091 node nics
 kctl --node <addr>:9091 node disks
 ```
+
+### Removing a member
+
+Drop the node from `spec.nodes` and `kctl apply` the manifest. The plan
+(and the apply, which runs the same plan) refuses unless:
+
+- the survivors still number at least `size` — every replica needs its own
+  host under the default CRUSH rule, so a 3-node `size: 3` cluster must lower
+  `size` (and `minSize`) first, in the same or an earlier apply;
+- the cluster is `HEALTH_OK` as a surviving member reports it, so every PG is
+  fully replicated before one copy leaves;
+- no earlier removal is still in progress, and only one member leaves per
+  apply.
+
+The plan lists the leaving member and warns when 2 monitors remain (no
+quorum tolerance). The reconciler then asks a survivor to `ceph osd out` the
+leaving host's OSDs (`DrainCephHost`) and holds the removal, with
+`health_message` reporting how many PGs are not yet `active+clean`, until
+the data has moved. Only then does the leaving node stop its mon/mgr, purge
+and zap its OSDs, drop `kcore.ceph` from its system configuration, and a
+survivor runs `ceph mon rm`. Re-adding the node to the spec before the
+teardown ran cancels the removal.
 
 ## Phase 2 — RBD VM disks
 
@@ -140,6 +207,7 @@ Prefer a dedicated fabric for `clusterNetwork` (replication) and a separate `pub
 - Never point `osdDevice` at the OS disk.
 - Default `forceWipe: false` refuses OSD prepare when signatures exist.
 - Keep Ceph replication off a congested management NIC.
+- Removing a member is refused while it would leave fewer hosts than `size`, while the cluster is not `HEALTH_OK`, or while another removal is draining; see [Removing a member](#removing-a-member).
 - Live migration needs TCP 18000–18127 open between members (see [`vm-migration.md`](./vm-migration.md)).
 - A migration that fails with `ALREADY_EXISTS` usually means a **stranded receive session** on the destination, left behind when the controller died mid-migration. There is no automatic reaping — a wrong liveness guess would destroy a live receive — so inspect with `kctl get migrate-session <vm>` and clear with `kctl migrate reset-session <vm> --node <id> --force`. See [Runbook: a stranded receive session](./vm-migration.md#runbook-a-stranded-receive-session).
 

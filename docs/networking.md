@@ -440,6 +440,19 @@ traffic between VMs on the same network is unrestricted.
 UDP port 4789 is opened in the firewall when any VXLAN network is
 configured on the node.
 
+The kcore tables themselves (`ip kcore-<net>` for masquerade, port
+forwards and security-group DNAT; `bridge kcoreew-<net>` for the east-west
+filter) are owned by `kcore-firewall-<net>.service`, not by the bridge
+unit. It applies one `nft -f` transaction (`add table; delete table;
+table {...}`) so the tables are replaced atomically, and it is reloaded
+(not stopped) when the rules change, so a `nixos-rebuild switch` that adds
+a port or a security group takes effect on a live node without touching
+the bridge or the VMs. `systemctl reload kcore-firewall-<net>` restores the
+tables if anything flushed them; they are deleted only when the network is
+removed from the configuration. `networking.nftables.flushRuleset` stays
+`false` (asserted by `tests/ch-vm-module-eval.nix`), so the NixOS ruleset
+reload never drops them either.
+
 ## kctl commands
 
 ### Security groups (v1)

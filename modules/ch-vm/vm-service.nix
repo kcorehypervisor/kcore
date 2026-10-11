@@ -9,6 +9,15 @@ let
   helpers = import ./helpers.nix { inherit lib; };
   inherit (helpers) vmInterfaces;
 
+  chPkg =
+    if cfg.cloudHypervisorPatches == [ ] then
+      cfg.cloudHypervisorPackage
+    else
+      cfg.cloudHypervisorPackage.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ cfg.cloudHypervisorPatches;
+      });
+  chBin = "${chPkg}/bin/cloud-hypervisor";
+
   mkVmService =
     vmName: vmCfg:
     let
@@ -19,7 +28,6 @@ let
       seedIso = "/etc/kcore/seeds/${vmName}.iso";
       firmwarePath =
         if cfg.firmwarePath != null then cfg.firmwarePath else "${pkgs.OVMF-cloud-hypervisor.firmware}";
-      chBin = "${cfg.cloudHypervisorPackage}/bin/cloud-hypervisor";
 
       isLvm = vmCfg.storageBackend == "lvm";
       isZfs = vmCfg.storageBackend == "zfs";
@@ -47,11 +55,13 @@ let
           rbdDevice
         else
           toString vmCfg.image;
-      actualFormat = if isBlockBackend then "raw" else vmCfg.imageFormat;
+      # Block backends are always seeded as raw. For an in-place image the real
+      # format is sniffed in the start script (see srcFormatFn).
+      actualFormat = if isBlockBackend then "raw" else "$ROOT_FMT";
 
       vmDiskArg =
         "path=${actualDisk},image_type=${actualFormat}"
-        + lib.optionalString isCeph ",serial=root-${vmName}";
+        + lib.optionalString isCeph ",direct=on,serial=root-${vmName}";
       seedDiskArg = "path=${seedIso},readonly=on,image_type=raw";
       dataDiskArgs = lib.concatMapStringsSep " " (
         disk:
@@ -63,11 +73,50 @@ let
             else
               "/dev/rbd/${cfg.rbdPool}/${disk.rbdImage}";
         in
-        "path=${path},image_type=raw,serial=${disk.serial}${ro}"
+        "path=${path},image_type=raw,direct=on,serial=${disk.serial}${ro}"
       ) vmCfg.dataDisks;
+
+      # The declared format comes from the image URL/extension, which is wrong for
+      # qcow2 cloud images named *.img. A qcow2 magic header always wins over a
+      # declared "raw", otherwise the qcow2 bytes would be copied onto the disk verbatim.
+      srcFormatFn = ''
+        src_format() {
+          local PATH="${pkgs.coreutils}/bin:$PATH"
+          if [ "$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "514649fb" ]; then
+            echo qcow2
+          else
+            echo "$2"
+          fi
+        }
+      '';
+
+      # Runs right before every qemu-img convert onto a volume. The node agent
+      # hashes the download once; this catches a cached file that changed
+      # since (bit rot, a partial re-download, an operator swapping files).
+      verifySourceFn = ''
+        verify_source() {
+          ${
+            if vmCfg.imageSha256 != null then
+              ''
+                local expected actual
+                expected="$(echo "${vmCfg.imageSha256}" | ${pkgs.coreutils}/bin/tr 'A-F' 'a-f')"
+                echo "Verifying $1 against sha256 $expected..."
+                actual="$(${pkgs.coreutils}/bin/sha256sum "$1" | ${pkgs.coreutils}/bin/cut -d' ' -f1)"
+                if [ "$actual" != "$expected" ]; then
+                  echo "ERROR: source image $1 has sha256 $actual, expected $expected; refusing to seed ${vmName} from it"
+                  exit 1
+                fi
+              ''
+            else
+              "true"
+          }
+        }
+      '';
 
       lvmProvisionScript = pkgs.writeShellScript "lvm-provision-${vmName}" ''
         set -e
+        ${srcFormatFn}
+        ${verifySourceFn}
         LV_DEVICE="${lvDevice}"
         VG="${cfg.lvmVgName}"
         LV="${lvName}"
@@ -80,9 +129,10 @@ let
           rm -f "$SEED_MARKER"
         fi
         if [ ! -f "$SEED_MARKER" ]; then
+          verify_source ${toString vmCfg.image}
           echo "Converting source image to LV..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
-            -f ${vmCfg.imageFormat} -O raw \
+            -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
             ${toString vmCfg.image} "$LV_DEVICE"
           mkdir -p "$(dirname "$SEED_MARKER")"
           touch "$SEED_MARKER"
@@ -94,6 +144,8 @@ let
 
       zfsProvisionScript = pkgs.writeShellScript "zfs-provision-${vmName}" ''
         set -e
+        ${srcFormatFn}
+        ${verifySourceFn}
         ZVOL_DATASET="${zvolDataset}"
         ZVOL_DEVICE="${zvolDevice}"
         SIZE_BYTES="${toString vmCfg.storageSizeBytes}"
@@ -113,9 +165,10 @@ let
           rm -f "$SEED_MARKER"
         fi
         if [ ! -f "$SEED_MARKER" ]; then
+          verify_source ${toString vmCfg.image}
           echo "Converting source image to zvol..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
-            -f ${vmCfg.imageFormat} -O raw \
+            -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
             ${toString vmCfg.image} "$ZVOL_DEVICE"
           mkdir -p "$(dirname "$SEED_MARKER")"
           touch "$SEED_MARKER"
@@ -125,18 +178,42 @@ let
         fi
       '';
 
+      # Ceph 20 issues aes256k cephx keys, which the kernel libceph client
+      # rejects ("secret too big 32"), so images are mapped with rbd-nbd and
+      # exposed under the stable /dev/rbd/<pool>/<image> symlink. The nbd daemon
+      # runs in its own transient scope so it outlives this unit's cgroup.
+      rbdNbdFunctions = ''
+        export PATH="${pkgs.ceph}/bin:${pkgs.jq}/bin:${pkgs.kmod}/bin:${pkgs.util-linux}/bin:$PATH"
+        nbd_dev() {
+          rbd device list -t nbd --format json 2>/dev/null \
+            | jq -r --arg p "''${1%%/*}" --arg i "''${1#*/}" \
+              '[.[] | select(.pool == $p and .image == $i and ((.snap // "") | . == "" or . == "-"))][0].device // empty'
+        }
+      '';
+
       cephMapScript = pkgs.writeShellScript "ceph-map-${vmName}" ''
         set -e
+        ${srcFormatFn}
+        ${verifySourceFn}
+        ${rbdNbdFunctions}
         map_one() {
           local IMAGE="$1"
           local RBD_DEV="/dev/rbd/$IMAGE"
-          if ! ${pkgs.ceph}/bin/rbd info "$IMAGE" >/dev/null 2>&1; then
+          if ! rbd info "$IMAGE" >/dev/null 2>&1; then
             echo "ERROR: RBD image $IMAGE does not exist; create/attach the volume via kctl first"
             exit 1
           fi
-          if [ ! -b "$RBD_DEV" ]; then
-            ${pkgs.ceph}/bin/rbd map "$IMAGE"
+          local DEV
+          DEV="$(nbd_dev "$IMAGE")"
+          if [ -z "$DEV" ]; then
+            modprobe nbd || true
+            DEV="$(${pkgs.systemd}/bin/systemd-run --scope --quiet --collect -- \
+              rbd device map -t nbd --rbd-cache=true --rbd-cache-policy=writeback \
+                --rbd-readahead-trigger-requests=1 --rbd-readahead-max-bytes=4194304 \
+                --rbd-readahead-disable-after-bytes=0 "$IMAGE" | tail -1)"
           fi
+          mkdir -p "$(dirname "$RBD_DEV")"
+          ln -sfn "$DEV" "$RBD_DEV"
           test -b "$RBD_DEV"
         }
         IMAGE="${cfg.rbdPool}/${rbdImage}"
@@ -157,9 +234,10 @@ let
         fi
         if [ "$SEEDED" -eq 0 ]; then
           test -e "$SOURCE" || { echo "missing source image: $SOURCE"; exit 1; }
+          verify_source "$SOURCE"
           echo "Seeding RBD $IMAGE from $SOURCE..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
-            -f ${vmCfg.imageFormat} -O raw \
+            -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
             "$SOURCE" "$RBD_DEV"
           ${pkgs.ceph}/bin/rbd image-meta set "$IMAGE" kcore.seeded 1
           mkdir -p "$(dirname "$LOCAL_MARKER")"
@@ -171,9 +249,41 @@ let
       '';
 
       cephUnmapScript = pkgs.writeShellScript "ceph-unmap-${vmName}" ''
-        ${pkgs.ceph}/bin/rbd unmap ${rbdDevice} || true
+        ${rbdNbdFunctions}
+        # A live-migrated guest runs outside this unit. If the unit's own
+        # start fails (and ExecStopPost runs), the device is still in use by
+        # that guest, and unmapping it would pull the disk from under it.
+        held_by_vmm() {
+          local fd pid
+          for fd in /proc/[0-9]*/fd/*; do
+            [ "$(readlink "$fd" 2>/dev/null)" = "$1" ] || continue
+            pid="''${fd#/proc/}"
+            pid="''${pid%%/*}"
+            [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "rbd-nbd" ] && continue
+            return 0
+          done
+          return 1
+        }
+        unmap_one() {
+          local DEV
+          DEV="$(nbd_dev "$1")"
+          if [ -n "$DEV" ] && held_by_vmm "$DEV"; then
+            return 0
+          fi
+          # An open LUKS mapper stacked on the nbd keeps it mapped; the node
+          # agent unmaps it when the volume is locked on detach.
+          if [ -n "$DEV" ] && [ -n "$(ls -A "/sys/block/$(basename "$DEV")/holders" 2>/dev/null)" ]; then
+            return 0
+          fi
+          if [ -n "$DEV" ]; then
+            blockdev --flushbufs "$DEV" || true
+            rbd device unmap -t nbd "$DEV" || true
+          fi
+          rm -f "/dev/rbd/$1"
+        }
+        unmap_one "${cfg.rbdPool}/${rbdImage}"
         ${lib.concatMapStrings (disk: ''
-          ${pkgs.ceph}/bin/rbd unmap /dev/rbd/${cfg.rbdPool}/${disk.rbdImage} || true
+          unmap_one "${cfg.rbdPool}/${disk.rbdImage}"
         '') vmCfg.dataDisks}
       '';
 
@@ -260,12 +370,39 @@ let
         done
       '';
 
+      # A VMM for this VM may already run outside the unit's cgroup: the
+      # receiver of a live migration (spawned by the node agent), or one the
+      # unit adopted earlier and lost when systemd restarted the unit because
+      # its file changed. Such a process owns the sockets and the disk, so a
+      # start must never wipe its sockets, reseed its volume or launch a second
+      # writer next to it.
+      vmmFunctions = ''
+        vmm_pid() {
+          ${pkgs.procps}/bin/pgrep -f -- "cloud-hypervisor.*--api-socket[= ]${socketPath}( |$)" \
+            | ${pkgs.gnugrep}/bin/grep -vx "$$" | ${pkgs.coreutils}/bin/head -n1 || true
+        }
+        vm_state() {
+          ${pkgs.curl}/bin/curl -s --max-time 5 --unix-socket ${socketPath} http://localhost/api/v1/vm.info 2>/dev/null \
+            | ${pkgs.gnused}/bin/sed -n 's/.*"state":"\([A-Za-z]*\)".*/\1/p'
+        }
+      '';
+      # Exit status of ExecStart when another VMM serves the socket but has no
+      # guest to adopt. It is the main process' status, so
+      # RestartPreventExitStatus stops systemd from retrying into the same wall.
+      vmmAlreadyRunningStatus = 75;
+
       # After a live receive, CH is already running outside systemd. Skip
       # destructive socket cleanup so the handoff ExecStart can adopt it.
       startPreScript = pkgs.writeShellScript "kcore-vm-${vmName}-pre" ''
         set -e
         if [ -f "${liveMigratedMarker}" ]; then
           echo "live-migrated marker present; skipping socket wipe / cold provision"
+          exit 0
+        fi
+        ${vmmFunctions}
+        other_vmm="$(vmm_pid)"
+        if [ -n "$other_vmm" ]; then
+          echo "cloud-hypervisor pid $other_vmm already serves ${socketPath}; leaving its sockets and volume alone"
           exit 0
         fi
         ${pkgs.coreutils}/bin/rm -f ${socketPath} ${serialSocket}
@@ -284,24 +421,65 @@ let
         }
       '';
 
-      # Adopt an in-flight receive-mode CH (tail --pid) or cold-start CH.
+      # Adopt a running CH (tail --pid) or cold-start one. Adoption covers the
+      # live-migration handoff (marker + pid file) and every later restart of
+      # the unit while that CH still runs the guest; only a VMM without a
+      # running guest (a receiver whose migration never completed) is refused.
       startScript = pkgs.writeShellScript "kcore-vm-${vmName}-start" ''
         set -e
+        ${vmmFunctions}
+        adopt() {
+          echo "$2 cloud-hypervisor pid $1"
+          exec ${pkgs.coreutils}/bin/tail --pid="$1" -f /dev/null
+        }
         if [ -f "${liveMigratedMarker}" ]; then
-          if [ ! -f "${migratePidFile}" ]; then
-            echo "ERROR: ${liveMigratedMarker} present but ${migratePidFile} missing"
-            exit 1
-          fi
-          pid="$(${pkgs.coreutils}/bin/cat "${migratePidFile}")"
-          if ! ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null; then
-            echo "ERROR: live-migrated cloud-hypervisor pid $pid is not running"
-            exit 1
-          fi
+          pid="$(${pkgs.coreutils}/bin/cat "${migratePidFile}" 2>/dev/null || true)"
           ${pkgs.coreutils}/bin/rm -f "${liveMigratedMarker}" "${migratePidFile}"
-          echo "Adopting live-migrated cloud-hypervisor pid $pid"
-          exec ${pkgs.coreutils}/bin/tail --pid="$pid" -f /dev/null
+          if [ -n "$pid" ] && ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null; then
+            adopt "$pid" "Adopting live-migrated"
+          fi
+          echo "live-migrated marker present but pid '$pid' is not running; checking the API socket"
         fi
+        other_vmm="$(vmm_pid)"
+        if [ -n "$other_vmm" ]; then
+          state="$(vm_state)"
+          case "$state" in
+            Running | Paused)
+              adopt "$other_vmm" "Adopting already-running (guest $state)"
+              ;;
+            *)
+              echo "ERROR: cloud-hypervisor pid $other_vmm serves ${socketPath} without a running guest (state '$state'); refusing to start a second instance for ${vmName}. Finish or reset the migration, or stop that process explicitly."
+              exit ${toString vmmAlreadyRunningStatus}
+              ;;
+          esac
+        fi
+        ${srcFormatFn}
+        ROOT_FMT="$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})"
         exec ${chBin} ${chArgs}
+      '';
+
+      # Press the ACPI power button, then wait for the VMM to exit. systemd
+      # only waits for (and finally kills) processes inside the unit's cgroup,
+      # and an adopted VMM is not in it: without this wait the unit would be
+      # "stopped" while the guest runs on, and the next start would adopt it
+      # again instead of applying whatever the restart was meant to apply.
+      stopGraceSec = 25;
+      stopScript = pkgs.writeShellScript "kcore-vm-${vmName}-stop" ''
+        ${vmmFunctions}
+        pid="$(vmm_pid)"
+        ${pkgs.curl}/bin/curl -s --max-time 5 --unix-socket ${socketPath} -X PUT http://localhost/api/v1/vm.power-button || true
+        [ -n "$pid" ] || exit 0
+        for _ in $(${pkgs.coreutils}/bin/seq 1 ${toString stopGraceSec}); do
+          ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null || exit 0
+          ${pkgs.coreutils}/bin/sleep 1
+        done
+        echo "guest ${vmName} did not power off within ${toString stopGraceSec}s; terminating cloud-hypervisor pid $pid"
+        ${pkgs.coreutils}/bin/kill -TERM "$pid" 2>/dev/null || true
+        for _ in 1 2 3; do
+          ${pkgs.coreutils}/bin/kill -0 "$pid" 2>/dev/null || exit 0
+          ${pkgs.coreutils}/bin/sleep 1
+        done
+        exit 0
       '';
     in
     {
@@ -309,12 +487,14 @@ let
       requires = map (iface: "${iface.unit}.service") ifaces;
       after = map (iface: "${iface.unit}.service") ifaces;
       wantedBy = lib.optionals (vmCfg.autoStart && !vmCfg.incomingMigration) [ "multi-user.target" ];
-      # A live-migrated CH survives the destination rebuild because the unit is
-      # *new* there: switch-to-configuration only consults
-      # stopIfChanged/restartIfChanged for units that already existed and
-      # changed, so the handoff needs no override here. Leaving the defaults on
-      # keeps VM spec updates (cpu/memory/extraArgs) actually taking effect for
-      # Ceph-backed VMs.
+      # stopIfChanged/restartIfChanged keep their NixOS defaults so VM spec
+      # updates (cpu/memory/extraArgs) take effect for Ceph-backed VMs too. The
+      # destination unit of a live migration already exists (it was pushed
+      # with incomingMigration = true before the receive), so any difference
+      # between that file and the settled one restarts it right after the
+      # handoff: the start script then re-adopts the running VMM instead of
+      # starting a second one, and the stop script sees the guest through to
+      # power-off when a restart really is meant to apply a change.
 
       serviceConfig = {
         Type = "simple";
@@ -322,14 +502,21 @@ let
           "${startPreScript}"
         ];
         ExecStart = "${startScript}";
-        ExecStop = "${pkgs.curl}/bin/curl --unix-socket ${socketPath} -s -X PUT http://localhost/api/v1/vm.power-button";
+        ExecStop = "${stopScript}";
         ExecStopPost = lib.optionalString isCeph "-${cephUnmapScript}";
         TimeoutStopSec = 30;
         # ExecStartPre copies the image onto the volume. The 90s default is
         # shorter than a Windows qcow2 convert, which then fails the unit.
         TimeoutStartSec = "15min";
-        Restart = if vmCfg.autoStart && !vmCfg.incomingMigration then "always" else "no";
+        # Must not depend on incomingMigration: the config that flips a VM from
+        # incoming to settled would otherwise change this unit, and the switch
+        # would restart the unit that just adopted the live-migrated guest.
+        Restart = if vmCfg.autoStart then "always" else "no";
         RestartSec = 5;
+        # "another VMM owns this VM's socket and has nothing to adopt" is not
+        # transient; retrying would keep running the failure path
+        # (ExecStopPost) next to that process every few seconds.
+        RestartPreventExitStatus = toString vmmAlreadyRunningStatus;
 
         Group = "kvm";
         LimitMEMLOCK = "infinity";
@@ -360,6 +547,19 @@ in
     boot.supportedFilesystems = lib.mkIf anyVmUsesZfs [ "zfs" ];
 
     services.lvm.enable = lib.mkIf anyVmUsesLvm true;
+
+    # The node agent spawns the receiving VMM for a live migration itself, so
+    # it must run the exact binary the units use (patched, same build), or the
+    # unit later adopts a process it could not have started.
+    environment.etc."kcore/cloud-hypervisor".text = chBin + "\n";
+    environment.etc."kcore/vm-socket-dir".text = cfg.socketDir + "\n";
+    # Options the controller may only emit once this module version is
+    # installed on the node (an unknown option fails the whole evaluation).
+    # Append here when adding a per-VM option the controller renders.
+    environment.etc."kcore/ch-vm-features".text = ''
+      imageSha256
+      cloudHypervisorPatches
+    '';
 
     systemd.services = lib.mapAttrs' (
       vmName: vmCfg: lib.nameValuePair "kcore-vm-${vmName}" (mkVmService vmName vmCfg)

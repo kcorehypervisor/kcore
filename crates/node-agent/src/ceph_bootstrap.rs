@@ -63,6 +63,10 @@ pub fn encode_package(pkg: &BootstrapPackage) -> Result<Vec<u8>, String> {
     serde_json::to_vec(pkg).map_err(|e| format!("encode bootstrap package: {e}"))
 }
 
+/// Default wall-clock limit for `ceph` / `rados` CLI calls that can hang when
+/// quorum is missing.
+pub const CEPH_CLI_TIMEOUT_SECS: &str = "30";
+
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(program)
         .args(args)
@@ -76,6 +80,47 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Run a program under `timeout(1)` so missing quorum cannot block forever.
+fn run_timeout(secs: &str, program: &str, args: &[&str]) -> Result<String, String> {
+    let mut full = Vec::with_capacity(args.len() + 2);
+    full.push(secs);
+    full.push(program);
+    full.extend_from_slice(args);
+    let out = Command::new("timeout")
+        .args(&full)
+        .output()
+        .map_err(|e| format!("starting timeout {program}: {e}"))?;
+    if !out.status.success() {
+        let code = out.status.code();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if code == Some(124) {
+            return Err(format!(
+                "{program} {} timed out after {secs}s",
+                args.join(" ")
+            ));
+        }
+        return Err(format!("{program} {} failed: {stderr}", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn run_ceph(args: &[&str]) -> Result<String, String> {
+    run_timeout(CEPH_CLI_TIMEOUT_SECS, "ceph", args)
+}
+
+/// Members to put in a *fresh* monmap for `daemon_id`.
+///
+/// The first mon must mkfs with only itself so it can form a single-member
+/// quorum; later members adopt the running map via `ceph mon add`.
+pub fn fresh_monmap_member<'a>(
+    daemon_id: &str,
+    mons: &'a [MonMember],
+) -> Result<&'a MonMember, String> {
+    mons.iter()
+        .find(|m| m.id == daemon_id)
+        .ok_or_else(|| format!("daemon {daemon_id} missing from mon_map"))
 }
 
 /// Generate mon/admin/bootstrap-osd keyrings with `ceph-authtool` (requires Ceph tools).
@@ -207,9 +252,32 @@ pub fn mon_already_initialized(daemon_id: &str) -> bool {
         || Path::new(&mon_data_dir(daemon_id)).join("done").exists()
 }
 
+/// Only the first mon in the spec may create a brand-new single-member
+/// monmap. Any other member that cannot reach a running cluster must fail
+/// instead of founding a second cluster with the same fsid.
+pub fn may_found_cluster(daemon_id: &str, mons: &[MonMember]) -> bool {
+    mons.first().is_some_and(|m| m.id == daemon_id)
+}
+
+/// Both messenger versions, so a mon never joins as v1-only. For `monmaptool
+/// --addv` only: `ceph mon add` rejects this form (its argument parser crashes
+/// on it in Ceph 20) and takes a bare IP, which also means v2 plus v1.
+pub fn mon_addrvec(ip: &str) -> String {
+    format!("[v2:{ip}:3300,v1:{ip}:6789]")
+}
+
+fn saved_monmap_path(daemon_id: &str) -> String {
+    format!("/var/lib/kcore/ceph-monmap-{daemon_id}.bin")
+}
+
 /// A cluster that already has quorum must learn this mon before mkfs.
 /// Building a fresh monmap here gives the new daemon a different epoch, so it
 /// never joins. Returns true when `monmap_path` holds the cluster's map.
+///
+/// The map is fetched *before* `ceph mon add`: going from one mon to two makes
+/// quorum need both, so once the new mon is registered but not yet running no
+/// `ceph` command can answer. The fetched map is kept on disk so a retry after
+/// that point can still mkfs from it.
 fn adopt_running_monmap(
     daemon_id: &str,
     mons: &[MonMember],
@@ -218,42 +286,61 @@ fn adopt_running_monmap(
     let Some(me) = mons.iter().find(|m| m.id == daemon_id) else {
         return Ok(false);
     };
-    let addr = format!("{}:6789", me.addr);
-    let add_ok = match Command::new("timeout")
-        .args(["10", "ceph", "mon", "add", daemon_id, &addr])
-        .output()
-    {
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            out.status.success() || stderr.contains("already")
-        }
-        Err(_) => false,
-    };
-    let get_ok = match Command::new("timeout")
-        .args(["10", "ceph", "mon", "getmap", "-o"])
+    let addr = mon_addrvec(&me.addr);
+    let saved = saved_monmap_path(daemon_id);
+
+    let fetched = match Command::new("timeout")
+        .args(["15", "ceph", "mon", "getmap", "-o"])
         .arg(monmap_path)
         .output()
     {
         Ok(out) => out.status.success() && monmap_path.is_file(),
         Err(_) => false,
     };
-    if add_ok && !get_ok {
+    if fetched {
+        let _ = std::fs::create_dir_all("/var/lib/kcore");
+        std::fs::copy(monmap_path, &saved).map_err(|e| format!("save monmap: {e}"))?;
+    } else if Path::new(&saved).is_file() {
+        std::fs::copy(&saved, monmap_path).map_err(|e| format!("restore saved monmap: {e}"))?;
+    } else if may_found_cluster(daemon_id, mons) {
+        return Ok(false);
+    } else {
         return Err(format!(
-            "registered mon.{daemon_id} with the cluster but could not fetch the monmap"
+            "no running Ceph cluster answered `ceph mon getmap` and mon.{daemon_id} is not the \
+             first mon; refusing to create a second cluster with the same fsid"
         ));
     }
-    if !get_ok {
-        return Ok(false);
+
+    let printed = run(
+        "monmaptool",
+        &["--print", &monmap_path.display().to_string()],
+    )?;
+    if !printed.contains(&format!("mon.{daemon_id}")) {
+        run(
+            "monmaptool",
+            &[
+                "--addv",
+                daemon_id,
+                &addr,
+                &monmap_path.display().to_string(),
+            ],
+        )?;
     }
-    let printed = Command::new("monmaptool")
-        .arg("--print")
-        .arg(monmap_path)
+
+    let out = Command::new("timeout")
+        .args(["20", "ceph", "mon", "add", daemon_id, &me.addr])
         .output()
-        .map_err(|e| format!("monmaptool --print: {e}"))?;
-    let text = String::from_utf8_lossy(&printed.stdout);
-    if !text.contains(&format!("mon.{daemon_id}")) {
+        .map_err(|e| format!("ceph mon add: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let already = stderr.contains("already") || stdout.contains("already");
+    // A hung `mon add` on retry means it was registered earlier and quorum is
+    // waiting for this mon; the saved map is enough to continue.
+    let timed_out = out.status.code() == Some(124);
+    if !out.status.success() && !already && !timed_out {
         return Err(format!(
-            "cluster monmap does not include mon.{daemon_id}; refusing to mkfs a divergent map"
+            "ceph mon add {daemon_id} {} failed: {stderr}",
+            me.addr
         ));
     }
     Ok(true)
@@ -268,21 +355,25 @@ pub fn mkfs_mon(pkg: &BootstrapPackage, daemon_id: &str, mons: &[MonMember]) -> 
     let mon_kr = tmp.path().join("mon.keyring");
     std::fs::write(&mon_kr, &pkg.mon_keyring).map_err(|e| e.to_string())?;
 
-    let mut args: Vec<String> = vec![
-        "--create".into(),
-        "--fsid".into(),
-        pkg.fsid.clone(),
-        "--clobber".into(),
-    ];
-    for m in mons {
-        args.push("--add".into());
-        args.push(m.id.clone());
-        args.push(format!("{}:6789", m.addr));
-    }
-    args.push(monmap.display().to_string());
     if !adopt_running_monmap(daemon_id, mons, &monmap)? {
-        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-        run("monmaptool", &args_ref)?;
+        // First mon: single-member monmap so this daemon can form quorum alone.
+        // Listing every future member here left them as 0.0.0.0 placeholders and
+        // the mon stayed in "probing" forever — blocking ensure_mgr_keyring and
+        // the reconciler loop before peers were ever applied.
+        let me = fresh_monmap_member(daemon_id, mons)?;
+        run(
+            "monmaptool",
+            &[
+                "--create",
+                "--fsid",
+                &pkg.fsid,
+                "--clobber",
+                "--addv",
+                &me.id,
+                &mon_addrvec(&me.addr),
+                &monmap.display().to_string(),
+            ],
+        )?;
     }
 
     let data = mon_data_dir(daemon_id);
@@ -312,24 +403,21 @@ pub fn ensure_mgr_keyring(daemon_id: &str) -> Result<(), String> {
         return Ok(());
     }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Wait briefly for mon quorum after mkfs+start.
+    // Wait briefly for mon quorum after mkfs+start. Each ceph call is bounded.
     for _ in 0..30 {
-        if run(
-            "ceph",
-            &[
-                "auth",
-                "get-or-create",
-                "-o",
-                &keyring,
-                &format!("mgr.{daemon_id}"),
-                "mon",
-                "allow profile mgr",
-                "osd",
-                "allow *",
-                "mds",
-                "allow *",
-            ],
-        )
+        if run_ceph(&[
+            "auth",
+            "get-or-create",
+            "-o",
+            &keyring,
+            &format!("mgr.{daemon_id}"),
+            "mon",
+            "allow profile mgr",
+            "osd",
+            "allow *",
+            "mds",
+            "allow *",
+        ])
         .is_ok()
         {
             let _ = run("chown", &["-R", "ceph:ceph", &dir]);
@@ -495,9 +583,75 @@ pub fn parse_osd_counters(json: &serde_json::Value) -> (i32, i32) {
     (up, inn)
 }
 
+/// `ceph osd ls-tree <host> -f json`: a JSON array of OSD ids.
+pub fn parse_osd_ls_tree(stdout: &str) -> Result<Vec<String>, String> {
+    let ids: Vec<serde_json::Value> =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("osd ls-tree json: {e}"))?;
+    ids.iter()
+        .map(|v| match v {
+            serde_json::Value::Number(n) => Ok(n.to_string()),
+            serde_json::Value::String(s) => Ok(s.clone()),
+            other => Err(format!("unexpected osd id {other}")),
+        })
+        .collect()
+}
+
+/// Placement-group totals from `ceph -s --format json`: `(total, not active+clean)`.
+///
+/// Anything other than exactly `active+clean` (degraded, undersized,
+/// remapped, backfilling, peering...) still depends on an OSD somewhere, so
+/// a host whose OSDs were marked out is only free once this reaches zero.
+pub fn parse_pg_clean(json: &serde_json::Value) -> (i32, i32) {
+    let total = json
+        .pointer("/pgmap/num_pgs")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let clean = json
+        .pointer("/pgmap/pgs_by_state")
+        .and_then(|v| v.as_array())
+        .map(|states| {
+            states
+                .iter()
+                .filter(|s| s.get("state_name").and_then(|n| n.as_str()) == Some("active+clean"))
+                .filter_map(|s| s.get("count").and_then(|c| c.as_i64()))
+                .sum::<i64>()
+        })
+        .unwrap_or(0) as i32;
+    (total, (total - clean).max(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osd_ls_tree_accepts_numbers_and_strings() {
+        assert_eq!(parse_osd_ls_tree("[0,2]\n").unwrap(), vec!["0", "2"]);
+        assert_eq!(parse_osd_ls_tree("[]").unwrap(), Vec::<String>::new());
+        assert!(parse_osd_ls_tree("Error ENOENT").is_err());
+        assert!(parse_osd_ls_tree("[{}]").is_err());
+    }
+
+    #[test]
+    fn pg_clean_counts_only_active_clean() {
+        let json: serde_json::Value = serde_json::json!({
+            "pgmap": {
+                "num_pgs": 129,
+                "pgs_by_state": [
+                    {"state_name": "active+clean", "count": 100},
+                    {"state_name": "active+undersized+degraded", "count": 20},
+                    {"state_name": "active+remapped+backfilling", "count": 9}
+                ]
+            }
+        });
+        assert_eq!(parse_pg_clean(&json), (129, 29));
+        let json: serde_json::Value = serde_json::json!({
+            "pgmap": {"num_pgs": 33, "pgs_by_state": [{"state_name": "active+clean", "count": 33}]}
+        });
+        assert_eq!(parse_pg_clean(&json), (33, 0));
+        // No PGs at all (fresh cluster with no pools) counts as clean.
+        assert_eq!(parse_pg_clean(&serde_json::json!({})), (0, 0));
+    }
 
     #[test]
     fn parse_mon_map_strips_ports() {
@@ -512,6 +666,34 @@ mod tests {
     fn parse_mon_map_rejects_empty() {
         assert!(parse_mon_map("").is_err());
         assert!(parse_mon_map("bad").is_err());
+    }
+
+    #[test]
+    fn mon_addrvec_carries_both_messenger_versions() {
+        assert_eq!(
+            mon_addrvec("10.0.0.1"),
+            "[v2:10.0.0.1:3300,v1:10.0.0.1:6789]"
+        );
+    }
+
+    #[test]
+    fn only_the_first_mon_may_found_a_cluster() {
+        let mons = parse_mon_map("dell-1=10.10.0.11,dell-2=10.10.0.12,dell-3=10.10.0.13").unwrap();
+        assert!(may_found_cluster("dell-1", &mons));
+        assert!(!may_found_cluster("dell-2", &mons));
+        assert!(!may_found_cluster("dell-3", &mons));
+        assert!(!may_found_cluster("dell-1", &[]));
+    }
+
+    #[test]
+    fn fresh_monmap_member_is_only_the_local_daemon() {
+        let mons = parse_mon_map("dell-1=10.10.0.11,dell-2=10.10.0.12,dell-3=10.10.0.13").unwrap();
+        let me = fresh_monmap_member("dell-2", &mons).unwrap();
+        assert_eq!(me.id, "dell-2");
+        assert_eq!(me.addr, "10.10.0.12");
+        // First-mon path must never expand to the full membership list.
+        assert_eq!(fresh_monmap_member("dell-1", &mons).unwrap().id, "dell-1");
+        assert!(fresh_monmap_member("missing", &mons).is_err());
     }
 
     #[test]

@@ -132,6 +132,8 @@ pub fn grow_script(serial: &str) -> String {
     let serial = serial.replace('\'', "");
     format!(
         r#"set -euo pipefail
+SUDO=""
+[ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
 SERIAL='{serial}'
 LINE=$(lsblk -bno NAME,SIZE,SERIAL,TYPE | awk -v s="$SERIAL" '$3==s || $3==("virtio-" s) {{print; if ($4=="disk") exit}}')
 NAME=$(echo "$LINE" | awk '{{print $1}}')
@@ -143,14 +145,16 @@ TARGET="$DEV"
 if [ -n "${{PART:-}}" ]; then
   TARGET="/dev/$PART"
   if command -v growpart >/dev/null 2>&1; then
-    growpart "$DEV" 1 || true
+    $SUDO growpart "$DEV" 1 || true
   fi
 fi
-if command -v resize2fs >/dev/null 2>&1 && blkid -o value -s TYPE "$TARGET" 2>/dev/null | grep -Eq 'ext[234]'; then
-  resize2fs "$TARGET"
-elif command -v xfs_growfs >/dev/null 2>&1 && blkid -o value -s TYPE "$TARGET" 2>/dev/null | grep -q xfs; then
+if command -v resize2fs >/dev/null 2>&1 && $SUDO blkid -o value -s TYPE "$TARGET" 2>/dev/null | grep -Eq 'ext[234]'; then
+  # resize2fs refuses an unmounted filesystem that has not been checked since its last mount.
+  if ! findmnt -n "$TARGET" >/dev/null 2>&1; then $SUDO e2fsck -fp "$TARGET" >/dev/null 2>&1 || true; fi
+  $SUDO resize2fs "$TARGET"
+elif command -v xfs_growfs >/dev/null 2>&1 && $SUDO blkid -o value -s TYPE "$TARGET" 2>/dev/null | grep -q xfs; then
   MP=$(findmnt -n -o TARGET "$TARGET" 2>/dev/null || true)
-  if [ -n "$MP" ]; then xfs_growfs "$MP"; fi
+  if [ -n "$MP" ]; then $SUDO xfs_growfs "$MP"; fi
 fi
 lsblk -bno SIZE,SERIAL,TYPE | awk -v s="$SERIAL" '$2==s || $2==("virtio-" s) {{ if ($3=="disk") {{print $1; exit}} }}'
 "#
@@ -160,9 +164,9 @@ lsblk -bno SIZE,SERIAL,TYPE | awk -v s="$SERIAL" '$2==s || $2==("virtio-" s) {{ 
 /// Remote shell snippet: quiesce or release the guest root filesystem via `fsfreeze`.
 pub fn fsfreeze_script(freeze: bool) -> &'static str {
     if freeze {
-        "set -euo pipefail; command -v fsfreeze >/dev/null; fsfreeze --freeze /"
+        "set -euo pipefail; command -v fsfreeze >/dev/null; if [ \"$(id -u)\" -ne 0 ]; then sudo -n fsfreeze --freeze /; else fsfreeze --freeze /; fi"
     } else {
-        "set -euo pipefail; command -v fsfreeze >/dev/null; fsfreeze --unfreeze /"
+        "set -euo pipefail; command -v fsfreeze >/dev/null; if [ \"$(id -u)\" -ne 0 ]; then sudo -n fsfreeze --unfreeze /; else fsfreeze --unfreeze /; fi"
     }
 }
 
@@ -259,12 +263,14 @@ vdb1 107374182400 abcdef012345 part
         let s = grow_script("abc123");
         assert!(s.contains("abc123"));
         assert!(s.contains("growpart") || s.contains("resize2fs"));
+        assert!(s.contains("e2fsck -fp"));
     }
 
     #[test]
     fn fsfreeze_script_uses_root_mount() {
         assert!(fsfreeze_script(true).contains("fsfreeze --freeze /"));
         assert!(fsfreeze_script(false).contains("fsfreeze --unfreeze /"));
+        assert!(fsfreeze_script(true).contains("sudo -n fsfreeze"));
     }
 
     #[tokio::test]

@@ -16,6 +16,8 @@ Connection defaults:
 - Controller default port: `9090`
 - Node-agent default port: `9091`
 - Controller PKI HTTP listener (CRL and OCSP, plain HTTP): `9092`
+- Host metrics (`node_exporter`) on every node: `9100` (source-restricted firewall)
+- VictoriaMetrics on controller nodes: `8428` (PromQL / vmui); see [host-metrics.md](./host-metrics.md)
 - Default cert dir: `~/.kcore/certs`
 
 ## 2) Initialize cluster PKI and context
