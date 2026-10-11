@@ -61,6 +61,7 @@ let
   cfg = eval.config;
   cephUnit = cfg.systemd.services."kcore-vm-ceph-guest";
   lvmUnit = cfg.systemd.services."kcore-vm-lvm-guest";
+  fwUnit = cfg.systemd.services."kcore-firewall-default";
   chBin = lib.removeSuffix "\n" cfg.environment.etc."kcore/cloud-hypervisor".text;
   unpatched = "${pkgs.cloud-hypervisor}/bin/cloud-hypervisor";
 in
@@ -83,6 +84,18 @@ assert cfg.networking.nftables.enable;
 assert !cfg.networking.nftables.flushRuleset;
 assert cfg.networking.nftables.ruleset == "";
 assert cfg.networking.nftables.rulesetFile == null;
+# Those tables belong to a unit of their own: applied as one `nft -f`
+# transaction, reloaded (not stopped) on rule changes, deleted only when the
+# network goes away. The bridge unit never restarts, so it must not own them.
+assert fwUnit.reloadIfChanged;
+assert fwUnit.serviceConfig.RemainAfterExit;
+assert lib.hasSuffix "-kcore-firewall-default.nft" fwUnit.serviceConfig.ExecStart;
+assert fwUnit.serviceConfig.ExecReload == fwUnit.serviceConfig.ExecStart;
+assert lib.elem "kcore-bridge-default.service" fwUnit.requires;
+assert lib.hasInfix "nft delete table ip kcore-default" fwUnit.preStop;
+assert !(lib.hasInfix "nft " cfg.systemd.services."kcore-bridge-default".script);
+assert !(lib.hasInfix "nft " cfg.systemd.services."kcore-bridge-default".preStop);
+assert !cfg.systemd.services."kcore-bridge-default".restartIfChanged;
 # Setting cloudHypervisorPatches = [] must hand back the stock package.
 assert
   (nixosSystem {
