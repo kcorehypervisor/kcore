@@ -141,6 +141,26 @@ async fn main() -> anyhow::Result<()> {
         cfg.tls.clone(),
         &cfg.listen_addr,
     );
+    {
+        let db = database.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                ticker.tick().await;
+                let db = db.clone();
+                match tokio::task::spawn_blocking(move || {
+                    db.prune_replication_outbox(3600, 7 * 86400)
+                })
+                .await
+                {
+                    Ok(Ok(n)) if n > 0 => tracing::info!(removed = n, "pruned replication outbox"),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(error = %e, "replication outbox prune failed"),
+                    Err(e) => tracing::warn!(error = %e, "replication outbox prune join failed"),
+                }
+            }
+        });
+    }
     replication::spawn_compensation_executor(database.clone());
     replication::spawn_head_materializer(database.clone());
     replication::spawn_reservation_retry_executor(database.clone());
