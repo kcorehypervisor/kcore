@@ -10291,6 +10291,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "detach the volume before deleting it",
             ));
         }
+        let snapshots = self
+            .db
+            .list_volume_snapshots(Some(&row.id))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !snapshots.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "volume '{}' still has {} snapshot(s); delete them first (kctl delete volume-snapshot)",
+                row.name,
+                snapshots.len()
+            )));
+        }
         let node = self
             .pick_healthy_ceph_node()
             .await
