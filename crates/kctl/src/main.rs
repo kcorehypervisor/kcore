@@ -175,6 +175,11 @@ enum Command {
         #[command(subcommand)]
         action: NodeAction,
     },
+    /// Kubernetes cluster management
+    Kubernetes {
+        #[command(subcommand)]
+        action: KubernetesAction,
+    },
     /// Pull a resource
     Pull {
         #[command(subcommand)]
@@ -1209,6 +1214,50 @@ pub enum OperatorRoleArg {
     VmAdmin,
     #[value(name = "cluster-admin")]
     ClusterAdmin,
+}
+
+#[derive(Subcommand)]
+enum KubernetesAction {
+    /// Apply a Kubernetes cluster manifest from file
+    Apply {
+        /// YAML manifest file
+        #[arg(short = 'f', long)]
+        file: String,
+    },
+    /// Get a Kubernetes cluster
+    Get {
+        /// Cluster name
+        name: String,
+    },
+    /// List all Kubernetes clusters
+    List,
+    /// Delete a Kubernetes cluster
+    Delete {
+        /// Cluster name
+        name: String,
+        /// Force delete even if nodes are unreachable
+        #[arg(long)]
+        force: bool,
+    },
+    /// Get cluster health status
+    Health {
+        /// Cluster name
+        name: String,
+    },
+    /// Scale a Kubernetes cluster (add/remove nodes)
+    Scale {
+        /// Cluster name
+        name: String,
+        /// Add control plane nodes (node IDs, comma-separated)
+        #[arg(long = "add-control-plane")]
+        add_control_plane: Option<String>,
+        /// Add worker nodes (node IDs, comma-separated)
+        #[arg(long = "add-workers")]
+        add_workers: Option<String>,
+        /// Remove nodes (node IDs, comma-separated)
+        #[arg(long = "remove")]
+        remove: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2398,6 +2447,66 @@ async fn main() {
         } => {
             let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
             commands::image::pull(&info, uri, sha256.as_deref()).await
+        }
+
+        Command::Kubernetes {
+            action: KubernetesAction::Apply { file },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::apply_from_file(&info, file).await
+        }
+
+        Command::Kubernetes {
+            action: KubernetesAction::Get { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::get(&info, name).await
+        }
+
+        Command::Kubernetes {
+            action: KubernetesAction::List,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::list(&info).await
+        }
+
+        Command::Kubernetes {
+            action: KubernetesAction::Delete { name, force },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::delete(&info, name, *force).await
+        }
+
+        Command::Kubernetes {
+            action: KubernetesAction::Health { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::health(&info, name).await
+        }
+
+        Command::Kubernetes {
+            action:
+                KubernetesAction::Scale {
+                    name,
+                    add_control_plane,
+                    add_workers,
+                    remove,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            let add_cp = add_control_plane
+                .clone()
+                .map(|s| s.split(',').map(String::from).collect())
+                .unwrap_or_default();
+            let add_wk = add_workers
+                .clone()
+                .map(|s| s.split(',').map(String::from).collect())
+                .unwrap_or_default();
+            let rem = remove
+                .clone()
+                .map(|s| s.split(',').map(String::from).collect())
+                .unwrap_or_default();
+            commands::kubernetes::scale(&info, name, add_cp, add_wk, rem).await
         }
 
         Command::SshKey {
