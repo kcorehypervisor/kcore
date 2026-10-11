@@ -95,24 +95,42 @@ pub fn list_pager_named(
     let extras_owned: Vec<(String, String)> = extra.to_vec();
     let page_size_u = page_size;
 
-    let prev_link = if has_prev {
-        view! { <a href=prev_href>"← Previous"</a> }.into_any()
-    } else {
-        view! { <span></span> }.into_any()
-    };
-    let next_link = if has_next {
-        view! { <a href=next_href>"Next →"</a> }.into_any()
-    } else {
-        view! { <span></span> }.into_any()
+    // Avoid empty placeholder nodes so flex `gap` does not leave a hole
+    // when Previous or Next is absent.
+    let nav = match (has_prev, has_next) {
+        (true, true) => view! {
+            <div class="pager-nav">
+                <a href=prev_href>"← Previous"</a>
+                <span class="muted">{summary.clone()}</span>
+                <a href=next_href>"Next →"</a>
+            </div>
+        }
+        .into_any(),
+        (true, false) => view! {
+            <div class="pager-nav">
+                <a href=prev_href>"← Previous"</a>
+                <span class="muted">{summary.clone()}</span>
+            </div>
+        }
+        .into_any(),
+        (false, true) => view! {
+            <div class="pager-nav">
+                <span class="muted">{summary.clone()}</span>
+                <a href=next_href>"Next →"</a>
+            </div>
+        }
+        .into_any(),
+        (false, false) => view! {
+            <div class="pager-nav">
+                <span class="muted">{summary.clone()}</span>
+            </div>
+        }
+        .into_any(),
     };
 
     view! {
         <div class="pager">
-            <div class="pager-nav">
-                {prev_link}
-                <span class="muted">{summary}</span>
-                {next_link}
-            </div>
+            {nav}
             <form class="pager-size" method="get" action=path_owned>
                 {extras_owned
                     .into_iter()
