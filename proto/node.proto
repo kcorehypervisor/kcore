@@ -207,6 +207,11 @@ service NodeAdmin {
   // reloads its listener. The private key never leaves the node. A failure
   // leaves the previous certificate in place and serving.
   rpc RotateNodeCert(RotateNodeCertRequest) returns (RotateNodeCertResponse);
+  
+  // Kubernetes configuration management
+  rpc ApplyKubernetesConfig(ApplyKubernetesConfigRequest) returns (ApplyKubernetesConfigResponse);
+  rpc GetKubernetesStatus(GetKubernetesStatusRequest) returns (GetKubernetesStatusResponse);
+  rpc DrainKubernetesNode(DrainKubernetesNodeRequest) returns (DrainKubernetesNodeResponse);
 }
 
 // VM specification
@@ -1413,5 +1418,67 @@ message HotRemoveDiskRequest {
 
 message HotRemoveDiskResponse {
   bool success = 1;
+  string message = 2;
+}
+
+// ============================================================================
+// Kubernetes Node Configuration
+// ============================================================================
+
+message CiliumConfig {
+  string mode = 1;
+  int32 mtu = 2;
+  string tunnel = 3;
+  bool auto_direct_node_routes = 4;
+  bool nat_outgoing = 5;
+  repeated string load_balancer_ip_pools = 6;
+}
+
+message ApplyKubernetesConfigRequest {
+  string role = 1;                  // "control-plane" or "worker"
+  string cluster_name = 2;
+  string cluster_cidr = 3;
+  string service_cidr = 4;
+  string cluster_dns = 5;
+  string advertise_address = 6;
+  string iface = 7;
+  string api_server_endpoint = 8;
+  bool initial_cluster = 9;
+  string cni = 10;                  // "cilium"
+  CiliumConfig cilium_config = 11;
+  string etcd_initial_cluster = 12;
+  bool ha_enabled = 13;
+  string vip_address = 14;
+  string vip_interface = 15;
+  bytes kubeconfig_data = 16;
+}
+
+message ApplyKubernetesConfigResponse {
+  string apply_id = 1;
+  string status = 2;                // "started", "completed", "failed"
+  string message = 3;
+}
+
+message GetKubernetesStatusRequest {}
+
+message GetKubernetesStatusResponse {
+  bool enabled = 1;
+  string role = 2;
+  bool kubelet_active = 3;
+  bool api_server_active = 4;
+  bool etcd_active = 5;
+  bool cilium_node_active = 6;
+  string node_status = 7;
+  int32 running_pods = 8;
+}
+
+message DrainKubernetesNodeRequest {
+  bool delete_emptydir_data = 1;
+  bool ignore_daemonsets = 2;
+  int32 timeout_seconds = 3;
+}
+
+message DrainKubernetesNodeResponse {
+  string status = 1;
   string message = 2;
 }
