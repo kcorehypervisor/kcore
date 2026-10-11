@@ -90,9 +90,33 @@ let
         }
       '';
 
+      # Runs right before every qemu-img convert onto a volume. The node agent
+      # hashes the download once; this catches a cached file that changed
+      # since (bit rot, a partial re-download, an operator swapping files).
+      verifySourceFn = ''
+        verify_source() {
+          ${
+            if vmCfg.imageSha256 != null then
+              ''
+                local expected actual
+                expected="$(echo "${vmCfg.imageSha256}" | ${pkgs.coreutils}/bin/tr 'A-F' 'a-f')"
+                echo "Verifying $1 against sha256 $expected..."
+                actual="$(${pkgs.coreutils}/bin/sha256sum "$1" | ${pkgs.coreutils}/bin/cut -d' ' -f1)"
+                if [ "$actual" != "$expected" ]; then
+                  echo "ERROR: source image $1 has sha256 $actual, expected $expected; refusing to seed ${vmName} from it"
+                  exit 1
+                fi
+              ''
+            else
+              "true"
+          }
+        }
+      '';
+
       lvmProvisionScript = pkgs.writeShellScript "lvm-provision-${vmName}" ''
         set -e
         ${srcFormatFn}
+        ${verifySourceFn}
         LV_DEVICE="${lvDevice}"
         VG="${cfg.lvmVgName}"
         LV="${lvName}"
@@ -105,6 +129,7 @@ let
           rm -f "$SEED_MARKER"
         fi
         if [ ! -f "$SEED_MARKER" ]; then
+          verify_source ${toString vmCfg.image}
           echo "Converting source image to LV..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
             -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
@@ -120,6 +145,7 @@ let
       zfsProvisionScript = pkgs.writeShellScript "zfs-provision-${vmName}" ''
         set -e
         ${srcFormatFn}
+        ${verifySourceFn}
         ZVOL_DATASET="${zvolDataset}"
         ZVOL_DEVICE="${zvolDevice}"
         SIZE_BYTES="${toString vmCfg.storageSizeBytes}"
@@ -139,6 +165,7 @@ let
           rm -f "$SEED_MARKER"
         fi
         if [ ! -f "$SEED_MARKER" ]; then
+          verify_source ${toString vmCfg.image}
           echo "Converting source image to zvol..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
             -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
@@ -167,6 +194,7 @@ let
       cephMapScript = pkgs.writeShellScript "ceph-map-${vmName}" ''
         set -e
         ${srcFormatFn}
+        ${verifySourceFn}
         ${rbdNbdFunctions}
         map_one() {
           local IMAGE="$1"
@@ -206,6 +234,7 @@ let
         fi
         if [ "$SEEDED" -eq 0 ]; then
           test -e "$SOURCE" || { echo "missing source image: $SOURCE"; exit 1; }
+          verify_source "$SOURCE"
           echo "Seeding RBD $IMAGE from $SOURCE..."
           ${pkgs.qemu-utils}/bin/qemu-img convert \
             -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \

@@ -138,6 +138,17 @@ let
         description = "Path to the VM disk image.";
       };
 
+      imageSha256 = lib.mkOption {
+        type = lib.types.nullOr (lib.types.strMatching "[0-9a-fA-F]{64}");
+        default = null;
+        description = ''
+          Expected SHA-256 of `image`. Block backends (lvm, zfs, ceph) hash the
+          source right before seeding the volume and refuse to seed on a
+          mismatch, so a cached image that was corrupted or swapped after
+          download never reaches a disk. Null skips the check.
+        '';
+      };
+
       imageFormat = lib.mkOption {
         type = lib.types.enum [
           "raw"
