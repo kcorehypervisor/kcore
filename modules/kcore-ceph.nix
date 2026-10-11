@@ -205,10 +205,10 @@ in
     services.ceph = {
       enable = true;
       global = {
-        fsid = cfg.fsid;
-        clusterName = cfg.clusterName;
-        publicNetwork = cfg.publicNetwork;
-        clusterNetwork = cfg.clusterNetwork;
+        inherit (cfg) fsid;
+        inherit (cfg) clusterName;
+        inherit (cfg) publicNetwork;
+        inherit (cfg) clusterNetwork;
         monHost = cfg.monAddress;
         monInitialMembers = if cfg.monInitialMembers == "" then null else cfg.monInitialMembers;
       };

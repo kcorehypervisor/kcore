@@ -169,12 +169,12 @@
             disko-module = import ./tests/disko-module.nix { inherit pkgs; };
             ceph-module-eval = import ./tests/ceph-module-eval.nix {
               inherit pkgs;
-              lib = pkgs.lib;
+              inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
             ch-vm-module-eval = import ./tests/ch-vm-module-eval.nix {
               inherit pkgs;
-              lib = pkgs.lib;
+              inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
             fmt-nix =
@@ -254,7 +254,7 @@
             let
               # Shared by the ISO and the netboot image; media-specific options live in
               # the per-target modules below.
-              kcoreInstallerModule = (
+              kcoreInstallerModule =
                 {
                   pkgs,
                   lib,
@@ -1518,17 +1518,14 @@
                     ];
                     mode = "0644";
                   };
-                }
-              );
-
-              kcoreIsoModule =
-                { ... }:
-                {
-                  isoImage.volumeID = "KCORE";
-                  isoImage.makeUsbBootable = true;
-                  isoImage.makeEfiBootable = true;
-                  image.fileName = "kcoreos-${kcoreVersion}-x86_64-linux.iso";
                 };
+
+              kcoreIsoModule = _: {
+                isoImage.volumeID = "KCORE";
+                isoImage.makeUsbBootable = true;
+                isoImage.makeEfiBootable = true;
+                image.fileName = "kcoreos-${kcoreVersion}-x86_64-linux.iso";
+              };
 
               # PXE / UEFI HTTP Boot: kernel + one initrd that embeds the squashfs nix store
               # (the ISO initrd looks for it on a LABEL=KCORE volume, which a network boot

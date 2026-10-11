@@ -19,7 +19,7 @@ rec {
     let
       primary = {
         index = 0;
-        network = vmCfg.network;
+        inherit (vmCfg) network;
         macAddress = if vmCfg.macAddress != null then vmCfg.macAddress else generateMac vmName;
         ipv4 = vmCfg.dhcpReservedIPv4;
         ipv6 = vmCfg.dhcpReservedIPv6;
@@ -33,11 +33,11 @@ rec {
           salt = "${vmName}#${toString index}";
         in
         {
-          index = index;
-          network = nic.network;
+          inherit index;
+          inherit (nic) network;
           macAddress = if nic.macAddress != null then nic.macAddress else generateMac salt;
-          ipv4 = nic.ipv4;
-          ipv6 = nic.ipv6;
+          inherit (nic) ipv4;
+          inherit (nic) ipv6;
           tap = tapName salt;
           unit = "kcore-tap-${vmName}-${toString index}";
         }

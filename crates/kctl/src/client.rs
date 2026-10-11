@@ -28,12 +28,12 @@ fn tls_domain_name_for_endpoint(address: &str, info: &ConnectionInfo) -> Option<
 }
 
 pub mod controller_proto {
-    #![allow(clippy::result_large_err)]
+    #![allow(clippy::result_large_err, clippy::double_must_use)]
     tonic::include_proto!("kcore.controller");
 }
 
 pub mod node_proto {
-    #![allow(clippy::result_large_err)]
+    #![allow(clippy::result_large_err, clippy::double_must_use)]
     tonic::include_proto!("kcore.node");
 }
 
