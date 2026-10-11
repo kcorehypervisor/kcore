@@ -140,12 +140,6 @@ let
   natVmConfigsForNetwork =
     netName: lib.filterAttrs (_: vmCfg: vmCfg.network == netName) cfg.virtualMachines;
 
-  vmsUsingNetwork =
-    netName:
-    lib.filterAttrs (
-      _: vmCfg: vmCfg.network == netName || lib.any (nic: nic.network == netName) vmCfg.extraNics
-    ) cfg.virtualMachines;
-
   interfacesOnNetwork =
     netName:
     lib.concatLists (
@@ -250,9 +244,11 @@ in
         lib.nameValuePair "kcore-bridge-${netName}" {
           description = "kcore bridge for network ${netName}";
           wantedBy = [ "multi-user.target" ];
-          before = lib.mapAttrsToList (vmName: _vmCfg: "kcore-vm-${vmName}.service") (
-            vmsUsingNetwork netName
-          );
+          # The bridge must never be restarted by a config switch: stopping it
+          # takes down every tap and VM on the network. Ordering against VMs
+          # comes from their tap units (`after` the bridge), so this unit does
+          # not list VMs and stays byte-identical when VMs are added.
+          restartIfChanged = false;
 
           serviceConfig = {
             Type = "oneshot";
