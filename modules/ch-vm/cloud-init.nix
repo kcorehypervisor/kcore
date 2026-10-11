@@ -63,9 +63,28 @@ let
   mkSeedIso =
     vmName: vmCfg:
     let
-      guestOpsPart = pkgs.writeText "${vmName}-guest-ops-part.yaml" (
-        "#cloud-config\nusers:\n  - name: kcore\n    gecos: kcore GuestOps\n    groups: [sudo]\n    shell: /bin/bash\n    lock_passwd: true\n    ssh_authorized_keys:\n"
-        + lib.concatMapStrings (k: "      - ${builtins.toJSON k}\n") vmCfg.cloudInitGuestOpsKeys
+      # A shell-script part, not a second `users:` entry: cloud-init ignores a
+      # repeated user name, so keys for a `kcore` user the operator already
+      # defined would be dropped.
+      guestOpsPart = pkgs.writeText "${vmName}-guest-ops-part.sh" (
+        ''
+          #!/bin/sh
+          u=kcore
+          id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo "$u" || exit 0
+          home="$(getent passwd "$u" | cut -d: -f6)"
+          install -d -m 700 -o "$u" -g "$u" "$home/.ssh"
+          f="$home/.ssh/authorized_keys"
+          touch "$f"
+          while IFS= read -r k; do
+            [ -n "$k" ] && { grep -qxF "$k" "$f" || printf '%s\n' "$k" >> "$f"; }
+          done <<'KCORE_KEYS'
+        ''
+        + lib.concatMapStrings (k: "${k}\n") vmCfg.cloudInitGuestOpsKeys
+        + ''
+          KCORE_KEYS
+          chown "$u:$u" "$f"
+          chmod 600 "$f"
+        ''
       );
       mergedUserData = pkgs.runCommand "${vmName}-user-data-mime" { } ''
         boundary="==KCORE-USER-DATA=="
@@ -73,7 +92,7 @@ let
           printf 'Content-Type: multipart/mixed; boundary="%s"\nMIME-Version: 1.0\n\n' "$boundary"
           printf -- '--%s\nContent-Type: text/cloud-config; charset="utf-8"\nMIME-Version: 1.0\n\n' "$boundary"
           cat ${vmCfg.cloudInitUserConfigFile}
-          printf '\n--%s\nContent-Type: text/cloud-config; charset="utf-8"\nMIME-Version: 1.0\nMerge-Type: list(append)+dict(recurse_array)+str()\n\n' "$boundary"
+          printf '\n--%s\nContent-Type: text/x-shellscript; charset="utf-8"\nMIME-Version: 1.0\n\n' "$boundary"
           cat ${guestOpsPart}
           printf '\n--%s--\n' "$boundary"
         } > "$out"
