@@ -1158,6 +1158,7 @@ impl ControllerService {
                                     rbd_device: format!("{}/{}", key.pool, key.image),
                                     dek: key.dek,
                                     mapper_name: key.mapper_name,
+                                    resize: false,
                                 })
                                 .await;
                         }
@@ -1726,6 +1727,40 @@ impl ControllerService {
         Ok(())
     }
 
+    /// After `rbd resize`, grow the LUKS mapper on the node that has it open.
+    async fn grow_encrypted_mapper(&self, vol: &VolumeRow) -> Result<(), Status> {
+        let vm = self
+            .db
+            .get_vm(&vol.vm_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("attached VM missing"))?;
+        let node = self
+            .db
+            .get_node(&vm.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("storage client unavailable"))?;
+        let keys = self.encrypted_volume_keys_for_vols(std::slice::from_ref(vol))?;
+        for key in keys {
+            storage
+                .unlock_encrypted_volume(node_proto::UnlockEncryptedVolumeRequest {
+                    rbd_device: format!("{}/{}", key.pool, key.image),
+                    dek: key.dek,
+                    mapper_name: key.mapper_name,
+                    resize: true,
+                })
+                .await
+                .map_err(|e| Status::internal(format!("grow LUKS mapper: {e}")))?;
+        }
+        Ok(())
+    }
+
     async fn hotplug_add_volume_disk(&self, vm: &VmRow, vol: &VolumeRow) -> Result<(), Status> {
         let node = self
             .db
@@ -1748,6 +1783,7 @@ impl ControllerService {
                             rbd_device: format!("{}/{}", key.pool, key.image),
                             dek: key.dek,
                             mapper_name: key.mapper_name,
+                            resize: false,
                         })
                         .await
                         .map_err(|e| Status::internal(format!("unlock for hotplug: {e}")))?;
@@ -10921,6 +10957,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.db
             .upsert_volume(&vol)
             .map_err(|e| Status::internal(e.to_string()))?;
+        if vol.encrypted && !vol.vm_id.is_empty() {
+            if let Err(e) = self.grow_encrypted_mapper(&vol).await {
+                if !op_id.is_empty() {
+                    let _ = self.db.update_vm_operation_phase(
+                        &op_id,
+                        VmOperationRow::PHASE_FAILED,
+                        None,
+                        None,
+                        true,
+                    );
+                }
+                return Err(e);
+            }
+        }
         if !op_id.is_empty() {
             let _ = self.db.update_vm_operation_phase(
                 &op_id,
