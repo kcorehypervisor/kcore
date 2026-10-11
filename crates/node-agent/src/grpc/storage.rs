@@ -213,6 +213,9 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         let req = request.into_inner();
         let mapper = tokio::task::spawn_blocking(move || {
             let rbd = resolve_rbd_device(&req.rbd_device)?;
+            if req.resize {
+                crate::volume_crypto::resize(&req.mapper_name, &req.dek)?;
+            }
             crate::volume_crypto::open(&rbd, &req.dek, &req.mapper_name)
         })
         .await

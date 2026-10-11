@@ -89,6 +89,17 @@ pub fn open(rbd_device: &str, dek: &[u8], mapper_name: &str) -> Result<String, S
     Ok(mapped)
 }
 
+/// Grow an open mapper to the size of its backing device after `rbd resize`.
+pub fn resize(mapper_name: &str, dek: &[u8]) -> Result<(), String> {
+    validate_mapper_name(mapper_name)?;
+    if !std::path::Path::new(&mapper_path(mapper_name)).exists() {
+        return Ok(());
+    }
+    let key = write_keyfile(dek)?;
+    let key_path = key.path().to_str().unwrap_or("");
+    run_cryptsetup(&["resize", "--key-file", key_path, mapper_name.trim()])
+}
+
 pub fn close(mapper_name: &str) -> Result<(), String> {
     validate_mapper_name(mapper_name)?;
     let mapped = mapper_path(mapper_name);

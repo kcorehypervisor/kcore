@@ -561,6 +561,9 @@ message UnlockEncryptedVolumeRequest {
   string rbd_device = 1;
   bytes dek = 2;
   string mapper_name = 3;
+  // When the mapper is already open, grow it to the current backing size
+  // (`cryptsetup resize`) instead of leaving it untouched.
+  bool resize = 4;
 }
 
 message UnlockEncryptedVolumeResponse {
