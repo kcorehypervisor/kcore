@@ -150,6 +150,15 @@ fn backing_nbd(mapper_name: &str) -> Option<String> {
     name.starts_with("nbd").then(|| format!("/dev/{name}"))
 }
 
+/// `cryptsetup close` without touching the nbd underneath (the caller owns it).
+pub fn close_mapper_only(mapper_name: &str) -> Result<(), String> {
+    validate_mapper_name(mapper_name)?;
+    if !std::path::Path::new(&mapper_path(mapper_name)).exists() {
+        return Ok(());
+    }
+    run_cryptsetup(&["close", mapper_name.trim()])
+}
+
 /// Close the mapper and release the nbd it was holding mapped.
 pub fn close(mapper_name: &str) -> Result<(), String> {
     validate_mapper_name(mapper_name)?;
