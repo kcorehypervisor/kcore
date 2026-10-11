@@ -271,6 +271,16 @@ pub fn generate_node_config_inner(
             "      imageFormat = \"{}\";\n",
             nix_escape(&vm.image_format)
         ));
+        // The provision scripts re-hash the cached image right before seeding.
+        // Only a well-formed digest is emitted; anything else would fail the
+        // module's strMatching type and take the whole config down with it.
+        let sha = vm.image_sha256.trim();
+        if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            out.push_str(&format!(
+                "      imageSha256 = \"{}\";\n",
+                sha.to_ascii_lowercase()
+            ));
+        }
         out.push_str(&format!(
             "      storageBackend = \"{}\";\n",
             nix_escape(&vm.storage_backend)
@@ -676,6 +686,37 @@ mod tests {
         assert!(config.contains(r#"image = "/images/foo\"\${bar}.raw";"#));
         // The raw `${` is escaped to `\${`, preventing Nix interpolation.
         assert!(!config.contains("image = \"/images/foo\"${bar}.raw\";"));
+    }
+
+    #[test]
+    fn image_sha256_is_rendered_only_when_well_formed() {
+        let render = |sha: &str| {
+            let mut v = vm(true, "sha");
+            v.image_sha256 = sha.into();
+            generate_node_config(
+                &[v],
+                "eno1",
+                &default_net(),
+                &[],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            )
+        };
+        let good = "A".repeat(32) + &"b".repeat(32);
+        let config = render(&good);
+        assert!(
+            config.contains(&format!("imageSha256 = \"{}\";", good.to_ascii_lowercase())),
+            "{config}"
+        );
+        for bad in [
+            "",
+            "abc",
+            &"g".repeat(64),
+            &format!("{}\"; evil = 1; x = \"", "a".repeat(64)),
+        ] {
+            let config = render(bad);
+            assert!(!config.contains("imageSha256"), "{bad:?} -> {config}");
+        }
     }
 
     #[test]
