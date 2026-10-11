@@ -62,6 +62,15 @@ pub fn derive_image_format(image_url: &str) -> String {
     }
 }
 
+/// Filesystem-backed VMs boot the image file itself, so two of them cannot
+/// share one path. LVM, ZFS and Ceph only read the image once to seed a volume.
+pub fn image_used_in_place(storage_backend: &str) -> bool {
+    matches!(
+        storage_backend.trim().to_ascii_lowercase().as_str(),
+        "" | "filesystem"
+    )
+}
+
 pub fn validate_image_path(path: &str) -> Result<String, Status> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -291,6 +300,15 @@ mod tests {
             "qcow2"
         );
         assert!(normalize_image_format("iso").is_err());
+    }
+
+    #[test]
+    fn only_filesystem_backend_uses_the_image_in_place() {
+        assert!(image_used_in_place("filesystem"));
+        assert!(image_used_in_place(""));
+        assert!(!image_used_in_place("ceph"));
+        assert!(!image_used_in_place("lvm"));
+        assert!(!image_used_in_place("zfs"));
     }
 
     #[test]
