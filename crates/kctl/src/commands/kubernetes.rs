@@ -465,29 +465,45 @@ pub async fn health(info: &ConnectionInfo, name: &str) -> Result<()> {
 pub async fn scale(
     info: &ConnectionInfo,
     name: &str,
+    add_control_plane: Vec<String>,
     add_workers: Vec<String>,
     remove_workers: Vec<String>,
 ) -> Result<()> {
     let mut client = client::controller_client(info).await?;
 
-    let add_nodes = add_workers
-        .into_iter()
-        .map(|node_id| {
-            // Parse node_id:address format
-            let parts: Vec<&str> = node_id.split(':').collect();
-            if parts.len() != 2 {
-                bail!("worker format must be node_id:address (e.g., node-110:192.168.40.110)");
-            }
-            Ok(controller_proto::KubernetesNodeSpec {
-                node_id: parts[0].to_string(),
-                role: "worker".to_string(),
-                advertise_address: parts[1].to_string(),
-                iface: "enp6s0".to_string(),
-                initial_cluster: false,
-                join_existing: true,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut add_nodes = Vec::new();
+
+    // Add control plane nodes
+    for node_id in add_control_plane {
+        let parts: Vec<&str> = node_id.split(':').collect();
+        if parts.len() != 2 {
+            bail!("control-plane format must be node_id:address (e.g., node-108:192.168.40.108)");
+        }
+        add_nodes.push(controller_proto::KubernetesNodeSpec {
+            node_id: parts[0].to_string(),
+            role: "control-plane".to_string(),
+            advertise_address: parts[1].to_string(),
+            iface: "enp6s0".to_string(),
+            initial_cluster: false,
+            join_existing: true,
+        });
+    }
+
+    // Add worker nodes
+    for node_id in add_workers {
+        let parts: Vec<&str> = node_id.split(':').collect();
+        if parts.len() != 2 {
+            bail!("worker format must be node_id:address (e.g., node-110:192.168.40.110)");
+        }
+        add_nodes.push(controller_proto::KubernetesNodeSpec {
+            node_id: parts[0].to_string(),
+            role: "worker".to_string(),
+            advertise_address: parts[1].to_string(),
+            iface: "enp6s0".to_string(),
+            initial_cluster: false,
+            join_existing: true,
+        });
+    }
 
     let _response = client
         .scale_kubernetes_cluster(controller_proto::ScaleKubernetesClusterRequest {
