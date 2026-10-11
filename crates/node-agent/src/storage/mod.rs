@@ -841,6 +841,225 @@ pub fn ceph_resize_volume(
     Ok(i64::try_from(size_mib.saturating_mul(1024 * 1024)).unwrap_or(i64::MAX))
 }
 
+/// How long a fenced client stays on the OSD blocklist. Long enough that a
+/// node which only lost contact with the controller cannot resume writing
+/// once the entry expires; the entry is removed by `ceph osd blocklist rm`
+/// or when the node is reinstalled (a new client gets a new nonce anyway).
+pub const FENCE_BLOCKLIST_EXPIRE_SECS: u64 = 7 * 24 * 3600;
+
+/// A lock on an RBD image as listed by `rbd lock ls`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RbdLock {
+    pub id: String,
+    pub locker: String,
+    pub address: String,
+}
+
+/// Host part of a Ceph entity address: `v1:192.0.2.1:0/123` → `192.0.2.1`,
+/// `[2001:db8::1]:0/123` → `2001:db8::1`.
+pub fn entity_addr_host(addr: &str) -> &str {
+    let addr = addr.trim();
+    let addr = addr
+        .strip_prefix("v1:")
+        .or_else(|| addr.strip_prefix("v2:"))
+        .unwrap_or(addr);
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or("");
+    }
+    let without_nonce = addr.split('/').next().unwrap_or(addr);
+    match without_nonce.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => without_nonce,
+    }
+}
+
+/// Watcher entity addresses from `rbd status --format json`.
+pub fn parse_rbd_status_watchers(json: &str) -> Result<Vec<String>, StorageError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| StorageError::new(ErrorKind::Internal, format!("parsing rbd status: {e}")))?;
+    let watchers = value
+        .get("watchers")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for watcher in watchers {
+        if let Some(address) = watcher.get("address").and_then(|a| a.as_str()) {
+            if !address.is_empty() && !out.iter().any(|a| a == address) {
+                out.push(address.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Locks from `rbd lock ls --format json`. Accepts both the list form
+/// (`[{"id":..,"locker":..,"address":..}]`) and the older map form keyed by
+/// lock id.
+pub fn parse_rbd_lock_ls(json: &str) -> Result<Vec<RbdLock>, StorageError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| StorageError::new(ErrorKind::Internal, format!("parsing rbd lock ls: {e}")))?;
+    let str_field = |v: &serde_json::Value, key: &str| -> String {
+        v.get(key)
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut out = Vec::new();
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                out.push(RbdLock {
+                    id: str_field(&item, "id"),
+                    locker: str_field(&item, "locker"),
+                    address: str_field(&item, "address"),
+                });
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (id, item) in map {
+                out.push(RbdLock {
+                    id,
+                    locker: str_field(&item, "locker"),
+                    address: str_field(&item, "address"),
+                });
+            }
+        }
+        _ => {}
+    }
+    out.retain(|lock| !lock.address.is_empty());
+    Ok(out)
+}
+
+/// Decide which entity addresses to blocklist for `backend_handle`.
+///
+/// Every client with the image open must come from one of `source_hosts`;
+/// a client anywhere else means the controller's idea of where the guest
+/// runs is wrong, and fencing it would cut off a healthy guest.
+pub fn fence_targets(
+    backend_handle: &str,
+    watchers: &[String],
+    locks: &[RbdLock],
+    source_hosts: &[String],
+) -> Result<Vec<String>, StorageError> {
+    let hosts: Vec<&str> = source_hosts
+        .iter()
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "source_hosts is required",
+        ));
+    }
+    let mut targets: Vec<String> = Vec::new();
+    for addr in watchers
+        .iter()
+        .chain(locks.iter().map(|lock| &lock.address))
+    {
+        if targets.iter().any(|t| t == addr) {
+            continue;
+        }
+        let host = entity_addr_host(addr);
+        if !hosts.contains(&host) {
+            return Err(StorageError::new(
+                ErrorKind::FailedPrecondition,
+                format!(
+                    "{backend_handle} is open from {addr} (host {host}), which is not the node being fenced ({}); refusing to fence",
+                    hosts.join(", ")
+                ),
+            ));
+        }
+        targets.push(addr.clone());
+    }
+    Ok(targets)
+}
+
+fn run_cmd_capture(
+    program: &str,
+    args: &[&str],
+    err_kind: ErrorKind,
+) -> Result<String, StorageError> {
+    let out = Command::new("timeout")
+        .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+        .arg(program)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            StorageError::new(
+                err_kind,
+                format!("running {program}: {e}; ensure the required storage tools are installed"),
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(StorageError::new(
+            err_kind,
+            format!("{program} {} failed: {}", args.join(" "), stderr.trim()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Blocklist every Ceph client that has `backend_handle` open from one of
+/// `source_hosts` and drop any RBD lock it held. Returns the blocklisted
+/// entity addresses.
+///
+/// Images are created with `layering` only, so there is no exclusive lock
+/// to arbitrate writers: once the controller restarts a guest elsewhere the
+/// old rbd-nbd on the lost node would keep writing. The OSD blocklist is the
+/// only thing that stops it, which is why this must run before the guest is
+/// reassigned. Clients are listed by `rbd status` (watchers), with `rbd lock
+/// ls` as a second source for images that do carry locks.
+pub fn ceph_fence_volume(
+    backend_handle: &str,
+    source_hosts: &[String],
+) -> Result<Vec<String>, StorageError> {
+    let handle = validate_rbd_pool_image_handle(backend_handle)?;
+    let handle = handle.as_str();
+    let status = run_cmd_capture(
+        "rbd",
+        &["status", handle, "--format", "json"],
+        ErrorKind::Internal,
+    )?;
+    let watchers = parse_rbd_status_watchers(&status)?;
+    let locks = match run_cmd_capture(
+        "rbd",
+        &["lock", "ls", handle, "--format", "json"],
+        ErrorKind::Internal,
+    ) {
+        Ok(json) => parse_rbd_lock_ls(&json)?,
+        Err(e) => {
+            tracing::warn!(handle, error = %e, "rbd lock ls failed; fencing watchers only");
+            Vec::new()
+        }
+    };
+    let targets = fence_targets(handle, &watchers, &locks, source_hosts)?;
+    let expire = FENCE_BLOCKLIST_EXPIRE_SECS.to_string();
+    for addr in &targets {
+        run_cmd_capture(
+            "ceph",
+            &["osd", "blocklist", "add", addr, &expire],
+            ErrorKind::Internal,
+        )?;
+        tracing::info!(handle, addr = %addr, "blocklisted Ceph client");
+    }
+    for lock in locks
+        .iter()
+        .filter(|lock| targets.iter().any(|t| t == &lock.address))
+    {
+        if let Err(e) = run_cmd_capture(
+            "rbd",
+            &["lock", "rm", handle, &lock.id, &lock.locker],
+            ErrorKind::Internal,
+        ) {
+            tracing::warn!(handle, lock = %lock.id, error = %e, "removing fenced client's RBD lock failed");
+        }
+    }
+    Ok(targets)
+}
+
 fn validate_volume_create_inputs(req: &CreateVolumeRequest) -> Result<(), StorageError> {
     if req.volume_id.trim().is_empty() {
         return Err(StorageError::new(
@@ -1425,6 +1644,89 @@ fn upload_image_file_to_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_addr_host_strips_protocol_port_and_nonce() {
+        assert_eq!(
+            entity_addr_host("192.168.40.103:0/3790053379"),
+            "192.168.40.103"
+        );
+        assert_eq!(entity_addr_host("v1:192.168.40.145:0/42"), "192.168.40.145");
+        assert_eq!(entity_addr_host("v2:10.0.0.9:6800/7"), "10.0.0.9");
+        assert_eq!(entity_addr_host("[2001:db8::1]:0/5"), "2001:db8::1");
+        assert_eq!(entity_addr_host("v1:[fd00::7]:0/5"), "fd00::7");
+        assert_eq!(entity_addr_host("10.1.1.1"), "10.1.1.1");
+    }
+
+    #[test]
+    fn rbd_status_watchers_are_parsed_from_live_output() {
+        let json = r#"{"watchers":[{"address":"192.168.40.103:0/3790053379","client":15624,"cookie":94549744340208},{"address":"192.168.40.103:0/3790053379","client":15624,"cookie":1}]}"#;
+        assert_eq!(
+            parse_rbd_status_watchers(json).unwrap(),
+            vec!["192.168.40.103:0/3790053379".to_string()]
+        );
+        assert!(parse_rbd_status_watchers(r#"{"watchers":[]}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_rbd_status_watchers("{}").unwrap().is_empty());
+        assert!(parse_rbd_status_watchers("not json").is_err());
+    }
+
+    #[test]
+    fn rbd_lock_ls_accepts_list_and_map_forms() {
+        let list = r#"[{"id":"auto 94549744340208","locker":"client.15624","address":"192.168.40.103:0/3790053379"}]"#;
+        let map = r#"{"auto 94549744340208":{"locker":"client.15624","address":"192.168.40.103:0/3790053379"}}"#;
+        let expected = vec![RbdLock {
+            id: "auto 94549744340208".into(),
+            locker: "client.15624".into(),
+            address: "192.168.40.103:0/3790053379".into(),
+        }];
+        assert_eq!(parse_rbd_lock_ls(list).unwrap(), expected);
+        assert_eq!(parse_rbd_lock_ls(map).unwrap(), expected);
+        assert!(parse_rbd_lock_ls("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fence_targets_blocklists_only_clients_on_the_fenced_node() {
+        let watchers = vec![
+            "192.168.40.145:0/11".to_string(),
+            "v1:192.168.40.145:0/22".to_string(),
+        ];
+        let locks = vec![RbdLock {
+            id: "auto 1".into(),
+            locker: "client.9".into(),
+            address: "192.168.40.145:0/11".into(),
+        }];
+        let hosts = vec!["192.168.40.145".to_string(), "192.168.47.2".to_string()];
+        let targets = fence_targets("kcore-vms/img", &watchers, &locks, &hosts).unwrap();
+        assert_eq!(
+            targets,
+            vec!["192.168.40.145:0/11", "v1:192.168.40.145:0/22"]
+        );
+    }
+
+    #[test]
+    fn fence_targets_refuses_when_a_client_elsewhere_has_the_image_open() {
+        let watchers = vec![
+            "192.168.40.145:0/11".to_string(),
+            "192.168.40.103:0/5".to_string(),
+        ];
+        let hosts = vec!["192.168.40.145".to_string()];
+        let err = fence_targets("kcore-vms/img", &watchers, &[], &hosts).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::FailedPrecondition));
+        assert!(err.message().contains("192.168.40.103:0/5"), "{err}");
+        assert!(err.message().contains("refusing to fence"), "{err}");
+    }
+
+    #[test]
+    fn fence_targets_with_nobody_watching_is_a_noop() {
+        let hosts = vec!["192.168.40.145".to_string()];
+        assert!(fence_targets("kcore-vms/img", &[], &[], &hosts)
+            .unwrap()
+            .is_empty());
+        let err = fence_targets("kcore-vms/img", &[], &[], &[]).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+    }
 
     #[test]
     fn default_filesystem_adapter_creates_volume_file() {

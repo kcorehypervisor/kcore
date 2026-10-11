@@ -48,6 +48,13 @@ service NodeStorage {
   rpc FlattenVolume(FlattenVolumeRequest) returns (FlattenVolumeResponse);
   rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
 
+  // FenceVolume cuts every Ceph client that still has the image open from
+  // one of the given hosts off the cluster (`ceph osd blocklist add`), so a
+  // guest restarted on another node cannot share the image with a writer on
+  // a node the controller can no longer reach. It fails when the image is
+  // open from any other host; the caller must not move the guest then.
+  rpc FenceVolume(FenceVolumeRequest) returns (FenceVolumeResponse);
+
   // Host-side LUKS over a mapped RBD device (E2 per-volume encryption).
   rpc FormatEncryptedVolume(FormatEncryptedVolumeRequest)
       returns (FormatEncryptedVolumeResponse);
@@ -555,6 +562,21 @@ message ResizeVolumeResponse {
   bool success = 1;
   string message = 2;
   int64 size_bytes = 3;
+}
+
+message FenceVolumeRequest {
+  // pool/image
+  string backend_handle = 1;
+  // Every address the lost node may show up under in `rbd status`: its Ceph
+  // public address and the host part of its gRPC address. A watcher from any
+  // other host makes the call fail.
+  repeated string source_hosts = 2;
+}
+
+message FenceVolumeResponse {
+  // Entity addresses (`ip:port/nonce`) that were added to the OSD blocklist.
+  // Empty when nobody had the image open.
+  repeated string blocklisted = 1;
 }
 
 message FormatEncryptedVolumeRequest {

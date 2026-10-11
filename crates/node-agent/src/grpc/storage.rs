@@ -140,6 +140,20 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         Ok(Response::new(resp))
     }
 
+    async fn fence_volume(
+        &self,
+        request: Request<proto::FenceVolumeRequest>,
+    ) -> Result<Response<proto::FenceVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let blocklisted = tokio::task::spawn_blocking(move || {
+            storage::ceph_fence_volume(&req.backend_handle, &req.source_hosts)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::FenceVolumeResponse { blocklisted }))
+    }
+
     async fn rollback_volume(
         &self,
         request: Request<proto::RollbackVolumeRequest>,
