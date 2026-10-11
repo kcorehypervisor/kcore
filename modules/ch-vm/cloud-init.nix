@@ -84,6 +84,11 @@ let
           KCORE_KEYS
           chown "$u:$u" "$f"
           chmod 600 "$f"
+          # GuestOps (probe, grow, fsfreeze) runs as this user and needs root.
+          if [ -d /etc/sudoers.d ]; then
+            printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" > /etc/sudoers.d/90-kcore-guest-ops
+            chmod 440 /etc/sudoers.d/90-kcore-guest-ops
+          fi
         ''
       );
       mergedUserData = pkgs.runCommand "${vmName}-user-data-mime" { } ''
