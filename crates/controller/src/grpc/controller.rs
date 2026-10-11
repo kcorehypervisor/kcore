@@ -115,11 +115,11 @@ use super::rbac_matrix;
 use super::signing;
 use super::validation::{
     derive_image_format, derive_image_format_from_path, derive_local_image_path,
-    normalize_image_format, normalize_storage_backend, storage_backend_to_proto,
-    validate_image_path, validate_image_sha256, validate_image_url, validate_ipv4,
-    validate_netmask, validate_network_name, validate_network_type, validate_postgresql_database,
-    validate_postgresql_name, validate_postgresql_package, validate_postgresql_port,
-    validate_storage_size_bytes,
+    image_used_in_place, normalize_image_format, normalize_storage_backend,
+    storage_backend_to_proto, validate_image_path, validate_image_sha256, validate_image_url,
+    validate_ipv4, validate_netmask, validate_network_name, validate_network_type,
+    validate_postgresql_database, validate_postgresql_name, validate_postgresql_package,
+    validate_postgresql_port, validate_storage_size_bytes,
 };
 
 #[cfg(test)]
@@ -5201,10 +5201,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 node.id
             )));
         }
-        if let Some(conflict) = existing_on_node
-            .into_iter()
-            .find(|existing| existing.image_path == image_path)
-        {
+        if let Some(conflict) = existing_on_node.into_iter().find(|existing| {
+            existing.image_path == image_path
+                && image_used_in_place(&existing.storage_backend)
+                && image_used_in_place(&requested_storage_backend)
+        }) {
             return Err(Status::failed_precondition(format!(
                 "image path '{}' is already used by VM '{}' on node '{}'; duplicate writable disk usage is not supported",
                 image_path, conflict.name, node.id
