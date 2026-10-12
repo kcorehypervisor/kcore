@@ -2,6 +2,9 @@
 name = "kcore-controller"
 version = "0.3.0"
 edition = "2021"
+# examples/create_k8s_cluster.rs declares modules that are not crate files.
+# Leave it out of the package targets so cargo fmt and cargo test can run.
+autoexamples = false
 
 [dependencies]
 anyhow = "1.0.102"
