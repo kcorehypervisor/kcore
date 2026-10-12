@@ -4174,7 +4174,7 @@ impl AdminService {
         Ok(crate::nixgen_k8s::generate_kubernetes_node_config(&config))
     }
 
-    async fn run_k8s_nixos_rebuild(config_path: PathBuf, apply_id: String) {
+    async fn run_k8s_nixos_rebuild(_config_path: PathBuf, apply_id: String) {
         write_apply_state(&apply_id, "rebuilding", "running nixos-rebuild switch");
 
         // Get NIX_PATH from bash login shell, then run nixos-rebuild

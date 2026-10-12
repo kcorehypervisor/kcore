@@ -1682,7 +1682,7 @@ mod kubernetes_tests {
             "server-key",
             &peer,
             "peer-key",
-            &[node.clone()],
+            std::slice::from_ref(&node),
         )
         .unwrap();
 
