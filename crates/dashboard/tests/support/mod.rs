@@ -983,6 +983,20 @@ impl Controller for MockController {
         }))
     }
 
+    async fn get_ceph_dashboard_credentials(
+        &self,
+        _: Request<GetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<GetCephDashboardCredentialsResponse>, Status> {
+        Err(unimp("get_ceph_dashboard_credentials"))
+    }
+
+    async fn set_ceph_dashboard_credentials(
+        &self,
+        _: Request<SetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<SetCephDashboardCredentialsResponse>, Status> {
+        Err(unimp("set_ceph_dashboard_credentials"))
+    }
+
     async fn create_shared_filesystem(
         &self,
         _: Request<CreateSharedFilesystemRequest>,
