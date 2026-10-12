@@ -9,6 +9,7 @@ use crate::kubernetes_pki::{self, KubernetesPki, NodeInfo};
 use crate::node_client::NodeClient;
 
 /// Orchestrates Kubernetes cluster bootstrap across multiple nodes
+#[derive(Clone)]
 pub struct KubernetesOrchestrator {
     db: Database,
     node_clients: Arc<HashMap<String, NodeClient>>,

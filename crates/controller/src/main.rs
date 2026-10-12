@@ -30,6 +30,8 @@ mod path_safety;
 mod pci;
 mod pki;
 mod kubernetes_pki;
+mod kubernetes_orchestrator;
+mod kubernetes_update;
 mod rate_limit;
 mod replication;
 mod replication_policy;
