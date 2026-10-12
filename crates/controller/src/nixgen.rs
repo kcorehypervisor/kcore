@@ -1632,3 +1632,25 @@ mod kubernetes_tests {
         assert!(!nix.contains("etcdInitialCluster"));
     }
 }
+
+/// Generate Kubernetes node configuration for a node in the cluster
+pub fn generate_kubernetes_config(
+    _cluster_name: &str,
+    _node: &crate::kubernetes_orchestrator::ClusterNode,
+    _pki: &crate::kubernetes_pki::KubernetesPki,
+    _etcd_server_cert: &str,
+    _etcd_server_key: &str,
+    _etcd_peer_cert: &str,
+    _etcd_peer_key: &str,
+    _initial_cluster: bool,
+) -> anyhow::Result<String> {
+    // TODO: Generate full NixOS configuration for Kubernetes node
+    // For now, return a minimal placeholder
+    Ok(String::from(
+        r#"{ config, pkgs, ... }: {
+  services.kubernetes = {
+    enable = true;
+  };
+}"#,
+    ))
+}

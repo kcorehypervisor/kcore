@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
@@ -67,7 +67,7 @@ pub fn generate_kubernetes_pki(
 
     // Generate Kubernetes CA
     let (ca_cert, ca_key) = generate_ca("kubernetes-ca", "kubernetes", 3650)?;
-    
+
     // Generate etcd CA
     let (etcd_ca_cert, etcd_ca_key) = generate_ca("etcd-ca", "etcd", 3650)?;
 
@@ -155,13 +155,8 @@ pub fn generate_kubernetes_pki(
     }
 
     // Generate admin kubeconfig
-    let (admin_cert, admin_key) = generate_client_cert(
-        "kubernetes-admin",
-        "system:masters",
-        &ca_cert,
-        &ca_key,
-        365,
-    )?;
+    let (admin_cert, admin_key) =
+        generate_client_cert("kubernetes-admin", "system:masters", &ca_cert, &ca_key, 365)?;
 
     let admin_kubeconfig = generate_kubeconfig(
         cluster_name,
@@ -247,7 +242,7 @@ fn generate_server_cert(
 
     let ca_key = KeyPair::from_pem(ca_key_pem)?;
     let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
-    
+
     let key_pair = KeyPair::generate()?;
     let cert = params.signed_by(&key_pair, &issuer)?;
     let cert_pem = cert.pem();
@@ -281,7 +276,7 @@ fn generate_client_cert(
 
     let ca_key = KeyPair::from_pem(ca_key_pem)?;
     let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
-    
+
     let key_pair = KeyPair::generate()?;
     let cert = params.signed_by(&key_pair, &issuer)?;
     let cert_pem = cert.pem();
@@ -300,7 +295,10 @@ fn generate_key_pair() -> Result<(String, String)> {
         .take_while(|line: &&str| !line.starts_with("-----END"))
         .collect::<Vec<_>>()
         .join("\n");
-    let public_pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", public_pem);
+    let public_pem = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        public_pem
+    );
 
     Ok((private_pem, public_pem))
 }
@@ -313,9 +311,18 @@ fn generate_kubeconfig(
     client_key: &str,
     user_name: &str,
 ) -> Result<String> {
-    let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ca_cert.as_bytes());
-    let cert_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, client_cert.as_bytes());
-    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, client_key.as_bytes());
+    let ca_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        ca_cert.as_bytes(),
+    );
+    let cert_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        client_cert.as_bytes(),
+    );
+    let key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        client_key.as_bytes(),
+    );
 
     let kubeconfig = format!(
         r#"apiVersion: v1

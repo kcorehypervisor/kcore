@@ -11,7 +11,11 @@ pub const CERT_VALIDITY_DAYS: i64 = 365;
 /// a CN, SAN or EKU it is not entitled to.
 fn node_cert_params(node_host: &str, validity_days: i64) -> Result<CertificateParams, String> {
     let mut params = CertificateParams::default();
-    params.subject_alt_names = vec![SanType::DnsName(node_host.try_into().map_err(|e| format!("invalid hostname: {e}"))?)];
+    params.subject_alt_names = vec![SanType::DnsName(
+        node_host
+            .try_into()
+            .map_err(|e| format!("invalid hostname: {e}"))?,
+    )];
     params
         .distinguished_name
         .push(DnType::CommonName, format!("kcore-node-{node_host}"));
