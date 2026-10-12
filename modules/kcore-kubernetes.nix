@@ -501,7 +501,9 @@ let
         serviceConfig = {
           Type = "forking";
           PIDFile = "/run/keepalived-${name}.pid";
-          ExecStart = "${pkgs.keepalived}/bin/keepalived -f /etc/keepalived/keepalived-${name}.conf -p /run/keepalived-${name}.pid";
+          # A second keepalived cannot share the primary daemon's
+          # /run/vrrp.pid. -r gives this cluster its own VRRP pid file.
+          ExecStart = "${pkgs.keepalived}/bin/keepalived -f /etc/keepalived/keepalived-${name}.conf -p /run/keepalived-${name}.pid -r /run/vrrp-${name}.pid";
           Restart = "always";
           RestartSec = "5s";
         };
