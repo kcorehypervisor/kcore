@@ -12018,6 +12018,93 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
+    async fn get_ceph_dashboard_credentials(
+        &self,
+        request: Request<controller_proto::GetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<controller_proto::GetCephDashboardCredentialsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let name = request.into_inner().name;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_ceph_dashboard_credentials(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "no dashboard credentials stored for ceph cluster '{name}' \
+                     (set with SetCephDashboardCredentials / \
+                     `kctl set ceph-dashboard-credentials`)"
+                ))
+            })?;
+        Ok(Response::new(
+            controller_proto::GetCephDashboardCredentialsResponse {
+                name: row.name,
+                url: row.url,
+                username: row.username,
+                password: row.password,
+                updated_at: row.updated_at,
+            },
+        ))
+    }
+
+    async fn set_ceph_dashboard_credentials(
+        &self,
+        request: Request<controller_proto::SetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<controller_proto::SetCephDashboardCredentialsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let url = req.url.trim().to_string();
+        let username = req.username.trim().to_string();
+        let password = req.password;
+        if url.is_empty() {
+            return Err(Status::invalid_argument("url is required"));
+        }
+        if username.is_empty() {
+            return Err(Status::invalid_argument("username is required"));
+        }
+        if password.is_empty() {
+            return Err(Status::invalid_argument("password is required"));
+        }
+        self.db
+            .upsert_ceph_dashboard_credentials(&crate::db::CephDashboardCredentialsRow {
+                name: name.clone(),
+                url: url.clone(),
+                username: username.clone(),
+                password: password.clone(),
+                updated_at: String::new(),
+            })
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.audit(
+            "SetCephDashboardCredentials",
+            &format!("ceph_cluster/{name}"),
+            &format!("url={url} user={username}"),
+        );
+        let stored = self
+            .db
+            .get_ceph_dashboard_credentials(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::internal("credentials missing after upsert"))?;
+        Ok(Response::new(
+            controller_proto::SetCephDashboardCredentialsResponse {
+                success: true,
+                credentials: Some(controller_proto::GetCephDashboardCredentialsResponse {
+                    name: stored.name,
+                    url: stored.url,
+                    username: stored.username,
+                    password: stored.password,
+                    updated_at: stored.updated_at,
+                }),
+            },
+        ))
+    }
+
     async fn get_ceph_cluster_capacity(
         &self,
         request: Request<controller_proto::GetCephClusterCapacityRequest>,

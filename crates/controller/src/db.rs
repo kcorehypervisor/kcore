@@ -295,6 +295,15 @@ pub struct CephClusterStatusRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct CephDashboardCredentialsRow {
+    pub name: String,
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct SharedFilesystemRow {
     pub name: String,
     pub generation: i64,
@@ -682,7 +691,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 49;
+pub const SCHEMA_VERSION: i32 = 50;
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -1694,6 +1703,22 @@ impl Database {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS pending_node_config_push (
                     node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE
+                );",
+            )?;
+        }
+
+        if version < 50 {
+            // Credentials are keyed by logical CephCluster name but do not FK to
+            // ceph_clusters: operators may record the mgr dashboard URL/password
+            // during bootstrap before a CephCluster resource exists. Ceph hashes
+            // dashboard passwords, so kcore stores the operator-retrievable copy.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ceph_dashboard_credentials (
+                    name TEXT PRIMARY KEY,
+                    url TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    password TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
                 );",
             )?;
         }
@@ -3857,6 +3882,46 @@ impl Database {
         let conn = self.lock_conn()?;
         self.clear_retired_ceph_nodes_conn(&conn, name)?;
         Ok(conn.execute("DELETE FROM ceph_clusters WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn get_ceph_dashboard_credentials(
+        &self,
+        name: &str,
+    ) -> Result<Option<CephDashboardCredentialsRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT name, url, username, password, updated_at
+             FROM ceph_dashboard_credentials WHERE name=?1",
+            params![name],
+            |r| {
+                Ok(CephDashboardCredentialsRow {
+                    name: r.get(0)?,
+                    url: r.get(1)?,
+                    username: r.get(2)?,
+                    password: r.get(3)?,
+                    updated_at: r.get(4)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn upsert_ceph_dashboard_credentials(
+        &self,
+        row: &CephDashboardCredentialsRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ceph_dashboard_credentials (name, url, username, password, updated_at)
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             ON CONFLICT(name) DO UPDATE SET
+               url=excluded.url,
+               username=excluded.username,
+               password=excluded.password,
+               updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            params![row.name, row.url, row.username, row.password],
+        )?;
+        Ok(())
     }
 
     pub fn add_retired_ceph_node(
@@ -8245,6 +8310,44 @@ mod tests {
 
         let err = dst.restore_sqlite(b"not a database").expect_err("garbage");
         assert!(err.contains("not a SQLite"));
+    }
+
+    #[test]
+    fn ceph_dashboard_credentials_round_trip_without_cluster() {
+        let db = Database::open(":memory:").expect("open");
+        assert!(db
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .is_none());
+        db.upsert_ceph_dashboard_credentials(&CephDashboardCredentialsRow {
+            name: "lab".into(),
+            url: "https://192.168.40.103:8444/".into(),
+            username: "admin".into(),
+            password: "s3cret".into(),
+            updated_at: String::new(),
+        })
+        .expect("upsert");
+        let got = db
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.url, "https://192.168.40.103:8444/");
+        assert_eq!(got.username, "admin");
+        assert_eq!(got.password, "s3cret");
+        assert!(!got.updated_at.is_empty());
+        db.upsert_ceph_dashboard_credentials(&CephDashboardCredentialsRow {
+            name: "lab".into(),
+            url: "https://192.168.40.103:8444/".into(),
+            username: "admin".into(),
+            password: "rotated".into(),
+            updated_at: String::new(),
+        })
+        .expect("rotate");
+        let rotated = db
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .expect("row");
+        assert_eq!(rotated.password, "rotated");
     }
 }
 

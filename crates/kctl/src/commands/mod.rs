@@ -1,6 +1,7 @@
 pub mod apply;
 pub mod audit;
 pub mod ceph_cluster;
+pub mod ceph_dashboard_credentials;
 pub mod certs;
 pub mod cluster;
 pub mod cluster_ops;

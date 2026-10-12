@@ -693,6 +693,20 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    async fn get_ceph_dashboard_credentials(
+        &self,
+        _: TRequest<GetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<GetCephDashboardCredentialsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn set_ceph_dashboard_credentials(
+        &self,
+        _: TRequest<SetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<SetCephDashboardCredentialsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
     async fn create_shared_filesystem(
         &self,
         _: TRequest<CreateSharedFilesystemRequest>,

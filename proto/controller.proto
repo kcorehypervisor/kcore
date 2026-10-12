@@ -188,6 +188,12 @@ service Controller {
   // On-demand capacity from a live member (`ceph df`). Read-only.
   rpc GetCephClusterCapacity(GetCephClusterCapacityRequest)
       returns (GetCephClusterCapacityResponse);
+  // Upstream Ceph Manager Dashboard login material stored by the controller.
+  // Ceph itself keeps only a password hash, so plaintext is served from kcore.
+  rpc GetCephDashboardCredentials(GetCephDashboardCredentialsRequest)
+      returns (GetCephDashboardCredentialsResponse);
+  rpc SetCephDashboardCredentials(SetCephDashboardCredentialsRequest)
+      returns (SetCephDashboardCredentialsResponse);
 
   // SharedFilesystem (CephFS) — cluster-scoped POSIX file service on Ceph.
   rpc CreateSharedFilesystem(CreateSharedFilesystemRequest) returns (CreateSharedFilesystemResponse);
@@ -2151,6 +2157,26 @@ message GetCephClusterCapacityResponse {
   int64 avail_bytes = 6;
   repeated CephDeviceClassCapacity by_class = 7;
   repeated CephPoolCapacity pools = 8;
+}
+
+message GetCephDashboardCredentialsRequest { string name = 1; }
+message GetCephDashboardCredentialsResponse {
+  string name = 1;
+  string url = 2;
+  string username = 3;
+  string password = 4;
+  string updated_at = 5;
+}
+
+message SetCephDashboardCredentialsRequest {
+  string name = 1;
+  string url = 2;
+  string username = 3;
+  string password = 4;
+}
+message SetCephDashboardCredentialsResponse {
+  bool success = 1;
+  GetCephDashboardCredentialsResponse credentials = 2;
 }
 message CephDeviceClassCapacity {
   string device_class = 1;
