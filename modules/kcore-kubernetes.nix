@@ -484,7 +484,10 @@ let
               --root-dir=/var/lib/kubelet-${name} \
               --cert-dir=/var/lib/kubelet-${name}/pki \
               --node-ip=${c.advertiseAddress} \
-              --hostname-override=${config.networking.hostName}
+              --hostname-override=${config.networking.hostName} \
+              ${lib.optionalString (
+                c.role == "control-plane"
+              ) "--node-labels=node-role.kubernetes.io/control-plane="}
           '';
           Restart = "always";
           RestartSec = "10s";
