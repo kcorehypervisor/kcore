@@ -141,7 +141,14 @@ impl KubernetesOrchestrator {
                     "deploying node configuration"
                 );
                 orchestrator
-                    .configure_node(&cluster_name, &node, &pki, &cluster_cidr, &service_cidr, &all_nodes)
+                    .configure_node(
+                        &cluster_name,
+                        &node,
+                        &pki,
+                        &cluster_cidr,
+                        &service_cidr,
+                        &all_nodes,
+                    )
                     .await
             });
             deploy_tasks.push(task);
@@ -162,7 +169,11 @@ impl KubernetesOrchestrator {
                 total = nodes.len(),
                 "some node deployments failed"
             );
-            return Err(anyhow!("{} of {} node deployments failed", failed_count, nodes.len()));
+            return Err(anyhow!(
+                "{} of {} node deployments failed",
+                failed_count,
+                nodes.len()
+            ));
         }
 
         info!(
@@ -247,8 +258,15 @@ impl KubernetesOrchestrator {
             );
 
             // All nodes get the same etcd initial cluster config
-            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, all_nodes)
-                .await?;
+            self.configure_node(
+                cluster_name,
+                node,
+                &pki,
+                cluster_cidr,
+                service_cidr,
+                all_nodes,
+            )
+            .await?;
 
             // Wait between additions
             sleep(Duration::from_secs(15)).await;
@@ -325,14 +343,71 @@ impl KubernetesOrchestrator {
             &node_infos,
         )?;
 
-        // TODO: Store PKI in database for future reference
-        // Skipping for now until kubernetes_pki table migration is working
-        // self.db
-        //     .store_kubernetes_pki(cluster_name, &pki)
-        //     .context("failed to store PKI")?;
+        self.db
+            .store_kubernetes_pki(cluster_name, &pki)
+            .context("failed to store PKI")?;
 
         info!(cluster = cluster_name, "PKI generated");
         Ok(pki)
+    }
+
+    /// Push node Nix again without advancing the cluster phase.
+    ///
+    /// Cluster create used to mark the cluster ready from a second bootstrap
+    /// that never embedded certificates. A controller restart then ignored the
+    /// cluster because the orchestrator only selects phase `bootstrapping`.
+    async fn redeploy_node_certificates(
+        &self,
+        cluster_name: &str,
+        api_endpoint: &str,
+        service_cidr: &str,
+    ) -> Result<()> {
+        let nodes = self.get_cluster_nodes(cluster_name).await?;
+        if nodes.is_empty() {
+            anyhow::bail!("no nodes configured for cluster {}", cluster_name);
+        }
+        let cluster = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+
+        let stored = self.db.load_kubernetes_pki(cluster_name)?;
+        let pki = match stored {
+            Some(pki)
+                if nodes.iter().all(|node| {
+                    pki.etcd_node_certs.contains_key(&node.node_id)
+                        && pki.etcd_node_peer_certs.contains_key(&node.node_id)
+                }) =>
+            {
+                pki
+            }
+            _ => {
+                info!(
+                    cluster = cluster_name,
+                    "stored PKI is missing node certificates; generating"
+                );
+                self.generate_and_store_pki(cluster_name, api_endpoint, service_cidr, &nodes)
+                    .await?
+            }
+        };
+
+        for node in &nodes {
+            self.configure_node(
+                cluster_name,
+                node,
+                &pki,
+                &cluster.cluster_cidr,
+                service_cidr,
+                &nodes,
+            )
+            .await?;
+        }
+        info!(
+            cluster = cluster_name,
+            nodes = nodes.len(),
+            "redeployed kubernetes node configuration"
+        );
+        Ok(())
     }
 
     async fn configure_node(
@@ -389,7 +464,7 @@ impl KubernetesOrchestrator {
 
         // Apply configuration via node agent RPC
         use crate::node_proto::ApplyRawKubernetesConfigRequest;
-        
+
         let request = ApplyRawKubernetesConfigRequest {
             nix_config_content: k8s_config,
             kubeconfig_data: pki.admin_kubeconfig.clone(),
@@ -542,6 +617,38 @@ pub struct ClusterNode {
 /// Background task that orchestrates Kubernetes cluster bootstraps
 pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClients) {
     let orchestrator = KubernetesOrchestrator::new(db.clone(), node_clients);
+
+    // Clusters that already left `bootstrapping` never get another render.
+    // Push certificates once per controller start. The 30s loop below still
+    // owns clusters that are waiting to bootstrap.
+    match db.list_kubernetes_clusters() {
+        Ok(clusters) => {
+            for cluster in clusters {
+                if cluster.phase == "bootstrapping" {
+                    continue;
+                }
+                let orchestrator = orchestrator.clone();
+                let cluster_name = cluster.name.clone();
+                let api_endpoint = cluster.api_server_endpoint.clone();
+                let service_cidr = cluster.service_cidr.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = orchestrator
+                        .redeploy_node_certificates(&cluster_name, &api_endpoint, &service_cidr)
+                        .await
+                    {
+                        error!(
+                            cluster = cluster_name,
+                            error = %e,
+                            "kubernetes certificate redeploy failed"
+                        );
+                    }
+                });
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "failed to list Kubernetes clusters for certificate redeploy");
+        }
+    }
 
     loop {
         // Check for clusters in "bootstrapping" phase that need bootstrap

@@ -724,7 +724,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 51;
+pub const SCHEMA_VERSION: i32 = 52;
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -1802,6 +1802,15 @@ impl Database {
                     apiserver_etcd_client_key TEXT NOT NULL,
                     admin_kubeconfig TEXT NOT NULL
                 );",
+            )?;
+        }
+
+        // Per-node etcd certs. Without these, a controller restart could not
+        // push the same PKI and would mint a new CA.
+        if version < 52 {
+            conn.execute_batch(
+                "ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_certs_json TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_peer_certs_json TEXT NOT NULL DEFAULT '';",
             )?;
         }
 
@@ -6611,20 +6620,34 @@ impl Database {
     }
 
     // Kubernetes PKI storage and retrieval
+    fn decode_cert_map(
+        json: String,
+    ) -> Result<std::collections::HashMap<String, (String, String)>, rusqlite::Error> {
+        if json.trim().is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        serde_json::from_str(&json)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+    }
+
     pub fn store_kubernetes_pki(
         &self,
         cluster_name: &str,
         pki: &crate::kubernetes_pki::KubernetesPki,
     ) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
+        let etcd_node_certs_json = serde_json::to_string(&pki.etcd_node_certs)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let etcd_node_peer_certs_json = serde_json::to_string(&pki.etcd_node_peer_certs)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         conn.execute(
             "INSERT OR REPLACE INTO kubernetes_pki (
                 cluster_name, ca_cert, ca_key, sa_key, sa_pub,
                 etcd_ca_cert, etcd_ca_key, apiserver_cert, apiserver_key,
                 apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
                 apiserver_etcd_client_cert, apiserver_etcd_client_key,
-                admin_kubeconfig
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 cluster_name,
                 &pki.ca_cert,
@@ -6640,6 +6663,8 @@ impl Database {
                 &pki.apiserver_etcd_client_cert,
                 &pki.apiserver_etcd_client_key,
                 &pki.admin_kubeconfig,
+                etcd_node_certs_json,
+                etcd_node_peer_certs_json,
             ],
         )?;
         Ok(())
@@ -6655,10 +6680,12 @@ impl Database {
                     etcd_ca_cert, etcd_ca_key, apiserver_cert, apiserver_key,
                     apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
                     apiserver_etcd_client_cert, apiserver_etcd_client_key,
-                    admin_kubeconfig
+                    admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json
              FROM kubernetes_pki WHERE cluster_name=?1",
         )?;
         let mut rows = stmt.query_map(params![cluster_name], |r| {
+            let etcd_node_certs = Self::decode_cert_map(r.get::<_, String>(13)?)?;
+            let etcd_node_peer_certs = Self::decode_cert_map(r.get::<_, String>(14)?)?;
             Ok(crate::kubernetes_pki::KubernetesPki {
                 ca_cert: r.get(0)?,
                 ca_key: r.get(1)?,
@@ -6673,8 +6700,8 @@ impl Database {
                 apiserver_etcd_client_cert: r.get(10)?,
                 apiserver_etcd_client_key: r.get(11)?,
                 admin_kubeconfig: r.get(12)?,
-                etcd_node_certs: std::collections::HashMap::new(),
-                etcd_node_peer_certs: std::collections::HashMap::new(),
+                etcd_node_certs,
+                etcd_node_peer_certs,
             })
         })?;
         rows.next().transpose()

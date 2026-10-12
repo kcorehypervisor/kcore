@@ -399,25 +399,33 @@ in
       mode = "0600";
     };
 
-    environment.etc."kubernetes/pki/apiserver-kubelet-client.crt" = lib.mkIf (cfg.apiserverKubeletClientCrt != "") {
-      text = cfg.apiserverKubeletClientCrt;
-      mode = "0644";
-    };
+    environment.etc."kubernetes/pki/apiserver-kubelet-client.crt" =
+      lib.mkIf (cfg.apiserverKubeletClientCrt != "")
+        {
+          text = cfg.apiserverKubeletClientCrt;
+          mode = "0644";
+        };
 
-    environment.etc."kubernetes/pki/apiserver-kubelet-client.key" = lib.mkIf (cfg.apiserverKubeletClientKey != "") {
-      text = cfg.apiserverKubeletClientKey;
-      mode = "0600";
-    };
+    environment.etc."kubernetes/pki/apiserver-kubelet-client.key" =
+      lib.mkIf (cfg.apiserverKubeletClientKey != "")
+        {
+          text = cfg.apiserverKubeletClientKey;
+          mode = "0600";
+        };
 
-    environment.etc."kubernetes/pki/apiserver-etcd-client.crt" = lib.mkIf (cfg.apiserverEtcdClientCrt != "") {
-      text = cfg.apiserverEtcdClientCrt;
-      mode = "0644";
-    };
+    environment.etc."kubernetes/pki/apiserver-etcd-client.crt" =
+      lib.mkIf (cfg.apiserverEtcdClientCrt != "")
+        {
+          text = cfg.apiserverEtcdClientCrt;
+          mode = "0644";
+        };
 
-    environment.etc."kubernetes/pki/apiserver-etcd-client.key" = lib.mkIf (cfg.apiserverEtcdClientKey != "") {
-      text = cfg.apiserverEtcdClientKey;
-      mode = "0600";
-    };
+    environment.etc."kubernetes/pki/apiserver-etcd-client.key" =
+      lib.mkIf (cfg.apiserverEtcdClientKey != "")
+        {
+          text = cfg.apiserverEtcdClientKey;
+          mode = "0600";
+        };
 
     environment.etc."kubernetes/pki/etcd/ca.crt" = lib.mkIf (cfg.etcdCaCrt != "") {
       text = cfg.etcdCaCrt;
@@ -515,6 +523,14 @@ in
 
       serviceConfig = {
         Type = "notify";
+        # A crash before the first WAL (missing peer certs) leaves an empty
+        # member directory. etcd then refuses --initial-cluster-state=new.
+        # Keep a directory that already has a snapshot or WAL.
+        ExecStartPre = "${pkgs.writeShellScript "kcore-etcd-clear-empty-member" ''
+          if [ ! -e /var/lib/etcd/member/snap/db ] && [ ! -d /var/lib/etcd/member/wal ]; then
+            rm -rf /var/lib/etcd/member
+          fi
+        ''}";
         ExecStart = ''
           ${pkgs.etcd}/bin/etcd \
             --name=${config.networking.hostName} \

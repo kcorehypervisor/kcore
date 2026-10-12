@@ -1631,6 +1631,74 @@ mod kubernetes_tests {
         assert!(nix.contains("haEnabled = false"));
         assert!(!nix.contains("etcdInitialCluster"));
     }
+
+    #[test]
+    fn pki_options_stay_inside_kubernetes_attrset() {
+        use crate::kubernetes_orchestrator::ClusterNode;
+        use crate::kubernetes_pki::KubernetesPki;
+        use std::collections::HashMap;
+
+        let node = ClusterNode {
+            node_id: "node-107".to_string(),
+            hostname: "node-107".to_string(),
+            ip_address: "192.168.40.107".to_string(),
+            initial_cluster: true,
+        };
+        let peer = "-----BEGIN CERTIFICATE-----\nMIIBPEER\n-----END CERTIFICATE-----\n".to_string();
+        let server =
+            "-----BEGIN CERTIFICATE-----\nMIIBSERVER\n-----END CERTIFICATE-----\n".to_string();
+        let mut etcd_node_certs = HashMap::new();
+        etcd_node_certs.insert(
+            node.node_id.clone(),
+            (server.clone(), "server-key".to_string()),
+        );
+        let mut etcd_node_peer_certs = HashMap::new();
+        etcd_node_peer_certs.insert(node.node_id.clone(), (peer.clone(), "peer-key".to_string()));
+        let pki = KubernetesPki {
+            ca_cert: "CA".to_string(),
+            ca_key: "CAKEY".to_string(),
+            sa_key: "SA".to_string(),
+            sa_pub: "SAPUB".to_string(),
+            etcd_ca_cert: "ETCDCA".to_string(),
+            etcd_ca_key: "ETCDCAKEY".to_string(),
+            apiserver_cert: "API".to_string(),
+            apiserver_key: "APIKEY".to_string(),
+            apiserver_kubelet_client_cert: "AKC".to_string(),
+            apiserver_kubelet_client_key: "AKCKEY".to_string(),
+            apiserver_etcd_client_cert: "AEC".to_string(),
+            apiserver_etcd_client_key: "AECKEY".to_string(),
+            etcd_node_certs,
+            etcd_node_peer_certs,
+            admin_kubeconfig: "apiVersion: v1\nkind: Config\n".to_string(),
+        };
+
+        let nix = generate_kubernetes_config(
+            "lab",
+            &node,
+            &pki,
+            "10.244.0.0/16",
+            "10.96.0.0/12",
+            &server,
+            "server-key",
+            &peer,
+            "peer-key",
+            &[node.clone()],
+        )
+        .unwrap();
+
+        let close = nix.rfind("\n  };\n").expect("kubernetes attrset close");
+        let peer_at = nix.find("etcdPeerCrt").expect("etcdPeerCrt option");
+        assert!(
+            peer_at < close,
+            "etcdPeerCrt must be inside kcore.kubernetes"
+        );
+        assert!(nix.contains("etcdPeerKey"));
+        assert!(nix.contains("MIIBPEER"));
+        assert!(nix.contains("node-107=https://192.168.40.107:2380"));
+        assert!(!nix.contains("environment.etc"));
+        assert!(nix.ends_with("  };\n}\n"));
+        assert_eq!(nix.matches("kubeconfigData").count(), 1);
+    }
 }
 
 /// Generate Kubernetes node configuration for a node in the cluster
@@ -1648,9 +1716,18 @@ pub fn generate_kubernetes_config(
 ) -> anyhow::Result<String> {
     // Build complete etcd initial cluster string with ALL members
     // For static bootstrap, every node needs the complete list
+    // etcd --name is the NixOS hostname (see modules/kcore-kubernetes.nix).
+    // The initial-cluster keys must be that same name.
     let etcd_initial_cluster = all_nodes
         .iter()
-        .map(|n| format!("{}=https://{}:2380", n.node_id, n.ip_address))
+        .map(|n| {
+            let name = if n.hostname.is_empty() {
+                n.node_id.as_str()
+            } else {
+                n.hostname.as_str()
+            };
+            format!("{name}=https://{}:2380", n.ip_address)
+        })
         .collect::<Vec<_>>()
         .join(",");
 
@@ -1663,7 +1740,7 @@ pub fn generate_kubernetes_config(
         advertise_address: node.ip_address.clone(),
         iface: "enp6s0".to_string(), // TODO: Get from database
         api_server_endpoint: format!("https://{}:6443", node.ip_address), // TODO: Use VIP if HA
-        initial_cluster: true, // Always true for static bootstrap
+        initial_cluster: true,       // Always true for static bootstrap
         etcd_initial_cluster,
         cni: "cilium".to_string(),
         cilium_mode: "native-routing".to_string(),
@@ -1677,83 +1754,62 @@ pub fn generate_kubernetes_config(
         kubeconfig_data: String::new(), // TODO: Include admin kubeconfig
     };
 
-    let mut nix = generate_kubernetes_node_config(&k8s_config);
+    let nix = generate_kubernetes_node_config(&k8s_config);
+    // generate_kubernetes_node_config closes `kcore.kubernetes` and then the
+    // module. Certificate options have to be inside `kcore.kubernetes`; popping
+    // two characters only removed the outer `}`, so the options landed beside
+    // the attrset and Nix evaluation failed.
+    const MODULE_CLOSE: &str = "  };\n}\n";
+    let Some(head) = nix.strip_suffix(MODULE_CLOSE) else {
+        anyhow::bail!("kubernetes nix module did not end with the expected close");
+    };
 
-    // Insert PKI certificates as module options before the closing brace
-    nix.pop(); // Remove trailing '}\n'
-    nix.pop();
-
-    nix.push_str("\n    # PKI Certificates\n");
-    nix.push_str("    caCrt = ''");
-    nix.push_str(&pki.ca_cert.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    caKey = ''");
-    nix.push_str(&pki.ca_key.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    saKey = ''");
-    nix.push_str(&pki.sa_key.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    saPub = ''");
-    nix.push_str(&pki.sa_pub.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    apiserverCrt = ''");
-    nix.push_str(&pki.apiserver_cert.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    apiserverKey = ''");
-    nix.push_str(&pki.apiserver_key.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    apiserverKubeletClientCrt = ''");
-    nix.push_str(&pki.apiserver_kubelet_client_cert.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    apiserverKubeletClientKey = ''");
-    nix.push_str(&pki.apiserver_kubelet_client_key.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    apiserverEtcdClientCrt = ''");
-    nix.push_str(&pki.apiserver_etcd_client_cert.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    apiserverEtcdClientKey = ''");
-    nix.push_str(&pki.apiserver_etcd_client_key.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    etcdCaCrt = ''");
-    nix.push_str(&pki.etcd_ca_cert.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    etcdCaKey = ''");
-    nix.push_str(&pki.etcd_ca_key.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    etcdServerCrt = ''");
-    nix.push_str(&etcd_server_cert.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    etcdServerKey = ''");
-    nix.push_str(&etcd_server_key.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    etcdPeerCrt = ''");
-    nix.push_str(&etcd_peer_cert.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    etcdPeerKey = ''");
-    nix.push_str(&etcd_peer_key.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("    kubeconfigData = ''");
-    nix.push_str(&pki.admin_kubeconfig.replace("'", "''"));
-    nix.push_str("'';\n");
-
-    nix.push_str("  };\n");
-    nix.push_str("}\n");
+    let mut nix = head.to_string();
+    nix.push_str("\n    # PKI certificates (written by modules/kcore-kubernetes.nix)\n");
+    for (name, value) in [
+        ("caCrt", pki.ca_cert.as_str()),
+        ("caKey", pki.ca_key.as_str()),
+        ("saKey", pki.sa_key.as_str()),
+        ("saPub", pki.sa_pub.as_str()),
+        ("apiserverCrt", pki.apiserver_cert.as_str()),
+        ("apiserverKey", pki.apiserver_key.as_str()),
+        (
+            "apiserverKubeletClientCrt",
+            pki.apiserver_kubelet_client_cert.as_str(),
+        ),
+        (
+            "apiserverKubeletClientKey",
+            pki.apiserver_kubelet_client_key.as_str(),
+        ),
+        (
+            "apiserverEtcdClientCrt",
+            pki.apiserver_etcd_client_cert.as_str(),
+        ),
+        (
+            "apiserverEtcdClientKey",
+            pki.apiserver_etcd_client_key.as_str(),
+        ),
+        ("etcdCaCrt", pki.etcd_ca_cert.as_str()),
+        ("etcdCaKey", pki.etcd_ca_key.as_str()),
+        ("etcdServerCrt", etcd_server_cert),
+        ("etcdServerKey", etcd_server_key),
+        ("etcdPeerCrt", etcd_peer_cert),
+        ("etcdPeerKey", etcd_peer_key),
+        ("kubeconfigData", pki.admin_kubeconfig.as_str()),
+    ] {
+        nix.push_str(&format!("    {name} = {};\n", nix_multiline(value)));
+    }
+    nix.push_str(MODULE_CLOSE);
 
     Ok(nix)
+}
+
+/// Nix indented string. PEM and kubeconfig text must not close the string or
+/// expand as an antiquotation.
+fn nix_multiline(value: &str) -> String {
+    let mut escaped = value.replace("''", "'''").replace("${", "''${");
+    if !escaped.ends_with('\n') {
+        escaped.push('\n');
+    }
+    format!("''{escaped}''")
 }
