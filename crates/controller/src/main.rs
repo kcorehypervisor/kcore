@@ -29,6 +29,7 @@ mod object_store_spec;
 mod path_safety;
 mod pci;
 mod pki;
+mod kubernetes_pki;
 mod rate_limit;
 mod replication;
 mod replication_policy;
