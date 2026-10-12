@@ -1642,6 +1642,7 @@ mod kubernetes_tests {
             node_id: "node-107".to_string(),
             hostname: "node-107".to_string(),
             ip_address: "192.168.40.107".to_string(),
+            iface: "enp6s0".to_string(),
             initial_cluster: true,
         };
         let peer = "-----BEGIN CERTIFICATE-----\nMIIBPEER\n-----END CERTIFICATE-----\n".to_string();
@@ -1683,6 +1684,18 @@ mod kubernetes_tests {
             &peer,
             "peer-key",
             std::slice::from_ref(&node),
+            &KubernetesRenderSettings {
+                api_server_endpoint: "192.168.40.200:6443".to_string(),
+                cluster_dns: "10.96.0.10".to_string(),
+                ha_enabled: true,
+                vip_address: "192.168.40.200".to_string(),
+                vip_interface: "enp6s0".to_string(),
+                cilium_mode: "native-routing".to_string(),
+                cilium_mtu: 1500,
+                cilium_tunnel: "disabled".to_string(),
+                cilium_auto_direct_routes: true,
+                cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+            },
         )
         .unwrap();
 
@@ -1695,10 +1708,29 @@ mod kubernetes_tests {
         assert!(nix.contains("etcdPeerKey"));
         assert!(nix.contains("MIIBPEER"));
         assert!(nix.contains("node-107=https://192.168.40.107:2380"));
+        assert!(nix.contains("apiServerEndpoint = \"192.168.40.200:6443\""));
+        assert!(nix.contains("haEnabled = true"));
+        assert!(nix.contains("vipAddress = \"192.168.40.200\""));
+        assert!(!nix.contains("https://https://"));
         assert!(!nix.contains("environment.etc"));
         assert!(nix.ends_with("  };\n}\n"));
         assert_eq!(nix.matches("kubeconfigData").count(), 1);
     }
+}
+
+/// Cluster-wide values copied into every node's `kcore.kubernetes` block.
+#[derive(Debug, Clone)]
+pub struct KubernetesRenderSettings {
+    pub api_server_endpoint: String,
+    pub cluster_dns: String,
+    pub ha_enabled: bool,
+    pub vip_address: String,
+    pub vip_interface: String,
+    pub cilium_mode: String,
+    pub cilium_mtu: i32,
+    pub cilium_tunnel: String,
+    pub cilium_auto_direct_routes: bool,
+    pub cilium_lb_ip_pools: Vec<String>,
 }
 
 /// Generate Kubernetes node configuration for a node in the cluster
@@ -1713,6 +1745,7 @@ pub fn generate_kubernetes_config(
     etcd_peer_cert: &str,
     etcd_peer_key: &str,
     all_nodes: &[crate::kubernetes_orchestrator::ClusterNode],
+    settings: &KubernetesRenderSettings,
 ) -> anyhow::Result<String> {
     // Build complete etcd initial cluster string with ALL members
     // For static bootstrap, every node needs the complete list
@@ -1736,21 +1769,37 @@ pub fn generate_kubernetes_config(
         cluster_name: cluster_name.to_string(),
         cluster_cidr: cluster_cidr.to_string(),
         service_cidr: service_cidr.to_string(),
-        cluster_dns: "10.96.0.10".to_string(), // TODO: Parse from service_cidr
+        cluster_dns: if settings.cluster_dns.is_empty() {
+            "10.96.0.10".to_string()
+        } else {
+            settings.cluster_dns.clone()
+        },
         advertise_address: node.ip_address.clone(),
-        iface: "enp6s0".to_string(), // TODO: Get from database
-        api_server_endpoint: format!("https://{}:6443", node.ip_address), // TODO: Use VIP if HA
-        initial_cluster: true,       // Always true for static bootstrap
+        iface: if node.iface.is_empty() {
+            "enp6s0".to_string()
+        } else {
+            node.iface.clone()
+        },
+        api_server_endpoint: api_endpoint_for_nix(&settings.api_server_endpoint, &node.ip_address),
+        initial_cluster: true, // Every member starts together on a new static cluster
         etcd_initial_cluster,
         cni: "cilium".to_string(),
-        cilium_mode: "native-routing".to_string(),
-        cilium_mtu: 1500,
-        cilium_tunnel: "disabled".to_string(),
-        cilium_auto_direct_routes: true,
-        cilium_lb_ip_pools: vec![],
-        ha_enabled: false, // TODO: Read from cluster config
-        vip_address: String::new(),
-        vip_interface: String::new(),
+        cilium_mode: if settings.cilium_mode.is_empty() {
+            "native-routing".to_string()
+        } else {
+            settings.cilium_mode.clone()
+        },
+        cilium_mtu: settings.cilium_mtu,
+        cilium_tunnel: if settings.cilium_tunnel.is_empty() {
+            "disabled".to_string()
+        } else {
+            settings.cilium_tunnel.clone()
+        },
+        cilium_auto_direct_routes: settings.cilium_auto_direct_routes,
+        cilium_lb_ip_pools: settings.cilium_lb_ip_pools.clone(),
+        ha_enabled: settings.ha_enabled,
+        vip_address: settings.vip_address.clone(),
+        vip_interface: settings.vip_interface.clone(),
         kubeconfig_data: String::new(), // TODO: Include admin kubeconfig
     };
 
@@ -1802,6 +1851,20 @@ pub fn generate_kubernetes_config(
     nix.push_str(MODULE_CLOSE);
 
     Ok(nix)
+}
+
+/// The NixOS module prefixes `https://` itself. Stored endpoints sometimes
+/// already include the scheme.
+fn api_endpoint_for_nix(raw: &str, fallback_ip: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if trimmed.is_empty() {
+        format!("{fallback_ip}:6443")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Nix indented string. PEM and kubeconfig text must not close the string or

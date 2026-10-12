@@ -1807,11 +1807,41 @@ impl Database {
 
         // Per-node etcd certs. Without these, a controller restart could not
         // push the same PKI and would mint a new CA.
+        // Schema 51 on the lab was recorded without this table, so a bare
+        // ALTER fails there. Create the table when it is missing, and add the
+        // columns only when an older table is already present.
         if version < 52 {
             conn.execute_batch(
-                "ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_certs_json TEXT NOT NULL DEFAULT '';
-                 ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_peer_certs_json TEXT NOT NULL DEFAULT '';",
+                "CREATE TABLE IF NOT EXISTS kubernetes_pki (
+                    cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    ca_cert TEXT NOT NULL,
+                    ca_key TEXT NOT NULL,
+                    sa_key TEXT NOT NULL,
+                    sa_pub TEXT NOT NULL,
+                    etcd_ca_cert TEXT NOT NULL,
+                    etcd_ca_key TEXT NOT NULL,
+                    apiserver_cert TEXT NOT NULL,
+                    apiserver_key TEXT NOT NULL,
+                    apiserver_kubelet_client_cert TEXT NOT NULL,
+                    apiserver_kubelet_client_key TEXT NOT NULL,
+                    apiserver_etcd_client_cert TEXT NOT NULL,
+                    apiserver_etcd_client_key TEXT NOT NULL,
+                    admin_kubeconfig TEXT NOT NULL,
+                    etcd_node_certs_json TEXT NOT NULL DEFAULT '',
+                    etcd_node_peer_certs_json TEXT NOT NULL DEFAULT ''
+                );",
             )?;
+            let has_node_certs: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('kubernetes_pki') WHERE name = 'etcd_node_certs_json'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_node_certs == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_certs_json TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_peer_certs_json TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;

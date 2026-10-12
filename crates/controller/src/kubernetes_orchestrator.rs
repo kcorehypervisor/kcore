@@ -310,7 +310,12 @@ impl KubernetesOrchestrator {
             nodes.push(ClusterNode {
                 node_id: row.node_id,
                 hostname: node.hostname,
-                ip_address: node.address.split(':').next().unwrap_or("").to_string(),
+                ip_address: if row.advertise_address.is_empty() {
+                    node.address.split(':').next().unwrap_or("").to_string()
+                } else {
+                    row.advertise_address
+                },
+                iface: row.iface,
                 initial_cluster: row.initial_cluster,
             });
         }
@@ -426,6 +431,13 @@ impl KubernetesOrchestrator {
         );
 
         let address = format!("{}:9091", node.ip_address);
+        // Startup redeploy runs before the controller has dialed every node.
+        if self.node_clients.get_admin(&address).is_none() {
+            self.node_clients
+                .connect(&address)
+                .await
+                .with_context(|| format!("connect node agent {address}"))?;
+        }
         let mut admin_client = self
             .node_clients
             .get_admin(&address)
@@ -441,6 +453,32 @@ impl KubernetesOrchestrator {
             .get(&node.node_id)
             .context("etcd peer cert not found")?;
 
+        let cluster = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+        let cfg = self
+            .db
+            .get_kubernetes_cluster_config(cluster_name)?
+            .context("cluster config not found")?;
+        let settings = crate::nixgen::KubernetesRenderSettings {
+            api_server_endpoint: cluster.api_server_endpoint,
+            cluster_dns: cluster.cluster_dns,
+            ha_enabled: cfg.ha_enabled,
+            vip_address: cfg.vip_address,
+            vip_interface: cfg.vip_interface,
+            cilium_mode: cfg.cilium_mode,
+            cilium_mtu: cfg.cilium_mtu,
+            cilium_tunnel: cfg.cilium_tunnel,
+            cilium_auto_direct_routes: cfg.cilium_auto_direct_routes,
+            cilium_lb_ip_pools: cfg
+                .cilium_lb_ip_pools
+                .split(',')
+                .filter(|pool| !pool.is_empty())
+                .map(|pool| pool.to_string())
+                .collect(),
+        };
+
         // Build complete Kubernetes Nix config with embedded PKI
         let k8s_config = crate::nixgen::generate_kubernetes_config(
             cluster_name,
@@ -453,6 +491,7 @@ impl KubernetesOrchestrator {
             etcd_peer_cert,
             etcd_peer_key,
             all_nodes,
+            &settings,
         )?;
 
         info!(
@@ -611,6 +650,7 @@ pub struct ClusterNode {
     pub node_id: String,
     pub hostname: String,
     pub ip_address: String,
+    pub iface: String,
     pub initial_cluster: bool,
 }
 
@@ -632,15 +672,24 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
                 let api_endpoint = cluster.api_server_endpoint.clone();
                 let service_cidr = cluster.service_cidr.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = orchestrator
-                        .redeploy_node_certificates(&cluster_name, &api_endpoint, &service_cidr)
-                        .await
-                    {
-                        error!(
-                            cluster = cluster_name,
-                            error = %e,
-                            "kubernetes certificate redeploy failed"
-                        );
+                    // Node agents may still be restarting when the controller
+                    // comes up. This path runs once per process, so retry.
+                    for attempt in 1..=6 {
+                        match orchestrator
+                            .redeploy_node_certificates(&cluster_name, &api_endpoint, &service_cidr)
+                            .await
+                        {
+                            Ok(()) => return,
+                            Err(e) => {
+                                error!(
+                                    cluster = cluster_name,
+                                    attempt,
+                                    error = %e,
+                                    "kubernetes certificate redeploy failed"
+                                );
+                                sleep(Duration::from_secs(5)).await;
+                            }
+                        }
                     }
                 });
             }
