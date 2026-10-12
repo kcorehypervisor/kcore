@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    IsCa, KeyPair, KeyUsagePurpose, SanType,
+    IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
@@ -66,54 +66,57 @@ pub fn generate_kubernetes_pki(
     let service_cluster_ip = parse_first_ip(service_cidr)?;
 
     // Generate Kubernetes CA
-    let (ca_cert_obj, ca_cert, ca_key) = generate_ca_with_cert("kubernetes-ca", "kubernetes", 3650)?;
+    let (ca_cert, ca_key) = generate_ca("kubernetes-ca", "kubernetes", 3650)?;
     
     // Generate etcd CA
-    let (etcd_ca_cert_obj, etcd_ca_cert, etcd_ca_key) = generate_ca_with_cert("etcd-ca", "etcd", 3650)?;
+    let (etcd_ca_cert, etcd_ca_key) = generate_ca("etcd-ca", "etcd", 3650)?;
 
     // Generate service account keys
     let (sa_key, sa_pub) = generate_key_pair()?;
 
     // Build API server SANs
     let mut api_sans = vec![
-        SanType::DnsName("kubernetes".to_string()),
-        SanType::DnsName("kubernetes.default".to_string()),
-        SanType::DnsName("kubernetes.default.svc".to_string()),
-        SanType::DnsName("kubernetes.default.svc.cluster.local".to_string()),
+        SanType::DnsName("kubernetes".try_into().unwrap()),
+        SanType::DnsName("kubernetes.default".try_into().unwrap()),
+        SanType::DnsName("kubernetes.default.svc".try_into().unwrap()),
+        SanType::DnsName("kubernetes.default.svc.cluster.local".try_into().unwrap()),
         SanType::IpAddress(service_cluster_ip.parse().context("invalid service IP")?),
         SanType::IpAddress(api_vip.parse().context("invalid API VIP")?),
         SanType::IpAddress("127.0.0.1".parse().unwrap()),
     ];
 
     for node in nodes {
-        api_sans.push(SanType::DnsName(node.hostname.clone()));
+        api_sans.push(SanType::DnsName(node.hostname.as_str().try_into().unwrap()));
         api_sans.push(SanType::IpAddress(
             node.ip_address.parse().context("invalid node IP")?,
         ));
     }
 
     // Generate API server certificate
-    let (apiserver_cert, apiserver_key) = generate_server_cert_with_ca(
+    let (apiserver_cert, apiserver_key) = generate_server_cert(
         "kube-apiserver",
         "kubernetes",
         &api_sans,
-        &ca_cert_obj,
+        &ca_cert,
+        &ca_key,
         365,
     )?;
 
     // Generate API server kubelet client certificate
-    let (apiserver_kubelet_client_cert, apiserver_kubelet_client_key) = generate_client_cert_with_ca(
+    let (apiserver_kubelet_client_cert, apiserver_kubelet_client_key) = generate_client_cert(
         "kube-apiserver-kubelet-client",
         "system:masters",
-        &ca_cert_obj,
+        &ca_cert,
+        &ca_key,
         365,
     )?;
 
     // Generate API server etcd client certificate
-    let (apiserver_etcd_client_cert, apiserver_etcd_client_key) = generate_client_cert_with_ca(
+    let (apiserver_etcd_client_cert, apiserver_etcd_client_key) = generate_client_cert(
         "kube-apiserver-etcd-client",
         "system:masters",
-        &etcd_ca_cert_obj,
+        &etcd_ca_cert,
+        &etcd_ca_key,
         365,
     )?;
 
@@ -123,25 +126,27 @@ pub fn generate_kubernetes_pki(
 
     for node in nodes {
         let etcd_sans = vec![
-            SanType::DnsName(node.hostname.clone()),
-            SanType::DnsName("localhost".to_string()),
+            SanType::DnsName(node.hostname.as_str().try_into().unwrap()),
+            SanType::DnsName("localhost".try_into().unwrap()),
             SanType::IpAddress(node.ip_address.parse().context("invalid node IP")?),
             SanType::IpAddress("127.0.0.1".parse().unwrap()),
         ];
 
-        let (server_cert, server_key) = generate_server_cert_with_ca(
+        let (server_cert, server_key) = generate_server_cert(
             &node.hostname,
             "etcd",
             &etcd_sans,
-            &etcd_ca_cert_obj,
+            &etcd_ca_cert,
+            &etcd_ca_key,
             365,
         )?;
 
-        let (peer_cert, peer_key) = generate_server_cert_with_ca(
+        let (peer_cert, peer_key) = generate_server_cert(
             &node.hostname,
             "etcd",
             &etcd_sans,
-            &etcd_ca_cert_obj,
+            &etcd_ca_cert,
+            &etcd_ca_key,
             365,
         )?;
 
@@ -150,10 +155,11 @@ pub fn generate_kubernetes_pki(
     }
 
     // Generate admin kubeconfig
-    let (admin_cert, admin_key) = generate_client_cert_with_ca(
+    let (admin_cert, admin_key) = generate_client_cert(
         "kubernetes-admin",
         "system:masters",
-        &ca_cert_obj,
+        &ca_cert,
+        &ca_key,
         365,
     )?;
 
@@ -210,36 +216,12 @@ fn generate_ca(cn: &str, org: &str, days: u32) -> Result<(String, String)> {
     Ok((cert_pem, key_pem))
 }
 
-fn generate_ca_with_cert(cn: &str, org: &str, days: u32) -> Result<(Certificate, String, String)> {
-    let mut params = CertificateParams::default();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + Duration::days(days as i64);
-
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, cn);
-    dn.push(DnType::OrganizationName, org);
-    params.distinguished_name = dn;
-
-    params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-    ];
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-
-    Ok((cert, cert_pem, key_pem))
-}
-
-fn generate_server_cert_with_ca(
+fn generate_server_cert(
     cn: &str,
     org: &str,
     sans: &[SanType],
-    ca_cert: &Certificate,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
     days: u32,
 ) -> Result<(String, String)> {
     let mut params = CertificateParams::default();
@@ -263,18 +245,22 @@ fn generate_server_cert_with_ca(
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
 
+    let ca_key = KeyPair::from_pem(ca_key_pem)?;
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
+    
     let key_pair = KeyPair::generate()?;
-    let cert = params.signed_by(&key_pair, ca_cert, &ca_cert.key_pair().ok_or_else(|| anyhow::anyhow!("CA has no key pair"))?)?;
+    let cert = params.signed_by(&key_pair, &issuer)?;
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
 
     Ok((cert_pem, key_pem))
 }
 
-fn generate_client_cert_with_ca(
+fn generate_client_cert(
     cn: &str,
     org: &str,
-    ca_cert: &Certificate,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
     days: u32,
 ) -> Result<(String, String)> {
     let mut params = CertificateParams::default();
@@ -293,8 +279,11 @@ fn generate_client_cert_with_ca(
 
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
 
+    let ca_key = KeyPair::from_pem(ca_key_pem)?;
+    let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
+    
     let key_pair = KeyPair::generate()?;
-    let cert = params.signed_by(&key_pair, ca_cert, &ca_cert.key_pair().ok_or_else(|| anyhow::anyhow!("CA has no key pair"))?)?;
+    let cert = params.signed_by(&key_pair, &issuer)?;
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
 

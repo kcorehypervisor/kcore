@@ -138,25 +138,21 @@ pub fn build_crl(
         issuing_distribution_point: None,
         revoked_certs,
         key_identifier_method: KeyIdMethod::Sha256,
-        alg: &rcgen::PKCS_RSA_SHA256,
     };
 
     let key = KeyPair::from_pem(sub_ca_key_pem).map_err(|e| format!("loading sub-CA key: {e}"))?;
     let issuer = Issuer::from_ca_cert_pem(sub_ca_cert_pem, key)
         .map_err(|e| format!("loading sub-CA cert: {e}"))?;
-    let crl: CertificateRevocationList = CertificateRevocationList::from_params(params)
-        .map_err(|e| format!("creating CRL: {e}"))?;
-    let crl_pem = crl.serialize_pem_with_signer(&issuer)
+    let crl: CertificateRevocationList = params
+        .signed_by(&issuer)
         .map_err(|e| format!("signing CRL: {e}"))?;
-    let crl_der = crl.serialize_der_with_signer(&issuer)
-        .map_err(|e| format!("signing CRL DER: {e}"))?;
 
     Ok(SignedCrl {
         crl_number,
         this_update,
         next_update,
-        pem: crl_pem,
-        der: crl_der,
+        pem: crl.pem().map_err(|e| format!("encoding CRL PEM: {e}"))?,
+        der: crl.der().to_vec(),
         revoked_count,
     })
 }
