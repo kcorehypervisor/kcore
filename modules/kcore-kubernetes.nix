@@ -163,6 +163,106 @@ in
       default = "";
       description = "Base64-encoded kubeconfig content (written by node-agent).";
     };
+
+    # PKI Certificates - Kubernetes CA
+    caCrt = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "Kubernetes CA certificate (PEM).";
+    };
+
+    caKey = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "Kubernetes CA private key (PEM).";
+    };
+
+    # Service Account keys
+    saKey = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "Service account signing private key (PEM).";
+    };
+
+    saPub = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "Service account public key (PEM).";
+    };
+
+    # API Server certificates
+    apiserverCrt = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "API server certificate (PEM).";
+    };
+
+    apiserverKey = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "API server private key (PEM).";
+    };
+
+    apiserverKubeletClientCrt = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "API server kubelet client certificate (PEM).";
+    };
+
+    apiserverKubeletClientKey = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "API server kubelet client private key (PEM).";
+    };
+
+    apiserverEtcdClientCrt = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "API server etcd client certificate (PEM).";
+    };
+
+    apiserverEtcdClientKey = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "API server etcd client private key (PEM).";
+    };
+
+    # etcd CA and certificates
+    etcdCaCrt = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "etcd CA certificate (PEM).";
+    };
+
+    etcdCaKey = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "etcd CA private key (PEM).";
+    };
+
+    etcdServerCrt = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "etcd server certificate (PEM).";
+    };
+
+    etcdServerKey = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "etcd server private key (PEM).";
+    };
+
+    etcdPeerCrt = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "etcd peer certificate (PEM).";
+    };
+
+    etcdPeerKey = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "etcd peer private key (PEM).";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -198,7 +298,7 @@ in
     boot.kernel.sysctl = {
       "net.bridge.bridge-nf-call-iptables" = 1;
       "net.bridge.bridge-nf-call-ip6tables" = 1;
-      "net.ipv4.ip_forward" = 1;
+      "net.ipv4.ip_forward" = lib.mkDefault 1;
       "net.ipv4.conf.all.forwarding" = 1;
       "net.ipv6.conf.all.forwarding" = 1;
     };
@@ -210,8 +310,33 @@ in
         etcd
         cilium-cli
         kubectl
+        containerd
       ]
       ++ lib.optionals cfg.haEnabled [ keepalived ];
+
+    # containerd configuration
+    virtualisation.containerd = {
+      enable = true;
+      settings = {
+        version = 2;
+        plugins."io.containerd.grpc.v1.cri" = {
+          cni = {
+            bin_dir = "/opt/cni/bin";
+            conf_dir = "/etc/cni/net.d";
+          };
+          containerd = {
+            runtimes = {
+              runc = {
+                runtime_type = "io.containerd.runc.v2";
+                options = {
+                  SystemdCgroup = true;
+                };
+              };
+            };
+          };
+        };
+      };
+    };
 
     # Firewall configuration
     networking.firewall = {
@@ -239,6 +364,144 @@ in
 
     # Write kubeconfig if provided
     environment.etc."kubernetes/admin.conf" = lib.mkIf (cfg.kubeconfigData != "") {
+      text = cfg.kubeconfigData;
+      mode = "0600";
+    };
+
+    # Write PKI certificates
+    environment.etc."kubernetes/pki/ca.crt" = lib.mkIf (cfg.caCrt != "") {
+      text = cfg.caCrt;
+      mode = "0644";
+    };
+
+    environment.etc."kubernetes/pki/ca.key" = lib.mkIf (cfg.caKey != "") {
+      text = cfg.caKey;
+      mode = "0600";
+    };
+
+    environment.etc."kubernetes/pki/sa.key" = lib.mkIf (cfg.saKey != "") {
+      text = cfg.saKey;
+      mode = "0600";
+    };
+
+    environment.etc."kubernetes/pki/sa.pub" = lib.mkIf (cfg.saPub != "") {
+      text = cfg.saPub;
+      mode = "0644";
+    };
+
+    environment.etc."kubernetes/pki/apiserver.crt" = lib.mkIf (cfg.apiserverCrt != "") {
+      text = cfg.apiserverCrt;
+      mode = "0644";
+    };
+
+    environment.etc."kubernetes/pki/apiserver.key" = lib.mkIf (cfg.apiserverKey != "") {
+      text = cfg.apiserverKey;
+      mode = "0600";
+    };
+
+    environment.etc."kubernetes/pki/apiserver-kubelet-client.crt" = lib.mkIf (cfg.apiserverKubeletClientCrt != "") {
+      text = cfg.apiserverKubeletClientCrt;
+      mode = "0644";
+    };
+
+    environment.etc."kubernetes/pki/apiserver-kubelet-client.key" = lib.mkIf (cfg.apiserverKubeletClientKey != "") {
+      text = cfg.apiserverKubeletClientKey;
+      mode = "0600";
+    };
+
+    environment.etc."kubernetes/pki/apiserver-etcd-client.crt" = lib.mkIf (cfg.apiserverEtcdClientCrt != "") {
+      text = cfg.apiserverEtcdClientCrt;
+      mode = "0644";
+    };
+
+    environment.etc."kubernetes/pki/apiserver-etcd-client.key" = lib.mkIf (cfg.apiserverEtcdClientKey != "") {
+      text = cfg.apiserverEtcdClientKey;
+      mode = "0600";
+    };
+
+    environment.etc."kubernetes/pki/etcd/ca.crt" = lib.mkIf (cfg.etcdCaCrt != "") {
+      text = cfg.etcdCaCrt;
+      mode = "0644";
+    };
+
+    environment.etc."kubernetes/pki/etcd/ca.key" = lib.mkIf (cfg.etcdCaKey != "") {
+      text = cfg.etcdCaKey;
+      mode = "0600";
+    };
+
+    environment.etc."kubernetes/pki/etcd/server.crt" = lib.mkIf (cfg.etcdServerCrt != "") {
+      text = cfg.etcdServerCrt;
+      mode = "0644";
+    };
+
+    environment.etc."kubernetes/pki/etcd/server.key" = lib.mkIf (cfg.etcdServerKey != "") {
+      text = cfg.etcdServerKey;
+      mode = "0600";
+    };
+
+    environment.etc."kubernetes/pki/etcd/peer.crt" = lib.mkIf (cfg.etcdPeerCrt != "") {
+      text = cfg.etcdPeerCrt;
+      mode = "0644";
+    };
+
+    environment.etc."kubernetes/pki/etcd/peer.key" = lib.mkIf (cfg.etcdPeerKey != "") {
+      text = cfg.etcdPeerKey;
+      mode = "0600";
+    };
+
+    # Kubelet configuration file
+    environment.etc."kubernetes/kubelet-config.yaml" = {
+      text = ''
+        apiVersion: kubelet.config.k8s.io/v1beta1
+        kind: KubeletConfiguration
+        authentication:
+          anonymous:
+            enabled: false
+          webhook:
+            enabled: true
+          x509:
+            clientCAFile: /etc/kubernetes/pki/ca.crt
+        authorization:
+          mode: Webhook
+        cgroupDriver: systemd
+        clusterDNS:
+          - ${cfg.clusterDns}
+        clusterDomain: cluster.local
+        containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+        cpuManagerReconcilePeriod: 10s
+        evictionHard:
+          imagefs.available: 15%
+          memory.available: 100Mi
+          nodefs.available: 10%
+        failSwapOn: false
+        hairpinMode: hairpin-veth
+        healthzBindAddress: 0.0.0.0
+        healthzPort: ${toString k8sPorts.kubeletHealthz}
+        imageMinimumGCAge: 2m0s
+        logging:
+          format: text
+        maxPods: 110
+        podCIDR: ${cfg.clusterCidr}
+        port: ${toString k8sPorts.kubeletApi}
+        resolvConf: /etc/resolv.conf
+        runtimeRequestTimeout: 15m
+        staticPodPath: /etc/kubernetes/manifests
+        streamingConnectionIdleTimeout: 4h0m0s
+        syncFrequency: 1m0s
+        tlsCertFile: /var/lib/kubelet/pki/kubelet-client-current.pem
+        volumePluginDir: /usr/libexec/kubernetes/kubelet-plugins/volume/exec/
+      '';
+      mode = "0644";
+    };
+
+    # Bootstrap kubeconfig for kubelet (minimal, will be replaced after TLS bootstrap)
+    environment.etc."kubernetes/bootstrap-kubelet.conf" = lib.mkIf (cfg.kubeconfigData != "") {
+      text = cfg.kubeconfigData;
+      mode = "0600";
+    };
+
+    # Kubelet kubeconfig (will be created by kubelet TLS bootstrap)
+    environment.etc."kubernetes/kubelet.conf" = lib.mkIf (cfg.kubeconfigData != "") {
       text = cfg.kubeconfigData;
       mode = "0600";
     };
