@@ -3997,6 +3997,81 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn apply_raw_kubernetes_config(
+        &self,
+        request: Request<proto::ApplyRawKubernetesConfigRequest>,
+    ) -> Result<Response<proto::ApplyKubernetesConfigResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+
+        // Write the complete Nix module config to kcore-kubernetes.nix
+        let k8s_config_path = PathBuf::from("/etc/nixos/kcore-kubernetes.nix");
+        
+        tokio::task::spawn_blocking({
+            let path = k8s_config_path.clone();
+            let content = req.nix_config_content.clone();
+            move || std::fs::write(&path, &content)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(|e| {
+            error!(path = %k8s_config_path.display(), error = %e, "failed to write kubernetes config");
+            Status::internal(format!("writing {}: {e}", k8s_config_path.display()))
+        })?;
+
+        info!(
+            path = %k8s_config_path.display(),
+            config_size = req.nix_config_content.len(),
+            "wrote raw kubernetes config with embedded PKI"
+        );
+
+        // Generate apply_id for tracking
+        let apply_id = format!("k8s-apply-{}", uuid_like_suffix());
+        write_apply_state(&apply_id, "running", "queued");
+
+        // Write kubeconfig if provided
+        if !req.kubeconfig_data.is_empty() {
+            let kubeconfig_path = PathBuf::from("/etc/kubernetes/admin.conf");
+            tokio::task::spawn_blocking({
+                let path = kubeconfig_path.clone();
+                let data = req.kubeconfig_data.clone();
+                move || {
+                    std::fs::create_dir_all("/etc/kubernetes")?;
+                    std::fs::write(&path, &data)?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                    Ok::<_, std::io::Error>(())
+                }
+            })
+            .await
+            .map_err(|e| Status::internal(format!("kubeconfig task join: {e}")))?
+            .map_err(|e| {
+                error!(error = %e, "failed to write kubeconfig");
+                Status::internal(format!("writing kubeconfig: {e}"))
+            })?;
+            
+            info!("wrote admin kubeconfig to /etc/kubernetes/admin.conf");
+        }
+
+        // Start background nixos-rebuild
+        let apply_lock = Arc::clone(&self.apply_lock);
+        let spawned_id = apply_id.clone();
+        let nix_config_path = self.nix_config_path.clone();
+
+        tokio::spawn(async move {
+            let _guard = apply_lock.lock().await;
+            Self::run_k8s_nixos_rebuild(nix_config_path, spawned_id).await;
+        });
+
+        Ok(Response::new(proto::ApplyKubernetesConfigResponse {
+            apply_id: apply_id.clone(),
+            status: "started".to_string(),
+            message: format!(
+                "Raw Kubernetes configuration written; nixos-rebuild started ({})",
+                apply_id
+            ),
+        }))
+    }
+
     async fn drain_kubernetes_node(
         &self,
         request: Request<proto::DrainKubernetesNodeRequest>,
@@ -4094,59 +4169,43 @@ impl AdminService {
     }
 
     async fn run_k8s_nixos_rebuild(config_path: PathBuf, apply_id: String) {
-        write_apply_state(&apply_id, "rebuilding", "running nixos-rebuild test");
+        write_apply_state(&apply_id, "rebuilding", "running nixos-rebuild switch");
 
-        let test_result = tokio::process::Command::new("nixos-rebuild")
-            .arg("test")
-            .arg("--flake")
-            .arg(format!(".#{}", config_path.display()))
+        // Get NIX_PATH from bash login shell, then run nixos-rebuild
+        // This ensures we have the correct nixpkgs path from the system configuration
+        let switch_result = tokio::process::Command::new("bash")
+            .arg("-lc")
+            .arg("NIX_PATH=\"$NIX_PATH:nixos-config=/etc/nixos/configuration.nix\" nixos-rebuild switch --fast")
             .output()
             .await;
 
-        match test_result {
+        match switch_result {
             Ok(output) if output.status.success() => {
-                info!(apply_id = %apply_id, "nixos-rebuild test succeeded");
-                write_apply_state(&apply_id, "activating", "running nixos-rebuild switch");
-
-                let switch_result = tokio::process::Command::new("nixos-rebuild")
-                    .arg("switch")
-                    .arg("--flake")
-                    .arg(format!(".#{}", config_path.display()))
-                    .output()
-                    .await;
-
-                match switch_result {
-                    Ok(output) if output.status.success() => {
-                        info!(apply_id = %apply_id, "nixos-rebuild switch succeeded");
-                        write_apply_state(
-                            &apply_id,
-                            "completed",
-                            "kubernetes configuration active",
-                        );
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        error!(apply_id = %apply_id, error = %stderr, "nixos-rebuild switch failed");
-                        write_apply_state(
-                            &apply_id,
-                            "failed",
-                            &format!("switch failed: {}", stderr),
-                        );
-                    }
-                    Err(e) => {
-                        error!(apply_id = %apply_id, error = %e, "failed to run nixos-rebuild switch");
-                        write_apply_state(&apply_id, "failed", &format!("switch error: {}", e));
-                    }
-                }
+                info!(apply_id = %apply_id, "nixos-rebuild switch succeeded");
+                write_apply_state(
+                    &apply_id,
+                    "completed",
+                    "kubernetes configuration active",
+                );
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                error!(apply_id = %apply_id, error = %stderr, "nixos-rebuild test failed");
-                write_apply_state(&apply_id, "failed", &format!("test failed: {}", stderr));
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                error!(
+                    apply_id = %apply_id,
+                    stderr = %stderr,
+                    stdout = %stdout,
+                    "nixos-rebuild switch failed"
+                );
+                write_apply_state(
+                    &apply_id,
+                    "failed",
+                    &format!("switch failed: {}", stderr),
+                );
             }
             Err(e) => {
-                error!(apply_id = %apply_id, error = %e, "failed to run nixos-rebuild test");
-                write_apply_state(&apply_id, "failed", &format!("test error: {}", e));
+                error!(apply_id = %apply_id, error = %e, "failed to run nixos-rebuild switch");
+                write_apply_state(&apply_id, "failed", &format!("switch error: {}", e));
             }
         }
     }

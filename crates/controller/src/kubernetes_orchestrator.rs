@@ -129,8 +129,15 @@ impl KubernetesOrchestrator {
         // Phase 3: Configure bootstrap node (initialCluster=true)
         self.update_phase(cluster_name, BootstrapPhase::ConfiguringBootstrapNode)
             .await?;
-        self.configure_node(cluster_name, bootstrap_node, &pki, cluster_cidr, service_cidr, true)
-            .await?;
+        self.configure_node(
+            cluster_name,
+            bootstrap_node,
+            &pki,
+            cluster_cidr,
+            service_cidr,
+            true,
+        )
+        .await?;
 
         // Phase 4: Wait for etcd leader election on bootstrap node
         self.update_phase(cluster_name, BootstrapPhase::WaitingForEtcdLeader)
@@ -155,7 +162,8 @@ impl KubernetesOrchestrator {
                 "joining node to cluster"
             );
 
-            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, false).await?;
+            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, false)
+                .await?;
 
             // Wait a bit between joins to ensure cluster stability
             sleep(Duration::from_secs(10)).await;
@@ -237,7 +245,8 @@ impl KubernetesOrchestrator {
             );
 
             // All new nodes join existing cluster (initialCluster=false)
-            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, false).await?;
+            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, false)
+                .await?;
 
             // Wait between additions
             sleep(Duration::from_secs(15)).await;
@@ -356,7 +365,7 @@ impl KubernetesOrchestrator {
             .get(&node.node_id)
             .context("etcd peer cert not found")?;
 
-        // Build Kubernetes config
+        // Build complete Kubernetes Nix config with embedded PKI
         let k8s_config = crate::nixgen::generate_kubernetes_config(
             cluster_name,
             node,
@@ -370,16 +379,33 @@ impl KubernetesOrchestrator {
             initial_cluster,
         )?;
 
-        // Apply configuration via node agent RPC
-        // TODO: For now, write config directly instead of using the RPC's built-in generator
-        // The RPC expects individual parameters, but we have a complete Nix module
-        // We'll need to enhance the RPC or add a new one that accepts raw Nix config
-        
         info!(
             cluster = cluster_name,
             node_id = node.node_id,
             config_len = k8s_config.len(),
-            "Kubernetes configuration generated (deployment pending RPC enhancement)"
+            "generated Kubernetes configuration with embedded PKI"
+        );
+
+        // Apply configuration via node agent RPC
+        use crate::node_proto::ApplyRawKubernetesConfigRequest;
+        
+        let request = ApplyRawKubernetesConfigRequest {
+            nix_config_content: k8s_config,
+            kubeconfig_data: pki.admin_kubeconfig.clone(),
+        };
+
+        let response = admin_client
+            .apply_raw_kubernetes_config(request)
+            .await
+            .context("apply_raw_kubernetes_config RPC failed")?
+            .into_inner();
+
+        info!(
+            cluster = cluster_name,
+            node_id = node.node_id,
+            apply_id = response.apply_id,
+            status = response.status,
+            "Kubernetes configuration deployment started on node"
         );
 
         Ok(())
@@ -450,7 +476,7 @@ impl KubernetesOrchestrator {
 
     async fn count_healthy_etcd_members(&self, cluster_name: &str) -> Result<usize> {
         let _nodes = self.get_cluster_nodes(cluster_name).await?;
-        
+
         // TODO: Implement actual etcd status check via node agent RPC
         // For now, always return 0 to force fresh bootstrap
         // This ensures clusters are always bootstrapped from scratch until
@@ -513,10 +539,7 @@ pub struct ClusterNode {
 }
 
 /// Background task that orchestrates Kubernetes cluster bootstraps
-pub async fn start_kubernetes_orchestrator(
-    db: Database,
-    node_clients: NodeClients,
-) {
+pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClients) {
     let orchestrator = KubernetesOrchestrator::new(db.clone(), node_clients);
 
     loop {
