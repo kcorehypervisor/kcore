@@ -66,10 +66,10 @@ pub fn generate_kubernetes_pki(
     let service_cluster_ip = parse_first_ip(service_cidr)?;
 
     // Generate Kubernetes CA
-    let (ca_cert, ca_key) = generate_ca("kubernetes-ca", "kubernetes", 3650)?;
-
+    let (ca_cert_obj, ca_cert, ca_key) = generate_ca_with_cert("kubernetes-ca", "kubernetes", 3650)?;
+    
     // Generate etcd CA
-    let (etcd_ca_cert, etcd_ca_key) = generate_ca("etcd-ca", "etcd", 3650)?;
+    let (etcd_ca_cert_obj, etcd_ca_cert, etcd_ca_key) = generate_ca_with_cert("etcd-ca", "etcd", 3650)?;
 
     // Generate service account keys
     let (sa_key, sa_pub) = generate_key_pair()?;
@@ -93,30 +93,27 @@ pub fn generate_kubernetes_pki(
     }
 
     // Generate API server certificate
-    let (apiserver_cert, apiserver_key) = generate_server_cert(
+    let (apiserver_cert, apiserver_key) = generate_server_cert_with_ca(
         "kube-apiserver",
         "kubernetes",
         &api_sans,
-        &ca_cert,
-        &ca_key,
+        &ca_cert_obj,
         365,
     )?;
 
     // Generate API server kubelet client certificate
-    let (apiserver_kubelet_client_cert, apiserver_kubelet_client_key) = generate_client_cert(
+    let (apiserver_kubelet_client_cert, apiserver_kubelet_client_key) = generate_client_cert_with_ca(
         "kube-apiserver-kubelet-client",
         "system:masters",
-        &ca_cert,
-        &ca_key,
+        &ca_cert_obj,
         365,
     )?;
 
     // Generate API server etcd client certificate
-    let (apiserver_etcd_client_cert, apiserver_etcd_client_key) = generate_client_cert(
+    let (apiserver_etcd_client_cert, apiserver_etcd_client_key) = generate_client_cert_with_ca(
         "kube-apiserver-etcd-client",
         "system:masters",
-        &etcd_ca_cert,
-        &etcd_ca_key,
+        &etcd_ca_cert_obj,
         365,
     )?;
 
@@ -132,21 +129,19 @@ pub fn generate_kubernetes_pki(
             SanType::IpAddress("127.0.0.1".parse().unwrap()),
         ];
 
-        let (server_cert, server_key) = generate_server_cert(
+        let (server_cert, server_key) = generate_server_cert_with_ca(
             &node.hostname,
             "etcd",
             &etcd_sans,
-            &etcd_ca_cert,
-            &etcd_ca_key,
+            &etcd_ca_cert_obj,
             365,
         )?;
 
-        let (peer_cert, peer_key) = generate_server_cert(
+        let (peer_cert, peer_key) = generate_server_cert_with_ca(
             &node.hostname,
             "etcd",
             &etcd_sans,
-            &etcd_ca_cert,
-            &etcd_ca_key,
+            &etcd_ca_cert_obj,
             365,
         )?;
 
@@ -155,11 +150,10 @@ pub fn generate_kubernetes_pki(
     }
 
     // Generate admin kubeconfig
-    let (admin_cert, admin_key) = generate_client_cert(
+    let (admin_cert, admin_key) = generate_client_cert_with_ca(
         "kubernetes-admin",
         "system:masters",
-        &ca_cert,
-        &ca_key,
+        &ca_cert_obj,
         365,
     )?;
 
@@ -208,25 +202,46 @@ fn generate_ca(cn: &str, org: &str, days: u32) -> Result<(String, String)> {
         KeyUsagePurpose::CrlSign,
     ];
 
-    let cert = Certificate::from_params(params).context("failed to generate CA certificate")?;
-    let cert_pem = cert.serialize_pem().context("failed to serialize CA cert")?;
-    let key_pem = cert.serialize_private_key_pem();
+    let key_pair = KeyPair::generate(&rcgen::PKCS_RSA_SHA256)?;
+    let cert = Certificate::from_params(params)?;
+    let cert_pem = cert.serialize_pem()?;
+    let key_pem = key_pair.serialize_pem();
 
     Ok((cert_pem, key_pem))
 }
 
-fn generate_server_cert(
+fn generate_ca_with_cert(cn: &str, org: &str, days: u32) -> Result<(Certificate, String, String)> {
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.not_before = OffsetDateTime::now_utc();
+    params.not_after = OffsetDateTime::now_utc() + Duration::days(days as i64);
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    dn.push(DnType::OrganizationName, org);
+    params.distinguished_name = dn;
+
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+
+    let key_pair = KeyPair::generate(&rcgen::PKCS_RSA_SHA256)?;
+    let cert = Certificate::from_params(params)?;
+    let cert_pem = cert.serialize_pem()?;
+    let key_pem = key_pair.serialize_pem();
+
+    Ok((cert, cert_pem, key_pem))
+}
+
+fn generate_server_cert_with_ca(
     cn: &str,
     org: &str,
     sans: &[SanType],
-    ca_cert_pem: &str,
-    ca_key_pem: &str,
+    ca_cert: &Certificate,
     days: u32,
 ) -> Result<(String, String)> {
-    let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem, KeyPair::from_pem(ca_key_pem)?)
-        .context("failed to parse CA certificate")?;
-    let ca_cert = Certificate::from_params(ca_cert_params)?;
-
     let mut params = CertificateParams::default();
     params.not_before = OffsetDateTime::now_utc();
     params.not_after = OffsetDateTime::now_utc() + Duration::days(days as i64);
@@ -248,26 +263,19 @@ fn generate_server_cert(
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
 
-    let cert = Certificate::from_params(params).context("failed to generate server certificate")?;
-    let cert_pem = cert
-        .serialize_pem_with_signer(&ca_cert)
-        .context("failed to serialize server cert")?;
+    let cert = Certificate::from_params(params)?;
+    let cert_pem = cert.serialize_pem_with_signer(ca_cert)?;
     let key_pem = cert.serialize_private_key_pem();
 
     Ok((cert_pem, key_pem))
 }
 
-fn generate_client_cert(
+fn generate_client_cert_with_ca(
     cn: &str,
     org: &str,
-    ca_cert_pem: &str,
-    ca_key_pem: &str,
+    ca_cert: &Certificate,
     days: u32,
 ) -> Result<(String, String)> {
-    let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem, KeyPair::from_pem(ca_key_pem)?)
-        .context("failed to parse CA certificate")?;
-    let ca_cert = Certificate::from_params(ca_cert_params)?;
-
     let mut params = CertificateParams::default();
     params.not_before = OffsetDateTime::now_utc();
     params.not_after = OffsetDateTime::now_utc() + Duration::days(days as i64);
@@ -284,10 +292,8 @@ fn generate_client_cert(
 
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
 
-    let cert = Certificate::from_params(params).context("failed to generate client certificate")?;
-    let cert_pem = cert
-        .serialize_pem_with_signer(&ca_cert)
-        .context("failed to serialize client cert")?;
+    let cert = Certificate::from_params(params)?;
+    let cert_pem = cert.serialize_pem_with_signer(ca_cert)?;
     let key_pem = cert.serialize_private_key_pem();
 
     Ok((cert_pem, key_pem))
@@ -300,7 +306,7 @@ fn generate_key_pair() -> Result<(String, String)> {
         .public_key_pem()
         .lines()
         .skip(1)
-        .take_while(|line| !line.starts_with("-----END"))
+        .take_while(|line: &&str| !line.starts_with("-----END"))
         .collect::<Vec<_>>()
         .join("\n");
     let public_pem = format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", public_pem);
