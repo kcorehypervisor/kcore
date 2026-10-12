@@ -1780,6 +1780,22 @@ impl Database {
                     cilium_tunnel TEXT NOT NULL DEFAULT 'disabled',
                     cilium_auto_direct_routes INTEGER NOT NULL DEFAULT 1,
                     cilium_lb_ip_pools TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS kubernetes_pki (
+                    cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    ca_cert TEXT NOT NULL,
+                    ca_key TEXT NOT NULL,
+                    sa_key TEXT NOT NULL,
+                    sa_pub TEXT NOT NULL,
+                    etcd_ca_cert TEXT NOT NULL,
+                    etcd_ca_key TEXT NOT NULL,
+                    apiserver_cert TEXT NOT NULL,
+                    apiserver_key TEXT NOT NULL,
+                    apiserver_kubelet_client_cert TEXT NOT NULL,
+                    apiserver_kubelet_client_key TEXT NOT NULL,
+                    apiserver_etcd_client_cert TEXT NOT NULL,
+                    apiserver_etcd_client_key TEXT NOT NULL,
+                    admin_kubeconfig TEXT NOT NULL
                 );",
             )?;
         }
@@ -6587,6 +6603,120 @@ impl Database {
             })
         })?;
         rows.next().transpose()
+    }
+
+    // Kubernetes PKI storage and retrieval
+    pub fn store_kubernetes_pki(
+        &self,
+        cluster_name: &str,
+        pki: &crate::kubernetes_pki::KubernetesPki,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO kubernetes_pki (
+                cluster_name, ca_cert, ca_key, sa_key, sa_pub,
+                etcd_ca_cert, etcd_ca_key, apiserver_cert, apiserver_key,
+                apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
+                apiserver_etcd_client_cert, apiserver_etcd_client_key,
+                admin_kubeconfig
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                cluster_name,
+                &pki.ca_cert,
+                &pki.ca_key,
+                &pki.sa_key,
+                &pki.sa_pub,
+                &pki.etcd_ca_cert,
+                &pki.etcd_ca_key,
+                &pki.apiserver_cert,
+                &pki.apiserver_key,
+                &pki.apiserver_kubelet_client_cert,
+                &pki.apiserver_kubelet_client_key,
+                &pki.apiserver_etcd_client_cert,
+                &pki.apiserver_etcd_client_key,
+                &pki.admin_kubeconfig,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_kubernetes_pki(
+        &self,
+        cluster_name: &str,
+    ) -> Result<Option<crate::kubernetes_pki::KubernetesPki>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT ca_cert, ca_key, sa_key, sa_pub,
+                    etcd_ca_cert, etcd_ca_key, apiserver_cert, apiserver_key,
+                    apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
+                    apiserver_etcd_client_cert, apiserver_etcd_client_key,
+                    admin_kubeconfig
+             FROM kubernetes_pki WHERE cluster_name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![cluster_name], |r| {
+            Ok(crate::kubernetes_pki::KubernetesPki {
+                ca_cert: r.get(0)?,
+                ca_key: r.get(1)?,
+                sa_key: r.get(2)?,
+                sa_pub: r.get(3)?,
+                etcd_ca_cert: r.get(4)?,
+                etcd_ca_key: r.get(5)?,
+                apiserver_cert: r.get(6)?,
+                apiserver_key: r.get(7)?,
+                apiserver_kubelet_client_cert: r.get(8)?,
+                apiserver_kubelet_client_key: r.get(9)?,
+                apiserver_etcd_client_cert: r.get(10)?,
+                apiserver_etcd_client_key: r.get(11)?,
+                admin_kubeconfig: r.get(12)?,
+                etcd_node_certs: std::collections::HashMap::new(),
+                etcd_node_peer_certs: std::collections::HashMap::new(),
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn update_kubernetes_cluster_phase(
+        &self,
+        cluster_name: &str,
+        phase: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_clusters SET phase=?1 WHERE name=?2",
+            params![phase, cluster_name],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_kubernetes_clusters_by_phase(
+        &self,
+        phase: &str,
+    ) -> Result<Vec<KubernetesClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, generation, cluster_cidr, service_cidr, cluster_dns,
+                    api_server_endpoint, cni, phase, status_message,
+                    ready_control_planes, ready_workers, created_at, updated_at
+             FROM kubernetes_clusters WHERE phase=?1",
+        )?;
+        let rows = stmt.query_map(params![phase], |r| {
+            Ok(KubernetesClusterRow {
+                name: r.get(0)?,
+                generation: r.get(1)?,
+                cluster_cidr: r.get(2)?,
+                service_cidr: r.get(3)?,
+                cluster_dns: r.get(4)?,
+                api_server_endpoint: r.get(5)?,
+                cni: r.get(6)?,
+                phase: r.get(7)?,
+                status_message: r.get(8)?,
+                ready_control_planes: r.get(9)?,
+                ready_workers: r.get(10)?,
+                created_at: r.get(11)?,
+                updated_at: r.get(12)?,
+            })
+        })?;
+        rows.collect()
     }
 }
 

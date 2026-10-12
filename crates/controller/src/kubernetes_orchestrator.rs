@@ -6,13 +6,13 @@ use tracing::{error, info, warn};
 
 use crate::db::Database;
 use crate::kubernetes_pki::{self, KubernetesPki, NodeInfo};
-use crate::node_client::NodeClient;
+use crate::node_client::NodeClients;
 
 /// Orchestrates Kubernetes cluster bootstrap across multiple nodes
 #[derive(Clone)]
 pub struct KubernetesOrchestrator {
     db: Database,
-    node_clients: Arc<HashMap<String, NodeClient>>,
+    node_clients: Arc<HashMap<String, NodeClients>>,
 }
 
 /// Bootstrap phase for tracking progress
@@ -44,7 +44,7 @@ impl BootstrapPhase {
 }
 
 impl KubernetesOrchestrator {
-    pub fn new(db: Database, node_clients: Arc<HashMap<String, NodeClient>>) -> Self {
+    pub fn new(db: Database, node_clients: Arc<HashMap<String, NodeClients>>) -> Self {
         Self { db, node_clients }
     }
 
@@ -102,7 +102,8 @@ impl KubernetesOrchestrator {
         // Phase 1: Generate PKI
         self.update_phase(cluster_name, BootstrapPhase::GeneratingPki)
             .await?;
-        let pki = self.generate_and_store_pki(cluster_name, api_endpoint, service_cidr, nodes)
+        let pki = self
+            .generate_and_store_pki(cluster_name, api_endpoint, service_cidr, nodes)
             .await?;
 
         // Phase 2: Determine bootstrap node
@@ -135,7 +136,7 @@ impl KubernetesOrchestrator {
         // Phase 5: Join remaining nodes sequentially
         self.update_phase(cluster_name, BootstrapPhase::JoiningNodes)
             .await?;
-        
+
         for (idx, node) in nodes.iter().enumerate() {
             if idx == bootstrap_idx {
                 continue; // Skip bootstrap node
@@ -149,8 +150,7 @@ impl KubernetesOrchestrator {
                 "joining node to cluster"
             );
 
-            self.configure_node(cluster_name, node, &pki, false)
-                .await?;
+            self.configure_node(cluster_name, node, &pki, false).await?;
 
             // Wait a bit between joins to ensure cluster stability
             sleep(Duration::from_secs(10)).await;
@@ -169,7 +169,8 @@ impl KubernetesOrchestrator {
         self.wait_for_apiserver(cluster_name, 120).await?;
 
         // Phase 8: Mark ready
-        self.update_phase(cluster_name, BootstrapPhase::Ready).await?;
+        self.update_phase(cluster_name, BootstrapPhase::Ready)
+            .await?;
 
         info!(
             cluster = cluster_name,
@@ -192,10 +193,7 @@ impl KubernetesOrchestrator {
             .load_kubernetes_pki(cluster_name)?
             .context("PKI not found for existing cluster")?;
 
-        info!(
-            cluster = cluster_name,
-            "scaling cluster: joining new nodes"
-        );
+        info!(cluster = cluster_name, "scaling cluster: joining new nodes");
 
         // Find nodes that aren't part of etcd yet
         let new_nodes: Vec<&ClusterNode> = all_nodes
@@ -218,7 +216,7 @@ impl KubernetesOrchestrator {
         );
 
         // Add each new node sequentially
-        for node in new_nodes {
+        for node in &new_nodes {
             info!(
                 cluster = cluster_name,
                 node_id = node.node_id,
@@ -226,8 +224,7 @@ impl KubernetesOrchestrator {
             );
 
             // All new nodes join existing cluster (initialCluster=false)
-            self.configure_node(cluster_name, node, &pki, false)
-                .await?;
+            self.configure_node(cluster_name, node, &pki, false).await?;
 
             // Wait between additions
             sleep(Duration::from_secs(15)).await;
@@ -236,7 +233,7 @@ impl KubernetesOrchestrator {
         // Wait for new quorum
         let expected_members = existing_member_count + new_nodes.len();
         let required_quorum = (expected_members / 2) + 1;
-        
+
         info!(
             cluster = cluster_name,
             expected_members = expected_members,
@@ -266,16 +263,13 @@ impl KubernetesOrchestrator {
         let mut nodes = Vec::new();
 
         for row in rows {
-            let node = self
-                .db
-                .get_node_by_id(&row.node_id)?
-                .context("node not found")?;
+            let node = self.db.get_node(&row.node_id)?.context("node not found")?;
 
             nodes.push(ClusterNode {
                 node_id: row.node_id,
                 hostname: node.hostname,
                 ip_address: node.address.split(':').next().unwrap_or("").to_string(),
-                initial_cluster: row.initial_cluster != 0,
+                initial_cluster: row.initial_cluster,
             });
         }
 
@@ -504,7 +498,7 @@ impl KubernetesOrchestrator {
 }
 
 #[derive(Debug, Clone)]
-struct ClusterNode {
+pub struct ClusterNode {
     node_id: String,
     hostname: String,
     ip_address: String,
@@ -514,7 +508,7 @@ struct ClusterNode {
 /// Background task that orchestrates Kubernetes cluster bootstraps
 pub async fn start_kubernetes_orchestrator(
     db: Database,
-    node_clients: Arc<HashMap<String, NodeClient>>,
+    node_clients: Arc<HashMap<String, NodeClients>>,
 ) {
     let orchestrator = KubernetesOrchestrator::new(db.clone(), node_clients);
 
@@ -539,7 +533,9 @@ pub async fn start_kubernetes_orchestrator(
                                 error = %e,
                                 "Kubernetes bootstrap failed"
                             );
-                            let _ = orchestrator.update_phase(&cluster_name, BootstrapPhase::Failed).await;
+                            let _ = orchestrator
+                                .update_phase(&cluster_name, BootstrapPhase::Failed)
+                                .await;
                         }
                     });
                 }
