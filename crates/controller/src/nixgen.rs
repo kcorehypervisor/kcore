@@ -1644,15 +1644,15 @@ pub fn generate_kubernetes_config(
     etcd_server_key: &str,
     etcd_peer_cert: &str,
     etcd_peer_key: &str,
-    initial_cluster: bool,
+    all_nodes: &[crate::kubernetes_orchestrator::ClusterNode],
 ) -> anyhow::Result<String> {
-    // Build etcd initial cluster string (for control plane nodes)
-    let etcd_initial_cluster = if initial_cluster {
-        format!("{}=https://{}:2380", node.node_id, node.ip_address)
-    } else {
-        // TODO: Get full etcd cluster membership from database
-        String::new()
-    };
+    // Build complete etcd initial cluster string with ALL members
+    // For static bootstrap, every node needs the complete list
+    let etcd_initial_cluster = all_nodes
+        .iter()
+        .map(|n| format!("{}=https://{}:2380", n.node_id, n.ip_address))
+        .collect::<Vec<_>>()
+        .join(",");
 
     let k8s_config = KubernetesNodeConfig {
         role: "control-plane".to_string(),
@@ -1663,7 +1663,7 @@ pub fn generate_kubernetes_config(
         advertise_address: node.ip_address.clone(),
         iface: "enp6s0".to_string(), // TODO: Get from database
         api_server_endpoint: format!("https://{}:6443", node.ip_address), // TODO: Use VIP if HA
-        initial_cluster,
+        initial_cluster: true, // Always true for static bootstrap
         etcd_initial_cluster,
         cni: "cilium".to_string(),
         cilium_mode: "native-routing".to_string(),
