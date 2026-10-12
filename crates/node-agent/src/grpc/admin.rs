@@ -4006,7 +4006,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
 
         // Write the complete Nix module config to kcore-kubernetes.nix
         let k8s_config_path = PathBuf::from("/etc/nixos/kcore-kubernetes.nix");
-        
+
         tokio::task::spawn_blocking({
             let path = k8s_config_path.clone();
             let content = req.nix_config_content.clone();
@@ -4048,7 +4048,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 error!(error = %e, "failed to write kubeconfig");
                 Status::internal(format!("writing kubeconfig: {e}"))
             })?;
-            
+
             info!("wrote admin kubeconfig to /etc/kubernetes/admin.conf");
         }
 
@@ -4182,11 +4182,7 @@ impl AdminService {
         match switch_result {
             Ok(output) if output.status.success() => {
                 info!(apply_id = %apply_id, "nixos-rebuild switch succeeded");
-                write_apply_state(
-                    &apply_id,
-                    "completed",
-                    "kubernetes configuration active",
-                );
+                write_apply_state(&apply_id, "completed", "kubernetes configuration active");
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4197,11 +4193,7 @@ impl AdminService {
                     stdout = %stdout,
                     "nixos-rebuild switch failed"
                 );
-                write_apply_state(
-                    &apply_id,
-                    "failed",
-                    &format!("switch failed: {}", stderr),
-                );
+                write_apply_state(&apply_id, "failed", &format!("switch failed: {}", stderr));
             }
             Err(e) => {
                 error!(apply_id = %apply_id, error = %e, "failed to run nixos-rebuild switch");

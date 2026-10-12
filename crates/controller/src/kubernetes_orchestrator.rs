@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
@@ -111,77 +111,79 @@ impl KubernetesOrchestrator {
             .generate_and_store_pki(cluster_name, api_endpoint, service_cidr, nodes)
             .await?;
 
-        // Phase 2: Determine bootstrap node
-        // Use first node with initial_cluster=true, or first node in array
-        let (bootstrap_idx, bootstrap_node) = nodes
-            .iter()
-            .enumerate()
-            .find(|(_, n)| n.initial_cluster)
-            .or_else(|| nodes.iter().enumerate().next())
-            .context("no nodes available for bootstrap")?;
+        // Phase 2: Deploy all nodes in parallel
+        // For static bootstrap, all nodes need --initial-cluster-state=new
+        // and must be deployed before etcd can form quorum
+        self.update_phase(cluster_name, BootstrapPhase::ConfiguringBootstrapNode)
+            .await?;
 
         info!(
             cluster = cluster_name,
-            bootstrap_node = bootstrap_node.node_id,
-            "selected bootstrap node (first in cluster)"
+            node_count = nodes.len(),
+            "deploying all nodes in parallel for static bootstrap"
         );
 
-        // Phase 3: Configure bootstrap node (initialCluster=true)
-        self.update_phase(cluster_name, BootstrapPhase::ConfiguringBootstrapNode)
-            .await?;
-        self.configure_node(
-            cluster_name,
-            bootstrap_node,
-            &pki,
-            cluster_cidr,
-            service_cidr,
-            true,
-        )
-        .await?;
+        // Deploy all nodes concurrently
+        let mut deploy_tasks = Vec::new();
+        for node in nodes {
+            let cluster_name = cluster_name.to_string();
+            let node = node.clone();
+            let pki = pki.clone();
+            let cluster_cidr = cluster_cidr.to_string();
+            let service_cidr = service_cidr.to_string();
+            let all_nodes = nodes.to_vec();
+            let orchestrator = self.clone();
 
-        // Phase 4: Wait for etcd leader election on bootstrap node
-        self.update_phase(cluster_name, BootstrapPhase::WaitingForEtcdLeader)
-            .await?;
-        self.wait_for_etcd_leader(&bootstrap_node.node_id, 120)
-            .await?;
-
-        // Phase 5: Join remaining nodes sequentially
-        self.update_phase(cluster_name, BootstrapPhase::JoiningNodes)
-            .await?;
-
-        for (idx, node) in nodes.iter().enumerate() {
-            if idx == bootstrap_idx {
-                continue; // Skip bootstrap node
-            }
-
-            info!(
-                cluster = cluster_name,
-                node_id = node.node_id,
-                node_position = idx + 1,
-                total_nodes = nodes.len(),
-                "joining node to cluster"
-            );
-
-            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, false)
-                .await?;
-
-            // Wait a bit between joins to ensure cluster stability
-            sleep(Duration::from_secs(10)).await;
+            let task = tokio::spawn(async move {
+                info!(
+                    cluster = %cluster_name,
+                    node_id = %node.node_id,
+                    "deploying node configuration"
+                );
+                orchestrator
+                    .configure_node(&cluster_name, &node, &pki, &cluster_cidr, &service_cidr, &all_nodes)
+                    .await
+            });
+            deploy_tasks.push(task);
         }
 
-        // Phase 6: Wait for etcd quorum (majority of nodes)
+        // Wait for all deployments to complete
+        let mut deploy_results = Vec::new();
+        for task in deploy_tasks {
+            deploy_results.push(task.await.context("task join failed")?);
+        }
+
+        // Check if any deployments failed
+        let failed_count = deploy_results.iter().filter(|r| r.is_err()).count();
+        if failed_count > 0 {
+            error!(
+                cluster = cluster_name,
+                failed = failed_count,
+                total = nodes.len(),
+                "some node deployments failed"
+            );
+            return Err(anyhow!("{} of {} node deployments failed", failed_count, nodes.len()));
+        }
+
+        info!(
+            cluster = cluster_name,
+            node_count = nodes.len(),
+            "all nodes deployed successfully, waiting for etcd quorum"
+        );
+
+        // Phase 3: Wait for etcd quorum (majority of nodes)
         self.update_phase(cluster_name, BootstrapPhase::WaitingForQuorum)
             .await?;
         let required_quorum = (nodes.len() / 2) + 1;
-        self.wait_for_etcd_quorum(cluster_name, required_quorum, 180)
+        self.wait_for_etcd_quorum(cluster_name, required_quorum, 300)
             .await?;
 
-        // Phase 7: Wait for API server
+        // Phase 4: Wait for API server
         self.update_phase(cluster_name, BootstrapPhase::StartingApiServer)
             .await?;
-        self.wait_for_apiserver(cluster_name, 120).await?;
+        self.wait_for_apiserver(cluster_name, 180).await?;
 
-        // Phase 8: Mark ready
+        // Phase 5: Mark ready
         self.update_phase(cluster_name, BootstrapPhase::Ready)
             .await?;
 
@@ -244,8 +246,8 @@ impl KubernetesOrchestrator {
                 "adding node to cluster"
             );
 
-            // All new nodes join existing cluster (initialCluster=false)
-            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, false)
+            // All nodes get the same etcd initial cluster config
+            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, all_nodes)
                 .await?;
 
             // Wait between additions
@@ -340,12 +342,11 @@ impl KubernetesOrchestrator {
         pki: &KubernetesPki,
         cluster_cidr: &str,
         service_cidr: &str,
-        initial_cluster: bool,
+        all_nodes: &[ClusterNode],
     ) -> Result<()> {
         info!(
             cluster = cluster_name,
             node_id = node.node_id,
-            initial_cluster = initial_cluster,
             "configuring Kubernetes on node"
         );
 
@@ -376,7 +377,7 @@ impl KubernetesOrchestrator {
             etcd_server_key,
             etcd_peer_cert,
             etcd_peer_key,
-            initial_cluster,
+            all_nodes,
         )?;
 
         info!(
