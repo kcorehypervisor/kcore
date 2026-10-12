@@ -1635,22 +1635,132 @@ mod kubernetes_tests {
 
 /// Generate Kubernetes node configuration for a node in the cluster
 pub fn generate_kubernetes_config(
-    _cluster_name: &str,
-    _node: &crate::kubernetes_orchestrator::ClusterNode,
-    _pki: &crate::kubernetes_pki::KubernetesPki,
-    _etcd_server_cert: &str,
-    _etcd_server_key: &str,
-    _etcd_peer_cert: &str,
-    _etcd_peer_key: &str,
-    _initial_cluster: bool,
+    cluster_name: &str,
+    node: &crate::kubernetes_orchestrator::ClusterNode,
+    pki: &crate::kubernetes_pki::KubernetesPki,
+    cluster_cidr: &str,
+    service_cidr: &str,
+    etcd_server_cert: &str,
+    etcd_server_key: &str,
+    etcd_peer_cert: &str,
+    etcd_peer_key: &str,
+    initial_cluster: bool,
 ) -> anyhow::Result<String> {
-    // TODO: Generate full NixOS configuration for Kubernetes node
-    // For now, return a minimal placeholder
-    Ok(String::from(
-        r#"{ config, pkgs, ... }: {
-  services.kubernetes = {
-    enable = true;
-  };
-}"#,
-    ))
+    // Build etcd initial cluster string (for control plane nodes)
+    let etcd_initial_cluster = if initial_cluster {
+        format!("{}=https://{}:2380", node.node_id, node.ip_address)
+    } else {
+        // TODO: Get full etcd cluster membership from database
+        String::new()
+    };
+
+    let k8s_config = KubernetesNodeConfig {
+        role: "control-plane".to_string(),
+        cluster_name: cluster_name.to_string(),
+        cluster_cidr: cluster_cidr.to_string(),
+        service_cidr: service_cidr.to_string(),
+        cluster_dns: "10.96.0.10".to_string(), // TODO: Parse from service_cidr
+        advertise_address: node.ip_address.clone(),
+        iface: "enp6s0".to_string(), // TODO: Get from database
+        api_server_endpoint: format!("https://{}:6443", node.ip_address), // TODO: Use VIP if HA
+        initial_cluster,
+        etcd_initial_cluster,
+        cni: "cilium".to_string(),
+        cilium_mode: "native-routing".to_string(),
+        cilium_mtu: 1500,
+        cilium_tunnel: "disabled".to_string(),
+        cilium_auto_direct_routes: true,
+        cilium_lb_ip_pools: vec![],
+        ha_enabled: false, // TODO: Read from cluster config
+        vip_address: String::new(),
+        vip_interface: String::new(),
+        kubeconfig_data: String::new(), // TODO: Include admin kubeconfig
+    };
+
+    let mut nix = generate_kubernetes_node_config(&k8s_config);
+    
+    // Append PKI certificates as writeText
+    nix.pop(); // Remove trailing '}\n'
+    nix.pop();
+    
+    nix.push_str("\n  # Kubernetes PKI certificates\n");
+    nix.push_str("  environment.etc = {\n");
+    
+    // CA certificate
+    nix.push_str("    \"kubernetes/pki/ca.crt\".text = ''\n");
+    nix.push_str(&pki.ca_cert);
+    nix.push_str("'';\n");
+    
+    // CA key (control plane only)
+    nix.push_str("    \"kubernetes/pki/ca.key\".text = ''\n");
+    nix.push_str(&pki.ca_key);
+    nix.push_str("'';\n");
+    
+    // Service account key pair
+    nix.push_str("    \"kubernetes/pki/sa.key\".text = ''\n");
+    nix.push_str(&pki.sa_key);
+    nix.push_str("'';\n");
+    
+    nix.push_str("    \"kubernetes/pki/sa.pub\".text = ''\n");
+    nix.push_str(&pki.sa_pub);
+    nix.push_str("'';\n");
+    
+    // API server certificate and key
+    nix.push_str("    \"kubernetes/pki/apiserver.crt\".text = ''\n");
+    nix.push_str(&pki.apiserver_cert);
+    nix.push_str("'';\n");
+    
+    nix.push_str("    \"kubernetes/pki/apiserver.key\".text = ''\n");
+    nix.push_str(&pki.apiserver_key);
+    nix.push_str("'';\n");
+    
+    // API server kubelet client cert
+    nix.push_str("    \"kubernetes/pki/apiserver-kubelet-client.crt\".text = ''\n");
+    nix.push_str(&pki.apiserver_kubelet_client_cert);
+    nix.push_str("'';\n");
+    
+    nix.push_str("    \"kubernetes/pki/apiserver-kubelet-client.key\".text = ''\n");
+    nix.push_str(&pki.apiserver_kubelet_client_key);
+    nix.push_str("'';\n");
+    
+    // etcd CA
+    nix.push_str("    \"kubernetes/pki/etcd/ca.crt\".text = ''\n");
+    nix.push_str(&pki.etcd_ca_cert);
+    nix.push_str("'';\n");
+    
+    nix.push_str("    \"kubernetes/pki/etcd/ca.key\".text = ''\n");
+    nix.push_str(&pki.etcd_ca_key);
+    nix.push_str("'';\n");
+    
+    // Node-specific etcd server cert/key
+    nix.push_str("    \"kubernetes/pki/etcd/server.crt\".text = ''\n");
+    nix.push_str(etcd_server_cert);
+    nix.push_str("'';\n");
+    
+    nix.push_str("    \"kubernetes/pki/etcd/server.key\".text = ''\n");
+    nix.push_str(etcd_server_key);
+    nix.push_str("'';\n");
+    
+    // Node-specific etcd peer cert/key
+    nix.push_str("    \"kubernetes/pki/etcd/peer.crt\".text = ''\n");
+    nix.push_str(etcd_peer_cert);
+    nix.push_str("'';\n");
+    
+    nix.push_str("    \"kubernetes/pki/etcd/peer.key\".text = ''\n");
+    nix.push_str(etcd_peer_key);
+    nix.push_str("'';\n");
+    
+    // API server etcd client cert
+    nix.push_str("    \"kubernetes/pki/apiserver-etcd-client.crt\".text = ''\n");
+    nix.push_str(&pki.apiserver_etcd_client_cert);
+    nix.push_str("'';\n");
+    
+    nix.push_str("    \"kubernetes/pki/apiserver-etcd-client.key\".text = ''\n");
+    nix.push_str(&pki.apiserver_etcd_client_key);
+    nix.push_str("'';\n");
+    
+    nix.push_str("  };\n");
+    nix.push_str("}\n");
+    
+    Ok(nix)
 }
