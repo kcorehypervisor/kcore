@@ -590,42 +590,111 @@ impl KubernetesOrchestrator {
     }
 
     async fn count_healthy_etcd_members(&self, cluster_name: &str) -> Result<usize> {
-        let _nodes = self.get_cluster_nodes(cluster_name).await?;
+        let Some(pki) = self.db.load_kubernetes_pki(cluster_name)? else {
+            return Ok(0);
+        };
+        let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        let mut healthy = 0usize;
+        for row in rows.iter().filter(|row| row.role == "control-plane") {
+            let ip = row.advertise_address.as_str();
+            if ip.is_empty() {
+                continue;
+            }
+            match etcd_member_healthy(
+                ip,
+                &pki.etcd_ca_cert,
+                &pki.apiserver_etcd_client_cert,
+                &pki.apiserver_etcd_client_key,
+            )
+            .await
+            {
+                Ok(true) => healthy += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    info!(
+                        cluster = cluster_name,
+                        node_id = %row.node_id,
+                        error = %e,
+                        "etcd health probe failed"
+                    );
+                }
+            }
+        }
+        Ok(healthy)
+    }
 
-        // TODO: Implement actual etcd status check via node agent RPC
-        // For now, always return 0 to force fresh bootstrap
-        // This ensures clusters are always bootstrapped from scratch until
-        // we implement proper etcd health checking
-        Ok(0)
+    async fn control_plane_quorum(&self, cluster_name: &str) -> Result<usize> {
+        let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        let control_planes = rows
+            .iter()
+            .filter(|row| row.role == "control-plane")
+            .count();
+        Ok((control_planes / 2) + 1)
+    }
+
+    async fn apiserver_is_ready(&self, cluster_name: &str) -> Result<bool> {
+        let Some(cluster) = self.db.get_kubernetes_cluster(cluster_name)? else {
+            return Ok(false);
+        };
+        let Some(pki) = self.db.load_kubernetes_pki(cluster_name)? else {
+            return Ok(false);
+        };
+        match apiserver_ready(&cluster.api_server_endpoint, &pki.ca_cert).await {
+            Ok(ready) => Ok(ready),
+            Err(e) => {
+                info!(
+                    cluster = cluster_name,
+                    error = %e,
+                    "API server readiness probe failed"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// A cluster left in `failed` by the old stub health check can already
+    /// have etcd and the API server up. Promote it without minting new PKI.
+    async fn promote_if_healthy(&self, cluster_name: &str) -> Result<()> {
+        let Some(cluster) = self.db.get_kubernetes_cluster(cluster_name)? else {
+            return Ok(());
+        };
+        if cluster.phase == "ready" || cluster.phase == "bootstrapping" {
+            return Ok(());
+        }
+        let need = self.control_plane_quorum(cluster_name).await?;
+        let healthy = self.count_healthy_etcd_members(cluster_name).await?;
+        if healthy < need {
+            return Ok(());
+        }
+        if !self.apiserver_is_ready(cluster_name).await? {
+            return Ok(());
+        }
+        let control_planes = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)?
+            .iter()
+            .filter(|row| row.role == "control-plane")
+            .count() as i32;
+        self.db
+            .mark_kubernetes_cluster_ready(cluster_name, control_planes)?;
+        info!(
+            cluster = cluster_name,
+            healthy_etcd = healthy,
+            control_planes,
+            "recorded kubernetes cluster ready"
+        );
+        Ok(())
     }
 
     async fn wait_for_apiserver(&self, cluster_name: &str, timeout_secs: u64) -> Result<()> {
         info!(cluster = cluster_name, "waiting for API server");
 
-        let nodes = self.get_cluster_nodes(cluster_name).await?;
         let start = std::time::Instant::now();
-
         while start.elapsed().as_secs() < timeout_secs {
-            let mut healthy_count = 0;
-
-            for node in &nodes {
-                let address = format!("{}:9091", node.ip_address);
-                if self.node_clients.get_admin(&address).is_some() {
-                    // TODO: Implement actual apiserver status check via node agent RPC
-                    // For now, assume healthy if node is reachable
-                    healthy_count += 1;
-                }
-            }
-
-            if healthy_count > (nodes.len() / 2) {
-                info!(
-                    cluster = cluster_name,
-                    healthy_apiservers = healthy_count,
-                    "API server quorum achieved"
-                );
+            if self.apiserver_is_ready(cluster_name).await? {
+                info!(cluster = cluster_name, "API server ready");
                 return Ok(());
             }
-
             sleep(Duration::from_secs(10)).await;
         }
 
@@ -645,6 +714,133 @@ impl KubernetesOrchestrator {
     }
 }
 
+fn endpoint_host_port(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_string()
+}
+
+fn response_reports_ready(path: &str, status: u16, body: &str) -> bool {
+    if status != 200 {
+        return false;
+    }
+    if path == "/health" {
+        body.replace([' ', '\n'], "")
+            .contains("\"health\":\"true\"")
+    } else {
+        body.contains("ok")
+    }
+}
+
+async fn etcd_member_healthy(
+    ip: &str,
+    ca_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+) -> Result<bool> {
+    let (status, body) = tls_get(
+        &format!("{ip}:2379"),
+        ip,
+        "/health",
+        ca_pem,
+        Some((client_cert_pem, client_key_pem)),
+    )
+    .await?;
+    Ok(response_reports_ready("/health", status, &body))
+}
+
+async fn apiserver_ready(api_endpoint: &str, ca_pem: &str) -> Result<bool> {
+    let endpoint = endpoint_host_port(api_endpoint);
+    let host = endpoint.split(':').next().unwrap_or("").to_string();
+    if host.is_empty() {
+        return Ok(false);
+    }
+    let (status, body) = tls_get(&endpoint, &host, "/readyz", ca_pem, None).await?;
+    Ok(response_reports_ready("/readyz", status, &body))
+}
+
+async fn tls_get(
+    addr: &str,
+    server_name: &str,
+    path: &str,
+    ca_pem: &str,
+    client_auth: Option<(&str, &str)>,
+) -> Result<(u16, String)> {
+    use rustls::pki_types::ServerName;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in pem_certs(ca_pem)? {
+        roots.add(cert).context("etcd or kubernetes CA")?;
+    }
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let config = if let Some((cert_pem, key_pem)) = client_auth {
+        builder
+            .with_client_auth_cert(pem_certs(cert_pem)?, pem_key(key_pem)?)
+            .context("etcd client certificate")?
+    } else {
+        builder.with_no_client_auth()
+    };
+    let name = ServerName::try_from(server_name.to_string()).context("probe server name")?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
+        .await
+        .context("connect timed out")?
+        .with_context(|| format!("connect {addr}"))?;
+    let mut tls = connector
+        .connect(name, stream)
+        .await
+        .context("tls handshake")?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {server_name}\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .await
+        .context("write probe")?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut buf))
+        .await
+        .context("read timed out")?
+        .context("read probe")?;
+    let text = String::from_utf8_lossy(&buf);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    Ok((status, body.to_string()))
+}
+
+fn pem_certs(pem_str: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::CertificateDer;
+    let mut certs = Vec::new();
+    for block in pem::parse_many(pem_str).context("parsing certificate pem")? {
+        if block.tag() == "CERTIFICATE" {
+            certs.push(CertificateDer::from(block.contents().to_vec()));
+        }
+    }
+    if certs.is_empty() {
+        anyhow::bail!("no certificate in pem");
+    }
+    Ok(certs)
+}
+
+fn pem_key(pem_str: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    use rustls::pki_types::{
+        PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    };
+    let block = pem::parse(pem_str).context("parsing private key pem")?;
+    let bytes = block.contents().to_vec();
+    match block.tag() {
+        "PRIVATE KEY" => Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes))),
+        "EC PRIVATE KEY" => Ok(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(bytes))),
+        "RSA PRIVATE KEY" => Ok(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(bytes))),
+        other => anyhow::bail!("unsupported private key type {other}"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusterNode {
     pub node_id: String,
@@ -652,6 +848,41 @@ pub struct ClusterNode {
     pub ip_address: String,
     pub iface: String,
     pub initial_cluster: bool,
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::response_reports_ready;
+
+    #[test]
+    fn etcd_health_body_requires_true() {
+        assert!(response_reports_ready(
+            "/health",
+            200,
+            r#"{"health":"true"}"#
+        ));
+        assert!(response_reports_ready(
+            "/health",
+            200,
+            "{\n  \"health\": \"true\"\n}"
+        ));
+        assert!(!response_reports_ready(
+            "/health",
+            200,
+            r#"{"health":"false"}"#
+        ));
+        assert!(!response_reports_ready(
+            "/health",
+            503,
+            r#"{"health":"true"}"#
+        ));
+    }
+
+    #[test]
+    fn apiserver_readyz_accepts_ok() {
+        assert!(response_reports_ready("/readyz", 200, "ok"));
+        assert!(!response_reports_ready("/readyz", 500, "ok"));
+    }
 }
 
 /// Background task that orchestrates Kubernetes cluster bootstraps
@@ -671,6 +902,22 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
                 let cluster_name = cluster.name.clone();
                 let api_endpoint = cluster.api_server_endpoint.clone();
                 let service_cidr = cluster.service_cidr.clone();
+                let already_up = orchestrator
+                    .count_healthy_etcd_members(&cluster_name)
+                    .await
+                    .unwrap_or(0);
+                let need = orchestrator
+                    .control_plane_quorum(&cluster_name)
+                    .await
+                    .unwrap_or(1);
+                if already_up >= need {
+                    info!(
+                        cluster = %cluster_name,
+                        healthy_etcd = already_up,
+                        "etcd already has quorum; skipping certificate redeploy"
+                    );
+                    continue;
+                }
                 tokio::spawn(async move {
                     // Node agents may still be restarting when the controller
                     // comes up. This path runs once per process, so retry.
@@ -700,6 +947,18 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
     }
 
     loop {
+        if let Ok(clusters) = db.list_kubernetes_clusters() {
+            for cluster in clusters {
+                if let Err(e) = orchestrator.promote_if_healthy(&cluster.name).await {
+                    error!(
+                        cluster = %cluster.name,
+                        error = %e,
+                        "kubernetes health promotion failed"
+                    );
+                }
+            }
+        }
+
         // Check for clusters in "bootstrapping" phase that need bootstrap
         match db.list_kubernetes_clusters_by_phase("bootstrapping") {
             Ok(clusters) => {
