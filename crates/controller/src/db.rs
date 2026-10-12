@@ -691,7 +691,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 50;
+pub const SCHEMA_VERSION: i32 = 51;
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -1712,6 +1712,20 @@ impl Database {
             // ceph_clusters: operators may record the mgr dashboard URL/password
             // during bootstrap before a CephCluster resource exists. Ceph hashes
             // dashboard passwords, so kcore stores the operator-retrievable copy.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ceph_dashboard_credentials (
+                    name TEXT PRIMARY KEY,
+                    url TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    password TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                );",
+            )?;
+        }
+
+        // v50 may have been recorded without the table (partial migrate / restore).
+        // v51 re-applies CREATE IF NOT EXISTS so credentials storage is present.
+        if version < 51 {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS ceph_dashboard_credentials (
                     name TEXT PRIMARY KEY,
