@@ -12055,6 +12055,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::SetCephDashboardCredentialsRequest>,
     ) -> Result<Response<controller_proto::SetCephDashboardCredentialsResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let name = req.name.trim().to_string();
         if name.is_empty() {
@@ -12081,10 +12082,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 updated_at: String::new(),
             })
             .map_err(|e| Status::internal(e.to_string()))?;
-        self.audit(
+        self.record_audit(
+            &actor,
             "SetCephDashboardCredentials",
             &format!("ceph_cluster/{name}"),
-            &format!("url={url} user={username}"),
+            format!("url={url} user={username}"),
         );
         let stored = self
             .db
