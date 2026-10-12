@@ -850,41 +850,6 @@ pub struct ClusterNode {
     pub initial_cluster: bool,
 }
 
-#[cfg(test)]
-mod health_tests {
-    use super::response_reports_ready;
-
-    #[test]
-    fn etcd_health_body_requires_true() {
-        assert!(response_reports_ready(
-            "/health",
-            200,
-            r#"{"health":"true"}"#
-        ));
-        assert!(response_reports_ready(
-            "/health",
-            200,
-            "{\n  \"health\": \"true\"\n}"
-        ));
-        assert!(!response_reports_ready(
-            "/health",
-            200,
-            r#"{"health":"false"}"#
-        ));
-        assert!(!response_reports_ready(
-            "/health",
-            503,
-            r#"{"health":"true"}"#
-        ));
-    }
-
-    #[test]
-    fn apiserver_readyz_accepts_ok() {
-        assert!(response_reports_ready("/readyz", 200, "ok"));
-        assert!(!response_reports_ready("/readyz", 500, "ok"));
-    }
-}
-
 /// Background task that orchestrates Kubernetes cluster bootstraps
 pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClients) {
     let orchestrator = KubernetesOrchestrator::new(db.clone(), node_clients);
@@ -993,5 +958,40 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
 
         // Check every 30 seconds
         sleep(Duration::from_secs(30)).await;
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::response_reports_ready;
+
+    #[test]
+    fn etcd_health_body_requires_true() {
+        assert!(response_reports_ready(
+            "/health",
+            200,
+            r#"{"health":"true"}"#
+        ));
+        assert!(response_reports_ready(
+            "/health",
+            200,
+            "{\n  \"health\": \"true\"\n}"
+        ));
+        assert!(!response_reports_ready(
+            "/health",
+            200,
+            r#"{"health":"false"}"#
+        ));
+        assert!(!response_reports_ready(
+            "/health",
+            503,
+            r#"{"health":"true"}"#
+        ));
+    }
+
+    #[test]
+    fn apiserver_readyz_accepts_ok() {
+        assert!(response_reports_ready("/readyz", 200, "ok"));
+        assert!(!response_reports_ready("/readyz", 500, "ok"));
     }
 }
