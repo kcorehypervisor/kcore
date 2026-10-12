@@ -3889,21 +3889,20 @@ impl Database {
         name: &str,
     ) -> Result<Option<CephDashboardCredentialsRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
-        conn.query_row(
+        let mut stmt = conn.prepare(
             "SELECT name, url, username, password, updated_at
              FROM ceph_dashboard_credentials WHERE name=?1",
-            params![name],
-            |r| {
-                Ok(CephDashboardCredentialsRow {
-                    name: r.get(0)?,
-                    url: r.get(1)?,
-                    username: r.get(2)?,
-                    password: r.get(3)?,
-                    updated_at: r.get(4)?,
-                })
-            },
-        )
-        .optional()
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(CephDashboardCredentialsRow {
+                name: r.get(0)?,
+                url: r.get(1)?,
+                username: r.get(2)?,
+                password: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.next().transpose()
     }
 
     pub fn upsert_ceph_dashboard_credentials(
