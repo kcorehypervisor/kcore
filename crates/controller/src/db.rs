@@ -724,7 +724,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 50;
+pub const SCHEMA_VERSION: i32 = 51;
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -1780,8 +1780,13 @@ impl Database {
                     cilium_tunnel TEXT NOT NULL DEFAULT 'disabled',
                     cilium_auto_direct_routes INTEGER NOT NULL DEFAULT 1,
                     cilium_lb_ip_pools TEXT NOT NULL DEFAULT ''
-                );
-                CREATE TABLE IF NOT EXISTS kubernetes_pki (
+                );",
+            )?;
+        }
+
+        if version < 51 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS kubernetes_pki (
                     cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
                     ca_cert TEXT NOT NULL,
                     ca_key TEXT NOT NULL,
