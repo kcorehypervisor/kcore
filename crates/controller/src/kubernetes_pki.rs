@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use std::collections::HashMap;
