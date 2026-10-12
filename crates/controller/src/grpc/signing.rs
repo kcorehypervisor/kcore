@@ -11,7 +11,7 @@ pub const CERT_VALIDITY_DAYS: i64 = 365;
 /// a CN, SAN or EKU it is not entitled to.
 fn node_cert_params(node_host: &str, validity_days: i64) -> Result<CertificateParams, String> {
     let mut params = CertificateParams::default();
-    params.subject_alt_names = vec![SanType::DnsName(node_host.to_string())];
+    params.subject_alt_names = vec![SanType::DnsName(node_host.try_into().map_err(|e| format!("invalid hostname: {e}"))?)];
     params
         .distinguished_name
         .push(DnType::CommonName, format!("kcore-node-{node_host}"));
@@ -61,18 +61,11 @@ pub fn sign_node_cert_with_validity(
         .map_err(|e| format!("loading sub-CA cert: {e}"))?;
 
     let cert_key = KeyPair::generate().map_err(|e| format!("generating node key: {e}"))?;
-    let cert = params.self_signed(&cert_key).map_err(|e| format!("creating cert: {e}"))?;
-    let cert_pem = cert.pem();
-    
-    let issuer_key = KeyPair::from_pem(sub_ca_key_pem).map_err(|e| format!("loading issuer key: {e}"))?;
-    let issuer_cert = rcgen::Certificate::from_params(
-        CertificateParams::from_ca_cert_pem(sub_ca_cert_pem).map_err(|e| format!("loading CA cert: {e}"))?
-    ).and_then(|mut c| { c.key_pair = Some(issuer_key); Ok(c) }).map_err(|e: rcgen::Error| format!("creating issuer: {e}"))?;
-    
-    let signed_cert_pem = cert.serialize_pem_with_signer(&issuer_cert)
+    let cert = params
+        .signed_by(&cert_key, &issuer)
         .map_err(|e| format!("signing node cert: {e}"))?;
 
-    let chain_pem = format!("{}{}", cert_pem, sub_ca_cert_pem);
+    let chain_pem = format!("{}{}", cert.pem(), sub_ca_cert_pem);
     Ok((chain_pem, cert_key.serialize_pem()))
 }
 
@@ -128,12 +121,11 @@ pub fn sign_node_csr(
     let issuer = Issuer::from_ca_cert_pem(sub_ca_cert_pem, ca_key)
         .map_err(|e| format!("loading sub-CA cert: {e}"))?;
 
-    let cert = csr.serialize()
-        .map_err(|e| format!("creating cert from CSR: {e}"))?;
-    let cert_pem = cert.serialize_pem_with_signer(&issuer)
+    let cert = csr
+        .signed_by(&issuer)
         .map_err(|e| format!("signing CSR: {e}"))?;
 
-    Ok(format!("{}{}", cert_pem, sub_ca_cert_pem))
+    Ok(format!("{}{}", cert.pem(), sub_ca_cert_pem))
 }
 
 /// Text of a DN attribute, for the printable string types we can compare.
@@ -157,8 +149,7 @@ pub fn sign_operator_cert(
 ) -> Result<(String, String), String> {
     let cn = format!("kctl:{operator_name}");
     let san = format!("kctl.operator.{operator_name}");
-    let mut params = CertificateParams::default();
-    params.subject_alt_names = vec![SanType::DnsName(san)];
+    let mut params = CertificateParams::new(vec![san]).map_err(|e| format!("invalid SAN: {e}"))?;
     params.distinguished_name.push(DnType::CommonName, cn);
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     params.not_before = OffsetDateTime::now_utc();
@@ -169,12 +160,12 @@ pub fn sign_operator_cert(
     let issuer = Issuer::from_ca_cert_pem(sub_ca_cert_pem, ca_key)
         .map_err(|e| format!("loading sub-CA cert: {e}"))?;
 
-    let cert_key = KeyPair::generate(&rcgen::PKCS_RSA_SHA256).map_err(|e| format!("generating operator key: {e}"))?;
-    let cert = rcgen::Certificate::from_params(params).map_err(|e| format!("creating cert: {e}"))?;
-    let cert_pem = cert.serialize_pem_with_signer(&issuer)
+    let cert_key = KeyPair::generate().map_err(|e| format!("generating operator key: {e}"))?;
+    let cert = params
+        .signed_by(&cert_key, &issuer)
         .map_err(|e| format!("signing operator cert: {e}"))?;
 
-    let chain_pem = format!("{}{}", cert_pem, sub_ca_cert_pem);
+    let chain_pem = format!("{}{}", cert.pem(), sub_ca_cert_pem);
     Ok((chain_pem, cert_key.serialize_pem()))
 }
 
