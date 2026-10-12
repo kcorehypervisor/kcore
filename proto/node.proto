@@ -210,6 +210,7 @@ service NodeAdmin {
   
   // Kubernetes configuration management
   rpc ApplyKubernetesConfig(ApplyKubernetesConfigRequest) returns (ApplyKubernetesConfigResponse);
+  rpc ApplyRawKubernetesConfig(ApplyRawKubernetesConfigRequest) returns (ApplyKubernetesConfigResponse);
   rpc GetKubernetesStatus(GetKubernetesStatusRequest) returns (GetKubernetesStatusResponse);
   rpc DrainKubernetesNode(DrainKubernetesNodeRequest) returns (DrainKubernetesNodeResponse);
 }
@@ -1457,6 +1458,11 @@ message ApplyKubernetesConfigResponse {
   string apply_id = 1;
   string status = 2;                // "started", "completed", "failed"
   string message = 3;
+}
+
+message ApplyRawKubernetesConfigRequest {
+  string nix_config_content = 1;    // Complete Nix module text with embedded PKI
+  string kubeconfig_data = 2;       // Optional: admin kubeconfig for kubectl access
 }
 
 message GetKubernetesStatusRequest {}
