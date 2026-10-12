@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::db::Database;
 use crate::node_client::NodeClients;

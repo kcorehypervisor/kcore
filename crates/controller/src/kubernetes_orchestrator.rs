@@ -469,7 +469,7 @@ impl KubernetesOrchestrator {
                 }
             }
 
-            if healthy_count >= (nodes.len() / 2) + 1 {
+            if healthy_count > (nodes.len() / 2) {
                 info!(
                     cluster = cluster_name,
                     healthy_apiservers = healthy_count,
