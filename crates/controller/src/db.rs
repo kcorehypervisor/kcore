@@ -6750,6 +6750,25 @@ impl Database {
         Ok(())
     }
 
+    /// Record that etcd has quorum and the API server answered.
+    pub fn mark_kubernetes_cluster_ready(
+        &self,
+        cluster_name: &str,
+        ready_control_planes: i32,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_clusters
+             SET phase='ready',
+                 status_message='etcd quorum and API server ready',
+                 ready_control_planes=?1,
+                 updated_at=datetime('now')
+             WHERE name=?2",
+            params![ready_control_planes, cluster_name],
+        )?;
+        Ok(())
+    }
+
     pub fn list_kubernetes_clusters_by_phase(
         &self,
         phase: &str,
