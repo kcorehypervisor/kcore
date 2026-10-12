@@ -2100,7 +2100,7 @@ pub fn generate_colocated_kubernetes_config(
     if primary.is_some() {
         for member in &extras {
             let ports = kubernetes_listen_ports(&member.settings.api_server_endpoint);
-            if ports.offset < 1000 || ports.offset % 1000 != 0 {
+            if ports.offset == 0 || !ports.offset.is_multiple_of(1000) {
                 anyhow::bail!(
                     "cluster {} must use an API port at least 1000 above 6443 so its etcd and VRRP ids stay off the primary cluster",
                     member.cluster_name
