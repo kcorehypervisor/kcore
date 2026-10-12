@@ -202,9 +202,9 @@ fn generate_ca(cn: &str, org: &str, days: u32) -> Result<(String, String)> {
         KeyUsagePurpose::CrlSign,
     ];
 
-    let key_pair = KeyPair::generate(&rcgen::PKCS_RSA_SHA256)?;
-    let cert = Certificate::from_params(params)?;
-    let cert_pem = cert.serialize_pem()?;
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
 
     Ok((cert_pem, key_pem))
@@ -227,9 +227,9 @@ fn generate_ca_with_cert(cn: &str, org: &str, days: u32) -> Result<(Certificate,
         KeyUsagePurpose::CrlSign,
     ];
 
-    let key_pair = KeyPair::generate(&rcgen::PKCS_RSA_SHA256)?;
-    let cert = Certificate::from_params(params)?;
-    let cert_pem = cert.serialize_pem()?;
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
 
     Ok((cert, cert_pem, key_pem))
@@ -263,9 +263,10 @@ fn generate_server_cert_with_ca(
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
 
-    let cert = Certificate::from_params(params)?;
-    let cert_pem = cert.serialize_pem_with_signer(ca_cert)?;
-    let key_pem = cert.serialize_private_key_pem();
+    let key_pair = KeyPair::generate()?;
+    let cert = params.signed_by(&key_pair, ca_cert, &ca_cert.key_pair().ok_or_else(|| anyhow::anyhow!("CA has no key pair"))?)?;
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
 
     Ok((cert_pem, key_pem))
 }
@@ -292,15 +293,16 @@ fn generate_client_cert_with_ca(
 
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
 
-    let cert = Certificate::from_params(params)?;
-    let cert_pem = cert.serialize_pem_with_signer(ca_cert)?;
-    let key_pem = cert.serialize_private_key_pem();
+    let key_pair = KeyPair::generate()?;
+    let cert = params.signed_by(&key_pair, ca_cert, &ca_cert.key_pair().ok_or_else(|| anyhow::anyhow!("CA has no key pair"))?)?;
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
 
     Ok((cert_pem, key_pem))
 }
 
 fn generate_key_pair() -> Result<(String, String)> {
-    let key = KeyPair::generate(&rcgen::PKCS_RSA_SHA256)?;
+    let key = KeyPair::generate()?;
     let private_pem = key.serialize_pem();
     let public_pem = key
         .public_key_pem()
