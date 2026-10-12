@@ -60,9 +60,16 @@ pub fn sign_node_cert_with_validity(
     let issuer = Issuer::from_ca_cert_pem(sub_ca_cert_pem, ca_key)
         .map_err(|e| format!("loading sub-CA cert: {e}"))?;
 
-    let cert_key = KeyPair::generate(&rcgen::PKCS_RSA_SHA256).map_err(|e| format!("generating node key: {e}"))?;
-    let cert = rcgen::Certificate::from_params(params).map_err(|e| format!("creating cert: {e}"))?;
-    let cert_pem = cert.serialize_pem_with_signer(&issuer)
+    let cert_key = KeyPair::generate().map_err(|e| format!("generating node key: {e}"))?;
+    let cert = params.self_signed(&cert_key).map_err(|e| format!("creating cert: {e}"))?;
+    let cert_pem = cert.pem();
+    
+    let issuer_key = KeyPair::from_pem(sub_ca_key_pem).map_err(|e| format!("loading issuer key: {e}"))?;
+    let issuer_cert = rcgen::Certificate::from_params(
+        CertificateParams::from_ca_cert_pem(sub_ca_cert_pem).map_err(|e| format!("loading CA cert: {e}"))?
+    ).and_then(|mut c| { c.key_pair = Some(issuer_key); Ok(c) }).map_err(|e: rcgen::Error| format!("creating issuer: {e}"))?;
+    
+    let signed_cert_pem = cert.serialize_pem_with_signer(&issuer_cert)
         .map_err(|e| format!("signing node cert: {e}"))?;
 
     let chain_pem = format!("{}{}", cert_pem, sub_ca_cert_pem);
