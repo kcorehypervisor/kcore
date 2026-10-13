@@ -14402,6 +14402,8 @@ impl ControllerService {
                 size_bytes: volume.size_bytes,
                 fs_type: volume.fs_type.as_str(),
                 mount_path: volume.mount_path.as_str(),
+                role: volume.role.as_str(),
+                volume_group: volume.volume_group.as_str(),
             })
             .collect();
         crate::kubernetes_local::normalize(
@@ -14409,6 +14411,7 @@ impl ControllerService {
             &Self::kubernetes_members(spec),
             declared.enabled,
             &declared.storage_class_name,
+            &declared.mode,
             &volumes,
         )
         .map_err(Status::invalid_argument)
@@ -14468,7 +14471,8 @@ impl ControllerService {
         cluster: &str,
         volume: &crate::kubernetes_local::LocalVolume,
     ) -> Result<(), Status> {
-        let vol_name = crate::kubernetes_local::controller_volume_name(cluster, &volume.name);
+        let vol_name =
+            crate::kubernetes_local::controller_volume_name(cluster, &volume.node_id, &volume.name);
         let node = self
             .db
             .get_node(&volume.node_id)
@@ -14502,6 +14506,15 @@ impl ControllerService {
             self.create_or_adopt_host_volume(actor, &vol_name, &volume.name, &node, volume)
                 .await?
         };
+        if volume.storage_class == "lvm" {
+            self.ensure_lvm_role(&node, &volume.name, &volume.role)
+                .await?;
+        }
+        if volume.role == "pool" && (!row.fs_type.is_empty() || !row.mount_point.is_empty()) {
+            return Err(Status::failed_precondition(format!(
+                "volume {vol_name} is a formatted filesystem; a thin pool needs its own name"
+            )));
+        }
         if volume.size_bytes > row.size_bytes {
             let device = crate::host_volume::device_path(&row.storage_class, &row.pool, &row.image)
                 .map_err(Status::failed_precondition)?;
@@ -14524,6 +14537,9 @@ impl ControllerService {
             self.db
                 .upsert_volume(&row)
                 .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        if volume.role == "pool" {
+            return Ok(());
         }
         if row.fs_type.is_empty() {
             let device = crate::host_volume::device_path(&row.storage_class, &row.pool, &row.image)
@@ -14551,6 +14567,12 @@ impl ControllerService {
                         .upsert_volume(&row)
                         .map_err(|e| Status::internal(e.to_string()))?;
                 }
+                Err(e) if e.code() == tonic::Code::Unimplemented => {
+                    return Err(Status::failed_precondition(format!(
+                        "node {} cannot format volumes; install a node agent that implements FormatVolume",
+                        node.id
+                    )));
+                }
                 Err(e) => {
                     return Err(Status::internal(format!("formatting {vol_name}: {e}")));
                 }
@@ -14573,7 +14595,16 @@ impl ControllerService {
                     persistent: true,
                 })
                 .await
-                .map_err(|e| Status::internal(format!("mounting {vol_name}: {e}")))?
+                .map_err(|e| {
+                    if e.code() == tonic::Code::Unimplemented {
+                        Status::failed_precondition(format!(
+                            "node {} cannot mount volumes; install a node agent that implements MountVolume",
+                            node.id
+                        ))
+                    } else {
+                        Status::internal(format!("mounting {vol_name}: {e}"))
+                    }
+                })?
                 .into_inner();
             row.mount_point = if mounted.mount_point.is_empty() {
                 volume.mount_path.clone()
@@ -14609,12 +14640,16 @@ impl ControllerService {
         volume: &crate::kubernetes_local::LocalVolume,
     ) -> Result<crate::db::VolumeRow, Status> {
         let mut storage = self.connect_node_storage(node).await?;
+        let mut parameters = HashMap::new();
+        if volume.role == "pool" {
+            parameters.insert("lvm-type".to_string(), "thin-pool".to_string());
+        }
         let created = storage
             .create_volume(node_proto::CreateVolumeRequest {
                 volume_id: vol_name.to_string(),
                 storage_class: volume.storage_class.clone(),
                 size_bytes: volume.size_bytes,
-                parameters: HashMap::new(),
+                parameters,
                 lv_name: lv_name.to_string(),
             })
             .await;
@@ -14651,11 +14686,34 @@ impl ControllerService {
         Ok(row)
     }
 
-    async fn adopt_lvm_handle(
+    async fn ensure_lvm_role(
         &self,
         node: &crate::db::NodeRow,
         lv_name: &str,
-    ) -> Result<String, Status> {
+        role: &str,
+    ) -> Result<(), Status> {
+        let lv = self.lvm_logical_volume(node, lv_name).await?;
+        let thin_pool = lv.attr.starts_with('t');
+        if role == "pool" && !thin_pool {
+            return Err(Status::failed_precondition(format!(
+                "logical volume {lv_name} on {} is not a thin pool (attr {}); choose a new name so the existing volume is left intact",
+                node.id, lv.attr
+            )));
+        }
+        if role != "pool" && thin_pool {
+            return Err(Status::failed_precondition(format!(
+                "logical volume {lv_name} on {} is a thin pool; declare mode lvm to carve formatted volumes from it",
+                node.id
+            )));
+        }
+        Ok(())
+    }
+
+    async fn lvm_logical_volume(
+        &self,
+        node: &crate::db::NodeRow,
+        lv_name: &str,
+    ) -> Result<node_proto::LvmLogicalVolumeInfo, Status> {
         if self.clients.get_admin(&node.address).is_none() {
             self.clients
                 .connect(&node.address)
@@ -14673,14 +14731,27 @@ impl ControllerService {
         info.logical_volumes
             .into_iter()
             .find(|lv| lv.name == lv_name)
-            .map(|lv| lv.path)
-            .filter(|path| !path.is_empty())
             .ok_or_else(|| {
-                Status::already_exists(format!(
-                    "logical volume {lv_name} already exists on {} but was not found in LVM inventory",
+                Status::failed_precondition(format!(
+                    "logical volume {lv_name} was not found in LVM inventory on {}",
                     node.id
                 ))
             })
+    }
+
+    async fn adopt_lvm_handle(
+        &self,
+        node: &crate::db::NodeRow,
+        lv_name: &str,
+    ) -> Result<String, Status> {
+        let path = self.lvm_logical_volume(node, lv_name).await?.path;
+        if path.is_empty() {
+            return Err(Status::already_exists(format!(
+                "logical volume {lv_name} already exists on {} but has no device path",
+                node.id
+            )));
+        }
+        Ok(path)
     }
 
     fn build_kubernetes_cluster_proto(
@@ -14762,8 +14833,11 @@ impl ControllerService {
                         size_bytes: volume.size_bytes,
                         fs_type: volume.fs_type,
                         mount_path: volume.mount_path,
+                        role: volume.role,
+                        volume_group: volume.volume_group,
                     })
                     .collect(),
+                mode: provisioner.mode,
             });
 
         Ok(controller_proto::KubernetesCluster {

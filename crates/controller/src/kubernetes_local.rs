@@ -1,9 +1,13 @@
-//! Local-path provisioner declared on a Kubernetes cluster.
+//! Host storage for PersistentVolumeClaims on a Kubernetes cluster.
 //!
-//! Each volume is an LVM logical volume or a ZFS zvol on one cluster node.
-//! The rendered manifest is a Rancher local-path provisioner whose node paths
-//! are those mount points, so a PersistentVolumeClaim becomes a directory on
-//! the disk that holds the volume.
+//! `shared` mode formats and mounts one LVM logical volume or ZFS zvol. The
+//! rendered manifest is a Rancher local-path provisioner, so many claims
+//! become directories on that one filesystem.
+//!
+//! `lvm` mode creates an LVM thin pool of the declared size. The rendered
+//! manifest is a TopoLVM device class: each claim is its own thin logical
+//! volume, formatted with the declared filesystem, and many claims share the
+//! pool.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +22,9 @@ pub struct LocalVolume {
     pub size_bytes: i64,
     pub fs_type: String,
     pub mount_path: String,
+    /// "filesystem" or "pool".
+    pub role: String,
+    pub volume_group: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +35,9 @@ pub struct LocalProvisioner {
     pub storage_class_name: String,
     #[serde(default)]
     pub volumes: Vec<LocalVolume>,
+    /// "shared" or "lvm".
+    #[serde(default)]
+    pub mode: String,
 }
 
 impl LocalProvisioner {
@@ -36,7 +46,12 @@ impl LocalProvisioner {
             enabled: false,
             storage_class_name: String::new(),
             volumes: Vec::new(),
+            mode: String::new(),
         }
+    }
+
+    pub fn is_lvm(&self) -> bool {
+        self.mode == "lvm"
     }
 }
 
@@ -47,6 +62,8 @@ pub struct VolumeDecl<'a> {
     pub size_bytes: i64,
     pub fs_type: &'a str,
     pub mount_path: &'a str,
+    pub role: &'a str,
+    pub volume_group: &'a str,
 }
 
 pub fn normalize(
@@ -54,6 +71,7 @@ pub fn normalize(
     members: &BTreeSet<String>,
     enabled: bool,
     storage_class_name: &str,
+    mode: &str,
     volumes: &[VolumeDecl<'_>],
 ) -> Result<LocalProvisioner, String> {
     if !enabled {
@@ -65,6 +83,15 @@ pub fn normalize(
     if volumes.is_empty() {
         return Err("local provisioner requires at least one lvm or zfs volume".to_string());
     }
+    let mode = match mode.trim() {
+        "" | "shared" => "shared".to_string(),
+        "lvm" => "lvm".to_string(),
+        other => {
+            return Err(format!(
+                "local provisioner mode must be shared or lvm, got '{other}'"
+            ));
+        }
+    };
     let storage_class_name = {
         let name = storage_class_name.trim();
         if name.is_empty() {
@@ -114,9 +141,40 @@ pub fn normalize(
                 ));
             }
         };
-        let mount_path = {
+        let role = match (mode.as_str(), volume.role.trim()) {
+            ("lvm", "" | "pool") => "pool",
+            ("shared", "" | "filesystem") => "filesystem",
+            ("lvm", other) => {
+                return Err(format!(
+                    "volume '{name}' role must be pool in lvm mode, got '{other}'"
+                ));
+            }
+            ("shared", other) => {
+                return Err(format!(
+                    "volume '{name}' role must be filesystem in shared mode, got '{other}'"
+                ));
+            }
+            _ => unreachable!(),
+        };
+        if role == "pool" {
+            if storage_class != "lvm" {
+                return Err(format!(
+                    "volume '{name}' pool must use storage_class lvm, got '{storage_class}'"
+                ));
+            }
+            validate_volume_group(volume.volume_group.trim())
+                .map_err(|err| format!("volume '{name}' volume_group: {err}"))?;
+            if !volume.mount_path.trim().is_empty() {
+                return Err(format!(
+                    "volume '{name}' is a thin pool and is not mounted; leave mount_path empty"
+                ));
+            }
+        }
+        let mount_path = if role == "pool" {
+            String::new()
+        } else {
             let requested = volume.mount_path.trim();
-            if requested.is_empty() {
+            let mount_path = if requested.is_empty() {
                 format!(
                     "/mnt/kcore/{}/{}",
                     path_segment(cluster_name),
@@ -125,13 +183,14 @@ pub fn normalize(
             } else {
                 validate_mount_path(requested)?;
                 requested.to_string()
+            };
+            if !seen_mounts.insert(mount_path.clone()) {
+                return Err(format!(
+                    "mount path {mount_path} is used by more than one volume"
+                ));
             }
+            mount_path
         };
-        if !seen_mounts.insert(mount_path.clone()) {
-            return Err(format!(
-                "mount path {mount_path} is used by more than one volume"
-            ));
-        }
         normalized.push(LocalVolume {
             name: name.to_string(),
             node_id: node_id.to_string(),
@@ -139,12 +198,30 @@ pub fn normalize(
             size_bytes: volume.size_bytes,
             fs_type,
             mount_path,
+            role: role.to_string(),
+            volume_group: volume.volume_group.trim().to_string(),
         });
+    }
+    if mode == "lvm" {
+        let first = &normalized[0];
+        for volume in &normalized[1..] {
+            if volume.name != first.name
+                || volume.volume_group != first.volume_group
+                || volume.size_bytes != first.size_bytes
+                || volume.fs_type != first.fs_type
+            {
+                return Err(format!(
+                    "lvm mode uses one thin pool on every node; {} on {} does not match {} on {}",
+                    volume.name, volume.node_id, first.name, first.node_id
+                ));
+            }
+        }
     }
     Ok(LocalProvisioner {
         enabled: true,
         storage_class_name,
         volumes: normalized,
+        mode,
     })
 }
 
@@ -164,13 +241,21 @@ pub fn decode(json: &str) -> Result<LocalProvisioner, String> {
 }
 
 /// Controller volume name for a cluster-declared host volume.
-pub fn controller_volume_name(cluster: &str, volume: &str) -> String {
-    format!("k8s-{}-{}", path_segment(cluster), path_segment(volume))
+pub fn controller_volume_name(cluster: &str, node: &str, volume: &str) -> String {
+    format!(
+        "k8s-{}-{}-{}",
+        path_segment(cluster),
+        path_segment(node),
+        path_segment(volume)
+    )
 }
 
 pub fn manifests(provisioner: &LocalProvisioner) -> String {
     if !provisioner.enabled {
         return String::new();
+    }
+    if provisioner.is_lvm() {
+        return lvm_manifests(provisioner);
     }
     let mut by_node: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for volume in &provisioner.volumes {
@@ -273,6 +358,8 @@ kind: StorageClass
 metadata:
   name: {class_name}
 provisioner: rancher.io/local-path
+parameters:
+  kcore.io/layout: shared-filesystem
 volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
 ---
@@ -318,6 +405,86 @@ spec:
 "#,
         class_name = provisioner.storage_class_name
     )
+}
+
+fn lvm_manifests(provisioner: &LocalProvisioner) -> String {
+    let Some(pool) = provisioner.volumes.first() else {
+        return String::new();
+    };
+    let nodes = provisioner
+        .volumes
+        .iter()
+        .map(|volume| volume.node_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"# TopoLVM device class. Each PersistentVolumeClaim becomes its own thin
+# logical volume in pool {pool_name} ({size} bytes) on volume group {vg}.
+# TopoLVM formats that volume as {fs}. Many claims share the pool.
+# Create the pool on: {nodes}
+# Install TopoLVM chart 17.3.0 (app 0.42.0, image
+# ghcr.io/topolvm/topolvm-with-sidecar:0.42.0) with this lvmd config.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: topolvm-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lvmd
+  namespace: topolvm-system
+data:
+  lvmd.yaml: |
+    socket-name: /run/topolvm/lvmd.sock
+    device-classes:
+      - name: {class_name}
+        volume-group: {vg}
+        type: thin
+        thin-pool:
+          name: {pool_name}
+          overprovision-ratio: 1.0
+        default: true
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {class_name}
+provisioner: topolvm.io
+parameters:
+  topolvm.io/device-class: {class_name}
+  csi.storage.k8s.io/fstype: {fs}
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+"#,
+        pool_name = pool.name,
+        size = pool.size_bytes,
+        vg = pool.volume_group,
+        fs = pool.fs_type,
+        nodes = nodes,
+        class_name = provisioner.storage_class_name,
+    )
+}
+
+fn validate_volume_group(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+        && !name.contains("..");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{name}' must be letters, digits, '_', '.', '+', or '-'"
+        ))
+    }
 }
 
 fn dns_label(name: &str) -> Result<(), String> {
@@ -394,6 +561,21 @@ mod tests {
             size_bytes: size,
             fs_type: "",
             mount_path: "",
+            role: "",
+            volume_group: "",
+        }
+    }
+
+    fn pool<'a>(name: &'a str, node: &'a str, size: i64) -> VolumeDecl<'a> {
+        VolumeDecl {
+            name,
+            node_id: node,
+            storage_class: "lvm",
+            size_bytes: size,
+            fs_type: "",
+            mount_path: "",
+            role: "pool",
+            volume_group: "vg_kcore",
         }
     }
 
@@ -403,6 +585,7 @@ mod tests {
             "lab",
             &members(),
             true,
+            "",
             "",
             &[volume(
                 "kcore-kdata",
@@ -425,8 +608,8 @@ mod tests {
         assert!(yaml.contains("/mnt/kcore/lab/kcore-kdata"));
         assert!(yaml.contains("node-105"));
         assert_eq!(
-            controller_volume_name("lab", "kcore-kdata"),
-            "k8s-lab-kcore-kdata"
+            controller_volume_name("lab", "node-105", "kcore-kdata"),
+            "k8s-lab-node-105-kcore-kdata"
         );
     }
 
@@ -440,6 +623,7 @@ mod tests {
             &members(),
             true,
             "local-path",
+            "",
             &[
                 volume("kcore-kdata", "node-105", "lvm", 1024),
                 volume("extra", "node-105", "lvm", 2048),
@@ -461,6 +645,7 @@ mod tests {
             &members(),
             true,
             "local-path",
+            "",
             &[volume("kdata", "node-103", "lvm", 1024)],
         )
         .unwrap_err();
@@ -470,6 +655,7 @@ mod tests {
             &members(),
             true,
             "local-path",
+            "",
             &[volume("kdata", "node-107", "ceph", 1024)],
         )
         .unwrap_err();
@@ -479,14 +665,74 @@ mod tests {
             &members(),
             false,
             "",
+            "",
             &[volume("kdata", "node-107", "lvm", 1024)],
         )
         .unwrap_err();
         assert!(err.contains("enabled"));
         assert!(
-            !normalize("lab", &members(), false, "", &[])
+            !normalize("lab", &members(), false, "", "", &[])
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn lvm_mode_shares_one_thin_pool_and_formats_each_claim() {
+        let size = 50 * 1024 * 1024 * 1024;
+        let provisioner = normalize(
+            "lab",
+            &members(),
+            true,
+            "kcore-lvm",
+            "lvm",
+            &[
+                pool("kcore-kdata", "node-105", size),
+                pool("kcore-kdata", "node-107", size),
+                pool("kcore-kdata", "node-119", size),
+            ],
+        )
+        .unwrap();
+        assert_eq!(provisioner.mode, "lvm");
+        assert!(provisioner
+            .volumes
+            .iter()
+            .all(|volume| volume.role == "pool"));
+        assert!(provisioner
+            .volumes
+            .iter()
+            .all(|volume| volume.mount_path.is_empty()));
+        assert!(provisioner
+            .volumes
+            .iter()
+            .all(|volume| volume.fs_type == "ext4"));
+        let yaml = manifests(&provisioner);
+        assert!(yaml.contains("provisioner: topolvm.io"));
+        assert!(yaml.contains("type: thin"));
+        assert!(yaml.contains("name: kcore-kdata"));
+        assert!(yaml.contains("volume-group: vg_kcore"));
+        assert!(yaml.contains("csi.storage.k8s.io/fstype: ext4"));
+        assert!(yaml.contains("allowVolumeExpansion: true"));
+        assert!(!yaml.contains("rancher.io/local-path"));
+        let stored = decode(&encode(&provisioner)).unwrap();
+        assert_eq!(stored, provisioner);
+
+        let mismatch = normalize(
+            "lab",
+            &members(),
+            true,
+            "kcore-lvm",
+            "lvm",
+            &[
+                pool("kcore-kdata", "node-105", size),
+                pool("other", "node-107", size),
+            ],
+        )
+        .unwrap_err();
+        assert!(mismatch.contains("one thin pool"));
+        let mut mounted = pool("kcore-kdata", "node-105", size);
+        mounted.mount_path = "/mnt/kcore/lab/kcore-kdata";
+        let err = normalize("lab", &members(), true, "kcore-lvm", "lvm", &[mounted]).unwrap_err();
+        assert!(err.contains("not mounted"));
     }
 }
