@@ -35,6 +35,20 @@ pub fn service_phase_label(phase: i32) -> &'static str {
     }
 }
 
+/// Kubernetes cluster phase is a free-form word (`ready`, `bootstrapping`, …).
+pub fn kubernetes_phase_label(phase: &str) -> String {
+    let trimmed = phase.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut label = first.to_uppercase().collect::<String>();
+            label.push_str(chars.as_str());
+            label
+        }
+        None => "Unknown".to_string(),
+    }
+}
+
 /// UTC timestamp from Unix seconds. Non-positive values render as an em dash.
 pub fn format_unix_utc(seconds: i64) -> String {
     if seconds <= 0 {
@@ -252,6 +266,14 @@ mod tests {
     fn service_phases() {
         assert_eq!(service_phase_label(3), "Healthy");
         assert_eq!(service_phase_label(0), "Unspecified");
+    }
+
+    #[test]
+    fn kubernetes_phase_labels() {
+        assert_eq!(kubernetes_phase_label("ready"), "Ready");
+        assert_eq!(kubernetes_phase_label("bootstrapping"), "Bootstrapping");
+        assert_eq!(kubernetes_phase_label("  "), "Unknown");
+        assert_eq!(kubernetes_phase_label("Ready"), "Ready");
     }
 
     #[test]

@@ -4,16 +4,19 @@ use leptos::prelude::*;
 
 use crate::controller_client;
 use crate::dto::{
-    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ComplianceDto, NetworkOverviewDto,
+    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto,
+    DbmsRowDto, KubernetesClusterDetailDto, KubernetesClusterRowDto, NetworkOverviewDto,
     NetworkRowDto, ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto,
     SharedFilesystemRowDto, StorageOverviewDto, VmOperationRowDto, VmsPageDto, VolumeRowDto,
 };
 use crate::mappers::{
     audit_events_from_proto, ceph_cluster_detail_from_proto, ceph_clusters_from_proto,
-    compliance_from_proto, conflicts_from_proto, filter_audit_events, filter_vm_operations,
-    merge_ceph_capacity, network_overview_from_proto, networks_from_proto,
-    object_stores_from_proto, replication_status_from_proto, shared_filesystems_from_proto,
-    storage_overview_from_proto, vm_operations_from_proto, vms_page_from_proto, volumes_from_proto,
+    compliance_from_proto, conflicts_from_proto, dbms_detail_from_postgresql,
+    dbms_from_postgresqls, filter_audit_events, filter_vm_operations,
+    kubernetes_clusters_from_proto, kubernetes_detail_from_proto, merge_ceph_capacity,
+    network_overview_from_proto, networks_from_proto, object_stores_from_proto,
+    replication_status_from_proto, shared_filesystems_from_proto, storage_overview_from_proto,
+    vm_operations_from_proto, vms_page_from_proto, volumes_from_proto,
 };
 use crate::state::dashboard_config;
 
@@ -170,6 +173,55 @@ pub async fn list_operations_dto(q: String) -> Result<Vec<VmOperationRowDto>, Se
         .await
         .map_err(map_err)?;
     Ok(filter_vm_operations(vm_operations_from_proto(ops), &q))
+}
+
+#[server(ListDbms, "/api")]
+pub async fn list_dbms_dto() -> Result<Vec<DbmsRowDto>, ServerFnError> {
+    let cfg = dashboard_config();
+    let rows = controller_client::list_postgresqls(cfg)
+        .await
+        .map_err(map_err)?;
+    Ok(dbms_from_postgresqls(rows))
+}
+
+#[server(GetDbms, "/api")]
+pub async fn get_dbms_dto(name: String) -> Result<DbmsDetailDto, ServerFnError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ServerFnError::new("missing database service name"));
+    }
+    let cfg = dashboard_config();
+    let info = controller_client::get_postgresql(cfg, name)
+        .await
+        .map_err(map_err)?;
+    Ok(dbms_detail_from_postgresql(info))
+}
+
+#[server(ListKubernetesClusters, "/api")]
+pub async fn list_kubernetes_clusters_dto() -> Result<Vec<KubernetesClusterRowDto>, ServerFnError> {
+    let cfg = dashboard_config();
+    let clusters = controller_client::list_kubernetes_clusters(cfg)
+        .await
+        .map_err(map_err)?;
+    Ok(kubernetes_clusters_from_proto(clusters))
+}
+
+#[server(GetKubernetesCluster, "/api")]
+pub async fn get_kubernetes_cluster_dto(
+    name: String,
+) -> Result<KubernetesClusterDetailDto, ServerFnError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ServerFnError::new("missing Kubernetes cluster name"));
+    }
+    let cfg = dashboard_config();
+    let cluster = controller_client::get_kubernetes_cluster(cfg, name)
+        .await
+        .map_err(map_err)?;
+    let health = controller_client::get_kubernetes_cluster_health(cfg, name)
+        .await
+        .map_err(|err| format!("{err:#}"));
+    Ok(kubernetes_detail_from_proto(cluster, health))
 }
 
 #[server(ListAuditEvents, "/api")]

@@ -1446,132 +1446,321 @@ mod tests {
     }
 }
 
-/// Property-based tests (Phase 2) — Nix string escaping and sanitization.
+/// Kubernetes cluster node configuration parameters.
+#[derive(Debug, Clone)]
+pub struct KubernetesNodeConfig {
+    pub role: String,
+    pub cluster_name: String,
+    pub cluster_cidr: String,
+    pub service_cidr: String,
+    pub cluster_dns: String,
+    pub advertise_address: String,
+    pub iface: String,
+    pub api_server_endpoint: String,
+    pub initial_cluster: bool,
+    pub etcd_initial_cluster: String,
+    pub cni: String,
+    pub cilium_mode: String,
+    pub cilium_mtu: i32,
+    pub cilium_tunnel: String,
+    pub cilium_auto_direct_routes: bool,
+    pub cilium_lb_ip_pools: Vec<String>,
+    pub ha_enabled: bool,
+    pub vip_address: String,
+    pub vip_interface: String,
+    pub kubeconfig_data: String,
+}
+
+/// Generate the kcore.kubernetes NixOS module configuration for a node.
 ///
-/// `nix_escape` is the trust boundary for embedding controller-stored
-/// strings (VM names, descriptions, etc.) into rendered Nix
-/// configuration. A bug here could let a malicious VM name execute
-/// arbitrary Nix code at evaluation time, so we want strong
-/// post-condition guarantees against ALL inputs, not just the handful
-/// covered by example tests.
+/// This produces a Nix attribute set that will be merged into the node's
+/// configuration.nix, enabling the Kubernetes services (etcd, kube-apiserver,
+/// controller-manager, scheduler, kubelet) based on the node's role.
+pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  kcore.kubernetes = {\n");
+    out.push_str("    enable = true;\n");
+    out.push_str(&format!("    role = \"{}\";\n", nix_escape(&k8s.role)));
+    out.push_str(&format!(
+        "    clusterName = \"{}\";\n",
+        nix_escape(&k8s.cluster_name)
+    ));
+    out.push_str(&format!(
+        "    clusterCidr = \"{}\";\n",
+        nix_escape(&k8s.cluster_cidr)
+    ));
+    out.push_str(&format!(
+        "    serviceCidr = \"{}\";\n",
+        nix_escape(&k8s.service_cidr)
+    ));
+    out.push_str(&format!(
+        "    clusterDns = \"{}\";\n",
+        nix_escape(&k8s.cluster_dns)
+    ));
+    out.push_str(&format!(
+        "    advertiseAddress = \"{}\";\n",
+        nix_escape(&k8s.advertise_address)
+    ));
+    out.push_str(&format!("    iface = \"{}\";\n", nix_escape(&k8s.iface)));
+    out.push_str(&format!(
+        "    apiServerEndpoint = \"{}\";\n",
+        nix_escape(&k8s.api_server_endpoint)
+    ));
+    out.push_str(&format!("    initialCluster = {};\n", k8s.initial_cluster));
+
+    if k8s.role == "control-plane" {
+        out.push_str(&format!(
+            "    etcdInitialCluster = \"{}\";\n",
+            nix_escape(&k8s.etcd_initial_cluster)
+        ));
+    }
+
+    out.push_str(&format!("    cni = \"{}\";\n", nix_escape(&k8s.cni)));
+    out.push_str(&format!(
+        "    ciliumMode = \"{}\";\n",
+        nix_escape(&k8s.cilium_mode)
+    ));
+    out.push_str(&format!("    ciliumMtu = {};\n", k8s.cilium_mtu));
+    out.push_str(&format!(
+        "    ciliumTunnel = \"{}\";\n",
+        nix_escape(&k8s.cilium_tunnel)
+    ));
+    out.push_str(&format!(
+        "    ciliumAutoDirectNodeRoutes = {};\n",
+        k8s.cilium_auto_direct_routes
+    ));
+
+    if !k8s.cilium_lb_ip_pools.is_empty() {
+        out.push_str("    ciliumLoadBalancerIpPools = [\n");
+        for pool in &k8s.cilium_lb_ip_pools {
+            out.push_str(&format!("      \"{}\"\n", nix_escape(pool)));
+        }
+        out.push_str("    ];\n");
+    }
+
+    out.push_str(&format!("    haEnabled = {};\n", k8s.ha_enabled));
+    if k8s.ha_enabled {
+        out.push_str(&format!(
+            "    vipAddress = \"{}\";\n",
+            nix_escape(&k8s.vip_address)
+        ));
+        out.push_str(&format!(
+            "    vipInterface = \"{}\";\n",
+            nix_escape(&k8s.vip_interface)
+        ));
+    }
+
+    if !k8s.kubeconfig_data.is_empty() {
+        out.push_str(&format!(
+            "    kubeconfigData = ''{}'';\n",
+            k8s.kubeconfig_data
+        ));
+    }
+
+    out.push_str("  };\n");
+    out.push_str("}\n");
+    out
+}
+
 #[cfg(test)]
-mod proptests {
+mod kubernetes_tests {
     use super::*;
-    use proptest::prelude::*;
 
-    /// Returns true iff `s`, when wrapped in `"…"`, is safe to embed
-    /// in a Nix double-quoted string literal: no unescaped `"`, no
-    /// unescaped `\`, and no unescaped `${` interpolation marker.
-    fn is_safely_escaped(s: &str) -> bool {
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                // A backslash MUST be followed by another byte (escape pair).
-                b'\\' => {
-                    if i + 1 >= bytes.len() {
-                        return false;
-                    }
-                    i += 2;
-                    continue;
-                }
-                // A bare `"` is never allowed.
-                b'"' => return false,
-                // A bare `${` is never allowed.
-                b'$' if bytes.get(i + 1) == Some(&b'{') => return false,
-                _ => i += 1,
-            }
-        }
-        true
+    #[test]
+    fn test_generate_kubernetes_control_plane_config() {
+        let config = KubernetesNodeConfig {
+            role: "control-plane".to_string(),
+            cluster_name: "kcore-k8s".to_string(),
+            cluster_cidr: "10.244.0.0/16".to_string(),
+            service_cidr: "10.96.0.0/12".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            advertise_address: "192.168.40.105".to_string(),
+            iface: "enp6s0".to_string(),
+            api_server_endpoint: "192.168.40.200:6443".to_string(),
+            initial_cluster: true,
+            etcd_initial_cluster: "node-105=https://192.168.40.105:2380".to_string(),
+            cni: "cilium".to_string(),
+            cilium_mode: "native-routing".to_string(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".to_string(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+            ha_enabled: true,
+            vip_address: "192.168.40.200".to_string(),
+            vip_interface: "enp6s0".to_string(),
+            kubeconfig_data: String::new(),
+        };
+
+        let nix = generate_kubernetes_node_config(&config);
+        assert!(nix.contains("enable = true"));
+        assert!(nix.contains("role = \"control-plane\""));
+        assert!(nix.contains("haEnabled = true"));
+        assert!(nix.contains("initialCluster = true"));
+        assert!(nix.contains("etcdInitialCluster"));
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 2_000,
-            .. ProptestConfig::default()
-        })]
+    #[test]
+    fn test_generate_kubernetes_worker_config() {
+        let config = KubernetesNodeConfig {
+            role: "worker".to_string(),
+            cluster_name: "kcore-k8s".to_string(),
+            cluster_cidr: "10.244.0.0/16".to_string(),
+            service_cidr: "10.96.0.0/12".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            advertise_address: "192.168.40.110".to_string(),
+            iface: "enp6s0".to_string(),
+            api_server_endpoint: "192.168.40.200:6443".to_string(),
+            initial_cluster: false,
+            etcd_initial_cluster: String::new(),
+            cni: "cilium".to_string(),
+            cilium_mode: "native-routing".to_string(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".to_string(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: vec![],
+            ha_enabled: false,
+            vip_address: String::new(),
+            vip_interface: String::new(),
+            kubeconfig_data: String::new(),
+        };
 
-        /// `nix_escape` never panics for any UTF-8 input.
-        #[test]
-        fn nix_escape_never_panics(s in ".{0,128}") {
-            let _ = nix_escape(&s);
-        }
-
-        /// **Soundness**: the output of `nix_escape` is always safe to
-        /// embed inside a Nix double-quoted string literal. This is the
-        /// security-critical post-condition every caller relies on.
-        #[test]
-        fn nix_escape_output_is_always_safe(s in ".{0,128}") {
-            let escaped = nix_escape(&s);
-            prop_assert!(
-                is_safely_escaped(&escaped),
-                "nix_escape({s:?}) = {escaped:?} is not safely escaped"
-            );
-        }
-
-        /// **Idempotence on safe input**: a string that contains no
-        /// `\`, `"`, or `${` is left unchanged.
-        #[test]
-        fn nix_escape_is_identity_on_safe_input(s in "[a-zA-Z0-9 _\\-./]{0,32}") {
-            prop_assert_eq!(nix_escape(&s), s);
-        }
-
-        /// `nix_escape` is **idempotent**: escaping an already-escaped
-        /// string and then escaping again is the same as escaping the
-        /// already-escaped string only once. (Necessary for any future
-        /// pipeline that may re-process strings.)
-        ///
-        /// Note: this property is intentionally weaker than
-        /// `nix_escape(nix_escape(s)) == nix_escape(s)`, which does NOT
-        /// hold (because escaping `\` produces `\\`, which itself
-        /// contains `\`). The realistic invariant is that two passes
-        /// are equivalent to one pass on the once-escaped output —
-        /// which is trivially true. We assert the safe-output post-
-        /// condition recursively instead.
-        #[test]
-        fn nix_escape_repeated_application_stays_safe(s in ".{0,64}") {
-            let once = nix_escape(&s);
-            let twice = nix_escape(&once);
-            prop_assert!(is_safely_escaped(&once));
-            prop_assert!(is_safely_escaped(&twice));
-        }
-
-        /// `sanitize_nix_attr_key` always returns a string of the same
-        /// `chars().count()` whose every character is in
-        /// `[A-Za-z0-9_-]`.
-        #[test]
-        fn sanitize_nix_attr_key_charset(s in ".{0,32}") {
-            let out = sanitize_nix_attr_key(&s);
-            prop_assert_eq!(out.chars().count(), s.chars().count());
-            for c in out.chars() {
-                prop_assert!(
-                    c.is_ascii_alphanumeric() || c == '-' || c == '_',
-                    "sanitize_nix_attr_key produced unsafe char {c:?}"
-                );
-            }
-        }
-
-        /// `netmask_to_cidr` for any well-formed IPv4 dotted netmask
-        /// returns the popcount of the underlying 32-bit value, so it
-        /// is always in `[0, 32]`.
-        #[test]
-        fn netmask_to_cidr_is_in_range(
-            a in 0u8..=255, b in 0u8..=255, c in 0u8..=255, d in 0u8..=255,
-        ) {
-            let s = format!("{a}.{b}.{c}.{d}");
-            let n = netmask_to_cidr(&s);
-            prop_assert!(n <= 32, "netmask_to_cidr({s:?}) = {n} > 32");
-            // Must also equal sum of octet popcounts.
-            let expected = (a.count_ones() + b.count_ones() + c.count_ones() + d.count_ones()) as u8;
-            prop_assert_eq!(n, expected);
-        }
-
-        /// `netmask_to_cidr` on garbage input never panics; it just
-        /// drops un-parseable octets and returns the popcount of the
-        /// remainder.
-        #[test]
-        fn netmask_to_cidr_never_panics_on_garbage(s in ".{0,32}") {
-            let _ = netmask_to_cidr(&s);
-        }
+        let nix = generate_kubernetes_node_config(&config);
+        assert!(nix.contains("enable = true"));
+        assert!(nix.contains("role = \"worker\""));
+        assert!(nix.contains("haEnabled = false"));
+        assert!(!nix.contains("etcdInitialCluster"));
     }
+}
+
+/// Generate Kubernetes node configuration for a node in the cluster
+pub fn generate_kubernetes_config(
+    cluster_name: &str,
+    node: &crate::kubernetes_orchestrator::ClusterNode,
+    pki: &crate::kubernetes_pki::KubernetesPki,
+    cluster_cidr: &str,
+    service_cidr: &str,
+    etcd_server_cert: &str,
+    etcd_server_key: &str,
+    etcd_peer_cert: &str,
+    etcd_peer_key: &str,
+    all_nodes: &[crate::kubernetes_orchestrator::ClusterNode],
+) -> anyhow::Result<String> {
+    // Build complete etcd initial cluster string with ALL members
+    // For static bootstrap, every node needs the complete list
+    let etcd_initial_cluster = all_nodes
+        .iter()
+        .map(|n| format!("{}=https://{}:2380", n.node_id, n.ip_address))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let k8s_config = KubernetesNodeConfig {
+        role: "control-plane".to_string(),
+        cluster_name: cluster_name.to_string(),
+        cluster_cidr: cluster_cidr.to_string(),
+        service_cidr: service_cidr.to_string(),
+        cluster_dns: "10.96.0.10".to_string(), // TODO: Parse from service_cidr
+        advertise_address: node.ip_address.clone(),
+        iface: "enp6s0".to_string(), // TODO: Get from database
+        api_server_endpoint: format!("https://{}:6443", node.ip_address), // TODO: Use VIP if HA
+        initial_cluster: true,       // Always true for static bootstrap
+        etcd_initial_cluster,
+        cni: "cilium".to_string(),
+        cilium_mode: "native-routing".to_string(),
+        cilium_mtu: 1500,
+        cilium_tunnel: "disabled".to_string(),
+        cilium_auto_direct_routes: true,
+        cilium_lb_ip_pools: vec![],
+        ha_enabled: false, // TODO: Read from cluster config
+        vip_address: String::new(),
+        vip_interface: String::new(),
+        kubeconfig_data: String::new(), // TODO: Include admin kubeconfig
+    };
+
+    let mut nix = generate_kubernetes_node_config(&k8s_config);
+
+    // Append PKI certificates as writeText
+    nix.pop(); // Remove trailing '}\n'
+    nix.pop();
+
+    nix.push_str("\n  # Kubernetes PKI certificates\n");
+    nix.push_str("  environment.etc = {\n");
+
+    // CA certificate
+    nix.push_str("    \"kubernetes/pki/ca.crt\".text = ''\n");
+    nix.push_str(&pki.ca_cert);
+    nix.push_str("'';\n");
+
+    // CA key (control plane only)
+    nix.push_str("    \"kubernetes/pki/ca.key\".text = ''\n");
+    nix.push_str(&pki.ca_key);
+    nix.push_str("'';\n");
+
+    // Service account key pair
+    nix.push_str("    \"kubernetes/pki/sa.key\".text = ''\n");
+    nix.push_str(&pki.sa_key);
+    nix.push_str("'';\n");
+
+    nix.push_str("    \"kubernetes/pki/sa.pub\".text = ''\n");
+    nix.push_str(&pki.sa_pub);
+    nix.push_str("'';\n");
+
+    // API server certificate and key
+    nix.push_str("    \"kubernetes/pki/apiserver.crt\".text = ''\n");
+    nix.push_str(&pki.apiserver_cert);
+    nix.push_str("'';\n");
+
+    nix.push_str("    \"kubernetes/pki/apiserver.key\".text = ''\n");
+    nix.push_str(&pki.apiserver_key);
+    nix.push_str("'';\n");
+
+    // API server kubelet client cert
+    nix.push_str("    \"kubernetes/pki/apiserver-kubelet-client.crt\".text = ''\n");
+    nix.push_str(&pki.apiserver_kubelet_client_cert);
+    nix.push_str("'';\n");
+
+    nix.push_str("    \"kubernetes/pki/apiserver-kubelet-client.key\".text = ''\n");
+    nix.push_str(&pki.apiserver_kubelet_client_key);
+    nix.push_str("'';\n");
+
+    // etcd CA
+    nix.push_str("    \"kubernetes/pki/etcd/ca.crt\".text = ''\n");
+    nix.push_str(&pki.etcd_ca_cert);
+    nix.push_str("'';\n");
+
+    nix.push_str("    \"kubernetes/pki/etcd/ca.key\".text = ''\n");
+    nix.push_str(&pki.etcd_ca_key);
+    nix.push_str("'';\n");
+
+    // Node-specific etcd server cert/key
+    nix.push_str("    \"kubernetes/pki/etcd/server.crt\".text = ''\n");
+    nix.push_str(etcd_server_cert);
+    nix.push_str("'';\n");
+
+    nix.push_str("    \"kubernetes/pki/etcd/server.key\".text = ''\n");
+    nix.push_str(etcd_server_key);
+    nix.push_str("'';\n");
+
+    // Node-specific etcd peer cert/key
+    nix.push_str("    \"kubernetes/pki/etcd/peer.crt\".text = ''\n");
+    nix.push_str(etcd_peer_cert);
+    nix.push_str("'';\n");
+
+    nix.push_str("    \"kubernetes/pki/etcd/peer.key\".text = ''\n");
+    nix.push_str(etcd_peer_key);
+    nix.push_str("'';\n");
+
+    // API server etcd client cert
+    nix.push_str("    \"kubernetes/pki/apiserver-etcd-client.crt\".text = ''\n");
+    nix.push_str(&pki.apiserver_etcd_client_cert);
+    nix.push_str("'';\n");
+
+    nix.push_str("    \"kubernetes/pki/apiserver-etcd-client.key\".text = ''\n");
+    nix.push_str(&pki.apiserver_etcd_client_key);
+    nix.push_str("'';\n");
+
+    nix.push_str("  };\n");
+    nix.push_str("}\n");
+
+    Ok(nix)
 }

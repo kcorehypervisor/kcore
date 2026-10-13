@@ -1,0 +1,471 @@
+# Sample Kubernetes Cluster Specifications (Cilium-Native)
+
+## Production HA Cluster (3 Control Planes + 3 Workers)
+
+Recommended for production. Full high availability with Cilium eBPF networking.
+
+```yaml
+kind: KubernetesCluster
+metadata:
+  name: lab-ha
+  generation: 1
+spec:
+  clusterCidr: 10.244.0.0/16
+  serviceCidr: 10.96.0.0/12
+  clusterDns: 10.96.0.10
+  apiServerEndpoint: 192.168.40.200:6443
+  
+  cni: cilium
+  ciliumConfig:
+    mode: native-routing  # Direct routing, no tunnels
+    mtu: 1500             # Full MTU
+    ipam: kubernetes
+    tunnel: disabled
+    autoDirectNodeRoutes: true
+    
+    # Hubble observability
+    hubble:
+      enabled: true
+      relay:
+        enabled: true
+      ui:
+        enabled: true
+    
+    # Cilium LoadBalancer L2
+    loadBalancer:
+      mode: l2
+      ipPools:
+        - name: default-pool
+          cidr: 192.168.40.220/29  # 8 IPs (.220-.227)
+      l2Announcements:
+        - interface: enp6s0
+  
+  controlPlane:
+    nodes:
+      - nodeId: node-105
+        advertiseAddress: 192.168.40.105
+        iface: enp6s0
+        initialCluster: true
+      
+      - nodeId: node-107
+        advertiseAddress: 192.168.40.107
+        iface: enp6s0
+        joinExisting: true
+      
+      - nodeId: node-119
+        advertiseAddress: 192.168.40.119
+        iface: enp6s0
+        joinExisting: true
+  
+  workers:
+    nodes:
+      - nodeId: node-103
+        advertiseAddress: 192.168.40.103
+        iface: enp6s0
+      
+      - nodeId: worker-2
+        advertiseAddress: 192.168.40.104
+        iface: enp6s0
+      
+      - nodeId: worker-3
+        advertiseAddress: 192.168.40.106
+        iface: enp6s0
+  
+  highAvailability:
+    enabled: true
+    vipAddress: 192.168.40.200
+    vipInterface: enp6s0
+    method: keepalived
+```
+
+**Features:**
+- 3 control planes = tolerates 1 control plane failure
+- 3 etcd members = tolerates 1 etcd failure
+- VIP failover = API always reachable
+- Cilium eBPF = 10x faster than iptables
+- Native routing = no encapsulation overhead
+- Hubble = deep network observability
+- LoadBalancer IPs from 192.168.40.220-227
+
+---
+
+## Large Cluster (5 Control Planes + 10 Workers)
+
+For very large deployments requiring maximum availability.
+
+```yaml
+kind: KubernetesCluster
+metadata:
+  name: production-large
+  generation: 1
+spec:
+  clusterCidr: 10.244.0.0/16
+  serviceCidr: 10.96.0.0/12
+  clusterDns: 10.96.0.10
+  apiServerEndpoint: 192.168.40.200:6443
+  
+  cni: cilium
+  ciliumConfig:
+    mode: native-routing
+    mtu: 1500
+    ipam: kubernetes
+    tunnel: disabled
+    autoDirectNodeRoutes: true
+    
+    hubble:
+      enabled: true
+      relay:
+        enabled: true
+      ui:
+        enabled: true
+    
+    loadBalancer:
+      mode: l2
+      ipPools:
+        - name: default-pool
+          cidr: 192.168.40.220/28  # 16 IPs (.220-.235)
+      l2Announcements:
+        - interface: enp6s0
+  
+  controlPlane:
+    nodes:
+      - nodeId: cp-1
+        advertiseAddress: 192.168.40.101
+        iface: enp6s0
+        initialCluster: true
+      
+      - nodeId: cp-2
+        advertiseAddress: 192.168.40.102
+        iface: enp6s0
+        joinExisting: true
+      
+      - nodeId: cp-3
+        advertiseAddress: 192.168.40.103
+        iface: enp6s0
+        joinExisting: true
+      
+      - nodeId: cp-4
+        advertiseAddress: 192.168.40.104
+        iface: enp6s0
+        joinExisting: true
+      
+      - nodeId: cp-5
+        advertiseAddress: 192.168.40.105
+        iface: enp6s0
+        joinExisting: true
+  
+  workers:
+    nodes:
+      - nodeId: worker-1
+        advertiseAddress: 192.168.40.111
+        iface: enp6s0
+      
+      - nodeId: worker-2
+        advertiseAddress: 192.168.40.112
+        iface: enp6s0
+      
+      - nodeId: worker-3
+        advertiseAddress: 192.168.40.113
+        iface: enp6s0
+      
+      - nodeId: worker-4
+        advertiseAddress: 192.168.40.114
+        iface: enp6s0
+      
+      - nodeId: worker-5
+        advertiseAddress: 192.168.40.115
+        iface: enp6s0
+      
+      - nodeId: worker-6
+        advertiseAddress: 192.168.40.116
+        iface: enp6s0
+      
+      - nodeId: worker-7
+        advertiseAddress: 192.168.40.117
+        iface: enp6s0
+      
+      - nodeId: worker-8
+        advertiseAddress: 192.168.40.118
+        iface: enp6s0
+      
+      - nodeId: worker-9
+        advertiseAddress: 192.168.40.119
+        iface: enp6s0
+      
+      - nodeId: worker-10
+        advertiseAddress: 192.168.40.120
+        iface: enp6s0
+  
+  highAvailability:
+    enabled: true
+    vipAddress: 192.168.40.200
+    vipInterface: enp6s0
+    method: keepalived
+```
+
+**Features:**
+- 5 control planes = tolerates 2 failures (etcd quorum = 3/5)
+- 10 workers = high workload capacity
+- Larger LoadBalancer IP pool (16 IPs)
+- Better load distribution
+
+**Note:** etcd odd numbers only (3, 5, 7). Don't use 4 or 6 control planes.
+
+---
+
+## Multi-NIC Cluster (Separate Management/Data Networks)
+
+For clusters with dedicated data plane network.
+
+```yaml
+kind: KubernetesCluster
+metadata:
+  name: multi-nic
+  generation: 1
+spec:
+  clusterCidr: 10.244.0.0/16
+  serviceCidr: 10.96.0.0/12
+  clusterDns: 10.96.0.10
+  apiServerEndpoint: 192.168.40.200:6443
+  
+  cni: cilium
+  ciliumConfig:
+    mode: native-routing
+    mtu: 9000  # Jumbo frames on 10G data network
+    ipam: kubernetes
+    tunnel: disabled
+    autoDirectNodeRoutes: true
+    
+    hubble:
+      enabled: true
+    
+    loadBalancer:
+      mode: l2
+      ipPools:
+        - name: default-pool
+          cidr: 192.168.40.220/29
+      l2Announcements:
+        - interface: enp7s0  # 10G data NIC
+  
+  controlPlane:
+    nodes:
+      - nodeId: node-105
+        advertiseAddress: 192.168.40.105
+        iface: enp7s0  # Use 10G data NIC for pod traffic
+        initialCluster: true
+      
+      - nodeId: node-107
+        advertiseAddress: 192.168.40.107
+        iface: enp7s0
+        joinExisting: true
+      
+      - nodeId: node-119
+        advertiseAddress: 192.168.40.119
+        iface: enp7s0
+        joinExisting: true
+  
+  workers:
+    nodes:
+      - nodeId: node-103
+        advertiseAddress: 192.168.40.103
+        iface: enp7s0
+      
+      - nodeId: worker-2
+        advertiseAddress: 192.168.40.104
+        iface: enp7s0
+      
+      - nodeId: worker-3
+        advertiseAddress: 192.168.40.106
+        iface: enp7s0
+  
+  highAvailability:
+    enabled: true
+    vipAddress: 192.168.40.200
+    vipInterface: enp7s0
+    method: keepalived
+```
+
+**Use Case:**
+- Separate 1G management (kcore control) from 10G data (Kubernetes)
+- Jumbo frames (MTU 9000) for better performance
+- Isolate Kubernetes traffic from VM traffic
+
+---
+
+## Scaling Example
+
+Start small, scale up:
+
+**Initial (3 control planes + 3 workers):**
+```yaml
+  controlPlane:
+    nodes:
+      - nodeId: node-105
+        advertiseAddress: 192.168.40.105
+        iface: enp6s0
+        initialCluster: true
+      
+      - nodeId: node-107
+        advertiseAddress: 192.168.40.107
+        iface: enp6s0
+        joinExisting: true
+      
+      - nodeId: node-119
+        advertiseAddress: 192.168.40.119
+        iface: enp6s0
+        joinExisting: true
+  
+  workers:
+    nodes:
+      - nodeId: node-103
+        advertiseAddress: 192.168.40.103
+        iface: enp6s0
+      
+      - nodeId: worker-2
+        advertiseAddress: 192.168.40.104
+        iface: enp6s0
+      
+      - nodeId: worker-3
+        advertiseAddress: 192.168.40.106
+        iface: enp6s0
+```
+
+**After scaling (add 2 workers):**
+```yaml
+  workers:
+    nodes:
+      - nodeId: node-103
+        advertiseAddress: 192.168.40.103
+        iface: enp6s0
+      
+      - nodeId: worker-2
+        advertiseAddress: 192.168.40.104
+        iface: enp6s0
+      
+      - nodeId: worker-3
+        advertiseAddress: 192.168.40.106
+        iface: enp6s0
+      
+      - nodeId: worker-4  # NEW
+        advertiseAddress: 192.168.40.108
+        iface: enp6s0
+      
+      - nodeId: worker-5  # NEW
+        advertiseAddress: 192.168.40.109
+        iface: enp6s0
+```
+
+Then:
+```bash
+kctl kubernetes plan -f updated-cluster.yaml
+kctl kubernetes apply -f updated-cluster.yaml
+```
+
+---
+
+## Cilium Configuration Reference
+
+### Native Routing (Default, Recommended)
+
+```yaml
+ciliumConfig:
+  mode: native-routing
+  mtu: 1500
+  ipam: kubernetes
+  tunnel: disabled
+  autoDirectNodeRoutes: true
+```
+
+**Benefits:** No encapsulation, full MTU, best performance
+
+### Tunnel Mode (VXLAN Fallback)
+
+```yaml
+ciliumConfig:
+  mode: tunnel
+  tunnel: vxlan
+  mtu: 1450
+  ipam: kubernetes
+```
+
+**Use only if:** Native routing blocked by network policy
+
+### LoadBalancer IP Pools
+
+```yaml
+ciliumConfig:
+  loadBalancer:
+    mode: l2
+    ipPools:
+      - name: default-pool
+        cidr: 192.168.40.220/29  # 8 IPs
+      - name: high-priority
+        cidr: 192.168.40.230/30  # 4 IPs
+        serviceSelector:
+          matchLabels:
+            priority: high
+    l2Announcements:
+      - interface: enp6s0
+```
+
+### Hubble Observability
+
+```yaml
+ciliumConfig:
+  hubble:
+    enabled: true
+    relay:
+      enabled: true
+    ui:
+      enabled: true
+    metrics:
+      enabled:
+        - dns
+        - drop
+        - tcp
+        - flow
+        - icmp
+        - http
+```
+
+---
+
+## CIDR Planning
+
+### Avoid Overlaps
+
+| Network Type | Default | Alternatives |
+|--------------|---------|--------------|
+| Pod CIDR | 10.244.0.0/16 | 10.240.0.0/16, 172.16.0.0/16 |
+| Service CIDR | 10.96.0.0/12 | 10.32.0.0/12, 172.20.0.0/16 |
+| Management | 192.168.40.0/24 | (existing, don't change) |
+| Ceph | 192.168.47.0/24 | (existing, don't change) |
+| LoadBalancer | 192.168.40.220/29 | (reserve IPs outside DHCP) |
+
+### Capacity
+
+| CIDR | Max Addresses | Use Case |
+|------|---------------|----------|
+| /16 | 65,536 | Large clusters (thousands of pods) |
+| /20 | 4,096 | Medium clusters (hundreds of pods) |
+| /24 | 256 | Small dev clusters |
+
+---
+
+## Validation Checklist
+
+Before applying any spec:
+
+- [ ] Node IDs exist in `kctl get nodes`
+- [ ] All nodes are approved
+- [ ] Advertise addresses are correct and static
+- [ ] Interfaces exist on all nodes
+- [ ] VIP is not already in use
+- [ ] Pod CIDR doesn't overlap management (192.168.40.x)
+- [ ] Pod CIDR doesn't overlap Ceph (192.168.47.x)
+- [ ] Service CIDR doesn't overlap Pod CIDR
+- [ ] Control plane count is odd (1, 3, 5, 7)
+- [ ] LoadBalancer IPs reserved outside DHCP range
+- [ ] All nodes have sufficient resources (CPU, RAM, disk)
+- [ ] Cilium requires kernel 4.19.57+ (check with `uname -r`)
+
