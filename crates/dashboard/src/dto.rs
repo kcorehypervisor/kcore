@@ -255,6 +255,106 @@ pub struct CephClusterRowDto {
     pub osd_devices: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephPgStateDto {
+    pub state_name: String,
+    pub count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephCheckDto {
+    pub name: String,
+    pub severity: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephHealthDetailDto {
+    pub health_status: String,
+    pub mon_quorum: String,
+    pub osd_total: i32,
+    pub osd_up: i32,
+    pub osd_in: i32,
+    pub pgs_total: i32,
+    pub pgs_by_state: Vec<CephPgStateDto>,
+    pub noout: bool,
+    pub norebalance: bool,
+    pub flags: Vec<String>,
+    pub checks: Vec<CephCheckDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephMemberDto {
+    pub node_id: String,
+    pub mon_addr: String,
+    pub cluster_addr: String,
+    pub public_iface: String,
+    pub cluster_iface: String,
+    pub osd_devices: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephDeviceClassDto {
+    pub device_class: String,
+    pub total_bytes: i64,
+    pub used_bytes: i64,
+    pub avail_bytes: i64,
+    pub total_human: String,
+    pub used_human: String,
+    pub avail_human: String,
+    pub used_percent: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephPoolUsageDto {
+    pub name: String,
+    pub stored_bytes: i64,
+    pub stored_human: String,
+    pub objects: i64,
+    pub percent_used_bp: i32,
+    pub max_avail_bytes: i64,
+    pub max_avail_human: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephCapacityDto {
+    pub total_bytes: i64,
+    pub used_bytes: i64,
+    pub avail_bytes: i64,
+    pub total_human: String,
+    pub used_human: String,
+    pub avail_human: String,
+    pub used_percent: i32,
+    pub by_class: Vec<CephDeviceClassDto>,
+    pub pools: Vec<CephPoolUsageDto>,
+    /// `df`, `pgmap`, or `none`.
+    pub source: String,
+    pub queried_node: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CephClusterDetailDto {
+    pub name: String,
+    pub generation: i64,
+    pub fsid: String,
+    pub phase: String,
+    pub health_message: String,
+    pub public_network: String,
+    pub cluster_network: String,
+    pub size: i32,
+    pub min_size: i32,
+    pub encrypt_osds: bool,
+    pub force_wipe: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub members: Vec<CephMemberDto>,
+    pub health: CephHealthDetailDto,
+    pub capacity: CephCapacityDto,
+    pub cluster_pie_svg: String,
+    pub class_pie_svg: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedFilesystemRowDto {
     pub name: String,
@@ -302,4 +402,98 @@ pub struct LvmPhysicalVolumeDto {
     pub size: String,
     pub free: String,
     pub attr: String,
+}
+
+/// One DBMS managed by kcore Database Service. v1 is a PostgreSQL instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbmsRowDto {
+    pub name: String,
+    pub engine: String,
+    pub database: String,
+    pub package: String,
+    pub port: i32,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbmsDetailDto {
+    pub name: String,
+    pub engine: String,
+    pub database: String,
+    pub package: String,
+    pub port: i32,
+    pub node_id: String,
+    /// How clients reach the database.
+    pub access: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesNodeDto {
+    pub node_id: String,
+    pub role: String,
+    pub advertise_address: String,
+    pub iface: String,
+    pub initial_cluster: bool,
+    pub join_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesClusterRowDto {
+    pub name: String,
+    pub phase: String,
+    pub message: String,
+    pub cni: String,
+    pub api_server_endpoint: String,
+    pub control_planes: i32,
+    pub workers: i32,
+    pub ready_control_planes: i32,
+    pub ready_workers: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesNodeHealthDto {
+    pub node_id: String,
+    pub kubernetes_status: String,
+    pub kubelet_active: bool,
+    pub etcd_active: bool,
+    pub api_server_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesClusterDetailDto {
+    pub name: String,
+    pub generation: i64,
+    pub phase: String,
+    pub message: String,
+    pub last_updated: String,
+    pub active_node_ids: String,
+    pub cluster_cidr: String,
+    pub service_cidr: String,
+    pub cluster_dns: String,
+    pub api_server_endpoint: String,
+    pub cni: String,
+    pub cilium_configured: bool,
+    pub cilium_mode: String,
+    pub cilium_mtu: i32,
+    pub cilium_tunnel: String,
+    pub cilium_auto_direct: bool,
+    pub cilium_lb_pools: String,
+    pub ha_configured: bool,
+    pub ha_enabled: bool,
+    pub ha_vip: String,
+    pub ha_interface: String,
+    pub ha_method: String,
+    pub control_plane_nodes: Vec<KubernetesNodeDto>,
+    pub worker_nodes: Vec<KubernetesNodeDto>,
+    pub overall_health: String,
+    pub health_ready_control_planes: i32,
+    pub health_total_control_planes: i32,
+    pub health_ready_workers: i32,
+    pub health_total_workers: i32,
+    pub etcd_healthy: bool,
+    pub etcd_member_count: i32,
+    pub api_server_reachable: bool,
+    pub node_health: Vec<KubernetesNodeHealthDto>,
+    /// Empty when the health RPC succeeded.
+    pub health_error: String,
 }

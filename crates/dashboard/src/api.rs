@@ -4,15 +4,19 @@ use leptos::prelude::*;
 
 use crate::controller_client;
 use crate::dto::{
-    AuditEventDto, CephClusterRowDto, ComplianceDto, NetworkOverviewDto, NetworkRowDto,
-    ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto, SharedFilesystemRowDto,
-    StorageOverviewDto, VmOperationRowDto, VmsPageDto, VolumeRowDto,
+    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto,
+    DbmsRowDto, KubernetesClusterDetailDto, KubernetesClusterRowDto, NetworkOverviewDto,
+    NetworkRowDto, ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto,
+    SharedFilesystemRowDto, StorageOverviewDto, VmOperationRowDto, VmsPageDto, VolumeRowDto,
 };
 use crate::mappers::{
-    audit_events_from_proto, ceph_clusters_from_proto, compliance_from_proto, conflicts_from_proto,
-    filter_audit_events, filter_vm_operations, network_overview_from_proto, networks_from_proto,
-    object_stores_from_proto, replication_status_from_proto, shared_filesystems_from_proto,
-    storage_overview_from_proto, vm_operations_from_proto, vms_page_from_proto, volumes_from_proto,
+    audit_events_from_proto, ceph_cluster_detail_from_proto, ceph_clusters_from_proto,
+    compliance_from_proto, conflicts_from_proto, dbms_detail_from_postgresql,
+    dbms_from_postgresqls, filter_audit_events, filter_vm_operations,
+    kubernetes_clusters_from_proto, kubernetes_detail_from_proto, merge_ceph_capacity,
+    network_overview_from_proto, networks_from_proto, object_stores_from_proto,
+    replication_status_from_proto, shared_filesystems_from_proto, storage_overview_from_proto,
+    vm_operations_from_proto, vms_page_from_proto, volumes_from_proto,
 };
 use crate::state::dashboard_config;
 
@@ -30,10 +34,14 @@ pub async fn get_compliance_dto() -> Result<ComplianceDto, ServerFnError> {
 }
 
 #[server(ListVmsPage, "/api")]
-pub async fn list_vms_page(page: u32) -> Result<VmsPageDto, ServerFnError> {
+pub async fn list_vms_page(page: u32, page_size: u32) -> Result<VmsPageDto, ServerFnError> {
     let cfg = dashboard_config();
     let vms = controller_client::list_vms(cfg).await.map_err(map_err)?;
-    Ok(vms_page_from_proto(vms, page))
+    Ok(vms_page_from_proto(
+        vms,
+        page,
+        crate::format::normalize_page_size(page_size),
+    ))
 }
 
 #[server(ListNetworks, "/api")]
@@ -100,6 +108,46 @@ pub async fn list_ceph_clusters_dto() -> Result<Vec<CephClusterRowDto>, ServerFn
     Ok(ceph_clusters_from_proto(clusters))
 }
 
+#[server(GetCephClusterDetail, "/api")]
+pub async fn get_ceph_cluster_detail_dto(
+    name: String,
+) -> Result<CephClusterDetailDto, ServerFnError> {
+    let cfg = dashboard_config();
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(ServerFnError::new("cluster name is required"));
+    }
+    let cluster = controller_client::get_ceph_cluster(cfg, &name)
+        .await
+        .map_err(map_err)?;
+    let mut detail = ceph_cluster_detail_from_proto(cluster);
+    match controller_client::get_ceph_cluster_capacity(cfg, &name).await {
+        Ok(cap) => {
+            detail.capacity = merge_ceph_capacity(detail.capacity, cap);
+            let cluster_slices = vec![
+                ("used".to_string(), detail.capacity.used_bytes),
+                ("available".to_string(), detail.capacity.avail_bytes),
+            ];
+            detail.cluster_pie_svg =
+                crate::ceph_status::pie_svg(&cluster_slices, "Cluster capacity");
+            let class_slices: Vec<(String, i64)> = detail
+                .capacity
+                .by_class
+                .iter()
+                .map(|c| (c.device_class.clone(), c.total_bytes))
+                .collect();
+            detail.class_pie_svg =
+                crate::ceph_status::pie_svg(&class_slices, "Device class capacity");
+        }
+        Err(e) => {
+            if detail.capacity.error.is_empty() {
+                detail.capacity.error = format!("live capacity unavailable: {e:#}");
+            }
+        }
+    }
+    Ok(detail)
+}
+
 #[server(ListSharedFilesystems, "/api")]
 pub async fn list_shared_filesystems_dto() -> Result<Vec<SharedFilesystemRowDto>, ServerFnError> {
     let cfg = dashboard_config();
@@ -125,6 +173,55 @@ pub async fn list_operations_dto(q: String) -> Result<Vec<VmOperationRowDto>, Se
         .await
         .map_err(map_err)?;
     Ok(filter_vm_operations(vm_operations_from_proto(ops), &q))
+}
+
+#[server(ListDbms, "/api")]
+pub async fn list_dbms_dto() -> Result<Vec<DbmsRowDto>, ServerFnError> {
+    let cfg = dashboard_config();
+    let rows = controller_client::list_postgresqls(cfg)
+        .await
+        .map_err(map_err)?;
+    Ok(dbms_from_postgresqls(rows))
+}
+
+#[server(GetDbms, "/api")]
+pub async fn get_dbms_dto(name: String) -> Result<DbmsDetailDto, ServerFnError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ServerFnError::new("missing database service name"));
+    }
+    let cfg = dashboard_config();
+    let info = controller_client::get_postgresql(cfg, name)
+        .await
+        .map_err(map_err)?;
+    Ok(dbms_detail_from_postgresql(info))
+}
+
+#[server(ListKubernetesClusters, "/api")]
+pub async fn list_kubernetes_clusters_dto() -> Result<Vec<KubernetesClusterRowDto>, ServerFnError> {
+    let cfg = dashboard_config();
+    let clusters = controller_client::list_kubernetes_clusters(cfg)
+        .await
+        .map_err(map_err)?;
+    Ok(kubernetes_clusters_from_proto(clusters))
+}
+
+#[server(GetKubernetesCluster, "/api")]
+pub async fn get_kubernetes_cluster_dto(
+    name: String,
+) -> Result<KubernetesClusterDetailDto, ServerFnError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ServerFnError::new("missing Kubernetes cluster name"));
+    }
+    let cfg = dashboard_config();
+    let cluster = controller_client::get_kubernetes_cluster(cfg, name)
+        .await
+        .map_err(map_err)?;
+    let health = controller_client::get_kubernetes_cluster_health(cfg, name)
+        .await
+        .map_err(|err| format!("{err:#}"));
+    Ok(kubernetes_detail_from_proto(cluster, health))
 }
 
 #[server(ListAuditEvents, "/api")]

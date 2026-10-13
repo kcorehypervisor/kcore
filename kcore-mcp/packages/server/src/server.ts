@@ -20,7 +20,7 @@ Before every create, update, delete, migrate, drain, or node install:
 3. Call kcore_plan and show that plan.
 4. Call kcore_apply or kcore_delete only after the operator explicitly agrees, with confirm set to true.
 
-Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller or node method; pass confirm true before a method that is not a get, list, classify, check, or plan.`;
+Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller, node, or kcore-provisioning method. Provisioning covers images, machines, boot targets, Redfish discovery, BMC boot, and power control. Set connection.provisioning to that controller's host:port. Pass confirm true before a method that is not a get, list, classify, check, or plan.`;
 
 const connectionShape = {
   config: z.string().optional().describe("Path to the kcore context file. Defaults to ~/.kcore/config."),
@@ -29,6 +29,9 @@ const connectionShape = {
   tlsServerName: z.string().optional().describe("SNI / certificate name when dialing an IP."),
   operator: z.string().optional().describe("Operator identity for --as."),
   node: z.string().optional().describe("Node-agent host:port for node-scoped commands."),
+  provisioning: z.string().optional().describe("kcore-provisioning gRPC host:port. Also read from KCORE_PROVISIONING."),
+  provisioningInsecure: z.boolean().optional().describe("Dial provisioning without TLS. Defaults to true."),
+  timeoutMs: z.number().optional().describe("RPC deadline in milliseconds. Defaults to 120000."),
 };
 
 const specSchema = z.record(z.string(), z.unknown()).optional();
@@ -43,6 +46,8 @@ function connectionOf(input: ConnectionInput | undefined, controller?: string): 
     tlsServerName: input?.tlsServerName,
     operator: input?.operator,
     timeoutMs: input?.timeoutMs,
+    provisioning: input?.provisioning,
+    provisioningInsecure: input?.provisioningInsecure,
   };
 }
 
@@ -182,7 +187,7 @@ export function createServer(): McpServer {
     {
       title: "Call a kcore gRPC method",
       description:
-        "Call one implemented unary RPC on the controller or a node. Omit method to list them. Request fields use proto JSON names in camelCase. Streaming RPCs and node methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true.",
+        "Call one implemented unary RPC on the controller, a node, or kcore-provisioning. Omit method to list them. Provisioning methods need connection.provisioning. Request fields use proto JSON names in camelCase. Streaming RPCs and methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true.",
       inputSchema: {
         service: z.enum(SERVICE_NAMES).optional().describe("gRPC service. Required when method is set."),
         method: z.string().optional().describe("CamelCase RPC name, such as listNodes or getPkiStatus."),

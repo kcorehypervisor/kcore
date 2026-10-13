@@ -62,6 +62,10 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(home.contains(r#"href="/volumes""#));
     assert!(home.contains(r#"href="/operations""#));
     assert!(home.contains(r#"href="/ceph""#));
+    assert!(home.contains(r#"href="/kds""#));
+    assert!(home.contains(r#"href="/k8s""#));
+    assert!(home.contains("kcore Database Service"));
+    assert!(home.contains("Kubernetes clusters, nodes, and health."));
     assert!(home.contains(r#"href="/audit""#));
     assert!(home.contains("kcore"));
     assert!(home.contains("Dashboard"));
@@ -437,6 +441,94 @@ async fn all_dashboard_pages_against_mock_controller() {
     );
     assert!(ceph.contains("7480"), "object store must show its port");
 
+    // ── KDS ──────────────────────────────────────────────────────────
+    let (status, kds) = fetch(&app, "/kds").await;
+    assert_eq!(status, StatusCode::OK, "/kds status");
+    assert!(kds.contains("kcore Database Service"), "KDS page heading");
+    assert!(kds.contains("app-db"), "KDS must list app-db");
+    assert!(kds.contains("analytics"), "KDS must list analytics");
+    assert!(kds.contains("PostgreSQL"), "KDS must show the engine");
+    assert!(
+        kds.contains(r#"href="/kds/app-db""#),
+        "each DBMS row must link to its detail page"
+    );
+    assert!(
+        kds.contains(r#"href="/kds/analytics""#),
+        "each DBMS row must link to its detail page"
+    );
+
+    let (status, db) = fetch(&app, "/kds/app-db").await;
+    assert_eq!(status, StatusCode::OK, "/kds/app-db status");
+    assert!(
+        db.contains("postgresql_16"),
+        "DBMS detail must show the package"
+    );
+    assert!(db.contains("node-107"), "DBMS detail must show the node");
+    assert!(
+        db.contains("Local Unix socket"),
+        "DBMS detail must show how clients connect"
+    );
+    assert!(
+        db.contains(r#"href="/kds""#),
+        "DBMS detail must link back to the list"
+    );
+
+    let (status, missing_db) = fetch(&app, "/kds/missing-db").await;
+    assert_eq!(status, StatusCode::OK, "/kds/missing-db status");
+    assert!(
+        missing_db.contains("not found"),
+        "missing DBMS must say it was not found"
+    );
+
+    // ── Kubernetes ───────────────────────────────────────────────────
+    let (status, k8s) = fetch(&app, "/k8s").await;
+    assert_eq!(status, StatusCode::OK, "/k8s status");
+    assert!(k8s.contains(">Kubernetes<"), "Kubernetes page heading");
+    assert!(k8s.contains("lab"), "Kubernetes page must list lab");
+    assert!(k8s.contains("edge"), "Kubernetes page must list edge");
+    assert!(
+        k8s.contains("192.168.40.220:6443"),
+        "Kubernetes page must show the API endpoint"
+    );
+    assert!(
+        k8s.contains(r#"href="/k8s/lab""#),
+        "each cluster row must link to its detail page"
+    );
+    assert!(
+        k8s.contains(r#"href="/k8s/edge""#),
+        "each cluster row must link to its detail page"
+    );
+
+    let (status, cluster) = fetch(&app, "/k8s/lab").await;
+    assert_eq!(status, StatusCode::OK, "/k8s/lab status");
+    assert!(
+        cluster.contains("native-routing"),
+        "cluster detail must show Cilium mode"
+    );
+    assert!(
+        cluster.contains("keepalived"),
+        "cluster detail must show the HA method"
+    );
+    assert!(
+        cluster.contains("node-119"),
+        "cluster detail must list the worker"
+    );
+    assert!(
+        cluster.contains("Healthy"),
+        "cluster detail must show health"
+    );
+    assert!(
+        cluster.contains(r#"href="/k8s""#),
+        "cluster detail must link back to the list"
+    );
+
+    let (status, missing_cluster) = fetch(&app, "/k8s/missing-cluster").await;
+    assert_eq!(status, StatusCode::OK, "/k8s/missing-cluster status");
+    assert!(
+        missing_cluster.contains("not found"),
+        "missing cluster must say it was not found"
+    );
+
     // ── 404 for unknown path ─────────────────────────────────────────
     let (status, body404) = fetch(&app, "/nonexistent-page-xyz").await;
     assert!(
@@ -460,6 +552,10 @@ async fn all_dashboard_pages_against_mock_controller() {
         ("/operations", &operations),
         ("/audit", &audit),
         ("/ceph", &ceph),
+        ("/kds", &kds),
+        ("/k8s", &k8s),
+        ("/kds/app-db", &db),
+        ("/k8s/lab", &cluster),
     ] {
         assert!(body.contains("nav"), "{page} must have navigation element");
         assert!(body.contains("kcore"), "{page} must show brand name");

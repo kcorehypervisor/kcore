@@ -620,6 +620,108 @@ pub fn parse_pg_clean(json: &serde_json::Value) -> (i32, i32) {
     (total, (total - clean).max(0))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCephDf {
+    pub total_bytes: i64,
+    pub used_bytes: i64,
+    pub avail_bytes: i64,
+    pub by_class: Vec<ParsedDeviceClass>,
+    pub pools: Vec<ParsedPoolUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedDeviceClass {
+    pub device_class: String,
+    pub total_bytes: i64,
+    pub used_bytes: i64,
+    pub avail_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedPoolUsage {
+    pub name: String,
+    pub stored_bytes: i64,
+    pub objects: i64,
+    pub percent_used_bp: i32,
+    pub max_avail_bytes: i64,
+}
+
+/// Typed reading of `ceph df --format json` (cluster totals, device classes, pools).
+pub fn parse_ceph_df(json: &serde_json::Value) -> ParsedCephDf {
+    let total_bytes = json
+        .pointer("/stats/total_bytes")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let used_bytes = json
+        .pointer("/stats/total_used_bytes")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let avail_bytes = json
+        .pointer("/stats/total_avail_bytes")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let mut by_class = Vec::new();
+    if let Some(classes) = json.get("stats_by_class").and_then(|v| v.as_object()) {
+        for (name, stats) in classes {
+            by_class.push(ParsedDeviceClass {
+                device_class: name.clone(),
+                total_bytes: stats
+                    .get("total_bytes")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                used_bytes: stats
+                    .get("total_used_bytes")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                avail_bytes: stats
+                    .get("total_avail_bytes")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+            });
+        }
+        by_class.sort_by(|a, b| a.device_class.cmp(&b.device_class));
+    }
+
+    let mut pools = Vec::new();
+    if let Some(items) = json.get("pools").and_then(|v| v.as_array()) {
+        for pool in items {
+            let name = pool
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let stats = pool
+                .get("stats")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let percent = stats
+                .get("percent_used")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            pools.push(ParsedPoolUsage {
+                name,
+                stored_bytes: stats.get("stored").and_then(|v| v.as_i64()).unwrap_or(0),
+                objects: stats.get("objects").and_then(|v| v.as_i64()).unwrap_or(0),
+                percent_used_bp: (percent * 100.0).round() as i32,
+                max_avail_bytes: stats.get("max_avail").and_then(|v| v.as_i64()).unwrap_or(0),
+            });
+        }
+        pools.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    ParsedCephDf {
+        total_bytes,
+        used_bytes,
+        avail_bytes,
+        by_class,
+        pools,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +861,48 @@ mod tests {
         assert_eq!(parse_osd_counters(&modern), (3, 3));
         let nested = serde_json::json!({"osdmap":{"osdmap":{"num_up_osds":2,"num_in_osds":1}}});
         assert_eq!(parse_osd_counters(&nested), (2, 1));
+    }
+
+    #[test]
+    fn parse_ceph_df_reads_classes_and_pools() {
+        let json = serde_json::json!({
+            "stats": {
+                "total_bytes": 1000,
+                "total_used_bytes": 400,
+                "total_avail_bytes": 600
+            },
+            "stats_by_class": {
+                "ssd": {
+                    "total_bytes": 300,
+                    "total_used_bytes": 100,
+                    "total_avail_bytes": 200
+                },
+                "hdd": {
+                    "total_bytes": 700,
+                    "total_used_bytes": 300,
+                    "total_avail_bytes": 400
+                }
+            },
+            "pools": [{
+                "name": "kcore-vms",
+                "stats": {
+                    "stored": 50,
+                    "objects": 3,
+                    "percent_used": 12.5,
+                    "max_avail": 200
+                }
+            }]
+        });
+        let parsed = parse_ceph_df(&json);
+        assert_eq!(parsed.total_bytes, 1000);
+        assert_eq!(parsed.used_bytes, 400);
+        assert_eq!(parsed.avail_bytes, 600);
+        assert_eq!(parsed.by_class.len(), 2);
+        assert_eq!(parsed.by_class[0].device_class, "hdd");
+        assert_eq!(parsed.by_class[1].device_class, "ssd");
+        assert_eq!(parsed.by_class[1].total_bytes, 300);
+        assert_eq!(parsed.pools.len(), 1);
+        assert_eq!(parsed.pools[0].percent_used_bp, 1250);
+        assert_eq!(parsed.pools[0].max_avail_bytes, 200);
     }
 }
