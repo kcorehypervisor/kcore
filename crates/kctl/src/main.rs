@@ -140,10 +140,25 @@ enum Command {
         #[command(subcommand)]
         resource: FlattenResource,
     },
-    /// Grow or shrink a Ceph volume (shrink requires --allow-shrink)
+    /// Grow or shrink a Ceph, LVM, or ZFS volume
     Resize {
         #[command(subcommand)]
         resource: ResizeResource,
+    },
+    /// Format an LVM or ZFS volume as ext4 or xfs
+    Format {
+        #[command(subcommand)]
+        resource: FormatResource,
+    },
+    /// Mount an LVM or ZFS volume on its node
+    Mount {
+        #[command(subcommand)]
+        resource: MountResource,
+    },
+    /// Unmount an LVM or ZFS volume
+    Unmount {
+        #[command(subcommand)]
+        resource: UnmountResource,
     },
     /// Format LUKS on an existing plain RBD volume (data-destructive)
     Encrypt {
@@ -256,6 +271,134 @@ enum Command {
     SecurityGroup {
         #[command(subcommand)]
         action: SecurityGroupAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeLvmAction {
+    /// Create a logical volume in the node's volume group
+    Create {
+        /// Volume id. Used as the LV name when --lv-name is omitted, with the kcore- prefix.
+        #[arg(long)]
+        id: String,
+        /// Size in bytes
+        #[arg(long)]
+        size_bytes: i64,
+        /// Logical volume name without the VM prefix
+        #[arg(long)]
+        lv_name: Option<String>,
+    },
+    /// Grow or shrink a logical volume. Shrink needs --allow-shrink and an unmounted ext4 filesystem.
+    Resize {
+        /// Device path, /dev/<vg>/<lv>
+        #[arg(long)]
+        device: String,
+        /// New size in bytes, a multiple of 1 MiB
+        #[arg(long)]
+        size_bytes: i64,
+        /// Allow the volume to become smaller
+        #[arg(long)]
+        allow_shrink: bool,
+    },
+    /// Format a logical volume as ext4 or xfs
+    Format {
+        /// Device path, /dev/<vg>/<lv>
+        #[arg(long)]
+        device: String,
+        /// ext4 or xfs
+        #[arg(long)]
+        fs: String,
+        /// Replace an existing filesystem
+        #[arg(long)]
+        force: bool,
+    },
+    /// Mount a logical volume under /var/lib/kcore or /mnt/kcore
+    Mount {
+        /// Device path, /dev/<vg>/<lv>
+        #[arg(long)]
+        device: String,
+        /// Mount point
+        #[arg(long)]
+        path: String,
+        /// ext4 or xfs. Empty uses the filesystem already on the volume.
+        #[arg(long)]
+        fs: Option<String>,
+        /// Install a systemd mount unit so the volume returns after reboot
+        #[arg(long)]
+        persistent: bool,
+    },
+    /// Unmount a logical volume
+    Unmount {
+        /// Mount point
+        #[arg(long)]
+        path: String,
+        /// Also remove the systemd mount unit
+        #[arg(long)]
+        persistent: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeZfsAction {
+    /// Create a zvol in the node's pool
+    Create {
+        /// Volume id. Used as the zvol name when --dataset is omitted, with the kcore- prefix.
+        #[arg(long)]
+        id: String,
+        /// Size in bytes
+        #[arg(long)]
+        size_bytes: i64,
+        /// Zvol name without the VM prefix
+        #[arg(long)]
+        dataset: Option<String>,
+    },
+    /// Grow or shrink a zvol. Shrink needs --allow-shrink and an unmounted ext4 filesystem.
+    Resize {
+        /// Device path, /dev/zvol/<pool>/<name>
+        #[arg(long)]
+        device: String,
+        /// New size in bytes, a multiple of 1 MiB
+        #[arg(long)]
+        size_bytes: i64,
+        /// Allow the volume to become smaller
+        #[arg(long)]
+        allow_shrink: bool,
+    },
+    /// Format a zvol as ext4 or xfs
+    Format {
+        /// Device path, /dev/zvol/<pool>/<name>
+        #[arg(long)]
+        device: String,
+        /// ext4 or xfs
+        #[arg(long)]
+        fs: String,
+        /// Replace an existing filesystem
+        #[arg(long)]
+        force: bool,
+    },
+    /// Mount a zvol under /var/lib/kcore or /mnt/kcore
+    Mount {
+        /// Device path, /dev/zvol/<pool>/<name>
+        #[arg(long)]
+        device: String,
+        /// Mount point
+        #[arg(long)]
+        path: String,
+        /// ext4 or xfs. Empty uses the filesystem already on the volume.
+        #[arg(long)]
+        fs: Option<String>,
+        /// Install a systemd mount unit so the volume returns after reboot
+        #[arg(long)]
+        persistent: bool,
+    },
+    /// Unmount a zvol
+    Unmount {
+        /// Mount point
+        #[arg(long)]
+        path: String,
+        /// Also remove the systemd mount unit
+        #[arg(long)]
+        persistent: bool,
     },
 }
 
@@ -493,17 +636,26 @@ enum CreateResource {
         #[arg(long = "east-west-firewall")]
         east_west_firewall: bool,
     },
-    /// Create a detached Ceph data volume (optionally attach to a stopped VM)
+    /// Create a volume. Ceph by default; lvm and zfs need --node.
     Volume {
         /// Volume name
         name: String,
         /// Size in bytes
         #[arg(long = "size-bytes", default_value_t = 0)]
         size_bytes: i64,
-        /// Optional VM id or name to attach immediately (VM must be stopped)
+        /// ceph, lvm, or zfs
+        #[arg(long, default_value = "ceph")]
+        storage_class: String,
+        /// Node id. Required for lvm and zfs.
+        #[arg(long)]
+        node: Option<String>,
+        /// Logical volume or zvol name. Empty keeps the kcore- prefix.
+        #[arg(long)]
+        volume_name: Option<String>,
+        /// Optional VM id or name to attach immediately (Ceph only; VM must be stopped)
         #[arg(long)]
         vm: Option<String>,
-        /// Clone from an existing volume snapshot
+        /// Clone from an existing volume snapshot (Ceph only)
         #[arg(long = "from-snapshot")]
         from_snapshot: Option<String>,
         /// Host-side LUKS over RBD (E2); DEK wrapped by cluster master key
@@ -739,7 +891,7 @@ enum FlattenResource {
 
 #[derive(Subcommand)]
 enum ResizeResource {
-    /// Grow or shrink a Ceph RBD volume (shrink: detached only, `--allow-shrink`)
+    /// Grow or shrink a volume. LVM and ZFS shrink an unmounted ext4 filesystem.
     Volume {
         name: String,
         #[arg(long = "size-bytes")]
@@ -750,6 +902,47 @@ enum ResizeResource {
         /// Shrink via `rbd resize --allow-shrink` (destroys tail; volume must be detached)
         #[arg(long = "allow-shrink")]
         allow_shrink: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum FormatResource {
+    /// Format an LVM or ZFS volume
+    Volume {
+        name: String,
+        /// ext4 or xfs
+        #[arg(long)]
+        fs: String,
+        /// Replace an existing filesystem
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MountResource {
+    /// Mount an LVM or ZFS volume under /var/lib/kcore or /mnt/kcore
+    Volume {
+        name: String,
+        #[arg(long)]
+        path: String,
+        /// ext4 or xfs. Empty uses the filesystem already on the volume.
+        #[arg(long)]
+        fs: Option<String>,
+        /// Install a systemd mount unit
+        #[arg(long)]
+        persistent: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum UnmountResource {
+    /// Unmount an LVM or ZFS volume
+    Volume {
+        name: String,
+        /// Also remove the systemd mount unit
+        #[arg(long)]
+        persistent: bool,
     },
 }
 
@@ -1071,6 +1264,16 @@ enum NodeAction {
     Disks,
     /// List network interfaces on a node
     Nics,
+    /// Create, resize, format, and mount a logical volume on this node
+    Lvm {
+        #[command(subcommand)]
+        action: NodeLvmAction,
+    },
+    /// Create, resize, format, and mount a zvol on this node
+    Zfs {
+        #[command(subcommand)]
+        action: NodeZfsAction,
+    },
     /// Install kcore to disk on a node
     Install {
         /// OS disk (e.g. /dev/sda)
@@ -1753,6 +1956,9 @@ async fn main() {
                 CreateResource::Volume {
                     name,
                     size_bytes,
+                    storage_class,
+                    node,
+                    volume_name,
                     vm,
                     from_snapshot,
                     encrypt,
@@ -1763,6 +1969,9 @@ async fn main() {
                 &info,
                 name,
                 *size_bytes,
+                storage_class,
+                node.as_deref(),
+                volume_name.as_deref(),
                 vm.clone(),
                 from_snapshot.clone(),
                 *encrypt,
@@ -1987,6 +2196,30 @@ async fn main() {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::volume::resize(&info, name, *size_bytes, *grow_filesystem, *allow_shrink)
                 .await
+        }
+        Command::Format {
+            resource: FormatResource::Volume { name, fs, force },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::format(&info, name, fs, *force).await
+        }
+        Command::Mount {
+            resource:
+                MountResource::Volume {
+                    name,
+                    path,
+                    fs,
+                    persistent,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::mount(&info, name, path, fs.as_deref(), *persistent).await
+        }
+        Command::Unmount {
+            resource: UnmountResource::Volume { name, persistent },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::unmount(&info, name, *persistent).await
         }
         Command::Encrypt {
             resource: EncryptResource::Volume { name, destroy_data },
@@ -2379,6 +2612,70 @@ async fn main() {
         } => {
             let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
             commands::node::nics(&info).await
+        }
+
+        Command::Node {
+            action: NodeAction::Lvm { action },
+        } => {
+            let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
+            match action {
+                NodeLvmAction::Create {
+                    id,
+                    size_bytes,
+                    lv_name,
+                } => commands::node::lvm_create(&info, id, *size_bytes, lv_name.as_deref()).await,
+                NodeLvmAction::Resize {
+                    device,
+                    size_bytes,
+                    allow_shrink,
+                } => commands::node::lvm_resize(&info, device, *size_bytes, *allow_shrink).await,
+                NodeLvmAction::Format { device, fs, force } => {
+                    commands::node::lvm_format(&info, device, fs, *force).await
+                }
+                NodeLvmAction::Mount {
+                    device,
+                    path,
+                    fs,
+                    persistent,
+                } => {
+                    commands::node::lvm_mount(&info, device, path, fs.as_deref(), *persistent).await
+                }
+                NodeLvmAction::Unmount { path, persistent } => {
+                    commands::node::lvm_unmount(&info, path, *persistent).await
+                }
+            }
+        }
+
+        Command::Node {
+            action: NodeAction::Zfs { action },
+        } => {
+            let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
+            match action {
+                NodeZfsAction::Create {
+                    id,
+                    size_bytes,
+                    dataset,
+                } => commands::node::zfs_create(&info, id, *size_bytes, dataset.as_deref()).await,
+                NodeZfsAction::Resize {
+                    device,
+                    size_bytes,
+                    allow_shrink,
+                } => commands::node::lvm_resize(&info, device, *size_bytes, *allow_shrink).await,
+                NodeZfsAction::Format { device, fs, force } => {
+                    commands::node::lvm_format(&info, device, fs, *force).await
+                }
+                NodeZfsAction::Mount {
+                    device,
+                    path,
+                    fs,
+                    persistent,
+                } => {
+                    commands::node::lvm_mount(&info, device, path, fs.as_deref(), *persistent).await
+                }
+                NodeZfsAction::Unmount { path, persistent } => {
+                    commands::node::lvm_unmount(&info, path, *persistent).await
+                }
+            }
         }
 
         Command::Node {

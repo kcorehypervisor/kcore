@@ -1,23 +1,53 @@
 use tonic::{Request, Response, Status};
 
 use crate::auth::{self, CN_CONTROLLER_PREFIX, CN_KCTL};
+use crate::lvm_ops;
 use crate::proto;
 use crate::storage::{self, StorageAdapter};
+use crate::zfs_ops;
 use std::sync::Arc;
 
 pub struct StorageService {
     storage: Arc<dyn StorageAdapter>,
+    lvm_vg: Option<String>,
+    zfs_pool: Option<String>,
 }
 
 impl StorageService {
     pub fn new() -> Self {
         Self {
             storage: storage::default_adapter(),
+            lvm_vg: None,
+            zfs_pool: None,
         }
     }
 
     pub fn new_with_storage(storage: Arc<dyn StorageAdapter>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            lvm_vg: None,
+            zfs_pool: None,
+        }
+    }
+
+    pub fn with_lvm_vg(mut self, vg: impl Into<String>) -> Self {
+        self.lvm_vg = Some(vg.into());
+        self
+    }
+
+    pub fn with_zfs_pool(mut self, pool: impl Into<String>) -> Self {
+        self.zfs_pool = Some(pool.into());
+        self
+    }
+
+    fn host_fs_ready(&self) -> Result<(), Status> {
+        if self.lvm_vg.is_some() || self.zfs_pool.is_some() {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(
+                "node storage backend is not lvm or zfs",
+            ))
+        }
     }
 }
 
@@ -37,6 +67,7 @@ impl proto::node_storage_server::NodeStorage for StorageService {
                     storage_class: req.storage_class,
                     size_bytes: req.size_bytes,
                     parameters: req.parameters,
+                    lv_name: req.lv_name,
                 })
                 .map(|backend_handle| proto::CreateVolumeResponse { backend_handle })
         })
@@ -187,15 +218,148 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
         let req = request.into_inner();
         let allow_shrink = req.allow_shrink;
-        let size = tokio::task::spawn_blocking(move || {
-            storage::ceph_resize_volume(&req.backend_handle, req.size_bytes, allow_shrink)
+        let vg = self.lvm_vg.clone();
+        let pool = self.zfs_pool.clone();
+        let (size, message) = tokio::task::spawn_blocking(move || {
+            let handle = req.backend_handle.trim();
+            if handle.starts_with("/dev/zvol/") {
+                let pool = pool.ok_or_else(|| {
+                    storage::StorageError::new(
+                        storage::ErrorKind::FailedPrecondition,
+                        "node storage backend is not zfs",
+                    )
+                })?;
+                let message = zfs_ops::resize_volume(&pool, handle, req.size_bytes, allow_shrink)
+                    .map_err(lvm_to_storage)?;
+                Ok::<_, storage::StorageError>((req.size_bytes, message))
+            } else if handle.starts_with("/dev/") {
+                let vg = vg.ok_or_else(|| {
+                    storage::StorageError::new(
+                        storage::ErrorKind::FailedPrecondition,
+                        "node storage backend is not lvm",
+                    )
+                })?;
+                let message = lvm_ops::resize_volume(&vg, handle, req.size_bytes, allow_shrink)
+                    .map_err(lvm_to_storage)?;
+                Ok::<_, storage::StorageError>((req.size_bytes, message))
+            } else {
+                let size =
+                    storage::ceph_resize_volume(&req.backend_handle, req.size_bytes, allow_shrink)?;
+                Ok((size, format!("resized to {size} bytes")))
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))??;
         Ok(Response::new(proto::ResizeVolumeResponse {
             success: true,
-            message: format!("resized to {size} bytes"),
+            message,
             size_bytes: size,
+        }))
+    }
+
+    async fn format_volume(
+        &self,
+        request: Request<proto::FormatVolumeRequest>,
+    ) -> Result<Response<proto::FormatVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let vg = self.lvm_vg.clone();
+        let pool = self.zfs_pool.clone();
+        let req = request.into_inner();
+        let message = tokio::task::spawn_blocking(move || {
+            if req.backend_handle.trim().starts_with("/dev/zvol/") {
+                let pool = pool.ok_or_else(|| {
+                    storage::StorageError::new(
+                        storage::ErrorKind::FailedPrecondition,
+                        "node storage backend is not zfs",
+                    )
+                })?;
+                zfs_ops::format_volume(&pool, &req.backend_handle, &req.fs_type, req.force)
+                    .map_err(lvm_to_storage)
+            } else {
+                let vg = vg.ok_or_else(|| {
+                    storage::StorageError::new(
+                        storage::ErrorKind::FailedPrecondition,
+                        "node storage backend is not lvm",
+                    )
+                })?;
+                lvm_ops::format_volume(&vg, &req.backend_handle, &req.fs_type, req.force)
+                    .map_err(lvm_to_storage)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::FormatVolumeResponse {
+            success: true,
+            message,
+        }))
+    }
+
+    async fn mount_volume(
+        &self,
+        request: Request<proto::MountVolumeRequest>,
+    ) -> Result<Response<proto::MountVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let vg = self.lvm_vg.clone();
+        let pool = self.zfs_pool.clone();
+        let req = request.into_inner();
+        let mount_point = req.mount_point.clone();
+        let message = tokio::task::spawn_blocking(move || {
+            if req.backend_handle.trim().starts_with("/dev/zvol/") {
+                let pool = pool.ok_or_else(|| {
+                    storage::StorageError::new(
+                        storage::ErrorKind::FailedPrecondition,
+                        "node storage backend is not zfs",
+                    )
+                })?;
+                zfs_ops::mount_volume(
+                    &pool,
+                    &req.backend_handle,
+                    &req.mount_point,
+                    &req.fs_type,
+                    req.persistent,
+                )
+                .map_err(lvm_to_storage)
+            } else {
+                let vg = vg.ok_or_else(|| {
+                    storage::StorageError::new(
+                        storage::ErrorKind::FailedPrecondition,
+                        "node storage backend is not lvm",
+                    )
+                })?;
+                lvm_ops::mount_volume(
+                    &vg,
+                    &req.backend_handle,
+                    &req.mount_point,
+                    &req.fs_type,
+                    req.persistent,
+                )
+                .map_err(lvm_to_storage)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::MountVolumeResponse {
+            success: true,
+            message,
+            mount_point,
+        }))
+    }
+
+    async fn unmount_volume(
+        &self,
+        request: Request<proto::UnmountVolumeRequest>,
+    ) -> Result<Response<proto::UnmountVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        self.host_fs_ready()?;
+        let req = request.into_inner();
+        let message = tokio::task::spawn_blocking(move || {
+            lvm_ops::unmount_volume(&req.mount_point, req.persistent).map_err(lvm_to_storage)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::UnmountVolumeResponse {
+            success: true,
+            message,
         }))
     }
 
@@ -259,6 +423,15 @@ impl proto::node_storage_server::NodeStorage for StorageService {
     }
 }
 
+fn lvm_to_storage(err: lvm_ops::LvmOpError) -> storage::StorageError {
+    let kind = match err.kind {
+        lvm_ops::Kind::InvalidArgument => storage::ErrorKind::InvalidArgument,
+        lvm_ops::Kind::FailedPrecondition => storage::ErrorKind::FailedPrecondition,
+        lvm_ops::Kind::Internal => storage::ErrorKind::Internal,
+    };
+    storage::StorageError::new(kind, err.message)
+}
+
 /// Accept either `/dev/rbd/pool/image` or `pool/image` and ensure mapped.
 fn resolve_rbd_device(rbd_device: &str) -> Result<String, String> {
     let s = rbd_device.trim();
@@ -299,6 +472,7 @@ mod tests {
                     storage_class: "default".to_string(),
                     size_bytes: 1024,
                     parameters: std::collections::HashMap::new(),
+                    lv_name: String::new(),
                 }),
             )
             .await,

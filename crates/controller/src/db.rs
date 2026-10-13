@@ -417,6 +417,10 @@ pub struct VolumeRow {
     pub encrypted: bool,
     /// Base64 AES-GCM wrap of the volume DEK (empty when not encrypted).
     pub wrapped_dek: String,
+    /// Node that owns an LVM or ZFS volume. Empty for Ceph.
+    pub host_node_id: String,
+    pub fs_type: String,
+    pub mount_point: String,
     pub created_at: String,
 }
 
@@ -465,6 +469,9 @@ impl VolumeRow {
             guest_checked_at: String::new(),
             encrypted: false,
             wrapped_dek: String::new(),
+            host_node_id: String::new(),
+            fs_type: String::new(),
+            mount_point: String::new(),
             created_at: String::new(),
         }
     }
@@ -492,6 +499,9 @@ impl VolumeRow {
             guest_checked_at: String::new(),
             encrypted: false,
             wrapped_dek: String::new(),
+            host_node_id: String::new(),
+            fs_type: String::new(),
+            mount_point: String::new(),
             created_at: String::new(),
         }
     }
@@ -733,7 +743,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 53;
+pub const SCHEMA_VERSION: i32 = 54;
 
 const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
                     name TEXT PRIMARY KEY,
@@ -1873,6 +1883,24 @@ impl Database {
                 conn.execute_batch(
                     "ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_certs_json TEXT NOT NULL DEFAULT '';
                      ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_peer_certs_json TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+        }
+
+        // Host LVM/ZFS volumes record the owning node, filesystem, and mount.
+        // This branch previously used schema 52 for those columns. Main already
+        // shipped 52 and 53, so v54 adds them when they are not present.
+        if version < 54 {
+            let has_host_node: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('volumes') WHERE name = 'host_node_id'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_host_node == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE volumes ADD COLUMN host_node_id TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE volumes ADD COLUMN fs_type TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE volumes ADD COLUMN mount_point TEXT NOT NULL DEFAULT '';",
                 )?;
             }
         }
@@ -4531,13 +4559,15 @@ impl Database {
                 storage_class, attach_state, serial, source_json,
                 guest_format_json, generation, parent_snapshot_id,
                 guest_visible_bytes, guest_checked_at, encrypted, wrapped_dek,
+                host_node_id, fs_type, mount_point,
                 created_at
              )
              VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19,
-                COALESCE(NULLIF(?20, ''), datetime('now'))
+                ?20, ?21, ?22,
+                COALESCE(NULLIF(?23, ''), datetime('now'))
              )
              ON CONFLICT(id) DO UPDATE SET
                name=excluded.name,
@@ -4557,7 +4587,10 @@ impl Database {
                guest_visible_bytes=excluded.guest_visible_bytes,
                guest_checked_at=excluded.guest_checked_at,
                encrypted=excluded.encrypted,
-               wrapped_dek=excluded.wrapped_dek",
+               wrapped_dek=excluded.wrapped_dek,
+               host_node_id=excluded.host_node_id,
+               fs_type=excluded.fs_type,
+               mount_point=excluded.mount_point",
             params![
                 row.id,
                 row.name,
@@ -4578,6 +4611,9 @@ impl Database {
                 row.guest_checked_at,
                 row.encrypted as i32,
                 row.wrapped_dek,
+                row.host_node_id,
+                row.fs_type,
+                row.mount_point,
                 row.created_at
             ],
         )?;
@@ -4605,7 +4641,10 @@ impl Database {
             guest_checked_at: r.get(16)?,
             encrypted: r.get::<_, i32>(17)? != 0,
             wrapped_dek: r.get(18)?,
-            created_at: r.get(19)?,
+            host_node_id: r.get(19)?,
+            fs_type: r.get(20)?,
+            mount_point: r.get(21)?,
+            created_at: r.get(22)?,
         })
     }
 
@@ -4613,7 +4652,8 @@ impl Database {
         "SELECT id, name, vm_id, role, slot, pool, image, size_bytes,
             storage_class, attach_state, serial, source_json, guest_format_json,
             generation, parent_snapshot_id, guest_visible_bytes, guest_checked_at,
-            encrypted, wrapped_dek, created_at FROM volumes";
+            encrypted, wrapped_dek, host_node_id, fs_type, mount_point, created_at
+         FROM volumes";
 
     /// Root volume for a VM (attach_state may still be attached). None when the
     /// VM has no Ceph root row yet.
@@ -8677,6 +8717,9 @@ mod tests {
             guest_checked_at: String::new(),
             encrypted: false,
             wrapped_dek: String::new(),
+            host_node_id: String::new(),
+            fs_type: String::new(),
+            mount_point: String::new(),
             created_at: String::new(),
         }
     }
@@ -8712,7 +8755,15 @@ mod tests {
         data.vm_id = "vm-1".into();
         data.attach_state = VolumeRow::ATTACH_ATTACHED.into();
         data.slot = 1;
+        data.storage_class = "lvm".into();
+        data.host_node_id = "n1".into();
+        data.fs_type = "ext4".into();
+        data.mount_point = "/var/lib/kcore/k8s".into();
         db.upsert_volume(&data).unwrap();
+        let stored = db.get_volume_by_name("pgdata").unwrap().unwrap();
+        assert_eq!(stored.host_node_id, "n1");
+        assert_eq!(stored.fs_type, "ext4");
+        assert_eq!(stored.mount_point, "/var/lib/kcore/k8s");
         assert_eq!(db.list_volumes_for_vm("vm-1").unwrap().len(), 2);
         assert_eq!(db.list_attached_volumes_for_vm("vm-1").unwrap().len(), 2);
 
