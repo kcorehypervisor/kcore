@@ -2,12 +2,13 @@
 
 use crate::controller_client::controller_proto;
 use crate::dto::{
-    AccessControlEntryDto, AuditEventDto, CephClusterRowDto, ComplianceDto, HostInterfaceDto,
-    LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto,
-    NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto,
-    ReplicationConflictDto, ReplicationIncomingDto, ReplicationOutgoingDto, ReplicationStatusDto,
-    SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto,
-    VmsPageDto, VolumeRowDto,
+    AccessControlEntryDto, AuditEventDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto,
+    DbmsRowDto, HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto,
+    KubernetesNodeDto, KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
+    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
+    NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto, ReplicationIncomingDto,
+    ReplicationOutgoingDto, ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto,
+    StorageOverviewDto, VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
 };
 use crate::format::{self, paginate_by_name, VM_PAGE_SIZE};
 
@@ -624,6 +625,181 @@ pub fn audit_events_from_proto(events: Vec<controller_proto::AuditEvent>) -> Vec
         .collect()
 }
 
+const POSTGRES_ENGINE: &str = "PostgreSQL";
+const POSTGRES_DEFAULT_PACKAGE: &str = "pkgs.postgresql";
+const POSTGRES_DEFAULT_PORT: i32 = 5432;
+const POSTGRES_ACCESS: &str = "Local Unix socket on the node. TCP is not opened.";
+
+fn postgres_package(package: &str) -> String {
+    let package = package.trim();
+    if package.is_empty() {
+        POSTGRES_DEFAULT_PACKAGE.to_string()
+    } else {
+        package.to_string()
+    }
+}
+
+fn postgres_port(port: i32) -> i32 {
+    if port <= 0 {
+        POSTGRES_DEFAULT_PORT
+    } else {
+        port
+    }
+}
+
+pub fn dbms_from_postgresqls(rows: Vec<controller_proto::PostgresqlInfo>) -> Vec<DbmsRowDto> {
+    let mut rows: Vec<DbmsRowDto> = rows
+        .into_iter()
+        .map(|info| DbmsRowDto {
+            name: info.name,
+            engine: POSTGRES_ENGINE.to_string(),
+            database: info.database,
+            package: postgres_package(&info.package),
+            port: postgres_port(info.port),
+            node_id: info.node_id,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn dbms_detail_from_postgresql(info: controller_proto::PostgresqlInfo) -> DbmsDetailDto {
+    DbmsDetailDto {
+        name: info.name,
+        engine: POSTGRES_ENGINE.to_string(),
+        database: info.database,
+        package: postgres_package(&info.package),
+        port: postgres_port(info.port),
+        node_id: info.node_id,
+        access: POSTGRES_ACCESS.to_string(),
+    }
+}
+
+fn kubernetes_node_dto(node: controller_proto::KubernetesNodeSpec) -> KubernetesNodeDto {
+    KubernetesNodeDto {
+        node_id: node.node_id,
+        role: node.role,
+        advertise_address: node.advertise_address,
+        iface: node.iface,
+        initial_cluster: node.initial_cluster,
+        join_existing: node.join_existing,
+    }
+}
+
+fn kubernetes_nodes(nodes: Vec<controller_proto::KubernetesNodeSpec>) -> Vec<KubernetesNodeDto> {
+    let mut rows: Vec<KubernetesNodeDto> = nodes.into_iter().map(kubernetes_node_dto).collect();
+    rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    rows
+}
+
+pub fn kubernetes_clusters_from_proto(
+    clusters: Vec<controller_proto::KubernetesCluster>,
+) -> Vec<KubernetesClusterRowDto> {
+    let mut rows: Vec<KubernetesClusterRowDto> = clusters
+        .into_iter()
+        .map(|cluster| {
+            let spec = cluster.spec.unwrap_or_default();
+            let status = cluster.status.unwrap_or_default();
+            KubernetesClusterRowDto {
+                name: cluster.name,
+                phase: format::kubernetes_phase_label(&status.phase),
+                message: status.message,
+                cni: spec.cni,
+                api_server_endpoint: spec.api_server_endpoint,
+                control_planes: spec.control_plane_nodes.len() as i32,
+                workers: spec.worker_nodes.len() as i32,
+                ready_control_planes: status.ready_control_planes,
+                ready_workers: status.ready_workers,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn kubernetes_detail_from_proto(
+    cluster: controller_proto::KubernetesCluster,
+    health: Result<controller_proto::GetKubernetesClusterHealthResponse, String>,
+) -> KubernetesClusterDetailDto {
+    let spec = cluster.spec.unwrap_or_default();
+    let status = cluster.status.unwrap_or_default();
+    let cilium_configured = spec.cilium_config.is_some();
+    let cilium = spec.cilium_config.unwrap_or_default();
+    let ha_configured = spec.high_availability.is_some();
+    let ha = spec.high_availability.unwrap_or_default();
+    let (overall_health, health_fields, health_error, node_health) = match health {
+        Ok(health) => {
+            let nodes = health
+                .node_health
+                .into_iter()
+                .map(|node| KubernetesNodeHealthDto {
+                    node_id: node.node_id,
+                    kubernetes_status: node.kubernetes_status,
+                    kubelet_active: node.kubelet_active,
+                    etcd_active: node.etcd_active,
+                    api_server_active: node.api_server_active,
+                })
+                .collect::<Vec<_>>();
+            (
+                format::kubernetes_phase_label(&health.overall_health),
+                (
+                    health.ready_control_planes,
+                    health.total_control_planes,
+                    health.ready_workers,
+                    health.total_workers,
+                    health.etcd_healthy,
+                    health.etcd_member_count,
+                    health.api_server_reachable,
+                ),
+                String::new(),
+                nodes,
+            )
+        }
+        Err(error) => (
+            "Unknown".to_string(),
+            (0, 0, 0, 0, false, 0, false),
+            error,
+            Vec::new(),
+        ),
+    };
+    KubernetesClusterDetailDto {
+        name: cluster.name,
+        generation: cluster.generation,
+        phase: format::kubernetes_phase_label(&status.phase),
+        message: status.message,
+        last_updated: timestamp_label(status.last_updated),
+        active_node_ids: join_nonempty(status.active_node_ids),
+        cluster_cidr: spec.cluster_cidr,
+        service_cidr: spec.service_cidr,
+        cluster_dns: spec.cluster_dns,
+        api_server_endpoint: spec.api_server_endpoint,
+        cni: spec.cni,
+        cilium_configured,
+        cilium_mode: cilium.mode,
+        cilium_mtu: cilium.mtu,
+        cilium_tunnel: cilium.tunnel,
+        cilium_auto_direct: cilium.auto_direct_node_routes,
+        cilium_lb_pools: join_nonempty(cilium.load_balancer_ip_pools),
+        ha_configured,
+        ha_enabled: ha.enabled,
+        ha_vip: ha.vip_address,
+        ha_interface: ha.vip_interface,
+        ha_method: ha.method,
+        control_plane_nodes: kubernetes_nodes(spec.control_plane_nodes),
+        worker_nodes: kubernetes_nodes(spec.worker_nodes),
+        overall_health,
+        health_ready_control_planes: health_fields.0,
+        health_total_control_planes: health_fields.1,
+        health_ready_workers: health_fields.2,
+        health_total_workers: health_fields.3,
+        etcd_healthy: health_fields.4,
+        etcd_member_count: health_fields.5,
+        api_server_reachable: health_fields.6,
+        node_health,
+        health_error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,6 +1239,142 @@ mod tests {
         assert_eq!(dtos[0].id, 42);
         assert_eq!(dtos[0].resource_key, "vm:abc");
         assert_eq!(dtos[0].reason, "concurrent create");
+    }
+
+    #[test]
+    fn postgresql_maps_to_dbms_with_defaults() {
+        let rows = dbms_from_postgresqls(vec![
+            controller_proto::PostgresqlInfo {
+                name: "zeta".into(),
+                database: "zeta".into(),
+                package: String::new(),
+                port: 0,
+                node_id: "node-105".into(),
+            },
+            controller_proto::PostgresqlInfo {
+                name: "app-db".into(),
+                database: "app".into(),
+                package: "postgresql_16".into(),
+                port: 5432,
+                node_id: "node-107".into(),
+            },
+        ]);
+        assert_eq!(rows[0].name, "app-db");
+        assert_eq!(rows[0].engine, "PostgreSQL");
+        assert_eq!(rows[0].package, "postgresql_16");
+        assert_eq!(rows[1].package, "pkgs.postgresql");
+        assert_eq!(rows[1].port, 5432);
+        let detail = dbms_detail_from_postgresql(controller_proto::PostgresqlInfo {
+            name: "app-db".into(),
+            database: "app".into(),
+            package: "postgresql_16".into(),
+            port: 5432,
+            node_id: "node-107".into(),
+        });
+        assert_eq!(
+            detail.access,
+            "Local Unix socket on the node. TCP is not opened."
+        );
+    }
+
+    #[test]
+    fn kubernetes_cluster_maps_list_and_detail() {
+        let cluster = sample_k8s_cluster();
+        let rows = kubernetes_clusters_from_proto(vec![cluster.clone()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "lab");
+        assert_eq!(rows[0].phase, "Ready");
+        assert_eq!(rows[0].control_planes, 1);
+        assert_eq!(rows[0].workers, 1);
+        assert_eq!(rows[0].cni, "cilium");
+
+        let health = controller_proto::GetKubernetesClusterHealthResponse {
+            overall_health: "healthy".into(),
+            ready_control_planes: 1,
+            total_control_planes: 1,
+            ready_workers: 1,
+            total_workers: 1,
+            etcd_healthy: true,
+            etcd_member_count: 1,
+            api_server_reachable: true,
+            node_health: vec![controller_proto::NodeHealth {
+                node_id: "node-107".into(),
+                kubernetes_status: "Ready".into(),
+                kubelet_active: true,
+                etcd_active: true,
+                api_server_active: true,
+            }],
+        };
+        let detail = kubernetes_detail_from_proto(cluster, Ok(health));
+        assert_eq!(detail.overall_health, "Healthy");
+        assert_eq!(detail.api_server_endpoint, "192.168.40.220:6443");
+        assert!(detail.cilium_configured);
+        assert_eq!(detail.cilium_mode, "native-routing");
+        assert!(detail.ha_enabled);
+        assert_eq!(detail.control_plane_nodes[0].node_id, "node-107");
+        assert_eq!(detail.worker_nodes[0].node_id, "node-119");
+        assert!(detail.health_error.is_empty());
+        assert_eq!(detail.node_health.len(), 1);
+        assert_eq!(detail.last_updated, "2023-11-14 22:13:20Z");
+
+        let failed = kubernetes_detail_from_proto(sample_k8s_cluster(), Err("health down".into()));
+        assert_eq!(failed.overall_health, "Unknown");
+        assert_eq!(failed.health_error, "health down");
+        assert!(failed.node_health.is_empty());
+    }
+
+    fn sample_k8s_cluster() -> controller_proto::KubernetesCluster {
+        controller_proto::KubernetesCluster {
+            name: "lab".into(),
+            generation: 4,
+            spec: Some(controller_proto::KubernetesClusterSpec {
+                cluster_cidr: "10.244.0.0/16".into(),
+                service_cidr: "10.96.0.0/12".into(),
+                cluster_dns: "10.96.0.10".into(),
+                api_server_endpoint: "192.168.40.220:6443".into(),
+                cni: "cilium".into(),
+                cilium_config: Some(controller_proto::CiliumConfig {
+                    mode: "native-routing".into(),
+                    mtu: 1500,
+                    tunnel: "disabled".into(),
+                    auto_direct_node_routes: true,
+                    load_balancer_ip_pools: vec!["192.168.40.220/29".into()],
+                }),
+                control_plane_nodes: vec![controller_proto::KubernetesNodeSpec {
+                    node_id: "node-107".into(),
+                    role: "control-plane".into(),
+                    advertise_address: "192.168.40.107".into(),
+                    iface: "enp6s0".into(),
+                    initial_cluster: true,
+                    join_existing: false,
+                }],
+                worker_nodes: vec![controller_proto::KubernetesNodeSpec {
+                    node_id: "node-119".into(),
+                    role: "worker".into(),
+                    advertise_address: "192.168.40.119".into(),
+                    iface: "enp6s0".into(),
+                    initial_cluster: false,
+                    join_existing: false,
+                }],
+                high_availability: Some(controller_proto::HighAvailabilityConfig {
+                    enabled: true,
+                    vip_address: "192.168.40.220".into(),
+                    vip_interface: "enp6s0".into(),
+                    method: "keepalived".into(),
+                }),
+            }),
+            status: Some(controller_proto::KubernetesClusterStatus {
+                phase: "ready".into(),
+                message: "all nodes joined".into(),
+                ready_control_planes: 1,
+                ready_workers: 1,
+                last_updated: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                active_node_ids: vec!["node-107".into(), "node-119".into()],
+            }),
+        }
     }
 }
 

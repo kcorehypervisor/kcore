@@ -19,8 +19,8 @@ pub use app::shell;
 // Ensure server function registrations are linked.
 #[allow(unused_imports)]
 use api::{
-    get_compliance_dto, get_replication_status_dto, get_storage_overview_dto,
-    list_audit_events_dto, list_ceph_clusters_dto, list_networks_dto, list_object_stores_dto,
-    list_operations_dto, list_replication_conflicts_dto, list_shared_filesystems_dto,
-    list_vms_page, list_volumes_dto,
+    get_compliance_dto, get_dbms_dto, get_kubernetes_cluster_dto, get_replication_status_dto,
+    get_storage_overview_dto, list_audit_events_dto, list_ceph_clusters_dto, list_dbms_dto,
+    list_kubernetes_clusters_dto, list_networks_dto, list_object_stores_dto, list_operations_dto,
+    list_replication_conflicts_dto, list_shared_filesystems_dto, list_vms_page, list_volumes_dto,
 };

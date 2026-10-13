@@ -1,21 +1,23 @@
 use crate::api::{
-    get_compliance_dto, get_network_overview_dto, get_replication_status_dto,
-    get_storage_overview_dto, list_audit_events_dto, list_ceph_clusters_dto, list_networks_dto,
+    get_compliance_dto, get_dbms_dto, get_kubernetes_cluster_dto, get_network_overview_dto,
+    get_replication_status_dto, get_storage_overview_dto, list_audit_events_dto,
+    list_ceph_clusters_dto, list_dbms_dto, list_kubernetes_clusters_dto, list_networks_dto,
     list_object_stores_dto, list_operations_dto, list_replication_conflicts_dto,
     list_shared_filesystems_dto, list_vms_page, list_volumes_dto,
 };
 use crate::dto::{
-    AuditEventDto, CephClusterRowDto, ComplianceDto, HostInterfaceDto, LvmLogicalVolumeDto,
-    LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
-    NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto,
-    ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto,
-    VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
+    AuditEventDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto, DbmsRowDto, HostInterfaceDto,
+    KubernetesClusterDetailDto, KubernetesClusterRowDto, KubernetesNodeDto,
+    KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto,
+    NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto,
+    ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto, SharedFilesystemRowDto,
+    StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};
 use leptos_router::{
     components::{FlatRoutes, Route, Router},
-    hooks::use_query_map,
+    hooks::{use_params_map, use_query_map},
     path,
 };
 
@@ -60,6 +62,8 @@ pub fn App() -> impl IntoView {
                     <a href="/vms">"Virtual machines"</a>
                     <a href="/volumes">"Volumes"</a>
                     <a href="/ceph">"Ceph"</a>
+                    <a href="/kds">"KDS"</a>
+                    <a href="/k8s">"Kubernetes"</a>
                     <a href="/networks">"Networks"</a>
                     <a href="/storage">"Storage"</a>
                     <a href="/operations">"Operations"</a>
@@ -74,6 +78,10 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/vms") view=VmsPage/>
                         <Route path=path!("/volumes") view=VolumesPage/>
                         <Route path=path!("/ceph") view=CephPage/>
+                        <Route path=path!("/kds") view=KdsPage/>
+                        <Route path=path!("/kds/:name") view=KdsDetailPage/>
+                        <Route path=path!("/k8s") view=KubernetesPage/>
+                        <Route path=path!("/k8s/:name") view=KubernetesDetailPage/>
                         <Route path=path!("/operations") view=OperationsPage/>
                         <Route path=path!("/audit") view=AuditPage/>
                         <Route path=path!("/networks") view=NetworksPage/>
@@ -95,7 +103,7 @@ fn HomePage() -> impl IntoView {
         <section class="hero">
             <h1>"Declarative virtualization"</h1>
             <p>
-                "Monitor compliance posture, workloads, and networks from a single dashboard. "
+                "Monitor compliance posture, workloads, databases, Kubernetes clusters, and networks from a single dashboard. "
                 "No direct database access — everything goes through the controller API."
             </p>
         </section>
@@ -115,6 +123,14 @@ fn HomePage() -> impl IntoView {
             <a href="/ceph" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Ceph"</h2>
                 <p class="muted">"Ceph clusters, CephFS shares, and RGW object stores."</p>
+            </a>
+            <a href="/kds" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"KDS"</h2>
+                <p class="muted">"kcore Database Service. DBMS instances running on the cluster."</p>
+            </a>
+            <a href="/k8s" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Kubernetes"</h2>
+                <p class="muted">"Kubernetes clusters, nodes, and health."</p>
             </a>
             <a href="/operations" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Operations"</h2>
@@ -1529,6 +1545,439 @@ fn object_stores_table(rows: Vec<ObjectStoreRowDto>) -> impl IntoView {
                                 <td>{store.members.clone()}</td>
                             </tr>
                         }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+fn encode_path_segment(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn phase_badge_class(phase: &str) -> String {
+    match phase.to_ascii_lowercase().as_str() {
+        "ready" | "healthy" => "badge badge-run".to_string(),
+        "degraded" | "bootstrapping" | "scaling" | "pending" => "badge badge-warn".to_string(),
+        _ => "badge badge-stop".to_string(),
+    }
+}
+
+#[component]
+fn KdsPage() -> impl IntoView {
+    let res = Resource::new(|| (), |_| list_dbms_dto());
+    view! {
+        <section class="hero">
+            <h1>"KDS"</h1>
+            <p class="muted">
+                "kcore Database Service. DBMS instances running on the cluster. "
+                "v1 is PostgreSQL from the NixOS postgresql package."
+            </p>
+        </section>
+        <Suspense fallback=move || view! { <p class="muted">"Loading database services…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(rows) => dbms_table(rows).into_any(),
+                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn dbms_table(rows: Vec<DbmsRowDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! {
+            <div class="empty-note">
+                "No database services. Create one with "<code class="inline">"kctl create postgresql"</code>"."
+            </div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Engine"</th>
+                        <th>"Database"</th>
+                        <th>"Package"</th>
+                        <th>"Port"</th>
+                        <th>"Node"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|row| {
+                        let href = format!("/kds/{}", encode_path_segment(&row.name));
+                        view! {
+                            <tr>
+                                <td><a class="cell-link" href=href.clone()><strong>{row.name.clone()}</strong></a></td>
+                                <td><a class="cell-link" href=href.clone()>{row.engine.clone()}</a></td>
+                                <td><a class="cell-link" href=href.clone()><code class="inline">{row.database.clone()}</code></a></td>
+                                <td><a class="cell-link" href=href.clone()><code class="inline">{row.package.clone()}</code></a></td>
+                                <td><a class="cell-link" href=href.clone()>{row.port}</a></td>
+                                <td><a class="cell-link" href=href>{display_or_dash(&row.node_id)}</a></td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn KdsDetailPage() -> impl IntoView {
+    let params = use_params_map();
+    let name = Memo::new(move |_| {
+        params
+            .get()
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    });
+    let res = Resource::new(
+        move || name.get(),
+        |n| async move {
+            if n.trim().is_empty() {
+                return Err(ServerFnError::new("missing database service name"));
+            }
+            get_dbms_dto(n).await
+        },
+    );
+    view! {
+        <Suspense fallback=move || view! { <p class="muted">"Loading database service…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(detail) => dbms_detail_view(detail).into_any(),
+                    Err(e) => view! {
+                        <section class="hero">
+                            <p class="crumb"><a href="/kds">"← KDS"</a></p>
+                            <h1>"Database service"</h1>
+                        </section>
+                        <p class="err">{e.to_string()}</p>
+                    }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn dbms_detail_view(detail: DbmsDetailDto) -> impl IntoView {
+    view! {
+        <section class="hero">
+            <p class="crumb"><a href="/kds">"← KDS"</a></p>
+            <h1>{detail.name.clone()}</h1>
+            <p class="muted">
+                <span class="badge badge-run">{detail.engine.clone()}</span>
+                " on "<code class="inline">{display_or_dash(&detail.node_id)}</code>
+            </p>
+        </section>
+        <div class="stat-row">
+            <div class="stat"><div class="label">"Engine"</div><div class="value">{detail.engine.clone()}</div></div>
+            <div class="stat"><div class="label">"Port"</div><div class="value">{detail.port}</div></div>
+            <div class="stat"><div class="label">"Node"</div><div class="value">{display_or_dash(&detail.node_id)}</div></div>
+        </div>
+        <h2 class="section-title">"Database"</h2>
+        <div class="card">
+            <dl class="kv">
+                <dt>"Name"</dt><dd>{detail.name.clone()}</dd>
+                <dt>"Engine"</dt><dd>{detail.engine.clone()}</dd>
+                <dt>"Database"</dt><dd>{display_or_dash(&detail.database)}</dd>
+                <dt>"Package"</dt><dd>{detail.package.clone()}</dd>
+                <dt>"Port"</dt><dd>{detail.port.to_string()}</dd>
+                <dt>"Node"</dt><dd>{display_or_dash(&detail.node_id)}</dd>
+                <dt>"Access"</dt><dd>{detail.access.clone()}</dd>
+            </dl>
+        </div>
+    }
+}
+
+#[component]
+fn KubernetesPage() -> impl IntoView {
+    let res = Resource::new(|| (), |_| list_kubernetes_clusters_dto());
+    view! {
+        <section class="hero">
+            <h1>"Kubernetes"</h1>
+            <p class="muted">
+                "Kubernetes clusters managed by kcore. Open a cluster for nodes, networking, and health."
+            </p>
+        </section>
+        <Suspense fallback=move || view! { <p class="muted">"Loading Kubernetes clusters…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(rows) => kubernetes_table(rows).into_any(),
+                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn kubernetes_table(rows: Vec<KubernetesClusterRowDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! {
+            <div class="empty-note">
+                "No Kubernetes clusters. Create one with "<code class="inline">"kctl kubernetes apply -f"</code>"."
+            </div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Phase"</th>
+                        <th>"API"</th>
+                        <th>"CNI"</th>
+                        <th>"Control planes"</th>
+                        <th>"Workers"</th>
+                        <th>"Status"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|row| {
+                        let href = format!("/k8s/{}", encode_path_segment(&row.name));
+                        let badge = phase_badge_class(&row.phase);
+                        let cp = format!("{}/{}", row.ready_control_planes, row.control_planes);
+                        let workers = format!("{}/{}", row.ready_workers, row.workers);
+                        view! {
+                            <tr>
+                                <td><a class="cell-link" href=href.clone()><strong>{row.name.clone()}</strong></a></td>
+                                <td><a class="cell-link" href=href.clone()><span class=badge>{row.phase.clone()}</span></a></td>
+                                <td><a class="cell-link" href=href.clone()><code class="inline">{display_or_dash(&row.api_server_endpoint)}</code></a></td>
+                                <td><a class="cell-link" href=href.clone()>{display_or_dash(&row.cni)}</a></td>
+                                <td><a class="cell-link" href=href.clone()>{cp}</a></td>
+                                <td><a class="cell-link" href=href.clone()>{workers}</a></td>
+                                <td><a class="cell-link" href=href>{display_or_dash(&row.message)}</a></td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn KubernetesDetailPage() -> impl IntoView {
+    let params = use_params_map();
+    let name = Memo::new(move |_| {
+        params
+            .get()
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    });
+    let res = Resource::new(
+        move || name.get(),
+        |n| async move {
+            if n.trim().is_empty() {
+                return Err(ServerFnError::new("missing Kubernetes cluster name"));
+            }
+            get_kubernetes_cluster_dto(n).await
+        },
+    );
+    view! {
+        <Suspense fallback=move || view! { <p class="muted">"Loading Kubernetes cluster…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(detail) => kubernetes_detail_view(detail).into_any(),
+                    Err(e) => view! {
+                        <section class="hero">
+                            <p class="crumb"><a href="/k8s">"← Kubernetes"</a></p>
+                            <h1>"Kubernetes cluster"</h1>
+                        </section>
+                        <p class="err">{e.to_string()}</p>
+                    }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn kubernetes_detail_view(detail: KubernetesClusterDetailDto) -> impl IntoView {
+    let badge = phase_badge_class(&detail.phase);
+    let health_badge = phase_badge_class(&detail.overall_health);
+    let cp_nodes = detail.control_plane_nodes.clone();
+    let workers = detail.worker_nodes.clone();
+    let health_nodes = detail.node_health.clone();
+    let health_error = detail.health_error.clone();
+    view! {
+        <section class="hero">
+            <p class="crumb"><a href="/k8s">"← Kubernetes"</a></p>
+            <h1>{detail.name.clone()}</h1>
+            <p class="muted">
+                <span class=badge>{detail.phase.clone()}</span>
+                " · generation "{detail.generation}
+                " · health "<span class=health_badge>{detail.overall_health.clone()}</span>
+            </p>
+            <p class="muted">{display_or_dash(&detail.message)}</p>
+        </section>
+        {if health_error.is_empty() {
+            let etcd = if detail.etcd_healthy { "healthy" } else { "not healthy" };
+            let api = if detail.api_server_reachable { "reachable" } else { "unreachable" };
+            view! {
+                <div class="stat-row">
+                    <div class="stat"><div class="label">"Control planes"</div><div class="value">{format!("{}/{}", detail.health_ready_control_planes, detail.health_total_control_planes)}</div></div>
+                    <div class="stat"><div class="label">"Workers"</div><div class="value">{format!("{}/{}", detail.health_ready_workers, detail.health_total_workers)}</div></div>
+                    <div class="stat"><div class="label">"etcd members"</div><div class="value">{detail.etcd_member_count}</div></div>
+                    <div class="stat"><div class="label">"etcd"</div><div class="value">{etcd}</div></div>
+                    <div class="stat"><div class="label">"API server"</div><div class="value">{api}</div></div>
+                </div>
+            }.into_any()
+        } else {
+            view! { <p class="err">{health_error}</p> }.into_any()
+        }}
+
+        <h2 class="section-title">"Cluster"</h2>
+        <div class="card">
+            <dl class="kv">
+                <dt>"Name"</dt><dd>{detail.name.clone()}</dd>
+                <dt>"Phase"</dt><dd>{detail.phase.clone()}</dd>
+                <dt>"Updated"</dt><dd>{detail.last_updated.clone()}</dd>
+                <dt>"Active nodes"</dt><dd>{detail.active_node_ids.clone()}</dd>
+                <dt>"Pod CIDR"</dt><dd>{display_or_dash(&detail.cluster_cidr)}</dd>
+                <dt>"Service CIDR"</dt><dd>{display_or_dash(&detail.service_cidr)}</dd>
+                <dt>"Cluster DNS"</dt><dd>{display_or_dash(&detail.cluster_dns)}</dd>
+                <dt>"API"</dt><dd>{display_or_dash(&detail.api_server_endpoint)}</dd>
+                <dt>"CNI"</dt><dd>{display_or_dash(&detail.cni)}</dd>
+            </dl>
+        </div>
+
+        <h2 class="section-title">"Cilium"</h2>
+        {if detail.cilium_configured {
+            view! {
+                <div class="card">
+                    <dl class="kv">
+                        <dt>"Mode"</dt><dd>{display_or_dash(&detail.cilium_mode)}</dd>
+                        <dt>"MTU"</dt><dd>{detail.cilium_mtu.to_string()}</dd>
+                        <dt>"Tunnel"</dt><dd>{display_or_dash(&detail.cilium_tunnel)}</dd>
+                        <dt>"Direct routes"</dt><dd>{yes_no(detail.cilium_auto_direct)}</dd>
+                        <dt>"LB pools"</dt><dd>{detail.cilium_lb_pools.clone()}</dd>
+                    </dl>
+                </div>
+            }.into_any()
+        } else {
+            view! { <div class="empty-note">"No Cilium config on this cluster."</div> }.into_any()
+        }}
+
+        <h2 class="section-title">"High availability"</h2>
+        {if detail.ha_configured {
+            view! {
+                <div class="card">
+                    <dl class="kv">
+                        <dt>"Enabled"</dt><dd>{yes_no(detail.ha_enabled)}</dd>
+                        <dt>"VIP"</dt><dd>{display_or_dash(&detail.ha_vip)}</dd>
+                        <dt>"Interface"</dt><dd>{display_or_dash(&detail.ha_interface)}</dd>
+                        <dt>"Method"</dt><dd>{display_or_dash(&detail.ha_method)}</dd>
+                    </dl>
+                </div>
+            }.into_any()
+        } else {
+            view! { <div class="empty-note">"High availability is not configured."</div> }.into_any()
+        }}
+
+        {k8s_member_table("Control plane", cp_nodes)}
+        {k8s_member_table("Workers", workers)}
+        {k8s_health_table(health_nodes)}
+    }
+}
+
+fn k8s_member_table(title: &'static str, nodes: Vec<KubernetesNodeDto>) -> impl IntoView {
+    if nodes.is_empty() {
+        return view! {
+            <h2 class="section-title">{title}</h2>
+            <div class="empty-note">"No nodes in this role."</div>
+        }
+        .into_any();
+    }
+    view! {
+        <h2 class="section-title">{title}</h2>
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Node"</th>
+                        <th>"Role"</th>
+                        <th>"Address"</th>
+                        <th>"Interface"</th>
+                        <th>"Initial"</th>
+                        <th>"Join"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {nodes.into_iter().map(|node| view! {
+                        <tr>
+                            <td><strong>{node.node_id.clone()}</strong></td>
+                            <td>{display_or_dash(&node.role)}</td>
+                            <td><code class="inline">{display_or_dash(&node.advertise_address)}</code></td>
+                            <td><code class="inline">{display_or_dash(&node.iface)}</code></td>
+                            <td>{yes_no(node.initial_cluster)}</td>
+                            <td>{yes_no(node.join_existing)}</td>
+                        </tr>
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+fn k8s_health_table(nodes: Vec<KubernetesNodeHealthDto>) -> impl IntoView {
+    if nodes.is_empty() {
+        return view! {
+            <h2 class="section-title">"Node health"</h2>
+            <div class="empty-note">"No per-node health reported."</div>
+        }
+        .into_any();
+    }
+    view! {
+        <h2 class="section-title">"Node health"</h2>
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Node"</th>
+                        <th>"Status"</th>
+                        <th>"Kubelet"</th>
+                        <th>"etcd"</th>
+                        <th>"API server"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {nodes.into_iter().map(|node| view! {
+                        <tr>
+                            <td><strong>{node.node_id.clone()}</strong></td>
+                            <td>{display_or_dash(&node.kubernetes_status)}</td>
+                            <td>{yes_no(node.kubelet_active)}</td>
+                            <td>{yes_no(node.etcd_active)}</td>
+                            <td>{yes_no(node.api_server_active)}</td>
+                        </tr>
                     }).collect_view()}
                 </tbody>
             </table>
