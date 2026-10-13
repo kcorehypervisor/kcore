@@ -273,6 +273,10 @@ let
           authorization:
             mode: Webhook
           cgroupDriver: systemd
+          # The primary cluster already owns kubepods.slice. A second
+          # kubelet in that hierarchy treats this cluster's pods as
+          # orphans and deletes their cgroups.
+          cgroupRoot: /kubepods-${name}
           clusterDNS:
             - ${c.clusterDns}
           clusterDomain: cluster.local
@@ -452,12 +456,20 @@ let
         };
       };
 
+      # Hyphens in a cgroup name become underscores in the systemd slice
+      # path. kubelet looks for that slice before it will start.
+      systemd.slices."kubepods_${lib.replaceStrings [ "-" ] [ "_" ] name}" = {
+        description = "Pod cgroup root for Kubernetes cluster ${name}";
+      };
+
       systemd.services."kubelet-${name}" = {
         description = "Kubelet for Kubernetes cluster ${name}";
         wantedBy = [ "multi-user.target" ];
+        requires = [ "kubepods_${lib.replaceStrings [ "-" ] [ "_" ] name}.slice" ];
         after = [
           "network-online.target"
           "containerd-${name}.service"
+          "kubepods_${lib.replaceStrings [ "-" ] [ "_" ] name}.slice"
         ]
         ++ lib.optionals (c.role == "control-plane") [ "kube-apiserver-${name}.service" ];
         wants = [
@@ -1069,6 +1081,25 @@ in
           "cilium_host"
           "cilium_net"
         ];
+        # Unicast keepalived speaks IP protocol 112. The filter accept
+        # stops the firewall from dropping adverts. The raw NOTRACK rules
+        # stop conntrack from applying the VM-network masquerade, which
+        # otherwise rewrites the advert source to the VM gateway and the
+        # real master is never heard.
+        extraCommands =
+          lib.mkIf (cfg.haEnabled || lib.any (c: c.haEnabled) (lib.attrValues cfg.additionalClusters))
+            ''
+              iptables -C nixos-fw -p 112 -j nixos-fw-accept 2>/dev/null || iptables -A nixos-fw -p 112 -j nixos-fw-accept
+              iptables -t raw -C PREROUTING -p 112 -j CT --notrack 2>/dev/null || iptables -t raw -I PREROUTING 1 -p 112 -j CT --notrack
+              iptables -t raw -C OUTPUT -p 112 -j CT --notrack 2>/dev/null || iptables -t raw -I OUTPUT 1 -p 112 -j CT --notrack
+            '';
+        extraStopCommands =
+          lib.mkIf (cfg.haEnabled || lib.any (c: c.haEnabled) (lib.attrValues cfg.additionalClusters))
+            ''
+              while iptables -D nixos-fw -p 112 -j nixos-fw-accept 2>/dev/null; do :; done
+              while iptables -t raw -D PREROUTING -p 112 -j CT --notrack 2>/dev/null; do :; done
+              while iptables -t raw -D OUTPUT -p 112 -j CT --notrack 2>/dev/null; do :; done
+            '';
       };
 
       # Write kubeconfig if provided
