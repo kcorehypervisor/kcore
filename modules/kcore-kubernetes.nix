@@ -6,7 +6,6 @@
 }:
 let
   cfg = config.kcore.kubernetes;
-  nonEmpty = value: value != "";
 
   # Cilium ports
   ciliumPorts = {
@@ -29,7 +28,7 @@ let
   };
 
   # etcd initial cluster string
-  etcdInitialCluster = cfg.etcdInitialCluster;
+  inherit (cfg) etcdInitialCluster;
 
   # Kubeconfig for local components
   kubeconfigPath = "/etc/kubernetes/admin.conf";
