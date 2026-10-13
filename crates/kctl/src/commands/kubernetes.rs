@@ -116,6 +116,9 @@ struct ManifestLocalProvisioner {
     enabled: bool,
     #[serde(default)]
     storage_class_name: String,
+    /// "shared" (directories on one formatted volume) or "lvm" (TopoLVM thin pool).
+    #[serde(default)]
+    mode: String,
     #[serde(default)]
     volumes: Vec<ManifestHostVolume>,
 }
@@ -133,6 +136,11 @@ struct ManifestHostVolume {
     fs_type: String,
     #[serde(default)]
     mount_path: String,
+    /// "filesystem" or "pool". Empty follows the provisioner mode.
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    volume_group: String,
 }
 
 fn parse_manifest(file: &str) -> Result<KubernetesClusterManifest> {
@@ -175,6 +183,7 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
         Some(controller_proto::KubernetesLocalProvisioner {
             enabled: local.enabled,
             storage_class_name: local.storage_class_name.clone(),
+            mode: local.mode.clone(),
             volumes: local
                 .volumes
                 .iter()
@@ -185,6 +194,8 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
                     size_bytes: volume.size_bytes,
                     fs_type: volume.fs_type.clone(),
                     mount_path: volume.mount_path.clone(),
+                    role: volume.role.clone(),
+                    volume_group: volume.volume_group.clone(),
                 })
                 .collect(),
         })
@@ -398,17 +409,35 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
 
             if let Some(local) = spec.local_provisioner.filter(|local| local.enabled) {
                 println!("\nLocal provisioner:");
+                let mode = if local.mode.is_empty() {
+                    "shared"
+                } else {
+                    local.mode.as_str()
+                };
+                println!("  Mode: {mode}");
                 println!("  StorageClass: {}", local.storage_class_name);
                 for volume in &local.volumes {
-                    println!(
-                        "  - {} on {} ({} {} bytes, {} at {})",
-                        volume.name,
-                        volume.node_id,
-                        volume.storage_class,
-                        volume.size_bytes,
-                        volume.fs_type,
-                        volume.mount_path
-                    );
+                    if volume.role == "pool" {
+                        println!(
+                            "  - thin pool {} on {} ({}/{}, {} bytes, claims formatted {})",
+                            volume.name,
+                            volume.node_id,
+                            volume.volume_group,
+                            volume.name,
+                            volume.size_bytes,
+                            volume.fs_type
+                        );
+                    } else {
+                        println!(
+                            "  - {} on {} ({} {} bytes, {} at {})",
+                            volume.name,
+                            volume.node_id,
+                            volume.storage_class,
+                            volume.size_bytes,
+                            volume.fs_type,
+                            volume.mount_path
+                        );
+                    }
                 }
             }
         }
@@ -665,6 +694,39 @@ spec:
         assert_eq!(local.volumes[0].node_id, "node-105");
         assert_eq!(local.volumes[0].storage_class, "lvm");
         assert_eq!(local.volumes[0].size_bytes, 53_687_091_200);
+        assert!(local.mode.is_empty());
+
+        let lvm = parse_manifest_str(
+            r#"
+kind: KubernetesCluster
+metadata:
+  name: lab
+spec:
+  clusterCidr: 10.245.0.0/16
+  serviceCidr: 10.112.0.0/12
+  apiServerEndpoint: 192.168.40.201:7443
+  controlPlaneNodes:
+    - nodeId: node-105
+      advertiseAddress: 192.168.40.105
+  localProvisioner:
+    enabled: true
+    mode: lvm
+    storageClassName: kcore-lvm
+    volumes:
+      - name: kcore-kdata
+        nodeId: node-105
+        storageClass: lvm
+        sizeBytes: 53687091200
+        role: pool
+        volumeGroup: vg_kcore
+"#,
+        )
+        .unwrap();
+        let lvm_spec = to_proto_spec(&lvm.spec);
+        let lvm_local = lvm_spec.local_provisioner.expect("lvm provisioner");
+        assert_eq!(lvm_local.mode, "lvm");
+        assert_eq!(lvm_local.volumes[0].role, "pool");
+        assert_eq!(lvm_local.volumes[0].volume_group, "vg_kcore");
 
         let plain = parse_manifest_str(
             r#"

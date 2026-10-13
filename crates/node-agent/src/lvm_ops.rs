@@ -62,6 +62,67 @@ pub fn logical_volume_name(
     validate_lv_name(&format!("{prefix}{id}"))
 }
 
+/// `lvcreate` argv for a linear volume, a thin pool, or a thin volume in a pool.
+///
+/// `lvm_type` is empty or `linear`, `thin-pool`, or `thin`. A thin volume
+/// names the pool with `thin_pool`.
+pub fn lvcreate_args(
+    vg: &str,
+    lv_name: &str,
+    size_bytes: i64,
+    lvm_type: &str,
+    thin_pool: &str,
+) -> Result<Vec<String>, LvmOpError> {
+    if size_bytes <= 0 {
+        return Err(LvmOpError::new(
+            Kind::InvalidArgument,
+            "size_bytes must be positive",
+        ));
+    }
+    let vg = validate_component(vg, "volume_group")?;
+    let lv_name = validate_lv_name(lv_name)?;
+    let size = format!("{size_bytes}B");
+    match lvm_type.trim() {
+        "" | "linear" => Ok(vec![
+            "lvcreate".into(),
+            "-y".into(),
+            "-L".into(),
+            size,
+            "-n".into(),
+            lv_name,
+            vg,
+        ]),
+        "thin-pool" => Ok(vec![
+            "lvcreate".into(),
+            "-y".into(),
+            "--type".into(),
+            "thin-pool".into(),
+            "-L".into(),
+            size,
+            "-n".into(),
+            lv_name,
+            vg,
+        ]),
+        "thin" => {
+            let pool = validate_lv_name(thin_pool)?;
+            Ok(vec![
+                "lvcreate".into(),
+                "-y".into(),
+                "-V".into(),
+                size,
+                "-n".into(),
+                lv_name,
+                "--thinpool".into(),
+                format!("{vg}/{pool}"),
+            ])
+        }
+        other => Err(LvmOpError::new(
+            Kind::InvalidArgument,
+            format!("lvm-type must be linear, thin-pool, or thin, got {other}"),
+        )),
+    }
+}
+
 /// Canonical `/dev/<vg>/<lv>` for a handle that must already live in `vg`.
 pub fn logical_volume_device(vg: &str, backend_handle: &str) -> Result<String, LvmOpError> {
     let vg = vg.trim();
@@ -758,6 +819,31 @@ mod tests {
         assert_eq!(commands[0][0], "e2fsck");
         assert_eq!(commands[1][0], "resize2fs");
         assert_eq!(commands[2][0], "lvreduce");
+    }
+
+    #[test]
+    fn lvcreate_plans_a_linear_volume_a_thin_pool_and_a_thin_volume() {
+        let linear = lvcreate_args("vg_kcore", "kcore-kdata", 1024, "", "").unwrap();
+        assert_eq!(
+            linear,
+            vec![
+                "lvcreate",
+                "-y",
+                "-L",
+                "1024B",
+                "-n",
+                "kcore-kdata",
+                "vg_kcore"
+            ]
+        );
+        let pool = lvcreate_args("vg_kcore", "kcore-kdata", 1024, "thin-pool", "").unwrap();
+        assert!(pool
+            .windows(2)
+            .any(|pair| pair[0] == "--type" && pair[1] == "thin-pool"));
+        let thin = lvcreate_args("vg_kcore", "pvc-1", 1024, "thin", "kcore-kdata").unwrap();
+        assert!(thin.iter().any(|arg| arg == "--thinpool"));
+        assert!(thin.iter().any(|arg| arg == "vg_kcore/kcore-kdata"));
+        assert!(lvcreate_args("vg_kcore", "pvc-1", 1024, "raid", "").is_err());
     }
 
     #[test]
