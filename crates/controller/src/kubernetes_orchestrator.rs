@@ -141,7 +141,14 @@ impl KubernetesOrchestrator {
                     "deploying node configuration"
                 );
                 orchestrator
-                    .configure_node(&cluster_name, &node, &pki, &cluster_cidr, &service_cidr, &all_nodes)
+                    .configure_node(
+                        &cluster_name,
+                        &node,
+                        &pki,
+                        &cluster_cidr,
+                        &service_cidr,
+                        &all_nodes,
+                    )
                     .await
             });
             deploy_tasks.push(task);
@@ -162,7 +169,11 @@ impl KubernetesOrchestrator {
                 total = nodes.len(),
                 "some node deployments failed"
             );
-            return Err(anyhow!("{} of {} node deployments failed", failed_count, nodes.len()));
+            return Err(anyhow!(
+                "{} of {} node deployments failed",
+                failed_count,
+                nodes.len()
+            ));
         }
 
         info!(
@@ -247,8 +258,15 @@ impl KubernetesOrchestrator {
             );
 
             // All nodes get the same etcd initial cluster config
-            self.configure_node(cluster_name, node, &pki, cluster_cidr, service_cidr, all_nodes)
-                .await?;
+            self.configure_node(
+                cluster_name,
+                node,
+                &pki,
+                cluster_cidr,
+                service_cidr,
+                all_nodes,
+            )
+            .await?;
 
             // Wait between additions
             sleep(Duration::from_secs(15)).await;
@@ -389,7 +407,7 @@ impl KubernetesOrchestrator {
 
         // Apply configuration via node agent RPC
         use crate::node_proto::ApplyRawKubernetesConfigRequest;
-        
+
         let request = ApplyRawKubernetesConfigRequest {
             nix_config_content: k8s_config,
             kubeconfig_data: pki.admin_kubeconfig.clone(),

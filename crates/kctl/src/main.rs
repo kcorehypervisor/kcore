@@ -260,6 +260,70 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum NodeLvmAction {
+    /// Create a logical volume in the node's volume group
+    Create {
+        /// Volume id. Used as the LV name when --lv-name is omitted, with the kcore- prefix.
+        #[arg(long)]
+        id: String,
+        /// Size in bytes
+        #[arg(long)]
+        size_bytes: i64,
+        /// Logical volume name without the VM prefix
+        #[arg(long)]
+        lv_name: Option<String>,
+    },
+    /// Grow or shrink a logical volume. Shrink needs --allow-shrink and an unmounted ext4 filesystem.
+    Resize {
+        /// Device path, /dev/<vg>/<lv>
+        #[arg(long)]
+        device: String,
+        /// New size in bytes, a multiple of 1 MiB
+        #[arg(long)]
+        size_bytes: i64,
+        /// Allow the volume to become smaller
+        #[arg(long)]
+        allow_shrink: bool,
+    },
+    /// Format a logical volume as ext4 or xfs
+    Format {
+        /// Device path, /dev/<vg>/<lv>
+        #[arg(long)]
+        device: String,
+        /// ext4 or xfs
+        #[arg(long)]
+        fs: String,
+        /// Replace an existing filesystem
+        #[arg(long)]
+        force: bool,
+    },
+    /// Mount a logical volume under /var/lib/kcore or /mnt/kcore
+    Mount {
+        /// Device path, /dev/<vg>/<lv>
+        #[arg(long)]
+        device: String,
+        /// Mount point
+        #[arg(long)]
+        path: String,
+        /// ext4 or xfs. Empty uses the filesystem already on the volume.
+        #[arg(long)]
+        fs: Option<String>,
+        /// Install a systemd mount unit so the volume returns after reboot
+        #[arg(long)]
+        persistent: bool,
+    },
+    /// Unmount a logical volume
+    Unmount {
+        /// Mount point
+        #[arg(long)]
+        path: String,
+        /// Also remove the systemd mount unit
+        #[arg(long)]
+        persistent: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum UpdateClusterCmd {
     /// Dry-run: resolve nodes and compatibility (reads YAML manifest)
     Plan {
@@ -1050,6 +1114,11 @@ enum NodeAction {
     Disks,
     /// List network interfaces on a node
     Nics,
+    /// Create, resize, format, and mount a logical volume on this node
+    Lvm {
+        #[command(subcommand)]
+        action: NodeLvmAction,
+    },
     /// Install kcore to disk on a node
     Install {
         /// OS disk (e.g. /dev/sda)
@@ -2340,6 +2409,38 @@ async fn main() {
         } => {
             let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
             commands::node::nics(&info).await
+        }
+
+        Command::Node {
+            action: NodeAction::Lvm { action },
+        } => {
+            let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
+            match action {
+                NodeLvmAction::Create {
+                    id,
+                    size_bytes,
+                    lv_name,
+                } => commands::node::lvm_create(&info, id, *size_bytes, lv_name.as_deref()).await,
+                NodeLvmAction::Resize {
+                    device,
+                    size_bytes,
+                    allow_shrink,
+                } => commands::node::lvm_resize(&info, device, *size_bytes, *allow_shrink).await,
+                NodeLvmAction::Format { device, fs, force } => {
+                    commands::node::lvm_format(&info, device, fs, *force).await
+                }
+                NodeLvmAction::Mount {
+                    device,
+                    path,
+                    fs,
+                    persistent,
+                } => {
+                    commands::node::lvm_mount(&info, device, path, fs.as_deref(), *persistent).await
+                }
+                NodeLvmAction::Unmount { path, persistent } => {
+                    commands::node::lvm_unmount(&info, path, *persistent).await
+                }
+            }
         }
 
         Command::Node {
