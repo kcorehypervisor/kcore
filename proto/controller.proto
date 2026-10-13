@@ -2590,6 +2590,9 @@ message KubernetesClusterSpec {
   repeated KubernetesNodeSpec worker_nodes = 8;
   HighAvailabilityConfig high_availability = 9;
   KubernetesLocalProvisioner local_provisioner = 10;
+  // Control-plane nodes also accept pods. A cluster can list no separate
+  // worker nodes and still schedule workloads on the masters.
+  bool schedule_on_control_plane = 11;
 }
 
 message KubernetesClusterStatus {

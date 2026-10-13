@@ -14255,11 +14255,23 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
 
-        let _cluster = self
+        let cluster = self
             .db
             .get_kubernetes_cluster(&req.name)
             .map_err(internal_db)?
             .ok_or_else(|| Status::not_found(format!("cluster {} not found", req.name)))?;
+        let schedule_on_control_plane = self
+            .db
+            .get_kubernetes_cluster_config(&req.name)
+            .map_err(internal_db)?
+            .map(|config| config.schedule_on_control_plane)
+            .unwrap_or(false);
+        let mut control_plane_ready_budget =
+            if schedule_on_control_plane && cluster.phase == "ready" {
+                cluster.ready_control_planes
+            } else {
+                0
+            };
 
         let nodes = self
             .db
@@ -14273,14 +14285,24 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut total_workers = 0;
 
         for node in &nodes {
-            if node.role == "control-plane" {
+            let control_plane = node.role == "control-plane";
+            if control_plane {
                 total_control_planes += 1;
                 if node.kubelet_ready {
                     ready_control_planes += 1;
                 }
-            } else {
+            }
+            if !control_plane || schedule_on_control_plane {
                 total_workers += 1;
-                if node.kubelet_ready {
+                let ready = if node.kubelet_ready {
+                    true
+                } else if control_plane && control_plane_ready_budget > 0 {
+                    control_plane_ready_budget -= 1;
+                    true
+                } else {
+                    false
+                };
+                if ready {
                     ready_workers += 1;
                 }
             }
@@ -14402,6 +14424,7 @@ impl ControllerService {
                 .map(|c| c.load_balancer_ip_pools.join(","))
                 .unwrap_or_default(),
             local_provisioner_json: crate::kubernetes_local::encode(provisioner),
+            schedule_on_control_plane: spec.schedule_on_control_plane,
         }
     }
 
@@ -14739,16 +14762,39 @@ impl ControllerService {
                 worker_nodes,
                 high_availability: ha_config,
                 local_provisioner,
+                schedule_on_control_plane: config
+                    .as_ref()
+                    .map(|c| c.schedule_on_control_plane)
+                    .unwrap_or(false),
             }),
             status: Some(controller_proto::KubernetesClusterStatus {
                 phase: row.phase.clone(),
                 message: row.status_message.clone(),
                 ready_control_planes: row.ready_control_planes,
-                ready_workers: row.ready_workers,
+                ready_workers: displayed_ready_workers(
+                    row.ready_workers,
+                    row.ready_control_planes,
+                    config
+                        .as_ref()
+                        .map(|c| c.schedule_on_control_plane)
+                        .unwrap_or(false),
+                ),
                 last_updated: None,
                 active_node_ids: vec![],
             }),
         })
+    }
+}
+
+fn displayed_ready_workers(
+    dedicated_ready: i32,
+    ready_control_planes: i32,
+    schedule_on_control_plane: bool,
+) -> i32 {
+    if schedule_on_control_plane {
+        dedicated_ready.saturating_add(ready_control_planes)
+    } else {
+        dedicated_ready
     }
 }
 

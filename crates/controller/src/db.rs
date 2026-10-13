@@ -372,6 +372,8 @@ pub struct KubernetesClusterConfigRow {
     pub cilium_lb_ip_pools: String,
     /// JSON [`crate::kubernetes_local::LocalProvisioner`], empty when disabled.
     pub local_provisioner_json: String,
+    /// Control-plane nodes are schedulable workers.
+    pub schedule_on_control_plane: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -745,7 +747,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 55;
+pub const SCHEMA_VERSION: i32 = 56;
 
 const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
                     name TEXT PRIMARY KEY,
@@ -1918,6 +1920,21 @@ impl Database {
             if has_local == 0 {
                 conn.execute_batch(
                     "ALTER TABLE kubernetes_cluster_config ADD COLUMN local_provisioner_json TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+        }
+
+        // Masters can run pods. The worker count then includes control planes.
+        if version < 56 {
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
+            let has_schedule: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('kubernetes_cluster_config') WHERE name = 'schedule_on_control_plane'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_schedule == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE kubernetes_cluster_config ADD COLUMN schedule_on_control_plane INTEGER NOT NULL DEFAULT 0;",
                 )?;
             }
         }
@@ -6725,8 +6742,8 @@ impl Database {
             "INSERT INTO kubernetes_cluster_config (
                 cluster_name, ha_enabled, vip_address, vip_interface,
                 cilium_mode, cilium_mtu, cilium_tunnel, cilium_auto_direct_routes,
-                cilium_lb_ip_pools, local_provisioner_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                cilium_lb_ip_pools, local_provisioner_json, schedule_on_control_plane
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(cluster_name) DO UPDATE SET
                 ha_enabled=excluded.ha_enabled,
                 vip_address=excluded.vip_address,
@@ -6736,7 +6753,8 @@ impl Database {
                 cilium_tunnel=excluded.cilium_tunnel,
                 cilium_auto_direct_routes=excluded.cilium_auto_direct_routes,
                 cilium_lb_ip_pools=excluded.cilium_lb_ip_pools,
-                local_provisioner_json=excluded.local_provisioner_json",
+                local_provisioner_json=excluded.local_provisioner_json,
+                schedule_on_control_plane=excluded.schedule_on_control_plane",
             params![
                 row.cluster_name,
                 row.ha_enabled,
@@ -6747,7 +6765,8 @@ impl Database {
                 row.cilium_tunnel,
                 row.cilium_auto_direct_routes,
                 row.cilium_lb_ip_pools,
-                row.local_provisioner_json
+                row.local_provisioner_json,
+                row.schedule_on_control_plane
             ],
         )?;
         Ok(())
@@ -6761,7 +6780,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT cluster_name, ha_enabled, vip_address, vip_interface,
                     cilium_mode, cilium_mtu, cilium_tunnel, cilium_auto_direct_routes,
-                    cilium_lb_ip_pools, local_provisioner_json
+                    cilium_lb_ip_pools, local_provisioner_json, schedule_on_control_plane
              FROM kubernetes_cluster_config WHERE cluster_name=?1",
         )?;
         let mut rows = stmt.query_map(params![cluster_name], |r| {
@@ -6776,6 +6795,7 @@ impl Database {
                 cilium_auto_direct_routes: r.get(7)?,
                 cilium_lb_ip_pools: r.get(8)?,
                 local_provisioner_json: r.get(9)?,
+                schedule_on_control_plane: r.get(10)?,
             })
         })?;
         rows.next().transpose()
