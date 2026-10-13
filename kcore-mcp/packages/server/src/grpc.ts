@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { InputError } from "./names.js";
-import { resolveConnection, type ConnectionOptions, type ResolvedConnection } from "./connection.js";
+import { resolveConnection, resolveProvisioning, type ConnectionOptions, type ResolvedConnection } from "./connection.js";
 
 type GrpcClient = {
   close: () => void;
@@ -19,6 +19,7 @@ export const SERVICE_NAMES = [
   "node-storage",
   "node-info",
   "node-admin",
+  "provisioning",
 ] as const;
 
 export type ServiceName = (typeof SERVICE_NAMES)[number];
@@ -40,7 +41,7 @@ function services(): Loaded {
   if (loaded) return loaded;
   const dir = protoDir();
   const definition = protoLoader.loadSync(
-    [join(dir, "controller.proto"), join(dir, "node.proto")],
+    [join(dir, "controller.proto"), join(dir, "node.proto"), join(dir, "provisioning.proto")],
     {
       keepCase: false,
       longs: String,
@@ -60,6 +61,7 @@ function services(): Loaded {
         NodeInfo: grpc.ServiceClientConstructor;
         NodeAdmin: grpc.ServiceClientConstructor;
       };
+      provisioning: { Provisioning: grpc.ServiceClientConstructor };
     };
   };
   loaded = {
@@ -70,6 +72,7 @@ function services(): Loaded {
     "node-storage": pkg.kcore.node.NodeStorage,
     "node-info": pkg.kcore.node.NodeInfo,
     "node-admin": pkg.kcore.node.NodeAdmin,
+    provisioning: pkg.kcore.provisioning.Provisioning,
   };
   return loaded;
 }
@@ -117,6 +120,10 @@ export async function callApi(
   method: string,
   request: Record<string, unknown>,
 ): Promise<unknown> {
+  if (service === "provisioning") {
+    const conn = resolveProvisioning(options);
+    return callService(services().provisioning, conn.address, conn, method, request);
+  }
   const conn = resolveConnection(address ? { ...options, controller: address } : options);
   return callService(services()[service], conn.address, conn, method, request);
 }
