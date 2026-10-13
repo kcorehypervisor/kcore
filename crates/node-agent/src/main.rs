@@ -16,6 +16,7 @@ mod guest_ops;
 mod host_cpu;
 mod issue_screen;
 mod live_migrate;
+mod lvm_ops;
 mod nixgen_k8s;
 mod path_safety;
 mod pki;
@@ -197,9 +198,18 @@ async fn main() -> anyhow::Result<()> {
             ),
             limiter.interceptor(),
         );
+        let lvm_vg = if matches!(cfg.storage.backend, config::StorageBackendKind::Lvm) {
+            cfg.storage.lvm.as_ref().map(|lvm| lvm.vg_name.clone())
+        } else {
+            None
+        };
+        let mut storage_service = grpc::StorageService::new_with_storage(storage.clone());
+        if let Some(vg) = lvm_vg {
+            storage_service = storage_service.with_lvm_vg(vg);
+        }
         let storage_svc = InterceptedService::new(
             proto::node_storage_server::NodeStorageServer::with_interceptor(
-                grpc::StorageService::new_with_storage(storage.clone()),
+                storage_service,
                 pki::revocation::interceptor(revocation.clone()),
             ),
             limiter.interceptor(),

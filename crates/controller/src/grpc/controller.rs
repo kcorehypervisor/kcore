@@ -5641,6 +5641,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     storage_class: "ceph".into(),
                     size_bytes: vm.storage_size_bytes,
                     parameters: HashMap::new(),
+                    lv_name: String::new(),
                 })
                 .await
                 .map_err(|e| Status::internal(format!("creating RBD volume: {e}")))?;
@@ -10293,6 +10294,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     storage_class: "ceph".into(),
                     size_bytes: row.size_bytes,
                     parameters: HashMap::new(),
+                    lv_name: String::new(),
                 })
                 .await
                 .map_err(|e| Status::internal(format!("creating RBD volume: {e}")))?;

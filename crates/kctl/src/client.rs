@@ -320,6 +320,15 @@ pub async fn node_admin_client(
         .max_decoding_message_size(1024 * 1024 * 1024))
 }
 
+pub async fn node_storage_client(
+    info: &ConnectionInfo,
+) -> Result<node_proto::node_storage_client::NodeStorageClient<Channel>> {
+    let channel = connect(info).await?;
+    Ok(node_proto::node_storage_client::NodeStorageClient::new(
+        channel,
+    ))
+}
+
 pub async fn node_container_client(
     info: &ConnectionInfo,
 ) -> Result<node_proto::node_container_client::NodeContainerClient<Channel>> {

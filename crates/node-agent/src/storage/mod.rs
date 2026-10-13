@@ -68,6 +68,8 @@ pub struct CreateVolumeRequest {
     pub storage_class: String,
     pub size_bytes: i64,
     pub parameters: HashMap<String, String>,
+    /// Empty keeps `<lv_prefix><volume_id>`. Set to choose a name with no prefix.
+    pub lv_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -378,7 +380,9 @@ impl LvmAdapter {
 impl StorageAdapter for LvmAdapter {
     fn create_volume(&self, req: CreateVolumeRequest) -> Result<String, StorageError> {
         validate_volume_create_inputs(&req)?;
-        let lv_name = format!("{}{}", self.lv_prefix, sanitize_volume_name(&req.volume_id));
+        let lv_name =
+            crate::lvm_ops::logical_volume_name(&self.lv_prefix, &req.volume_id, &req.lv_name)
+                .map_err(from_lvm)?;
         run_cmd(
             "lvcreate",
             &[
@@ -395,33 +399,9 @@ impl StorageAdapter for LvmAdapter {
     }
 
     fn delete_volume(&self, backend_handle: &str) -> Result<(), StorageError> {
-        if backend_handle.trim().is_empty() {
-            return Err(StorageError::new(
-                ErrorKind::InvalidArgument,
-                "backend_handle is required",
-            ));
-        }
-        let expected_prefix = format!("/dev/{}/", self.vg_name);
-        if !backend_handle.starts_with(&expected_prefix) {
-            return Err(StorageError::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "backend_handle must be under {}, got {}",
-                    expected_prefix, backend_handle
-                ),
-            ));
-        }
-        let lv_name = &backend_handle[expected_prefix.len()..];
-        if !lv_name.starts_with(&self.lv_prefix) {
-            return Err(StorageError::new(
-                ErrorKind::InvalidArgument,
-                format!(
-                    "LV name must start with prefix '{}', got '{}'",
-                    self.lv_prefix, lv_name
-                ),
-            ));
-        }
-        run_cmd("lvremove", &["-f", backend_handle], ErrorKind::Internal)?;
+        let device = crate::lvm_ops::logical_volume_device(&self.vg_name, backend_handle)
+            .map_err(from_lvm)?;
+        run_cmd("lvremove", &["-f", &device], ErrorKind::Internal)?;
         Ok(())
     }
 
@@ -1058,6 +1038,15 @@ pub fn ceph_fence_volume(
         }
     }
     Ok(targets)
+}
+
+fn from_lvm(err: crate::lvm_ops::LvmOpError) -> StorageError {
+    let kind = match err.kind {
+        crate::lvm_ops::Kind::InvalidArgument => ErrorKind::InvalidArgument,
+        crate::lvm_ops::Kind::FailedPrecondition => ErrorKind::FailedPrecondition,
+        crate::lvm_ops::Kind::Internal => ErrorKind::Internal,
+    };
+    StorageError::new(kind, err.message)
 }
 
 fn validate_volume_create_inputs(req: &CreateVolumeRequest) -> Result<(), StorageError> {
@@ -1743,6 +1732,7 @@ mod tests {
                 storage_class: "filesystem".to_string(),
                 size_bytes: 1024 * 1024,
                 parameters: HashMap::new(),
+                lv_name: String::new(),
             })
             .expect("create volume");
         let meta = std::fs::metadata(&handle).expect("volume exists");
@@ -1785,6 +1775,7 @@ mod tests {
                 storage_class: "ceph".into(),
                 size_bytes: 1024,
                 parameters: HashMap::new(),
+                lv_name: String::new(),
             })
             .expect_err("empty volume id");
         assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
@@ -1794,6 +1785,7 @@ mod tests {
                 storage_class: "ceph".into(),
                 size_bytes: 0,
                 parameters: HashMap::new(),
+                lv_name: String::new(),
             })
             .expect_err("zero size");
         assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
@@ -1812,6 +1804,7 @@ mod tests {
                 storage_class: "ceph".into(),
                 size_bytes: 1024,
                 parameters: HashMap::new(),
+                lv_name: String::new(),
             })
             .expect_err("invalid before rbd");
         assert!(matches!(err.kind(), ErrorKind::InvalidArgument));

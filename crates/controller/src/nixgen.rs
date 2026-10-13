@@ -1663,7 +1663,7 @@ pub fn generate_kubernetes_config(
         advertise_address: node.ip_address.clone(),
         iface: "enp6s0".to_string(), // TODO: Get from database
         api_server_endpoint: format!("https://{}:6443", node.ip_address), // TODO: Use VIP if HA
-        initial_cluster: true, // Always true for static bootstrap
+        initial_cluster: true,       // Always true for static bootstrap
         etcd_initial_cluster,
         cni: "cilium".to_string(),
         cilium_mode: "native-routing".to_string(),
