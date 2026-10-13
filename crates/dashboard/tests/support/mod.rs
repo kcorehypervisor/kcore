@@ -1451,6 +1451,7 @@ fn sample_kubernetes_clusters() -> Vec<KubernetesCluster> {
                     vip_interface: "enp6s0".into(),
                     method: "keepalived".into(),
                 }),
+                local_provisioner: None,
             }),
             status: Some(KubernetesClusterStatus {
                 phase: "ready".into(),
