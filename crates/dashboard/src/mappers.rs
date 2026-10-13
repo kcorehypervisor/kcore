@@ -1,16 +1,18 @@
 //! gRPC proto → dashboard DTO (testable without the network).
 
+use crate::ceph_status::{self, capacity_dto, capacity_from_status_json, health_from_status_json};
 use crate::controller_client::controller_proto;
 use crate::dto::{
-    AccessControlEntryDto, AuditEventDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto,
-    DbmsRowDto, HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto,
-    KubernetesNodeDto, KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
-    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
-    NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto, ReplicationIncomingDto,
-    ReplicationOutgoingDto, ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto,
-    StorageOverviewDto, VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
+    AccessControlEntryDto, AuditEventDto, CephClusterDetailDto, CephClusterRowDto,
+    CephDeviceClassDto, CephMemberDto, CephPoolUsageDto, ComplianceDto, DbmsDetailDto, DbmsRowDto,
+    HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto, KubernetesNodeDto,
+    KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto,
+    NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto,
+    ObjectStoreRowDto, ReplicationConflictDto, ReplicationIncomingDto, ReplicationOutgoingDto,
+    ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto,
+    VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
 };
-use crate::format::{self, paginate_by_name, VM_PAGE_SIZE};
+use crate::format::{self, paginate_by_name};
 
 pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -> ComplianceDto {
     ComplianceDto {
@@ -63,7 +65,11 @@ pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -
     }
 }
 
-pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> VmsPageDto {
+pub fn vms_page_from_proto(
+    vms: Vec<controller_proto::VmInfo>,
+    page: u32,
+    page_size: usize,
+) -> VmsPageDto {
     let rows: Vec<VmRowDto> = vms
         .into_iter()
         .map(|v| VmRowDto {
@@ -77,7 +83,8 @@ pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> Vms
         })
         .collect();
     let page = page.max(1);
-    let pv = paginate_by_name(rows, |r| r.name.clone(), page, VM_PAGE_SIZE);
+    let page_size = format::normalize_page_size(page_size as u32);
+    let pv = paginate_by_name(rows, |r| r.name.clone(), page, page_size);
     VmsPageDto {
         total_pages: pv.total_pages(),
         has_prev: pv.has_prev(),
@@ -513,6 +520,139 @@ pub fn ceph_clusters_from_proto(
     rows
 }
 
+pub fn ceph_cluster_detail_from_proto(c: controller_proto::CephCluster) -> CephClusterDetailDto {
+    let spec = c.spec.unwrap_or_default();
+    let status = c.status.unwrap_or_default();
+    let created_at = c
+        .created_at
+        .as_ref()
+        .map(|t| format::format_unix_utc(t.seconds))
+        .unwrap_or_else(|| "—".to_string());
+    let updated_at = c
+        .updated_at
+        .as_ref()
+        .map(|t| format::format_unix_utc(t.seconds))
+        .unwrap_or_else(|| "—".to_string());
+
+    let mut members: Vec<CephMemberDto> = spec
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut devices = vec![n.osd_device.clone()];
+            for extra in &n.osd_devices {
+                if !extra.is_empty() && !devices.iter().any(|have| have == extra) {
+                    devices.push(extra.clone());
+                }
+            }
+            CephMemberDto {
+                node_id: n.node_id.clone(),
+                mon_addr: n.mon_addr.clone(),
+                cluster_addr: n.cluster_addr.clone(),
+                public_iface: n.public_iface.clone(),
+                cluster_iface: n.cluster_iface.clone(),
+                osd_devices: join_nonempty(devices),
+            }
+        })
+        .collect();
+    members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    let health = health_from_status_json(&status.ceph_status_json);
+    let mut capacity = capacity_from_status_json(&status.ceph_status_json);
+    let cluster_slices = vec![
+        ("used".to_string(), capacity.used_bytes),
+        ("available".to_string(), capacity.avail_bytes),
+    ];
+    let cluster_pie_svg = ceph_status::pie_svg(&cluster_slices, "Cluster capacity");
+    let class_pie_svg = ceph_status::pie_svg(&[], "Device class capacity");
+
+    if capacity.source.is_empty() {
+        capacity.source = "none".to_string();
+    }
+
+    CephClusterDetailDto {
+        name: c.name,
+        generation: c.generation,
+        fsid: spec.fsid,
+        phase: format::service_phase_label(status.phase).to_string(),
+        health_message: status.health_message,
+        public_network: spec.public_network,
+        cluster_network: spec.cluster_network,
+        size: spec.size,
+        min_size: spec.min_size,
+        encrypt_osds: spec.encrypt_osds,
+        force_wipe: spec.force_wipe,
+        created_at,
+        updated_at,
+        members,
+        health,
+        capacity,
+        cluster_pie_svg,
+        class_pie_svg,
+    }
+}
+
+/// Prefer live `ceph df` capacity when the controller returned it; keep pgmap fallback otherwise.
+pub fn merge_ceph_capacity(
+    fallback: crate::dto::CephCapacityDto,
+    live: controller_proto::GetCephClusterCapacityResponse,
+) -> crate::dto::CephCapacityDto {
+    if !live.ok {
+        let mut out = fallback;
+        if out.source.is_empty() || out.source == "none" {
+            out.source = "none".to_string();
+        }
+        if !live.message.is_empty() {
+            out.error = live.message;
+        }
+        return out;
+    }
+    let by_class = live
+        .by_class
+        .into_iter()
+        .map(|c| {
+            let used_percent = if c.total_bytes > 0 {
+                ((c.used_bytes as f64) * 100.0 / (c.total_bytes as f64)).round() as i32
+            } else {
+                0
+            };
+            CephDeviceClassDto {
+                device_class: c.device_class,
+                total_bytes: c.total_bytes,
+                used_bytes: c.used_bytes,
+                avail_bytes: c.avail_bytes,
+                total_human: format::bytes_human(c.total_bytes),
+                used_human: format::bytes_human(c.used_bytes),
+                avail_human: format::bytes_human(c.avail_bytes),
+                used_percent,
+            }
+        })
+        .collect::<Vec<_>>();
+    let pools = live
+        .pools
+        .into_iter()
+        .map(|p| CephPoolUsageDto {
+            name: p.name,
+            stored_bytes: p.stored_bytes,
+            stored_human: format::bytes_human(p.stored_bytes),
+            objects: p.objects,
+            percent_used_bp: p.percent_used_bp,
+            max_avail_bytes: p.max_avail_bytes,
+            max_avail_human: format::bytes_human(p.max_avail_bytes),
+        })
+        .collect();
+    let mut out = capacity_dto(
+        live.total_bytes,
+        live.used_bytes,
+        live.avail_bytes,
+        by_class,
+        pools,
+        "df",
+        "",
+    );
+    out.queried_node = live.queried_node;
+    out
+}
+
 pub fn shared_filesystems_from_proto(
     filesystems: Vec<controller_proto::SharedFilesystem>,
 ) -> Vec<SharedFilesystemRowDto> {
@@ -889,7 +1029,7 @@ mod tests {
                 storage_size_bytes: 0,
             },
         ];
-        let p = vms_page_from_proto(vms, 1);
+        let p = vms_page_from_proto(vms, 1, 10);
         assert_eq!(p.total, 2);
         assert_eq!(p.vms.len(), 2);
         assert_eq!(p.vms[0].name, "alpha");
@@ -930,6 +1070,96 @@ mod tests {
         assert_eq!(rows[1].vm, "web");
         assert!(rows[1].encrypted);
         assert!(rows[1].size.contains("10"));
+    }
+
+    #[test]
+    fn ceph_cluster_detail_maps_spec_and_status_json() {
+        let cluster = controller_proto::CephCluster {
+            name: "lab-san".into(),
+            generation: 3,
+            spec: Some(controller_proto::CephClusterSpec {
+                fsid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                public_network: "192.168.40.0/24".into(),
+                cluster_network: "192.168.47.0/24".into(),
+                size: 3,
+                min_size: 2,
+                encrypt_osds: true,
+                nodes: vec![controller_proto::CephClusterNodeSpec {
+                    node_id: "node-103".into(),
+                    mon_addr: "192.168.40.103:6789".into(),
+                    cluster_addr: "192.168.47.2".into(),
+                    public_iface: "enp6s0".into(),
+                    cluster_iface: "enp6s0d1".into(),
+                    osd_device: "/dev/sda".into(),
+                    osd_devices: vec!["/dev/sdb".into()],
+                }],
+                ..Default::default()
+            }),
+            status: Some(controller_proto::CephClusterStatus {
+                phase: controller_proto::CephClusterPhase::Healthy as i32,
+                health_message: "HEALTH_OK".into(),
+                ceph_status_json: r#"{
+                  "health":{"status":"HEALTH_OK","checks":{}},
+                  "quorum_names":["node-103"],
+                  "monmap":{"num_mons":1},
+                  "osdmap":{"num_osds":2,"num_up_osds":2,"num_in_osds":2},
+                  "pgmap":{
+                    "num_pgs":32,
+                    "bytes_total":1000,
+                    "bytes_used":250,
+                    "bytes_avail":750,
+                    "pgs_by_state":[{"state_name":"active+clean","count":32}]
+                  }
+                }"#
+                .into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let detail = ceph_cluster_detail_from_proto(cluster);
+        assert_eq!(detail.name, "lab-san");
+        assert_eq!(detail.size, 3);
+        assert_eq!(detail.min_size, 2);
+        assert_eq!(detail.members.len(), 1);
+        assert!(detail.members[0].osd_devices.contains("/dev/sda"));
+        assert!(detail.members[0].osd_devices.contains("/dev/sdb"));
+        assert_eq!(detail.health.osd_up, 2);
+        assert_eq!(detail.capacity.used_percent, 25);
+        assert_eq!(detail.capacity.source, "pgmap");
+        assert!(detail.cluster_pie_svg.contains("<path"));
+    }
+
+    #[test]
+    fn merge_ceph_capacity_prefers_live_df() {
+        let fallback = capacity_from_status_json("");
+        let live = controller_proto::GetCephClusterCapacityResponse {
+            ok: true,
+            queried_node: "node-103".into(),
+            total_bytes: 900,
+            used_bytes: 300,
+            avail_bytes: 600,
+            by_class: vec![controller_proto::CephDeviceClassCapacity {
+                device_class: "ssd".into(),
+                total_bytes: 900,
+                used_bytes: 300,
+                avail_bytes: 600,
+            }],
+            pools: vec![controller_proto::CephPoolCapacity {
+                name: "kcore-vms".into(),
+                stored_bytes: 10,
+                objects: 1,
+                percent_used_bp: 100,
+                max_avail_bytes: 200,
+            }],
+            ..Default::default()
+        };
+        let merged = merge_ceph_capacity(fallback, live);
+        assert_eq!(merged.source, "df");
+        assert_eq!(merged.queried_node, "node-103");
+        assert_eq!(merged.by_class.len(), 1);
+        assert_eq!(merged.by_class[0].device_class, "ssd");
+        assert_eq!(merged.pools[0].name, "kcore-vms");
+        assert_eq!(merged.used_percent, 33);
     }
 
     #[test]
