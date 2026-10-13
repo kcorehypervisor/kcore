@@ -13907,13 +13907,28 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
         }
 
+        let local = match Self::local_provisioner_of(&req.name, &spec) {
+            Ok(provisioner) => Some(provisioner),
+            Err(err) => {
+                blocking_issues.push(err.message().to_string());
+                None
+            }
+        };
+        let rendered_nix_preview = match local.as_ref().filter(|provisioner| provisioner.enabled) {
+            Some(provisioner) => format!(
+                "# Kubernetes configuration will be generated\n{}",
+                crate::kubernetes_local::manifests(provisioner)
+            ),
+            None => "# Kubernetes configuration will be generated".to_string(),
+        };
+
         Ok(Response::new(
             controller_proto::PlanKubernetesClusterResponse {
                 action: action.to_string(),
                 blocking_issues,
                 warnings,
                 node_plans,
-                rendered_nix_preview: "# Kubernetes configuration will be generated".to_string(),
+                rendered_nix_preview,
             },
         ))
     }
@@ -13923,6 +13938,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::CreateKubernetesClusterRequest>,
     ) -> Result<Response<controller_proto::CreateKubernetesClusterResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         if !req.confirm {
@@ -13949,8 +13965,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )));
         }
 
+        let provisioner = Self::local_provisioner_of(&req.name, &spec)?;
+
         // Store cluster in database
-        let cluster_row = crate::db::KubernetesClusterRow {
+        let mut cluster_row = crate::db::KubernetesClusterRow {
             name: req.name.clone(),
             generation: 1,
             cluster_cidr: spec.cluster_cidr.clone(),
@@ -13970,32 +13988,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .upsert_kubernetes_cluster(&cluster_row)
             .map_err(internal_db)?;
 
-        // Store cluster config
-        let ha_config = spec.high_availability.as_ref();
-        let cilium_config = spec.cilium_config.as_ref();
-
-        let config_row = crate::db::KubernetesClusterConfigRow {
-            cluster_name: req.name.clone(),
-            ha_enabled: ha_config.map(|c| c.enabled).unwrap_or(false),
-            vip_address: ha_config.map(|c| c.vip_address.clone()).unwrap_or_default(),
-            vip_interface: ha_config
-                .map(|c| c.vip_interface.clone())
-                .unwrap_or_default(),
-            cilium_mode: cilium_config
-                .map(|c| c.mode.clone())
-                .unwrap_or_else(|| "native-routing".to_string()),
-            cilium_mtu: cilium_config.map(|c| c.mtu).unwrap_or(1500),
-            cilium_tunnel: cilium_config
-                .map(|c| c.tunnel.clone())
-                .unwrap_or_else(|| "disabled".to_string()),
-            cilium_auto_direct_routes: cilium_config
-                .map(|c| c.auto_direct_node_routes)
-                .unwrap_or(true),
-            cilium_lb_ip_pools: cilium_config
-                .map(|c| c.load_balancer_ip_pools.join(","))
-                .unwrap_or_default(),
-        };
-
+        let config_row = Self::kubernetes_config_row(&req.name, &spec, &provisioner);
         self.db
             .upsert_kubernetes_cluster_config(&config_row)
             .map_err(internal_db)?;
@@ -14033,6 +14026,22 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .map_err(internal_db)?;
         }
 
+        if let Err(err) = self
+            .reconcile_local_volumes(&actor, &req.name, &provisioner)
+            .await
+        {
+            warn!(
+                cluster = %req.name,
+                error = %err,
+                "local volumes were not reconciled"
+            );
+            cluster_row.phase = "degraded".to_string();
+            cluster_row.status_message = err.message().to_string();
+            self.db
+                .upsert_kubernetes_cluster(&cluster_row)
+                .map_err(internal_db)?;
+        }
+
         info!(
             cluster = %req.name,
             "kubernetes cluster created; the orchestrator renders node nix with PKI"
@@ -14051,6 +14060,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::UpdateKubernetesClusterRequest>,
     ) -> Result<Response<controller_proto::UpdateKubernetesClusterResponse>, Status> {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
 
         if !req.confirm {
@@ -14066,9 +14076,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        let provisioner = Self::local_provisioner_of(&req.name, &spec)?;
 
         // Update cluster
-        let cluster_row = crate::db::KubernetesClusterRow {
+        let mut cluster_row = crate::db::KubernetesClusterRow {
             name: req.name.clone(),
             generation: existing.generation + 1,
             cluster_cidr: spec.cluster_cidr.clone(),
@@ -14087,6 +14098,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.db
             .upsert_kubernetes_cluster(&cluster_row)
             .map_err(internal_db)?;
+        let config_row = Self::kubernetes_config_row(&req.name, &spec, &provisioner);
+        self.db
+            .upsert_kubernetes_cluster_config(&config_row)
+            .map_err(internal_db)?;
+        if let Err(err) = self
+            .reconcile_local_volumes(&actor, &req.name, &provisioner)
+            .await
+        {
+            warn!(
+                cluster = %req.name,
+                error = %err,
+                "local volumes were not reconciled"
+            );
+            cluster_row.phase = "degraded".to_string();
+            cluster_row.status_message = err.message().to_string();
+            self.db
+                .upsert_kubernetes_cluster(&cluster_row)
+                .map_err(internal_db)?;
+        }
 
         let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
         Ok(Response::new(
@@ -14304,6 +14334,314 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
 // Helper methods for Kubernetes cluster management
 impl ControllerService {
+    fn kubernetes_members(
+        spec: &controller_proto::KubernetesClusterSpec,
+    ) -> std::collections::BTreeSet<String> {
+        spec.control_plane_nodes
+            .iter()
+            .chain(spec.worker_nodes.iter())
+            .map(|node| node.node_id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    fn local_provisioner_of(
+        cluster: &str,
+        spec: &controller_proto::KubernetesClusterSpec,
+    ) -> Result<crate::kubernetes_local::LocalProvisioner, Status> {
+        let Some(declared) = spec.local_provisioner.as_ref() else {
+            return Ok(crate::kubernetes_local::LocalProvisioner::disabled());
+        };
+        let volumes: Vec<crate::kubernetes_local::VolumeDecl<'_>> = declared
+            .volumes
+            .iter()
+            .map(|volume| crate::kubernetes_local::VolumeDecl {
+                name: volume.name.as_str(),
+                node_id: volume.node_id.as_str(),
+                storage_class: volume.storage_class.as_str(),
+                size_bytes: volume.size_bytes,
+                fs_type: volume.fs_type.as_str(),
+                mount_path: volume.mount_path.as_str(),
+            })
+            .collect();
+        crate::kubernetes_local::normalize(
+            cluster,
+            &Self::kubernetes_members(spec),
+            declared.enabled,
+            &declared.storage_class_name,
+            &volumes,
+        )
+        .map_err(Status::invalid_argument)
+    }
+
+    fn kubernetes_config_row(
+        name: &str,
+        spec: &controller_proto::KubernetesClusterSpec,
+        provisioner: &crate::kubernetes_local::LocalProvisioner,
+    ) -> crate::db::KubernetesClusterConfigRow {
+        let ha_config = spec.high_availability.as_ref();
+        let cilium_config = spec.cilium_config.as_ref();
+        crate::db::KubernetesClusterConfigRow {
+            cluster_name: name.to_string(),
+            ha_enabled: ha_config.map(|c| c.enabled).unwrap_or(false),
+            vip_address: ha_config.map(|c| c.vip_address.clone()).unwrap_or_default(),
+            vip_interface: ha_config
+                .map(|c| c.vip_interface.clone())
+                .unwrap_or_default(),
+            cilium_mode: cilium_config
+                .map(|c| c.mode.clone())
+                .unwrap_or_else(|| "native-routing".to_string()),
+            cilium_mtu: cilium_config.map(|c| c.mtu).unwrap_or(1500),
+            cilium_tunnel: cilium_config
+                .map(|c| c.tunnel.clone())
+                .unwrap_or_else(|| "disabled".to_string()),
+            cilium_auto_direct_routes: cilium_config
+                .map(|c| c.auto_direct_node_routes)
+                .unwrap_or(true),
+            cilium_lb_ip_pools: cilium_config
+                .map(|c| c.load_balancer_ip_pools.join(","))
+                .unwrap_or_default(),
+            local_provisioner_json: crate::kubernetes_local::encode(provisioner),
+        }
+    }
+
+    async fn reconcile_local_volumes(
+        &self,
+        actor: &str,
+        cluster: &str,
+        provisioner: &crate::kubernetes_local::LocalProvisioner,
+    ) -> Result<(), Status> {
+        if !provisioner.enabled {
+            return Ok(());
+        }
+        for volume in &provisioner.volumes {
+            self.reconcile_one_local_volume(actor, cluster, volume)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_one_local_volume(
+        &self,
+        actor: &str,
+        cluster: &str,
+        volume: &crate::kubernetes_local::LocalVolume,
+    ) -> Result<(), Status> {
+        let vol_name = crate::kubernetes_local::controller_volume_name(cluster, &volume.name);
+        let node = self
+            .db
+            .get_node(&volume.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", volume.node_id)))?;
+        if node.storage_backend != volume.storage_class {
+            return Err(Status::failed_precondition(format!(
+                "node {} storage backend is {}, not {}",
+                node.id, node.storage_backend, volume.storage_class
+            )));
+        }
+        let existing = self
+            .db
+            .get_volume_by_name(&vol_name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut row = if let Some(existing) = existing {
+            if existing.host_node_id != node.id || existing.storage_class != volume.storage_class {
+                return Err(Status::failed_precondition(format!(
+                    "volume {vol_name} already belongs to {}/{}",
+                    existing.host_node_id, existing.storage_class
+                )));
+            }
+            if volume.size_bytes < existing.size_bytes {
+                return Err(Status::invalid_argument(format!(
+                    "volume {vol_name} is {} bytes; shrinking it is not part of a cluster update",
+                    existing.size_bytes
+                )));
+            }
+            existing
+        } else {
+            self.create_or_adopt_host_volume(actor, &vol_name, &volume.name, &node, volume)
+                .await?
+        };
+        if volume.size_bytes > row.size_bytes {
+            let device = crate::host_volume::device_path(&row.storage_class, &row.pool, &row.image)
+                .map_err(Status::failed_precondition)?;
+            let mut storage = self.connect_node_storage(&node).await?;
+            let resized = storage
+                .resize_volume(node_proto::ResizeVolumeRequest {
+                    backend_handle: device,
+                    size_bytes: volume.size_bytes,
+                    allow_shrink: false,
+                })
+                .await
+                .map_err(|e| Status::internal(format!("resizing {vol_name}: {e}")))?
+                .into_inner();
+            row.size_bytes = if resized.size_bytes > 0 {
+                resized.size_bytes
+            } else {
+                volume.size_bytes
+            };
+            row.generation += 1;
+            self.db
+                .upsert_volume(&row)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        if row.fs_type.is_empty() {
+            let device = crate::host_volume::device_path(&row.storage_class, &row.pool, &row.image)
+                .map_err(Status::failed_precondition)?;
+            let mut storage = self.connect_node_storage(&node).await?;
+            match storage
+                .format_volume(node_proto::FormatVolumeRequest {
+                    backend_handle: device,
+                    fs_type: volume.fs_type.clone(),
+                    force: false,
+                })
+                .await
+            {
+                Ok(_) => {
+                    row.fs_type = volume.fs_type.clone();
+                    row.generation += 1;
+                    self.db
+                        .upsert_volume(&row)
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+                Err(e) if e.message().contains("already has a") => {
+                    row.fs_type = volume.fs_type.clone();
+                    row.generation += 1;
+                    self.db
+                        .upsert_volume(&row)
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!("formatting {vol_name}: {e}")));
+                }
+            }
+        } else if row.fs_type != volume.fs_type {
+            return Err(Status::failed_precondition(format!(
+                "volume {vol_name} is {}, not {}",
+                row.fs_type, volume.fs_type
+            )));
+        }
+        if row.mount_point.is_empty() {
+            let device = crate::host_volume::device_path(&row.storage_class, &row.pool, &row.image)
+                .map_err(Status::failed_precondition)?;
+            let mut storage = self.connect_node_storage(&node).await?;
+            let mounted = storage
+                .mount_volume(node_proto::MountVolumeRequest {
+                    backend_handle: device,
+                    mount_point: volume.mount_path.clone(),
+                    fs_type: volume.fs_type.clone(),
+                    persistent: true,
+                })
+                .await
+                .map_err(|e| Status::internal(format!("mounting {vol_name}: {e}")))?
+                .into_inner();
+            row.mount_point = if mounted.mount_point.is_empty() {
+                volume.mount_path.clone()
+            } else {
+                mounted.mount_point
+            };
+            row.generation += 1;
+            self.db
+                .upsert_volume(&row)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.log_replication_event(
+                actor,
+                Some("volume.update"),
+                EVT_VOLUME_UPDATE,
+                &format!("volume/{vol_name}"),
+                self.host_volume_event(&row),
+            );
+        } else if row.mount_point != volume.mount_path {
+            return Err(Status::failed_precondition(format!(
+                "volume {vol_name} is mounted at {}, not {}",
+                row.mount_point, volume.mount_path
+            )));
+        }
+        Ok(())
+    }
+
+    async fn create_or_adopt_host_volume(
+        &self,
+        actor: &str,
+        vol_name: &str,
+        lv_name: &str,
+        node: &crate::db::NodeRow,
+        volume: &crate::kubernetes_local::LocalVolume,
+    ) -> Result<crate::db::VolumeRow, Status> {
+        let mut storage = self.connect_node_storage(node).await?;
+        let created = storage
+            .create_volume(node_proto::CreateVolumeRequest {
+                volume_id: vol_name.to_string(),
+                storage_class: volume.storage_class.clone(),
+                size_bytes: volume.size_bytes,
+                parameters: HashMap::new(),
+                lv_name: lv_name.to_string(),
+            })
+            .await;
+        let handle = match created {
+            Ok(response) => response.into_inner().backend_handle,
+            Err(e) if volume.storage_class == "lvm" && e.to_string().contains("already exists") => {
+                self.adopt_lvm_handle(node, lv_name).await?
+            }
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "creating {} volume {lv_name} on {}: {e}",
+                    volume.storage_class, node.id
+                )));
+            }
+        };
+        let (pool, image) =
+            crate::host_volume::split_backend_handle(&volume.storage_class, &handle)
+                .map_err(Status::internal)?;
+        let mut row = crate::db::VolumeRow::new_data(vol_name, volume.size_bytes);
+        row.storage_class = volume.storage_class.clone();
+        row.host_node_id = node.id.clone();
+        row.pool = pool;
+        row.image = image;
+        self.db
+            .upsert_volume(&row)
+            .map_err(|e| Status::internal(format!("storing volume: {e}")))?;
+        self.log_replication_event(
+            actor,
+            Some("volume.create"),
+            EVT_VOLUME_CREATE,
+            &format!("volume/{vol_name}"),
+            self.host_volume_event(&row),
+        );
+        Ok(row)
+    }
+
+    async fn adopt_lvm_handle(
+        &self,
+        node: &crate::db::NodeRow,
+        lv_name: &str,
+    ) -> Result<String, Status> {
+        if self.clients.get_admin(&node.address).is_none() {
+            self.clients
+                .connect(&node.address)
+                .await
+                .map_err(|e| Status::unavailable(format!("connecting to {}: {e}", node.id)))?;
+        }
+        let mut admin = self.clients.get_admin(&node.address).ok_or_else(|| {
+            Status::unavailable(format!("admin client unavailable for {}", node.id))
+        })?;
+        let info = admin
+            .get_lvm_info(node_proto::GetLvmInfoRequest {})
+            .await
+            .map_err(|e| Status::internal(format!("reading LVM on {}: {e}", node.id)))?
+            .into_inner();
+        info.logical_volumes
+            .into_iter()
+            .find(|lv| lv.name == lv_name)
+            .map(|lv| lv.path)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                Status::already_exists(format!(
+                    "logical volume {lv_name} already exists on {} but was not found in LVM inventory",
+                    node.id
+                ))
+            })
+    }
+
     fn build_kubernetes_cluster_proto(
         &self,
         name: &str,
@@ -14364,6 +14702,28 @@ impl ControllerService {
                 vip_interface: c.vip_interface.clone(),
                 method: "keepalived".to_string(),
             });
+        let local_provisioner = config
+            .as_ref()
+            .map(|c| crate::kubernetes_local::decode(&c.local_provisioner_json))
+            .transpose()
+            .map_err(Status::internal)?
+            .filter(|provisioner| provisioner.enabled)
+            .map(|provisioner| controller_proto::KubernetesLocalProvisioner {
+                enabled: true,
+                storage_class_name: provisioner.storage_class_name,
+                volumes: provisioner
+                    .volumes
+                    .into_iter()
+                    .map(|volume| controller_proto::KubernetesHostVolume {
+                        name: volume.name,
+                        node_id: volume.node_id,
+                        storage_class: volume.storage_class,
+                        size_bytes: volume.size_bytes,
+                        fs_type: volume.fs_type,
+                        mount_path: volume.mount_path,
+                    })
+                    .collect(),
+            });
 
         Ok(controller_proto::KubernetesCluster {
             name: row.name.clone(),
@@ -14378,6 +14738,7 @@ impl ControllerService {
                 control_plane_nodes,
                 worker_nodes,
                 high_availability: ha_config,
+                local_provisioner,
             }),
             status: Some(controller_proto::KubernetesClusterStatus {
                 phase: row.phase.clone(),

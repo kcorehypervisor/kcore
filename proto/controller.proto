@@ -2561,6 +2561,24 @@ message HighAvailabilityConfig {
   string method = 4;                // "keepalived" (kcore-managed)
 }
 
+// One LVM logical volume or ZFS zvol that the local-path provisioner uses.
+message KubernetesHostVolume {
+  string name = 1;            // LV or zvol name on the node
+  string node_id = 2;
+  string storage_class = 3;   // "lvm" or "zfs"
+  int64 size_bytes = 4;
+  string fs_type = 5;         // "ext4" or "xfs"; empty means ext4
+  string mount_path = 6;      // empty means /mnt/kcore/<cluster>/<name>
+}
+
+// Rancher local-path provisioner. PersistentVolumeClaims land as directories
+// on the declared host volumes.
+message KubernetesLocalProvisioner {
+  bool enabled = 1;
+  string storage_class_name = 2; // empty means "local-path"
+  repeated KubernetesHostVolume volumes = 3;
+}
+
 message KubernetesClusterSpec {
   string cluster_cidr = 1;
   string service_cidr = 2;
@@ -2571,6 +2589,7 @@ message KubernetesClusterSpec {
   repeated KubernetesNodeSpec control_plane_nodes = 7;
   repeated KubernetesNodeSpec worker_nodes = 8;
   HighAvailabilityConfig high_availability = 9;
+  KubernetesLocalProvisioner local_provisioner = 10;
 }
 
 message KubernetesClusterStatus {

@@ -1592,6 +1592,7 @@ mod tests {
                     vip_interface: "enp6s0".into(),
                     method: "keepalived".into(),
                 }),
+                local_provisioner: None,
             }),
             status: Some(controller_proto::KubernetesClusterStatus {
                 phase: "ready".into(),
