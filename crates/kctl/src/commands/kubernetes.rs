@@ -37,6 +37,11 @@ struct ManifestSpec {
     worker_nodes: Vec<ManifestNode>,
     #[serde(default)]
     high_availability: ManifestHA,
+    #[serde(default)]
+    local_provisioner: ManifestLocalProvisioner,
+    /// Masters accept pods. Dedicated workerNodes may be empty.
+    #[serde(default)]
+    schedule_on_control_plane: bool,
 }
 
 fn default_cluster_dns() -> String {
@@ -104,10 +109,48 @@ struct ManifestHA {
     vip_interface: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ManifestLocalProvisioner {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    storage_class_name: String,
+    /// "shared" (directories on one formatted volume) or "lvm" (TopoLVM thin pool).
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    volumes: Vec<ManifestHostVolume>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestHostVolume {
+    name: String,
+    node_id: String,
+    #[serde(default)]
+    storage_class: String,
+    #[serde(default)]
+    size_bytes: i64,
+    #[serde(default)]
+    fs_type: String,
+    #[serde(default)]
+    mount_path: String,
+    /// "filesystem" or "pool". Empty follows the provisioner mode.
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    volume_group: String,
+}
+
 fn parse_manifest(file: &str) -> Result<KubernetesClusterManifest> {
     let data = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    parse_manifest_str(&data).with_context(|| format!("parsing YAML in {file}"))
+}
+
+fn parse_manifest_str(data: &str) -> Result<KubernetesClusterManifest> {
     let manifest: KubernetesClusterManifest =
-        serde_yaml::from_str(&data).with_context(|| format!("parsing YAML in {file}"))?;
+        serde_yaml::from_str(data).context("parsing KubernetesCluster YAML")?;
     let kind = manifest.kind.trim().to_ascii_lowercase();
     if kind != "kubernetescluster" && kind != "kubernetes-cluster" && kind != "kubernetes_cluster" {
         bail!("expected kind: KubernetesCluster, got {}", manifest.kind);
@@ -130,6 +173,31 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
             vip_address: spec.high_availability.vip_address.clone(),
             vip_interface: spec.high_availability.vip_interface.clone(),
             method: "keepalived".to_string(),
+        })
+    } else {
+        None
+    };
+
+    let local = &spec.local_provisioner;
+    let local_provisioner = if local.enabled || !local.volumes.is_empty() {
+        Some(controller_proto::KubernetesLocalProvisioner {
+            enabled: local.enabled,
+            storage_class_name: local.storage_class_name.clone(),
+            mode: local.mode.clone(),
+            volumes: local
+                .volumes
+                .iter()
+                .map(|volume| controller_proto::KubernetesHostVolume {
+                    name: volume.name.clone(),
+                    node_id: volume.node_id.clone(),
+                    storage_class: volume.storage_class.clone(),
+                    size_bytes: volume.size_bytes,
+                    fs_type: volume.fs_type.clone(),
+                    mount_path: volume.mount_path.clone(),
+                    role: volume.role.clone(),
+                    volume_group: volume.volume_group.clone(),
+                })
+                .collect(),
         })
     } else {
         None
@@ -167,6 +235,17 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
             })
             .collect(),
         high_availability: ha_config,
+        local_provisioner,
+        schedule_on_control_plane: spec.schedule_on_control_plane,
+    }
+}
+
+fn worker_slot_count(spec: &controller_proto::KubernetesClusterSpec) -> i32 {
+    let dedicated = spec.worker_nodes.len() as i32;
+    if spec.schedule_on_control_plane {
+        dedicated + spec.control_plane_nodes.len() as i32
+    } else {
+        dedicated
     }
 }
 
@@ -222,6 +301,10 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
         }
     }
 
+    if plan.rendered_nix_preview.contains("kind: StorageClass") {
+        println!("\nLocal-path manifest:\n{}", plan.rendered_nix_preview);
+    }
+
     println!("\n📝 Proceed? (y/n)");
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
@@ -230,19 +313,35 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Create
-    let result = client
-        .create_kubernetes_cluster(controller_proto::CreateKubernetesClusterRequest {
-            name: manifest.metadata.name.clone(),
-            spec: Some(to_proto_spec(&manifest.spec)),
-            confirm: true,
-        })
-        .await
-        .context("create_kubernetes_cluster rpc")?
-        .into_inner();
+    let spec = Some(to_proto_spec(&manifest.spec));
+    let updating = plan.action == "update";
+    let result = if updating {
+        client
+            .update_kubernetes_cluster(controller_proto::UpdateKubernetesClusterRequest {
+                name: manifest.metadata.name.clone(),
+                spec,
+                confirm: true,
+            })
+            .await
+            .context("update_kubernetes_cluster rpc")?
+            .into_inner()
+            .cluster
+    } else {
+        client
+            .create_kubernetes_cluster(controller_proto::CreateKubernetesClusterRequest {
+                name: manifest.metadata.name.clone(),
+                spec,
+                confirm: true,
+            })
+            .await
+            .context("create_kubernetes_cluster rpc")?
+            .into_inner()
+            .cluster
+    };
 
-    if let Some(cluster) = result.cluster {
-        println!("\n✅ Kubernetes cluster created: {}", cluster.name);
+    if let Some(cluster) = result {
+        let verb = if updating { "updated" } else { "created" };
+        println!("\n✅ Kubernetes cluster {verb}: {}", cluster.name);
         if let Some(status) = cluster.status {
             println!("   Phase: {}", status.phase);
             println!("   Message: {}", status.message);
@@ -303,6 +402,44 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
                     );
                 }
             }
+
+            if spec.schedule_on_control_plane {
+                println!("\nScheduling: control-plane nodes accept workloads");
+            }
+
+            if let Some(local) = spec.local_provisioner.filter(|local| local.enabled) {
+                println!("\nLocal provisioner:");
+                let mode = if local.mode.is_empty() {
+                    "shared"
+                } else {
+                    local.mode.as_str()
+                };
+                println!("  Mode: {mode}");
+                println!("  StorageClass: {}", local.storage_class_name);
+                for volume in &local.volumes {
+                    if volume.role == "pool" {
+                        println!(
+                            "  - thin pool {} on {} ({}/{}, {} bytes, claims formatted {})",
+                            volume.name,
+                            volume.node_id,
+                            volume.volume_group,
+                            volume.name,
+                            volume.size_bytes,
+                            volume.fs_type
+                        );
+                    } else {
+                        println!(
+                            "  - {} on {} ({} {} bytes, {} at {})",
+                            volume.name,
+                            volume.node_id,
+                            volume.storage_class,
+                            volume.size_bytes,
+                            volume.fs_type,
+                            volume.mount_path
+                        );
+                    }
+                }
+            }
         }
 
         if let Some(status) = cluster.status {
@@ -358,11 +495,7 @@ pub async fn list(info: &ConnectionInfo) -> Result<()> {
             .as_ref()
             .map(|s| s.control_plane_nodes.len() as i32)
             .unwrap_or(0);
-        let worker_total = cluster
-            .spec
-            .as_ref()
-            .map(|s| s.worker_nodes.len() as i32)
-            .unwrap_or(0);
+        let worker_total = cluster.spec.as_ref().map(worker_slot_count).unwrap_or(0);
 
         println!(
             "{:<20} {:<15} {:<10} {}/{:<5} {}/{}",
@@ -518,4 +651,98 @@ pub async fn scale(
 
     println!("✅ Kubernetes cluster '{}' scaled", name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yaml_declares_local_lvm_volumes() {
+        let manifest = parse_manifest_str(
+            r#"
+kind: KubernetesCluster
+metadata:
+  name: lab
+spec:
+  clusterCidr: 10.244.0.0/16
+  serviceCidr: 10.96.0.0/12
+  apiServerEndpoint: 192.168.40.220:6443
+  controlPlaneNodes:
+    - nodeId: node-107
+      advertiseAddress: 192.168.40.107
+  scheduleOnControlPlane: true
+  localProvisioner:
+    enabled: true
+    storageClassName: local-path
+    volumes:
+      - name: kcore-kdata
+        nodeId: node-105
+        storageClass: lvm
+        sizeBytes: 53687091200
+"#,
+        )
+        .unwrap();
+        let spec = to_proto_spec(&manifest.spec);
+        assert!(spec.schedule_on_control_plane);
+        assert_eq!(worker_slot_count(&spec), 1);
+        let local = spec.local_provisioner.expect("local provisioner");
+        assert!(local.enabled);
+        assert_eq!(local.storage_class_name, "local-path");
+        assert_eq!(local.volumes.len(), 1);
+        assert_eq!(local.volumes[0].name, "kcore-kdata");
+        assert_eq!(local.volumes[0].node_id, "node-105");
+        assert_eq!(local.volumes[0].storage_class, "lvm");
+        assert_eq!(local.volumes[0].size_bytes, 53_687_091_200);
+        assert!(local.mode.is_empty());
+
+        let lvm = parse_manifest_str(
+            r#"
+kind: KubernetesCluster
+metadata:
+  name: lab
+spec:
+  clusterCidr: 10.245.0.0/16
+  serviceCidr: 10.112.0.0/12
+  apiServerEndpoint: 192.168.40.201:7443
+  controlPlaneNodes:
+    - nodeId: node-105
+      advertiseAddress: 192.168.40.105
+  localProvisioner:
+    enabled: true
+    mode: lvm
+    storageClassName: kcore-lvm
+    volumes:
+      - name: kcore-kdata
+        nodeId: node-105
+        storageClass: lvm
+        sizeBytes: 53687091200
+        role: pool
+        volumeGroup: vg_kcore
+"#,
+        )
+        .unwrap();
+        let lvm_spec = to_proto_spec(&lvm.spec);
+        let lvm_local = lvm_spec.local_provisioner.expect("lvm provisioner");
+        assert_eq!(lvm_local.mode, "lvm");
+        assert_eq!(lvm_local.volumes[0].role, "pool");
+        assert_eq!(lvm_local.volumes[0].volume_group, "vg_kcore");
+
+        let plain = parse_manifest_str(
+            r#"
+kind: KubernetesCluster
+metadata:
+  name: lab
+spec:
+  clusterCidr: 10.244.0.0/16
+  serviceCidr: 10.96.0.0/12
+  apiServerEndpoint: 192.168.40.220:6443
+  controlPlaneNodes:
+    - nodeId: node-107
+      advertiseAddress: 192.168.40.107
+"#,
+        )
+        .unwrap();
+        assert!(to_proto_spec(&plain.spec).local_provisioner.is_none());
+    }
 }

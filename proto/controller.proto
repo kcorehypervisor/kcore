@@ -2561,6 +2561,35 @@ message HighAvailabilityConfig {
   string method = 4;                // "keepalived" (kcore-managed)
 }
 
+// One LVM logical volume or ZFS zvol that the local-path provisioner uses.
+message KubernetesHostVolume {
+  string name = 1;            // LV or zvol name on the node
+  string node_id = 2;
+  string storage_class = 3;   // "lvm" or "zfs"
+  int64 size_bytes = 4;
+  string fs_type = 5;         // "ext4" or "xfs"; empty means ext4
+  string mount_path = 6;      // empty means /mnt/kcore/<cluster>/<name>
+  // "filesystem" (default): format and mount this volume. Many
+  // PersistentVolumeClaims are directories on that one filesystem.
+  // "pool": an LVM thin pool of size_bytes. Each claim is its own thin
+  // logical volume, formatted with fs_type. Many claims share the pool.
+  string role = 7;
+  // Volume group that holds a pool. Required when role is "pool".
+  string volume_group = 8;
+}
+
+// Host storage for PersistentVolumeClaims.
+// mode "shared" (default) is the Rancher local-path provisioner: claims are
+// directories on a formatted volume.
+// mode "lvm" is a TopoLVM device class: claims are thin logical volumes in
+// the declared pool, each formatted with the volume fs_type.
+message KubernetesLocalProvisioner {
+  bool enabled = 1;
+  string storage_class_name = 2; // empty means "local-path"
+  repeated KubernetesHostVolume volumes = 3;
+  string mode = 4; // "shared" or "lvm"; empty means shared
+}
+
 message KubernetesClusterSpec {
   string cluster_cidr = 1;
   string service_cidr = 2;
@@ -2571,6 +2600,10 @@ message KubernetesClusterSpec {
   repeated KubernetesNodeSpec control_plane_nodes = 7;
   repeated KubernetesNodeSpec worker_nodes = 8;
   HighAvailabilityConfig high_availability = 9;
+  KubernetesLocalProvisioner local_provisioner = 10;
+  // Control-plane nodes also accept pods. A cluster can list no separate
+  // worker nodes and still schedule workloads on the masters.
+  bool schedule_on_control_plane = 11;
 }
 
 message KubernetesClusterStatus {

@@ -33,6 +33,29 @@ let
     else
       builtins.elemAt match 0;
 
+  # Network address of the VM bridge. Masquerade must match only this
+  # subnet: a rule on the upstream NIC also matches host traffic, and
+  # conntrack then rewrites keepalived (protocol 112) to the VM gateway.
+  pow2 = n: if n <= 0 then 1 else 2 * pow2 (n - 1);
+  internalCidr =
+    netCfg:
+    let
+      octets = map lib.toInt (lib.splitString "." netCfg.gatewayIP);
+      ipInt =
+        (builtins.elemAt octets 0) * 16777216
+        + (builtins.elemAt octets 1) * 65536
+        + (builtins.elemAt octets 2) * 256
+        + (builtins.elemAt octets 3);
+      hostBits = 32 - lib.toInt (netmaskToCidr netCfg.internalNetmask);
+      block = pow2 hostBits;
+      network = ipInt / block * block;
+      a = network / 16777216;
+      b = network / 65536 - a * 256;
+      c = network / 256 - a * 65536 - b * 256;
+      d = network - a * 16777216 - b * 65536 - c * 256;
+    in
+    "${toString a}.${toString b}.${toString c}.${toString d}/${toString (32 - hostBits)}";
+
   netmaskToCidr =
     mask:
     {
@@ -239,7 +262,7 @@ let
       rulesFor = chain: map (e: e.rule) (lib.filter (e: e.chain == chain) entries);
     in
     {
-      postrouting = [ "oifname \"${upstream}\" masquerade" ];
+      postrouting = [ "ip saddr ${internalCidr netCfg} oifname \"${upstream}\" masquerade" ];
       prerouting = rulesFor "prerouting";
       forward = rulesFor "forward";
     };
@@ -282,7 +305,7 @@ let
             table ip kcore-${netName} {
               chain postrouting {
                 type nat hook postrouting priority srcnat; policy accept;
-                oifname "${cfg.gatewayInterface}" masquerade
+                ip saddr ${internalCidr netCfg} oifname "${cfg.gatewayInterface}" masquerade
               }
             }
           ''

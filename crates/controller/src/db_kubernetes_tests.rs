@@ -226,6 +226,8 @@ mod kubernetes_cluster_tests {
             cilium_tunnel: "disabled".to_string(),
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: "192.168.40.220/29".to_string(),
+            local_provisioner_json: String::new(),
+            schedule_on_control_plane: false,
         };
 
         db.upsert_kubernetes_cluster_config(&config_row).unwrap();
@@ -239,6 +241,28 @@ mod kubernetes_cluster_tests {
         assert_eq!(config.cilium_mode, "native-routing");
         assert_eq!(config.cilium_mtu, 1500);
         assert!(config.cilium_auto_direct_routes);
+        assert!(config.local_provisioner_json.is_empty());
+
+        let stored = r#"{"enabled":true,"storageClassName":"local-path","volumes":[]}"#;
+        let mut with_local = config_row;
+        with_local.local_provisioner_json = stored.to_string();
+        db.upsert_kubernetes_cluster_config(&with_local).unwrap();
+        let config = db
+            .get_kubernetes_cluster_config("test-cluster")
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.local_provisioner_json, stored);
+        assert!(!config.schedule_on_control_plane);
+
+        let mut schedulable = with_local;
+        schedulable.schedule_on_control_plane = true;
+        db.upsert_kubernetes_cluster_config(&schedulable).unwrap();
+        let config = db
+            .get_kubernetes_cluster_config("test-cluster")
+            .unwrap()
+            .unwrap();
+        assert!(config.schedule_on_control_plane);
+        assert_eq!(config.local_provisioner_json, stored);
     }
 
     #[test]
@@ -288,6 +312,8 @@ mod kubernetes_cluster_tests {
             cilium_tunnel: "disabled".to_string(),
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: "192.168.40.220/29".to_string(),
+            local_provisioner_json: String::new(),
+            schedule_on_control_plane: false,
         };
         db.upsert_kubernetes_cluster_config(&config_row).unwrap();
 

@@ -383,18 +383,29 @@ impl StorageAdapter for LvmAdapter {
         let lv_name =
             crate::lvm_ops::logical_volume_name(&self.lv_prefix, &req.volume_id, &req.lv_name)
                 .map_err(from_lvm)?;
-        run_cmd(
-            "lvcreate",
-            &[
-                "-y",
-                "-L",
-                &format!("{}B", req.size_bytes),
-                "-n",
-                &lv_name,
-                &self.vg_name,
-            ],
-            ErrorKind::Internal,
-        )?;
+        let lvm_type = req
+            .parameters
+            .get("lvm-type")
+            .map(String::as_str)
+            .unwrap_or("");
+        let thin_pool = req
+            .parameters
+            .get("thin-pool")
+            .map(String::as_str)
+            .unwrap_or("");
+        let args = crate::lvm_ops::lvcreate_args(
+            &self.vg_name,
+            &lv_name,
+            req.size_bytes,
+            lvm_type,
+            thin_pool,
+        )
+        .map_err(from_lvm)?;
+        let (program, argv) = args
+            .split_first()
+            .ok_or_else(|| StorageError::new(ErrorKind::Internal, "lvcreate command is empty"))?;
+        let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_cmd(program, &argv_ref, ErrorKind::Internal)?;
         Ok(format!("/dev/{}/{}", self.vg_name, lv_name))
     }
 

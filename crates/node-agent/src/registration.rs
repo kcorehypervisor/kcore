@@ -192,13 +192,17 @@ fn derive_external_address(listen_addr: &str) -> String {
 }
 
 fn get_primary_ip() -> Result<String, std::io::Error> {
-    // Prefer the IPv4 on the default-route interface so we don't accidentally
-    // register bridge/gateway addresses like 10.240.0.1 as the node endpoint.
+    // Prefer the default route's `src`. A Kubernetes VIP on the same bridge
+    // is listed first by `ip addr`, and registering that address makes the
+    // controller dial the VIP instead of this node.
     let route = std::process::Command::new("ip")
         .args(["-4", "route", "show", "default"])
         .output()?;
     if route.status.success() {
         let route_stdout = String::from_utf8_lossy(&route.stdout);
+        if let Some(ip) = parse_default_route_src(&route_stdout) {
+            return Ok(ip.to_string());
+        }
         if let Some(dev) = parse_default_route_dev(&route_stdout) {
             let addr = std::process::Command::new("ip")
                 .args(["-4", "-o", "addr", "show", "dev", dev, "scope", "global"])
@@ -228,6 +232,20 @@ fn parse_default_route_dev(route_stdout: &str) -> Option<&str> {
     for tok in route_stdout.split_whitespace() {
         if prev == "dev" {
             return Some(tok);
+        }
+        prev = tok;
+    }
+    None
+}
+
+fn parse_default_route_src(route_stdout: &str) -> Option<&str> {
+    let mut prev = "";
+    for tok in route_stdout.split_whitespace() {
+        if prev == "src" {
+            let ip = tok.split('/').next().unwrap_or(tok);
+            if !ip.is_empty() {
+                return Some(ip);
+            }
         }
         prev = tok;
     }
@@ -542,6 +560,17 @@ mod tests {
     fn parse_default_route_dev_extracts_interface() {
         let line = "default via 192.168.40.1 dev eno1 proto dhcp src 192.168.40.105";
         assert_eq!(parse_default_route_dev(line), Some("eno1"));
+        assert_eq!(parse_default_route_src(line), Some("192.168.40.105"));
+    }
+
+    #[test]
+    fn parse_default_route_src_ignores_a_bridge_vip() {
+        let line = "default via 192.168.40.1 dev br0 proto dhcp src 192.168.40.105 metric 1007";
+        assert_eq!(parse_default_route_src(line), Some("192.168.40.105"));
+        assert_eq!(
+            parse_default_route_src("default via 192.168.40.1 dev br0"),
+            None
+        );
     }
 
     #[test]
