@@ -339,6 +339,7 @@ impl KubernetesOrchestrator {
                 },
                 iface: row.iface,
                 initial_cluster: row.initial_cluster,
+                role: row.role,
             });
         }
 
@@ -571,6 +572,7 @@ impl KubernetesOrchestrator {
                     .filter(|pool| !pool.is_empty())
                     .map(|pool| pool.to_string())
                     .collect(),
+                schedule_on_control_plane: cfg.schedule_on_control_plane,
             };
             let ports = crate::nixgen::kubernetes_listen_ports(&settings.api_server_endpoint);
             if ports.api_server == 6443 {
@@ -979,6 +981,8 @@ pub struct ClusterNode {
     pub ip_address: String,
     pub iface: String,
     pub initial_cluster: bool,
+    /// "control-plane" or "worker". Empty is treated as control-plane.
+    pub role: String,
 }
 
 /// Background task that orchestrates Kubernetes cluster bootstraps
@@ -991,7 +995,10 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
     match db.list_kubernetes_clusters() {
         Ok(clusters) => {
             for cluster in clusters {
-                if cluster.phase == "bootstrapping" {
+                // A ready cluster keeps the nix the operator last applied.
+                // Rebuilding it on every controller start would restart kubelet
+                // on nodes that are already serving.
+                if cluster.phase == "bootstrapping" || cluster.phase == "ready" {
                     continue;
                 }
                 let orchestrator = orchestrator.clone();

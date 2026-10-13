@@ -39,6 +39,9 @@ struct ManifestSpec {
     high_availability: ManifestHA,
     #[serde(default)]
     local_provisioner: ManifestLocalProvisioner,
+    /// Masters accept pods. Dedicated workerNodes may be empty.
+    #[serde(default)]
+    schedule_on_control_plane: bool,
 }
 
 fn default_cluster_dns() -> String {
@@ -222,6 +225,16 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
             .collect(),
         high_availability: ha_config,
         local_provisioner,
+        schedule_on_control_plane: spec.schedule_on_control_plane,
+    }
+}
+
+fn worker_slot_count(spec: &controller_proto::KubernetesClusterSpec) -> i32 {
+    let dedicated = spec.worker_nodes.len() as i32;
+    if spec.schedule_on_control_plane {
+        dedicated + spec.control_plane_nodes.len() as i32
+    } else {
+        dedicated
     }
 }
 
@@ -379,6 +392,10 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
                 }
             }
 
+            if spec.schedule_on_control_plane {
+                println!("\nScheduling: control-plane nodes accept workloads");
+            }
+
             if let Some(local) = spec.local_provisioner.filter(|local| local.enabled) {
                 println!("\nLocal provisioner:");
                 println!("  StorageClass: {}", local.storage_class_name);
@@ -449,11 +466,7 @@ pub async fn list(info: &ConnectionInfo) -> Result<()> {
             .as_ref()
             .map(|s| s.control_plane_nodes.len() as i32)
             .unwrap_or(0);
-        let worker_total = cluster
-            .spec
-            .as_ref()
-            .map(|s| s.worker_nodes.len() as i32)
-            .unwrap_or(0);
+        let worker_total = cluster.spec.as_ref().map(worker_slot_count).unwrap_or(0);
 
         println!(
             "{:<20} {:<15} {:<10} {}/{:<5} {}/{}",
@@ -629,6 +642,7 @@ spec:
   controlPlaneNodes:
     - nodeId: node-107
       advertiseAddress: 192.168.40.107
+  scheduleOnControlPlane: true
   localProvisioner:
     enabled: true
     storageClassName: local-path
@@ -641,6 +655,8 @@ spec:
         )
         .unwrap();
         let spec = to_proto_spec(&manifest.spec);
+        assert!(spec.schedule_on_control_plane);
+        assert_eq!(worker_slot_count(&spec), 1);
         let local = spec.local_provisioner.expect("local provisioner");
         assert!(local.enabled);
         assert_eq!(local.storage_class_name, "local-path");

@@ -1452,6 +1452,7 @@ fn sample_kubernetes_clusters() -> Vec<KubernetesCluster> {
                     method: "keepalived".into(),
                 }),
                 local_provisioner: None,
+                schedule_on_control_plane: false,
             }),
             status: Some(KubernetesClusterStatus {
                 phase: "ready".into(),

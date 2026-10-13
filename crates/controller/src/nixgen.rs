@@ -1469,6 +1469,8 @@ pub struct KubernetesNodeConfig {
     pub vip_address: String,
     pub vip_interface: String,
     pub kubeconfig_data: String,
+    /// Control-plane kubelets also register the worker role and stay schedulable.
+    pub schedule_on_control_plane: bool,
     /// Set for a cluster that shares the node with the primary one.
     /// The primary cluster keeps the module defaults and leaves this empty.
     pub instance: Option<KubernetesInstanceLayout>,
@@ -1525,6 +1527,10 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
         nix_escape(&k8s.api_server_endpoint)
     ));
     out.push_str(&format!("    initialCluster = {};\n", k8s.initial_cluster));
+    out.push_str(&format!(
+        "    scheduleOnControlPlane = {};\n",
+        k8s.schedule_on_control_plane
+    ));
 
     if k8s.role == "control-plane" {
         out.push_str(&format!(
@@ -1649,12 +1655,14 @@ mod kubernetes_tests {
             vip_address: "192.168.40.200".to_string(),
             vip_interface: "enp6s0".to_string(),
             kubeconfig_data: String::new(),
+            schedule_on_control_plane: true,
             instance: None,
         };
 
         let nix = generate_kubernetes_node_config(&config);
         assert!(nix.contains("enable = true"));
         assert!(nix.contains("role = \"control-plane\""));
+        assert!(nix.contains("scheduleOnControlPlane = true"));
         assert!(nix.contains("haEnabled = true"));
         assert!(nix.contains("initialCluster = true"));
         assert!(nix.contains("etcdInitialCluster"));
@@ -1683,6 +1691,7 @@ mod kubernetes_tests {
             vip_address: String::new(),
             vip_interface: String::new(),
             kubeconfig_data: String::new(),
+            schedule_on_control_plane: false,
             instance: None,
         };
 
@@ -1705,6 +1714,7 @@ mod kubernetes_tests {
             ip_address: "192.168.40.107".to_string(),
             iface: "enp6s0".to_string(),
             initial_cluster: true,
+            role: "control-plane".to_string(),
         };
         let peer = "-----BEGIN CERTIFICATE-----\nMIIBPEER\n-----END CERTIFICATE-----\n".to_string();
         let server =
@@ -1756,6 +1766,7 @@ mod kubernetes_tests {
                 cilium_tunnel: "disabled".to_string(),
                 cilium_auto_direct_routes: true,
                 cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+                schedule_on_control_plane: false,
             },
         )
         .unwrap();
@@ -1790,6 +1801,7 @@ mod kubernetes_tests {
             ip_address: "192.168.40.105".to_string(),
             iface: "br0".to_string(),
             initial_cluster: true,
+            role: "control-plane".to_string(),
         };
         let pki = KubernetesPki {
             ca_cert: "CA".to_string(),
@@ -1825,6 +1837,7 @@ mod kubernetes_tests {
             cilium_tunnel: "disabled".to_string(),
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+            schedule_on_control_plane: false,
         };
         let extra = KubernetesRenderSettings {
             api_server_endpoint: "192.168.40.201:7443".to_string(),
@@ -1837,6 +1850,7 @@ mod kubernetes_tests {
             cilium_tunnel: "disabled".to_string(),
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: vec![],
+            schedule_on_control_plane: true,
         };
         let nix = generate_colocated_kubernetes_config(&[
             KubernetesMemberRender {
@@ -1881,6 +1895,8 @@ mod kubernetes_tests {
         let extra = &nix[extra_at..];
         assert!(!extra.contains("ciliumMode"));
         assert!(!extra.contains("cni ="));
+        assert!(extra.contains("scheduleOnControlPlane = true"));
+        assert!(nix.contains("node-105=https://192.168.40.105:3380"));
         assert!(nix.ends_with("  };\n}\n"));
         assert_eq!(
             kubernetes_listen_ports("192.168.40.201:7443").etcd_client,
@@ -1902,6 +1918,7 @@ pub struct KubernetesRenderSettings {
     pub cilium_tunnel: String,
     pub cilium_auto_direct_routes: bool,
     pub cilium_lb_ip_pools: Vec<String>,
+    pub schedule_on_control_plane: bool,
 }
 
 /// Generate Kubernetes node configuration for a node in the cluster
@@ -1955,6 +1972,7 @@ pub fn generate_kubernetes_member(
     // The initial-cluster keys must be that same name.
     let etcd_initial_cluster = all_nodes
         .iter()
+        .filter(|n| n.role != "worker")
         .map(|n| {
             let name = if n.hostname.is_empty() {
                 n.node_id.as_str()
@@ -1966,8 +1984,13 @@ pub fn generate_kubernetes_member(
         .collect::<Vec<_>>()
         .join(",");
 
+    let role = if node.role == "worker" {
+        "worker"
+    } else {
+        "control-plane"
+    };
     let k8s_config = KubernetesNodeConfig {
-        role: "control-plane".to_string(),
+        role: role.to_string(),
         cluster_name: cluster_name.to_string(),
         cluster_cidr: cluster_cidr.to_string(),
         service_cidr: service_cidr.to_string(),
@@ -2003,6 +2026,7 @@ pub fn generate_kubernetes_member(
         vip_address: settings.vip_address.clone(),
         vip_interface: settings.vip_interface.clone(),
         kubeconfig_data: String::new(), // TODO: Include admin kubeconfig
+        schedule_on_control_plane: settings.schedule_on_control_plane,
         instance: layout,
     };
 

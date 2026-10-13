@@ -483,7 +483,15 @@ let
               --root-dir=/var/lib/kubelet-${name} \
               --cert-dir=/var/lib/kubelet-${name}/pki \
               --node-ip=${c.advertiseAddress} \
-              --hostname-override=${config.networking.hostName}
+              --hostname-override=${config.networking.hostName} \
+              --node-labels=${
+                if c.role == "worker" then
+                  "node-role.kubernetes.io/worker="
+                else if c.scheduleOnControlPlane then
+                  "node-role.kubernetes.io/control-plane=,node-role.kubernetes.io/worker="
+                else
+                  "node-role.kubernetes.io/control-plane="
+              }
           '';
           Restart = "always";
           RestartSec = "10s";
@@ -554,6 +562,12 @@ in
       ];
       default = "worker";
       description = "Node role in the Kubernetes cluster.";
+    };
+
+    scheduleOnControlPlane = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Register this control-plane node as a schedulable worker.";
     };
 
     clusterName = lib.mkOption {
@@ -788,6 +802,11 @@ in
                 "worker"
               ];
               default = "control-plane";
+            };
+            scheduleOnControlPlane = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Register this control-plane node as a schedulable worker.";
             };
             clusterName = lib.mkOption {
               type = lib.types.str;
@@ -1363,7 +1382,15 @@ in
               --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf \
               --container-runtime-endpoint=unix:///run/containerd/containerd.sock \
               --node-ip=${cfg.advertiseAddress} \
-              --hostname-override=${config.networking.hostName}
+              --hostname-override=${config.networking.hostName} \
+              --node-labels=${
+                if cfg.role == "worker" then
+                  "node-role.kubernetes.io/worker="
+                else if cfg.scheduleOnControlPlane then
+                  "node-role.kubernetes.io/control-plane=,node-role.kubernetes.io/worker="
+                else
+                  "node-role.kubernetes.io/control-plane="
+              }
           '';
           Restart = "always";
           RestartSec = "10s";
