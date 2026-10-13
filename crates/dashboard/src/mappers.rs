@@ -333,8 +333,74 @@ pub fn volumes_from_proto(vols: Vec<controller_proto::VolumeInfo>) -> Vec<Volume
             }
         })
         .collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    sort_volume_rows(&mut rows);
     rows
+}
+
+/// Registered volumes plus LVM logical volumes reported by node inventory.
+///
+/// ZFS rows are the controller volumes whose backend is ZFS. The storage
+/// overview has no zvol list, so an empty ZFS section means none are registered.
+pub fn volumes_with_host_inventory(
+    vols: Vec<controller_proto::VolumeInfo>,
+    storage: Option<&controller_proto::GetStorageOverviewResponse>,
+) -> Vec<VolumeRowDto> {
+    let mut rows = volumes_from_proto(vols);
+    let Some(storage) = storage else {
+        return rows;
+    };
+    for node in &storage.nodes {
+        if !node.lvm_inventory_ok {
+            continue;
+        }
+        for lv in &node.lvm_logical_volumes {
+            let name = lv.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let pool = lv.vg_name.trim();
+            let already = rows.iter().any(|row| {
+                row.backend == "LVM"
+                    && row.node_id == node.node_id
+                    && row.pool == pool
+                    && row.name == name
+            });
+            if already {
+                continue;
+            }
+            rows.push(VolumeRowDto {
+                name: name.to_string(),
+                role: String::new(),
+                attach_state: String::new(),
+                size: format::bytes_human(lv.size_bytes),
+                vm: String::new(),
+                encrypted: false,
+                backend: "LVM".to_string(),
+                pool: pool.to_string(),
+                node_id: node.node_id.clone(),
+            });
+        }
+    }
+    sort_volume_rows(&mut rows);
+    rows
+}
+
+fn sort_volume_rows(rows: &mut [VolumeRowDto]) {
+    rows.sort_by(|a, b| {
+        volume_backend_rank(&a.backend)
+            .cmp(&volume_backend_rank(&b.backend))
+            .then(a.name.cmp(&b.name))
+            .then(a.node_id.cmp(&b.node_id))
+    });
+}
+
+fn volume_backend_rank(backend: &str) -> u8 {
+    match backend {
+        "Ceph" => 0,
+        "LVM" => 1,
+        "ZFS" => 2,
+        _ => 3,
+    }
 }
 
 pub fn vm_operations_from_proto(ops: Vec<controller_proto::VmOperation>) -> Vec<VmOperationRowDto> {
@@ -1070,6 +1136,69 @@ mod tests {
         assert_eq!(rows[1].vm, "web");
         assert!(rows[1].encrypted);
         assert!(rows[1].size.contains("10"));
+    }
+
+    #[test]
+    fn host_lvm_inventory_joins_registered_ceph_and_zfs() {
+        let vols = vec![
+            controller_proto::VolumeInfo {
+                name: "rbd-root".into(),
+                storage_backend: "ceph".into(),
+                pool: "kcore-vms".into(),
+                node_id: "node-103".into(),
+                ..Default::default()
+            },
+            controller_proto::VolumeInfo {
+                name: "tank-data".into(),
+                storage_backend: "zfs".into(),
+                pool: "tank0".into(),
+                node_id: "node-119".into(),
+                ..Default::default()
+            },
+            controller_proto::VolumeInfo {
+                name: "kcore-kdata".into(),
+                storage_backend: "lvm".into(),
+                pool: "vg_kcore".into(),
+                node_id: "node-107".into(),
+                ..Default::default()
+            },
+        ];
+        let storage = controller_proto::GetStorageOverviewResponse {
+            nodes: vec![controller_proto::NodeStorageOverview {
+                node_id: "node-107".into(),
+                lvm_inventory_ok: true,
+                lvm_logical_volumes: vec![
+                    controller_proto::StorageLvmLogicalVolumeDetail {
+                        name: "kcore-kdata".into(),
+                        vg_name: "vg_kcore".into(),
+                        size_bytes: 50 * 1024 * 1024 * 1024,
+                        path: "/dev/vg_kcore/kcore-kdata".into(),
+                        ..Default::default()
+                    },
+                    controller_proto::StorageLvmLogicalVolumeDetail {
+                        name: "kcore-win-01".into(),
+                        vg_name: "vg_kcore".into(),
+                        size_bytes: 40 * 1024 * 1024 * 1024,
+                        path: "/dev/vg_kcore/kcore-win-01".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rows = volumes_with_host_inventory(vols, Some(&storage));
+        let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["rbd-root", "kcore-kdata", "kcore-win-01", "tank-data"]
+        );
+        assert_eq!(rows[0].backend, "Ceph");
+        assert_eq!(rows[1].backend, "LVM");
+        assert_eq!(rows[2].backend, "LVM");
+        assert_eq!(rows[2].pool, "vg_kcore");
+        assert_eq!(rows[2].node_id, "node-107");
+        assert_eq!(rows[3].backend, "ZFS");
     }
 
     #[test]
