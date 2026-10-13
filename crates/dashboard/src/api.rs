@@ -16,7 +16,7 @@ use crate::mappers::{
     kubernetes_clusters_from_proto, kubernetes_detail_from_proto, merge_ceph_capacity,
     network_overview_from_proto, networks_from_proto, object_stores_from_proto,
     replication_status_from_proto, shared_filesystems_from_proto, storage_overview_from_proto,
-    vm_operations_from_proto, vms_page_from_proto, volumes_from_proto,
+    vm_operations_from_proto, vms_page_from_proto, volumes_with_host_inventory,
 };
 use crate::state::dashboard_config;
 
@@ -96,7 +96,10 @@ pub async fn list_volumes_dto() -> Result<Vec<VolumeRowDto>, ServerFnError> {
     let vols = controller_client::list_volumes(cfg)
         .await
         .map_err(map_err)?;
-    Ok(volumes_from_proto(vols))
+    // Node inventory is extra. A storage RPC failure must not hide Ceph,
+    // LVM, or ZFS volumes the controller already registered.
+    let storage = controller_client::get_storage_overview(cfg).await.ok();
+    Ok(volumes_with_host_inventory(vols, storage.as_ref()))
 }
 
 #[server(ListCephClusters, "/api")]

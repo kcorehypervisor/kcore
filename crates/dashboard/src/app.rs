@@ -14,7 +14,7 @@ use crate::dto::{
     SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto,
     VmsPageDto, VolumeRowDto,
 };
-use crate::format::paginate_by_name;
+use crate::format::{paginate_by_name, paginate_preserve_order};
 use crate::paging::{
     list_pager, list_pager_named, list_paging, list_paging_named, paginate_items, query_string,
 };
@@ -133,7 +133,7 @@ fn HomePage() -> impl IntoView {
             </a>
             <a href="/volumes" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Volumes"</h2>
-                <p class="muted">"Ceph RBD volumes, attach state, pool, and LUKS encryption flags."</p>
+                <p class="muted">"Ceph, LVM, and ZFS volumes, with attach state and the node that holds each one."</p>
             </a>
             <a href="/ceph" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Ceph"</h2>
@@ -693,7 +693,7 @@ fn VolumesPage() -> impl IntoView {
     view! {
         <section class="hero">
             <h1>"Volumes"</h1>
-            <p class="muted">"Ceph RBD volumes from the controller (same data as kctl volume list). Local LVM and ZFS disks are on the Storage page."</p>
+            <p class="muted">"Ceph RBD volumes, LVM logical volumes, and ZFS zvols. Registered volumes come from the controller. LVM rows also include logical volumes reported by each node."</p>
         </section>
         <Suspense fallback=move || view! { <p class="muted">"Loading volumes…"</p> }>
             {move || {
@@ -710,18 +710,30 @@ fn VolumesPage() -> impl IntoView {
 }
 
 fn volumes_table(rows: Vec<VolumeRowDto>, page: u32, per_page: usize) -> impl IntoView {
+    let ceph = rows.iter().filter(|row| row.backend == "Ceph").count();
+    let lvm = rows.iter().filter(|row| row.backend == "LVM").count();
+    let zfs = rows.iter().filter(|row| row.backend == "ZFS").count();
+    let stats = view! {
+        <div class="stat-row" style="margin-bottom: 1rem;">
+            <div class="stat"><div class="label">"Ceph"</div><div class="value">{ceph}</div></div>
+            <div class="stat"><div class="label">"LVM"</div><div class="value">{lvm}</div></div>
+            <div class="stat"><div class="label">"ZFS"</div><div class="value">{zfs}</div></div>
+        </div>
+    };
     if rows.is_empty() {
         return view! {
-            <div class="empty-note">"No Ceph RBD volumes registered. Local disks are on the Storage page. Create a volume with "<code class="inline">"kctl create volume"</code>"."</div>
+            {stats}
+            <div class="empty-note">"No Ceph, LVM, or ZFS volumes. Create one with "<code class="inline">"kctl create volume"</code>"."</div>
         }
         .into_any();
     }
-    let pv = paginate_by_name(rows, |r| r.name.clone(), page, per_page);
+    let pv = paginate_preserve_order(rows, page, per_page);
     let page = pv.page;
     let page_size = pv.page_size;
     let total = pv.total;
     let rows = pv.items;
     view! {
+        {stats}
         <div class="table-wrap">
             <table class="data">
                 <thead>
