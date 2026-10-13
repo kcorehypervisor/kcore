@@ -12452,6 +12452,191 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
+    async fn get_ceph_dashboard_credentials(
+        &self,
+        request: Request<controller_proto::GetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<controller_proto::GetCephDashboardCredentialsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let name = request.into_inner().name;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_ceph_dashboard_credentials(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "no dashboard credentials stored for ceph cluster '{name}' \
+                     (set with SetCephDashboardCredentials / \
+                     `kctl set ceph-dashboard-credentials`)"
+                ))
+            })?;
+        Ok(Response::new(
+            controller_proto::GetCephDashboardCredentialsResponse {
+                name: row.name,
+                url: row.url,
+                username: row.username,
+                password: row.password,
+                updated_at: row.updated_at,
+            },
+        ))
+    }
+
+    async fn set_ceph_dashboard_credentials(
+        &self,
+        request: Request<controller_proto::SetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<controller_proto::SetCephDashboardCredentialsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let url = req.url.trim().to_string();
+        let username = req.username.trim().to_string();
+        let password = req.password;
+        if url.is_empty() {
+            return Err(Status::invalid_argument("url is required"));
+        }
+        if username.is_empty() {
+            return Err(Status::invalid_argument("username is required"));
+        }
+        if password.is_empty() {
+            return Err(Status::invalid_argument("password is required"));
+        }
+        self.db
+            .upsert_ceph_dashboard_credentials(&crate::db::CephDashboardCredentialsRow {
+                name: name.clone(),
+                url: url.clone(),
+                username: username.clone(),
+                password: password.clone(),
+                updated_at: String::new(),
+            })
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.record_audit(
+            &actor,
+            "SetCephDashboardCredentials",
+            &format!("ceph_cluster/{name}"),
+            format!("url={url} user={username}"),
+        );
+        let stored = self
+            .db
+            .get_ceph_dashboard_credentials(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::internal("credentials missing after upsert"))?;
+        Ok(Response::new(
+            controller_proto::SetCephDashboardCredentialsResponse {
+                success: true,
+                credentials: Some(controller_proto::GetCephDashboardCredentialsResponse {
+                    name: stored.name,
+                    url: stored.url,
+                    username: stored.username,
+                    password: stored.password,
+                    updated_at: stored.updated_at,
+                }),
+            },
+        ))
+    }
+
+    async fn get_ceph_cluster_capacity(
+        &self,
+        request: Request<controller_proto::GetCephClusterCapacityRequest>,
+    ) -> Result<Response<controller_proto::GetCephClusterCapacityResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let name = request.into_inner().name;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_ceph_cluster(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("ceph cluster '{name}' not found")))?;
+        let spec = ceph_cluster_spec::spec_from_json(&row.spec_json)
+            .map_err(|e| Status::internal(format!("decode ceph spec: {e}")))?;
+        if spec.nodes.is_empty() {
+            return Ok(Response::new(
+                controller_proto::GetCephClusterCapacityResponse {
+                    ok: false,
+                    message: "cluster has no members".into(),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        let mut last_err = String::new();
+        for member in &spec.nodes {
+            let Ok(Some(node)) = self.db.get_node(&member.node_id) else {
+                last_err = format!("member {} is not registered", member.node_id);
+                continue;
+            };
+            let Ok(mut admin) = self.ensure_admin_client_for_node(&node).await else {
+                last_err = format!("cannot reach member {}", member.node_id);
+                continue;
+            };
+            match admin
+                .get_ceph_df(node_proto::GetCephDfRequest {
+                    cluster_name: "ceph".into(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let df = resp.into_inner();
+                    return Ok(Response::new(
+                        controller_proto::GetCephClusterCapacityResponse {
+                            ok: true,
+                            message: String::new(),
+                            queried_node: member.node_id.clone(),
+                            total_bytes: df.total_bytes,
+                            used_bytes: df.used_bytes,
+                            avail_bytes: df.avail_bytes,
+                            by_class: df
+                                .by_class
+                                .into_iter()
+                                .map(|c| controller_proto::CephDeviceClassCapacity {
+                                    device_class: c.device_class,
+                                    total_bytes: c.total_bytes,
+                                    used_bytes: c.used_bytes,
+                                    avail_bytes: c.avail_bytes,
+                                })
+                                .collect(),
+                            pools: df
+                                .pools
+                                .into_iter()
+                                .map(|p| controller_proto::CephPoolCapacity {
+                                    name: p.name,
+                                    stored_bytes: p.stored_bytes,
+                                    objects: p.objects,
+                                    percent_used_bp: p.percent_used_bp,
+                                    max_avail_bytes: p.max_avail_bytes,
+                                })
+                                .collect(),
+                        },
+                    ));
+                }
+                Err(e) => {
+                    last_err = format!("{}: {e}", member.node_id);
+                }
+            }
+        }
+
+        Ok(Response::new(
+            controller_proto::GetCephClusterCapacityResponse {
+                ok: false,
+                message: if last_err.is_empty() {
+                    "no Ceph member answered".into()
+                } else {
+                    last_err
+                },
+                ..Default::default()
+            },
+        ))
+    }
+
     async fn delete_ceph_cluster(
         &self,
         request: Request<controller_proto::DeleteCephClusterRequest>,
@@ -13848,15 +14033,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .map_err(internal_db)?;
         }
 
-        info!(cluster = %req.name, "kubernetes cluster created, bootstrapping will begin");
-
-        // Spawn bootstrap task
-        let db = Arc::new(self.db.clone());
-        let clients = self.clients.clone();
-        let cluster_name = req.name.clone();
-        tokio::spawn(async move {
-            Self::bootstrap_kubernetes_cluster(db, clients, cluster_name).await;
-        });
+        info!(
+            cluster = %req.name,
+            "kubernetes cluster created; the orchestrator renders node nix with PKI"
+        );
 
         let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
         Ok(Response::new(
@@ -14208,215 +14388,6 @@ impl ControllerService {
                 active_node_ids: vec![],
             }),
         })
-    }
-
-    async fn bootstrap_kubernetes_cluster(
-        db: Arc<crate::db::Database>,
-        clients: crate::node_client::NodeClients,
-        cluster_name: String,
-    ) {
-        info!(cluster = %cluster_name, "starting kubernetes cluster bootstrap");
-
-        // Get cluster info
-        let cluster = match db.get_kubernetes_cluster(&cluster_name) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                error!(cluster = %cluster_name, "cluster not found");
-                return;
-            }
-            Err(e) => {
-                error!(cluster = %cluster_name, error = %e, "failed to get cluster");
-                return;
-            }
-        };
-
-        let config = match db.get_kubernetes_cluster_config(&cluster_name) {
-            Ok(Some(c)) => c,
-            _ => {
-                error!(cluster = %cluster_name, "cluster config not found");
-                return;
-            }
-        };
-
-        let cluster_nodes = match db.list_kubernetes_cluster_nodes(&cluster_name) {
-            Ok(nodes) => nodes,
-            Err(e) => {
-                error!(cluster = %cluster_name, error = %e, "failed to list cluster nodes");
-                return;
-            }
-        };
-
-        // Find the initial control plane node
-        let initial_node = cluster_nodes
-            .iter()
-            .find(|n| n.initial_cluster && n.role == "control-plane");
-
-        if let Some(init_node) = initial_node {
-            info!(cluster = %cluster_name, node = %init_node.node_id, "bootstrapping initial control plane");
-
-            // Build etcd initial cluster string
-            let control_planes: Vec<_> = cluster_nodes
-                .iter()
-                .filter(|n| n.role == "control-plane")
-                .collect();
-
-            let etcd_initial_cluster = control_planes
-                .iter()
-                .map(|n| format!("{}=https://{}:2380", n.node_id, n.advertise_address))
-                .collect::<Vec<_>>()
-                .join(",");
-
-            // Get node address
-            let node_addr = match db.get_node(&init_node.node_id) {
-                Ok(Some(n)) => n.address,
-                _ => {
-                    error!(cluster = %cluster_name, node = %init_node.node_id, "node not found in database");
-                    return;
-                }
-            };
-
-            // Apply config to initial node
-            if let Err(e) = Self::apply_k8s_config_to_node(
-                &clients,
-                &node_addr,
-                &cluster,
-                &config,
-                init_node,
-                &etcd_initial_cluster,
-                true,
-            )
-            .await
-            {
-                error!(cluster = %cluster_name, node = %init_node.node_id, error = %e, "failed to apply config to initial node");
-                let _ = db.upsert_kubernetes_cluster(&crate::db::KubernetesClusterRow {
-                    phase: "failed".to_string(),
-                    status_message: format!("bootstrap failed: {}", e),
-                    ..cluster
-                });
-                return;
-            }
-
-            // Wait for initial node to be ready
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-
-            // Join additional control planes
-            for cp_node in control_planes
-                .iter()
-                .filter(|n| n.node_id != init_node.node_id)
-            {
-                info!(cluster = %cluster_name, node = %cp_node.node_id, "joining additional control plane");
-
-                let node_addr = match db.get_node(&cp_node.node_id) {
-                    Ok(Some(n)) => n.address,
-                    _ => {
-                        warn!(cluster = %cluster_name, node = %cp_node.node_id, "node not found");
-                        continue;
-                    }
-                };
-
-                if let Err(e) = Self::apply_k8s_config_to_node(
-                    &clients,
-                    &node_addr,
-                    &cluster,
-                    &config,
-                    cp_node,
-                    &etcd_initial_cluster,
-                    false,
-                )
-                .await
-                {
-                    warn!(cluster = %cluster_name, node = %cp_node.node_id, error = %e, "failed to join control plane");
-                }
-
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            }
-
-            // Join workers
-            for worker in cluster_nodes.iter().filter(|n| n.role == "worker") {
-                info!(cluster = %cluster_name, node = %worker.node_id, "joining worker node");
-
-                let node_addr = match db.get_node(&worker.node_id) {
-                    Ok(Some(n)) => n.address,
-                    _ => {
-                        warn!(cluster = %cluster_name, node = %worker.node_id, "node not found");
-                        continue;
-                    }
-                };
-
-                if let Err(e) = Self::apply_k8s_config_to_node(
-                    &clients, &node_addr, &cluster, &config, worker, "", false,
-                )
-                .await
-                {
-                    warn!(cluster = %cluster_name, node = %worker.node_id, error = %e, "failed to join worker");
-                }
-            }
-
-            // Update cluster status
-            let _ = db.upsert_kubernetes_cluster(&crate::db::KubernetesClusterRow {
-                phase: "ready".to_string(),
-                status_message: "cluster bootstrap complete".to_string(),
-                ready_control_planes: control_planes.len() as i32,
-                ..cluster
-            });
-
-            info!(cluster = %cluster_name, "kubernetes cluster bootstrap complete");
-        }
-    }
-
-    async fn apply_k8s_config_to_node(
-        clients: &crate::node_client::NodeClients,
-        node_address: &str,
-        cluster: &crate::db::KubernetesClusterRow,
-        config: &crate::db::KubernetesClusterConfigRow,
-        node_info: &crate::db::KubernetesClusterNodeRow,
-        etcd_initial_cluster: &str,
-        _initial: bool,
-    ) -> Result<(), String> {
-        let mut admin_client = clients
-            .get_admin(node_address)
-            .ok_or_else(|| format!("node {} not connected", node_address))?;
-
-        let cilium_config = Some(crate::node_proto::CiliumConfig {
-            mode: config.cilium_mode.clone(),
-            mtu: config.cilium_mtu,
-            tunnel: config.cilium_tunnel.clone(),
-            auto_direct_node_routes: config.cilium_auto_direct_routes,
-            nat_outgoing: true,
-            load_balancer_ip_pools: config
-                .cilium_lb_ip_pools
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect(),
-        });
-
-        let request = crate::node_proto::ApplyKubernetesConfigRequest {
-            role: node_info.role.clone(),
-            cluster_name: cluster.name.clone(),
-            cluster_cidr: cluster.cluster_cidr.clone(),
-            service_cidr: cluster.service_cidr.clone(),
-            cluster_dns: cluster.cluster_dns.clone(),
-            advertise_address: node_info.advertise_address.clone(),
-            iface: node_info.iface.clone(),
-            api_server_endpoint: cluster.api_server_endpoint.clone(),
-            initial_cluster: node_info.initial_cluster,
-            cni: cluster.cni.clone(),
-            cilium_config,
-            etcd_initial_cluster: etcd_initial_cluster.to_string(),
-            ha_enabled: config.ha_enabled,
-            vip_address: config.vip_address.clone(),
-            vip_interface: config.vip_interface.clone(),
-            kubeconfig_data: vec![],
-        };
-
-        let response = admin_client
-            .apply_kubernetes_config(request)
-            .await
-            .map_err(|e| format!("apply_kubernetes_config RPC failed: {}", e))?;
-
-        info!(node = %node_address, apply_id = %response.into_inner().apply_id, "kubernetes config applied to node");
-        Ok(())
     }
 }
 

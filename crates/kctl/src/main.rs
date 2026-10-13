@@ -976,6 +976,21 @@ enum SetResource {
         #[arg(long = "target-node")]
         target_node: Option<String>,
     },
+    /// Store Ceph mgr Dashboard login credentials (cluster-admin)
+    #[command(name = "ceph-dashboard-credentials", alias = "ceph-dashboard-creds")]
+    CephDashboardCredentials {
+        /// Logical CephCluster name these credentials belong to
+        name: String,
+        /// Dashboard base URL (e.g. https://192.168.40.103:8444/)
+        #[arg(long)]
+        url: String,
+        /// Dashboard username
+        #[arg(long, default_value = "admin")]
+        username: String,
+        /// Dashboard password (Ceph stores only a hash; kcore keeps the plaintext)
+        #[arg(long)]
+        password: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1127,6 +1142,12 @@ enum GetResource {
     /// List CephCluster resources
     #[command(name = "ceph-clusters", alias = "ceph-cluster", alias = "cephcluster")]
     CephClusters,
+    /// Get Ceph mgr Dashboard login credentials (cluster-admin)
+    #[command(name = "ceph-dashboard-credentials", alias = "ceph-dashboard-creds")]
+    CephDashboardCredentials {
+        /// Logical CephCluster name
+        name: String,
+    },
     /// List SharedFilesystem resources
     #[command(
         name = "shared-filesystems",
@@ -2226,6 +2247,18 @@ async fn main() {
             };
             commands::vm::set_desired_state(&info, vm_id, desired, target_node.clone(), label).await
         }
+        Command::Set {
+            resource:
+                SetResource::CephDashboardCredentials {
+                    name,
+                    url,
+                    username,
+                    password,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_dashboard_credentials::set(&info, name, url, username, password).await
+        }
 
         Command::Update {
             resource:
@@ -2419,6 +2452,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::ceph_cluster::list(&info).await
+        }
+        Command::Get {
+            resource: GetResource::CephDashboardCredentials { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_dashboard_credentials::get(&info, name).await
         }
         Command::Get {
             resource: GetResource::SharedFilesystems,
@@ -3267,7 +3306,7 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {e}");
+        eprintln!("Error: {e:#}");
         process::exit(1);
     }
 }

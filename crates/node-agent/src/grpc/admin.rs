@@ -2610,6 +2610,57 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn get_ceph_df(
+        &self,
+        request: Request<proto::GetCephDfRequest>,
+    ) -> Result<Response<proto::GetCephDfResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let _ = request.into_inner();
+        let out = run_ceph_cmd(&["df", "--format", "json"])
+            .await
+            .map_err(|e| Status::internal(format!("starting ceph df (is Ceph installed?): {e}")))?;
+        if out.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("ceph df timed out"));
+        }
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "ceph df failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let raw_df = String::from_utf8_lossy(&out.stdout).to_string();
+        let json: JsonValue = serde_json::from_str(&raw_df)
+            .map_err(|e| Status::internal(format!("invalid ceph df JSON: {e}")))?;
+        let parsed = crate::ceph_bootstrap::parse_ceph_df(&json);
+        Ok(Response::new(proto::GetCephDfResponse {
+            raw_df,
+            total_bytes: parsed.total_bytes,
+            used_bytes: parsed.used_bytes,
+            avail_bytes: parsed.avail_bytes,
+            by_class: parsed
+                .by_class
+                .into_iter()
+                .map(|c| proto::CephDeviceClassStats {
+                    device_class: c.device_class,
+                    total_bytes: c.total_bytes,
+                    used_bytes: c.used_bytes,
+                    avail_bytes: c.avail_bytes,
+                })
+                .collect(),
+            pools: parsed
+                .pools
+                .into_iter()
+                .map(|p| proto::CephPoolUsageStats {
+                    name: p.name,
+                    stored_bytes: p.stored_bytes,
+                    objects: p.objects,
+                    percent_used_bp: p.percent_used_bp,
+                    max_avail_bytes: p.max_avail_bytes,
+                })
+                .collect(),
+        }))
+    }
+
     async fn ensure_ceph_pool(
         &self,
         request: Request<proto::EnsureCephPoolRequest>,
@@ -3885,7 +3936,10 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         tokio::task::spawn_blocking({
             let path = k8s_config_path.clone();
             let content = config_content.clone();
-            move || std::fs::write(&path, &content)
+            move || {
+                crate::nixgen_k8s::install_kubernetes_module_sources()?;
+                std::fs::write(&path, &content)
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))?
@@ -4010,7 +4064,10 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         tokio::task::spawn_blocking({
             let path = k8s_config_path.clone();
             let content = req.nix_config_content.clone();
-            move || std::fs::write(&path, &content)
+            move || {
+                crate::nixgen_k8s::install_kubernetes_module_sources()?;
+                std::fs::write(&path, &content)
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))?

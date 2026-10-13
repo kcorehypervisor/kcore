@@ -11,6 +11,10 @@ export type ConnectionOptions = {
   tlsServerName?: string;
   operator?: string;
   timeoutMs?: number;
+  /** kcore-provisioning gRPC address, host:port. */
+  provisioning?: string;
+  /** Provisioning listens without TLS unless this is false. */
+  provisioningInsecure?: boolean;
 };
 
 export type ResolvedConnection = {
@@ -40,6 +44,7 @@ type ContextEntry = {
   key?: string;
   ca?: string;
   operator?: string;
+  provisioning?: string;
 };
 
 export function resolveConnection(options: ConnectionOptions = {}): ResolvedConnection {
@@ -64,6 +69,30 @@ export function resolveConnection(options: ConnectionOptions = {}): ResolvedConn
     ...material,
     timeoutMs: options.timeoutMs ?? 120_000,
   };
+}
+
+export function resolveProvisioning(options: ConnectionOptions = {}): ResolvedConnection {
+  const configPath = options.config?.trim() || process.env.KCORE_CONFIG?.trim() || join(homedir(), ".kcore", "config");
+  const file = readContext(configPath);
+  const current = file?.["current-context"];
+  const entry = current && file?.contexts ? file.contexts[current] : undefined;
+  const address =
+    options.provisioning?.trim() ||
+    process.env.KCORE_PROVISIONING?.trim() ||
+    entry?.provisioning?.trim() ||
+    "";
+  if (!address) {
+    throw new InputError(
+      "No provisioning controller address. Set connection.provisioning or KCORE_PROVISIONING to host:port.",
+    );
+  }
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  const checked = assertAddress(address, "provisioning");
+  if (options.provisioningInsecure === false) {
+    const base = resolveConnection(options);
+    return { ...base, address: checked, insecure: false, timeoutMs };
+  }
+  return { address: checked, insecure: true, timeoutMs };
 }
 
 function readContext(path: string): ContextFile | undefined {

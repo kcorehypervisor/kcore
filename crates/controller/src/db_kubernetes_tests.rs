@@ -7,27 +7,26 @@ mod kubernetes_cluster_tests {
         NodeRow,
     };
 
-    /// `kubernetes_cluster_nodes.node_id` references `nodes(id)`.
-    fn ensure_host_node(db: &Database, node_id: &str) {
+    fn ensure_node(db: &Database, id: &str) {
         db.upsert_node(&NodeRow {
-            id: node_id.to_string(),
-            hostname: node_id.to_string(),
-            address: "127.0.0.1:9091".to_string(),
+            id: id.to_string(),
+            hostname: id.to_string(),
+            address: format!("{id}:9091"),
             cpu_cores: 4,
-            memory_bytes: 8 * 1024 * 1024 * 1024,
+            memory_bytes: 8_000_000_000,
             status: "ready".to_string(),
             last_heartbeat: String::new(),
             gateway_interface: "enp6s0".to_string(),
             cpu_used: 0,
             memory_used: 0,
-            storage_backend: "lvm".to_string(),
+            storage_backend: "filesystem".to_string(),
             disable_vxlan: false,
             approval_status: "approved".to_string(),
-            cert_expiry_days: -1,
-            luks_method: String::new(),
+            cert_expiry_days: 30,
+            luks_method: "tpm2".to_string(),
             dc_id: "DC1".to_string(),
         })
-        .expect("insert host node");
+        .expect("insert node");
     }
 
     #[test]
@@ -171,7 +170,7 @@ mod kubernetes_cluster_tests {
             updated_at: String::new(),
         };
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
-        ensure_host_node(&db, "node-105");
+        ensure_node(&db, "node-105");
 
         // Add node
         let node_row = KubernetesClusterNodeRow {
@@ -263,7 +262,7 @@ mod kubernetes_cluster_tests {
             updated_at: String::new(),
         };
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
-        ensure_host_node(&db, "node-105");
+        ensure_node(&db, "node-105");
 
         // Add node
         let node_row = KubernetesClusterNodeRow {
@@ -342,7 +341,7 @@ mod kubernetes_cluster_tests {
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
 
         for (i, node_id) in ["node-105", "node-107", "node-119"].iter().enumerate() {
-            ensure_host_node(&db, node_id);
+            ensure_node(&db, node_id);
             let node_row = KubernetesClusterNodeRow {
                 cluster_name: "ha-cluster".to_string(),
                 node_id: node_id.to_string(),
@@ -387,7 +386,7 @@ mod kubernetes_cluster_tests {
             updated_at: String::new(),
         };
         db.upsert_kubernetes_cluster(&cluster_row).unwrap();
-        ensure_host_node(&db, "node-105");
+        ensure_node(&db, "node-105");
 
         let node_row = KubernetesClusterNodeRow {
             cluster_name: "test-cluster".to_string(),
