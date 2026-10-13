@@ -184,9 +184,9 @@ pub fn normalize(
                 validate_mount_path(requested)?;
                 requested.to_string()
             };
-            if !seen_mounts.insert(mount_path.clone()) {
+            if !seen_mounts.insert((node_id.to_string(), mount_path.clone())) {
                 return Err(format!(
-                    "mount path {mount_path} is used by more than one volume"
+                    "mount path {mount_path} is used by more than one volume on {node_id}"
                 ));
             }
             mount_path

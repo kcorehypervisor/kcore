@@ -11,11 +11,17 @@ pub const CERT_VALIDITY_DAYS: i64 = 365;
 /// a CN, SAN or EKU it is not entitled to.
 fn node_cert_params(node_host: &str, validity_days: i64) -> Result<CertificateParams, String> {
     let mut params = CertificateParams::default();
-    params.subject_alt_names = vec![SanType::DnsName(
-        node_host
-            .try_into()
-            .map_err(|e| format!("invalid hostname: {e}"))?,
-    )];
+    // Nodes are dialed by the address they registered. An address is an IP,
+    // and rustls will not treat a DNS SAN of "192.168.40.105" as that IP.
+    let san = match node_host.parse::<std::net::IpAddr>() {
+        Ok(ip) => SanType::IpAddress(ip),
+        Err(_) => SanType::DnsName(
+            node_host
+                .try_into()
+                .map_err(|e| format!("invalid hostname: {e}"))?,
+        ),
+    };
+    params.subject_alt_names = vec![san];
     params
         .distinguished_name
         .push(DnType::CommonName, format!("kcore-node-{node_host}"));
@@ -256,6 +262,38 @@ mod tests {
         let (chain, key) = sign_node_cert(&sub_cert, &sub_key, "10.0.0.50").unwrap();
         assert!(key.contains("BEGIN PRIVATE KEY"));
         assert_eq!(chain.matches("BEGIN CERTIFICATE").count(), 2);
+    }
+
+    #[test]
+    fn sign_node_cert_uses_an_ip_san_when_the_host_is_an_address() {
+        let (ca_cert, ca_key) = generate_test_ca();
+        let (sub_cert, sub_key) = generate_test_sub_ca(&ca_cert, &ca_key);
+        let (chain, _) = sign_node_cert(&sub_cert, &sub_key, "10.0.0.50").unwrap();
+        let end = chain
+            .find("-----END CERTIFICATE-----")
+            .expect("first cert end");
+        let first_pem = &chain[..end + "-----END CERTIFICATE-----".len()];
+        let pem = pem::parse(first_pem).expect("pem leaf");
+        use x509_parser::prelude::FromDer;
+        let (_, cert) =
+            x509_parser::certificate::X509Certificate::from_der(pem.contents()).expect("x509");
+        let san = cert
+            .subject_alternative_name()
+            .expect("san parse")
+            .expect("san present");
+        let ips: Vec<String> = san
+            .value
+            .general_names
+            .iter()
+            .filter_map(|name| match name {
+                x509_parser::extensions::GeneralName::IPAddress(bytes) => Some(match *bytes {
+                    [a, b, c, d] => format!("{a}.{b}.{c}.{d}"),
+                    _ => format!("{bytes:?}"),
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ips, vec!["10.0.0.50".to_string()]);
     }
 
     #[test]
