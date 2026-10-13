@@ -130,7 +130,7 @@ pkgs.testers.runNixOSTest {
     # transaction, and come back after a reload or restart even when something
     # flushed them from under the bridge.
     machine.wait_for_unit("kcore-firewall-default.service")
-    machine.succeed("nft list table ip kcore-default | grep -F 'oifname \"eth0\" masquerade'")
+    machine.succeed("nft list table ip kcore-default | grep -F 'ip saddr 192.168.100.0/24 oifname \"eth0\" masquerade'")
     machine.succeed("nft list table ip kcore-default | grep -F 'tcp dport 2222 dnat to 192.168.100.1'")
     machine.succeed("nft list table ip kcore-default | grep -F 'udp dport 5353 dnat to 192.168.100.1'")
     machine.succeed("nft list table ip kcore-default | grep -F 'dnat to 192.168.100.20:80'")
