@@ -495,7 +495,6 @@ in
         staticPodPath: /etc/kubernetes/manifests
         streamingConnectionIdleTimeout: 4h0m0s
         syncFrequency: 1m0s
-        tlsCertFile: /var/lib/kubelet/pki/kubelet-client-current.pem
         volumePluginDir: /usr/libexec/kubernetes/kubelet-plugins/volume/exec/
       '';
       mode = "0644";
@@ -522,6 +521,14 @@ in
 
       serviceConfig = {
         Type = "notify";
+        # A crash before the first WAL (missing peer certs) leaves an empty
+        # member directory. etcd then refuses --initial-cluster-state=new.
+        # Keep a directory that already has a snapshot or WAL.
+        ExecStartPre = "${pkgs.writeShellScript "kcore-etcd-clear-empty-member" ''
+          if [ ! -e /var/lib/etcd/member/snap/db ] && [ ! -d /var/lib/etcd/member/wal ]; then
+            rm -rf /var/lib/etcd/member
+          fi
+        ''}";
         ExecStart = ''
           ${pkgs.etcd}/bin/etcd \
             --name=${config.networking.hostName} \
@@ -600,8 +607,10 @@ in
         ExecStart = ''
           ${pkgs.kubernetes}/bin/kube-controller-manager \
             --bind-address=127.0.0.1 \
+            --allocate-node-cidrs=true \
             --cluster-cidr=${cfg.clusterCidr} \
             --cluster-name=${cfg.clusterName} \
+            --node-cidr-mask-size=24 \
             --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt \
             --cluster-signing-key-file=/etc/kubernetes/pki/ca.key \
             --kubeconfig=${kubeconfigPath} \
@@ -644,6 +653,15 @@ in
       ]
       ++ lib.optionals (cfg.role == "control-plane") [ "kube-apiserver.service" ];
       wants = [ "network-online.target" ];
+      # Volume setup execs mount(8). The default unit PATH is the NixOS
+      # activation set, which does not include util-linux.
+      path = with pkgs; [
+        util-linux
+        iptables
+        iproute2
+        ethtool
+        kmod
+      ];
 
       serviceConfig = {
         Type = "simple";
@@ -674,8 +692,56 @@ in
         PIDFile = "/run/keepalived.pid";
         ExecStart = "${pkgs.keepalived}/bin/keepalived -f /etc/keepalived/keepalived.conf -p /run/keepalived.pid";
         Restart = "always";
+        RestartSec = "5s";
       };
     };
+
+    # VRRP for the API VIP. The unit used to start with no config file, so
+    # keepalived exited before it could own vipAddress.
+    environment.etc."keepalived/keepalived.conf" =
+      lib.mkIf (cfg.role == "control-plane" && cfg.haEnabled)
+        {
+          mode = "0644";
+          text =
+            let
+              members = lib.filter (member: member != "") (lib.splitString "," cfg.etcdInitialCluster);
+              ipOf =
+                member:
+                let
+                  url = lib.last (lib.splitString "=" member);
+                  hostport = lib.removePrefix "https://" url;
+                in
+                lib.head (lib.splitString ":" hostport);
+              peers = lib.filter (ip: ip != cfg.advertiseAddress) (map ipOf members);
+              octets = lib.splitString "." cfg.advertiseAddress;
+              last = if octets == [ ] then 100 else lib.toInt (lib.last octets);
+              priority = if last > 0 && last < 255 then last else 100;
+            in
+            ''
+              global_defs {
+                router_id ${config.networking.hostName}
+              }
+              vrrp_instance kcore_api {
+                state BACKUP
+                interface ${cfg.vipInterface}
+                virtual_router_id 40
+                priority ${toString priority}
+                advert_int 1
+                nopreempt
+                unicast_src_ip ${cfg.advertiseAddress}
+                unicast_peer {
+              ${lib.concatMapStrings (ip: "    ${ip}\n") peers}
+                }
+                authentication {
+                  auth_type PASS
+                  auth_pass kcoreapi
+                }
+                virtual_ipaddress {
+                  ${cfg.vipAddress}/24
+                }
+              }
+            '';
+        };
 
     # Cilium agent (installed via Helm/manifest after cluster bootstrap, not managed here)
     # The controller will apply Cilium manifests post-bootstrap

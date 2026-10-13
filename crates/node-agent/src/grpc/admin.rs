@@ -3936,7 +3936,10 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         tokio::task::spawn_blocking({
             let path = k8s_config_path.clone();
             let content = config_content.clone();
-            move || std::fs::write(&path, &content)
+            move || {
+                crate::nixgen_k8s::install_kubernetes_module_sources()?;
+                std::fs::write(&path, &content)
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))?
@@ -4061,7 +4064,10 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         tokio::task::spawn_blocking({
             let path = k8s_config_path.clone();
             let content = req.nix_config_content.clone();
-            move || std::fs::write(&path, &content)
+            move || {
+                crate::nixgen_k8s::install_kubernetes_module_sources()?;
+                std::fs::write(&path, &content)
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))?
