@@ -14116,6 +14116,24 @@ impl controller_proto::controller_server::Controller for ControllerService {
             self.db
                 .upsert_kubernetes_cluster(&cluster_row)
                 .map_err(internal_db)?;
+        } else {
+            // Update only persists config. A ready cluster must stay ready:
+            // the orchestrator rebuilds any other phase on the next start.
+            cluster_row.phase = if existing.phase == "updating" {
+                "ready".to_string()
+            } else {
+                existing.phase.clone()
+            };
+            cluster_row.status_message = if spec.schedule_on_control_plane {
+                "control-plane nodes accept workloads".to_string()
+            } else if existing.phase == "updating" {
+                "cluster configuration updated".to_string()
+            } else {
+                existing.status_message.clone()
+            };
+            self.db
+                .upsert_kubernetes_cluster(&cluster_row)
+                .map_err(internal_db)?;
         }
 
         let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
