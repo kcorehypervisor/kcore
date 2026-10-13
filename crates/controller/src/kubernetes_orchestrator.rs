@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+
 use anyhow::{anyhow, Context, Result};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
@@ -11,6 +15,9 @@ use crate::node_client::NodeClients;
 pub struct KubernetesOrchestrator {
     db: Database,
     node_clients: NodeClients,
+    /// Serializes Nix renders for one node so two cluster bootstraps cannot
+    /// overwrite each other's file with a stale single-cluster config.
+    node_apply_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// Bootstrap phase for tracking progress
@@ -43,7 +50,22 @@ impl BootstrapPhase {
 
 impl KubernetesOrchestrator {
     pub fn new(db: Database, node_clients: NodeClients) -> Self {
-        Self { db, node_clients }
+        Self {
+            db,
+            node_clients,
+            node_apply_locks: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    fn node_apply_lock(&self, node_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .node_apply_locks
+            .lock()
+            .expect("kubernetes node apply locks");
+        locks
+            .entry(node_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Orchestrate complete cluster bootstrap or scale-up
@@ -420,9 +442,9 @@ impl KubernetesOrchestrator {
         cluster_name: &str,
         node: &ClusterNode,
         pki: &KubernetesPki,
-        cluster_cidr: &str,
-        service_cidr: &str,
-        all_nodes: &[ClusterNode],
+        _cluster_cidr: &str,
+        _service_cidr: &str,
+        _all_nodes: &[ClusterNode],
     ) -> Result<()> {
         info!(
             cluster = cluster_name,
@@ -443,70 +465,34 @@ impl KubernetesOrchestrator {
             .get_admin(&address)
             .context("node client not found")?;
 
-        // Get node-specific certs
-        let (etcd_server_cert, etcd_server_key) = pki
-            .etcd_node_certs
+        // Fail before the node rebuild if this cluster has no etcd certs yet.
+        pki.etcd_node_certs
             .get(&node.node_id)
             .context("etcd server cert not found")?;
-        let (etcd_peer_cert, etcd_peer_key) = pki
-            .etcd_node_peer_certs
+        pki.etcd_node_peer_certs
             .get(&node.node_id)
             .context("etcd peer cert not found")?;
 
-        let cluster = self
-            .db
-            .get_kubernetes_cluster(cluster_name)?
-            .context("cluster not found")?;
-        let cfg = self
-            .db
-            .get_kubernetes_cluster_config(cluster_name)?
-            .context("cluster config not found")?;
-        let settings = crate::nixgen::KubernetesRenderSettings {
-            api_server_endpoint: cluster.api_server_endpoint,
-            cluster_dns: cluster.cluster_dns,
-            ha_enabled: cfg.ha_enabled,
-            vip_address: cfg.vip_address,
-            vip_interface: cfg.vip_interface,
-            cilium_mode: cfg.cilium_mode,
-            cilium_mtu: cfg.cilium_mtu,
-            cilium_tunnel: cfg.cilium_tunnel,
-            cilium_auto_direct_routes: cfg.cilium_auto_direct_routes,
-            cilium_lb_ip_pools: cfg
-                .cilium_lb_ip_pools
-                .split(',')
-                .filter(|pool| !pool.is_empty())
-                .map(|pool| pool.to_string())
-                .collect(),
-        };
-
-        // Build complete Kubernetes Nix config with embedded PKI
-        let k8s_config = crate::nixgen::generate_kubernetes_config(
-            cluster_name,
-            node,
-            pki,
-            cluster_cidr,
-            service_cidr,
-            etcd_server_cert,
-            etcd_server_key,
-            etcd_peer_cert,
-            etcd_peer_key,
-            all_nodes,
-            &settings,
-        )?;
+        let apply_lock = self.node_apply_lock(&node.node_id);
+        let _guard = apply_lock.lock().await;
+        let rendered = self
+            .render_node_nix(&node.node_id, cluster_name, pki)
+            .await?;
 
         info!(
             cluster = cluster_name,
             node_id = node.node_id,
-            config_len = k8s_config.len(),
-            "generated Kubernetes configuration with embedded PKI"
+            config_len = rendered.nix.len(),
+            clusters = rendered.cluster_count,
+            "generated Kubernetes configuration for every cluster on the node"
         );
 
         // Apply configuration via node agent RPC
         use crate::node_proto::ApplyRawKubernetesConfigRequest;
 
         let request = ApplyRawKubernetesConfigRequest {
-            nix_config_content: k8s_config,
-            kubeconfig_data: pki.admin_kubeconfig.clone(),
+            nix_config_content: rendered.nix,
+            kubeconfig_data: rendered.primary_kubeconfig,
         };
 
         let response = admin_client
@@ -524,6 +510,123 @@ impl KubernetesOrchestrator {
         );
 
         Ok(())
+    }
+
+    /// Nix for every cluster that already has PKI and includes this node.
+    /// `current` overrides the database copy so a cluster that just stored
+    /// certificates is included even if the read races the write.
+    async fn render_node_nix(
+        &self,
+        node_id: &str,
+        current_cluster: &str,
+        current_pki: &KubernetesPki,
+    ) -> Result<RenderedNodeNix> {
+        let clusters = self.db.list_kubernetes_clusters()?;
+        let mut members = Vec::new();
+        let mut primary_kubeconfig = String::new();
+        for cluster in clusters {
+            let nodes = self.get_cluster_nodes(&cluster.name).await?;
+            let Some(node) = nodes.iter().find(|n| n.node_id == node_id).cloned() else {
+                continue;
+            };
+            let pki = if cluster.name == current_cluster {
+                current_pki.clone()
+            } else if let Some(stored) = self.db.load_kubernetes_pki(&cluster.name)? {
+                stored
+            } else {
+                info!(
+                    cluster = %cluster.name,
+                    node_id,
+                    "skipping cluster with no stored PKI"
+                );
+                continue;
+            };
+            let (etcd_server_cert, etcd_server_key) = pki
+                .etcd_node_certs
+                .get(&node.node_id)
+                .context("etcd server cert not found")?
+                .clone();
+            let (etcd_peer_cert, etcd_peer_key) = pki
+                .etcd_node_peer_certs
+                .get(&node.node_id)
+                .context("etcd peer cert not found")?
+                .clone();
+            let cfg = self
+                .db
+                .get_kubernetes_cluster_config(&cluster.name)?
+                .context("cluster config not found")?;
+            let settings = crate::nixgen::KubernetesRenderSettings {
+                api_server_endpoint: cluster.api_server_endpoint.clone(),
+                cluster_dns: cluster.cluster_dns.clone(),
+                ha_enabled: cfg.ha_enabled,
+                vip_address: cfg.vip_address,
+                vip_interface: cfg.vip_interface,
+                cilium_mode: cfg.cilium_mode,
+                cilium_mtu: cfg.cilium_mtu,
+                cilium_tunnel: cfg.cilium_tunnel,
+                cilium_auto_direct_routes: cfg.cilium_auto_direct_routes,
+                cilium_lb_ip_pools: cfg
+                    .cilium_lb_ip_pools
+                    .split(',')
+                    .filter(|pool| !pool.is_empty())
+                    .map(|pool| pool.to_string())
+                    .collect(),
+            };
+            let ports = crate::nixgen::kubernetes_listen_ports(&settings.api_server_endpoint);
+            if ports.api_server == 6443 {
+                primary_kubeconfig = pki.admin_kubeconfig.clone();
+            }
+            let mut ordered = nodes.clone();
+            ordered.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            let index = ordered
+                .iter()
+                .position(|n| n.node_id == node_id)
+                .unwrap_or(0);
+            let pod_subnet = crate::nixgen::node_pod_subnet(&cluster.cluster_cidr, index);
+            members.push(OwnedMember {
+                cluster_name: cluster.name,
+                node,
+                pki,
+                cluster_cidr: cluster.cluster_cidr,
+                service_cidr: cluster.service_cidr,
+                etcd_server_cert,
+                etcd_server_key,
+                etcd_peer_cert,
+                etcd_peer_key,
+                all_nodes: nodes,
+                settings,
+                pod_subnet,
+            });
+        }
+        if members.is_empty() {
+            anyhow::bail!("no kubernetes clusters with PKI include node {node_id}");
+        }
+        let renders: Vec<crate::nixgen::KubernetesMemberRender<'_>> = members
+            .iter()
+            .map(|member| crate::nixgen::KubernetesMemberRender {
+                cluster_name: &member.cluster_name,
+                node: &member.node,
+                pki: &member.pki,
+                cluster_cidr: &member.cluster_cidr,
+                service_cidr: &member.service_cidr,
+                etcd_server_cert: &member.etcd_server_cert,
+                etcd_server_key: &member.etcd_server_key,
+                etcd_peer_cert: &member.etcd_peer_cert,
+                etcd_peer_key: &member.etcd_peer_key,
+                all_nodes: &member.all_nodes,
+                settings: &member.settings,
+                pod_subnet: member.pod_subnet.clone(),
+            })
+            .collect();
+        let nix = crate::nixgen::generate_colocated_kubernetes_config(&renders)?;
+        if primary_kubeconfig.is_empty() {
+            primary_kubeconfig = current_pki.admin_kubeconfig.clone();
+        }
+        Ok(RenderedNodeNix {
+            nix,
+            primary_kubeconfig,
+            cluster_count: members.len(),
+        })
     }
 
     async fn wait_for_etcd_leader(&self, node_id: &str, timeout_secs: u64) -> Result<()> {
@@ -593,6 +696,11 @@ impl KubernetesOrchestrator {
         let Some(pki) = self.db.load_kubernetes_pki(cluster_name)? else {
             return Ok(0);
         };
+        let Some(cluster) = self.db.get_kubernetes_cluster(cluster_name)? else {
+            return Ok(0);
+        };
+        let etcd_port =
+            crate::nixgen::kubernetes_listen_ports(&cluster.api_server_endpoint).etcd_client;
         let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
         let mut healthy = 0usize;
         for row in rows.iter().filter(|row| row.role == "control-plane") {
@@ -602,6 +710,7 @@ impl KubernetesOrchestrator {
             }
             match etcd_member_healthy(
                 ip,
+                etcd_port,
                 &pki.etcd_ca_cert,
                 &pki.apiserver_etcd_client_cert,
                 &pki.apiserver_etcd_client_key,
@@ -735,12 +844,13 @@ fn response_reports_ready(path: &str, status: u16, body: &str) -> bool {
 
 async fn etcd_member_healthy(
     ip: &str,
+    port: u16,
     ca_pem: &str,
     client_cert_pem: &str,
     client_key_pem: &str,
 ) -> Result<bool> {
     let (status, body) = tls_get(
-        &format!("{ip}:2379"),
+        &format!("{ip}:{port}"),
         ip,
         "/health",
         ca_pem,
@@ -839,6 +949,27 @@ fn pem_key(pem_str: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
         "RSA PRIVATE KEY" => Ok(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(bytes))),
         other => anyhow::bail!("unsupported private key type {other}"),
     }
+}
+
+struct RenderedNodeNix {
+    nix: String,
+    primary_kubeconfig: String,
+    cluster_count: usize,
+}
+
+struct OwnedMember {
+    cluster_name: String,
+    node: ClusterNode,
+    pki: KubernetesPki,
+    cluster_cidr: String,
+    service_cidr: String,
+    etcd_server_cert: String,
+    etcd_server_key: String,
+    etcd_peer_cert: String,
+    etcd_peer_key: String,
+    all_nodes: Vec<ClusterNode>,
+    settings: crate::nixgen::KubernetesRenderSettings,
+    pod_subnet: String,
 }
 
 #[derive(Debug, Clone)]
