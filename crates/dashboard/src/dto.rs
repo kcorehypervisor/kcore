@@ -403,3 +403,97 @@ pub struct LvmPhysicalVolumeDto {
     pub free: String,
     pub attr: String,
 }
+
+/// One DBMS managed by kcore Database Service. v1 is a PostgreSQL instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbmsRowDto {
+    pub name: String,
+    pub engine: String,
+    pub database: String,
+    pub package: String,
+    pub port: i32,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbmsDetailDto {
+    pub name: String,
+    pub engine: String,
+    pub database: String,
+    pub package: String,
+    pub port: i32,
+    pub node_id: String,
+    /// How clients reach the database.
+    pub access: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesNodeDto {
+    pub node_id: String,
+    pub role: String,
+    pub advertise_address: String,
+    pub iface: String,
+    pub initial_cluster: bool,
+    pub join_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesClusterRowDto {
+    pub name: String,
+    pub phase: String,
+    pub message: String,
+    pub cni: String,
+    pub api_server_endpoint: String,
+    pub control_planes: i32,
+    pub workers: i32,
+    pub ready_control_planes: i32,
+    pub ready_workers: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesNodeHealthDto {
+    pub node_id: String,
+    pub kubernetes_status: String,
+    pub kubelet_active: bool,
+    pub etcd_active: bool,
+    pub api_server_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesClusterDetailDto {
+    pub name: String,
+    pub generation: i64,
+    pub phase: String,
+    pub message: String,
+    pub last_updated: String,
+    pub active_node_ids: String,
+    pub cluster_cidr: String,
+    pub service_cidr: String,
+    pub cluster_dns: String,
+    pub api_server_endpoint: String,
+    pub cni: String,
+    pub cilium_configured: bool,
+    pub cilium_mode: String,
+    pub cilium_mtu: i32,
+    pub cilium_tunnel: String,
+    pub cilium_auto_direct: bool,
+    pub cilium_lb_pools: String,
+    pub ha_configured: bool,
+    pub ha_enabled: bool,
+    pub ha_vip: String,
+    pub ha_interface: String,
+    pub ha_method: String,
+    pub control_plane_nodes: Vec<KubernetesNodeDto>,
+    pub worker_nodes: Vec<KubernetesNodeDto>,
+    pub overall_health: String,
+    pub health_ready_control_planes: i32,
+    pub health_total_control_planes: i32,
+    pub health_ready_workers: i32,
+    pub health_total_workers: i32,
+    pub etcd_healthy: bool,
+    pub etcd_member_count: i32,
+    pub api_server_reachable: bool,
+    pub node_health: Vec<KubernetesNodeHealthDto>,
+    /// Empty when the health RPC succeeded.
+    pub health_error: String,
+}

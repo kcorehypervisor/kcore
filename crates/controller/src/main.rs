@@ -20,6 +20,9 @@ mod db;
 mod disk_reconciler;
 mod grpc;
 mod guest_ops;
+mod kubernetes_orchestrator;
+mod kubernetes_pki;
+mod kubernetes_update;
 mod metrics_targets;
 mod net_policy;
 mod nixgen;
@@ -178,6 +181,12 @@ async fn main() -> anyhow::Result<()> {
     cluster_update_reconciler::spawn_cluster_update_reconciler(database.clone(), clients.clone());
     snapshot_policy_reconciler::spawn_snapshot_policy_reconciler(database.clone(), clients.clone());
     vm_operation_reconciler::spawn_vm_operation_reconciler(database.clone(), clients.clone());
+
+    tokio::spawn(kubernetes_orchestrator::start_kubernetes_orchestrator(
+        database.clone(),
+        clients.clone(),
+    ));
+
     {
         let db = database.clone();
         let clients = clients.clone();

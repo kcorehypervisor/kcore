@@ -16,6 +16,7 @@ mod guest_ops;
 mod host_cpu;
 mod issue_screen;
 mod live_migrate;
+mod nixgen_k8s;
 mod path_safety;
 mod pki;
 mod rate_limit;

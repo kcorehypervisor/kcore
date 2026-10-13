@@ -232,6 +232,81 @@ pub async fn list_vm_operations(
     Ok(resp.into_inner().operations)
 }
 
+pub async fn list_postgresqls(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::PostgresqlInfo>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_postgresqls(controller_proto::ListPostgresqlsRequest {
+            target_node: String::new(),
+        })
+        .await
+        .context("ListPostgresqls RPC")?;
+    Ok(resp.into_inner().postgresqls)
+}
+
+pub async fn get_postgresql(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::PostgresqlInfo> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .get_postgresql(controller_proto::GetPostgresqlRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetPostgresql RPC for '{name}'"))?;
+    resp.into_inner()
+        .postgresql
+        .with_context(|| format!("postgresql '{name}' not found"))
+}
+
+pub async fn list_kubernetes_clusters(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::KubernetesCluster>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_kubernetes_clusters(controller_proto::ListKubernetesClustersRequest {})
+        .await
+        .context("ListKubernetesClusters RPC")?;
+    Ok(resp.into_inner().clusters)
+}
+
+pub async fn get_kubernetes_cluster(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::KubernetesCluster> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .get_kubernetes_cluster(controller_proto::GetKubernetesClusterRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetKubernetesCluster RPC for '{name}'"))?;
+    resp.into_inner()
+        .cluster
+        .with_context(|| format!("kubernetes cluster '{name}' not found"))
+}
+
+pub async fn get_kubernetes_cluster_health(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::GetKubernetesClusterHealthResponse> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .get_kubernetes_cluster_health(controller_proto::GetKubernetesClusterHealthRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetKubernetesClusterHealth RPC for '{name}'"))?;
+    Ok(resp.into_inner())
+}
+
 pub async fn list_audit_events(
     cfg: &DashboardConfig,
     limit: u32,

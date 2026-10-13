@@ -96,4 +96,39 @@ impl NodeClients {
             .get(address)
             .map(|(_, _, _, s)| s.clone())
     }
+
+    // Kubernetes-specific methods
+    pub async fn apply_kubernetes_config(&self, _cluster_name: &str, _config: &str) -> Result<()> {
+        // TODO: Implement actual config application via node agent
+        Ok(())
+    }
+
+    pub async fn check_etcd_status(&self) -> Result<EtcdStatus> {
+        // TODO: Implement actual etcd status check
+        Ok(EtcdStatus {
+            is_leader: true,
+            is_healthy: true,
+        })
+    }
+
+    pub async fn check_apiserver_status(&self) -> Result<ApiserverStatus> {
+        // TODO: Implement actual apiserver status check
+        Ok(ApiserverStatus { is_healthy: true })
+    }
+
+    pub async fn execute_command(&self, _command: &str) -> Result<String> {
+        // TODO: Implement actual command execution
+        Ok(String::new())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EtcdStatus {
+    pub is_leader: bool,
+    pub is_healthy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiserverStatus {
+    pub is_healthy: bool,
 }
