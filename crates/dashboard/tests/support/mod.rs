@@ -715,6 +715,8 @@ impl Controller for MockController {
                 guest_visible_bytes: -1,
                 guest_checked_at: String::new(),
                 encrypted: false,
+                mount_point: String::new(),
+                fs_type: String::new(),
             }],
         }))
     }
@@ -830,6 +832,27 @@ impl Controller for MockController {
         _: Request<ResizeVolumeRequest>,
     ) -> Result<Response<ResizeVolumeResponse>, Status> {
         Err(unimp("resize_volume"))
+    }
+
+    async fn format_volume(
+        &self,
+        _: Request<FormatVolumeRequest>,
+    ) -> Result<Response<FormatVolumeResponse>, Status> {
+        Err(unimp("format_volume"))
+    }
+
+    async fn mount_volume(
+        &self,
+        _: Request<MountVolumeRequest>,
+    ) -> Result<Response<MountVolumeResponse>, Status> {
+        Err(unimp("mount_volume"))
+    }
+
+    async fn unmount_volume(
+        &self,
+        _: Request<UnmountVolumeRequest>,
+    ) -> Result<Response<UnmountVolumeResponse>, Status> {
+        Err(unimp("unmount_volume"))
     }
 
     async fn encrypt_volume(

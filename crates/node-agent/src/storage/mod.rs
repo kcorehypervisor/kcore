@@ -68,7 +68,7 @@ pub struct CreateVolumeRequest {
     pub storage_class: String,
     pub size_bytes: i64,
     pub parameters: HashMap<String, String>,
-    /// Empty keeps `<lv_prefix><volume_id>`. Set to choose a name with no prefix.
+    /// Empty keeps `<prefix><volume_id>`. Set to choose an LVM or ZFS name with no prefix.
     pub lv_name: String,
 }
 
@@ -457,12 +457,13 @@ impl ZfsAdapter {
 impl StorageAdapter for ZfsAdapter {
     fn create_volume(&self, req: CreateVolumeRequest) -> Result<String, StorageError> {
         validate_volume_create_inputs(&req)?;
-        let zvol = format!(
-            "{}/{}{}",
-            self.pool_name,
-            self.dataset_prefix,
-            sanitize_volume_name(&req.volume_id)
-        );
+        let dataset = crate::zfs_ops::dataset_name(
+            &self.pool_name,
+            &self.dataset_prefix,
+            &req.volume_id,
+            &req.lv_name,
+        )
+        .map_err(from_lvm)?;
         run_cmd(
             "zfs",
             &[
@@ -471,23 +472,17 @@ impl StorageAdapter for ZfsAdapter {
                 &req.size_bytes.to_string(),
                 "-o",
                 "volmode=dev",
-                &zvol,
+                &dataset,
             ],
             ErrorKind::Internal,
         )?;
-        Ok(format!("/dev/zvol/{zvol}"))
+        Ok(format!("/dev/zvol/{dataset}"))
     }
 
     fn delete_volume(&self, backend_handle: &str) -> Result<(), StorageError> {
-        let target = backend_handle.trim();
-        if target.is_empty() {
-            return Err(StorageError::new(
-                ErrorKind::InvalidArgument,
-                "backend_handle is required",
-            ));
-        }
-        let dataset = target.strip_prefix("/dev/zvol/").unwrap_or(target);
-        run_cmd("zfs", &["destroy", "-f", dataset], ErrorKind::Internal)?;
+        let (dataset, _) =
+            crate::zfs_ops::zvol_location(&self.pool_name, backend_handle).map_err(from_lvm)?;
+        run_cmd("zfs", &["destroy", "-f", &dataset], ErrorKind::Internal)?;
         Ok(())
     }
 

@@ -27,6 +27,7 @@ mod runtime;
 mod storage;
 mod vmm;
 mod volume_crypto;
+mod zfs_ops;
 
 use clap::{Args, Parser, Subcommand};
 use tokio::signal;
@@ -203,9 +204,17 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
+        let zfs_pool = if matches!(cfg.storage.backend, config::StorageBackendKind::Zfs) {
+            cfg.storage.zfs.as_ref().map(|zfs| zfs.pool_name.clone())
+        } else {
+            None
+        };
         let mut storage_service = grpc::StorageService::new_with_storage(storage.clone());
         if let Some(vg) = lvm_vg {
             storage_service = storage_service.with_lvm_vg(vg);
+        }
+        if let Some(pool) = zfs_pool {
+            storage_service = storage_service.with_zfs_pool(pool);
         }
         let storage_svc = InterceptedService::new(
             proto::node_storage_server::NodeStorageServer::with_interceptor(

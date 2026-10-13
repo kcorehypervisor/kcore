@@ -1887,7 +1887,7 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 .map_err(|e| format!("delete postgresql {name}: {e}"))?;
             Ok(())
         }
-        "volume.create" | "volume.attach" | "volume.detach" => {
+        "volume.create" | "volume.attach" | "volume.detach" | "volume.update" => {
             let id = required_str(&body, "id", &head.resource_key)?;
             let name = required_str(&body, "name", &head.resource_key)?;
             let existing = db
@@ -1930,6 +1930,15 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             }
             if let Some(v) = body.get("storageClass").and_then(Value::as_str) {
                 row.storage_class = v.to_string();
+            }
+            if let Some(v) = body.get("hostNodeId").and_then(Value::as_str) {
+                row.host_node_id = v.to_string();
+            }
+            if let Some(v) = body.get("fsType").and_then(Value::as_str) {
+                row.fs_type = v.to_string();
+            }
+            if let Some(v) = body.get("mountPoint").and_then(Value::as_str) {
+                row.mount_point = v.to_string();
             }
             if let Some(v) = body.get("sourceJson").and_then(Value::as_str) {
                 row.source_json = v.to_string();

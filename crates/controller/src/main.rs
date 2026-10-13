@@ -20,6 +20,7 @@ mod db;
 mod disk_reconciler;
 mod grpc;
 mod guest_ops;
+mod host_volume;
 mod kubernetes_orchestrator;
 mod kubernetes_pki;
 mod kubernetes_update;

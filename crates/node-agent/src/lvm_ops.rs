@@ -27,7 +27,7 @@ pub struct LvmOpError {
 }
 
 impl LvmOpError {
-    fn new(kind: Kind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: Kind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -142,7 +142,7 @@ pub fn mount_unit_name(mount_point: &str) -> String {
 
 pub fn mount_unit_contents(device: &str, mount_point: &str, fs_type: &str) -> String {
     format!(
-        "[Unit]\nDescription=kcore logical volume {mount_point}\n\n[Mount]\nWhat={device}\nWhere={mount_point}\nType={fs_type}\nOptions=defaults\n\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=kcore volume {mount_point}\n\n[Mount]\nWhat={device}\nWhere={mount_point}\nType={fs_type}\nOptions=defaults\n\n[Install]\nWantedBy=multi-user.target\n"
     )
 }
 
@@ -252,7 +252,7 @@ pub fn mount_fs_type(requested: &str, found: Option<&str>) -> Result<String, Lvm
         let found = found.ok_or_else(|| {
             LvmOpError::new(
                 Kind::FailedPrecondition,
-                "logical volume has no filesystem; format it or pass fs_type",
+                "volume has no filesystem; format it or pass fs_type",
             )
         })?;
         return normalize_fs_type(found);
@@ -279,7 +279,7 @@ pub fn format_commands(
     if facts.mounted_at.is_some() {
         return Err(LvmOpError::new(
             Kind::FailedPrecondition,
-            "unmount the logical volume before formatting it",
+            "unmount the volume before formatting it",
         ));
     }
     if facts.fs_type.is_some() && !force {
@@ -322,8 +322,21 @@ pub fn format_volume(
     force: bool,
 ) -> Result<String, LvmOpError> {
     let device = logical_volume_device(vg, backend_handle)?;
-    let facts = probe_device(&device)?;
-    let cmd = format_commands(&device, fs_type, force, &facts)?;
+    format_device(&device, fs_type, force)
+}
+
+pub(crate) fn format_device(
+    device: &str,
+    fs_type: &str,
+    force: bool,
+) -> Result<String, LvmOpError> {
+    let (mounted_at, fs_found) = block_fs(device)?;
+    let facts = BlockFacts {
+        size_bytes: 0,
+        mounted_at,
+        fs_type: fs_found,
+    };
+    let cmd = format_commands(device, fs_type, force, &facts)?;
     run_argv(&cmd)?;
     Ok(format!(
         "formatted {device} as {}",
@@ -339,13 +352,27 @@ pub fn mount_volume(
     persistent: bool,
 ) -> Result<String, LvmOpError> {
     let device = logical_volume_device(vg, backend_handle)?;
+    mount_device(&device, mount_point, fs_type, persistent)
+}
+
+pub(crate) fn mount_device(
+    device: &str,
+    mount_point: &str,
+    fs_type: &str,
+    persistent: bool,
+) -> Result<String, LvmOpError> {
     let mount_point = validate_mount_point(mount_point)?;
-    let facts = probe_device(&device)?;
+    let (mounted_at, fs_found) = block_fs(device)?;
+    let facts = BlockFacts {
+        size_bytes: 0,
+        mounted_at,
+        fs_type: fs_found,
+    };
     if let Some(existing) = facts.mounted_at.as_deref() {
         if existing == mount_point {
             if persistent {
                 install_mount_unit(
-                    &device,
+                    device,
                     &mount_point,
                     facts.fs_type.as_deref().unwrap_or("ext4"),
                 )?;
@@ -360,13 +387,13 @@ pub fn mount_volume(
     let fs = mount_fs_type(fs_type, facts.fs_type.as_deref())?;
     prepare_mount_point(&mount_point)?;
     if persistent {
-        install_mount_unit(&device, &mount_point, &fs)?;
+        install_mount_unit(device, &mount_point, &fs)?;
     } else {
         run_argv(&[
             "mount".into(),
             "-t".into(),
             fs.clone(),
-            device.clone(),
+            device.to_string(),
             mount_point.clone(),
         ])?;
     }
@@ -400,8 +427,8 @@ pub fn unmount_volume(mount_point: &str, persistent: bool) -> Result<String, Lvm
     Ok(format!("unmounted {mount_point}"))
 }
 
-fn validate_lv_name(name: &str) -> Result<String, LvmOpError> {
-    let name = path_safety::validate_safe_segment(name, "lv_name")
+pub(crate) fn validate_component(name: &str, what: &str) -> Result<String, LvmOpError> {
+    let name = path_safety::validate_safe_segment(name, what)
         .map_err(|err| LvmOpError::new(Kind::InvalidArgument, err))?;
     let mut chars = name.chars();
     let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
@@ -409,13 +436,17 @@ fn validate_lv_name(name: &str) -> Result<String, LvmOpError> {
     if !first_ok || !rest_ok {
         return Err(LvmOpError::new(
             Kind::InvalidArgument,
-            "lv_name must be letters, digits, '_', '.', '+', or '-'",
+            format!("{what} must be letters, digits, '_', '.', '+', or '-'"),
         ));
     }
     Ok(name.to_string())
 }
 
-fn sanitize_volume_id(name: &str) -> String {
+fn validate_lv_name(name: &str) -> Result<String, LvmOpError> {
+    validate_component(name, "lv_name")
+}
+
+pub(crate) fn sanitize_volume_id(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| {
@@ -487,17 +518,22 @@ fn mount_point_is_mounted(mount_point: &str) -> Result<bool, LvmOpError> {
 
 fn probe_device(device: &str) -> Result<BlockFacts, LvmOpError> {
     let size_bytes = lvs_size(device)?;
+    let (mounted_at, fs_type) = block_fs(device)?;
+    Ok(BlockFacts {
+        size_bytes,
+        mounted_at,
+        fs_type,
+    })
+}
+
+pub(crate) fn block_fs(device: &str) -> Result<(Option<String>, Option<String>), LvmOpError> {
     let (mounted_at, mounted_fs) = findmnt_source(device)?;
     let fs_type = if mounted_fs.is_some() {
         mounted_fs
     } else {
         blkid_type(device)?
     };
-    Ok(BlockFacts {
-        size_bytes,
-        mounted_at,
-        fs_type,
-    })
+    Ok((mounted_at, fs_type))
 }
 
 fn lvs_size(device: &str) -> Result<i64, LvmOpError> {
@@ -567,14 +603,14 @@ fn blkid_type(device: &str) -> Result<Option<String>, LvmOpError> {
     ))
 }
 
-fn run_plan(commands: &[Vec<String>]) -> Result<(), LvmOpError> {
+pub(crate) fn run_plan(commands: &[Vec<String>]) -> Result<(), LvmOpError> {
     for cmd in commands {
         run_argv(cmd)?;
     }
     Ok(())
 }
 
-fn run_argv(argv: &[String]) -> Result<(), LvmOpError> {
+pub(crate) fn run_argv(argv: &[String]) -> Result<(), LvmOpError> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| LvmOpError::new(Kind::Internal, "empty command"))?;
@@ -585,7 +621,7 @@ fn run_argv(argv: &[String]) -> Result<(), LvmOpError> {
     .map(|_| ())
 }
 
-fn capture(program: &str, args: &[&str]) -> Result<String, LvmOpError> {
+pub(crate) fn capture(program: &str, args: &[&str]) -> Result<String, LvmOpError> {
     let output = Command::new(program).args(args).output().map_err(|err| {
         LvmOpError::new(
             Kind::Internal,
