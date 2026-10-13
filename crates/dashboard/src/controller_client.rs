@@ -160,6 +160,38 @@ pub async fn list_ceph_clusters(
     Ok(resp.into_inner().ceph_clusters)
 }
 
+pub async fn get_ceph_cluster(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::CephCluster> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .get_ceph_cluster(controller_proto::GetCephClusterRequest {
+            name: name.to_string(),
+        })
+        .await
+        .context("GetCephCluster RPC")?;
+    resp.into_inner()
+        .ceph_cluster
+        .ok_or_else(|| anyhow::anyhow!("GetCephCluster returned empty cluster"))
+}
+
+pub async fn get_ceph_cluster_capacity(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::GetCephClusterCapacityResponse> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .get_ceph_cluster_capacity(controller_proto::GetCephClusterCapacityRequest {
+            name: name.to_string(),
+        })
+        .await
+        .context("GetCephClusterCapacity RPC")?;
+    Ok(resp.into_inner())
+}
+
 pub async fn list_shared_filesystems(
     cfg: &DashboardConfig,
 ) -> Result<Vec<controller_proto::SharedFilesystem>> {

@@ -1,17 +1,22 @@
 use crate::api::{
-    get_compliance_dto, get_dbms_dto, get_kubernetes_cluster_dto, get_network_overview_dto,
-    get_replication_status_dto, get_storage_overview_dto, list_audit_events_dto,
-    list_ceph_clusters_dto, list_dbms_dto, list_kubernetes_clusters_dto, list_networks_dto,
-    list_object_stores_dto, list_operations_dto, list_replication_conflicts_dto,
+    get_ceph_cluster_detail_dto, get_compliance_dto, get_dbms_dto, get_kubernetes_cluster_dto,
+    get_network_overview_dto, get_replication_status_dto, get_storage_overview_dto,
+    list_audit_events_dto, list_ceph_clusters_dto, list_dbms_dto, list_kubernetes_clusters_dto,
+    list_networks_dto, list_object_stores_dto, list_operations_dto, list_replication_conflicts_dto,
     list_shared_filesystems_dto, list_vms_page, list_volumes_dto,
 };
 use crate::dto::{
-    AuditEventDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto, DbmsRowDto, HostInterfaceDto,
-    KubernetesClusterDetailDto, KubernetesClusterRowDto, KubernetesNodeDto,
-    KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto,
-    NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto,
-    ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto, SharedFilesystemRowDto,
-    StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
+    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto,
+    DbmsRowDto, HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto,
+    KubernetesNodeDto, KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
+    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
+    NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto,
+    SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto,
+    VmsPageDto, VolumeRowDto,
+};
+use crate::format::paginate_by_name;
+use crate::paging::{
+    list_pager, list_pager_named, list_paging, list_paging_named, paginate_items, query_string,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, Meta, MetaTags, Stylesheet, Title};
@@ -20,6 +25,15 @@ use leptos_router::{
     hooks::{use_params_map, use_query_map},
     path,
 };
+
+fn extra_pair(key: &str, value: &str) -> Option<(String, String)> {
+    let v = value.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some((key.to_string(), v.to_string()))
+    }
+}
 
 pub fn shell(_options: LeptosOptions) -> impl IntoView {
     view! {
@@ -78,6 +92,7 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/vms") view=VmsPage/>
                         <Route path=path!("/volumes") view=VolumesPage/>
                         <Route path=path!("/ceph") view=CephPage/>
+                        <Route path=path!("/ceph/:name") view=CephClusterDetailPage/>
                         <Route path=path!("/kds") view=KdsPage/>
                         <Route path=path!("/kds/:name") view=KdsDetailPage/>
                         <Route path=path!("/k8s") view=KubernetesPage/>
@@ -154,6 +169,8 @@ fn HomePage() -> impl IntoView {
 
 #[component]
 fn CompliancePage() -> impl IntoView {
+    let query = use_query_map();
+    let paging = Memo::new(move |_| list_paging(&query.get()));
     let res = Resource::new(|| (), |_| get_compliance_dto());
     let replication_res = Resource::new(|| (), |_| get_replication_status_dto());
     let conflicts_res = Resource::new(|| (), |_| list_replication_conflicts_dto());
@@ -167,12 +184,15 @@ fn CompliancePage() -> impl IntoView {
             <p class="muted">"Same evidence categories as "<code class="inline">"kctl report"</code>"."</p>
         </section>
         <Suspense fallback=move || view! { <p class="muted">"Loading compliance…"</p> }>
-            {move || Suspend::new(async move {
-                match res.await {
-                    Ok(data) => compliance_view(data).into_any(),
-                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
-                }
-            })}
+            {move || {
+                let (page, per_page) = paging.get();
+                Suspend::new(async move {
+                    match res.await {
+                        Ok(data) => compliance_view(data, page, per_page).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
         </Suspense>
         <section class="card" style="margin-top: 1rem;">
             <h2>"Recent audit events"</h2>
@@ -180,7 +200,7 @@ fn CompliancePage() -> impl IntoView {
             <Suspense fallback=move || view! { <p class="muted">"Loading audit events…"</p> }>
                 {move || Suspend::new(async move {
                     match audit_res.await {
-                        Ok(data) => audit_events_view(data, false).into_any(),
+                        Ok(data) => audit_events_view(data, false, "", "page", 1, 50, &[]).into_any(),
                         Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
                     }
                 })}
@@ -211,7 +231,15 @@ fn CompliancePage() -> impl IntoView {
     }
 }
 
-fn audit_events_view(events: Vec<AuditEventDto>, searched: bool) -> impl IntoView {
+fn audit_events_view(
+    events: Vec<AuditEventDto>,
+    searched: bool,
+    path: &str,
+    page_param: &str,
+    page: u32,
+    per_page: usize,
+    extra: &[(String, String)],
+) -> impl IntoView {
     if events.is_empty() {
         let msg = if searched {
             "No audit events match this search."
@@ -220,7 +248,26 @@ fn audit_events_view(events: Vec<AuditEventDto>, searched: bool) -> impl IntoVie
         };
         return view! { <p class="muted">{msg}</p> }.into_any();
     }
-    view! {
+    let show_pager = !path.is_empty();
+    let pv = if show_pager {
+        paginate_items(events, page, per_page)
+    } else {
+        let n = events.len();
+        crate::format::PageView {
+            items: events,
+            page: 1,
+            page_size: n.max(1),
+            total: n,
+        }
+    };
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let events: Vec<AuditEventDto> = pv.items;
+    let path = path.to_string();
+    let page_param = page_param.to_string();
+    let extra = extra.to_vec();
+    let table = view! {
         <div class="table-wrap">
             <table class="data">
                 <thead>
@@ -233,7 +280,7 @@ fn audit_events_view(events: Vec<AuditEventDto>, searched: bool) -> impl IntoVie
                     </tr>
                 </thead>
                 <tbody>
-                    {events.into_iter().map(|e| {
+                    {events.into_iter().map(|e: AuditEventDto| {
                         let detail = if e.detail.chars().count() > 48 {
                             let mut t: String = e.detail.chars().take(47).collect();
                             t.push('…');
@@ -254,8 +301,16 @@ fn audit_events_view(events: Vec<AuditEventDto>, searched: bool) -> impl IntoVie
                 </tbody>
             </table>
         </div>
+    };
+    if show_pager {
+        view! {
+            {table}
+            {list_pager_named(&path, &page_param, page, page_size, total, "events", &extra)}
+        }
+        .into_any()
+    } else {
+        table.into_any()
     }
-    .into_any()
 }
 
 fn replication_status_view(data: ReplicationStatusDto) -> impl IntoView {
@@ -389,7 +444,7 @@ fn conflicts_view(conflicts: Vec<ReplicationConflictDto>) -> impl IntoView {
     .into_any()
 }
 
-fn compliance_view(data: ComplianceDto) -> impl IntoView {
+fn compliance_view(data: ComplianceDto, page: u32, per_page: usize) -> impl IntoView {
     let nodes = data.nodes.clone();
     let has_nodes = !nodes.is_empty();
     let mtls = if data.mtls_enabled {
@@ -481,13 +536,18 @@ fn compliance_view(data: ComplianceDto) -> impl IntoView {
             </section>
         </div>
         <Show when=move || has_nodes>
-            <NodeDetailsTable nodes=nodes.clone()/>
+            <NodeDetailsTable nodes=nodes.clone() page=page per_page=per_page/>
         </Show>
     }
 }
 
 #[component]
-fn NodeDetailsTable(nodes: Vec<NodeSummaryDto>) -> impl IntoView {
+fn NodeDetailsTable(nodes: Vec<NodeSummaryDto>, page: u32, per_page: usize) -> impl IntoView {
+    let pv = paginate_by_name(nodes, |n| n.hostname.clone(), page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let rows = pv.items;
     view! {
         <section class="card" style="margin-top: 1rem;">
             <h2>"Node details"</h2>
@@ -504,7 +564,7 @@ fn NodeDetailsTable(nodes: Vec<NodeSummaryDto>) -> impl IntoView {
                         </tr>
                     </thead>
                     <tbody>
-                        {nodes.into_iter().map(|n| view! {
+                        {rows.into_iter().map(|n| view! {
                             <tr>
                                 <td><code class="inline">{n.node_id}</code></td>
                                 <td>{n.hostname}</td>
@@ -517,6 +577,7 @@ fn NodeDetailsTable(nodes: Vec<NodeSummaryDto>) -> impl IntoView {
                     </tbody>
                 </table>
             </div>
+            {list_pager("/compliance", page, page_size, total, "nodes", &[])}
         </section>
     }
 }
@@ -524,22 +585,15 @@ fn NodeDetailsTable(nodes: Vec<NodeSummaryDto>) -> impl IntoView {
 #[component]
 fn VmsPage() -> impl IntoView {
     let query = use_query_map();
-    let page = Memo::new(move |_| {
-        query
-            .get()
-            .get("page")
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|&p| p >= 1)
-            .unwrap_or(1)
-    });
+    let paging = Memo::new(move |_| list_paging(&query.get()));
     let res = Resource::new(
-        move || page.get(),
-        |p| async move { list_vms_page(p).await },
+        move || paging.get(),
+        |(page, per_page)| async move { list_vms_page(page, per_page as u32).await },
     );
     view! {
         <section class="hero">
             <h1>"Virtual machines"</h1>
-            <p class="muted">"Ten VMs per page when the cluster has more than ten workloads."</p>
+            <p class="muted">"Choose how many VMs to show per page when the cluster has many workloads."</p>
         </section>
         <Suspense fallback=move || view! { <p class="muted">"Loading VMs…"</p> }>
             {move || Suspend::new(async move {
@@ -556,24 +610,10 @@ fn vms_table(data: VmsPageDto) -> impl IntoView {
     let VmsPageDto {
         vms,
         page,
-        total_pages,
+        page_size,
         total,
-        has_prev,
-        has_next,
         ..
     } = data;
-    let prev = page.saturating_sub(1);
-    let next = page.saturating_add(1);
-    let prev_href = if has_prev {
-        format!("/vms?page={prev}")
-    } else {
-        String::new()
-    };
-    let next_href = if has_next {
-        format!("/vms?page={next}")
-    } else {
-        String::new()
-    };
     view! {
         <div class="table-wrap">
             <table class="data">
@@ -593,17 +633,7 @@ fn vms_table(data: VmsPageDto) -> impl IntoView {
                 </tbody>
             </table>
         </div>
-        <div class="pager">
-            <Show when=move || has_prev>
-                <a href=prev_href.clone()>"← Previous"</a>
-            </Show>
-            <span class="muted">
-                {format!("Page {page} of {total_pages} — {total} VMs")}
-            </span>
-            <Show when=move || has_next>
-                <a href=next_href.clone()>"Next →"</a>
-            </Show>
-        </div>
+        {list_pager("/vms", page, page_size, total, "VMs", &[])}
     }
 }
 
@@ -657,6 +687,8 @@ fn urlencoding_path(s: &str) -> String {
 
 #[component]
 fn VolumesPage() -> impl IntoView {
+    let query = use_query_map();
+    let paging = Memo::new(move |_| list_paging(&query.get()));
     let res = Resource::new(|| (), |_| list_volumes_dto());
     view! {
         <section class="hero">
@@ -664,23 +696,31 @@ fn VolumesPage() -> impl IntoView {
             <p class="muted">"Ceph RBD volumes from the controller (same data as kctl volume list). Local LVM and ZFS disks are on the Storage page."</p>
         </section>
         <Suspense fallback=move || view! { <p class="muted">"Loading volumes…"</p> }>
-            {move || Suspend::new(async move {
-                match res.await {
-                    Ok(rows) => volumes_table(rows).into_any(),
-                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
-                }
-            })}
+            {move || {
+                let (page, per_page) = paging.get();
+                Suspend::new(async move {
+                    match res.await {
+                        Ok(rows) => volumes_table(rows, page, per_page).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
         </Suspense>
     }
 }
 
-fn volumes_table(rows: Vec<VolumeRowDto>) -> impl IntoView {
+fn volumes_table(rows: Vec<VolumeRowDto>, page: u32, per_page: usize) -> impl IntoView {
     if rows.is_empty() {
         return view! {
             <div class="empty-note">"No Ceph RBD volumes registered. Local disks are on the Storage page. Create a volume with "<code class="inline">"kctl create volume"</code>"."</div>
         }
         .into_any();
     }
+    let pv = paginate_by_name(rows, |r| r.name.clone(), page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let rows = pv.items;
     view! {
         <div class="table-wrap">
             <table class="data">
@@ -718,6 +758,7 @@ fn volumes_table(rows: Vec<VolumeRowDto>) -> impl IntoView {
                 </tbody>
             </table>
         </div>
+        {list_pager("/volumes", page, page_size, total, "volumes", &[])}
     }
     .into_any()
 }
@@ -725,14 +766,16 @@ fn volumes_table(rows: Vec<VolumeRowDto>) -> impl IntoView {
 #[component]
 fn OperationsPage() -> impl IntoView {
     let query = use_query_map();
-    let q = Memo::new(move |_| query.get().get("q").unwrap_or_default());
+    let q = Memo::new(move |_| query_string(&query.get(), "q"));
+    let ops_paging = Memo::new(move |_| list_paging_named(&query.get(), "page"));
+    let activity_paging = Memo::new(move |_| list_paging_named(&query.get(), "activity_page"));
     let ops_res = Resource::new(
         move || q.get(),
         |q| async move { list_operations_dto(q).await },
     );
     let activity_res = Resource::new(
         move || q.get(),
-        |q| async move { list_audit_events_dto(q, String::new(), String::new(), 100).await },
+        |q| async move { list_audit_events_dto(q, String::new(), String::new(), 200).await },
     );
     view! {
         <section class="hero">
@@ -753,9 +796,19 @@ fn OperationsPage() -> impl IntoView {
         <Suspense fallback=move || view! { <p class="muted">"Loading operations…"</p> }>
             {move || {
                 let searched = !q.get().trim().is_empty();
+                let q_val = q.get();
+                let (page, per_page) = ops_paging.get();
+                let (activity_page, _) = activity_paging.get();
+                let mut extra = Vec::new();
+                if let Some(p) = extra_pair("q", &q_val) {
+                    extra.push(p);
+                }
+                if activity_page > 1 {
+                    extra.push(("activity_page".into(), activity_page.to_string()));
+                }
                 Suspend::new(async move {
                     match ops_res.await {
-                        Ok(rows) => operations_table(rows, searched).into_any(),
+                        Ok(rows) => operations_table(rows, searched, page, per_page, &extra).into_any(),
                         Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
                     }
                 })
@@ -766,9 +819,28 @@ fn OperationsPage() -> impl IntoView {
         <Suspense fallback=move || view! { <p class="muted">"Loading activity…"</p> }>
             {move || {
                 let searched = !q.get().trim().is_empty();
+                let q_val = q.get();
+                let (activity_page, per_page) = activity_paging.get();
+                let (ops_page, _) = ops_paging.get();
+                let mut extra = Vec::new();
+                if let Some(p) = extra_pair("q", &q_val) {
+                    extra.push(p);
+                }
+                if ops_page > 1 {
+                    extra.push(("page".into(), ops_page.to_string()));
+                }
                 Suspend::new(async move {
                     match activity_res.await {
-                        Ok(rows) => audit_events_view(rows, searched).into_any(),
+                        Ok(rows) => audit_events_view(
+                            rows,
+                            searched,
+                            "/operations",
+                            "activity_page",
+                            activity_page,
+                            per_page,
+                            &extra,
+                        )
+                        .into_any(),
                         Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
                     }
                 })
@@ -783,20 +855,21 @@ fn AuditPage() -> impl IntoView {
     let filters = Memo::new(move |_| {
         let qmap = query.get();
         (
-            qmap.get("q").unwrap_or_default(),
-            qmap.get("action").unwrap_or_default(),
-            qmap.get("since").unwrap_or_default(),
+            query_string(&qmap, "q"),
+            query_string(&qmap, "action"),
+            query_string(&qmap, "since"),
         )
     });
+    let paging = Memo::new(move |_| list_paging(&query.get()));
     let res = Resource::new(
         move || filters.get(),
-        |(q, action, since)| async move { list_audit_events_dto(q, action, since, 200).await },
+        |(q, action, since)| async move { list_audit_events_dto(q, action, since, 500).await },
     );
     view! {
         <section class="hero">
             <h1>"Audit trail"</h1>
             <p class="muted">
-                "Append-only controller log. Search matches actor, action, resource, and detail in the latest 200 events. "
+                "Append-only controller log. Search matches actor, action, resource, and detail in the latest 500 events. "
                 "Action is an exact filter sent to the controller. Since is an inclusive RFC3339 lower bound."
             </p>
         </section>
@@ -817,13 +890,26 @@ fn AuditPage() -> impl IntoView {
         </form>
         <Suspense fallback=move || view! { <p class="muted">"Loading audit events…"</p> }>
             {move || {
-                let searched = {
-                    let (q, action, since) = filters.get();
-                    !q.trim().is_empty() || !action.trim().is_empty() || !since.trim().is_empty()
-                };
+                let (q, action, since) = filters.get();
+                let searched =
+                    !q.trim().is_empty() || !action.trim().is_empty() || !since.trim().is_empty();
+                let (page, per_page) = paging.get();
+                let mut extra = Vec::new();
+                if let Some(p) = extra_pair("q", &q) {
+                    extra.push(p);
+                }
+                if let Some(p) = extra_pair("action", &action) {
+                    extra.push(p);
+                }
+                if let Some(p) = extra_pair("since", &since) {
+                    extra.push(p);
+                }
                 Suspend::new(async move {
                     match res.await {
-                        Ok(rows) => audit_events_view(rows, searched).into_any(),
+                        Ok(rows) => {
+                            audit_events_view(rows, searched, "/audit", "page", page, per_page, &extra)
+                                .into_any()
+                        }
                         Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
                     }
                 })
@@ -832,7 +918,13 @@ fn AuditPage() -> impl IntoView {
     }
 }
 
-fn operations_table(rows: Vec<VmOperationRowDto>, searched: bool) -> impl IntoView {
+fn operations_table(
+    rows: Vec<VmOperationRowDto>,
+    searched: bool,
+    page: u32,
+    per_page: usize,
+    extra: &[(String, String)],
+) -> impl IntoView {
     if rows.is_empty() {
         let msg = if searched {
             "No VM jobs match this search."
@@ -844,6 +936,12 @@ fn operations_table(rows: Vec<VmOperationRowDto>, searched: bool) -> impl IntoVi
         }
         .into_any();
     }
+    let pv = paginate_items(rows, page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let rows = pv.items;
+    let extra = extra.to_vec();
     view! {
         <div class="table-wrap">
             <table class="data">
@@ -882,6 +980,7 @@ fn operations_table(rows: Vec<VmOperationRowDto>, searched: bool) -> impl IntoVi
                 </tbody>
             </table>
         </div>
+        {list_pager("/operations", page, page_size, total, "jobs", &extra)}
     }
     .into_any()
 }
@@ -896,6 +995,9 @@ fn display_or_dash(value: &str) -> String {
 
 #[component]
 fn NetworksPage() -> impl IntoView {
+    let query = use_query_map();
+    let nodes_paging = Memo::new(move |_| list_paging_named(&query.get(), "nodes_page"));
+    let sdn_paging = Memo::new(move |_| list_paging_named(&query.get(), "page"));
     let sdn_res = Resource::new(|| (), |_| list_networks_dto());
     let overview_res = Resource::new(|| (), |_| get_network_overview_dto());
     view! {
@@ -906,27 +1008,48 @@ fn NetworksPage() -> impl IntoView {
 
         <h2 class="section-title">"Host networking"</h2>
         <Suspense fallback=move || view! { <p class="muted">"Loading host network data…"</p> }>
-            {move || Suspend::new(async move {
-                match overview_res.await {
-                    Ok(data) => host_networking_view(data).into_any(),
-                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+            {move || {
+                let (nodes_page, per_page) = nodes_paging.get();
+                let (sdn_page, _) = sdn_paging.get();
+                let mut extra = Vec::new();
+                if sdn_page > 1 {
+                    extra.push(("page".into(), sdn_page.to_string()));
                 }
-            })}
+                Suspend::new(async move {
+                    match overview_res.await {
+                        Ok(data) => host_networking_view(data, nodes_page, per_page, &extra).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
         </Suspense>
 
         <h2 class="section-title">"Software-defined networks"</h2>
         <Suspense fallback=move || view! { <p class="muted">"Loading SDN data…"</p> }>
-            {move || Suspend::new(async move {
-                match sdn_res.await {
-                    Ok(rows) => sdn_section(rows).into_any(),
-                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+            {move || {
+                let (page, per_page) = sdn_paging.get();
+                let (nodes_page, _) = nodes_paging.get();
+                let mut extra = Vec::new();
+                if nodes_page > 1 {
+                    extra.push(("nodes_page".into(), nodes_page.to_string()));
                 }
-            })}
+                Suspend::new(async move {
+                    match sdn_res.await {
+                        Ok(rows) => sdn_section(rows, page, per_page, &extra).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
         </Suspense>
     }
 }
 
-fn host_networking_view(data: NetworkOverviewDto) -> impl IntoView {
+fn host_networking_view(
+    data: NetworkOverviewDto,
+    page: u32,
+    per_page: usize,
+    extra: &[(String, String)],
+) -> impl IntoView {
     let has_nodes = !data.nodes.is_empty();
     let vxlan_ready = data.nodes.iter().filter(|n| !n.disable_vxlan).count();
     let vxlan_off = data.nodes.iter().filter(|n| n.disable_vxlan).count();
@@ -936,6 +1059,12 @@ fn host_networking_view(data: NetworkOverviewDto) -> impl IntoView {
         .flat_map(|n| n.interfaces.iter())
         .filter(|iface| iface.kind == "vxlan")
         .count();
+    let pv = paginate_by_name(data.nodes.clone(), |n| n.hostname.clone(), page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let page_nodes = pv.items;
+    let extra = extra.to_vec();
     view! {
         <section class="card" style="margin-bottom: 1rem;">
             <h2>"VXLAN on nodes"</h2>
@@ -957,12 +1086,15 @@ fn host_networking_view(data: NetworkOverviewDto) -> impl IntoView {
                 <dt>"Netmask"</dt><dd>{data.default_internal_netmask.clone()}</dd>
             </dl>
         </section>
-        <Show when=move || has_nodes>
-            {data.nodes.clone().into_iter().map(node_network_card).collect_view()}
-        </Show>
-        <Show when=move || !has_nodes>
-            <div class="empty-note">"No approved nodes found."</div>
-        </Show>
+        {if has_nodes {
+            view! {
+                {page_nodes.into_iter().map(node_network_card).collect_view()}
+                {list_pager_named("/networks", "nodes_page", page, page_size, total, "nodes", &extra)}
+            }
+            .into_any()
+        } else {
+            view! { <div class="empty-note">"No approved nodes found."</div> }.into_any()
+        }}
     }
 }
 
@@ -1031,13 +1163,19 @@ fn iface_row(iface: HostInterfaceDto) -> impl IntoView {
     }
 }
 
-fn sdn_section(rows: Vec<NetworkRowDto>) -> impl IntoView {
+fn sdn_section(
+    rows: Vec<NetworkRowDto>,
+    page: u32,
+    per_page: usize,
+    extra: &[(String, String)],
+) -> impl IntoView {
     let vxlan_networks = rows.iter().filter(|n| n.network_type == "vxlan").count();
     let isolated = rows
         .iter()
         .filter(|n| n.network_type == "vxlan" && !n.enable_outbound_nat)
         .count();
     let firewalls = rows.iter().filter(|n| n.east_west_firewall).count();
+    let extra = extra.to_vec();
     view! {
         <section class="card" style="margin-bottom: 1rem;">
             <h2>"VXLAN overlays"</h2>
@@ -1051,11 +1189,16 @@ fn sdn_section(rows: Vec<NetworkRowDto>) -> impl IntoView {
                 ". Turn outbound NAT off to keep the overlay isolated from the internet."
             </p>
         </section>
-        {sdn_table(rows)}
+        {sdn_table(rows, page, per_page, &extra)}
     }
 }
 
-fn sdn_table(rows: Vec<NetworkRowDto>) -> impl IntoView {
+fn sdn_table(
+    rows: Vec<NetworkRowDto>,
+    page: u32,
+    per_page: usize,
+    extra: &[(String, String)],
+) -> impl IntoView {
     if rows.is_empty() {
         return view! {
             <div class="empty-note">
@@ -1068,6 +1211,12 @@ fn sdn_table(rows: Vec<NetworkRowDto>) -> impl IntoView {
         }
         .into_any();
     }
+    let pv = paginate_by_name(rows, |n| n.name.clone(), page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let rows = pv.items;
+    let extra = extra.to_vec();
     view! {
         <div class="table-wrap">
             <table class="data">
@@ -1108,12 +1257,16 @@ fn sdn_table(rows: Vec<NetworkRowDto>) -> impl IntoView {
                 </tbody>
             </table>
         </div>
+        {list_pager("/networks", page, page_size, total, "networks", &extra)}
     }
     .into_any()
 }
 
 #[component]
 fn StoragePage() -> impl IntoView {
+    let query = use_query_map();
+    let paging = Memo::new(move |_| list_paging(&query.get()));
+    let disk_page = Memo::new(move |_| list_paging_named(&query.get(), "disk_page").0);
     let res = Resource::new(|| (), |_| get_storage_overview_dto());
     view! {
         <section class="hero">
@@ -1126,19 +1279,39 @@ fn StoragePage() -> impl IntoView {
             </p>
         </section>
         <Suspense fallback=move || view! { <p class="muted">"Loading storage overview…"</p> }>
-            {move || Suspend::new(async move {
-                match res.await {
-                    Ok(data) => storage_overview_view(data).into_any(),
-                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
-                }
-            })}
+            {move || {
+                let (page, per_page) = paging.get();
+                let disk_page = disk_page.get();
+                Suspend::new(async move {
+                    match res.await {
+                        Ok(data) => {
+                            storage_overview_view(data, page, per_page, disk_page).into_any()
+                        }
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
         </Suspense>
     }
 }
 
-fn storage_overview_view(data: StorageOverviewDto) -> impl IntoView {
+fn storage_overview_view(
+    data: StorageOverviewDto,
+    page: u32,
+    per_page: usize,
+    disk_page: u32,
+) -> impl IntoView {
     let nodes = data.nodes.clone();
     let has_nodes = !nodes.is_empty();
+    let pv = paginate_by_name(nodes, |n| n.hostname.clone(), page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let page_nodes = pv.items;
+    let mut node_pager_extra = Vec::new();
+    if disk_page > 1 {
+        node_pager_extra.push(("disk_page".into(), disk_page.to_string()));
+    }
     view! {
         <h2 class="section-title">"Cluster"</h2>
         <div class="card-grid cols-2">
@@ -1174,16 +1347,27 @@ fn storage_overview_view(data: StorageOverviewDto) -> impl IntoView {
         </div>
 
         <h2 class="section-title" style="margin-top: 1.5rem;">"Nodes"</h2>
-        <Show when=move || has_nodes>
-            {nodes.clone().into_iter().map(storage_node_card).collect_view()}
-        </Show>
-        <Show when=move || !has_nodes>
-            <div class="empty-note">"No approved nodes."</div>
-        </Show>
+        {if has_nodes {
+            view! {
+                {page_nodes
+                    .into_iter()
+                    .map(|n| storage_node_card(n, page, per_page, disk_page))
+                    .collect_view()}
+                {list_pager("/storage", page, page_size, total, "nodes", &node_pager_extra)}
+            }
+            .into_any()
+        } else {
+            view! { <div class="empty-note">"No approved nodes."</div> }.into_any()
+        }}
     }
 }
 
-fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
+fn storage_node_card(
+    node: NodeStorageDto,
+    nodes_page: u32,
+    per_page: usize,
+    disk_page: u32,
+) -> impl IntoView {
     let inv_badge = if node.disk_inventory_ok {
         "badge badge-run"
     } else {
@@ -1195,7 +1379,6 @@ fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
         "unavailable"
     };
     let has_disks = !node.disks.is_empty();
-    let disks = node.disks.clone();
     let disk_inventory_ok = node.disk_inventory_ok;
     let luks_dd = if node.luks_method.is_empty() {
         "—".to_string()
@@ -1209,6 +1392,25 @@ fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
     let vgs = node.lvm_volume_groups.clone();
     let lvs = node.lvm_logical_volumes.clone();
     let pvs = node.lvm_physical_volumes.clone();
+
+    // Clamp so a high shared disk_page does not blank out short inventories.
+    let disk_total = node.disks.len();
+    let disk_total_pages = if disk_total == 0 {
+        1
+    } else {
+        disk_total.div_ceil(per_page.max(1)) as u32
+    };
+    let disk_page = disk_page.min(disk_total_pages).max(1);
+    let disk_pv = paginate_items(node.disks.clone(), disk_page, per_page);
+    let disk_page = disk_pv.page;
+    let disk_page_size = disk_pv.page_size;
+    let disk_total = disk_pv.total;
+    let disks = disk_pv.items;
+    let mut disk_extra = Vec::new();
+    if nodes_page > 1 {
+        disk_extra.push(("page".into(), nodes_page.to_string()));
+    }
+
     view! {
         <section class="card node-card">
             <div class="node-card-header">
@@ -1221,35 +1423,49 @@ fn storage_node_card(node: NodeStorageDto) -> impl IntoView {
                 <dt>"LUKS"</dt><dd>{luks_dd}</dd>
                 <dt>"Disk inventory"</dt><dd><span class={inv_badge}>{inv_label}</span></dd>
             </dl>
-            <Show when=move || has_disks>
-                <div class="table-wrap" style="margin-top: 0.75rem;">
-                    <table class="data">
-                        <thead>
-                            <tr>
-                                <th>"Device"</th>
-                                <th>"Path"</th>
-                                <th>"Size"</th>
-                                <th>"Model"</th>
-                                <th>"FS"</th>
-                                <th>"Mount"</th>
-                                <th>"Hint"</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {disks.clone().into_iter().map(storage_disk_row).collect_view()}
-                        </tbody>
-                    </table>
-                </div>
-            </Show>
-            <Show when=move || !has_disks>
-                <p class="muted" style="margin-top: 0.5rem; font-size: 0.85rem;">
-                    {if disk_inventory_ok {
-                        "No top-level block devices reported."
-                    } else {
-                        "Could not list disks (node unreachable or RPC failed)."
-                    }}
-                </p>
-            </Show>
+            {if has_disks {
+                view! {
+                    <div class="table-wrap" style="margin-top: 0.75rem;">
+                        <table class="data">
+                            <thead>
+                                <tr>
+                                    <th>"Device"</th>
+                                    <th>"Path"</th>
+                                    <th>"Size"</th>
+                                    <th>"Model"</th>
+                                    <th>"FS"</th>
+                                    <th>"Mount"</th>
+                                    <th>"Hint"</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {disks.into_iter().map(storage_disk_row).collect_view()}
+                            </tbody>
+                        </table>
+                    </div>
+                    {list_pager_named(
+                        "/storage",
+                        "disk_page",
+                        disk_page,
+                        disk_page_size,
+                        disk_total,
+                        "disks",
+                        &disk_extra,
+                    )}
+                }
+                .into_any()
+            } else {
+                view! {
+                    <p class="muted" style="margin-top: 0.5rem; font-size: 0.85rem;">
+                        {if disk_inventory_ok {
+                            "No top-level block devices reported."
+                        } else {
+                            "Could not list disks (node unreachable or RPC failed)."
+                        }}
+                    </p>
+                }
+                .into_any()
+            }}
             <Show when=move || has_lvm>
                 {lvm_detail_view(vgs.clone(), lvs.clone(), pvs.clone())}
             </Show>
@@ -1385,6 +1601,10 @@ fn storage_disk_row(d: StorageDiskRowDto) -> impl IntoView {
 
 #[component]
 fn CephPage() -> impl IntoView {
+    let query = use_query_map();
+    let cluster_paging = Memo::new(move |_| list_paging_named(&query.get(), "page"));
+    let fs_paging = Memo::new(move |_| list_paging_named(&query.get(), "fs_page"));
+    let rgw_paging = Memo::new(move |_| list_paging_named(&query.get(), "rgw_page"));
     let clusters_res = Resource::new(|| (), |_| list_ceph_clusters_dto());
     let fs_res = Resource::new(|| (), |_| list_shared_filesystems_dto());
     let rgw_res = Resource::new(|| (), |_| list_object_stores_dto());
@@ -1398,41 +1618,88 @@ fn CephPage() -> impl IntoView {
         </section>
         <h2 class="section-title">"Clusters"</h2>
         <Suspense fallback=move || view! { <p class="muted">"Loading Ceph clusters…"</p> }>
-            {move || Suspend::new(async move {
-                match clusters_res.await {
-                    Ok(rows) => ceph_clusters_table(rows).into_any(),
-                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+            {move || {
+                let (page, per_page) = cluster_paging.get();
+                let (fs_page, _) = fs_paging.get();
+                let (rgw_page, _) = rgw_paging.get();
+                let mut extra = Vec::new();
+                if fs_page > 1 {
+                    extra.push(("fs_page".into(), fs_page.to_string()));
                 }
-            })}
+                if rgw_page > 1 {
+                    extra.push(("rgw_page".into(), rgw_page.to_string()));
+                }
+                Suspend::new(async move {
+                    match clusters_res.await {
+                        Ok(rows) => ceph_clusters_table(rows, page, per_page, &extra).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
         </Suspense>
         <h2 class="section-title">"Shared filesystems"</h2>
         <Suspense fallback=move || view! { <p class="muted">"Loading CephFS…"</p> }>
-            {move || Suspend::new(async move {
-                match fs_res.await {
-                    Ok(rows) => shared_filesystems_table(rows).into_any(),
-                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+            {move || {
+                let (fs_page, per_page) = fs_paging.get();
+                let (page, _) = cluster_paging.get();
+                let (rgw_page, _) = rgw_paging.get();
+                let mut extra = Vec::new();
+                if page > 1 {
+                    extra.push(("page".into(), page.to_string()));
                 }
-            })}
+                if rgw_page > 1 {
+                    extra.push(("rgw_page".into(), rgw_page.to_string()));
+                }
+                Suspend::new(async move {
+                    match fs_res.await {
+                        Ok(rows) => shared_filesystems_table(rows, fs_page, per_page, &extra).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
         </Suspense>
         <h2 class="section-title">"Object stores"</h2>
         <Suspense fallback=move || view! { <p class="muted">"Loading object stores…"</p> }>
-            {move || Suspend::new(async move {
-                match rgw_res.await {
-                    Ok(rows) => object_stores_table(rows).into_any(),
-                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+            {move || {
+                let (rgw_page, per_page) = rgw_paging.get();
+                let (page, _) = cluster_paging.get();
+                let (fs_page, _) = fs_paging.get();
+                let mut extra = Vec::new();
+                if page > 1 {
+                    extra.push(("page".into(), page.to_string()));
                 }
-            })}
+                if fs_page > 1 {
+                    extra.push(("fs_page".into(), fs_page.to_string()));
+                }
+                Suspend::new(async move {
+                    match rgw_res.await {
+                        Ok(rows) => object_stores_table(rows, rgw_page, per_page, &extra).into_any(),
+                        Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
         </Suspense>
     }
 }
 
-fn ceph_clusters_table(rows: Vec<CephClusterRowDto>) -> impl IntoView {
+fn ceph_clusters_table(
+    rows: Vec<CephClusterRowDto>,
+    page: u32,
+    per_page: usize,
+    extra: &[(String, String)],
+) -> impl IntoView {
     if rows.is_empty() {
         return view! {
             <div class="empty-note">"No Ceph clusters. Create one with "<code class="inline">"kctl create ceph-cluster"</code>"."</div>
         }
         .into_any();
     }
+    let pv = paginate_by_name(rows, |c| c.name.clone(), page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let rows = pv.items;
+    let extra = extra.to_vec();
     view! {
         <div class="table-wrap">
             <table class="data">
@@ -1453,9 +1720,14 @@ fn ceph_clusters_table(rows: Vec<CephClusterRowDto>) -> impl IntoView {
                     {rows.into_iter().map(|c| {
                         let enc = if c.encrypt_osds { "yes" } else { "no" };
                         let health = if c.health_message.is_empty() { "—".to_string() } else { c.health_message.clone() };
+                        let href = format!("/ceph/{}", urlencoding_path(&c.name));
                         view! {
                             <tr>
-                                <td><strong>{c.name.clone()}</strong></td>
+                                <td>
+                                    <a href=href.clone() class="row-link">
+                                        <strong>{c.name.clone()}</strong>
+                                    </a>
+                                </td>
                                 <td>{c.phase.clone()}</td>
                                 <td>{health}</td>
                                 <td><code class="inline">{display_or_dash(&c.public_network)}</code></td>
@@ -1470,17 +1742,304 @@ fn ceph_clusters_table(rows: Vec<CephClusterRowDto>) -> impl IntoView {
                 </tbody>
             </table>
         </div>
+        {list_pager("/ceph", page, page_size, total, "clusters", &extra)}
     }
     .into_any()
 }
 
-fn shared_filesystems_table(rows: Vec<SharedFilesystemRowDto>) -> impl IntoView {
+#[component]
+fn CephClusterDetailPage() -> impl IntoView {
+    let params = use_params_map();
+    let name = Memo::new(move |_| {
+        params
+            .get()
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    });
+    let res = Resource::new(
+        move || name.get(),
+        |n| async move {
+            if n.trim().is_empty() {
+                return Err(ServerFnError::new("missing cluster name"));
+            }
+            get_ceph_cluster_detail_dto(n).await
+        },
+    );
+    view! {
+        <Suspense fallback=move || view! { <p class="muted">"Loading Ceph cluster…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(detail) => ceph_cluster_detail_view(detail).into_any(),
+                    Err(e) => view! {
+                        <section class="hero">
+                            <p class="crumb"><a href="/ceph">"← Ceph"</a></p>
+                            <h1>"Ceph cluster"</h1>
+                        </section>
+                        <p class="err">{e.to_string()}</p>
+                    }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn ceph_cluster_detail_view(detail: CephClusterDetailDto) -> impl IntoView {
+    let enc = if detail.encrypt_osds { "yes" } else { "no" };
+    let wipe = if detail.force_wipe { "yes" } else { "no" };
+    let health_status = if detail.health.health_status.is_empty() {
+        detail.phase.clone()
+    } else {
+        detail.health.health_status.clone()
+    };
+    let badge_class = if health_status.contains("OK") || detail.phase == "Healthy" {
+        "badge badge-run"
+    } else if health_status.contains("WARN") || detail.phase == "Degraded" {
+        "badge badge-warn"
+    } else {
+        "badge badge-stop"
+    };
+    let source_note = match detail.capacity.source.as_str() {
+        "df" => {
+            if detail.capacity.queried_node.is_empty() {
+                "Capacity from live ceph df".to_string()
+            } else {
+                format!(
+                    "Capacity from live ceph df (via {})",
+                    detail.capacity.queried_node
+                )
+            }
+        }
+        "pgmap" => "Capacity from cached ceph status (pgmap)".to_string(),
+        _ => "Capacity not available yet".to_string(),
+    };
+    let class_legend: Vec<(String, String)> = detail
+        .capacity
+        .by_class
+        .iter()
+        .map(|c| {
+            (
+                c.device_class.clone(),
+                format!(
+                    "max {} · used {} ({}%) · avail {}",
+                    c.total_human, c.used_human, c.used_percent, c.avail_human
+                ),
+            )
+        })
+        .collect();
+    let cluster_pie = detail.cluster_pie_svg.clone();
+    let class_pie = detail.class_pie_svg.clone();
+
+    view! {
+        <section class="hero">
+            <p class="crumb"><a href="/ceph">"← Ceph"</a></p>
+            <h1>{detail.name.clone()}</h1>
+            <p class="muted">
+                <span class=badge_class>{health_status.clone()}</span>
+                " · phase "{detail.phase.clone()}
+                " · generation "{detail.generation}
+            </p>
+            <p class="muted">{display_or_dash(&detail.health_message)}</p>
+        </section>
+
+        <div class="stat-row ceph-stat-row">
+            <div class="stat"><div class="label">"Replication"</div><div class="value">{format!("{}/{}", detail.min_size, detail.size)}</div></div>
+            <div class="stat"><div class="label">"Total"</div><div class="value">{detail.capacity.total_human.clone()}</div></div>
+            <div class="stat"><div class="label">"Used"</div><div class="value">{detail.capacity.used_human.clone()}</div></div>
+            <div class="stat"><div class="label">"Available"</div><div class="value">{detail.capacity.avail_human.clone()}</div></div>
+            <div class="stat"><div class="label">"Used %"</div><div class="value">{format!("{}%", detail.capacity.used_percent)}</div></div>
+            <div class="stat"><div class="label">"OSD encrypt"</div><div class="value">{enc}</div></div>
+        </div>
+        <p class="muted capacity-note">{source_note}</p>
+        {( !detail.capacity.error.is_empty() ).then(|| view! { <p class="muted">{detail.capacity.error.clone()}</p> })}
+
+        <div class="ceph-charts">
+            <div class="ceph-chart-card">
+                <h2 class="section-title">"Cluster capacity"</h2>
+                <div class="ceph-chart-body">
+                    <div class="ceph-pie-wrap" inner_html=cluster_pie></div>
+                    <ul class="ceph-legend">
+                        <li><span class="swatch swatch-0"></span>"Used "{detail.capacity.used_human.clone()}</li>
+                        <li><span class="swatch swatch-1"></span>"Available "{detail.capacity.avail_human.clone()}</li>
+                    </ul>
+                </div>
+                <div class="usage-bar" aria-hidden="true">
+                    <div class="usage-bar-fill" style=format!("width: {}%", detail.capacity.used_percent.min(100))></div>
+                </div>
+            </div>
+            <div class="ceph-chart-card">
+                <h2 class="section-title">"Device classes (max size)"</h2>
+                <div class="ceph-chart-body">
+                    <div class="ceph-pie-wrap" inner_html=class_pie></div>
+                    <ul class="ceph-legend">
+                        {if class_legend.is_empty() {
+                            view! { <li class="muted">"No device-class breakdown (needs live ceph df)."</li> }.into_any()
+                        } else {
+                            class_legend.into_iter().enumerate().map(|(i, (name, text))| {
+                                let swatch = format!("swatch swatch-{}", i % 8);
+                                view! { <li><span class=swatch></span><strong>{name}</strong>" — "{text}</li> }
+                            }).collect_view().into_any()
+                        }}
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <h2 class="section-title">"Replication"</h2>
+        <div class="card">
+            <dl class="kv">
+                <dt>"Cluster size"</dt><dd>{detail.size}</dd>
+                <dt>"Cluster min size"</dt><dd>{detail.min_size}</dd>
+                <dt>"Default pool"</dt><dd><code class="inline">"kcore-vms"</code>" inherits size/minSize"</dd>
+            </dl>
+            <p class="muted">
+                "Pool size is the number of replicas Ceph keeps; minSize is the minimum replicas that must be up for I/O."
+            </p>
+        </div>
+        {( !detail.capacity.pools.is_empty() ).then(|| view! {
+            <div class="table-wrap ceph-subtable">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>"Pool"</th>
+                            <th>"Stored"</th>
+                            <th>"Objects"</th>
+                            <th>"% used"</th>
+                            <th>"Max avail"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {detail.capacity.pools.clone().into_iter().map(|p| {
+                            let pct = format!("{:.2}%", (p.percent_used_bp as f64) / 100.0);
+                            view! {
+                                <tr>
+                                    <td><code class="inline">{p.name.clone()}</code></td>
+                                    <td>{p.stored_human.clone()}</td>
+                                    <td>{p.objects}</td>
+                                    <td>{pct}</td>
+                                    <td>{p.max_avail_human.clone()}</td>
+                                </tr>
+                            }
+                        }).collect_view()}
+                    </tbody>
+                </table>
+            </div>
+        })}
+
+        <h2 class="section-title">"Health"</h2>
+        <div class="card">
+            <dl class="kv">
+                <dt>"Status"</dt><dd>{display_or_dash(&detail.health.health_status)}</dd>
+                <dt>"Mon quorum"</dt><dd>{display_or_dash(&detail.health.mon_quorum)}</dd>
+                <dt>"OSDs"</dt><dd>{format!(
+                    "{} total, {} up, {} in",
+                    detail.health.osd_total, detail.health.osd_up, detail.health.osd_in
+                )}</dd>
+                <dt>"PGs"</dt><dd>{detail.health.pgs_total}</dd>
+                <dt>"Flags"</dt><dd>{if detail.health.flags.is_empty() {
+                    "—".to_string()
+                } else {
+                    detail.health.flags.join(", ")
+                }}</dd>
+                <dt>"noout"</dt><dd>{if detail.health.noout { "set" } else { "unset" }}</dd>
+                <dt>"norebalance"</dt><dd>{if detail.health.norebalance { "set" } else { "unset" }}</dd>
+            </dl>
+            {( !detail.health.pgs_by_state.is_empty() ).then(|| view! {
+                <div class="table-wrap" style="margin-top: 1rem;">
+                    <table class="data">
+                        <thead><tr><th>"PG state"</th><th>"Count"</th></tr></thead>
+                        <tbody>
+                            {detail.health.pgs_by_state.clone().into_iter().map(|s| view! {
+                                <tr><td>{s.state_name.clone()}</td><td>{s.count}</td></tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            })}
+            {( !detail.health.checks.is_empty() ).then(|| view! {
+                <div class="table-wrap" style="margin-top: 1rem;">
+                    <table class="data">
+                        <thead><tr><th>"Check"</th><th>"Severity"</th><th>"Message"</th></tr></thead>
+                        <tbody>
+                            {detail.health.checks.clone().into_iter().map(|c| view! {
+                                <tr>
+                                    <td><code class="inline">{c.name.clone()}</code></td>
+                                    <td>{c.severity.clone()}</td>
+                                    <td>{c.message.clone()}</td>
+                                </tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            })}
+        </div>
+
+        <h2 class="section-title">"Members"</h2>
+        {if detail.members.is_empty() {
+            view! { <div class="empty-note">"No members in the cluster spec."</div> }.into_any()
+        } else {
+            view! {
+                <div class="table-wrap">
+                    <table class="data">
+                        <thead>
+                            <tr>
+                                <th>"Node"</th>
+                                <th>"Mon"</th>
+                                <th>"Cluster addr"</th>
+                                <th>"Public iface"</th>
+                                <th>"Cluster iface"</th>
+                                <th>"OSD devices"</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {detail.members.clone().into_iter().map(|m| view! {
+                                <tr>
+                                    <td><strong>{m.node_id.clone()}</strong></td>
+                                    <td><code class="inline">{display_or_dash(&m.mon_addr)}</code></td>
+                                    <td><code class="inline">{display_or_dash(&m.cluster_addr)}</code></td>
+                                    <td><code class="inline">{display_or_dash(&m.public_iface)}</code></td>
+                                    <td><code class="inline">{display_or_dash(&m.cluster_iface)}</code></td>
+                                    <td><code class="inline">{m.osd_devices.clone()}</code></td>
+                                </tr>
+                            }).collect_view()}
+                        </tbody>
+                    </table>
+                </div>
+            }.into_any()
+        }}
+
+        <h2 class="section-title">"Spec"</h2>
+        <div class="card">
+            <dl class="kv">
+                <dt>"FSID"</dt><dd><code class="inline">{display_or_dash(&detail.fsid)}</code></dd>
+                <dt>"Public network"</dt><dd><code class="inline">{display_or_dash(&detail.public_network)}</code></dd>
+                <dt>"Cluster network"</dt><dd><code class="inline">{display_or_dash(&detail.cluster_network)}</code></dd>
+                <dt>"Force wipe"</dt><dd>{wipe}</dd>
+                <dt>"Created"</dt><dd>{detail.created_at.clone()}</dd>
+                <dt>"Updated"</dt><dd>{detail.updated_at.clone()}</dd>
+            </dl>
+        </div>
+    }
+}
+
+fn shared_filesystems_table(
+    rows: Vec<SharedFilesystemRowDto>,
+    page: u32,
+    per_page: usize,
+    extra: &[(String, String)],
+) -> impl IntoView {
     if rows.is_empty() {
         return view! {
             <div class="empty-note">"No shared filesystems."</div>
         }
         .into_any();
     }
+    let pv = paginate_by_name(rows, |fs| fs.name.clone(), page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let rows = pv.items;
+    let extra = extra.to_vec();
     view! {
         <div class="table-wrap">
             <table class="data">
@@ -1508,17 +2067,29 @@ fn shared_filesystems_table(rows: Vec<SharedFilesystemRowDto>) -> impl IntoView 
                 </tbody>
             </table>
         </div>
+        {list_pager_named("/ceph", "fs_page", page, page_size, total, "filesystems", &extra)}
     }
     .into_any()
 }
 
-fn object_stores_table(rows: Vec<ObjectStoreRowDto>) -> impl IntoView {
+fn object_stores_table(
+    rows: Vec<ObjectStoreRowDto>,
+    page: u32,
+    per_page: usize,
+    extra: &[(String, String)],
+) -> impl IntoView {
     if rows.is_empty() {
         return view! {
             <div class="empty-note">"No object stores."</div>
         }
         .into_any();
     }
+    let pv = paginate_by_name(rows, |s| s.name.clone(), page, per_page);
+    let page = pv.page;
+    let page_size = pv.page_size;
+    let total = pv.total;
+    let rows = pv.items;
+    let extra = extra.to_vec();
     view! {
         <div class="table-wrap">
             <table class="data">
@@ -1549,6 +2120,7 @@ fn object_stores_table(rows: Vec<ObjectStoreRowDto>) -> impl IntoView {
                 </tbody>
             </table>
         </div>
+        {list_pager_named("/ceph", "rgw_page", page, page_size, total, "object stores", &extra)}
     }
     .into_any()
 }

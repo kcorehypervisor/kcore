@@ -255,6 +255,106 @@ pub struct CephClusterRowDto {
     pub osd_devices: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephPgStateDto {
+    pub state_name: String,
+    pub count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephCheckDto {
+    pub name: String,
+    pub severity: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephHealthDetailDto {
+    pub health_status: String,
+    pub mon_quorum: String,
+    pub osd_total: i32,
+    pub osd_up: i32,
+    pub osd_in: i32,
+    pub pgs_total: i32,
+    pub pgs_by_state: Vec<CephPgStateDto>,
+    pub noout: bool,
+    pub norebalance: bool,
+    pub flags: Vec<String>,
+    pub checks: Vec<CephCheckDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephMemberDto {
+    pub node_id: String,
+    pub mon_addr: String,
+    pub cluster_addr: String,
+    pub public_iface: String,
+    pub cluster_iface: String,
+    pub osd_devices: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephDeviceClassDto {
+    pub device_class: String,
+    pub total_bytes: i64,
+    pub used_bytes: i64,
+    pub avail_bytes: i64,
+    pub total_human: String,
+    pub used_human: String,
+    pub avail_human: String,
+    pub used_percent: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephPoolUsageDto {
+    pub name: String,
+    pub stored_bytes: i64,
+    pub stored_human: String,
+    pub objects: i64,
+    pub percent_used_bp: i32,
+    pub max_avail_bytes: i64,
+    pub max_avail_human: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CephCapacityDto {
+    pub total_bytes: i64,
+    pub used_bytes: i64,
+    pub avail_bytes: i64,
+    pub total_human: String,
+    pub used_human: String,
+    pub avail_human: String,
+    pub used_percent: i32,
+    pub by_class: Vec<CephDeviceClassDto>,
+    pub pools: Vec<CephPoolUsageDto>,
+    /// `df`, `pgmap`, or `none`.
+    pub source: String,
+    pub queried_node: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CephClusterDetailDto {
+    pub name: String,
+    pub generation: i64,
+    pub fsid: String,
+    pub phase: String,
+    pub health_message: String,
+    pub public_network: String,
+    pub cluster_network: String,
+    pub size: i32,
+    pub min_size: i32,
+    pub encrypt_osds: bool,
+    pub force_wipe: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub members: Vec<CephMemberDto>,
+    pub health: CephHealthDetailDto,
+    pub capacity: CephCapacityDto,
+    pub cluster_pie_svg: String,
+    pub class_pie_svg: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedFilesystemRowDto {
     pub name: String,
