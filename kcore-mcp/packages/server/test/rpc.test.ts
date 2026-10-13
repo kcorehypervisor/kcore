@@ -19,6 +19,18 @@ test("the RPC catalog includes implemented controller methods and omits stubs an
   assert.equal(names.has("controller/attachVmConsole"), false);
   assert.equal(names.has("node-admin/attachVmConsole"), false);
   assert.equal(names.has("node-admin/uploadImageStream"), false);
+  assert.equal(names.has("provisioning/listImages"), true);
+  assert.equal(names.has("provisioning/listMachines"), true);
+  assert.equal(names.has("provisioning/setBootTarget"), true);
+  assert.equal(names.has("provisioning/discoverMachine"), true);
+  assert.equal(names.has("provisioning/powerControl"), true);
+  assert.equal(names.has("provisioning/downloadImage"), true);
+  assert.equal(names.has("provisioning/issueServerCertificate"), false);
+  assert.equal(names.has("provisioning/getCaBundle"), false);
+  const listImages = methods.find((item) => item.service === "provisioning" && item.method === "listImages");
+  assert.equal(listImages?.readOnly, true);
+  const power = methods.find((item) => item.service === "provisioning" && item.method === "powerControl");
+  assert.equal(power?.readOnly, false);
   const listVms = methods.find((item) => item.service === "controller" && item.method === "listVms");
   assert.equal(listVms?.readOnly, true);
   const createVm = methods.find((item) => item.service === "controller" && item.method === "createVm");
@@ -28,4 +40,5 @@ test("the RPC catalog includes implemented controller methods and omits stubs an
 test("an omitted stub is rejected before any dial", () => {
   assert.throws(() => requireRpc("node-compute", "pullImage"), InputError);
   assert.throws(() => requireRpc("controller", "attachVmConsole"), InputError);
+  assert.throws(() => requireRpc("provisioning", "issueNodeCertificate"), InputError);
 });
