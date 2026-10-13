@@ -1,15 +1,18 @@
 //! gRPC proto → dashboard DTO (testable without the network).
 
+use crate::ceph_status::{self, capacity_dto, capacity_from_status_json, health_from_status_json};
 use crate::controller_client::controller_proto;
 use crate::dto::{
-    AccessControlEntryDto, AuditEventDto, CephClusterRowDto, ComplianceDto, HostInterfaceDto,
-    LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto,
-    NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto,
-    ReplicationConflictDto, ReplicationIncomingDto, ReplicationOutgoingDto, ReplicationStatusDto,
-    SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto,
-    VmsPageDto, VolumeRowDto,
+    AccessControlEntryDto, AuditEventDto, CephClusterDetailDto, CephClusterRowDto,
+    CephDeviceClassDto, CephMemberDto, CephPoolUsageDto, ComplianceDto, DbmsDetailDto, DbmsRowDto,
+    HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto, KubernetesNodeDto,
+    KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto,
+    NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto,
+    ObjectStoreRowDto, ReplicationConflictDto, ReplicationIncomingDto, ReplicationOutgoingDto,
+    ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto,
+    VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
 };
-use crate::format::{self, paginate_by_name, VM_PAGE_SIZE};
+use crate::format::{self, paginate_by_name};
 
 pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -> ComplianceDto {
     ComplianceDto {
@@ -62,7 +65,11 @@ pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -
     }
 }
 
-pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> VmsPageDto {
+pub fn vms_page_from_proto(
+    vms: Vec<controller_proto::VmInfo>,
+    page: u32,
+    page_size: usize,
+) -> VmsPageDto {
     let rows: Vec<VmRowDto> = vms
         .into_iter()
         .map(|v| VmRowDto {
@@ -76,7 +83,8 @@ pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> Vms
         })
         .collect();
     let page = page.max(1);
-    let pv = paginate_by_name(rows, |r| r.name.clone(), page, VM_PAGE_SIZE);
+    let page_size = format::normalize_page_size(page_size as u32);
+    let pv = paginate_by_name(rows, |r| r.name.clone(), page, page_size);
     VmsPageDto {
         total_pages: pv.total_pages(),
         has_prev: pv.has_prev(),
@@ -512,6 +520,139 @@ pub fn ceph_clusters_from_proto(
     rows
 }
 
+pub fn ceph_cluster_detail_from_proto(c: controller_proto::CephCluster) -> CephClusterDetailDto {
+    let spec = c.spec.unwrap_or_default();
+    let status = c.status.unwrap_or_default();
+    let created_at = c
+        .created_at
+        .as_ref()
+        .map(|t| format::format_unix_utc(t.seconds))
+        .unwrap_or_else(|| "—".to_string());
+    let updated_at = c
+        .updated_at
+        .as_ref()
+        .map(|t| format::format_unix_utc(t.seconds))
+        .unwrap_or_else(|| "—".to_string());
+
+    let mut members: Vec<CephMemberDto> = spec
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut devices = vec![n.osd_device.clone()];
+            for extra in &n.osd_devices {
+                if !extra.is_empty() && !devices.iter().any(|have| have == extra) {
+                    devices.push(extra.clone());
+                }
+            }
+            CephMemberDto {
+                node_id: n.node_id.clone(),
+                mon_addr: n.mon_addr.clone(),
+                cluster_addr: n.cluster_addr.clone(),
+                public_iface: n.public_iface.clone(),
+                cluster_iface: n.cluster_iface.clone(),
+                osd_devices: join_nonempty(devices),
+            }
+        })
+        .collect();
+    members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+    let health = health_from_status_json(&status.ceph_status_json);
+    let mut capacity = capacity_from_status_json(&status.ceph_status_json);
+    let cluster_slices = vec![
+        ("used".to_string(), capacity.used_bytes),
+        ("available".to_string(), capacity.avail_bytes),
+    ];
+    let cluster_pie_svg = ceph_status::pie_svg(&cluster_slices, "Cluster capacity");
+    let class_pie_svg = ceph_status::pie_svg(&[], "Device class capacity");
+
+    if capacity.source.is_empty() {
+        capacity.source = "none".to_string();
+    }
+
+    CephClusterDetailDto {
+        name: c.name,
+        generation: c.generation,
+        fsid: spec.fsid,
+        phase: format::service_phase_label(status.phase).to_string(),
+        health_message: status.health_message,
+        public_network: spec.public_network,
+        cluster_network: spec.cluster_network,
+        size: spec.size,
+        min_size: spec.min_size,
+        encrypt_osds: spec.encrypt_osds,
+        force_wipe: spec.force_wipe,
+        created_at,
+        updated_at,
+        members,
+        health,
+        capacity,
+        cluster_pie_svg,
+        class_pie_svg,
+    }
+}
+
+/// Prefer live `ceph df` capacity when the controller returned it; keep pgmap fallback otherwise.
+pub fn merge_ceph_capacity(
+    fallback: crate::dto::CephCapacityDto,
+    live: controller_proto::GetCephClusterCapacityResponse,
+) -> crate::dto::CephCapacityDto {
+    if !live.ok {
+        let mut out = fallback;
+        if out.source.is_empty() || out.source == "none" {
+            out.source = "none".to_string();
+        }
+        if !live.message.is_empty() {
+            out.error = live.message;
+        }
+        return out;
+    }
+    let by_class = live
+        .by_class
+        .into_iter()
+        .map(|c| {
+            let used_percent = if c.total_bytes > 0 {
+                ((c.used_bytes as f64) * 100.0 / (c.total_bytes as f64)).round() as i32
+            } else {
+                0
+            };
+            CephDeviceClassDto {
+                device_class: c.device_class,
+                total_bytes: c.total_bytes,
+                used_bytes: c.used_bytes,
+                avail_bytes: c.avail_bytes,
+                total_human: format::bytes_human(c.total_bytes),
+                used_human: format::bytes_human(c.used_bytes),
+                avail_human: format::bytes_human(c.avail_bytes),
+                used_percent,
+            }
+        })
+        .collect::<Vec<_>>();
+    let pools = live
+        .pools
+        .into_iter()
+        .map(|p| CephPoolUsageDto {
+            name: p.name,
+            stored_bytes: p.stored_bytes,
+            stored_human: format::bytes_human(p.stored_bytes),
+            objects: p.objects,
+            percent_used_bp: p.percent_used_bp,
+            max_avail_bytes: p.max_avail_bytes,
+            max_avail_human: format::bytes_human(p.max_avail_bytes),
+        })
+        .collect();
+    let mut out = capacity_dto(
+        live.total_bytes,
+        live.used_bytes,
+        live.avail_bytes,
+        by_class,
+        pools,
+        "df",
+        "",
+    );
+    out.queried_node = live.queried_node;
+    out
+}
+
 pub fn shared_filesystems_from_proto(
     filesystems: Vec<controller_proto::SharedFilesystem>,
 ) -> Vec<SharedFilesystemRowDto> {
@@ -624,6 +765,181 @@ pub fn audit_events_from_proto(events: Vec<controller_proto::AuditEvent>) -> Vec
         .collect()
 }
 
+const POSTGRES_ENGINE: &str = "PostgreSQL";
+const POSTGRES_DEFAULT_PACKAGE: &str = "pkgs.postgresql";
+const POSTGRES_DEFAULT_PORT: i32 = 5432;
+const POSTGRES_ACCESS: &str = "Local Unix socket on the node. TCP is not opened.";
+
+fn postgres_package(package: &str) -> String {
+    let package = package.trim();
+    if package.is_empty() {
+        POSTGRES_DEFAULT_PACKAGE.to_string()
+    } else {
+        package.to_string()
+    }
+}
+
+fn postgres_port(port: i32) -> i32 {
+    if port <= 0 {
+        POSTGRES_DEFAULT_PORT
+    } else {
+        port
+    }
+}
+
+pub fn dbms_from_postgresqls(rows: Vec<controller_proto::PostgresqlInfo>) -> Vec<DbmsRowDto> {
+    let mut rows: Vec<DbmsRowDto> = rows
+        .into_iter()
+        .map(|info| DbmsRowDto {
+            name: info.name,
+            engine: POSTGRES_ENGINE.to_string(),
+            database: info.database,
+            package: postgres_package(&info.package),
+            port: postgres_port(info.port),
+            node_id: info.node_id,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn dbms_detail_from_postgresql(info: controller_proto::PostgresqlInfo) -> DbmsDetailDto {
+    DbmsDetailDto {
+        name: info.name,
+        engine: POSTGRES_ENGINE.to_string(),
+        database: info.database,
+        package: postgres_package(&info.package),
+        port: postgres_port(info.port),
+        node_id: info.node_id,
+        access: POSTGRES_ACCESS.to_string(),
+    }
+}
+
+fn kubernetes_node_dto(node: controller_proto::KubernetesNodeSpec) -> KubernetesNodeDto {
+    KubernetesNodeDto {
+        node_id: node.node_id,
+        role: node.role,
+        advertise_address: node.advertise_address,
+        iface: node.iface,
+        initial_cluster: node.initial_cluster,
+        join_existing: node.join_existing,
+    }
+}
+
+fn kubernetes_nodes(nodes: Vec<controller_proto::KubernetesNodeSpec>) -> Vec<KubernetesNodeDto> {
+    let mut rows: Vec<KubernetesNodeDto> = nodes.into_iter().map(kubernetes_node_dto).collect();
+    rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    rows
+}
+
+pub fn kubernetes_clusters_from_proto(
+    clusters: Vec<controller_proto::KubernetesCluster>,
+) -> Vec<KubernetesClusterRowDto> {
+    let mut rows: Vec<KubernetesClusterRowDto> = clusters
+        .into_iter()
+        .map(|cluster| {
+            let spec = cluster.spec.unwrap_or_default();
+            let status = cluster.status.unwrap_or_default();
+            KubernetesClusterRowDto {
+                name: cluster.name,
+                phase: format::kubernetes_phase_label(&status.phase),
+                message: status.message,
+                cni: spec.cni,
+                api_server_endpoint: spec.api_server_endpoint,
+                control_planes: spec.control_plane_nodes.len() as i32,
+                workers: spec.worker_nodes.len() as i32,
+                ready_control_planes: status.ready_control_planes,
+                ready_workers: status.ready_workers,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn kubernetes_detail_from_proto(
+    cluster: controller_proto::KubernetesCluster,
+    health: Result<controller_proto::GetKubernetesClusterHealthResponse, String>,
+) -> KubernetesClusterDetailDto {
+    let spec = cluster.spec.unwrap_or_default();
+    let status = cluster.status.unwrap_or_default();
+    let cilium_configured = spec.cilium_config.is_some();
+    let cilium = spec.cilium_config.unwrap_or_default();
+    let ha_configured = spec.high_availability.is_some();
+    let ha = spec.high_availability.unwrap_or_default();
+    let (overall_health, health_fields, health_error, node_health) = match health {
+        Ok(health) => {
+            let nodes = health
+                .node_health
+                .into_iter()
+                .map(|node| KubernetesNodeHealthDto {
+                    node_id: node.node_id,
+                    kubernetes_status: node.kubernetes_status,
+                    kubelet_active: node.kubelet_active,
+                    etcd_active: node.etcd_active,
+                    api_server_active: node.api_server_active,
+                })
+                .collect::<Vec<_>>();
+            (
+                format::kubernetes_phase_label(&health.overall_health),
+                (
+                    health.ready_control_planes,
+                    health.total_control_planes,
+                    health.ready_workers,
+                    health.total_workers,
+                    health.etcd_healthy,
+                    health.etcd_member_count,
+                    health.api_server_reachable,
+                ),
+                String::new(),
+                nodes,
+            )
+        }
+        Err(error) => (
+            "Unknown".to_string(),
+            (0, 0, 0, 0, false, 0, false),
+            error,
+            Vec::new(),
+        ),
+    };
+    KubernetesClusterDetailDto {
+        name: cluster.name,
+        generation: cluster.generation,
+        phase: format::kubernetes_phase_label(&status.phase),
+        message: status.message,
+        last_updated: timestamp_label(status.last_updated),
+        active_node_ids: join_nonempty(status.active_node_ids),
+        cluster_cidr: spec.cluster_cidr,
+        service_cidr: spec.service_cidr,
+        cluster_dns: spec.cluster_dns,
+        api_server_endpoint: spec.api_server_endpoint,
+        cni: spec.cni,
+        cilium_configured,
+        cilium_mode: cilium.mode,
+        cilium_mtu: cilium.mtu,
+        cilium_tunnel: cilium.tunnel,
+        cilium_auto_direct: cilium.auto_direct_node_routes,
+        cilium_lb_pools: join_nonempty(cilium.load_balancer_ip_pools),
+        ha_configured,
+        ha_enabled: ha.enabled,
+        ha_vip: ha.vip_address,
+        ha_interface: ha.vip_interface,
+        ha_method: ha.method,
+        control_plane_nodes: kubernetes_nodes(spec.control_plane_nodes),
+        worker_nodes: kubernetes_nodes(spec.worker_nodes),
+        overall_health,
+        health_ready_control_planes: health_fields.0,
+        health_total_control_planes: health_fields.1,
+        health_ready_workers: health_fields.2,
+        health_total_workers: health_fields.3,
+        etcd_healthy: health_fields.4,
+        etcd_member_count: health_fields.5,
+        api_server_reachable: health_fields.6,
+        node_health,
+        health_error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,7 +1029,7 @@ mod tests {
                 storage_size_bytes: 0,
             },
         ];
-        let p = vms_page_from_proto(vms, 1);
+        let p = vms_page_from_proto(vms, 1, 10);
         assert_eq!(p.total, 2);
         assert_eq!(p.vms.len(), 2);
         assert_eq!(p.vms[0].name, "alpha");
@@ -754,6 +1070,96 @@ mod tests {
         assert_eq!(rows[1].vm, "web");
         assert!(rows[1].encrypted);
         assert!(rows[1].size.contains("10"));
+    }
+
+    #[test]
+    fn ceph_cluster_detail_maps_spec_and_status_json() {
+        let cluster = controller_proto::CephCluster {
+            name: "lab-san".into(),
+            generation: 3,
+            spec: Some(controller_proto::CephClusterSpec {
+                fsid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                public_network: "192.168.40.0/24".into(),
+                cluster_network: "192.168.47.0/24".into(),
+                size: 3,
+                min_size: 2,
+                encrypt_osds: true,
+                nodes: vec![controller_proto::CephClusterNodeSpec {
+                    node_id: "node-103".into(),
+                    mon_addr: "192.168.40.103:6789".into(),
+                    cluster_addr: "192.168.47.2".into(),
+                    public_iface: "enp6s0".into(),
+                    cluster_iface: "enp6s0d1".into(),
+                    osd_device: "/dev/sda".into(),
+                    osd_devices: vec!["/dev/sdb".into()],
+                }],
+                ..Default::default()
+            }),
+            status: Some(controller_proto::CephClusterStatus {
+                phase: controller_proto::CephClusterPhase::Healthy as i32,
+                health_message: "HEALTH_OK".into(),
+                ceph_status_json: r#"{
+                  "health":{"status":"HEALTH_OK","checks":{}},
+                  "quorum_names":["node-103"],
+                  "monmap":{"num_mons":1},
+                  "osdmap":{"num_osds":2,"num_up_osds":2,"num_in_osds":2},
+                  "pgmap":{
+                    "num_pgs":32,
+                    "bytes_total":1000,
+                    "bytes_used":250,
+                    "bytes_avail":750,
+                    "pgs_by_state":[{"state_name":"active+clean","count":32}]
+                  }
+                }"#
+                .into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let detail = ceph_cluster_detail_from_proto(cluster);
+        assert_eq!(detail.name, "lab-san");
+        assert_eq!(detail.size, 3);
+        assert_eq!(detail.min_size, 2);
+        assert_eq!(detail.members.len(), 1);
+        assert!(detail.members[0].osd_devices.contains("/dev/sda"));
+        assert!(detail.members[0].osd_devices.contains("/dev/sdb"));
+        assert_eq!(detail.health.osd_up, 2);
+        assert_eq!(detail.capacity.used_percent, 25);
+        assert_eq!(detail.capacity.source, "pgmap");
+        assert!(detail.cluster_pie_svg.contains("<path"));
+    }
+
+    #[test]
+    fn merge_ceph_capacity_prefers_live_df() {
+        let fallback = capacity_from_status_json("");
+        let live = controller_proto::GetCephClusterCapacityResponse {
+            ok: true,
+            queried_node: "node-103".into(),
+            total_bytes: 900,
+            used_bytes: 300,
+            avail_bytes: 600,
+            by_class: vec![controller_proto::CephDeviceClassCapacity {
+                device_class: "ssd".into(),
+                total_bytes: 900,
+                used_bytes: 300,
+                avail_bytes: 600,
+            }],
+            pools: vec![controller_proto::CephPoolCapacity {
+                name: "kcore-vms".into(),
+                stored_bytes: 10,
+                objects: 1,
+                percent_used_bp: 100,
+                max_avail_bytes: 200,
+            }],
+            ..Default::default()
+        };
+        let merged = merge_ceph_capacity(fallback, live);
+        assert_eq!(merged.source, "df");
+        assert_eq!(merged.queried_node, "node-103");
+        assert_eq!(merged.by_class.len(), 1);
+        assert_eq!(merged.by_class[0].device_class, "ssd");
+        assert_eq!(merged.pools[0].name, "kcore-vms");
+        assert_eq!(merged.used_percent, 33);
     }
 
     #[test]
@@ -1063,6 +1469,142 @@ mod tests {
         assert_eq!(dtos[0].id, 42);
         assert_eq!(dtos[0].resource_key, "vm:abc");
         assert_eq!(dtos[0].reason, "concurrent create");
+    }
+
+    #[test]
+    fn postgresql_maps_to_dbms_with_defaults() {
+        let rows = dbms_from_postgresqls(vec![
+            controller_proto::PostgresqlInfo {
+                name: "zeta".into(),
+                database: "zeta".into(),
+                package: String::new(),
+                port: 0,
+                node_id: "node-105".into(),
+            },
+            controller_proto::PostgresqlInfo {
+                name: "app-db".into(),
+                database: "app".into(),
+                package: "postgresql_16".into(),
+                port: 5432,
+                node_id: "node-107".into(),
+            },
+        ]);
+        assert_eq!(rows[0].name, "app-db");
+        assert_eq!(rows[0].engine, "PostgreSQL");
+        assert_eq!(rows[0].package, "postgresql_16");
+        assert_eq!(rows[1].package, "pkgs.postgresql");
+        assert_eq!(rows[1].port, 5432);
+        let detail = dbms_detail_from_postgresql(controller_proto::PostgresqlInfo {
+            name: "app-db".into(),
+            database: "app".into(),
+            package: "postgresql_16".into(),
+            port: 5432,
+            node_id: "node-107".into(),
+        });
+        assert_eq!(
+            detail.access,
+            "Local Unix socket on the node. TCP is not opened."
+        );
+    }
+
+    #[test]
+    fn kubernetes_cluster_maps_list_and_detail() {
+        let cluster = sample_k8s_cluster();
+        let rows = kubernetes_clusters_from_proto(vec![cluster.clone()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "lab");
+        assert_eq!(rows[0].phase, "Ready");
+        assert_eq!(rows[0].control_planes, 1);
+        assert_eq!(rows[0].workers, 1);
+        assert_eq!(rows[0].cni, "cilium");
+
+        let health = controller_proto::GetKubernetesClusterHealthResponse {
+            overall_health: "healthy".into(),
+            ready_control_planes: 1,
+            total_control_planes: 1,
+            ready_workers: 1,
+            total_workers: 1,
+            etcd_healthy: true,
+            etcd_member_count: 1,
+            api_server_reachable: true,
+            node_health: vec![controller_proto::NodeHealth {
+                node_id: "node-107".into(),
+                kubernetes_status: "Ready".into(),
+                kubelet_active: true,
+                etcd_active: true,
+                api_server_active: true,
+            }],
+        };
+        let detail = kubernetes_detail_from_proto(cluster, Ok(health));
+        assert_eq!(detail.overall_health, "Healthy");
+        assert_eq!(detail.api_server_endpoint, "192.168.40.220:6443");
+        assert!(detail.cilium_configured);
+        assert_eq!(detail.cilium_mode, "native-routing");
+        assert!(detail.ha_enabled);
+        assert_eq!(detail.control_plane_nodes[0].node_id, "node-107");
+        assert_eq!(detail.worker_nodes[0].node_id, "node-119");
+        assert!(detail.health_error.is_empty());
+        assert_eq!(detail.node_health.len(), 1);
+        assert_eq!(detail.last_updated, "2023-11-14 22:13:20Z");
+
+        let failed = kubernetes_detail_from_proto(sample_k8s_cluster(), Err("health down".into()));
+        assert_eq!(failed.overall_health, "Unknown");
+        assert_eq!(failed.health_error, "health down");
+        assert!(failed.node_health.is_empty());
+    }
+
+    fn sample_k8s_cluster() -> controller_proto::KubernetesCluster {
+        controller_proto::KubernetesCluster {
+            name: "lab".into(),
+            generation: 4,
+            spec: Some(controller_proto::KubernetesClusterSpec {
+                cluster_cidr: "10.244.0.0/16".into(),
+                service_cidr: "10.96.0.0/12".into(),
+                cluster_dns: "10.96.0.10".into(),
+                api_server_endpoint: "192.168.40.220:6443".into(),
+                cni: "cilium".into(),
+                cilium_config: Some(controller_proto::CiliumConfig {
+                    mode: "native-routing".into(),
+                    mtu: 1500,
+                    tunnel: "disabled".into(),
+                    auto_direct_node_routes: true,
+                    load_balancer_ip_pools: vec!["192.168.40.220/29".into()],
+                }),
+                control_plane_nodes: vec![controller_proto::KubernetesNodeSpec {
+                    node_id: "node-107".into(),
+                    role: "control-plane".into(),
+                    advertise_address: "192.168.40.107".into(),
+                    iface: "enp6s0".into(),
+                    initial_cluster: true,
+                    join_existing: false,
+                }],
+                worker_nodes: vec![controller_proto::KubernetesNodeSpec {
+                    node_id: "node-119".into(),
+                    role: "worker".into(),
+                    advertise_address: "192.168.40.119".into(),
+                    iface: "enp6s0".into(),
+                    initial_cluster: false,
+                    join_existing: false,
+                }],
+                high_availability: Some(controller_proto::HighAvailabilityConfig {
+                    enabled: true,
+                    vip_address: "192.168.40.220".into(),
+                    vip_interface: "enp6s0".into(),
+                    method: "keepalived".into(),
+                }),
+            }),
+            status: Some(controller_proto::KubernetesClusterStatus {
+                phase: "ready".into(),
+                message: "all nodes joined".into(),
+                ready_control_planes: 1,
+                ready_workers: 1,
+                last_updated: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                active_node_ids: vec!["node-107".into(), "node-119".into()],
+            }),
+        }
     }
 }
 

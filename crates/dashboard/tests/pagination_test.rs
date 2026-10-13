@@ -686,6 +686,27 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    async fn get_ceph_cluster_capacity(
+        &self,
+        _: TRequest<GetCephClusterCapacityRequest>,
+    ) -> Result<Response<GetCephClusterCapacityResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_ceph_dashboard_credentials(
+        &self,
+        _: TRequest<GetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<GetCephDashboardCredentialsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn set_ceph_dashboard_credentials(
+        &self,
+        _: TRequest<SetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<SetCephDashboardCredentialsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
     async fn create_shared_filesystem(
         &self,
         _: TRequest<CreateSharedFilesystemRequest>,
@@ -973,12 +994,27 @@ async fn pagination_and_multiple_networks() {
     });
     assert!(p1.contains("15 VMs"), "total VM count");
     assert!(p1.contains("Next"), "page 1 must have Next link");
+    assert!(p1.contains("Per page"), "must offer page-size dropdown");
+    assert!(p1.contains(r#"name="per_page""#), "dropdown posts per_page");
 
     // ── Page 2: remaining 5 VMs ─────────────────────────────────────
     let (st, p2) = fetch(&app, "/vms?page=2").await;
     assert_eq!(st, StatusCode::OK);
     assert!(p2.contains("Page 2 of 2"), "second page");
     assert!(p2.contains("Previous"), "page 2 must have Previous link");
+    assert!(
+        p2.contains("per_page=10") || p2.contains(r#"value="10""#),
+        "page links / dropdown keep page size"
+    );
+
+    // ── Larger page size fits all 15 on one page ────────────────────
+    let (st, p_all) = fetch(&app, "/vms?per_page=25").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        p_all.contains("Page 1 of 1"),
+        "25 per page shows all 15 VMs on one page"
+    );
+    assert!(!p_all.contains("Next →"), "single page must not offer Next");
 
     // ── Networks: host + 2 SDN networks ────────────────────────────
     let (st, nets) = fetch(&app, "/networks").await;

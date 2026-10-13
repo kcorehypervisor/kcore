@@ -11,9 +11,9 @@ mod kubernetes_cluster_tests {
         db.upsert_node(&NodeRow {
             id: id.to_string(),
             hostname: id.to_string(),
-            address: "127.0.0.1:9091".to_string(),
+            address: format!("{id}:9091"),
             cpu_cores: 4,
-            memory_bytes: 8 * 1024 * 1024 * 1024,
+            memory_bytes: 8_000_000_000,
             status: "ready".to_string(),
             last_heartbeat: String::new(),
             gateway_interface: "enp6s0".to_string(),
@@ -22,11 +22,11 @@ mod kubernetes_cluster_tests {
             storage_backend: "filesystem".to_string(),
             disable_vxlan: false,
             approval_status: "approved".to_string(),
-            cert_expiry_days: -1,
-            luks_method: String::new(),
+            cert_expiry_days: 30,
+            luks_method: "tpm2".to_string(),
             dc_id: "DC1".to_string(),
         })
-        .unwrap();
+        .expect("insert node");
     }
 
     #[test]

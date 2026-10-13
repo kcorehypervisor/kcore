@@ -26,7 +26,7 @@ npm run build
 | `kcore_delete` | Delete, or cancel a non-terminal cluster update. |
 | `kcore_operation` | Power state, migrate, drain, cordon, node approval, update approve/rollback, node install. |
 | `kcore_catalog` | Resource kinds and which fields are mutable. |
-| `kcore_rpc` | Any other implemented unary controller or node RPC. Omit `method` to list them. Mutations need `confirm: true`. |
+| `kcore_rpc` | Any implemented unary controller, node, or kcore-provisioning RPC. Omit `method` to list them. Provisioning needs `connection.provisioning`. Mutations need `confirm: true`. |
 
 Node install partitions disks. It runs only after the operator sets `spec.acknowledge` to `wipe the selected disks`.
 

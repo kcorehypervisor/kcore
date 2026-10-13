@@ -117,6 +117,28 @@ else
   exit 1
 fi
 
+# Runtime drop-ins (e.g. /run/systemd/.../override.conf → /usr/local/bin/*-k8s)
+# can shadow /opt/kcore/bin. Copy the new binary onto that ExecStart path so
+# restart actually runs the build we just deployed.
+sync_effective_exec() {
+  local unit="$1" src="$2"
+  local exe
+  exe="$(systemctl show -p EffectiveExecStart --value "$unit" 2>/dev/null | awk '{print $1}')"
+  if [[ -z "$exe" || "$exe" == "$src" ]]; then
+    return 0
+  fi
+  case "$exe" in
+    /opt/kcore/bin/*|/nix/store/*) return 0 ;;
+  esac
+  if [[ -e "$exe" || -L "$exe" ]]; then
+    $SUDO install -m 0755 "$src" "$exe"
+    echo "    synced effective ExecStart $unit -> $exe"
+  fi
+}
+sync_effective_exec kcore-dashboard "$DASH/bin/kcore-dashboard"
+sync_effective_exec kcore-controller "$CTRL/bin/kcore-controller"
+sync_effective_exec kcore-node-agent "$AGENT/bin/kcore-node-agent"
+
 for u in kcore-dashboard kcore-controller kcore-node-agent; do
   if systemctl cat "$u" &>/dev/null; then
     $SUDO systemctl restart "$u"
