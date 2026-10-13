@@ -48,6 +48,12 @@ service NodeStorage {
   rpc FlattenVolume(FlattenVolumeRequest) returns (FlattenVolumeResponse);
   rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
 
+  // Format, mount, and unmount a logical volume in this node's volume group.
+  // Mount points must be under /var/lib/kcore or /mnt/kcore.
+  rpc FormatVolume(FormatVolumeRequest) returns (FormatVolumeResponse);
+  rpc MountVolume(MountVolumeRequest) returns (MountVolumeResponse);
+  rpc UnmountVolume(UnmountVolumeRequest) returns (UnmountVolumeResponse);
+
   // FenceVolume cuts every Ceph client that still has the image open from
   // one of the given hosts off the cluster (`ceph osd blocklist add`), so a
   // guest restarted on another node cannot share the image with a writer on
@@ -486,6 +492,9 @@ message CreateVolumeRequest {
   string storage_class = 2;
   int64 size_bytes = 3;
   map<string, string> parameters = 4; // StorageClass-specific params
+  // LVM logical volume or ZFS zvol name. Empty keeps <prefix><volume_id>.
+  // Set this to create a volume that is not a VM disk and does not use the prefix.
+  string lv_name = 5;
 }
 
 message CreateVolumeResponse {
@@ -570,6 +579,47 @@ message ResizeVolumeResponse {
   bool success = 1;
   string message = 2;
   int64 size_bytes = 3;
+}
+
+message FormatVolumeRequest {
+  // /dev/<vg>/<lv>
+  string backend_handle = 1;
+  // ext4 or xfs
+  string fs_type = 2;
+  // Replace an existing filesystem. A mounted volume is refused either way.
+  bool force = 3;
+}
+
+message FormatVolumeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message MountVolumeRequest {
+  string backend_handle = 1;
+  // Directory under /var/lib/kcore or /mnt/kcore.
+  string mount_point = 2;
+  // ext4 or xfs. Empty uses the filesystem already on the volume.
+  string fs_type = 3;
+  // Install a systemd mount unit so the volume comes back after reboot.
+  bool persistent = 4;
+}
+
+message MountVolumeResponse {
+  bool success = 1;
+  string message = 2;
+  string mount_point = 3;
+}
+
+message UnmountVolumeRequest {
+  string mount_point = 1;
+  // Also remove the systemd mount unit created with persistent=true.
+  bool persistent = 2;
+}
+
+message UnmountVolumeResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 message FenceVolumeRequest {

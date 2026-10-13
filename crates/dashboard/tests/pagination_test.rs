@@ -581,6 +581,27 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    async fn format_volume(
+        &self,
+        _: TRequest<FormatVolumeRequest>,
+    ) -> Result<Response<FormatVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn mount_volume(
+        &self,
+        _: TRequest<MountVolumeRequest>,
+    ) -> Result<Response<MountVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn unmount_volume(
+        &self,
+        _: TRequest<UnmountVolumeRequest>,
+    ) -> Result<Response<UnmountVolumeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
     async fn encrypt_volume(
         &self,
         _: TRequest<EncryptVolumeRequest>,

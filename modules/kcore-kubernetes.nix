@@ -42,7 +42,7 @@ let
       apiPort = c.apiServerPort;
       etcdClient = c.etcdClientPort;
       etcdPeer = c.etcdPeerPort;
-      kubeletPort = c.kubeletPort;
+      inherit (c) kubeletPort;
       kubeletHealthz = c.kubeletHealthzPort;
       root = "/etc/kubernetes/${name}";
       pki = "${root}/pki";

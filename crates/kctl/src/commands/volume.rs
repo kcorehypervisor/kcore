@@ -219,6 +219,9 @@ pub async fn create(
     info: &ConnectionInfo,
     name: &str,
     size_bytes: i64,
+    storage_class: &str,
+    node: Option<&str>,
+    volume_name: Option<&str>,
     vm: Option<String>,
     from_snapshot: Option<String>,
     encrypt: bool,
@@ -231,11 +234,13 @@ pub async fn create(
         .create_volume(controller_proto::CreateVolumeRequest {
             name: name.to_string(),
             size_bytes,
-            storage_class: "ceph".into(),
+            storage_class: storage_class.to_string(),
             vm: vm.unwrap_or_default(),
             guest_format_json: String::new(),
             from_snapshot: from_snapshot.unwrap_or_default(),
             encrypt,
+            node: node.unwrap_or("").to_string(),
+            volume_name: volume_name.unwrap_or("").to_string(),
         })
         .await?
         .into_inner();
@@ -374,6 +379,63 @@ pub async fn delete(info: &ConnectionInfo, name: &str) -> Result<()> {
     let resp = client
         .delete_volume(controller_proto::DeleteVolumeRequest {
             name: name.to_string(),
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
+pub async fn format(info: &ConnectionInfo, name: &str, fs: &str, force: bool) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .format_volume(controller_proto::FormatVolumeRequest {
+            name: name.to_string(),
+            fs_type: fs.to_string(),
+            force,
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
+pub async fn mount(
+    info: &ConnectionInfo,
+    name: &str,
+    path: &str,
+    fs: Option<&str>,
+    persistent: bool,
+) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .mount_volume(controller_proto::MountVolumeRequest {
+            name: name.to_string(),
+            mount_point: path.to_string(),
+            fs_type: fs.unwrap_or("").to_string(),
+            persistent,
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
+pub async fn unmount(info: &ConnectionInfo, name: &str, persistent: bool) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .unmount_volume(controller_proto::UnmountVolumeRequest {
+            name: name.to_string(),
+            persistent,
         })
         .await?
         .into_inner();

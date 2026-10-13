@@ -345,6 +345,133 @@ pub async fn disks(info: &ConnectionInfo) -> Result<()> {
     Ok(())
 }
 
+pub async fn zfs_create(
+    info: &ConnectionInfo,
+    id: &str,
+    size_bytes: i64,
+    dataset: Option<&str>,
+) -> Result<()> {
+    if size_bytes <= 0 {
+        anyhow::bail!("--size-bytes must be positive");
+    }
+    let mut client = client::node_storage_client(info).await?;
+    let resp = client
+        .create_volume(node_proto::CreateVolumeRequest {
+            volume_id: id.to_string(),
+            storage_class: "zfs".to_string(),
+            size_bytes,
+            parameters: std::collections::HashMap::new(),
+            lv_name: dataset.unwrap_or("").to_string(),
+        })
+        .await?
+        .into_inner();
+    println!("{}", resp.backend_handle);
+    Ok(())
+}
+
+pub async fn lvm_create(
+    info: &ConnectionInfo,
+    id: &str,
+    size_bytes: i64,
+    lv_name: Option<&str>,
+) -> Result<()> {
+    if size_bytes <= 0 {
+        anyhow::bail!("--size-bytes must be positive");
+    }
+    let mut client = client::node_storage_client(info).await?;
+    let resp = client
+        .create_volume(node_proto::CreateVolumeRequest {
+            volume_id: id.to_string(),
+            storage_class: "lvm".to_string(),
+            size_bytes,
+            parameters: std::collections::HashMap::new(),
+            lv_name: lv_name.unwrap_or("").to_string(),
+        })
+        .await?
+        .into_inner();
+    println!("{}", resp.backend_handle);
+    Ok(())
+}
+
+pub async fn lvm_resize(
+    info: &ConnectionInfo,
+    device: &str,
+    size_bytes: i64,
+    allow_shrink: bool,
+) -> Result<()> {
+    let mut client = client::node_storage_client(info).await?;
+    let resp = client
+        .resize_volume(node_proto::ResizeVolumeRequest {
+            backend_handle: device.to_string(),
+            size_bytes,
+            allow_shrink,
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        anyhow::bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
+pub async fn lvm_format(info: &ConnectionInfo, device: &str, fs: &str, force: bool) -> Result<()> {
+    let mut client = client::node_storage_client(info).await?;
+    let resp = client
+        .format_volume(node_proto::FormatVolumeRequest {
+            backend_handle: device.to_string(),
+            fs_type: fs.to_string(),
+            force,
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        anyhow::bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
+pub async fn lvm_mount(
+    info: &ConnectionInfo,
+    device: &str,
+    path: &str,
+    fs: Option<&str>,
+    persistent: bool,
+) -> Result<()> {
+    let mut client = client::node_storage_client(info).await?;
+    let resp = client
+        .mount_volume(node_proto::MountVolumeRequest {
+            backend_handle: device.to_string(),
+            mount_point: path.to_string(),
+            fs_type: fs.unwrap_or("").to_string(),
+            persistent,
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        anyhow::bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
+pub async fn lvm_unmount(info: &ConnectionInfo, path: &str, persistent: bool) -> Result<()> {
+    let mut client = client::node_storage_client(info).await?;
+    let resp = client
+        .unmount_volume(node_proto::UnmountVolumeRequest {
+            mount_point: path.to_string(),
+            persistent,
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        anyhow::bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
 pub async fn nics(info: &ConnectionInfo) -> Result<()> {
     let mut client = client::node_admin_client(info).await?;
     let resp = client
