@@ -1469,6 +1469,23 @@ pub struct KubernetesNodeConfig {
     pub vip_address: String,
     pub vip_interface: String,
     pub kubeconfig_data: String,
+    /// Set for a cluster that shares the node with the primary one.
+    /// The primary cluster keeps the module defaults and leaves this empty.
+    pub instance: Option<KubernetesInstanceLayout>,
+}
+
+/// Ports and per-node pod CIDR for a cluster that is not the host's primary.
+#[derive(Debug, Clone)]
+pub struct KubernetesInstanceLayout {
+    pub api_server_port: u16,
+    pub etcd_client_port: u16,
+    pub etcd_peer_port: u16,
+    pub kubelet_port: u16,
+    pub kubelet_healthz_port: u16,
+    pub controller_manager_port: u16,
+    pub scheduler_port: u16,
+    pub virtual_router_id: u16,
+    pub pod_subnet: String,
 }
 
 /// Generate the kcore.kubernetes NixOS module configuration for a node.
@@ -1516,27 +1533,31 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
         ));
     }
 
-    out.push_str(&format!("    cni = \"{}\";\n", nix_escape(&k8s.cni)));
-    out.push_str(&format!(
-        "    ciliumMode = \"{}\";\n",
-        nix_escape(&k8s.cilium_mode)
-    ));
-    out.push_str(&format!("    ciliumMtu = {};\n", k8s.cilium_mtu));
-    out.push_str(&format!(
-        "    ciliumTunnel = \"{}\";\n",
-        nix_escape(&k8s.cilium_tunnel)
-    ));
-    out.push_str(&format!(
-        "    ciliumAutoDirectNodeRoutes = {};\n",
-        k8s.cilium_auto_direct_routes
-    ));
+    // Extra clusters use a private bridge CNI. The submodule has no Cilium
+    // options, and a second Cilium agent would fight the primary one for BPF.
+    if k8s.instance.is_none() {
+        out.push_str(&format!("    cni = \"{}\";\n", nix_escape(&k8s.cni)));
+        out.push_str(&format!(
+            "    ciliumMode = \"{}\";\n",
+            nix_escape(&k8s.cilium_mode)
+        ));
+        out.push_str(&format!("    ciliumMtu = {};\n", k8s.cilium_mtu));
+        out.push_str(&format!(
+            "    ciliumTunnel = \"{}\";\n",
+            nix_escape(&k8s.cilium_tunnel)
+        ));
+        out.push_str(&format!(
+            "    ciliumAutoDirectNodeRoutes = {};\n",
+            k8s.cilium_auto_direct_routes
+        ));
 
-    if !k8s.cilium_lb_ip_pools.is_empty() {
-        out.push_str("    ciliumLoadBalancerIpPools = [\n");
-        for pool in &k8s.cilium_lb_ip_pools {
-            out.push_str(&format!("      \"{}\"\n", nix_escape(pool)));
+        if !k8s.cilium_lb_ip_pools.is_empty() {
+            out.push_str("    ciliumLoadBalancerIpPools = [\n");
+            for pool in &k8s.cilium_lb_ip_pools {
+                out.push_str(&format!("      \"{}\"\n", nix_escape(pool)));
+            }
+            out.push_str("    ];\n");
         }
-        out.push_str("    ];\n");
     }
 
     out.push_str(&format!("    haEnabled = {};\n", k8s.ha_enabled));
@@ -1549,6 +1570,44 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
             "    vipInterface = \"{}\";\n",
             nix_escape(&k8s.vip_interface)
         ));
+    }
+
+    if let Some(instance) = &k8s.instance {
+        out.push_str(&format!(
+            "    apiServerPort = {};\n",
+            instance.api_server_port
+        ));
+        out.push_str(&format!(
+            "    etcdClientPort = {};\n",
+            instance.etcd_client_port
+        ));
+        out.push_str(&format!(
+            "    etcdPeerPort = {};\n",
+            instance.etcd_peer_port
+        ));
+        out.push_str(&format!("    kubeletPort = {};\n", instance.kubelet_port));
+        out.push_str(&format!(
+            "    kubeletHealthzPort = {};\n",
+            instance.kubelet_healthz_port
+        ));
+        out.push_str(&format!(
+            "    controllerManagerPort = {};\n",
+            instance.controller_manager_port
+        ));
+        out.push_str(&format!(
+            "    schedulerPort = {};\n",
+            instance.scheduler_port
+        ));
+        out.push_str(&format!(
+            "    virtualRouterId = {};\n",
+            instance.virtual_router_id
+        ));
+        if !instance.pod_subnet.is_empty() {
+            out.push_str(&format!(
+                "    podSubnet = \"{}\";\n",
+                nix_escape(&instance.pod_subnet)
+            ));
+        }
     }
 
     if !k8s.kubeconfig_data.is_empty() {
@@ -1590,6 +1649,7 @@ mod kubernetes_tests {
             vip_address: "192.168.40.200".to_string(),
             vip_interface: "enp6s0".to_string(),
             kubeconfig_data: String::new(),
+            instance: None,
         };
 
         let nix = generate_kubernetes_node_config(&config);
@@ -1623,6 +1683,7 @@ mod kubernetes_tests {
             vip_address: String::new(),
             vip_interface: String::new(),
             kubeconfig_data: String::new(),
+            instance: None,
         };
 
         let nix = generate_kubernetes_node_config(&config);
@@ -1631,6 +1692,216 @@ mod kubernetes_tests {
         assert!(nix.contains("haEnabled = false"));
         assert!(!nix.contains("etcdInitialCluster"));
     }
+
+    #[test]
+    fn pki_options_stay_inside_kubernetes_attrset() {
+        use crate::kubernetes_orchestrator::ClusterNode;
+        use crate::kubernetes_pki::KubernetesPki;
+        use std::collections::HashMap;
+
+        let node = ClusterNode {
+            node_id: "node-107".to_string(),
+            hostname: "node-107".to_string(),
+            ip_address: "192.168.40.107".to_string(),
+            iface: "enp6s0".to_string(),
+            initial_cluster: true,
+        };
+        let peer = "-----BEGIN CERTIFICATE-----\nMIIBPEER\n-----END CERTIFICATE-----\n".to_string();
+        let server =
+            "-----BEGIN CERTIFICATE-----\nMIIBSERVER\n-----END CERTIFICATE-----\n".to_string();
+        let mut etcd_node_certs = HashMap::new();
+        etcd_node_certs.insert(
+            node.node_id.clone(),
+            (server.clone(), "server-key".to_string()),
+        );
+        let mut etcd_node_peer_certs = HashMap::new();
+        etcd_node_peer_certs.insert(node.node_id.clone(), (peer.clone(), "peer-key".to_string()));
+        let pki = KubernetesPki {
+            ca_cert: "CA".to_string(),
+            ca_key: "CAKEY".to_string(),
+            sa_key: "SA".to_string(),
+            sa_pub: "SAPUB".to_string(),
+            etcd_ca_cert: "ETCDCA".to_string(),
+            etcd_ca_key: "ETCDCAKEY".to_string(),
+            apiserver_cert: "API".to_string(),
+            apiserver_key: "APIKEY".to_string(),
+            apiserver_kubelet_client_cert: "AKC".to_string(),
+            apiserver_kubelet_client_key: "AKCKEY".to_string(),
+            apiserver_etcd_client_cert: "AEC".to_string(),
+            apiserver_etcd_client_key: "AECKEY".to_string(),
+            etcd_node_certs,
+            etcd_node_peer_certs,
+            admin_kubeconfig: "apiVersion: v1\nkind: Config\n".to_string(),
+        };
+
+        let nix = generate_kubernetes_config(
+            "lab",
+            &node,
+            &pki,
+            "10.244.0.0/16",
+            "10.96.0.0/12",
+            &server,
+            "server-key",
+            &peer,
+            "peer-key",
+            std::slice::from_ref(&node),
+            &KubernetesRenderSettings {
+                api_server_endpoint: "192.168.40.200:6443".to_string(),
+                cluster_dns: "10.96.0.10".to_string(),
+                ha_enabled: true,
+                vip_address: "192.168.40.200".to_string(),
+                vip_interface: "enp6s0".to_string(),
+                cilium_mode: "native-routing".to_string(),
+                cilium_mtu: 1500,
+                cilium_tunnel: "disabled".to_string(),
+                cilium_auto_direct_routes: true,
+                cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+            },
+        )
+        .unwrap();
+
+        let close = nix.rfind("\n  };\n").expect("kubernetes attrset close");
+        let peer_at = nix.find("etcdPeerCrt").expect("etcdPeerCrt option");
+        assert!(
+            peer_at < close,
+            "etcdPeerCrt must be inside kcore.kubernetes"
+        );
+        assert!(nix.contains("etcdPeerKey"));
+        assert!(nix.contains("MIIBPEER"));
+        assert!(nix.contains("node-107=https://192.168.40.107:2380"));
+        assert!(nix.contains("apiServerEndpoint = \"192.168.40.200:6443\""));
+        assert!(nix.contains("haEnabled = true"));
+        assert!(nix.contains("vipAddress = \"192.168.40.200\""));
+        assert!(!nix.contains("https://https://"));
+        assert!(!nix.contains("environment.etc"));
+        assert!(nix.ends_with("  };\n}\n"));
+        assert_eq!(nix.matches("kubeconfigData").count(), 1);
+    }
+
+    #[test]
+    fn colocated_clusters_keep_primary_ports_and_nest_the_extra() {
+        use crate::kubernetes_orchestrator::ClusterNode;
+        use crate::kubernetes_pki::KubernetesPki;
+        use std::collections::HashMap;
+
+        let node = ClusterNode {
+            node_id: "node-105".to_string(),
+            hostname: "node-105".to_string(),
+            ip_address: "192.168.40.105".to_string(),
+            iface: "br0".to_string(),
+            initial_cluster: true,
+        };
+        let pki = KubernetesPki {
+            ca_cert: "CA".to_string(),
+            ca_key: "CAKEY".to_string(),
+            sa_key: "SA".to_string(),
+            sa_pub: "SAPUB".to_string(),
+            etcd_ca_cert: "ETCDCA".to_string(),
+            etcd_ca_key: "ETCDCAKEY".to_string(),
+            apiserver_cert: "API".to_string(),
+            apiserver_key: "APIKEY".to_string(),
+            apiserver_kubelet_client_cert: "AKC".to_string(),
+            apiserver_kubelet_client_key: "AKCKEY".to_string(),
+            apiserver_etcd_client_cert: "AEC".to_string(),
+            apiserver_etcd_client_key: "AECKEY".to_string(),
+            etcd_node_certs: HashMap::from([(
+                node.node_id.clone(),
+                ("server".to_string(), "server-key".to_string()),
+            )]),
+            etcd_node_peer_certs: HashMap::from([(
+                node.node_id.clone(),
+                ("peer".to_string(), "peer-key".to_string()),
+            )]),
+            admin_kubeconfig: "apiVersion: v1\n".to_string(),
+        };
+        let primary = KubernetesRenderSettings {
+            api_server_endpoint: "192.168.40.200:6443".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            ha_enabled: true,
+            vip_address: "192.168.40.200".to_string(),
+            vip_interface: "br0".to_string(),
+            cilium_mode: "native-routing".to_string(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".to_string(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+        };
+        let extra = KubernetesRenderSettings {
+            api_server_endpoint: "192.168.40.201:7443".to_string(),
+            cluster_dns: "10.112.0.10".to_string(),
+            ha_enabled: true,
+            vip_address: "192.168.40.201".to_string(),
+            vip_interface: "br0".to_string(),
+            cilium_mode: "native-routing".to_string(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".to_string(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: vec![],
+        };
+        let nix = generate_colocated_kubernetes_config(&[
+            KubernetesMemberRender {
+                cluster_name: "kcore-b",
+                node: &node,
+                pki: &pki,
+                cluster_cidr: "10.245.0.0/16",
+                service_cidr: "10.112.0.0/12",
+                etcd_server_cert: "server",
+                etcd_server_key: "server-key",
+                etcd_peer_cert: "peer",
+                etcd_peer_key: "peer-key",
+                all_nodes: std::slice::from_ref(&node),
+                settings: &extra,
+                pod_subnet: node_pod_subnet("10.245.0.0/16", 0),
+            },
+            KubernetesMemberRender {
+                cluster_name: "kcore-prod",
+                node: &node,
+                pki: &pki,
+                cluster_cidr: "10.244.0.0/16",
+                service_cidr: "10.96.0.0/12",
+                etcd_server_cert: "server",
+                etcd_server_key: "server-key",
+                etcd_peer_cert: "peer",
+                etcd_peer_key: "peer-key",
+                all_nodes: std::slice::from_ref(&node),
+                settings: &primary,
+                pod_subnet: String::new(),
+            },
+        ])
+        .unwrap();
+
+        let extra_at = nix.find("additionalClusters.\"kcore-b\"").unwrap();
+        let primary_etcd = nix.find("node-105=https://192.168.40.105:2380").unwrap();
+        assert!(primary_etcd < extra_at);
+        assert!(nix.contains("node-105=https://192.168.40.105:3380"));
+        assert!(nix.contains("apiServerPort = 7443"));
+        assert!(nix.contains("podSubnet = \"10.245.0.0/24\""));
+        assert!(nix.contains("virtualRouterId = 41"));
+        assert!(nix.contains("clusterName = \"kcore-prod\""));
+        let extra = &nix[extra_at..];
+        assert!(!extra.contains("ciliumMode"));
+        assert!(!extra.contains("cni ="));
+        assert!(nix.ends_with("  };\n}\n"));
+        assert_eq!(
+            kubernetes_listen_ports("192.168.40.201:7443").etcd_client,
+            3379
+        );
+    }
+}
+
+/// Cluster-wide values copied into every node's `kcore.kubernetes` block.
+#[derive(Debug, Clone)]
+pub struct KubernetesRenderSettings {
+    pub api_server_endpoint: String,
+    pub cluster_dns: String,
+    pub ha_enabled: bool,
+    pub vip_address: String,
+    pub vip_interface: String,
+    pub cilium_mode: String,
+    pub cilium_mtu: i32,
+    pub cilium_tunnel: String,
+    pub cilium_auto_direct_routes: bool,
+    pub cilium_lb_ip_pools: Vec<String>,
 }
 
 /// Generate Kubernetes node configuration for a node in the cluster
@@ -1645,12 +1916,53 @@ pub fn generate_kubernetes_config(
     etcd_peer_cert: &str,
     etcd_peer_key: &str,
     all_nodes: &[crate::kubernetes_orchestrator::ClusterNode],
+    settings: &KubernetesRenderSettings,
 ) -> anyhow::Result<String> {
+    generate_kubernetes_member(
+        cluster_name,
+        node,
+        pki,
+        cluster_cidr,
+        service_cidr,
+        etcd_server_cert,
+        etcd_server_key,
+        etcd_peer_cert,
+        etcd_peer_key,
+        all_nodes,
+        settings,
+        None,
+    )
+}
+
+pub fn generate_kubernetes_member(
+    cluster_name: &str,
+    node: &crate::kubernetes_orchestrator::ClusterNode,
+    pki: &crate::kubernetes_pki::KubernetesPki,
+    cluster_cidr: &str,
+    service_cidr: &str,
+    etcd_server_cert: &str,
+    etcd_server_key: &str,
+    etcd_peer_cert: &str,
+    etcd_peer_key: &str,
+    all_nodes: &[crate::kubernetes_orchestrator::ClusterNode],
+    settings: &KubernetesRenderSettings,
+    layout: Option<KubernetesInstanceLayout>,
+) -> anyhow::Result<String> {
+    let peer_port = layout.as_ref().map(|l| l.etcd_peer_port).unwrap_or(2380);
     // Build complete etcd initial cluster string with ALL members
     // For static bootstrap, every node needs the complete list
+    // etcd --name is the NixOS hostname (see modules/kcore-kubernetes.nix).
+    // The initial-cluster keys must be that same name.
     let etcd_initial_cluster = all_nodes
         .iter()
-        .map(|n| format!("{}=https://{}:2380", n.node_id, n.ip_address))
+        .map(|n| {
+            let name = if n.hostname.is_empty() {
+                n.node_id.as_str()
+            } else {
+                n.hostname.as_str()
+            };
+            format!("{name}=https://{}:{peer_port}", n.ip_address)
+        })
         .collect::<Vec<_>>()
         .join(",");
 
@@ -1659,108 +1971,283 @@ pub fn generate_kubernetes_config(
         cluster_name: cluster_name.to_string(),
         cluster_cidr: cluster_cidr.to_string(),
         service_cidr: service_cidr.to_string(),
-        cluster_dns: "10.96.0.10".to_string(), // TODO: Parse from service_cidr
+        cluster_dns: if settings.cluster_dns.is_empty() {
+            "10.96.0.10".to_string()
+        } else {
+            settings.cluster_dns.clone()
+        },
         advertise_address: node.ip_address.clone(),
-        iface: "enp6s0".to_string(), // TODO: Get from database
-        api_server_endpoint: format!("https://{}:6443", node.ip_address), // TODO: Use VIP if HA
-        initial_cluster: true,       // Always true for static bootstrap
+        iface: if node.iface.is_empty() {
+            "enp6s0".to_string()
+        } else {
+            node.iface.clone()
+        },
+        api_server_endpoint: api_endpoint_for_nix(&settings.api_server_endpoint, &node.ip_address),
+        initial_cluster: true, // Every member starts together on a new static cluster
         etcd_initial_cluster,
         cni: "cilium".to_string(),
-        cilium_mode: "native-routing".to_string(),
-        cilium_mtu: 1500,
-        cilium_tunnel: "disabled".to_string(),
-        cilium_auto_direct_routes: true,
-        cilium_lb_ip_pools: vec![],
-        ha_enabled: false, // TODO: Read from cluster config
-        vip_address: String::new(),
-        vip_interface: String::new(),
+        cilium_mode: if settings.cilium_mode.is_empty() {
+            "native-routing".to_string()
+        } else {
+            settings.cilium_mode.clone()
+        },
+        cilium_mtu: settings.cilium_mtu,
+        cilium_tunnel: if settings.cilium_tunnel.is_empty() {
+            "disabled".to_string()
+        } else {
+            settings.cilium_tunnel.clone()
+        },
+        cilium_auto_direct_routes: settings.cilium_auto_direct_routes,
+        cilium_lb_ip_pools: settings.cilium_lb_ip_pools.clone(),
+        ha_enabled: settings.ha_enabled,
+        vip_address: settings.vip_address.clone(),
+        vip_interface: settings.vip_interface.clone(),
         kubeconfig_data: String::new(), // TODO: Include admin kubeconfig
+        instance: layout,
     };
 
-    let mut nix = generate_kubernetes_node_config(&k8s_config);
+    let nix = generate_kubernetes_node_config(&k8s_config);
+    // generate_kubernetes_node_config closes `kcore.kubernetes` and then the
+    // module. Certificate options have to be inside `kcore.kubernetes`; popping
+    // two characters only removed the outer `}`, so the options landed beside
+    // the attrset and Nix evaluation failed.
+    const MODULE_CLOSE: &str = "  };\n}\n";
+    let Some(head) = nix.strip_suffix(MODULE_CLOSE) else {
+        anyhow::bail!("kubernetes nix module did not end with the expected close");
+    };
 
-    // Append PKI certificates as writeText
-    nix.pop(); // Remove trailing '}\n'
-    nix.pop();
-
-    nix.push_str("\n  # Kubernetes PKI certificates\n");
-    nix.push_str("  environment.etc = {\n");
-
-    // CA certificate
-    nix.push_str("    \"kubernetes/pki/ca.crt\".text = ''\n");
-    nix.push_str(&pki.ca_cert);
-    nix.push_str("'';\n");
-
-    // CA key (control plane only)
-    nix.push_str("    \"kubernetes/pki/ca.key\".text = ''\n");
-    nix.push_str(&pki.ca_key);
-    nix.push_str("'';\n");
-
-    // Service account key pair
-    nix.push_str("    \"kubernetes/pki/sa.key\".text = ''\n");
-    nix.push_str(&pki.sa_key);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/sa.pub\".text = ''\n");
-    nix.push_str(&pki.sa_pub);
-    nix.push_str("'';\n");
-
-    // API server certificate and key
-    nix.push_str("    \"kubernetes/pki/apiserver.crt\".text = ''\n");
-    nix.push_str(&pki.apiserver_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/apiserver.key\".text = ''\n");
-    nix.push_str(&pki.apiserver_key);
-    nix.push_str("'';\n");
-
-    // API server kubelet client cert
-    nix.push_str("    \"kubernetes/pki/apiserver-kubelet-client.crt\".text = ''\n");
-    nix.push_str(&pki.apiserver_kubelet_client_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/apiserver-kubelet-client.key\".text = ''\n");
-    nix.push_str(&pki.apiserver_kubelet_client_key);
-    nix.push_str("'';\n");
-
-    // etcd CA
-    nix.push_str("    \"kubernetes/pki/etcd/ca.crt\".text = ''\n");
-    nix.push_str(&pki.etcd_ca_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/etcd/ca.key\".text = ''\n");
-    nix.push_str(&pki.etcd_ca_key);
-    nix.push_str("'';\n");
-
-    // Node-specific etcd server cert/key
-    nix.push_str("    \"kubernetes/pki/etcd/server.crt\".text = ''\n");
-    nix.push_str(etcd_server_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/etcd/server.key\".text = ''\n");
-    nix.push_str(etcd_server_key);
-    nix.push_str("'';\n");
-
-    // Node-specific etcd peer cert/key
-    nix.push_str("    \"kubernetes/pki/etcd/peer.crt\".text = ''\n");
-    nix.push_str(etcd_peer_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/etcd/peer.key\".text = ''\n");
-    nix.push_str(etcd_peer_key);
-    nix.push_str("'';\n");
-
-    // API server etcd client cert
-    nix.push_str("    \"kubernetes/pki/apiserver-etcd-client.crt\".text = ''\n");
-    nix.push_str(&pki.apiserver_etcd_client_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/apiserver-etcd-client.key\".text = ''\n");
-    nix.push_str(&pki.apiserver_etcd_client_key);
-    nix.push_str("'';\n");
-
-    nix.push_str("  };\n");
-    nix.push_str("}\n");
+    let mut nix = head.to_string();
+    nix.push_str("\n    # PKI certificates (written by modules/kcore-kubernetes.nix)\n");
+    for (name, value) in [
+        ("caCrt", pki.ca_cert.as_str()),
+        ("caKey", pki.ca_key.as_str()),
+        ("saKey", pki.sa_key.as_str()),
+        ("saPub", pki.sa_pub.as_str()),
+        ("apiserverCrt", pki.apiserver_cert.as_str()),
+        ("apiserverKey", pki.apiserver_key.as_str()),
+        (
+            "apiserverKubeletClientCrt",
+            pki.apiserver_kubelet_client_cert.as_str(),
+        ),
+        (
+            "apiserverKubeletClientKey",
+            pki.apiserver_kubelet_client_key.as_str(),
+        ),
+        (
+            "apiserverEtcdClientCrt",
+            pki.apiserver_etcd_client_cert.as_str(),
+        ),
+        (
+            "apiserverEtcdClientKey",
+            pki.apiserver_etcd_client_key.as_str(),
+        ),
+        ("etcdCaCrt", pki.etcd_ca_cert.as_str()),
+        ("etcdCaKey", pki.etcd_ca_key.as_str()),
+        ("etcdServerCrt", etcd_server_cert),
+        ("etcdServerKey", etcd_server_key),
+        ("etcdPeerCrt", etcd_peer_cert),
+        ("etcdPeerKey", etcd_peer_key),
+        ("kubeconfigData", pki.admin_kubeconfig.as_str()),
+    ] {
+        nix.push_str(&format!("    {name} = {};\n", nix_multiline(value)));
+    }
+    nix.push_str(MODULE_CLOSE);
 
     Ok(nix)
+}
+
+/// One cluster's render inputs for a single node.
+pub struct KubernetesMemberRender<'a> {
+    pub cluster_name: &'a str,
+    pub node: &'a crate::kubernetes_orchestrator::ClusterNode,
+    pub pki: &'a crate::kubernetes_pki::KubernetesPki,
+    pub cluster_cidr: &'a str,
+    pub service_cidr: &'a str,
+    pub etcd_server_cert: &'a str,
+    pub etcd_server_key: &'a str,
+    pub etcd_peer_cert: &'a str,
+    pub etcd_peer_key: &'a str,
+    pub all_nodes: &'a [crate::kubernetes_orchestrator::ClusterNode],
+    pub settings: &'a KubernetesRenderSettings,
+    pub pod_subnet: String,
+}
+
+/// Render every cluster that shares a node into one NixOS module.
+///
+/// The cluster on API port 6443 stays the primary `kcore.kubernetes` block so
+/// its etcd unit, data directory, and Cilium setup do not move. Every other
+/// cluster is nested under `additionalClusters`.
+pub fn generate_colocated_kubernetes_config(
+    members: &[KubernetesMemberRender<'_>],
+) -> anyhow::Result<String> {
+    if members.is_empty() {
+        anyhow::bail!("no kubernetes clusters to render");
+    }
+    let mut primary: Option<&KubernetesMemberRender<'_>> = None;
+    let mut extras: Vec<&KubernetesMemberRender<'_>> = Vec::new();
+    for member in members {
+        let ports = kubernetes_listen_ports(&member.settings.api_server_endpoint);
+        if ports.api_server == 6443 {
+            if primary.is_some() {
+                anyhow::bail!("two clusters want the primary API port 6443");
+            }
+            primary = Some(member);
+        } else {
+            extras.push(member);
+        }
+    }
+    extras.sort_by(|a, b| a.cluster_name.cmp(b.cluster_name));
+    if primary.is_some() {
+        for member in &extras {
+            let ports = kubernetes_listen_ports(&member.settings.api_server_endpoint);
+            if ports.offset == 0 || !ports.offset.is_multiple_of(1000) {
+                anyhow::bail!(
+                    "cluster {} must use an API port at least 1000 above 6443 so its etcd and VRRP ids stay off the primary cluster",
+                    member.cluster_name
+                );
+            }
+        }
+    }
+
+    let nix = if let Some(member) = primary {
+        generate_kubernetes_member(
+            member.cluster_name,
+            member.node,
+            member.pki,
+            member.cluster_cidr,
+            member.service_cidr,
+            member.etcd_server_cert,
+            member.etcd_server_key,
+            member.etcd_peer_cert,
+            member.etcd_peer_key,
+            member.all_nodes,
+            member.settings,
+            None,
+        )?
+    } else {
+        "{\n  kcore.kubernetes = {\n    enable = false;\n  };\n}\n".to_string()
+    };
+
+    const MODULE_CLOSE: &str = "  };\n}\n";
+    let Some(head) = nix.strip_suffix(MODULE_CLOSE) else {
+        anyhow::bail!("kubernetes nix module did not end with the expected close");
+    };
+    let mut out = head.to_string();
+    for member in extras {
+        let ports = kubernetes_listen_ports(&member.settings.api_server_endpoint);
+        let layout = KubernetesInstanceLayout {
+            api_server_port: ports.api_server,
+            etcd_client_port: ports.etcd_client,
+            etcd_peer_port: ports.etcd_peer,
+            kubelet_port: ports.kubelet,
+            kubelet_healthz_port: ports.kubelet_healthz,
+            controller_manager_port: 10257u16.saturating_add(ports.offset),
+            scheduler_port: 10259u16.saturating_add(ports.offset),
+            virtual_router_id: ports.virtual_router_id,
+            pod_subnet: member.pod_subnet.clone(),
+        };
+        let full = generate_kubernetes_member(
+            member.cluster_name,
+            member.node,
+            member.pki,
+            member.cluster_cidr,
+            member.service_cidr,
+            member.etcd_server_cert,
+            member.etcd_server_key,
+            member.etcd_peer_cert,
+            member.etcd_peer_key,
+            member.all_nodes,
+            member.settings,
+            Some(layout),
+        )?;
+        const OPEN: &str = "{\n  kcore.kubernetes = {\n";
+        let Some(body) = full
+            .strip_prefix(OPEN)
+            .and_then(|rest| rest.strip_suffix(MODULE_CLOSE))
+        else {
+            anyhow::bail!("extra cluster nix did not have the expected shape");
+        };
+        out.push_str(&format!(
+            "    additionalClusters.\"{}\" = {{\n",
+            nix_escape(member.cluster_name)
+        ));
+        out.push_str(body);
+        out.push_str("    };\n");
+    }
+    out.push_str(MODULE_CLOSE);
+    Ok(out)
+}
+
+/// Listen ports for a cluster. The primary API port 6443 keeps etcd on 2379
+/// and 2380. Each extra 1000 on the API port shifts etcd, kubelet, and VRRP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KubernetesListenPorts {
+    pub offset: u16,
+    pub api_server: u16,
+    pub etcd_client: u16,
+    pub etcd_peer: u16,
+    pub kubelet: u16,
+    pub kubelet_healthz: u16,
+    pub virtual_router_id: u16,
+}
+
+pub fn kubernetes_listen_ports(api_endpoint: &str) -> KubernetesListenPorts {
+    let endpoint = api_endpoint
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let api = endpoint
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .unwrap_or(6443);
+    let offset = api.saturating_sub(6443);
+    let vrid = 40u16.saturating_add(offset / 1000);
+    KubernetesListenPorts {
+        offset,
+        api_server: api,
+        etcd_client: 2379u16.saturating_add(offset),
+        etcd_peer: 2380u16.saturating_add(offset),
+        kubelet: 10250u16.saturating_add(offset),
+        kubelet_healthz: 10248u16.saturating_add(offset),
+        virtual_router_id: vrid.clamp(1, 255),
+    }
+}
+
+/// `10.245.0.0/16` and node index 1 becomes `10.245.1.0/24`.
+pub fn node_pod_subnet(cluster_cidr: &str, index: usize) -> String {
+    let base = cluster_cidr.split('/').next().unwrap_or("");
+    let mut octets: Vec<u32> = base
+        .split('.')
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    if octets.len() != 4 || index > 255 {
+        return format!("10.245.{index}.0/24");
+    }
+    octets[2] = index as u32;
+    octets[3] = 0;
+    format!("{}.{}.{}.{}/24", octets[0], octets[1], octets[2], octets[3])
+}
+
+/// The NixOS module prefixes `https://` itself. Stored endpoints sometimes
+/// already include the scheme.
+fn api_endpoint_for_nix(raw: &str, fallback_ip: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if trimmed.is_empty() {
+        format!("{fallback_ip}:6443")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Nix indented string. PEM and kubeconfig text must not close the string or
+/// expand as an antiquotation.
+fn nix_multiline(value: &str) -> String {
+    let mut escaped = value.replace("''", "'''").replace("${", "''${");
+    if !escaped.ends_with('\n') {
+        escaped.push('\n');
+    }
+    format!("''{escaped}''")
 }

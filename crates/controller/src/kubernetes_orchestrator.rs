@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+
 use anyhow::{anyhow, Context, Result};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
@@ -11,6 +15,9 @@ use crate::node_client::NodeClients;
 pub struct KubernetesOrchestrator {
     db: Database,
     node_clients: NodeClients,
+    /// Serializes Nix renders for one node so two cluster bootstraps cannot
+    /// overwrite each other's file with a stale single-cluster config.
+    node_apply_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// Bootstrap phase for tracking progress
@@ -43,7 +50,22 @@ impl BootstrapPhase {
 
 impl KubernetesOrchestrator {
     pub fn new(db: Database, node_clients: NodeClients) -> Self {
-        Self { db, node_clients }
+        Self {
+            db,
+            node_clients,
+            node_apply_locks: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    fn node_apply_lock(&self, node_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .node_apply_locks
+            .lock()
+            .expect("kubernetes node apply locks");
+        locks
+            .entry(node_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Orchestrate complete cluster bootstrap or scale-up
@@ -310,7 +332,12 @@ impl KubernetesOrchestrator {
             nodes.push(ClusterNode {
                 node_id: row.node_id,
                 hostname: node.hostname,
-                ip_address: node.address.split(':').next().unwrap_or("").to_string(),
+                ip_address: if row.advertise_address.is_empty() {
+                    node.address.split(':').next().unwrap_or("").to_string()
+                } else {
+                    row.advertise_address
+                },
+                iface: row.iface,
                 initial_cluster: row.initial_cluster,
             });
         }
@@ -343,14 +370,71 @@ impl KubernetesOrchestrator {
             &node_infos,
         )?;
 
-        // TODO: Store PKI in database for future reference
-        // Skipping for now until kubernetes_pki table migration is working
-        // self.db
-        //     .store_kubernetes_pki(cluster_name, &pki)
-        //     .context("failed to store PKI")?;
+        self.db
+            .store_kubernetes_pki(cluster_name, &pki)
+            .context("failed to store PKI")?;
 
         info!(cluster = cluster_name, "PKI generated");
         Ok(pki)
+    }
+
+    /// Push node Nix again without advancing the cluster phase.
+    ///
+    /// Cluster create used to mark the cluster ready from a second bootstrap
+    /// that never embedded certificates. A controller restart then ignored the
+    /// cluster because the orchestrator only selects phase `bootstrapping`.
+    async fn redeploy_node_certificates(
+        &self,
+        cluster_name: &str,
+        api_endpoint: &str,
+        service_cidr: &str,
+    ) -> Result<()> {
+        let nodes = self.get_cluster_nodes(cluster_name).await?;
+        if nodes.is_empty() {
+            anyhow::bail!("no nodes configured for cluster {}", cluster_name);
+        }
+        let cluster = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+
+        let stored = self.db.load_kubernetes_pki(cluster_name)?;
+        let pki = match stored {
+            Some(pki)
+                if nodes.iter().all(|node| {
+                    pki.etcd_node_certs.contains_key(&node.node_id)
+                        && pki.etcd_node_peer_certs.contains_key(&node.node_id)
+                }) =>
+            {
+                pki
+            }
+            _ => {
+                info!(
+                    cluster = cluster_name,
+                    "stored PKI is missing node certificates; generating"
+                );
+                self.generate_and_store_pki(cluster_name, api_endpoint, service_cidr, &nodes)
+                    .await?
+            }
+        };
+
+        for node in &nodes {
+            self.configure_node(
+                cluster_name,
+                node,
+                &pki,
+                &cluster.cluster_cidr,
+                service_cidr,
+                &nodes,
+            )
+            .await?;
+        }
+        info!(
+            cluster = cluster_name,
+            nodes = nodes.len(),
+            "redeployed kubernetes node configuration"
+        );
+        Ok(())
     }
 
     async fn configure_node(
@@ -358,9 +442,9 @@ impl KubernetesOrchestrator {
         cluster_name: &str,
         node: &ClusterNode,
         pki: &KubernetesPki,
-        cluster_cidr: &str,
-        service_cidr: &str,
-        all_nodes: &[ClusterNode],
+        _cluster_cidr: &str,
+        _service_cidr: &str,
+        _all_nodes: &[ClusterNode],
     ) -> Result<()> {
         info!(
             cluster = cluster_name,
@@ -369,48 +453,46 @@ impl KubernetesOrchestrator {
         );
 
         let address = format!("{}:9091", node.ip_address);
+        // Startup redeploy runs before the controller has dialed every node.
+        if self.node_clients.get_admin(&address).is_none() {
+            self.node_clients
+                .connect(&address)
+                .await
+                .with_context(|| format!("connect node agent {address}"))?;
+        }
         let mut admin_client = self
             .node_clients
             .get_admin(&address)
             .context("node client not found")?;
 
-        // Get node-specific certs
-        let (etcd_server_cert, etcd_server_key) = pki
-            .etcd_node_certs
+        // Fail before the node rebuild if this cluster has no etcd certs yet.
+        pki.etcd_node_certs
             .get(&node.node_id)
             .context("etcd server cert not found")?;
-        let (etcd_peer_cert, etcd_peer_key) = pki
-            .etcd_node_peer_certs
+        pki.etcd_node_peer_certs
             .get(&node.node_id)
             .context("etcd peer cert not found")?;
 
-        // Build complete Kubernetes Nix config with embedded PKI
-        let k8s_config = crate::nixgen::generate_kubernetes_config(
-            cluster_name,
-            node,
-            pki,
-            cluster_cidr,
-            service_cidr,
-            etcd_server_cert,
-            etcd_server_key,
-            etcd_peer_cert,
-            etcd_peer_key,
-            all_nodes,
-        )?;
+        let apply_lock = self.node_apply_lock(&node.node_id);
+        let _guard = apply_lock.lock().await;
+        let rendered = self
+            .render_node_nix(&node.node_id, cluster_name, pki)
+            .await?;
 
         info!(
             cluster = cluster_name,
             node_id = node.node_id,
-            config_len = k8s_config.len(),
-            "generated Kubernetes configuration with embedded PKI"
+            config_len = rendered.nix.len(),
+            clusters = rendered.cluster_count,
+            "generated Kubernetes configuration for every cluster on the node"
         );
 
         // Apply configuration via node agent RPC
         use crate::node_proto::ApplyRawKubernetesConfigRequest;
 
         let request = ApplyRawKubernetesConfigRequest {
-            nix_config_content: k8s_config,
-            kubeconfig_data: pki.admin_kubeconfig.clone(),
+            nix_config_content: rendered.nix,
+            kubeconfig_data: rendered.primary_kubeconfig,
         };
 
         let response = admin_client
@@ -428,6 +510,123 @@ impl KubernetesOrchestrator {
         );
 
         Ok(())
+    }
+
+    /// Nix for every cluster that already has PKI and includes this node.
+    /// `current` overrides the database copy so a cluster that just stored
+    /// certificates is included even if the read races the write.
+    async fn render_node_nix(
+        &self,
+        node_id: &str,
+        current_cluster: &str,
+        current_pki: &KubernetesPki,
+    ) -> Result<RenderedNodeNix> {
+        let clusters = self.db.list_kubernetes_clusters()?;
+        let mut members = Vec::new();
+        let mut primary_kubeconfig = String::new();
+        for cluster in clusters {
+            let nodes = self.get_cluster_nodes(&cluster.name).await?;
+            let Some(node) = nodes.iter().find(|n| n.node_id == node_id).cloned() else {
+                continue;
+            };
+            let pki = if cluster.name == current_cluster {
+                current_pki.clone()
+            } else if let Some(stored) = self.db.load_kubernetes_pki(&cluster.name)? {
+                stored
+            } else {
+                info!(
+                    cluster = %cluster.name,
+                    node_id,
+                    "skipping cluster with no stored PKI"
+                );
+                continue;
+            };
+            let (etcd_server_cert, etcd_server_key) = pki
+                .etcd_node_certs
+                .get(&node.node_id)
+                .context("etcd server cert not found")?
+                .clone();
+            let (etcd_peer_cert, etcd_peer_key) = pki
+                .etcd_node_peer_certs
+                .get(&node.node_id)
+                .context("etcd peer cert not found")?
+                .clone();
+            let cfg = self
+                .db
+                .get_kubernetes_cluster_config(&cluster.name)?
+                .context("cluster config not found")?;
+            let settings = crate::nixgen::KubernetesRenderSettings {
+                api_server_endpoint: cluster.api_server_endpoint.clone(),
+                cluster_dns: cluster.cluster_dns.clone(),
+                ha_enabled: cfg.ha_enabled,
+                vip_address: cfg.vip_address,
+                vip_interface: cfg.vip_interface,
+                cilium_mode: cfg.cilium_mode,
+                cilium_mtu: cfg.cilium_mtu,
+                cilium_tunnel: cfg.cilium_tunnel,
+                cilium_auto_direct_routes: cfg.cilium_auto_direct_routes,
+                cilium_lb_ip_pools: cfg
+                    .cilium_lb_ip_pools
+                    .split(',')
+                    .filter(|pool| !pool.is_empty())
+                    .map(|pool| pool.to_string())
+                    .collect(),
+            };
+            let ports = crate::nixgen::kubernetes_listen_ports(&settings.api_server_endpoint);
+            if ports.api_server == 6443 {
+                primary_kubeconfig = pki.admin_kubeconfig.clone();
+            }
+            let mut ordered = nodes.clone();
+            ordered.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            let index = ordered
+                .iter()
+                .position(|n| n.node_id == node_id)
+                .unwrap_or(0);
+            let pod_subnet = crate::nixgen::node_pod_subnet(&cluster.cluster_cidr, index);
+            members.push(OwnedMember {
+                cluster_name: cluster.name,
+                node,
+                pki,
+                cluster_cidr: cluster.cluster_cidr,
+                service_cidr: cluster.service_cidr,
+                etcd_server_cert,
+                etcd_server_key,
+                etcd_peer_cert,
+                etcd_peer_key,
+                all_nodes: nodes,
+                settings,
+                pod_subnet,
+            });
+        }
+        if members.is_empty() {
+            anyhow::bail!("no kubernetes clusters with PKI include node {node_id}");
+        }
+        let renders: Vec<crate::nixgen::KubernetesMemberRender<'_>> = members
+            .iter()
+            .map(|member| crate::nixgen::KubernetesMemberRender {
+                cluster_name: &member.cluster_name,
+                node: &member.node,
+                pki: &member.pki,
+                cluster_cidr: &member.cluster_cidr,
+                service_cidr: &member.service_cidr,
+                etcd_server_cert: &member.etcd_server_cert,
+                etcd_server_key: &member.etcd_server_key,
+                etcd_peer_cert: &member.etcd_peer_cert,
+                etcd_peer_key: &member.etcd_peer_key,
+                all_nodes: &member.all_nodes,
+                settings: &member.settings,
+                pod_subnet: member.pod_subnet.clone(),
+            })
+            .collect();
+        let nix = crate::nixgen::generate_colocated_kubernetes_config(&renders)?;
+        if primary_kubeconfig.is_empty() {
+            primary_kubeconfig = current_pki.admin_kubeconfig.clone();
+        }
+        Ok(RenderedNodeNix {
+            nix,
+            primary_kubeconfig,
+            cluster_count: members.len(),
+        })
     }
 
     async fn wait_for_etcd_leader(&self, node_id: &str, timeout_secs: u64) -> Result<()> {
@@ -494,42 +693,117 @@ impl KubernetesOrchestrator {
     }
 
     async fn count_healthy_etcd_members(&self, cluster_name: &str) -> Result<usize> {
-        let _nodes = self.get_cluster_nodes(cluster_name).await?;
+        let Some(pki) = self.db.load_kubernetes_pki(cluster_name)? else {
+            return Ok(0);
+        };
+        let Some(cluster) = self.db.get_kubernetes_cluster(cluster_name)? else {
+            return Ok(0);
+        };
+        let etcd_port =
+            crate::nixgen::kubernetes_listen_ports(&cluster.api_server_endpoint).etcd_client;
+        let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        let mut healthy = 0usize;
+        for row in rows.iter().filter(|row| row.role == "control-plane") {
+            let ip = row.advertise_address.as_str();
+            if ip.is_empty() {
+                continue;
+            }
+            match etcd_member_healthy(
+                ip,
+                etcd_port,
+                &pki.etcd_ca_cert,
+                &pki.apiserver_etcd_client_cert,
+                &pki.apiserver_etcd_client_key,
+            )
+            .await
+            {
+                Ok(true) => healthy += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    info!(
+                        cluster = cluster_name,
+                        node_id = %row.node_id,
+                        error = %e,
+                        "etcd health probe failed"
+                    );
+                }
+            }
+        }
+        Ok(healthy)
+    }
 
-        // TODO: Implement actual etcd status check via node agent RPC
-        // For now, always return 0 to force fresh bootstrap
-        // This ensures clusters are always bootstrapped from scratch until
-        // we implement proper etcd health checking
-        Ok(0)
+    async fn control_plane_quorum(&self, cluster_name: &str) -> Result<usize> {
+        let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        let control_planes = rows
+            .iter()
+            .filter(|row| row.role == "control-plane")
+            .count();
+        Ok((control_planes / 2) + 1)
+    }
+
+    async fn apiserver_is_ready(&self, cluster_name: &str) -> Result<bool> {
+        let Some(cluster) = self.db.get_kubernetes_cluster(cluster_name)? else {
+            return Ok(false);
+        };
+        let Some(pki) = self.db.load_kubernetes_pki(cluster_name)? else {
+            return Ok(false);
+        };
+        match apiserver_ready(&cluster.api_server_endpoint, &pki.ca_cert).await {
+            Ok(ready) => Ok(ready),
+            Err(e) => {
+                info!(
+                    cluster = cluster_name,
+                    error = %e,
+                    "API server readiness probe failed"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// A cluster left in `failed` by the old stub health check can already
+    /// have etcd and the API server up. Promote it without minting new PKI.
+    async fn promote_if_healthy(&self, cluster_name: &str) -> Result<()> {
+        let Some(cluster) = self.db.get_kubernetes_cluster(cluster_name)? else {
+            return Ok(());
+        };
+        if cluster.phase == "ready" || cluster.phase == "bootstrapping" {
+            return Ok(());
+        }
+        let need = self.control_plane_quorum(cluster_name).await?;
+        let healthy = self.count_healthy_etcd_members(cluster_name).await?;
+        if healthy < need {
+            return Ok(());
+        }
+        if !self.apiserver_is_ready(cluster_name).await? {
+            return Ok(());
+        }
+        let control_planes = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)?
+            .iter()
+            .filter(|row| row.role == "control-plane")
+            .count() as i32;
+        self.db
+            .mark_kubernetes_cluster_ready(cluster_name, control_planes)?;
+        info!(
+            cluster = cluster_name,
+            healthy_etcd = healthy,
+            control_planes,
+            "recorded kubernetes cluster ready"
+        );
+        Ok(())
     }
 
     async fn wait_for_apiserver(&self, cluster_name: &str, timeout_secs: u64) -> Result<()> {
         info!(cluster = cluster_name, "waiting for API server");
 
-        let nodes = self.get_cluster_nodes(cluster_name).await?;
         let start = std::time::Instant::now();
-
         while start.elapsed().as_secs() < timeout_secs {
-            let mut healthy_count = 0;
-
-            for node in &nodes {
-                let address = format!("{}:9091", node.ip_address);
-                if self.node_clients.get_admin(&address).is_some() {
-                    // TODO: Implement actual apiserver status check via node agent RPC
-                    // For now, assume healthy if node is reachable
-                    healthy_count += 1;
-                }
-            }
-
-            if healthy_count > (nodes.len() / 2) {
-                info!(
-                    cluster = cluster_name,
-                    healthy_apiservers = healthy_count,
-                    "API server quorum achieved"
-                );
+            if self.apiserver_is_ready(cluster_name).await? {
+                info!(cluster = cluster_name, "API server ready");
                 return Ok(());
             }
-
             sleep(Duration::from_secs(10)).await;
         }
 
@@ -549,11 +823,161 @@ impl KubernetesOrchestrator {
     }
 }
 
+fn endpoint_host_port(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_string()
+}
+
+fn response_reports_ready(path: &str, status: u16, body: &str) -> bool {
+    if status != 200 {
+        return false;
+    }
+    if path == "/health" {
+        body.replace([' ', '\n'], "")
+            .contains("\"health\":\"true\"")
+    } else {
+        body.contains("ok")
+    }
+}
+
+async fn etcd_member_healthy(
+    ip: &str,
+    port: u16,
+    ca_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+) -> Result<bool> {
+    let (status, body) = tls_get(
+        &format!("{ip}:{port}"),
+        ip,
+        "/health",
+        ca_pem,
+        Some((client_cert_pem, client_key_pem)),
+    )
+    .await?;
+    Ok(response_reports_ready("/health", status, &body))
+}
+
+async fn apiserver_ready(api_endpoint: &str, ca_pem: &str) -> Result<bool> {
+    let endpoint = endpoint_host_port(api_endpoint);
+    let host = endpoint.split(':').next().unwrap_or("").to_string();
+    if host.is_empty() {
+        return Ok(false);
+    }
+    let (status, body) = tls_get(&endpoint, &host, "/readyz", ca_pem, None).await?;
+    Ok(response_reports_ready("/readyz", status, &body))
+}
+
+async fn tls_get(
+    addr: &str,
+    server_name: &str,
+    path: &str,
+    ca_pem: &str,
+    client_auth: Option<(&str, &str)>,
+) -> Result<(u16, String)> {
+    use rustls::pki_types::ServerName;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in pem_certs(ca_pem)? {
+        roots.add(cert).context("etcd or kubernetes CA")?;
+    }
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let config = if let Some((cert_pem, key_pem)) = client_auth {
+        builder
+            .with_client_auth_cert(pem_certs(cert_pem)?, pem_key(key_pem)?)
+            .context("etcd client certificate")?
+    } else {
+        builder.with_no_client_auth()
+    };
+    let name = ServerName::try_from(server_name.to_string()).context("probe server name")?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
+        .await
+        .context("connect timed out")?
+        .with_context(|| format!("connect {addr}"))?;
+    let mut tls = connector
+        .connect(name, stream)
+        .await
+        .context("tls handshake")?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {server_name}\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .await
+        .context("write probe")?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut buf))
+        .await
+        .context("read timed out")?
+        .context("read probe")?;
+    let text = String::from_utf8_lossy(&buf);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    Ok((status, body.to_string()))
+}
+
+fn pem_certs(pem_str: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::CertificateDer;
+    let mut certs = Vec::new();
+    for block in pem::parse_many(pem_str).context("parsing certificate pem")? {
+        if block.tag() == "CERTIFICATE" {
+            certs.push(CertificateDer::from(block.contents().to_vec()));
+        }
+    }
+    if certs.is_empty() {
+        anyhow::bail!("no certificate in pem");
+    }
+    Ok(certs)
+}
+
+fn pem_key(pem_str: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    use rustls::pki_types::{
+        PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    };
+    let block = pem::parse(pem_str).context("parsing private key pem")?;
+    let bytes = block.contents().to_vec();
+    match block.tag() {
+        "PRIVATE KEY" => Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes))),
+        "EC PRIVATE KEY" => Ok(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(bytes))),
+        "RSA PRIVATE KEY" => Ok(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(bytes))),
+        other => anyhow::bail!("unsupported private key type {other}"),
+    }
+}
+
+struct RenderedNodeNix {
+    nix: String,
+    primary_kubeconfig: String,
+    cluster_count: usize,
+}
+
+struct OwnedMember {
+    cluster_name: String,
+    node: ClusterNode,
+    pki: KubernetesPki,
+    cluster_cidr: String,
+    service_cidr: String,
+    etcd_server_cert: String,
+    etcd_server_key: String,
+    etcd_peer_cert: String,
+    etcd_peer_key: String,
+    all_nodes: Vec<ClusterNode>,
+    settings: crate::nixgen::KubernetesRenderSettings,
+    pod_subnet: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusterNode {
     pub node_id: String,
     pub hostname: String,
     pub ip_address: String,
+    pub iface: String,
     pub initial_cluster: bool,
 }
 
@@ -561,7 +985,76 @@ pub struct ClusterNode {
 pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClients) {
     let orchestrator = KubernetesOrchestrator::new(db.clone(), node_clients);
 
+    // Clusters that already left `bootstrapping` never get another render.
+    // Push certificates once per controller start. The 30s loop below still
+    // owns clusters that are waiting to bootstrap.
+    match db.list_kubernetes_clusters() {
+        Ok(clusters) => {
+            for cluster in clusters {
+                if cluster.phase == "bootstrapping" {
+                    continue;
+                }
+                let orchestrator = orchestrator.clone();
+                let cluster_name = cluster.name.clone();
+                let api_endpoint = cluster.api_server_endpoint.clone();
+                let service_cidr = cluster.service_cidr.clone();
+                let already_up = orchestrator
+                    .count_healthy_etcd_members(&cluster_name)
+                    .await
+                    .unwrap_or(0);
+                let need = orchestrator
+                    .control_plane_quorum(&cluster_name)
+                    .await
+                    .unwrap_or(1);
+                if already_up >= need {
+                    info!(
+                        cluster = %cluster_name,
+                        healthy_etcd = already_up,
+                        "etcd already has quorum; skipping certificate redeploy"
+                    );
+                    continue;
+                }
+                tokio::spawn(async move {
+                    // Node agents may still be restarting when the controller
+                    // comes up. This path runs once per process, so retry.
+                    for attempt in 1..=6 {
+                        match orchestrator
+                            .redeploy_node_certificates(&cluster_name, &api_endpoint, &service_cidr)
+                            .await
+                        {
+                            Ok(()) => return,
+                            Err(e) => {
+                                error!(
+                                    cluster = cluster_name,
+                                    attempt,
+                                    error = %e,
+                                    "kubernetes certificate redeploy failed"
+                                );
+                                sleep(Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "failed to list Kubernetes clusters for certificate redeploy");
+        }
+    }
+
     loop {
+        if let Ok(clusters) = db.list_kubernetes_clusters() {
+            for cluster in clusters {
+                if let Err(e) = orchestrator.promote_if_healthy(&cluster.name).await {
+                    error!(
+                        cluster = %cluster.name,
+                        error = %e,
+                        "kubernetes health promotion failed"
+                    );
+                }
+            }
+        }
+
         // Check for clusters in "bootstrapping" phase that need bootstrap
         match db.list_kubernetes_clusters_by_phase("bootstrapping") {
             Ok(clusters) => {
@@ -596,5 +1089,40 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
 
         // Check every 30 seconds
         sleep(Duration::from_secs(30)).await;
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::response_reports_ready;
+
+    #[test]
+    fn etcd_health_body_requires_true() {
+        assert!(response_reports_ready(
+            "/health",
+            200,
+            r#"{"health":"true"}"#
+        ));
+        assert!(response_reports_ready(
+            "/health",
+            200,
+            "{\n  \"health\": \"true\"\n}"
+        ));
+        assert!(!response_reports_ready(
+            "/health",
+            200,
+            r#"{"health":"false"}"#
+        ));
+        assert!(!response_reports_ready(
+            "/health",
+            503,
+            r#"{"health":"true"}"#
+        ));
+    }
+
+    #[test]
+    fn apiserver_readyz_accepts_ok() {
+        assert!(response_reports_ready("/readyz", 200, "ok"));
+        assert!(!response_reports_ready("/readyz", 500, "ok"));
     }
 }

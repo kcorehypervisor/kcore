@@ -2,8 +2,8 @@
 name = "kcore-controller"
 version = "0.3.0"
 edition = "2021"
-# examples/create_k8s_cluster.rs is not a buildable target: it mods files that
-# are not next to it, which makes cargo fmt fail the whole package.
+# examples/create_k8s_cluster.rs references modules that are not beside it.
+# Leave it out of the package so rustfmt and cargo test do not try to load them.
 autoexamples = false
 
 [dependencies]

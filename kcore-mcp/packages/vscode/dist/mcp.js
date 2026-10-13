@@ -71962,6 +71962,14 @@ var KINDS = [
     immutable: ["publicKey"]
   },
   {
+    id: "postgresql",
+    yamlKind: "Postgresql",
+    title: "PostgreSQL database",
+    summary: "One database from the NixOS postgresql package (services.postgresql). v1 is a single database per node, reached through the local Unix socket. port can change; package, database, and targetNode cannot.",
+    mutable: ["port"],
+    immutable: ["database", "package", "targetNode"]
+  },
+  {
     id: "container",
     yamlKind: "Container",
     title: "Container",
@@ -72032,6 +72040,14 @@ var KINDS = [
     summary: "RGW object store on a Ceph cluster. members is the list of node ids that run the gateway.",
     mutable: ["port", "tls", "members"],
     immutable: ["cephCluster"]
+  },
+  {
+    id: "image",
+    yamlKind: "Image",
+    title: "Node image",
+    summary: "Boot image cached on a node. Read lists ListImages on each ready node. Images are not created through the controller.",
+    mutable: [],
+    immutable: ["name", "path"]
   },
   {
     id: "cluster-update",
@@ -72147,6 +72163,7 @@ var INTENT = [
   [/\bvirtual machines?\b|\bvms?\b/i, "vm"],
   [/\bnetworks?\b|\bvxlan\b|\bbridge\b/i, "network"],
   [/\bssh keys?\b/i, "ssh-key"],
+  [/\bpostgres(?:ql)?\b/i, "postgresql"],
   [/\bcontainers?\b/i, "container"],
   [/\bvolumes?\b/i, "volume"],
   [/\bsnapshot polic/i, "snapshot-policy"],
@@ -72256,6 +72273,43 @@ function questionsFor(kind, spec) {
           "The controller stores the public key and can inject it into cloud-init. The private key stays with the operator.",
           missing(spec, "publicKey"),
           { example: "ssh-ed25519 AAAA... operator@host" }
+        )
+      ].filter((item) => item.required || missing(spec, item.id));
+    case "postgresql":
+      return [
+        question(
+          "name",
+          "What should this PostgreSQL instance be called?",
+          "The name identifies the resource. It is also the database name when you leave database empty and the name is a PostgreSQL identifier.",
+          missing(spec, "name"),
+          { example: "app" }
+        ),
+        question(
+          "database",
+          "What is the single database name?",
+          "NixOS ensureDatabases creates this database. Use letters, digits, and underscores. Defaults to the instance name.",
+          false,
+          { example: "app" }
+        ),
+        question(
+          "package",
+          "Which NixOS PostgreSQL package should it use?",
+          "postgresql tracks the nixpkgs default. Pin postgresql_16 when the major version must stay put. This choice is immutable.",
+          false,
+          { choices: ["postgresql", "postgresql_14", "postgresql_15", "postgresql_16", "postgresql_17"] }
+        ),
+        question(
+          "port",
+          "Which port should PostgreSQL use?",
+          "Defaults to 5432. v1 still serves clients on the local Unix socket.",
+          false,
+          { example: "5432" }
+        ),
+        question(
+          "targetNode",
+          "Pin it to a node, or let the scheduler choose a free one?",
+          "v1 runs one PostgreSQL database on a node. targetNode is immutable.",
+          false
         )
       ].filter((item) => item.required || missing(spec, item.id));
     case "container":
@@ -72539,6 +72593,11 @@ function warningsFor(kind, spec) {
   if (kind.id === "disk-layout") {
     warnings.push("Plan this layout before apply. The node refuses a disk that still backs a VM, an LVM PV, or a ZFS pool member.");
   }
+  if (kind.id === "postgresql") {
+    warnings.push(
+      "v1 is one database per node, from the NixOS postgresql package, on the local Unix socket. Deleting the resource removes it from the node config and leaves /var/lib/postgresql on disk."
+    );
+  }
   if (kind.id === "cluster-update") {
     warnings.push("A cluster update can reboot nodes. Plan it, read the blockers, and apply only after the operator agrees.");
   }
@@ -72715,6 +72774,25 @@ function resolveConnection(options = {}) {
     timeoutMs: options.timeoutMs ?? 12e4
   };
 }
+function resolveProvisioning(options = {}) {
+  const configPath = options.config?.trim() || process.env.KCORE_CONFIG?.trim() || join(homedir(), ".kcore", "config");
+  const file = readContext(configPath);
+  const current = file?.["current-context"];
+  const entry = current && file?.contexts ? file.contexts[current] : void 0;
+  const address = options.provisioning?.trim() || process.env.KCORE_PROVISIONING?.trim() || entry?.provisioning?.trim() || "";
+  if (!address) {
+    throw new InputError(
+      "No provisioning controller address. Set connection.provisioning or KCORE_PROVISIONING to host:port."
+    );
+  }
+  const timeoutMs = options.timeoutMs ?? 12e4;
+  const checked = assertAddress(address, "provisioning");
+  if (options.provisioningInsecure === false) {
+    const base = resolveConnection(options);
+    return { ...base, address: checked, insecure: false, timeoutMs };
+  }
+  return { address: checked, insecure: true, timeoutMs };
+}
 function readContext(path) {
   try {
     const text2 = readFileSync(path, "utf8");
@@ -72771,6 +72849,16 @@ var protoLoader = __toESM(require_src2(), 1);
 import { existsSync } from "node:fs";
 import { dirname, join as join2 } from "node:path";
 import { fileURLToPath } from "node:url";
+var SERVICE_NAMES = [
+  "controller",
+  "controller-admin",
+  "node-compute",
+  "node-container",
+  "node-storage",
+  "node-info",
+  "node-admin",
+  "provisioning"
+];
 var loaded;
 function protoDir() {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -72784,7 +72872,7 @@ function services() {
   if (loaded) return loaded;
   const dir = protoDir();
   const definition = protoLoader.loadSync(
-    [join2(dir, "controller.proto"), join2(dir, "node.proto")],
+    [join2(dir, "controller.proto"), join2(dir, "node.proto"), join2(dir, "provisioning.proto")],
     {
       keepCase: false,
       longs: String,
@@ -72797,9 +72885,18 @@ function services() {
   const pkg = grpc.loadPackageDefinition(definition);
   loaded = {
     controller: pkg.kcore.controller.Controller,
-    nodeAdmin: pkg.kcore.node.NodeAdmin
+    "controller-admin": pkg.kcore.controller.ControllerAdmin,
+    "node-compute": pkg.kcore.node.NodeCompute,
+    "node-container": pkg.kcore.node.NodeContainer,
+    "node-storage": pkg.kcore.node.NodeStorage,
+    "node-info": pkg.kcore.node.NodeInfo,
+    "node-admin": pkg.kcore.node.NodeAdmin,
+    provisioning: pkg.kcore.provisioning.Provisioning
   };
   return loaded;
+}
+function serviceClient(name) {
+  return services()[name];
 }
 function credentials2(conn) {
   if (conn.insecure) return grpc.credentials.createInsecure();
@@ -72816,19 +72913,28 @@ function channelOptions(conn) {
   return options;
 }
 async function callController(options, method, request) {
-  const conn = resolveConnection(options);
-  return callService(services().controller, conn.address, conn, method, request);
+  return callApi("controller", void 0, options, method, request);
 }
 async function callNode(address, options, method, request) {
-  const conn = resolveConnection({ ...options, controller: address });
-  return callService(services().nodeAdmin, conn.address, conn, method, request);
+  return callApi("node-admin", address, options, method, request);
+}
+async function callNodeCompute(address, options, method, request) {
+  return callApi("node-compute", address, options, method, request);
+}
+async function callApi(service, address, options, method, request) {
+  if (service === "provisioning") {
+    const conn2 = resolveProvisioning(options);
+    return callService(services().provisioning, conn2.address, conn2, method, request);
+  }
+  const conn = resolveConnection(address ? { ...options, controller: address } : options);
+  return callService(services()[service], conn.address, conn, method, request);
 }
 function callService(Ctor, address, conn, method, request) {
   const client = new Ctor(address, credentials2(conn), channelOptions(conn));
   const fn = client[method];
   if (typeof fn !== "function") {
     client.close();
-    throw new InputError(`The controller API has no ${method} method.`);
+    throw new InputError(`The gRPC API has no ${method} method.`);
   }
   const deadline = new Date(Date.now() + conn.timeoutMs);
   return new Promise((resolve, reject) => {
@@ -72856,6 +72962,58 @@ function redact(value) {
     else out[key] = redact(item);
   }
   return out;
+}
+
+// src/rpc.ts
+var UNIMPLEMENTED = /* @__PURE__ */ new Set([
+  "node-compute/createVm",
+  "node-compute/updateVm",
+  "node-compute/deleteVm",
+  "node-compute/rebootVm",
+  "node-compute/pullImage",
+  "node-compute/createWorkload",
+  "node-compute/deleteWorkload",
+  "provisioning/issueServerCertificate",
+  "provisioning/issueNodeCertificate",
+  "provisioning/getCertificate",
+  "provisioning/listCertificates",
+  "provisioning/revokeCertificate",
+  "provisioning/renewCertificate",
+  "provisioning/getCaBundle"
+]);
+function isServiceName(value) {
+  return SERVICE_NAMES.includes(value);
+}
+function isReadOnlyMethod(method) {
+  return /^(get|list|classify|check|plan)/.test(method);
+}
+function rpcCatalog(service) {
+  const names = service ? [service] : [...SERVICE_NAMES];
+  const methods = [];
+  for (const name of names) {
+    const definition = serviceClient(name).service;
+    for (const [rawName, raw] of Object.entries(definition)) {
+      const desc = raw;
+      if (desc.requestStream || desc.responseStream) continue;
+      const method = rawName[0].toLowerCase() + rawName.slice(1);
+      if (UNIMPLEMENTED.has(`${name}/${method}`)) continue;
+      methods.push({ service: name, method, readOnly: isReadOnlyMethod(method) });
+    }
+  }
+  methods.sort((a, b) => a.service.localeCompare(b.service) || a.method.localeCompare(b.method));
+  return methods;
+}
+function requireRpc(serviceName, method) {
+  if (!isServiceName(serviceName)) {
+    throw new InputError(`unknown gRPC service '${serviceName}'. Use one of: ${SERVICE_NAMES.join(", ")}`);
+  }
+  const found = rpcCatalog(serviceName).find((item) => item.method === method);
+  if (!found) {
+    throw new InputError(
+      `${serviceName}.${method} is not an implemented unary RPC. Streaming methods and node stubs that always return UNIMPLEMENTED are omitted.`
+    );
+  }
+  return found;
 }
 
 // src/pki.ts
@@ -73069,6 +73227,8 @@ function buildApply(kind, spec) {
       return [{ target: "controller", method: "createSshKey", request: sshKeyRequest(spec) }];
     case "container":
       return [{ target: "controller", method: "createWorkload", request: containerRequest(spec) }];
+    case "postgresql":
+      return [{ target: "controller", method: "createPostgresql", request: postgresqlRequest(spec) }];
     case "volume":
       return [{ target: "controller", method: "createVolume", request: volumeRequest(spec) }];
     case "volume-snapshot":
@@ -73104,6 +73264,8 @@ function buildRead(kind, name) {
       return named ? { target: "controller", method: "getSshKey", request: { name: named } } : { target: "controller", method: "listSshKeys", request: {} };
     case "container":
       return named ? { target: "controller", method: "getWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: named } } : { target: "controller", method: "listWorkloads", request: { kind: "WORKLOAD_KIND_CONTAINER" } };
+    case "postgresql":
+      return named ? { target: "controller", method: "getPostgresql", request: { name: named } } : { target: "controller", method: "listPostgresqls", request: {} };
     case "volume":
       return named ? { target: "controller", method: "getVolume", request: { name: named } } : { target: "controller", method: "listVolumes", request: {} };
     case "volume-snapshot":
@@ -73122,6 +73284,8 @@ function buildRead(kind, name) {
       return named ? { target: "controller", method: "getObjectStore", request: { name: named } } : { target: "controller", method: "listObjectStores", request: {} };
     case "cluster-update":
       return named ? { target: "controller", method: "getClusterUpdate", request: { name: named } } : { target: "controller", method: "listClusterUpdates", request: {} };
+    case "image":
+      throw new InputError("image reads are collected from each node");
     default:
       throw new InputError(`unsupported kind ${kind.id}`);
   }
@@ -73139,6 +73303,8 @@ function buildDelete(kind, name) {
       return { target: "controller", method: "deleteSshKey", request: { name: id } };
     case "container":
       return { target: "controller", method: "deleteWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: id } };
+    case "postgresql":
+      return { target: "controller", method: "deletePostgresql", request: { name: id } };
     case "volume":
       return { target: "controller", method: "deleteVolume", request: { name: id } };
     case "volume-snapshot":
@@ -73559,6 +73725,39 @@ function stringList(value) {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
 }
+var POSTGRESQL_PACKAGES = /* @__PURE__ */ new Set([
+  "postgresql",
+  "postgresql_14",
+  "postgresql_15",
+  "postgresql_16",
+  "postgresql_17"
+]);
+function postgresqlRequest(spec) {
+  const name = assertName(required3(spec, "name", "name"), "name");
+  const database = opt(spec, "database") ?? name;
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(database)) {
+    throw new InputError(
+      "database must be a PostgreSQL identifier: a letter or underscore, then letters, digits, or underscores"
+    );
+  }
+  const packageName = opt(spec, "package") ?? "postgresql";
+  if (!POSTGRESQL_PACKAGES.has(packageName)) {
+    throw new InputError(
+      "package must be postgresql, postgresql_14, postgresql_15, postgresql_16, or postgresql_17"
+    );
+  }
+  const port = spec.port == null || spec.port === "" ? 5432 : Number(spec.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new InputError("port must be an integer from 1 to 65535");
+  }
+  return {
+    name,
+    database,
+    package: packageName,
+    port,
+    targetNode: opt(spec, "targetNode") ?? ""
+  };
+}
 function opt(spec, key) {
   const value = spec[key];
   if (typeof value === "number") return String(value);
@@ -73631,14 +73830,17 @@ Before every create, update, delete, migrate, drain, or node install:
 3. Call kcore_plan and show that plan.
 4. Call kcore_apply or kcore_delete only after the operator explicitly agrees, with confirm set to true.
 
-Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request.`;
+Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller, node, or kcore-provisioning method. Provisioning covers images, machines, boot targets, Redfish discovery, BMC boot, and power control. Set connection.provisioning to that controller's host:port. Pass confirm true before a method that is not a get, list, classify, check, or plan.`;
 var connectionShape = {
   config: external_exports.string().optional().describe("Path to the kcore context file. Defaults to ~/.kcore/config."),
   controller: external_exports.string().optional().describe("Controller host:port override."),
   insecure: external_exports.boolean().optional().describe("Plain HTTP, skipping TLS client auth."),
   tlsServerName: external_exports.string().optional().describe("SNI / certificate name when dialing an IP."),
   operator: external_exports.string().optional().describe("Operator identity for --as."),
-  node: external_exports.string().optional().describe("Node-agent host:port for node-scoped commands.")
+  node: external_exports.string().optional().describe("Node-agent host:port for node-scoped commands."),
+  provisioning: external_exports.string().optional().describe("kcore-provisioning gRPC host:port. Also read from KCORE_PROVISIONING."),
+  provisioningInsecure: external_exports.boolean().optional().describe("Dial provisioning without TLS. Defaults to true."),
+  timeoutMs: external_exports.number().optional().describe("RPC deadline in milliseconds. Defaults to 120000.")
 };
 var specSchema = external_exports.record(external_exports.string(), external_exports.unknown()).optional();
 function connectionOf(input, controller) {
@@ -73648,12 +73850,50 @@ function connectionOf(input, controller) {
     insecure: input?.insecure,
     tlsServerName: input?.tlsServerName,
     operator: input?.operator,
-    timeoutMs: input?.timeoutMs
+    timeoutMs: input?.timeoutMs,
+    provisioning: input?.provisioning,
+    provisioningInsecure: input?.provisioningInsecure
   };
 }
 function dial(input, spec) {
   const controller = typeof spec.controller === "string" && spec.controller.trim() ? spec.controller.trim() : void 0;
   return connectionOf(input, controller);
+}
+async function readImages(options, node, name) {
+  const wanted = name?.trim();
+  const targets = node?.trim() ? [{ nodeId: "", hostname: "", address: nodeAgentAddress(node.trim()) }] : await clusterNodes(options);
+  const listed = [];
+  for (const target of targets) {
+    try {
+      const response = await callNodeCompute(target.address, options, "listImages", {});
+      const images = (response.images ?? []).filter((image) => !wanted || image.name === wanted || image.path === wanted);
+      listed.push({ ...target, images });
+    } catch (error2) {
+      listed.push({ ...target, error: error2 instanceof Error ? error2.message : String(error2) });
+    }
+  }
+  return { nodes: listed };
+}
+async function clusterNodes(options) {
+  const response = await callController(options, "listNodes", {});
+  return (response.nodes ?? []).filter((node) => node.address).map((node) => ({
+    nodeId: node.nodeId ?? "",
+    hostname: node.hostname ?? "",
+    address: nodeAgentAddress(node.address ?? "")
+  }));
+}
+function nodeAgentAddress(address) {
+  if (address.startsWith("[")) {
+    const end = address.indexOf("]");
+    const host = end > 1 ? address.slice(1, end) : address;
+    const port2 = end > 1 ? address.slice(end + 1) : "";
+    return port2 === "" || port2 === ":9090" ? `[${host}]:9091` : address;
+  }
+  const split = address.lastIndexOf(":");
+  if (split <= 0) return `${address}:9091`;
+  const port = address.slice(split + 1);
+  if (port === "9090") return `${address.slice(0, split)}:9091`;
+  return address;
 }
 async function execute(call, options) {
   if (call.target === "node") {
@@ -73721,8 +73961,47 @@ function createServer() {
         summary: kind.summary,
         mutable: kind.mutable,
         immutable: kind.immutable
-      }))
+      })),
+      rpc: "Call kcore_rpc with no method to list every implemented unary gRPC method."
     })
+  );
+  server2.registerTool(
+    "kcore_rpc",
+    {
+      title: "Call a kcore gRPC method",
+      description: "Call one implemented unary RPC on the controller, a node, or kcore-provisioning. Omit method to list them. Provisioning methods need connection.provisioning. Request fields use proto JSON names in camelCase. Streaming RPCs and methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true.",
+      inputSchema: {
+        service: external_exports.enum(SERVICE_NAMES).optional().describe("gRPC service. Required when method is set."),
+        method: external_exports.string().optional().describe("CamelCase RPC name, such as listNodes or getPkiStatus."),
+        request: external_exports.record(external_exports.string(), external_exports.unknown()).optional().describe("RPC request message. Empty for methods with an empty request."),
+        confirm: external_exports.boolean().optional().describe("Required for any method that is not a get, list, classify, check, or plan."),
+        connection: external_exports.object(connectionShape).optional()
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+    },
+    async (input) => {
+      try {
+        if (!input.method) return text({ ok: true, methods: rpcCatalog(input.service) });
+        if (!input.service) throw new InputError("service is required when method is set");
+        const rpc = requireRpc(input.service, input.method);
+        if (!rpc.readOnly && input.confirm !== true) {
+          return text({
+            ok: false,
+            applied: false,
+            service: rpc.service,
+            method: rpc.method,
+            askTheUser: `Show ${rpc.service}.${rpc.method} to the operator. Call kcore_rpc again with confirm true only after they agree.`
+          });
+        }
+        const nodeService = rpc.service.startsWith("node-");
+        const address = input.connection?.node;
+        if (nodeService && !address) throw new InputError("connection.node is required for a node RPC (host:port, usually :9091)");
+        const response = await callApi(rpc.service, nodeService ? address : void 0, connectionOf(input.connection), rpc.method, input.request ?? {});
+        return text({ ok: true, service: rpc.service, method: rpc.method, response });
+      } catch (error2) {
+        return failure(error2);
+      }
+    }
   );
   server2.registerTool(
     "kcore_advise",
@@ -73885,8 +74164,13 @@ function createServer() {
       try {
         const kind = findKind(input.kind);
         if (!kind) throw new InputError(`unknown kind ${input.kind}`);
+        const options = connectionOf(input.connection);
+        if (kind.id === "image") {
+          const response2 = await readImages(options, input.connection?.node, input.name);
+          return text({ ok: true, method: "listImages", response: response2 });
+        }
         const call = buildRead(kind, input.name);
-        const response = await execute(call, connectionOf(input.connection));
+        const response = await execute(call, options);
         return text({ ok: true, method: call.method, response });
       } catch (error2) {
         return failure(error2);

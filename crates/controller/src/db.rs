@@ -295,6 +295,15 @@ pub struct CephClusterStatusRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct CephDashboardCredentialsRow {
+    pub name: String,
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct SharedFilesystemRow {
     pub name: String,
     pub generation: i64,
@@ -734,7 +743,66 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 52;
+pub const SCHEMA_VERSION: i32 = 54;
+
+const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
+                    name TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    cluster_cidr TEXT NOT NULL,
+                    service_cidr TEXT NOT NULL,
+                    cluster_dns TEXT NOT NULL,
+                    api_server_endpoint TEXT NOT NULL,
+                    cni TEXT NOT NULL DEFAULT 'cilium',
+                    phase TEXT NOT NULL DEFAULT 'pending',
+                    status_message TEXT NOT NULL DEFAULT '',
+                    ready_control_planes INTEGER NOT NULL DEFAULT 0,
+                    ready_workers INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS kubernetes_cluster_nodes (
+                    cluster_name TEXT NOT NULL REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    advertise_address TEXT NOT NULL,
+                    iface TEXT NOT NULL,
+                    initial_cluster INTEGER NOT NULL DEFAULT 0,
+                    join_existing INTEGER NOT NULL DEFAULT 0,
+                    kubelet_ready INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (cluster_name, node_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_cluster ON kubernetes_cluster_nodes(cluster_name);
+                CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_node ON kubernetes_cluster_nodes(node_id);
+                CREATE TABLE IF NOT EXISTS kubernetes_cluster_config (
+                    cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    ha_enabled INTEGER NOT NULL DEFAULT 0,
+                    vip_address TEXT NOT NULL DEFAULT '',
+                    vip_interface TEXT NOT NULL DEFAULT '',
+                    cilium_mode TEXT NOT NULL DEFAULT 'native-routing',
+                    cilium_mtu INTEGER NOT NULL DEFAULT 1500,
+                    cilium_tunnel TEXT NOT NULL DEFAULT 'disabled',
+                    cilium_auto_direct_routes INTEGER NOT NULL DEFAULT 1,
+                    cilium_lb_ip_pools TEXT NOT NULL DEFAULT ''
+                );";
+
+const KUBERNETES_PKI_TABLE: &str = "CREATE TABLE IF NOT EXISTS kubernetes_pki (
+                    cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
+                    ca_cert TEXT NOT NULL,
+                    ca_key TEXT NOT NULL,
+                    sa_key TEXT NOT NULL,
+                    sa_pub TEXT NOT NULL,
+                    etcd_ca_cert TEXT NOT NULL,
+                    etcd_ca_key TEXT NOT NULL,
+                    apiserver_cert TEXT NOT NULL,
+                    apiserver_key TEXT NOT NULL,
+                    apiserver_kubelet_client_cert TEXT NOT NULL,
+                    apiserver_kubelet_client_key TEXT NOT NULL,
+                    apiserver_etcd_client_cert TEXT NOT NULL,
+                    apiserver_etcd_client_key TEXT NOT NULL,
+                    admin_kubeconfig TEXT NOT NULL,
+                    etcd_node_certs_json TEXT NOT NULL DEFAULT '',
+                    etcd_node_peer_certs_json TEXT NOT NULL DEFAULT ''
+                );";
 
 /// Largest controller snapshot accepted by backup and restore.
 pub const MAX_CLUSTER_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
@@ -1751,76 +1819,90 @@ impl Database {
         }
 
         if version < 50 {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
-                    name TEXT PRIMARY KEY,
-                    generation INTEGER NOT NULL DEFAULT 1,
-                    cluster_cidr TEXT NOT NULL,
-                    service_cidr TEXT NOT NULL,
-                    cluster_dns TEXT NOT NULL,
-                    api_server_endpoint TEXT NOT NULL,
-                    cni TEXT NOT NULL DEFAULT 'cilium',
-                    phase TEXT NOT NULL DEFAULT 'pending',
-                    status_message TEXT NOT NULL DEFAULT '',
-                    ready_control_planes INTEGER NOT NULL DEFAULT 0,
-                    ready_workers INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-                );
-                CREATE TABLE IF NOT EXISTS kubernetes_cluster_nodes (
-                    cluster_name TEXT NOT NULL REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
-                    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-                    role TEXT NOT NULL,
-                    advertise_address TEXT NOT NULL,
-                    iface TEXT NOT NULL,
-                    initial_cluster INTEGER NOT NULL DEFAULT 0,
-                    join_existing INTEGER NOT NULL DEFAULT 0,
-                    kubelet_ready INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (cluster_name, node_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_cluster ON kubernetes_cluster_nodes(cluster_name);
-                CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_node ON kubernetes_cluster_nodes(node_id);
-                CREATE TABLE IF NOT EXISTS kubernetes_cluster_config (
-                    cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
-                    ha_enabled INTEGER NOT NULL DEFAULT 0,
-                    vip_address TEXT NOT NULL DEFAULT '',
-                    vip_interface TEXT NOT NULL DEFAULT '',
-                    cilium_mode TEXT NOT NULL DEFAULT 'native-routing',
-                    cilium_mtu INTEGER NOT NULL DEFAULT 1500,
-                    cilium_tunnel TEXT NOT NULL DEFAULT 'disabled',
-                    cilium_auto_direct_routes INTEGER NOT NULL DEFAULT 1,
-                    cilium_lb_ip_pools TEXT NOT NULL DEFAULT ''
-                );",
-            )?;
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
         }
 
         if version < 51 {
+            // A controller that recorded schema 50 from the unmerged Ceph
+            // credentials branch has no Kubernetes tables. Re-apply them
+            // before kubernetes_pki, which references kubernetes_clusters.
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
+            conn.execute_batch(KUBERNETES_PKI_TABLE)?;
+        }
+
+        if version < 52 {
+            // Credentials are keyed by logical CephCluster name but do not FK to
+            // ceph_clusters: operators may record the mgr dashboard URL/password
+            // during bootstrap before a CephCluster resource exists. Ceph hashes
+            // dashboard passwords, so kcore stores the operator-retrievable copy.
+            //
+            // Schema 50/51 on this branch previously meant the credentials table.
+            // Main already shipped those numbers for Kubernetes, so a database
+            // at version 51 from that branch skipped the Kubernetes DDL. v52
+            // re-applies both with CREATE IF NOT EXISTS.
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
+            conn.execute_batch(KUBERNETES_PKI_TABLE)?;
             conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS kubernetes_pki (
-                    cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
-                    ca_cert TEXT NOT NULL,
-                    ca_key TEXT NOT NULL,
-                    sa_key TEXT NOT NULL,
-                    sa_pub TEXT NOT NULL,
-                    etcd_ca_cert TEXT NOT NULL,
-                    etcd_ca_key TEXT NOT NULL,
-                    apiserver_cert TEXT NOT NULL,
-                    apiserver_key TEXT NOT NULL,
-                    apiserver_kubelet_client_cert TEXT NOT NULL,
-                    apiserver_kubelet_client_key TEXT NOT NULL,
-                    apiserver_etcd_client_cert TEXT NOT NULL,
-                    apiserver_etcd_client_key TEXT NOT NULL,
-                    admin_kubeconfig TEXT NOT NULL
+                "CREATE TABLE IF NOT EXISTS ceph_dashboard_credentials (
+                    name TEXT PRIMARY KEY,
+                    url TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    password TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
                 );",
             )?;
         }
 
-        if version < 52 {
+        // Per-node etcd certs. Without these, a controller restart could not
+        // push the same PKI and would mint a new CA.
+        // This branch previously used schema 52 for that change. Main already
+        // shipped 52 for Ceph dashboard credentials, so v53 covers both: a
+        // controller at 52 from main still gains the cert columns, and one at
+        // 52 from this branch still gains the credentials table.
+        // Schema 51 on the lab was recorded without kubernetes_pki, so a bare
+        // ALTER fails there. Create the table when it is missing, and add the
+        // columns only when an older table is already present.
+        if version < 53 {
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
+            conn.execute_batch(KUBERNETES_PKI_TABLE)?;
             conn.execute_batch(
-                "ALTER TABLE volumes ADD COLUMN host_node_id TEXT NOT NULL DEFAULT '';
-                 ALTER TABLE volumes ADD COLUMN fs_type TEXT NOT NULL DEFAULT '';
-                 ALTER TABLE volumes ADD COLUMN mount_point TEXT NOT NULL DEFAULT '';",
+                "CREATE TABLE IF NOT EXISTS ceph_dashboard_credentials (
+                    name TEXT PRIMARY KEY,
+                    url TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    password TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                );",
             )?;
+            let has_node_certs: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('kubernetes_pki') WHERE name = 'etcd_node_certs_json'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_node_certs == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_certs_json TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE kubernetes_pki ADD COLUMN etcd_node_peer_certs_json TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+        }
+
+        // Host LVM/ZFS volumes record the owning node, filesystem, and mount.
+        // This branch previously used schema 52 for those columns. Main already
+        // shipped 52 and 53, so v54 adds them when they are not present.
+        if version < 54 {
+            let has_host_node: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('volumes') WHERE name = 'host_node_id'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_host_node == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE volumes ADD COLUMN host_node_id TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE volumes ADD COLUMN fs_type TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE volumes ADD COLUMN mount_point TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -3982,6 +4064,45 @@ impl Database {
         let conn = self.lock_conn()?;
         self.clear_retired_ceph_nodes_conn(&conn, name)?;
         Ok(conn.execute("DELETE FROM ceph_clusters WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn get_ceph_dashboard_credentials(
+        &self,
+        name: &str,
+    ) -> Result<Option<CephDashboardCredentialsRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, url, username, password, updated_at
+             FROM ceph_dashboard_credentials WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(CephDashboardCredentialsRow {
+                name: r.get(0)?,
+                url: r.get(1)?,
+                username: r.get(2)?,
+                password: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn upsert_ceph_dashboard_credentials(
+        &self,
+        row: &CephDashboardCredentialsRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ceph_dashboard_credentials (name, url, username, password, updated_at)
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             ON CONFLICT(name) DO UPDATE SET
+               url=excluded.url,
+               username=excluded.username,
+               password=excluded.password,
+               updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            params![row.name, row.url, row.username, row.password],
+        )?;
+        Ok(())
     }
 
     pub fn add_retired_ceph_node(
@@ -6641,20 +6762,34 @@ impl Database {
     }
 
     // Kubernetes PKI storage and retrieval
+    fn decode_cert_map(
+        json: String,
+    ) -> Result<std::collections::HashMap<String, (String, String)>, rusqlite::Error> {
+        if json.trim().is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        serde_json::from_str(&json)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+    }
+
     pub fn store_kubernetes_pki(
         &self,
         cluster_name: &str,
         pki: &crate::kubernetes_pki::KubernetesPki,
     ) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
+        let etcd_node_certs_json = serde_json::to_string(&pki.etcd_node_certs)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let etcd_node_peer_certs_json = serde_json::to_string(&pki.etcd_node_peer_certs)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         conn.execute(
             "INSERT OR REPLACE INTO kubernetes_pki (
                 cluster_name, ca_cert, ca_key, sa_key, sa_pub,
                 etcd_ca_cert, etcd_ca_key, apiserver_cert, apiserver_key,
                 apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
                 apiserver_etcd_client_cert, apiserver_etcd_client_key,
-                admin_kubeconfig
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 cluster_name,
                 &pki.ca_cert,
@@ -6670,6 +6805,8 @@ impl Database {
                 &pki.apiserver_etcd_client_cert,
                 &pki.apiserver_etcd_client_key,
                 &pki.admin_kubeconfig,
+                etcd_node_certs_json,
+                etcd_node_peer_certs_json,
             ],
         )?;
         Ok(())
@@ -6685,10 +6822,12 @@ impl Database {
                     etcd_ca_cert, etcd_ca_key, apiserver_cert, apiserver_key,
                     apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
                     apiserver_etcd_client_cert, apiserver_etcd_client_key,
-                    admin_kubeconfig
+                    admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json
              FROM kubernetes_pki WHERE cluster_name=?1",
         )?;
         let mut rows = stmt.query_map(params![cluster_name], |r| {
+            let etcd_node_certs = Self::decode_cert_map(r.get::<_, String>(13)?)?;
+            let etcd_node_peer_certs = Self::decode_cert_map(r.get::<_, String>(14)?)?;
             Ok(crate::kubernetes_pki::KubernetesPki {
                 ca_cert: r.get(0)?,
                 ca_key: r.get(1)?,
@@ -6703,8 +6842,8 @@ impl Database {
                 apiserver_etcd_client_cert: r.get(10)?,
                 apiserver_etcd_client_key: r.get(11)?,
                 admin_kubeconfig: r.get(12)?,
-                etcd_node_certs: std::collections::HashMap::new(),
-                etcd_node_peer_certs: std::collections::HashMap::new(),
+                etcd_node_certs,
+                etcd_node_peer_certs,
             })
         })?;
         rows.next().transpose()
@@ -6719,6 +6858,25 @@ impl Database {
         conn.execute(
             "UPDATE kubernetes_clusters SET phase=?1 WHERE name=?2",
             params![phase, cluster_name],
+        )?;
+        Ok(())
+    }
+
+    /// Record that etcd has quorum and the API server answered.
+    pub fn mark_kubernetes_cluster_ready(
+        &self,
+        cluster_name: &str,
+        ready_control_planes: i32,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_clusters
+             SET phase='ready',
+                 status_message='etcd quorum and API server ready',
+                 ready_control_planes=?1,
+                 updated_at=datetime('now')
+             WHERE name=?2",
+            params![ready_control_planes, cluster_name],
         )?;
         Ok(())
     }
@@ -8738,6 +8896,172 @@ mod tests {
 
         let err = dst.restore_sqlite(b"not a database").expect_err("garbage");
         assert!(err.contains("not a SQLite"));
+    }
+
+    #[test]
+    fn ceph_dashboard_credentials_round_trip_without_cluster() {
+        let db = Database::open(":memory:").expect("open");
+        assert!(db
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .is_none());
+        db.upsert_ceph_dashboard_credentials(&CephDashboardCredentialsRow {
+            name: "lab".into(),
+            url: "https://192.168.40.103:8444/".into(),
+            username: "admin".into(),
+            password: "s3cret".into(),
+            updated_at: String::new(),
+        })
+        .expect("upsert");
+        let got = db
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .expect("row");
+        assert_eq!(got.url, "https://192.168.40.103:8444/");
+        assert_eq!(got.username, "admin");
+        assert_eq!(got.password, "s3cret");
+        assert!(!got.updated_at.is_empty());
+        db.upsert_ceph_dashboard_credentials(&CephDashboardCredentialsRow {
+            name: "lab".into(),
+            url: "https://192.168.40.103:8444/".into(),
+            username: "admin".into(),
+            password: "rotated".into(),
+            updated_at: String::new(),
+        })
+        .expect("rotate");
+        let rotated = db
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .expect("row");
+        assert_eq!(rotated.password, "rotated");
+    }
+
+    #[test]
+    fn schema_v52_heals_kubernetes_tables_skipped_by_ceph_v51() {
+        let db = Database::open(":memory:").expect("open");
+        db.upsert_ceph_dashboard_credentials(&CephDashboardCredentialsRow {
+            name: "lab".into(),
+            url: "https://192.168.40.103:8444/".into(),
+            username: "admin".into(),
+            password: "s3cret".into(),
+            updated_at: String::new(),
+        })
+        .expect("seed");
+        {
+            let conn = db.lock_conn().expect("lock");
+            // The unmerged Ceph credentials branch recorded schema 51 without
+            // the Kubernetes tables that main already shipped at v50/v51.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS kubernetes_pki;
+                 DROP TABLE IF EXISTS kubernetes_cluster_nodes;
+                 DROP TABLE IF EXISTS kubernetes_cluster_config;
+                 DROP TABLE IF EXISTS kubernetes_clusters;
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (51);",
+            )
+            .expect("rewind to collided schema 51");
+        }
+        db.migrate().expect("heal");
+        let conn = db.lock_conn().expect("lock");
+        for table in [
+            "kubernetes_clusters",
+            "kubernetes_cluster_nodes",
+            "kubernetes_cluster_config",
+            "kubernetes_pki",
+            "ceph_dashboard_credentials",
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            assert_eq!(present, 1, "{table} missing after heal");
+        }
+        assert_eq!(Database::schema_version(&conn), SCHEMA_VERSION);
+        drop(conn);
+        let got = db
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .expect("credentials survived");
+        assert_eq!(got.password, "s3cret");
+    }
+
+    #[test]
+    fn schema_v53_adds_etcd_node_certs_and_ceph_credentials() {
+        let db = Database::open(":memory:").expect("open");
+        db.upsert_ceph_dashboard_credentials(&CephDashboardCredentialsRow {
+            name: "lab".into(),
+            url: "https://192.168.40.103:8444/".into(),
+            username: "admin".into(),
+            password: "s3cret".into(),
+            updated_at: String::new(),
+        })
+        .expect("seed");
+        {
+            let conn = db.lock_conn().expect("lock");
+            // Main's schema 52 created kubernetes_pki without per-node etcd certs.
+            conn.execute_batch(
+                "DROP TABLE kubernetes_pki;
+                 CREATE TABLE kubernetes_pki (
+                    cluster_name TEXT PRIMARY KEY,
+                    ca_cert TEXT NOT NULL,
+                    ca_key TEXT NOT NULL,
+                    sa_key TEXT NOT NULL,
+                    sa_pub TEXT NOT NULL,
+                    etcd_ca_cert TEXT NOT NULL,
+                    etcd_ca_key TEXT NOT NULL,
+                    apiserver_cert TEXT NOT NULL,
+                    apiserver_key TEXT NOT NULL,
+                    apiserver_kubelet_client_cert TEXT NOT NULL,
+                    apiserver_kubelet_client_key TEXT NOT NULL,
+                    apiserver_etcd_client_cert TEXT NOT NULL,
+                    apiserver_etcd_client_key TEXT NOT NULL,
+                    admin_kubeconfig TEXT NOT NULL
+                 );
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (52);",
+            )
+            .expect("rewind to main schema 52");
+        }
+        db.migrate().expect("heal columns");
+        {
+            let conn = db.lock_conn().expect("lock");
+            let cols: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('kubernetes_pki')
+                     WHERE name IN ('etcd_node_certs_json', 'etcd_node_peer_certs_json')",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("columns");
+            assert_eq!(cols, 2);
+            assert_eq!(Database::schema_version(&conn), SCHEMA_VERSION);
+        }
+        let got = db
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .expect("credentials survived");
+        assert_eq!(got.password, "s3cret");
+
+        let branched = Database::open(":memory:").expect("open");
+        {
+            let conn = branched.lock_conn().expect("lock");
+            // This branch recorded schema 52 after adding the cert columns and
+            // before Ceph dashboard credentials existed.
+            conn.execute_batch(
+                "DROP TABLE ceph_dashboard_credentials;
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (52);",
+            )
+            .expect("rewind to branch schema 52");
+        }
+        branched.migrate().expect("heal credentials");
+        assert!(branched
+            .get_ceph_dashboard_credentials("lab")
+            .expect("get")
+            .is_none());
     }
 }
 

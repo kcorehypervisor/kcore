@@ -259,16 +259,27 @@ impl Controller for MockController {
 
     async fn get_postgresql(
         &self,
-        _: Request<GetPostgresqlRequest>,
+        request: Request<GetPostgresqlRequest>,
     ) -> Result<Response<GetPostgresqlResponse>, Status> {
-        Err(unimp("get_postgresql"))
+        let name = request.into_inner().name;
+        match sample_postgresqls()
+            .into_iter()
+            .find(|row| row.name == name)
+        {
+            Some(postgresql) => Ok(Response::new(GetPostgresqlResponse {
+                postgresql: Some(postgresql),
+            })),
+            None => Err(Status::not_found(format!("postgresql '{name}' not found"))),
+        }
     }
 
     async fn list_postgresqls(
         &self,
         _: Request<ListPostgresqlsRequest>,
     ) -> Result<Response<ListPostgresqlsResponse>, Status> {
-        Err(unimp("list_postgresqls"))
+        Ok(Response::new(ListPostgresqlsResponse {
+            postgresqls: sample_postgresqls(),
+        }))
     }
 
     async fn create_security_group(
@@ -986,6 +997,40 @@ impl Controller for MockController {
         Err(unimp("delete_ceph_cluster"))
     }
 
+    async fn get_ceph_cluster_capacity(
+        &self,
+        _: Request<GetCephClusterCapacityRequest>,
+    ) -> Result<Response<GetCephClusterCapacityResponse>, Status> {
+        Ok(Response::new(GetCephClusterCapacityResponse {
+            ok: true,
+            queried_node: "mock-node".into(),
+            total_bytes: 1_000,
+            used_bytes: 250,
+            avail_bytes: 750,
+            by_class: vec![CephDeviceClassCapacity {
+                device_class: "ssd".into(),
+                total_bytes: 1_000,
+                used_bytes: 250,
+                avail_bytes: 750,
+            }],
+            ..Default::default()
+        }))
+    }
+
+    async fn get_ceph_dashboard_credentials(
+        &self,
+        _: Request<GetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<GetCephDashboardCredentialsResponse>, Status> {
+        Err(unimp("get_ceph_dashboard_credentials"))
+    }
+
+    async fn set_ceph_dashboard_credentials(
+        &self,
+        _: Request<SetCephDashboardCredentialsRequest>,
+    ) -> Result<Response<SetCephDashboardCredentialsResponse>, Status> {
+        Err(unimp("set_ceph_dashboard_credentials"))
+    }
+
     async fn create_shared_filesystem(
         &self,
         _: Request<CreateSharedFilesystemRequest>,
@@ -1213,16 +1258,29 @@ impl Controller for MockController {
 
     async fn get_kubernetes_cluster(
         &self,
-        _: Request<GetKubernetesClusterRequest>,
+        request: Request<GetKubernetesClusterRequest>,
     ) -> Result<Response<GetKubernetesClusterResponse>, Status> {
-        Err(unimp("get_kubernetes_cluster"))
+        let name = request.into_inner().name;
+        match sample_kubernetes_clusters()
+            .into_iter()
+            .find(|cluster| cluster.name == name)
+        {
+            Some(cluster) => Ok(Response::new(GetKubernetesClusterResponse {
+                cluster: Some(cluster),
+            })),
+            None => Err(Status::not_found(format!(
+                "kubernetes cluster '{name}' not found"
+            ))),
+        }
     }
 
     async fn list_kubernetes_clusters(
         &self,
         _: Request<ListKubernetesClustersRequest>,
     ) -> Result<Response<ListKubernetesClustersResponse>, Status> {
-        Err(unimp("list_kubernetes_clusters"))
+        Ok(Response::new(ListKubernetesClustersResponse {
+            clusters: sample_kubernetes_clusters(),
+        }))
     }
 
     async fn delete_kubernetes_cluster(
@@ -1241,9 +1299,15 @@ impl Controller for MockController {
 
     async fn get_kubernetes_cluster_health(
         &self,
-        _: Request<GetKubernetesClusterHealthRequest>,
+        request: Request<GetKubernetesClusterHealthRequest>,
     ) -> Result<Response<GetKubernetesClusterHealthResponse>, Status> {
-        Err(unimp("get_kubernetes_cluster_health"))
+        let name = request.into_inner().name;
+        match sample_kubernetes_health(&name) {
+            Some(health) => Ok(Response::new(health)),
+            None => Err(Status::not_found(format!(
+                "kubernetes cluster '{name}' not found"
+            ))),
+        }
     }
 }
 
@@ -1315,6 +1379,162 @@ impl ControllerAdmin for MockController {
         _: Request<ResolveReplicationConflictRequest>,
     ) -> Result<Response<ResolveReplicationConflictResponse>, Status> {
         Err(unimp("resolve_replication_conflict"))
+    }
+}
+
+fn sample_postgresqls() -> Vec<PostgresqlInfo> {
+    vec![
+        PostgresqlInfo {
+            name: "app-db".into(),
+            database: "app".into(),
+            package: "postgresql_16".into(),
+            port: 5432,
+            node_id: "node-107".into(),
+        },
+        PostgresqlInfo {
+            name: "analytics".into(),
+            database: "analytics".into(),
+            package: "postgresql".into(),
+            port: 5433,
+            node_id: "node-105".into(),
+        },
+    ]
+}
+
+fn sample_k8s_node(
+    node_id: &str,
+    role: &str,
+    address: &str,
+    initial_cluster: bool,
+) -> KubernetesNodeSpec {
+    KubernetesNodeSpec {
+        node_id: node_id.into(),
+        role: role.into(),
+        advertise_address: address.into(),
+        iface: "enp6s0".into(),
+        initial_cluster,
+        join_existing: !initial_cluster && role == "control-plane",
+    }
+}
+
+fn sample_kubernetes_clusters() -> Vec<KubernetesCluster> {
+    vec![
+        KubernetesCluster {
+            name: "lab".into(),
+            generation: 4,
+            spec: Some(KubernetesClusterSpec {
+                cluster_cidr: "10.244.0.0/16".into(),
+                service_cidr: "10.96.0.0/12".into(),
+                cluster_dns: "10.96.0.10".into(),
+                api_server_endpoint: "192.168.40.220:6443".into(),
+                cni: "cilium".into(),
+                cilium_config: Some(CiliumConfig {
+                    mode: "native-routing".into(),
+                    mtu: 1500,
+                    tunnel: "disabled".into(),
+                    auto_direct_node_routes: true,
+                    load_balancer_ip_pools: vec!["192.168.40.220/29".into()],
+                }),
+                control_plane_nodes: vec![
+                    sample_k8s_node("node-107", "control-plane", "192.168.40.107", true),
+                    sample_k8s_node("node-105", "control-plane", "192.168.40.105", false),
+                ],
+                worker_nodes: vec![sample_k8s_node(
+                    "node-119",
+                    "worker",
+                    "192.168.40.119",
+                    false,
+                )],
+                high_availability: Some(HighAvailabilityConfig {
+                    enabled: true,
+                    vip_address: "192.168.40.220".into(),
+                    vip_interface: "enp6s0".into(),
+                    method: "keepalived".into(),
+                }),
+            }),
+            status: Some(KubernetesClusterStatus {
+                phase: "ready".into(),
+                message: "all nodes joined".into(),
+                ready_control_planes: 2,
+                ready_workers: 1,
+                last_updated: None,
+                active_node_ids: vec!["node-107".into(), "node-105".into(), "node-119".into()],
+            }),
+        },
+        KubernetesCluster {
+            name: "edge".into(),
+            generation: 1,
+            spec: Some(KubernetesClusterSpec {
+                cluster_cidr: "10.245.0.0/16".into(),
+                service_cidr: "10.97.0.0/12".into(),
+                cluster_dns: "10.97.0.10".into(),
+                api_server_endpoint: "192.168.40.221:6443".into(),
+                cni: "cilium".into(),
+                control_plane_nodes: vec![sample_k8s_node(
+                    "node-103",
+                    "control-plane",
+                    "192.168.40.103",
+                    true,
+                )],
+                ..Default::default()
+            }),
+            status: Some(KubernetesClusterStatus {
+                phase: "bootstrapping".into(),
+                message: "waiting for etcd".into(),
+                ready_control_planes: 0,
+                ready_workers: 0,
+                ..Default::default()
+            }),
+        },
+    ]
+}
+
+fn sample_kubernetes_health(name: &str) -> Option<GetKubernetesClusterHealthResponse> {
+    match name {
+        "lab" => Some(GetKubernetesClusterHealthResponse {
+            overall_health: "healthy".into(),
+            ready_control_planes: 2,
+            total_control_planes: 2,
+            ready_workers: 1,
+            total_workers: 1,
+            etcd_healthy: true,
+            etcd_member_count: 2,
+            api_server_reachable: true,
+            node_health: vec![
+                NodeHealth {
+                    node_id: "node-107".into(),
+                    kubernetes_status: "Ready".into(),
+                    kubelet_active: true,
+                    etcd_active: true,
+                    api_server_active: true,
+                },
+                NodeHealth {
+                    node_id: "node-119".into(),
+                    kubernetes_status: "Ready".into(),
+                    kubelet_active: true,
+                    etcd_active: false,
+                    api_server_active: false,
+                },
+            ],
+        }),
+        "edge" => Some(GetKubernetesClusterHealthResponse {
+            overall_health: "degraded".into(),
+            ready_control_planes: 0,
+            total_control_planes: 1,
+            ready_workers: 0,
+            total_workers: 0,
+            etcd_healthy: false,
+            etcd_member_count: 1,
+            api_server_reachable: false,
+            node_health: vec![NodeHealth {
+                node_id: "node-103".into(),
+                kubernetes_status: "NotReady".into(),
+                kubelet_active: false,
+                etcd_active: false,
+                api_server_active: false,
+            }],
+        }),
+        _ => None,
     }
 }
 

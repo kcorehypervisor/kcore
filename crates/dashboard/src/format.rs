@@ -35,6 +35,20 @@ pub fn service_phase_label(phase: i32) -> &'static str {
     }
 }
 
+/// Kubernetes cluster phase is a free-form word (`ready`, `bootstrapping`, …).
+pub fn kubernetes_phase_label(phase: &str) -> String {
+    let trimmed = phase.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut label = first.to_uppercase().collect::<String>();
+            label.push_str(chars.as_str());
+            label
+        }
+        None => "Unknown".to_string(),
+    }
+}
+
 /// UTC timestamp from Unix seconds. Non-positive values render as an em dash.
 pub fn format_unix_utc(seconds: i64) -> String {
     if seconds <= 0 {
@@ -101,7 +115,29 @@ pub fn bytes_human(bytes: i64) -> String {
     }
 }
 
-pub const VM_PAGE_SIZE: usize = 10;
+/// Default rows per page for dashboard list tables.
+pub const DEFAULT_PAGE_SIZE: usize = 10;
+/// Allowed `per_page` query values (dropdown options).
+pub const PAGE_SIZE_OPTIONS: &[usize] = &[10, 25, 50, 100];
+/// Back-compat alias used by older call sites / tests.
+pub const VM_PAGE_SIZE: usize = DEFAULT_PAGE_SIZE;
+
+/// Clamp a raw `per_page` query value to a supported size.
+pub fn normalize_page_size(raw: u32) -> usize {
+    let n = raw as usize;
+    if PAGE_SIZE_OPTIONS.contains(&n) {
+        n
+    } else {
+        DEFAULT_PAGE_SIZE
+    }
+}
+
+/// Parse a 1-based page number from a query string value.
+pub fn parse_page(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
+        .filter(|&p| p >= 1)
+        .unwrap_or(1)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageView<T> {
@@ -132,15 +168,29 @@ impl<T> PageView<T> {
     }
 }
 
-/// 1-based page, stable ordering by VM name.
+/// 1-based page, stable ordering by name key.
 pub fn paginate_by_name<T: Clone>(
     mut items: Vec<T>,
     sort_key: impl Fn(&T) -> String,
     page: u32,
     page_size: usize,
 ) -> PageView<T> {
-    let total = items.len();
     items.sort_by_key(|a| sort_key(a));
+    paginate_preserve_order(items, page, page_size)
+}
+
+/// 1-based page that keeps the input order (for already-sorted lists).
+pub fn paginate_preserve_order<T: Clone>(
+    items: Vec<T>,
+    page: u32,
+    page_size: usize,
+) -> PageView<T> {
+    let total = items.len();
+    let page_size = if page_size == 0 {
+        DEFAULT_PAGE_SIZE
+    } else {
+        page_size
+    };
     let page = page.max(1);
     let start = ((page - 1) as usize).saturating_mul(page_size);
     let slice: Vec<T> = if start >= items.len() {
@@ -155,6 +205,36 @@ pub fn paginate_by_name<T: Clone>(
         page_size,
         total,
     }
+}
+
+/// Build `path?k=v&…` from key/value pairs, skipping empty values.
+pub fn query_href(path: &str, pairs: &[(&str, String)]) -> String {
+    let mut parts = Vec::new();
+    for (k, v) in pairs {
+        if v.is_empty() {
+            continue;
+        }
+        parts.push(format!("{}={}", urlencoding_query(k), urlencoding_query(v)));
+    }
+    if parts.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", parts.join("&"))
+    }
+}
+
+fn urlencoding_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -189,6 +269,14 @@ mod tests {
     }
 
     #[test]
+    fn kubernetes_phase_labels() {
+        assert_eq!(kubernetes_phase_label("ready"), "Ready");
+        assert_eq!(kubernetes_phase_label("bootstrapping"), "Bootstrapping");
+        assert_eq!(kubernetes_phase_label("  "), "Unknown");
+        assert_eq!(kubernetes_phase_label("Ready"), "Ready");
+    }
+
+    #[test]
     fn vm_state_labels() {
         assert_eq!(vm_state_label(2), "Running");
         assert_eq!(vm_state_label(99), "Unknown");
@@ -208,6 +296,39 @@ mod tests {
         assert_eq!(p.total_pages(), 1);
         assert!(!p.has_prev());
         assert!(!p.has_next());
+    }
+
+    #[test]
+    fn normalize_page_size_accepts_options_else_default() {
+        assert_eq!(normalize_page_size(10), 10);
+        assert_eq!(normalize_page_size(25), 25);
+        assert_eq!(normalize_page_size(50), 50);
+        assert_eq!(normalize_page_size(100), 100);
+        assert_eq!(normalize_page_size(0), DEFAULT_PAGE_SIZE);
+        assert_eq!(normalize_page_size(7), DEFAULT_PAGE_SIZE);
+        assert_eq!(normalize_page_size(999), DEFAULT_PAGE_SIZE);
+    }
+
+    #[test]
+    fn paginate_preserve_order_keeps_input_sequence() {
+        let items = vec!["c", "a", "b"];
+        let p = paginate_preserve_order(items, 1, 2);
+        assert_eq!(p.items, vec!["c", "a"]);
+        assert_eq!(p.total, 3);
+        assert!(p.has_next());
+    }
+
+    #[test]
+    fn query_href_skips_empty_and_encodes() {
+        assert_eq!(query_href("/vms", &[]), "/vms");
+        assert_eq!(
+            query_href("/vms", &[("page", "2".into()), ("per_page", "25".into())]),
+            "/vms?page=2&per_page=25"
+        );
+        assert_eq!(
+            query_href("/ops", &[("q", "a b".into()), ("page", "".into())]),
+            "/ops?q=a+b"
+        );
     }
 
     #[test]
