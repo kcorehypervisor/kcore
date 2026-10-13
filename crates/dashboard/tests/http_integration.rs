@@ -335,6 +335,19 @@ async fn all_dashboard_pages_against_mock_controller() {
         volumes.contains("Ceph"),
         "volumes must show the Ceph backend"
     );
+    assert!(
+        volumes.contains("kcore-kdata"),
+        "volumes must show LVM logical volumes from node inventory"
+    );
+    assert!(
+        volumes.contains("vg_kcore"),
+        "volumes must show the LVM volume group"
+    );
+    assert!(
+        volumes.contains("tank-data"),
+        "volumes must show registered ZFS volumes"
+    );
+    assert!(volumes.contains("ZFS"), "volumes must show the ZFS backend");
 
     // ── Operations ───────────────────────────────────────────────────
     let (status, operations) = fetch(&app, "/operations").await;
