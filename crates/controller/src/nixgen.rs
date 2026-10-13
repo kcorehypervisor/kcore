@@ -1631,6 +1631,106 @@ mod kubernetes_tests {
         assert!(nix.contains("haEnabled = false"));
         assert!(!nix.contains("etcdInitialCluster"));
     }
+
+    #[test]
+    fn pki_options_stay_inside_kubernetes_attrset() {
+        use crate::kubernetes_orchestrator::ClusterNode;
+        use crate::kubernetes_pki::KubernetesPki;
+        use std::collections::HashMap;
+
+        let node = ClusterNode {
+            node_id: "node-107".to_string(),
+            hostname: "node-107".to_string(),
+            ip_address: "192.168.40.107".to_string(),
+            iface: "enp6s0".to_string(),
+            initial_cluster: true,
+        };
+        let peer = "-----BEGIN CERTIFICATE-----\nMIIBPEER\n-----END CERTIFICATE-----\n".to_string();
+        let server =
+            "-----BEGIN CERTIFICATE-----\nMIIBSERVER\n-----END CERTIFICATE-----\n".to_string();
+        let mut etcd_node_certs = HashMap::new();
+        etcd_node_certs.insert(
+            node.node_id.clone(),
+            (server.clone(), "server-key".to_string()),
+        );
+        let mut etcd_node_peer_certs = HashMap::new();
+        etcd_node_peer_certs.insert(node.node_id.clone(), (peer.clone(), "peer-key".to_string()));
+        let pki = KubernetesPki {
+            ca_cert: "CA".to_string(),
+            ca_key: "CAKEY".to_string(),
+            sa_key: "SA".to_string(),
+            sa_pub: "SAPUB".to_string(),
+            etcd_ca_cert: "ETCDCA".to_string(),
+            etcd_ca_key: "ETCDCAKEY".to_string(),
+            apiserver_cert: "API".to_string(),
+            apiserver_key: "APIKEY".to_string(),
+            apiserver_kubelet_client_cert: "AKC".to_string(),
+            apiserver_kubelet_client_key: "AKCKEY".to_string(),
+            apiserver_etcd_client_cert: "AEC".to_string(),
+            apiserver_etcd_client_key: "AECKEY".to_string(),
+            etcd_node_certs,
+            etcd_node_peer_certs,
+            admin_kubeconfig: "apiVersion: v1\nkind: Config\n".to_string(),
+        };
+
+        let nix = generate_kubernetes_config(
+            "lab",
+            &node,
+            &pki,
+            "10.244.0.0/16",
+            "10.96.0.0/12",
+            &server,
+            "server-key",
+            &peer,
+            "peer-key",
+            std::slice::from_ref(&node),
+            &KubernetesRenderSettings {
+                api_server_endpoint: "192.168.40.200:6443".to_string(),
+                cluster_dns: "10.96.0.10".to_string(),
+                ha_enabled: true,
+                vip_address: "192.168.40.200".to_string(),
+                vip_interface: "enp6s0".to_string(),
+                cilium_mode: "native-routing".to_string(),
+                cilium_mtu: 1500,
+                cilium_tunnel: "disabled".to_string(),
+                cilium_auto_direct_routes: true,
+                cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+            },
+        )
+        .unwrap();
+
+        let close = nix.rfind("\n  };\n").expect("kubernetes attrset close");
+        let peer_at = nix.find("etcdPeerCrt").expect("etcdPeerCrt option");
+        assert!(
+            peer_at < close,
+            "etcdPeerCrt must be inside kcore.kubernetes"
+        );
+        assert!(nix.contains("etcdPeerKey"));
+        assert!(nix.contains("MIIBPEER"));
+        assert!(nix.contains("node-107=https://192.168.40.107:2380"));
+        assert!(nix.contains("apiServerEndpoint = \"192.168.40.200:6443\""));
+        assert!(nix.contains("haEnabled = true"));
+        assert!(nix.contains("vipAddress = \"192.168.40.200\""));
+        assert!(!nix.contains("https://https://"));
+        assert!(!nix.contains("environment.etc"));
+        assert!(nix.ends_with("  };\n}\n"));
+        assert_eq!(nix.matches("kubeconfigData").count(), 1);
+    }
+}
+
+/// Cluster-wide values copied into every node's `kcore.kubernetes` block.
+#[derive(Debug, Clone)]
+pub struct KubernetesRenderSettings {
+    pub api_server_endpoint: String,
+    pub cluster_dns: String,
+    pub ha_enabled: bool,
+    pub vip_address: String,
+    pub vip_interface: String,
+    pub cilium_mode: String,
+    pub cilium_mtu: i32,
+    pub cilium_tunnel: String,
+    pub cilium_auto_direct_routes: bool,
+    pub cilium_lb_ip_pools: Vec<String>,
 }
 
 /// Generate Kubernetes node configuration for a node in the cluster
@@ -1645,12 +1745,22 @@ pub fn generate_kubernetes_config(
     etcd_peer_cert: &str,
     etcd_peer_key: &str,
     all_nodes: &[crate::kubernetes_orchestrator::ClusterNode],
+    settings: &KubernetesRenderSettings,
 ) -> anyhow::Result<String> {
     // Build complete etcd initial cluster string with ALL members
     // For static bootstrap, every node needs the complete list
+    // etcd --name is the NixOS hostname (see modules/kcore-kubernetes.nix).
+    // The initial-cluster keys must be that same name.
     let etcd_initial_cluster = all_nodes
         .iter()
-        .map(|n| format!("{}=https://{}:2380", n.node_id, n.ip_address))
+        .map(|n| {
+            let name = if n.hostname.is_empty() {
+                n.node_id.as_str()
+            } else {
+                n.hostname.as_str()
+            };
+            format!("{name}=https://{}:2380", n.ip_address)
+        })
         .collect::<Vec<_>>()
         .join(",");
 
@@ -1659,108 +1769,110 @@ pub fn generate_kubernetes_config(
         cluster_name: cluster_name.to_string(),
         cluster_cidr: cluster_cidr.to_string(),
         service_cidr: service_cidr.to_string(),
-        cluster_dns: "10.96.0.10".to_string(), // TODO: Parse from service_cidr
+        cluster_dns: if settings.cluster_dns.is_empty() {
+            "10.96.0.10".to_string()
+        } else {
+            settings.cluster_dns.clone()
+        },
         advertise_address: node.ip_address.clone(),
-        iface: "enp6s0".to_string(), // TODO: Get from database
-        api_server_endpoint: format!("https://{}:6443", node.ip_address), // TODO: Use VIP if HA
-        initial_cluster: true,       // Always true for static bootstrap
+        iface: if node.iface.is_empty() {
+            "enp6s0".to_string()
+        } else {
+            node.iface.clone()
+        },
+        api_server_endpoint: api_endpoint_for_nix(&settings.api_server_endpoint, &node.ip_address),
+        initial_cluster: true, // Every member starts together on a new static cluster
         etcd_initial_cluster,
         cni: "cilium".to_string(),
-        cilium_mode: "native-routing".to_string(),
-        cilium_mtu: 1500,
-        cilium_tunnel: "disabled".to_string(),
-        cilium_auto_direct_routes: true,
-        cilium_lb_ip_pools: vec![],
-        ha_enabled: false, // TODO: Read from cluster config
-        vip_address: String::new(),
-        vip_interface: String::new(),
+        cilium_mode: if settings.cilium_mode.is_empty() {
+            "native-routing".to_string()
+        } else {
+            settings.cilium_mode.clone()
+        },
+        cilium_mtu: settings.cilium_mtu,
+        cilium_tunnel: if settings.cilium_tunnel.is_empty() {
+            "disabled".to_string()
+        } else {
+            settings.cilium_tunnel.clone()
+        },
+        cilium_auto_direct_routes: settings.cilium_auto_direct_routes,
+        cilium_lb_ip_pools: settings.cilium_lb_ip_pools.clone(),
+        ha_enabled: settings.ha_enabled,
+        vip_address: settings.vip_address.clone(),
+        vip_interface: settings.vip_interface.clone(),
         kubeconfig_data: String::new(), // TODO: Include admin kubeconfig
     };
 
-    let mut nix = generate_kubernetes_node_config(&k8s_config);
+    let nix = generate_kubernetes_node_config(&k8s_config);
+    // generate_kubernetes_node_config closes `kcore.kubernetes` and then the
+    // module. Certificate options have to be inside `kcore.kubernetes`; popping
+    // two characters only removed the outer `}`, so the options landed beside
+    // the attrset and Nix evaluation failed.
+    const MODULE_CLOSE: &str = "  };\n}\n";
+    let Some(head) = nix.strip_suffix(MODULE_CLOSE) else {
+        anyhow::bail!("kubernetes nix module did not end with the expected close");
+    };
 
-    // Append PKI certificates as writeText
-    nix.pop(); // Remove trailing '}\n'
-    nix.pop();
-
-    nix.push_str("\n  # Kubernetes PKI certificates\n");
-    nix.push_str("  environment.etc = {\n");
-
-    // CA certificate
-    nix.push_str("    \"kubernetes/pki/ca.crt\".text = ''\n");
-    nix.push_str(&pki.ca_cert);
-    nix.push_str("'';\n");
-
-    // CA key (control plane only)
-    nix.push_str("    \"kubernetes/pki/ca.key\".text = ''\n");
-    nix.push_str(&pki.ca_key);
-    nix.push_str("'';\n");
-
-    // Service account key pair
-    nix.push_str("    \"kubernetes/pki/sa.key\".text = ''\n");
-    nix.push_str(&pki.sa_key);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/sa.pub\".text = ''\n");
-    nix.push_str(&pki.sa_pub);
-    nix.push_str("'';\n");
-
-    // API server certificate and key
-    nix.push_str("    \"kubernetes/pki/apiserver.crt\".text = ''\n");
-    nix.push_str(&pki.apiserver_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/apiserver.key\".text = ''\n");
-    nix.push_str(&pki.apiserver_key);
-    nix.push_str("'';\n");
-
-    // API server kubelet client cert
-    nix.push_str("    \"kubernetes/pki/apiserver-kubelet-client.crt\".text = ''\n");
-    nix.push_str(&pki.apiserver_kubelet_client_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/apiserver-kubelet-client.key\".text = ''\n");
-    nix.push_str(&pki.apiserver_kubelet_client_key);
-    nix.push_str("'';\n");
-
-    // etcd CA
-    nix.push_str("    \"kubernetes/pki/etcd/ca.crt\".text = ''\n");
-    nix.push_str(&pki.etcd_ca_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/etcd/ca.key\".text = ''\n");
-    nix.push_str(&pki.etcd_ca_key);
-    nix.push_str("'';\n");
-
-    // Node-specific etcd server cert/key
-    nix.push_str("    \"kubernetes/pki/etcd/server.crt\".text = ''\n");
-    nix.push_str(etcd_server_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/etcd/server.key\".text = ''\n");
-    nix.push_str(etcd_server_key);
-    nix.push_str("'';\n");
-
-    // Node-specific etcd peer cert/key
-    nix.push_str("    \"kubernetes/pki/etcd/peer.crt\".text = ''\n");
-    nix.push_str(etcd_peer_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/etcd/peer.key\".text = ''\n");
-    nix.push_str(etcd_peer_key);
-    nix.push_str("'';\n");
-
-    // API server etcd client cert
-    nix.push_str("    \"kubernetes/pki/apiserver-etcd-client.crt\".text = ''\n");
-    nix.push_str(&pki.apiserver_etcd_client_cert);
-    nix.push_str("'';\n");
-
-    nix.push_str("    \"kubernetes/pki/apiserver-etcd-client.key\".text = ''\n");
-    nix.push_str(&pki.apiserver_etcd_client_key);
-    nix.push_str("'';\n");
-
-    nix.push_str("  };\n");
-    nix.push_str("}\n");
+    let mut nix = head.to_string();
+    nix.push_str("\n    # PKI certificates (written by modules/kcore-kubernetes.nix)\n");
+    for (name, value) in [
+        ("caCrt", pki.ca_cert.as_str()),
+        ("caKey", pki.ca_key.as_str()),
+        ("saKey", pki.sa_key.as_str()),
+        ("saPub", pki.sa_pub.as_str()),
+        ("apiserverCrt", pki.apiserver_cert.as_str()),
+        ("apiserverKey", pki.apiserver_key.as_str()),
+        (
+            "apiserverKubeletClientCrt",
+            pki.apiserver_kubelet_client_cert.as_str(),
+        ),
+        (
+            "apiserverKubeletClientKey",
+            pki.apiserver_kubelet_client_key.as_str(),
+        ),
+        (
+            "apiserverEtcdClientCrt",
+            pki.apiserver_etcd_client_cert.as_str(),
+        ),
+        (
+            "apiserverEtcdClientKey",
+            pki.apiserver_etcd_client_key.as_str(),
+        ),
+        ("etcdCaCrt", pki.etcd_ca_cert.as_str()),
+        ("etcdCaKey", pki.etcd_ca_key.as_str()),
+        ("etcdServerCrt", etcd_server_cert),
+        ("etcdServerKey", etcd_server_key),
+        ("etcdPeerCrt", etcd_peer_cert),
+        ("etcdPeerKey", etcd_peer_key),
+        ("kubeconfigData", pki.admin_kubeconfig.as_str()),
+    ] {
+        nix.push_str(&format!("    {name} = {};\n", nix_multiline(value)));
+    }
+    nix.push_str(MODULE_CLOSE);
 
     Ok(nix)
+}
+
+/// The NixOS module prefixes `https://` itself. Stored endpoints sometimes
+/// already include the scheme.
+fn api_endpoint_for_nix(raw: &str, fallback_ip: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if trimmed.is_empty() {
+        format!("{fallback_ip}:6443")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Nix indented string. PEM and kubeconfig text must not close the string or
+/// expand as an antiquotation.
+fn nix_multiline(value: &str) -> String {
+    let mut escaped = value.replace("''", "'''").replace("${", "''${");
+    if !escaped.ends_with('\n') {
+        escaped.push('\n');
+    }
+    format!("''{escaped}''")
 }

@@ -115,3 +115,82 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
     out.push_str("}\n");
     out
 }
+
+/// NixOS module that turns `kcore.kubernetes.*` into units and PKI files.
+pub const KUBERNETES_MODULE_NIX: &str = include_str!("../../../modules/kcore-kubernetes.nix");
+
+/// True when `configuration.nix` already lists this import path on its own line.
+pub fn configuration_imports_path(config: &str, path: &str) -> bool {
+    config.lines().any(|line| {
+        let trimmed = line.trim().trim_end_matches(',');
+        trimmed == path
+    })
+}
+
+/// Insert missing imports at the start of the `imports` list.
+///
+/// `./kcore-kubernetes.nix` is a suffix of `./modules/kcore-kubernetes.nix`, so
+/// this matches whole import lines rather than substrings.
+pub fn ensure_nixos_imports(config: &str, imports: &[&str]) -> String {
+    let mut out = config.to_string();
+    let needle = "imports = [";
+    for import in imports.iter().rev() {
+        if configuration_imports_path(&out, import) {
+            continue;
+        }
+        let Some(idx) = out.find(needle) else {
+            continue;
+        };
+        let at = idx + needle.len();
+        out.insert_str(at, &format!("\n    {import}"));
+    }
+    out
+}
+
+/// Install the Kubernetes module and make configuration.nix import it and the
+/// generated values file. Without both imports, nixos-rebuild ignores the
+/// certificates the controller writes.
+pub fn install_kubernetes_module_sources() -> std::io::Result<()> {
+    std::fs::create_dir_all("/etc/nixos/modules")?;
+    std::fs::write(
+        "/etc/nixos/modules/kcore-kubernetes.nix",
+        KUBERNETES_MODULE_NIX,
+    )?;
+    let config_path = "/etc/nixos/configuration.nix";
+    let config = std::fs::read_to_string(config_path)?;
+    let updated = ensure_nixos_imports(
+        &config,
+        &["./modules/kcore-kubernetes.nix", "./kcore-kubernetes.nix"],
+    );
+    if updated != config {
+        std::fs::write(config_path, updated)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_insert_does_not_confuse_module_path_with_values_path() {
+        let config = "{\n  imports = [\n    ./hardware-configuration.nix\n  ];\n}\n";
+        let once = ensure_nixos_imports(
+            config,
+            &["./modules/kcore-kubernetes.nix", "./kcore-kubernetes.nix"],
+        );
+        let twice = ensure_nixos_imports(
+            &once,
+            &["./modules/kcore-kubernetes.nix", "./kcore-kubernetes.nix"],
+        );
+        assert_eq!(once, twice);
+        assert!(configuration_imports_path(
+            &once,
+            "./modules/kcore-kubernetes.nix"
+        ));
+        assert!(configuration_imports_path(&once, "./kcore-kubernetes.nix"));
+        let module_at = once.find("./modules/kcore-kubernetes.nix").unwrap();
+        let values_at = once.find("\n    ./kcore-kubernetes.nix").unwrap();
+        assert!(module_at < values_at);
+    }
+}
