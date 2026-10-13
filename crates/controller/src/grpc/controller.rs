@@ -352,6 +352,7 @@ const EVT_VM_MIGRATE: &str = "vm.migrate";
 const EVT_SSH_KEY_CREATE: &str = "ssh_key.create";
 const EVT_SSH_KEY_DELETE: &str = "ssh_key.delete";
 const EVT_VOLUME_CREATE: &str = "volume.create";
+const EVT_VOLUME_UPDATE: &str = "volume.update";
 const EVT_VOLUME_DELETE: &str = "volume.delete";
 const EVT_VOLUME_ATTACH: &str = "volume.attach";
 const EVT_VOLUME_DETACH: &str = "volume.detach";
@@ -1650,7 +1651,11 @@ impl ControllerService {
             slot: vol.slot,
             vm_id: vol.vm_id.clone(),
             vm_name: vm.map(|v| v.name.clone()).unwrap_or_default(),
-            node_id: vm.map(|v| v.node_id.clone()).unwrap_or_default(),
+            node_id: if !vol.host_node_id.is_empty() {
+                vol.host_node_id.clone()
+            } else {
+                vm.map(|v| v.node_id.clone()).unwrap_or_default()
+            },
             storage_backend: if vol.storage_class.is_empty() {
                 "ceph".into()
             } else {
@@ -1662,6 +1667,9 @@ impl ControllerService {
                     "/dev/mapper/{}",
                     crate::volume_crypto::mapper_name_for_serial(&vol.serial)
                 )
+            } else if crate::host_volume::is_host(&vol.storage_class) {
+                crate::host_volume::device_path(&vol.storage_class, &vol.pool, &vol.image)
+                    .unwrap_or_default()
             } else {
                 format!("/dev/rbd/{}/{}", vol.pool, vol.image)
             },
@@ -1672,6 +1680,8 @@ impl ControllerService {
             guest_visible_bytes: vol.guest_visible_bytes,
             guest_checked_at: vol.guest_checked_at.clone(),
             encrypted: vol.encrypted,
+            mount_point: vol.mount_point.clone(),
+            fs_type: vol.fs_type.clone(),
         }
     }
 
@@ -4967,10 +4977,405 @@ impl ControllerService {
             }
         }
     }
+    async fn connect_node_storage(
+        &self,
+        node: &NodeRow,
+    ) -> Result<node_proto::node_storage_client::NodeStorageClient<tonic::transport::Channel>, Status>
+    {
+        if self.clients.get_storage(&node.address).is_none() {
+            self.clients
+                .connect(&node.address)
+                .await
+                .map_err(|e| Status::unavailable(format!("connecting to {}: {e}", node.id)))?;
+        }
+        self.clients.get_storage(&node.address).ok_or_else(|| {
+            Status::unavailable(format!("storage client unavailable for {}", node.id))
+        })
+    }
+
+    fn host_volume_event(&self, vol: &VolumeRow) -> serde_json::Value {
+        serde_json::json!({
+            "id": vol.id,
+            "name": vol.name,
+            "role": vol.role,
+            "pool": vol.pool,
+            "image": vol.image,
+            "sizeBytes": vol.size_bytes,
+            "vmId": vol.vm_id,
+            "attachState": vol.attach_state,
+            "serial": vol.serial,
+            "slot": vol.slot,
+            "storageClass": vol.storage_class,
+            "hostNodeId": vol.host_node_id,
+            "fsType": vol.fs_type,
+            "mountPoint": vol.mount_point,
+        })
+    }
+
+    async fn create_host_volume(
+        &self,
+        actor: &str,
+        name: &str,
+        storage_class: &str,
+        req: &controller_proto::CreateVolumeRequest,
+    ) -> Result<Response<controller_proto::CreateVolumeResponse>, Status> {
+        if req.encrypt {
+            return Err(Status::invalid_argument(
+                "encrypt is only supported for ceph volumes",
+            ));
+        }
+        if !req.from_snapshot.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "from_snapshot is only supported for ceph volumes",
+            ));
+        }
+        if !req.vm.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "lvm and zfs volumes are mounted on their node, not attached to a VM",
+            ));
+        }
+        let node_id = req.node.trim();
+        if node_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "node is required for lvm and zfs volumes",
+            ));
+        }
+        if self
+            .db
+            .get_volume_by_name(name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_some()
+        {
+            return Err(Status::already_exists(format!(
+                "volume '{name}' already exists"
+            )));
+        }
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node '{node_id}' not found")))?;
+        if node.storage_backend != storage_class {
+            return Err(Status::failed_precondition(format!(
+                "node {} storage backend is {}, not {storage_class}",
+                node.id, node.storage_backend
+            )));
+        }
+        let mut row = VolumeRow::new_data(name, req.size_bytes);
+        row.storage_class = storage_class.to_string();
+        row.host_node_id = node.id.clone();
+        let mut storage = self.connect_node_storage(&node).await?;
+        let created = storage
+            .create_volume(node_proto::CreateVolumeRequest {
+                volume_id: name.to_string(),
+                storage_class: storage_class.to_string(),
+                size_bytes: row.size_bytes,
+                parameters: HashMap::new(),
+                lv_name: req.volume_name.trim().to_string(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("creating {storage_class} volume: {e}")))?
+            .into_inner();
+        let (pool, image) =
+            crate::host_volume::split_backend_handle(storage_class, &created.backend_handle)
+                .map_err(Status::internal)?;
+        row.pool = pool;
+        row.image = image;
+        self.db
+            .upsert_volume(&row)
+            .map_err(|e| Status::internal(format!("storing volume: {e}")))?;
+        self.log_replication_event(
+            actor,
+            Some("volume.create"),
+            EVT_VOLUME_CREATE,
+            &format!("volume/{}", row.name),
+            self.host_volume_event(&row),
+        );
+        Ok(Response::new(controller_proto::CreateVolumeResponse {
+            success: true,
+            volume: Some(self.volume_info_from_row(&row, None)),
+            message: format!("volume '{name}' created on {}", node.id),
+        }))
+    }
+
+    async fn resize_host_volume(
+        &self,
+        actor: String,
+        mut vol: VolumeRow,
+        size_bytes: i64,
+        allow_shrink: bool,
+    ) -> Result<Response<controller_proto::ResizeVolumeResponse>, Status> {
+        if size_bytes <= 0 {
+            return Err(Status::invalid_argument("size_bytes must be positive"));
+        }
+        if size_bytes == vol.size_bytes {
+            return Err(Status::invalid_argument(
+                "size_bytes equals current provisioned size; no change",
+            ));
+        }
+        if size_bytes < vol.size_bytes && !allow_shrink {
+            return Err(Status::invalid_argument(
+                "shrink refused; pass allow_shrink=true to shrink an unmounted ext4 volume",
+            ));
+        }
+        if size_bytes < vol.size_bytes && !vol.mount_point.is_empty() {
+            return Err(Status::failed_precondition(
+                "unmount the volume before shrinking it",
+            ));
+        }
+        let device = crate::host_volume::device_path(&vol.storage_class, &vol.pool, &vol.image)
+            .map_err(Status::failed_precondition)?;
+        let node = self.host_volume_node(&vol).await?;
+        let mut storage = self.connect_node_storage(&node).await?;
+        let resized = storage
+            .resize_volume(node_proto::ResizeVolumeRequest {
+                backend_handle: device,
+                size_bytes,
+                allow_shrink,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("resizing volume: {e}")))?
+            .into_inner();
+        vol.size_bytes = if resized.size_bytes > 0 {
+            resized.size_bytes
+        } else {
+            size_bytes
+        };
+        vol.generation += 1;
+        self.db
+            .upsert_volume(&vol)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.log_replication_event(
+            &actor,
+            Some("volume.update"),
+            EVT_VOLUME_UPDATE,
+            &format!("volume/{}", vol.name),
+            self.host_volume_event(&vol),
+        );
+        let message = if resized.message.is_empty() {
+            format!("resized '{}' to {} bytes", vol.name, vol.size_bytes)
+        } else {
+            resized.message
+        };
+        Ok(Response::new(controller_proto::ResizeVolumeResponse {
+            success: true,
+            message,
+            volume: Some(self.volume_info_from_row(&vol, None)),
+            operation_id: String::new(),
+            guest_status_note: String::new(),
+        }))
+    }
+
+    async fn delete_host_volume(
+        &self,
+        actor: String,
+        row: VolumeRow,
+    ) -> Result<Response<controller_proto::DeleteVolumeResponse>, Status> {
+        if !row.mount_point.is_empty() {
+            return Err(Status::failed_precondition(
+                "unmount the volume before deleting it",
+            ));
+        }
+        let device = crate::host_volume::device_path(&row.storage_class, &row.pool, &row.image)
+            .map_err(Status::failed_precondition)?;
+        let node = self.host_volume_node(&row).await?;
+        let mut storage = self.connect_node_storage(&node).await?;
+        storage
+            .delete_volume(node_proto::DeleteVolumeRequest {
+                backend_handle: device,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("deleting volume: {e}")))?;
+        self.db
+            .delete_volume_by_id(&row.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.log_replication_event(
+            &actor,
+            Some("volume.delete"),
+            EVT_VOLUME_DELETE,
+            &format!("volume/{}", row.name),
+            serde_json::json!({
+                "id": row.id,
+                "name": row.name,
+            }),
+        );
+        Ok(Response::new(controller_proto::DeleteVolumeResponse {
+            success: true,
+            message: format!("deleted volume '{}'", row.name),
+        }))
+    }
+
+    async fn host_volume_node(&self, vol: &VolumeRow) -> Result<NodeRow, Status> {
+        if vol.host_node_id.is_empty() {
+            return Err(Status::failed_precondition(
+                "host volume has no node recorded",
+            ));
+        }
+        self.db
+            .get_node(&vol.host_node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!("node '{}' is missing", vol.host_node_id))
+            })
+    }
 }
 
 #[tonic::async_trait]
 impl controller_proto::controller_server::Controller for ControllerService {
+    async fn format_volume(
+        &self,
+        request: Request<controller_proto::FormatVolumeRequest>,
+    ) -> Result<Response<controller_proto::FormatVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let mut vol = self
+            .resolve_volume_row(req.name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.name)))?;
+        if !crate::host_volume::is_host(&vol.storage_class) {
+            return Err(Status::failed_precondition(
+                "format is supported for lvm and zfs volumes",
+            ));
+        }
+        if !vol.mount_point.is_empty() {
+            return Err(Status::failed_precondition(
+                "unmount the volume before formatting it",
+            ));
+        }
+        let fs_type = req.fs_type.trim().to_ascii_lowercase();
+        let device = crate::host_volume::device_path(&vol.storage_class, &vol.pool, &vol.image)
+            .map_err(Status::failed_precondition)?;
+        let node = self.host_volume_node(&vol).await?;
+        let mut storage = self.connect_node_storage(&node).await?;
+        let formatted = storage
+            .format_volume(node_proto::FormatVolumeRequest {
+                backend_handle: device,
+                fs_type: fs_type.clone(),
+                force: req.force,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("formatting volume: {e}")))?
+            .into_inner();
+        vol.fs_type = fs_type;
+        vol.generation += 1;
+        self.db
+            .upsert_volume(&vol)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.log_replication_event(
+            &actor,
+            Some("volume.update"),
+            EVT_VOLUME_UPDATE,
+            &format!("volume/{}", vol.name),
+            self.host_volume_event(&vol),
+        );
+        Ok(Response::new(controller_proto::FormatVolumeResponse {
+            success: true,
+            message: formatted.message,
+            volume: Some(self.volume_info_from_row(&vol, None)),
+        }))
+    }
+
+    async fn mount_volume(
+        &self,
+        request: Request<controller_proto::MountVolumeRequest>,
+    ) -> Result<Response<controller_proto::MountVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let mut vol = self
+            .resolve_volume_row(req.name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.name)))?;
+        if !crate::host_volume::is_host(&vol.storage_class) {
+            return Err(Status::failed_precondition(
+                "mount is supported for lvm and zfs volumes",
+            ));
+        }
+        let device = crate::host_volume::device_path(&vol.storage_class, &vol.pool, &vol.image)
+            .map_err(Status::failed_precondition)?;
+        let node = self.host_volume_node(&vol).await?;
+        let mut storage = self.connect_node_storage(&node).await?;
+        let mounted = storage
+            .mount_volume(node_proto::MountVolumeRequest {
+                backend_handle: device,
+                mount_point: req.mount_point,
+                fs_type: req.fs_type.clone(),
+                persistent: req.persistent,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("mounting volume: {e}")))?
+            .into_inner();
+        vol.mount_point = mounted.mount_point;
+        if !req.fs_type.trim().is_empty() {
+            vol.fs_type = req.fs_type.trim().to_ascii_lowercase();
+        }
+        vol.generation += 1;
+        self.db
+            .upsert_volume(&vol)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.log_replication_event(
+            &actor,
+            Some("volume.update"),
+            EVT_VOLUME_UPDATE,
+            &format!("volume/{}", vol.name),
+            self.host_volume_event(&vol),
+        );
+        Ok(Response::new(controller_proto::MountVolumeResponse {
+            success: true,
+            message: mounted.message,
+            volume: Some(self.volume_info_from_row(&vol, None)),
+        }))
+    }
+
+    async fn unmount_volume(
+        &self,
+        request: Request<controller_proto::UnmountVolumeRequest>,
+    ) -> Result<Response<controller_proto::UnmountVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let mut vol = self
+            .resolve_volume_row(req.name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.name)))?;
+        if !crate::host_volume::is_host(&vol.storage_class) {
+            return Err(Status::failed_precondition(
+                "unmount is supported for lvm and zfs volumes",
+            ));
+        }
+        if vol.mount_point.is_empty() {
+            return Ok(Response::new(controller_proto::UnmountVolumeResponse {
+                success: true,
+                message: format!("volume '{}' is not mounted", vol.name),
+                volume: Some(self.volume_info_from_row(&vol, None)),
+            }));
+        }
+        let node = self.host_volume_node(&vol).await?;
+        let mut storage = self.connect_node_storage(&node).await?;
+        let unmounted = storage
+            .unmount_volume(node_proto::UnmountVolumeRequest {
+                mount_point: vol.mount_point.clone(),
+                persistent: req.persistent,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("unmounting volume: {e}")))?
+            .into_inner();
+        vol.mount_point.clear();
+        vol.generation += 1;
+        self.db
+            .upsert_volume(&vol)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.log_replication_event(
+            &actor,
+            Some("volume.update"),
+            EVT_VOLUME_UPDATE,
+            &format!("volume/{}", vol.name),
+            self.host_volume_event(&vol),
+        );
+        Ok(Response::new(controller_proto::UnmountVolumeResponse {
+            success: true,
+            message: unmounted.message,
+            volume: Some(self.volume_info_from_row(&vol, None)),
+        }))
+    }
     async fn register_node(
         &self,
         request: Request<controller_proto::RegisterNodeRequest>,
@@ -10209,9 +10614,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
         } else {
             req.storage_class.trim()
         };
+        if crate::host_volume::is_host(storage_class) {
+            return self
+                .create_host_volume(&actor, name, storage_class, &req)
+                .await;
+        }
         if storage_class != "ceph" {
             return Err(Status::invalid_argument(
-                "only storage_class=ceph is supported for CreateVolume in this release",
+                "storage_class must be ceph, lvm, or zfs",
             ));
         }
         if self
@@ -10435,6 +10845,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "root volumes cannot be re-attached",
             ));
         }
+        if crate::host_volume::is_host(&row.storage_class) {
+            return Err(Status::failed_precondition(
+                "lvm and zfs volumes stay on their node; mount them instead of attaching to a VM",
+            ));
+        }
         if row.attach_state == VolumeRow::ATTACH_ATTACHED && !row.vm_id.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "volume '{}' is already attached to {}",
@@ -10590,6 +11005,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 snapshots.len()
             )));
         }
+        if crate::host_volume::is_host(&row.storage_class) {
+            return self.delete_host_volume(actor, row).await;
+        }
         let node = self
             .pick_healthy_ceph_node()
             .await
@@ -10720,6 +11138,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let vol = self
             .resolve_volume_row(req.volume.trim())?
             .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume)))?;
+        crate::host_volume::require_ceph(&vol.storage_class, "snapshot")
+            .map_err(Status::failed_precondition)?;
         if !vol.vm_id.is_empty() {
             if let Ok(Some(open)) = self.db.get_open_vm_operation(&vol.vm_id) {
                 return Err(Status::failed_precondition(format!(
@@ -10949,6 +11369,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut vol = self
             .resolve_volume_row(req.volume.trim())?
             .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume)))?;
+        crate::host_volume::require_ceph(&vol.storage_class, "restore")
+            .map_err(Status::failed_precondition)?;
         let snap = self
             .db
             .get_volume_snapshot_by_name(req.snapshot.trim())
@@ -11022,6 +11444,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut vol = self
             .resolve_volume_row(name.trim())?
             .ok_or_else(|| Status::not_found(format!("volume '{name}' not found")))?;
+        crate::host_volume::require_ceph(&vol.storage_class, "flatten")
+            .map_err(Status::failed_precondition)?;
         if vol.parent_snapshot_id.is_empty() {
             return Err(Status::failed_precondition(
                 "volume is not a clone (no parent_snapshot_id)",
@@ -11081,6 +11505,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut vol = self
             .resolve_volume_row(req.name.trim())?
             .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.name)))?;
+        crate::host_volume::require_ceph(&vol.storage_class, "encrypt")
+            .map_err(Status::failed_precondition)?;
         if vol.encrypted {
             return Err(Status::failed_precondition(format!(
                 "volume '{}' is already encrypted",
@@ -11186,10 +11612,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::ResizeVolumeRequest>,
     ) -> Result<Response<controller_proto::ResizeVolumeResponse>, Status> {
         self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let mut vol = self
             .resolve_volume_row(req.name.trim())?
             .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.name)))?;
+        if crate::host_volume::is_host(&vol.storage_class) {
+            return self
+                .resize_host_volume(actor, vol, req.size_bytes, req.allow_shrink)
+                .await;
+        }
         let shrinking = req.size_bytes < vol.size_bytes;
         if req.size_bytes == vol.size_bytes {
             return Err(Status::invalid_argument(
@@ -15272,6 +15704,9 @@ mod tests {
             guest_checked_at: String::new(),
             encrypted: false,
             wrapped_dek: String::new(),
+            host_node_id: String::new(),
+            fs_type: String::new(),
+            mount_point: String::new(),
             created_at: String::new(),
         }
     }

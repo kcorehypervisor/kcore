@@ -345,6 +345,30 @@ pub async fn disks(info: &ConnectionInfo) -> Result<()> {
     Ok(())
 }
 
+pub async fn zfs_create(
+    info: &ConnectionInfo,
+    id: &str,
+    size_bytes: i64,
+    dataset: Option<&str>,
+) -> Result<()> {
+    if size_bytes <= 0 {
+        anyhow::bail!("--size-bytes must be positive");
+    }
+    let mut client = client::node_storage_client(info).await?;
+    let resp = client
+        .create_volume(node_proto::CreateVolumeRequest {
+            volume_id: id.to_string(),
+            storage_class: "zfs".to_string(),
+            size_bytes,
+            parameters: std::collections::HashMap::new(),
+            lv_name: dataset.unwrap_or("").to_string(),
+        })
+        .await?
+        .into_inner();
+    println!("{}", resp.backend_handle);
+    Ok(())
+}
+
 pub async fn lvm_create(
     info: &ConnectionInfo,
     id: &str,

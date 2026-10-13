@@ -490,8 +490,8 @@ message CreateVolumeRequest {
   string storage_class = 2;
   int64 size_bytes = 3;
   map<string, string> parameters = 4; // StorageClass-specific params
-  // Logical volume name. Empty keeps <lv_prefix><volume_id>. Set this to
-  // create a volume that is not a VM disk and does not use the prefix.
+  // LVM logical volume or ZFS zvol name. Empty keeps <prefix><volume_id>.
+  // Set this to create a volume that is not a VM disk and does not use the prefix.
   string lv_name = 5;
 }
 
