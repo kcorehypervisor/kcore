@@ -11,7 +11,12 @@ use std::process::Command;
 use crate::path_safety;
 
 const MIB: i64 = 1024 * 1024;
-const UNIT_DIR: &str = "/etc/systemd/system";
+/// Persistent units. NixOS makes this a symlink into the read-only store.
+const PERSISTENT_UNIT_DIR: &str = "/etc/systemd/system";
+/// Runtime units. Writable on NixOS and gone after reboot.
+const RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
+/// Linux `EROFS`.
+const EROFS: i32 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -464,23 +469,7 @@ pub(crate) fn mount_device(
 pub fn unmount_volume(mount_point: &str, persistent: bool) -> Result<String, LvmOpError> {
     let mount_point = validate_mount_point(mount_point)?;
     if persistent {
-        let unit = mount_unit_name(&mount_point);
-        let unit_path = Path::new(UNIT_DIR).join(&unit);
-        if unit_path.exists() {
-            let _ = run_argv(&[
-                "systemctl".into(),
-                "disable".into(),
-                "--now".into(),
-                unit.clone(),
-            ]);
-            fs::remove_file(&unit_path).map_err(|err| {
-                LvmOpError::new(
-                    Kind::Internal,
-                    format!("removing {}: {err}", unit_path.display()),
-                )
-            })?;
-            run_argv(&["systemctl".into(), "daemon-reload".into()])?;
-        }
+        remove_mount_unit(&mount_point)?;
     }
     if mount_point_is_mounted(&mount_point)? {
         run_argv(&["umount".into(), mount_point.clone()])?;
@@ -525,17 +514,79 @@ pub(crate) fn sanitize_volume_id(name: &str) -> String {
     }
 }
 
+fn io_is_read_only(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(EROFS)
+}
+
+fn write_unit_file(dir: &str, unit: &str, contents: &str) -> Result<PathBuf, std::io::Error> {
+    fs::create_dir_all(dir)?;
+    let path = Path::new(dir).join(unit);
+    fs::write(&path, contents)?;
+    Ok(path)
+}
+
 fn install_mount_unit(device: &str, mount_point: &str, fs_type: &str) -> Result<(), LvmOpError> {
     let fs = normalize_fs_type(fs_type)?;
     let unit = mount_unit_name(mount_point);
-    let path = PathBuf::from(UNIT_DIR).join(&unit);
-    fs::create_dir_all(UNIT_DIR)
-        .map_err(|err| LvmOpError::new(Kind::Internal, format!("creating {UNIT_DIR}: {err}")))?;
-    fs::write(&path, mount_unit_contents(device, mount_point, &fs)).map_err(|err| {
-        LvmOpError::new(Kind::Internal, format!("writing {}: {err}", path.display()))
-    })?;
+    let body = mount_unit_contents(device, mount_point, &fs);
+    // `systemctl enable` writes into /etc. On NixOS that directory is the
+    // store, so a read-only failure falls back to a runtime unit and start.
+    let enable = match write_unit_file(PERSISTENT_UNIT_DIR, &unit, &body) {
+        Ok(_) => true,
+        Err(err) if io_is_read_only(&err) => {
+            write_unit_file(RUNTIME_UNIT_DIR, &unit, &body).map_err(|err| {
+                LvmOpError::new(
+                    Kind::Internal,
+                    format!("writing {RUNTIME_UNIT_DIR}/{unit}: {err}"),
+                )
+            })?;
+            false
+        }
+        Err(err) => {
+            return Err(LvmOpError::new(
+                Kind::Internal,
+                format!("writing {PERSISTENT_UNIT_DIR}/{unit}: {err}"),
+            ));
+        }
+    };
     run_argv(&["systemctl".into(), "daemon-reload".into()])?;
-    run_argv(&["systemctl".into(), "enable".into(), "--now".into(), unit])?;
+    if enable {
+        run_argv(&["systemctl".into(), "enable".into(), "--now".into(), unit])?;
+    } else {
+        run_argv(&["systemctl".into(), "start".into(), unit])?;
+    }
+    Ok(())
+}
+
+fn remove_mount_unit(mount_point: &str) -> Result<(), LvmOpError> {
+    let unit = mount_unit_name(mount_point);
+    let persistent = Path::new(PERSISTENT_UNIT_DIR).join(&unit);
+    if persistent.exists() {
+        let _ = run_argv(&[
+            "systemctl".into(),
+            "disable".into(),
+            "--now".into(),
+            unit.clone(),
+        ]);
+        fs::remove_file(&persistent).map_err(|err| {
+            LvmOpError::new(
+                Kind::Internal,
+                format!("removing {}: {err}", persistent.display()),
+            )
+        })?;
+        run_argv(&["systemctl".into(), "daemon-reload".into()])?;
+    }
+    let runtime = Path::new(RUNTIME_UNIT_DIR).join(&unit);
+    if runtime.exists() {
+        let _ = run_argv(&["systemctl".into(), "stop".into(), unit]);
+        fs::remove_file(&runtime).map_err(|err| {
+            LvmOpError::new(
+                Kind::Internal,
+                format!("removing {}: {err}", runtime.display()),
+            )
+        })?;
+        run_argv(&["systemctl".into(), "daemon-reload".into()])?;
+    }
     Ok(())
 }
 
@@ -918,5 +969,11 @@ mod tests {
         assert!(unit.contains("What=/dev/vg_kcore/k8s-local\n"));
         assert!(unit.contains("Where=/var/lib/kcore/k8s\n"));
         assert!(unit.contains("Type=ext4\n"));
+    }
+
+    #[test]
+    fn read_only_systemd_dir_is_recognized() {
+        assert!(io_is_read_only(&std::io::Error::from_raw_os_error(EROFS)));
+        assert!(!io_is_read_only(&std::io::Error::from_raw_os_error(13)));
     }
 }
