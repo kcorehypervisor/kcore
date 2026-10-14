@@ -1471,6 +1471,10 @@ pub struct KubernetesNodeConfig {
     pub kubeconfig_data: String,
     /// Control-plane kubelets also register the worker role and stay schedulable.
     pub schedule_on_control_plane: bool,
+    /// Applied by the control plane after the API is ready. Empty skips it.
+    /// LVM mode leaves this empty: that mode creates a thin pool and does
+    /// not install a provisioner.
+    pub provisioner_manifest: String,
     /// Set for a cluster that shares the node with the primary one.
     /// The primary cluster keeps the module defaults and leaves this empty.
     pub instance: Option<KubernetesInstanceLayout>,
@@ -1616,6 +1620,13 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
         }
     }
 
+    if !k8s.provisioner_manifest.is_empty() {
+        out.push_str(&format!(
+            "    provisionerManifest = {};\n",
+            nix_multiline(&k8s.provisioner_manifest)
+        ));
+    }
+
     if !k8s.kubeconfig_data.is_empty() {
         out.push_str(&format!(
             "    kubeconfigData = ''{}'';\n",
@@ -1656,6 +1667,7 @@ mod kubernetes_tests {
             vip_interface: "enp6s0".to_string(),
             kubeconfig_data: String::new(),
             schedule_on_control_plane: true,
+            provisioner_manifest: String::new(),
             instance: None,
         };
 
@@ -1692,6 +1704,7 @@ mod kubernetes_tests {
             vip_interface: String::new(),
             kubeconfig_data: String::new(),
             schedule_on_control_plane: false,
+            provisioner_manifest: String::new(),
             instance: None,
         };
 
@@ -1767,6 +1780,7 @@ mod kubernetes_tests {
                 cilium_auto_direct_routes: true,
                 cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
                 schedule_on_control_plane: false,
+                provisioner_manifest: String::new(),
             },
         )
         .unwrap();
@@ -1838,6 +1852,7 @@ mod kubernetes_tests {
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
             schedule_on_control_plane: false,
+            provisioner_manifest: String::new(),
         };
         let extra = KubernetesRenderSettings {
             api_server_endpoint: "192.168.40.201:7443".to_string(),
@@ -1851,6 +1866,9 @@ mod kubernetes_tests {
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: vec![],
             schedule_on_control_plane: true,
+            provisioner_manifest:
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: local-path-config\n"
+                    .to_string(),
         };
         let nix = generate_colocated_kubernetes_config(&[
             KubernetesMemberRender {
@@ -1896,6 +1914,9 @@ mod kubernetes_tests {
         assert!(!extra.contains("ciliumMode"));
         assert!(!extra.contains("cni ="));
         assert!(extra.contains("scheduleOnControlPlane = true"));
+        assert!(extra.contains("provisionerManifest"));
+        assert!(extra.contains("name: local-path-config"));
+        assert!(!nix[..extra_at].contains("provisionerManifest"));
         assert!(nix.contains("node-105=https://192.168.40.105:3380"));
         assert!(nix.ends_with("  };\n}\n"));
         assert_eq!(
@@ -1919,6 +1940,7 @@ pub struct KubernetesRenderSettings {
     pub cilium_auto_direct_routes: bool,
     pub cilium_lb_ip_pools: Vec<String>,
     pub schedule_on_control_plane: bool,
+    pub provisioner_manifest: String,
 }
 
 /// Generate Kubernetes node configuration for a node in the cluster
@@ -2027,6 +2049,7 @@ pub fn generate_kubernetes_member(
         vip_interface: settings.vip_interface.clone(),
         kubeconfig_data: String::new(), // TODO: Include admin kubeconfig
         schedule_on_control_plane: settings.schedule_on_control_plane,
+        provisioner_manifest: settings.provisioner_manifest.clone(),
         instance: layout,
     };
 

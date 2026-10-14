@@ -282,6 +282,7 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `docs/kctl-commands-and-workflows.md` — CLI usage manual; command syntax, examples, and operational playbooks.
 - `docs/images.md` — image workflow guide; upload/pull/create/wait paths with constraints and troubleshooting.
 - `docs/storage.md` — storage backend deep dive; includes command examples, generated config shape, and implementation file mapping.
+- `docs/kubernetes-volumes.md` — Kubernetes claim options: local-path on a kcore volume, and a CSI the operator installs.
 - `docs/node-install-bootstrap-flow.md` — bootstrap sequence doc; details install-to-disk flow and certificate handoff lifecycle.
 - `docs/nix-vm-config-generation.md` — config generation internals; explains how DB state is transformed into node-applied Nix.
 - `docs/mtls-bootstrap-and-auth.md` — certificate lifecycle guide; bootstrapping, cert roles, and auth usage in runtime calls.

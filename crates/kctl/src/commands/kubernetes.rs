@@ -116,7 +116,7 @@ struct ManifestLocalProvisioner {
     enabled: bool,
     #[serde(default)]
     storage_class_name: String,
-    /// "shared" (directories on one formatted volume) or "lvm" (TopoLVM thin pool).
+    /// "shared" (directories on one formatted volume) or "lvm" (thin pool, no provisioner).
     #[serde(default)]
     mode: String,
     #[serde(default)]

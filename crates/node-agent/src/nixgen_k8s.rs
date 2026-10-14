@@ -147,6 +147,28 @@ pub fn ensure_nixos_imports(config: &str, imports: &[&str]) -> String {
     out
 }
 
+/// Hand-written `kcore-*-runtime.nix` files predate `additionalClusters`.
+/// They define the same systemd units as the module, so nixos-rebuild
+/// refuses to evaluate until the import is gone. The file itself stays
+/// on disk.
+pub fn drop_legacy_kubernetes_runtime_imports(config: &str) -> String {
+    let mut out = String::with_capacity(config.len());
+    for line in config.split_inclusive('\n') {
+        let trimmed = line.trim().trim_end_matches(',');
+        if is_legacy_kubernetes_runtime_import(trimmed) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn is_legacy_kubernetes_runtime_import(trimmed: &str) -> bool {
+    let path = trimmed.trim_matches(|c| c == '"' || c == '\'');
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.starts_with("kcore-") && name.ends_with("-runtime.nix")
+}
+
 /// Install the Kubernetes module and make configuration.nix import it and the
 /// generated values file. Without both imports, nixos-rebuild ignores the
 /// certificates the controller writes.
@@ -158,8 +180,9 @@ pub fn install_kubernetes_module_sources() -> std::io::Result<()> {
     )?;
     let config_path = "/etc/nixos/configuration.nix";
     let config = std::fs::read_to_string(config_path)?;
+    let without_legacy = drop_legacy_kubernetes_runtime_imports(&config);
     let updated = ensure_nixos_imports(
-        &config,
+        &without_legacy,
         &["./modules/kcore-kubernetes.nix", "./kcore-kubernetes.nix"],
     );
     if updated != config {
@@ -192,5 +215,23 @@ mod tests {
         let module_at = once.find("./modules/kcore-kubernetes.nix").unwrap();
         let values_at = once.find("\n    ./kcore-kubernetes.nix").unwrap();
         assert!(module_at < values_at);
+    }
+
+    #[test]
+    fn legacy_runtime_import_is_removed_and_module_imports_stay() {
+        let config = "{\n  imports = [\n    ./hardware-configuration.nix\n    ./modules/kcore-kubernetes.nix\n    ./kcore-kubernetes.nix\n    ./kcore-b-runtime.nix\n  ];\n}\n";
+        let once = drop_legacy_kubernetes_runtime_imports(config);
+        let twice = drop_legacy_kubernetes_runtime_imports(&once);
+        assert_eq!(once, twice);
+        assert!(!once.contains("kcore-b-runtime.nix"));
+        assert!(configuration_imports_path(
+            &once,
+            "./modules/kcore-kubernetes.nix"
+        ));
+        assert!(configuration_imports_path(&once, "./kcore-kubernetes.nix"));
+        assert!(configuration_imports_path(
+            &once,
+            "./hardware-configuration.nix"
+        ));
     }
 }
