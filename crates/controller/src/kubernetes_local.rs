@@ -251,6 +251,14 @@ pub fn controller_volume_name(cluster: &str, node: &str, volume: &str) -> String
 }
 
 pub fn manifests(provisioner: &LocalProvisioner) -> String {
+    manifests_at(provisioner, "")
+}
+
+/// `api_server_endpoint` is `host:port` of this cluster's API. An extra
+/// cluster has no kube-proxy: Cilium on the primary host already owns
+/// service dispatch. The provisioner then uses the host network and that
+/// endpoint instead of the ClusterIP, which nothing on the bridge answers.
+pub fn manifests_at(provisioner: &LocalProvisioner, api_server_endpoint: &str) -> String {
     if !provisioner.enabled {
         return String::new();
     }
@@ -278,6 +286,7 @@ pub fn manifests(provisioner: &LocalProvisioner) -> String {
             "        {{\"node\":\"{node}\",\"paths\":[{joined}]}}"
         ));
     }
+    let (host_net, api_env) = provisioner_api_access(api_server_endpoint);
     format!(
         r#"apiVersion: v1
 kind: Namespace
@@ -378,7 +387,7 @@ spec:
       labels:
         app: local-path-provisioner
     spec:
-      serviceAccountName: local-path-provisioner-service-account
+{host_net}      serviceAccountName: local-path-provisioner-service-account
       containers:
         - name: local-path-provisioner
           image: rancher/local-path-provisioner:v0.0.30
@@ -389,7 +398,7 @@ spec:
             - --config
             - /etc/config/config.json
           env:
-            - name: POD_NAMESPACE
+{api_env}            - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
@@ -403,7 +412,29 @@ spec:
           configMap:
             name: local-path-config
 "#,
-        class_name = provisioner.storage_class_name
+        class_name = provisioner.storage_class_name,
+        host_net = host_net,
+        api_env = api_env,
+    )
+}
+
+fn provisioner_api_access(endpoint: &str) -> (String, String) {
+    let Some((host, port)) = endpoint.trim().rsplit_once(':') else {
+        return (String::new(), String::new());
+    };
+    if host.is_empty()
+        || !port.chars().all(|c| c.is_ascii_digit())
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return (String::new(), String::new());
+    }
+    (
+        "      hostNetwork: true\n      dnsPolicy: ClusterFirstWithHostNet\n".to_string(),
+        format!(
+            "            - name: KUBERNETES_SERVICE_HOST\n              value: \"{host}\"\n            - name: KUBERNETES_SERVICE_PORT\n              value: \"{port}\"\n"
+        ),
     )
 }
 
@@ -602,6 +633,12 @@ mod tests {
             "/mnt/kcore/lab/kcore-kdata"
         );
         let yaml = manifests(&provisioner);
+        assert!(!yaml.contains("hostNetwork"));
+        let reached = manifests_at(&provisioner, "192.168.40.201:7443");
+        assert!(reached.contains("hostNetwork: true"));
+        assert!(reached.contains("value: \"192.168.40.201\""));
+        assert!(reached.contains("value: \"7443\""));
+        assert!(!manifests_at(&provisioner, "not a url").contains("hostNetwork"));
         assert!(yaml.contains("kind: StorageClass"));
         assert!(yaml.contains("name: local-path"));
         assert!(yaml.contains("rancher.io/local-path"));
