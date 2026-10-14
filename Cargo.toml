@@ -3,6 +3,7 @@ members = [
     "crates/kcore-gpu",
     "crates/kcore-sanitize",
     "crates/kcore-disko-types",
+    "crates/kcore-verification",
     "crates/kcore-disk-layout-yaml",
     "crates/kcore-console",
     "crates/kcore-disk-verify",
