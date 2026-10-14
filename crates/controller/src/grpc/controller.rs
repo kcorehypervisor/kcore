@@ -6760,6 +6760,30 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map(|n| (n.id, n.address))
             .collect::<std::collections::HashMap<_, _>>();
 
+        // Dial missing nodes together. Sequential connects used to add a full
+        // TCP timeout for every unreachable host before the page could render.
+        let mut missing_addresses = Vec::new();
+        let mut seen_addresses = HashSet::new();
+        for vm in &rows {
+            if let Some(node_address) = node_address_by_id.get(&vm.node_id) {
+                if self.clients.get_compute(node_address).is_none()
+                    && seen_addresses.insert(node_address.clone())
+                {
+                    missing_addresses.push(node_address.clone());
+                }
+            }
+        }
+        let mut connects = tokio::task::JoinSet::new();
+        for address in missing_addresses {
+            let clients = self.clients.clone();
+            connects.spawn(async move {
+                if let Err(err) = clients.connect(&address).await {
+                    warn!(address = %address, error = %err, "failed to refresh node compute client");
+                }
+            });
+        }
+        while connects.join_next().await.is_some() {}
+
         let vm_count = rows.len();
         let mut fallback_states: Vec<i32> = Vec::with_capacity(vm_count);
         let mut set = tokio::task::JoinSet::new();
@@ -6767,11 +6791,6 @@ impl controller_proto::controller_server::Controller for ControllerService {
         for (idx, vm) in rows.iter().enumerate() {
             fallback_states.push(state_fallback_without_runtime(vm.auto_start));
             if let Some(node_address) = node_address_by_id.get(&vm.node_id) {
-                if self.clients.get_compute(node_address).is_none() {
-                    if let Err(err) = self.clients.connect(node_address).await {
-                        warn!(address = %node_address, error = %err, "failed to refresh node compute client");
-                    }
-                }
                 if let Some(mut compute) = self.clients.get_compute(node_address) {
                     let vm_name = vm.name.clone();
                     let node_id = vm.node_id.clone();
@@ -10300,6 +10319,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         let mut nodes = Vec::with_capacity(approved.len());
         for node in &approved {
+            if node.status != "ready" {
+                nodes.push(controller_proto::NodeNetworkInfo {
+                    node_id: node.id.clone(),
+                    hostname: node.hostname.clone(),
+                    address: node.address.clone(),
+                    gateway_interface: node.gateway_interface.clone(),
+                    disable_vxlan: node.disable_vxlan,
+                    interfaces: Vec::new(),
+                });
+                continue;
+            }
             let interfaces = match self.ensure_admin_client_for_node(node).await {
                 Ok(mut admin) => {
                     match admin
@@ -10392,6 +10422,22 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut total_block_devices: i32 = 0;
 
         for node in &approved {
+            if node.status != "ready" {
+                nodes_out.push(controller_proto::NodeStorageOverview {
+                    node_id: node.id.clone(),
+                    hostname: node.hostname.clone(),
+                    address: node.address.clone(),
+                    storage_backend: storage_backend_to_proto(&node.storage_backend),
+                    luks_method: node.luks_method.clone(),
+                    disk_inventory_ok: false,
+                    disks: Vec::new(),
+                    lvm_inventory_ok: false,
+                    lvm_volume_groups: Vec::new(),
+                    lvm_logical_volumes: Vec::new(),
+                    lvm_physical_volumes: Vec::new(),
+                });
+                continue;
+            }
             let (
                 disks,
                 disk_inventory_ok,
