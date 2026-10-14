@@ -13917,7 +13917,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let rendered_nix_preview = match local.as_ref().filter(|provisioner| provisioner.enabled) {
             Some(provisioner) => format!(
                 "# Kubernetes configuration will be generated\n{}",
-                crate::kubernetes_local::manifests(provisioner)
+                crate::kubernetes_local::manifests_at(provisioner, &spec.api_server_endpoint)
             ),
             None => "# Kubernetes configuration will be generated".to_string(),
         };
@@ -13975,7 +13975,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             service_cidr: spec.service_cidr.clone(),
             cluster_dns: spec.cluster_dns.clone(),
             api_server_endpoint: spec.api_server_endpoint.clone(),
-            cni: spec.cni.clone(),
+            cni: stored_cni(&spec.api_server_endpoint, &spec.cni),
             phase: "bootstrapping".to_string(),
             status_message: "cluster creation started".to_string(),
             ready_control_planes: 0,
@@ -14086,7 +14086,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             service_cidr: spec.service_cidr.clone(),
             cluster_dns: spec.cluster_dns.clone(),
             api_server_endpoint: spec.api_server_endpoint.clone(),
-            cni: spec.cni.clone(),
+            cni: stored_cni(&spec.api_server_endpoint, &spec.cni),
             phase: "updating".to_string(),
             status_message: "cluster update in progress".to_string(),
             ready_control_planes: existing.ready_control_planes,
@@ -14102,25 +14102,50 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.db
             .upsert_kubernetes_cluster_config(&config_row)
             .map_err(internal_db)?;
-        if let Err(err) = self
+        let volume_error = match self
             .reconcile_local_volumes(&actor, &req.name, &provisioner)
             .await
         {
-            warn!(
-                cluster = %req.name,
-                error = %err,
-                "local volumes were not reconciled"
-            );
+            Ok(()) => None,
+            Err(err) => {
+                warn!(
+                    cluster = %req.name,
+                    error = %err,
+                    "local volumes were not reconciled"
+                );
+                Some(err.message().to_string())
+            }
+        };
+        // A config change has to reach the nodes. Leaving it in the database
+        // is how a cgroup, VIP, or provisioner fix stayed off the machines.
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let deploy_error = match orchestrator
+            .redeploy_node_certificates(
+                &req.name,
+                &cluster_row.api_server_endpoint,
+                &cluster_row.service_cidr,
+            )
+            .await
+        {
+            Ok(()) => None,
+            Err(err) => {
+                warn!(
+                    cluster = %req.name,
+                    error = %err,
+                    "kubernetes node configuration was not deployed"
+                );
+                Some(format!("{err:#}"))
+            }
+        };
+        if let Some(message) = deploy_error.or(volume_error) {
             cluster_row.phase = "degraded".to_string();
-            cluster_row.status_message = err.message().to_string();
-            self.db
-                .upsert_kubernetes_cluster(&cluster_row)
-                .map_err(internal_db)?;
+            cluster_row.status_message = message;
         } else {
-            // Update only persists config. A ready cluster must stay ready:
-            // the orchestrator rebuilds bootstrapping on the next start.
-            // A degraded cluster is the previous attempt's failure; this
-            // attempt reconciled, so it is ready again.
+            // A ready cluster stays ready. A degraded cluster is the previous
+            // attempt's failure; this attempt deployed, so it is ready again.
             let recovered = matches!(existing.phase.as_str(), "updating" | "degraded");
             cluster_row.phase = if recovered {
                 "ready".to_string()
@@ -14128,16 +14153,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 existing.phase.clone()
             };
             cluster_row.status_message = if spec.schedule_on_control_plane {
-                "control-plane nodes accept workloads".to_string()
+                "control-plane nodes accept workloads; node configuration deployed".to_string()
             } else if recovered {
-                "cluster configuration updated".to_string()
+                "cluster configuration deployed".to_string()
             } else {
-                existing.status_message.clone()
+                format!("{}; node configuration deployed", existing.status_message)
             };
-            self.db
-                .upsert_kubernetes_cluster(&cluster_row)
-                .map_err(internal_db)?;
         }
+        self.db
+            .upsert_kubernetes_cluster(&cluster_row)
+            .map_err(internal_db)?;
 
         let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
         Ok(Response::new(
@@ -14878,6 +14903,21 @@ impl ControllerService {
                 active_node_ids: vec![],
             }),
         })
+    }
+}
+
+/// The primary API keeps the requested CNI. Every other cluster on the same
+/// nodes uses the bridge CNI; a second Cilium agent would share BPF pins.
+fn stored_cni(api_endpoint: &str, requested: &str) -> String {
+    if crate::nixgen::kubernetes_listen_ports(api_endpoint).api_server == 6443 {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            "cilium".to_string()
+        } else {
+            requested.to_string()
+        }
+    } else {
+        "bridge".to_string()
     }
 }
 

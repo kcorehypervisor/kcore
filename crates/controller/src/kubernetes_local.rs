@@ -4,10 +4,8 @@
 //! rendered manifest is a Rancher local-path provisioner, so many claims
 //! become directories on that one filesystem.
 //!
-//! `lvm` mode creates an LVM thin pool of the declared size. The rendered
-//! manifest is a TopoLVM device class: each claim is its own thin logical
-//! volume, formatted with the declared filesystem, and many claims share the
-//! pool.
+//! `lvm` mode creates an LVM thin pool of the declared size and renders no
+//! provisioner. kcore does not install a CSI driver for that pool.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -251,11 +249,19 @@ pub fn controller_volume_name(cluster: &str, node: &str, volume: &str) -> String
 }
 
 pub fn manifests(provisioner: &LocalProvisioner) -> String {
+    manifests_at(provisioner, "")
+}
+
+/// `api_server_endpoint` is `host:port` of this cluster's API. An extra
+/// cluster has no kube-proxy: Cilium on the primary host already owns
+/// service dispatch. The provisioner then uses the host network and that
+/// endpoint instead of the ClusterIP, which nothing on the bridge answers.
+pub fn manifests_at(provisioner: &LocalProvisioner, api_server_endpoint: &str) -> String {
     if !provisioner.enabled {
         return String::new();
     }
     if provisioner.is_lvm() {
-        return lvm_manifests(provisioner);
+        return String::new();
     }
     let mut by_node: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for volume in &provisioner.volumes {
@@ -278,6 +284,7 @@ pub fn manifests(provisioner: &LocalProvisioner) -> String {
             "        {{\"node\":\"{node}\",\"paths\":[{joined}]}}"
         ));
     }
+    let (host_net, api_env) = provisioner_api_access(api_server_endpoint);
     format!(
         r#"apiVersion: v1
 kind: Namespace
@@ -378,7 +385,7 @@ spec:
       labels:
         app: local-path-provisioner
     spec:
-      serviceAccountName: local-path-provisioner-service-account
+{host_net}      serviceAccountName: local-path-provisioner-service-account
       containers:
         - name: local-path-provisioner
           image: rancher/local-path-provisioner:v0.0.30
@@ -389,7 +396,7 @@ spec:
             - --config
             - /etc/config/config.json
           env:
-            - name: POD_NAMESPACE
+{api_env}            - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
@@ -403,67 +410,29 @@ spec:
           configMap:
             name: local-path-config
 "#,
-        class_name = provisioner.storage_class_name
+        class_name = provisioner.storage_class_name,
+        host_net = host_net,
+        api_env = api_env,
     )
 }
 
-fn lvm_manifests(provisioner: &LocalProvisioner) -> String {
-    let Some(pool) = provisioner.volumes.first() else {
-        return String::new();
+fn provisioner_api_access(endpoint: &str) -> (String, String) {
+    let Some((host, port)) = endpoint.trim().rsplit_once(':') else {
+        return (String::new(), String::new());
     };
-    let nodes = provisioner
-        .volumes
-        .iter()
-        .map(|volume| volume.node_id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        r#"# TopoLVM device class. Each PersistentVolumeClaim becomes its own thin
-# logical volume in pool {pool_name} ({size} bytes) on volume group {vg}.
-# TopoLVM formats that volume as {fs}. Many claims share the pool.
-# Create the pool on: {nodes}
-# Install TopoLVM chart 17.3.0 (app 0.42.0, image
-# ghcr.io/topolvm/topolvm-with-sidecar:0.42.0) with this lvmd config.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: topolvm-system
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: lvmd
-  namespace: topolvm-system
-data:
-  lvmd.yaml: |
-    socket-name: /run/topolvm/lvmd.sock
-    device-classes:
-      - name: {class_name}
-        volume-group: {vg}
-        type: thin
-        thin-pool:
-          name: {pool_name}
-          overprovision-ratio: 1.0
-        default: true
----
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: {class_name}
-provisioner: topolvm.io
-parameters:
-  topolvm.io/device-class: {class_name}
-  csi.storage.k8s.io/fstype: {fs}
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
-reclaimPolicy: Delete
-"#,
-        pool_name = pool.name,
-        size = pool.size_bytes,
-        vg = pool.volume_group,
-        fs = pool.fs_type,
-        nodes = nodes,
-        class_name = provisioner.storage_class_name,
+    if host.is_empty()
+        || !port.chars().all(|c| c.is_ascii_digit())
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return (String::new(), String::new());
+    }
+    (
+        "      hostNetwork: true\n      dnsPolicy: ClusterFirstWithHostNet\n".to_string(),
+        format!(
+            "            - name: KUBERNETES_SERVICE_HOST\n              value: \"{host}\"\n            - name: KUBERNETES_SERVICE_PORT\n              value: \"{port}\"\n"
+        ),
     )
 }
 
@@ -602,6 +571,12 @@ mod tests {
             "/mnt/kcore/lab/kcore-kdata"
         );
         let yaml = manifests(&provisioner);
+        assert!(!yaml.contains("hostNetwork"));
+        let reached = manifests_at(&provisioner, "192.168.40.201:7443");
+        assert!(reached.contains("hostNetwork: true"));
+        assert!(reached.contains("value: \"192.168.40.201\""));
+        assert!(reached.contains("value: \"7443\""));
+        assert!(!manifests_at(&provisioner, "not a url").contains("hostNetwork"));
         assert!(yaml.contains("kind: StorageClass"));
         assert!(yaml.contains("name: local-path"));
         assert!(yaml.contains("rancher.io/local-path"));
@@ -678,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn lvm_mode_shares_one_thin_pool_and_formats_each_claim() {
+    fn lvm_mode_creates_one_thin_pool_and_installs_no_provisioner() {
         let size = 50 * 1024 * 1024 * 1024;
         let provisioner = normalize(
             "lab",
@@ -707,13 +682,7 @@ mod tests {
             .iter()
             .all(|volume| volume.fs_type == "ext4"));
         let yaml = manifests(&provisioner);
-        assert!(yaml.contains("provisioner: topolvm.io"));
-        assert!(yaml.contains("type: thin"));
-        assert!(yaml.contains("name: kcore-kdata"));
-        assert!(yaml.contains("volume-group: vg_kcore"));
-        assert!(yaml.contains("csi.storage.k8s.io/fstype: ext4"));
-        assert!(yaml.contains("allowVolumeExpansion: true"));
-        assert!(!yaml.contains("rancher.io/local-path"));
+        assert!(yaml.is_empty());
         let stored = decode(&encode(&provisioner)).unwrap();
         assert_eq!(stored, provisioner);
 

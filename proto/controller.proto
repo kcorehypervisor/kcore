@@ -2571,8 +2571,8 @@ message KubernetesHostVolume {
   string mount_path = 6;      // empty means /mnt/kcore/<cluster>/<name>
   // "filesystem" (default): format and mount this volume. Many
   // PersistentVolumeClaims are directories on that one filesystem.
-  // "pool": an LVM thin pool of size_bytes. Each claim is its own thin
-  // logical volume, formatted with fs_type. Many claims share the pool.
+  // "pool": an LVM thin pool of size_bytes. kcore creates the pool and
+  // does not carve claims from it.
   string role = 7;
   // Volume group that holds a pool. Required when role is "pool".
   string volume_group = 8;
@@ -2581,8 +2581,8 @@ message KubernetesHostVolume {
 // Host storage for PersistentVolumeClaims.
 // mode "shared" (default) is the Rancher local-path provisioner: claims are
 // directories on a formatted volume.
-// mode "lvm" is a TopoLVM device class: claims are thin logical volumes in
-// the declared pool, each formatted with the volume fs_type.
+// mode "lvm" creates one LVM thin pool on each declared node and does not
+// install a volume provisioner.
 message KubernetesLocalProvisioner {
   bool enabled = 1;
   string storage_class_name = 2; // empty means "local-path"

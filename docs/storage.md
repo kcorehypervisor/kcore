@@ -17,6 +17,8 @@ For **kcore SAN** (shared Ceph / RBD), see:
 - `docs/ceph.md` — fabric + RBD integration
 - `docs/vm-migration.md` — cold drain and Cloud Hypervisor live migration
 
+Kubernetes claims on a node-local volume are a separate path from VM disks. See [kubernetes-volumes.md](./kubernetes-volumes.md).
+
 Operator guides on the product site:
 
 - [kcore SAN (Ceph)](https://kcorehypervisor.com/docs/user/storage-vsan.html)

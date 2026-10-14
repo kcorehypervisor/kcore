@@ -4036,8 +4036,13 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             ("NotReady".to_string(), 0)
         };
 
-        // Check Cilium (would be a pod, but we'll check via systemd for now)
-        let cilium_node_active = kubelet_active; // Simplified
+        // Cilium is a pod on the primary cluster. A running kubelet does not
+        // mean that pod is up, and an extra cluster does not run Cilium.
+        let cilium_node_active = if kubelet_active {
+            Self::cilium_pod_running().await
+        } else {
+            false
+        };
 
         Ok(Response::new(proto::GetKubernetesStatusResponse {
             enabled: true,
@@ -4268,6 +4273,39 @@ impl AdminService {
             .await
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    async fn cilium_pod_running() -> bool {
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.to_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        if hostname.is_empty() {
+            return false;
+        }
+        let output = tokio::process::Command::new("kubectl")
+            .args([
+                "--kubeconfig",
+                "/etc/kubernetes/admin.conf",
+                "get",
+                "pods",
+                "-n",
+                "kube-system",
+                "-l",
+                "k8s-app=cilium",
+                "--field-selector",
+                &format!("spec.nodeName={hostname},status.phase=Running"),
+                "-o",
+                "name",
+            ])
+            .output()
+            .await;
+        match output {
+            Ok(output) if output.status.success() => {
+                !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            }
+            _ => false,
+        }
     }
 
     async fn get_k8s_node_status() -> (String, i32) {
