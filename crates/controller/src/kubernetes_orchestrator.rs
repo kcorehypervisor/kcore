@@ -966,8 +966,8 @@ struct RenderedNodeNix {
     cluster_count: usize,
 }
 
-/// Shared mode is applied on the cluster. LVM mode only previews TopoLVM;
-/// applying that StorageClass with no driver would leave claims pending.
+/// Shared mode is applied on the cluster. LVM mode creates a thin pool and
+/// does not install a provisioner.
 fn applied_provisioner_manifest(json: &str, api_server_endpoint: &str) -> String {
     let provisioner = crate::kubernetes_local::decode(json)
         .unwrap_or_else(|_| crate::kubernetes_local::LocalProvisioner::disabled());
