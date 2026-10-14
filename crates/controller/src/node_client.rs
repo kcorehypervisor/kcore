@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
@@ -21,6 +22,9 @@ pub struct TlsClientConfig {
 
 type ClientTuple = (ComputeClient, AdminClient, ContainerClient, StorageClient);
 
+/// How long a new node dial may block. Live LAN nodes connect well inside this.
+const NODE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+
 #[derive(Clone)]
 pub struct NodeClients {
     clients: Arc<Mutex<HashMap<String, ClientTuple>>>,
@@ -36,6 +40,9 @@ impl NodeClients {
     }
 
     pub async fn connect(&self, address: &str) -> Result<()> {
+        // Unreachable nodes must not stall dashboard pages. TCP's default
+        // retransmit wait is several seconds, and overviews used to pay it
+        // once per node.
         let channel = if let Some(tls_cfg) = &self.tls {
             let endpoint = format!("https://{address}");
             let ca_pem = std::fs::read_to_string(&tls_cfg.ca_file)?;
@@ -45,12 +52,16 @@ impl NodeClients {
                 .ca_certificate(Certificate::from_pem(ca_pem))
                 .identity(Identity::from_pem(cert_pem, key_pem));
             Channel::from_shared(endpoint)?
+                .connect_timeout(NODE_CONNECT_TIMEOUT)
                 .tls_config(tls)?
                 .connect()
                 .await?
         } else {
             let endpoint = format!("http://{address}");
-            Channel::from_shared(endpoint)?.connect().await?
+            Channel::from_shared(endpoint)?
+                .connect_timeout(NODE_CONNECT_TIMEOUT)
+                .connect()
+                .await?
         };
         let compute = ComputeClient::new(channel.clone());
         let admin = AdminClient::new(channel.clone());
