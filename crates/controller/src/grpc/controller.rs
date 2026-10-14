@@ -13917,7 +13917,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let rendered_nix_preview = match local.as_ref().filter(|provisioner| provisioner.enabled) {
             Some(provisioner) => format!(
                 "# Kubernetes configuration will be generated\n{}",
-                crate::kubernetes_local::manifests(provisioner)
+                crate::kubernetes_local::manifests_at(provisioner, &spec.api_server_endpoint)
             ),
             None => "# Kubernetes configuration will be generated".to_string(),
         };

@@ -573,7 +573,10 @@ impl KubernetesOrchestrator {
                     .map(|pool| pool.to_string())
                     .collect(),
                 schedule_on_control_plane: cfg.schedule_on_control_plane,
-                provisioner_manifest: applied_provisioner_manifest(&cfg.local_provisioner_json),
+                provisioner_manifest: applied_provisioner_manifest(
+                    &cfg.local_provisioner_json,
+                    &cluster.api_server_endpoint,
+                ),
             };
             let ports = crate::nixgen::kubernetes_listen_ports(&settings.api_server_endpoint);
             if ports.api_server == 6443 {
@@ -965,13 +968,13 @@ struct RenderedNodeNix {
 
 /// Shared mode is applied on the cluster. LVM mode only previews TopoLVM;
 /// applying that StorageClass with no driver would leave claims pending.
-fn applied_provisioner_manifest(json: &str) -> String {
+fn applied_provisioner_manifest(json: &str, api_server_endpoint: &str) -> String {
     let provisioner = crate::kubernetes_local::decode(json)
         .unwrap_or_else(|_| crate::kubernetes_local::LocalProvisioner::disabled());
     if !provisioner.enabled || provisioner.is_lvm() {
         String::new()
     } else {
-        crate::kubernetes_local::manifests(&provisioner)
+        crate::kubernetes_local::manifests_at(&provisioner, api_server_endpoint)
     }
 }
 

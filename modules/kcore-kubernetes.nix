@@ -1122,6 +1122,10 @@ in
         "net.ipv4.ip_forward" = lib.mkDefault 1;
         "net.ipv4.conf.all.forwarding" = 1;
         "net.ipv6.conf.all.forwarding" = 1;
+        # The kernel default of 128 inotify instances is already used by one
+        # kubelet plus the VMs on this host. A second kubelet then exits in
+        # cAdvisor with "too many open files" and never joins.
+        "fs.inotify.max_user_instances" = 1024;
       };
 
       environment.systemPackages =
