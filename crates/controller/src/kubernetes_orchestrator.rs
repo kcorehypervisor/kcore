@@ -384,7 +384,7 @@ impl KubernetesOrchestrator {
     /// Cluster create used to mark the cluster ready from a second bootstrap
     /// that never embedded certificates. A controller restart then ignored the
     /// cluster because the orchestrator only selects phase `bootstrapping`.
-    async fn redeploy_node_certificates(
+    pub async fn redeploy_node_certificates(
         &self,
         cluster_name: &str,
         api_endpoint: &str,
@@ -573,6 +573,7 @@ impl KubernetesOrchestrator {
                     .map(|pool| pool.to_string())
                     .collect(),
                 schedule_on_control_plane: cfg.schedule_on_control_plane,
+                provisioner_manifest: applied_provisioner_manifest(&cfg.local_provisioner_json),
             };
             let ports = crate::nixgen::kubernetes_listen_ports(&settings.api_server_endpoint);
             if ports.api_server == 6443 {
@@ -769,7 +770,10 @@ impl KubernetesOrchestrator {
         let Some(cluster) = self.db.get_kubernetes_cluster(cluster_name)? else {
             return Ok(());
         };
-        if cluster.phase == "ready" || cluster.phase == "bootstrapping" {
+        if matches!(
+            cluster.phase.as_str(),
+            "ready" | "bootstrapping" | "updating"
+        ) {
             return Ok(());
         }
         let need = self.control_plane_quorum(cluster_name).await?;
@@ -957,6 +961,18 @@ struct RenderedNodeNix {
     nix: String,
     primary_kubeconfig: String,
     cluster_count: usize,
+}
+
+/// Shared mode is applied on the cluster. LVM mode only previews TopoLVM;
+/// applying that StorageClass with no driver would leave claims pending.
+fn applied_provisioner_manifest(json: &str) -> String {
+    let provisioner = crate::kubernetes_local::decode(json)
+        .unwrap_or_else(|_| crate::kubernetes_local::LocalProvisioner::disabled());
+    if !provisioner.enabled || provisioner.is_lvm() {
+        String::new()
+    } else {
+        crate::kubernetes_local::manifests(&provisioner)
+    }
 }
 
 struct OwnedMember {
