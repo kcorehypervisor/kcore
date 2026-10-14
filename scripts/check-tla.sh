@@ -36,4 +36,13 @@ run_tlc "CrossDcReplication.tla" "CrossDcReplication.cfg"
 run_tlc "DiskLayoutReconcile.tla" "DiskLayoutReconcile.cfg"
 popd >/dev/null
 
+# Design model imported beside the product specs. Same module names, different
+# directory, so TLC does not mix the two ControllerNodeReconcile models.
+pushd "${SPEC_DIR}/model" >/dev/null
+run_tlc "CompensationExecutor.tla" "CompensationExecutor.cfg"
+run_tlc "ReplicationReservations.tla" "ReplicationReservations.cfg"
+run_tlc "ControllerNodeReconcile.tla" "ControllerNodeReconcile.cfg"
+run_tlc "DiskLayoutReconcile.tla" "DiskLayoutReconcile.cfg"
+popd >/dev/null
+
 echo "TLA+ model checks passed."

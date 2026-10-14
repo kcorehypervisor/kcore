@@ -1,0 +1,16 @@
+[package]
+name = "kcore-verification"
+version = "0.3.0"
+edition = "2021"
+description = "Design model for path checks, placement, replication, and compensation. Property tests live here. They do not prove the product functions."
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1.11"
+
+[lints]
+workspace = true
