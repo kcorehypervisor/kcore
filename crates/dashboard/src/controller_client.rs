@@ -326,6 +326,328 @@ pub async fn list_audit_events(
     Ok(resp.into_inner().events)
 }
 
+async fn controller(
+    cfg: &DashboardConfig,
+) -> Result<controller_proto::controller_client::ControllerClient<Channel>> {
+    let channel = connect_channel(cfg).await?;
+    Ok(controller_proto::controller_client::ControllerClient::new(
+        channel,
+    ))
+}
+
+pub async fn get_vm(cfg: &DashboardConfig, name: &str) -> Result<controller_proto::GetVmResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_vm(controller_proto::GetVmRequest {
+            vm_id: name.to_string(),
+            target_node: String::new(),
+        })
+        .await
+        .with_context(|| format!("GetVm RPC for '{name}'"))?;
+    Ok(resp.into_inner())
+}
+
+pub async fn get_live_migrate_receive_status(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::GetLiveMigrateReceiveStatusResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_live_migrate_receive_status(controller_proto::GetLiveMigrateReceiveStatusRequest {
+            vm_id: name.to_string(),
+            node_id: String::new(),
+        })
+        .await
+        .with_context(|| format!("GetLiveMigrateReceiveStatus RPC for '{name}'"))?;
+    Ok(resp.into_inner())
+}
+
+pub async fn get_volume(cfg: &DashboardConfig, name: &str) -> Result<controller_proto::VolumeInfo> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_volume(controller_proto::GetVolumeRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetVolume RPC for '{name}'"))?;
+    resp.into_inner()
+        .volume
+        .with_context(|| format!("volume '{name}' not found"))
+}
+
+pub async fn list_volume_snapshots(
+    cfg: &DashboardConfig,
+    volume: &str,
+) -> Result<Vec<controller_proto::VolumeSnapshotInfo>> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .list_volume_snapshots(controller_proto::ListVolumeSnapshotsRequest {
+            volume: volume.to_string(),
+        })
+        .await
+        .context("ListVolumeSnapshots RPC")?;
+    Ok(resp.into_inner().snapshots)
+}
+
+pub async fn list_snapshot_policies(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::SnapshotPolicy>> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .list_snapshot_policies(controller_proto::ListSnapshotPoliciesRequest {})
+        .await
+        .context("ListSnapshotPolicies RPC")?;
+    Ok(resp.into_inner().policies)
+}
+
+pub async fn get_snapshot_policy(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::SnapshotPolicy> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_snapshot_policy(controller_proto::GetSnapshotPolicyRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetSnapshotPolicy RPC for '{name}'"))?;
+    resp.into_inner()
+        .policy
+        .with_context(|| format!("snapshot policy '{name}' not found"))
+}
+
+pub async fn get_shared_filesystem(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::SharedFilesystem> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_shared_filesystem(controller_proto::GetSharedFilesystemRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetSharedFilesystem RPC for '{name}'"))?;
+    resp.into_inner()
+        .shared_filesystem
+        .with_context(|| format!("shared filesystem '{name}' not found"))
+}
+
+pub async fn get_object_store(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::ObjectStore> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_object_store(controller_proto::GetObjectStoreRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetObjectStore RPC for '{name}'"))?;
+    resp.into_inner()
+        .object_store
+        .with_context(|| format!("object store '{name}' not found"))
+}
+
+pub async fn get_vm_operation(
+    cfg: &DashboardConfig,
+    id: &str,
+) -> Result<controller_proto::VmOperation> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_vm_operation(controller_proto::GetVmOperationRequest { id: id.to_string() })
+        .await
+        .with_context(|| format!("GetVmOperation RPC for '{id}'"))?;
+    resp.into_inner()
+        .operation
+        .with_context(|| format!("operation '{id}' not found"))
+}
+
+pub async fn list_nodes(cfg: &DashboardConfig) -> Result<Vec<controller_proto::NodeInfo>> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .list_nodes(controller_proto::ListNodesRequest {})
+        .await
+        .context("ListNodes RPC")?;
+    Ok(resp.into_inner().nodes)
+}
+
+pub async fn get_node(cfg: &DashboardConfig, id: &str) -> Result<controller_proto::NodeInfo> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_node(controller_proto::GetNodeRequest {
+            node_id: id.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetNode RPC for '{id}'"))?;
+    resp.into_inner()
+        .node
+        .with_context(|| format!("node '{id}' not found"))
+}
+
+pub async fn list_pci_devices(
+    cfg: &DashboardConfig,
+    node_id: &str,
+) -> Result<Vec<controller_proto::GpuInfo>> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .list_pci_devices(controller_proto::ListGpusRequest {
+            node_id: node_id.to_string(),
+        })
+        .await
+        .context("ListPciDevices RPC")?;
+    Ok(resp.into_inner().gpus)
+}
+
+pub async fn list_containers(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::ContainerInfo>> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .list_workloads(controller_proto::ListWorkloadsRequest {
+            kind: controller_proto::WorkloadKind::Container as i32,
+            target_node: String::new(),
+        })
+        .await
+        .context("ListWorkloads RPC")?;
+    Ok(resp.into_inner().containers)
+}
+
+pub async fn get_container(
+    cfg: &DashboardConfig,
+    name: &str,
+    node: &str,
+) -> Result<controller_proto::GetWorkloadResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_workload(controller_proto::GetWorkloadRequest {
+            kind: controller_proto::WorkloadKind::Container as i32,
+            workload_id: name.to_string(),
+            target_node: node.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetWorkload RPC for '{name}'"))?;
+    Ok(resp.into_inner())
+}
+
+pub async fn list_disk_layouts(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::DiskLayoutSummary>> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .list_disk_layouts(controller_proto::ListDiskLayoutsRequest {
+            node_id: String::new(),
+        })
+        .await
+        .context("ListDiskLayouts RPC")?;
+    Ok(resp.into_inner().disk_layouts)
+}
+
+pub async fn get_disk_layout(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::GetDiskLayoutResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_disk_layout(controller_proto::GetDiskLayoutRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetDiskLayout RPC for '{name}'"))?;
+    Ok(resp.into_inner())
+}
+
+pub async fn get_cluster_health(
+    cfg: &DashboardConfig,
+) -> Result<controller_proto::GetClusterHealthResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_cluster_health(controller_proto::GetClusterHealthRequest {})
+        .await
+        .context("GetClusterHealth RPC")?;
+    Ok(resp.into_inner())
+}
+
+pub async fn list_certificates(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::CertificateInfo>> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .list_certificates(controller_proto::ListCertificatesRequest::default())
+        .await
+        .context("ListCertificates RPC")?;
+    Ok(resp.into_inner().certificates)
+}
+
+pub async fn get_pki_status(
+    cfg: &DashboardConfig,
+) -> Result<controller_proto::GetPkiStatusResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_pki_status(controller_proto::GetPkiStatusRequest {})
+        .await
+        .context("GetPkiStatus RPC")?;
+    Ok(resp.into_inner())
+}
+
+pub async fn get_crl(cfg: &DashboardConfig) -> Result<controller_proto::GetCrlResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_crl(controller_proto::GetCrlRequest {})
+        .await
+        .context("GetCrl RPC")?;
+    Ok(resp.into_inner())
+}
+
+pub async fn list_ssh_keys(cfg: &DashboardConfig) -> Result<Vec<controller_proto::SshKeyInfo>> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .list_ssh_keys(controller_proto::ListSshKeysRequest {})
+        .await
+        .context("ListSshKeys RPC")?;
+    Ok(resp.into_inner().keys)
+}
+
+pub async fn get_ssh_key(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::SshKeyInfo> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_ssh_key(controller_proto::GetSshKeyRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetSshKey RPC for '{name}'"))?;
+    resp.into_inner()
+        .key
+        .with_context(|| format!("ssh key '{name}' not found"))
+}
+
+pub async fn export_sbom(
+    cfg: &DashboardConfig,
+    kind: &str,
+) -> Result<controller_proto::ExportSbomResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .export_sbom(controller_proto::ExportSbomRequest {
+            kind: kind.to_string(),
+        })
+        .await
+        .with_context(|| format!("ExportSbom RPC for '{kind}'"))?;
+    Ok(resp.into_inner())
+}
+
+pub async fn get_crypto_config(
+    cfg: &DashboardConfig,
+) -> Result<controller_proto::GetCryptoConfigResponse> {
+    let mut client = controller(cfg).await?;
+    let resp = client
+        .get_crypto_config(controller_proto::GetCryptoConfigRequest {})
+        .await
+        .context("GetCryptoConfig RPC")?;
+    Ok(resp.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
