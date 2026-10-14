@@ -52,6 +52,33 @@ let
       exit 1
     '';
 
+  # Kubelet 1.33 refuses node-role.kubernetes.io/* on --node-labels and
+  # exits before the node registers. Apply those labels through the API.
+  roleLabelArgs =
+    role: scheduleOnControlPlane:
+    if role == "worker" then
+      "node-role.kubernetes.io/worker="
+    else if scheduleOnControlPlane then
+      "node-role.kubernetes.io/control-plane= node-role.kubernetes.io/worker="
+    else
+      "node-role.kubernetes.io/control-plane=";
+
+  nodeRoleApply =
+    kubeconfig: hostname: labels:
+    pkgs.writeShellScript "kcore-node-roles" ''
+      set -eu
+      kube=${pkgs.kubectl}/bin/kubectl
+      for _ in $(${pkgs.coreutils}/bin/seq 1 90); do
+        if "$kube" --kubeconfig=${kubeconfig} get node ${hostname} >/dev/null 2>&1; then
+          "$kube" --kubeconfig=${kubeconfig} label node ${hostname} ${labels} --overwrite
+          exit 0
+        fi
+        sleep 2
+      done
+      echo "node ${hostname} was not registered for role labels" >&2
+      exit 1
+    '';
+
   # etcd initial cluster string
   inherit (cfg) etcdInitialCluster;
 
@@ -520,20 +547,30 @@ let
               --root-dir=/var/lib/kubelet-${name} \
               --cert-dir=/var/lib/kubelet-${name}/pki \
               --node-ip=${c.advertiseAddress} \
-              --hostname-override=${config.networking.hostName} \
-              --node-labels=${
-                if c.role == "worker" then
-                  "node-role.kubernetes.io/worker="
-                else if c.scheduleOnControlPlane then
-                  "node-role.kubernetes.io/control-plane=,node-role.kubernetes.io/worker="
-                else
-                  "node-role.kubernetes.io/control-plane="
-              }
+              --hostname-override=${config.networking.hostName}
           '';
           Restart = "always";
           RestartSec = "10s";
           KillMode = "process";
           StateDirectory = "kubelet-${name}";
+        };
+      };
+
+      systemd.services."kcore-kubernetes-node-roles-${name}" = lib.mkIf (c.role == "control-plane") {
+        description = "Apply node role labels for Kubernetes cluster ${name}";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "kube-apiserver-${name}.service"
+          "kubelet-${name}.service"
+        ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = nodeRoleApply "${root}/admin.conf" config.networking.hostName (
+            roleLabelArgs c.role c.scheduleOnControlPlane
+          );
+          Restart = "on-failure";
+          RestartSec = "15s";
         };
       };
 
@@ -1156,12 +1193,13 @@ in
               iptables -t raw -C PREROUTING -p 112 -j CT --notrack 2>/dev/null || iptables -t raw -I PREROUTING 1 -p 112 -j CT --notrack
               iptables -t raw -C OUTPUT -p 112 -j CT --notrack 2>/dev/null || iptables -t raw -I OUTPUT 1 -p 112 -j CT --notrack
             '';
+        # Leave the raw NOTRACK rules in place when the firewall unit
+        # reloads. Deleting them opens a window where VM masquerade
+        # rewrites keepalived adverts for every cluster on this host.
         extraStopCommands =
           lib.mkIf (cfg.haEnabled || lib.any (c: c.haEnabled) (lib.attrValues cfg.additionalClusters))
             ''
               while iptables -D nixos-fw -p 112 -j nixos-fw-accept 2>/dev/null; do :; done
-              while iptables -t raw -D PREROUTING -p 112 -j CT --notrack 2>/dev/null; do :; done
-              while iptables -t raw -D OUTPUT -p 112 -j CT --notrack 2>/dev/null; do :; done
             '';
       };
 
@@ -1476,19 +1514,29 @@ in
               --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf \
               --container-runtime-endpoint=unix:///run/containerd/containerd.sock \
               --node-ip=${cfg.advertiseAddress} \
-              --hostname-override=${config.networking.hostName} \
-              --node-labels=${
-                if cfg.role == "worker" then
-                  "node-role.kubernetes.io/worker="
-                else if cfg.scheduleOnControlPlane then
-                  "node-role.kubernetes.io/control-plane=,node-role.kubernetes.io/worker="
-                else
-                  "node-role.kubernetes.io/control-plane="
-              }
+              --hostname-override=${config.networking.hostName}
           '';
           Restart = "always";
           RestartSec = "10s";
           KillMode = "process";
+        };
+      };
+
+      systemd.services.kcore-kubernetes-node-roles = lib.mkIf (cfg.role == "control-plane") {
+        description = "Apply Kubernetes node role labels";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "kube-apiserver.service"
+          "kubelet.service"
+        ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = nodeRoleApply "/etc/kubernetes/admin.conf" config.networking.hostName (
+            roleLabelArgs cfg.role cfg.scheduleOnControlPlane
+          );
+          Restart = "on-failure";
+          RestartSec = "15s";
         };
       };
 
