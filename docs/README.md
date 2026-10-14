@@ -6,6 +6,7 @@ This directory contains the complete implementation plan for running Kubernetes 
 
 ### For Operators
 - **Start here:** [kubernetes-quickstart.md](./kubernetes-quickstart.md) - How to deploy and manage
+- **Volumes:** [kubernetes-volumes.md](./kubernetes-volumes.md) - Local-path claims, and a CSI the operator installs
 - **Examples:** [kubernetes-cluster-examples.yaml](./kubernetes-cluster-examples.yaml) - Sample cluster specs
 
 ### For Developers

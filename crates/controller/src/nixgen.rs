@@ -1472,8 +1472,8 @@ pub struct KubernetesNodeConfig {
     /// Control-plane kubelets also register the worker role and stay schedulable.
     pub schedule_on_control_plane: bool,
     /// Applied by the control plane after the API is ready. Empty skips it.
-    /// LVM mode is a TopoLVM plan preview and is not applied: the chart's
-    /// webhook would block every claim if the driver is absent.
+    /// LVM mode leaves this empty: that mode creates a thin pool and does
+    /// not install a provisioner.
     pub provisioner_manifest: String,
     /// Set for a cluster that shares the node with the primary one.
     /// The primary cluster keeps the module defaults and leaves this empty.
