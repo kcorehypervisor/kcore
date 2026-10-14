@@ -33,6 +33,11 @@ The intent is to check protocol-level safety/liveness properties with TLC.
   - Auxiliary invariants check that `Observed <= Generation` and that
     terminal phases (`Applied`/`Failed`) imply the reconciler caught up.
 
+- `model/`
+  - Separate design model: compensation, replication reservations, and a second
+    controller/node and disk-layout reconcile. `make test-tla` checks these
+    after the specs above. A pass there does not replace those specs.
+
 ## Running locally
 
 Preferred:
