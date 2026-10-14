@@ -70,6 +70,13 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(home.contains("kcore"));
     assert!(home.contains("Dashboard"));
     assert!(home.contains("kcorehypervisor.com"));
+    assert!(
+        home.contains("Cluster is healthy"),
+        "home must show the health headline"
+    );
+    assert!(home.contains(r#"href="/health""#));
+    assert!(home.contains(r#"href="/nodes""#));
+    assert!(home.contains(r#"href="/containers""#));
 
     // ── Compliance ────────────────────────────────────────────────────
     let (status, compliance) = fetch(&app, "/compliance").await;
@@ -121,6 +128,22 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(
         compliance.contains(r#"href="/audit""#),
         "compliance must link to the searchable audit trail"
+    );
+    assert!(
+        compliance.contains("CMVP-0000"),
+        "compliance must show the FIPS certificate"
+    );
+    assert!(
+        compliance.contains("CycloneDX"),
+        "compliance must show the SBOM format"
+    );
+    assert!(
+        compliance.contains("kctl get sbom -o"),
+        "compliance must point at the full SBOM command"
+    );
+    assert!(
+        compliance.contains("laptop"),
+        "compliance must preview SSH key names"
     );
 
     // Replication section (now from ControllerAdmin mock)
@@ -348,6 +371,14 @@ async fn all_dashboard_pages_against_mock_controller() {
         "volumes must show registered ZFS volumes"
     );
     assert!(volumes.contains("ZFS"), "volumes must show the ZFS backend");
+    assert!(
+        volumes.contains(r#"href="/volumes/mock-pgdata?node=node-mock-a""#),
+        "each volume must open its detail page"
+    );
+    assert!(
+        volumes.contains(r#"href="/snapshots""#),
+        "volumes must link to snapshots"
+    );
 
     // ── Operations ───────────────────────────────────────────────────
     let (status, operations) = fetch(&app, "/operations").await;
@@ -534,12 +565,242 @@ async fn all_dashboard_pages_against_mock_controller() {
         cluster.contains(r#"href="/k8s""#),
         "cluster detail must link back to the list"
     );
+    assert!(
+        cluster.contains("Control-plane nodes accept workloads."),
+        "lab cluster must say the control plane accepts workloads"
+    );
+    assert!(
+        cluster.contains("kdata"),
+        "lab cluster must list the host volume"
+    );
+    assert!(
+        cluster.contains("/mnt/kcore/lab/kdata"),
+        "lab cluster must show where the volume is mounted"
+    );
 
     let (status, missing_cluster) = fetch(&app, "/k8s/missing-cluster").await;
     assert_eq!(status, StatusCode::OK, "/k8s/missing-cluster status");
     assert!(
         missing_cluster.contains("not found"),
         "missing cluster must say it was not found"
+    );
+
+    // ── Detail pages for the rest of the inventory ───────────────────
+    let (status, health) = fetch(&app, "/health").await;
+    assert_eq!(status, StatusCode::OK, "/health status");
+    assert!(
+        health.contains("Cluster is healthy"),
+        "health page must use a plain headline"
+    );
+    assert!(
+        health.contains("Nothing needs attention."),
+        "a healthy cluster must say so"
+    );
+
+    let (status, nodes) = fetch(&app, "/nodes").await;
+    assert_eq!(status, StatusCode::OK, "/nodes status");
+    assert!(
+        nodes.contains("mock-host-alpha"),
+        "nodes must list the host"
+    );
+    assert!(
+        nodes.contains(r#"href="/nodes/node-mock-a""#),
+        "each node must open its detail page"
+    );
+
+    let (status, node) = fetch(&app, "/nodes/node-mock-a").await;
+    assert_eq!(status, StatusCode::OK, "/nodes/node-mock-a status");
+    assert!(node.contains("radeon0"), "node detail must list the GPU");
+    assert!(
+        node.contains("AI compute"),
+        "GPU role must be plain language"
+    );
+    assert!(
+        node.contains("Free"),
+        "an unused device must say it is free"
+    );
+
+    let (status, vm) = fetch(&app, "/vms/mock-vm-alpha").await;
+    assert_eq!(status, StatusCode::OK, "/vms/mock-vm-alpha status");
+    assert!(vm.contains("10.0.0.50"), "VM detail must show the address");
+    assert!(
+        vm.contains("radeon0"),
+        "VM detail must show the named device"
+    );
+    assert!(
+        vm.contains(r#"href="/vms/mock-vm-alpha/console""#),
+        "VM detail must keep the console as its own link"
+    );
+    assert!(
+        vm.contains(r#"href="/networks/node-mock-a/mock-net-stub""#),
+        "a NIC must open the network it is attached to"
+    );
+    assert!(
+        vm.contains("no receive session"),
+        "VM detail must say when migration has nothing waiting"
+    );
+
+    let (status, volume) = fetch(&app, "/volumes/mock-pgdata?node=node-mock-a").await;
+    assert_eq!(status, StatusCode::OK, "volume detail status");
+    assert!(
+        volume.contains("abc123"),
+        "volume detail must show the serial"
+    );
+    assert!(
+        volume.contains("Not checked"),
+        "an unknown guest size must say it was not checked"
+    );
+    assert!(
+        volume.contains(r#"href="/vms/mock-vm-alpha""#),
+        "volume detail must open the attached VM"
+    );
+
+    let (status, inventory) = fetch(&app, "/volumes/kcore-kdata?node=node-mock-a").await;
+    assert_eq!(status, StatusCode::OK, "inventory volume status");
+    assert!(
+        inventory.contains("not a registered kcore volume"),
+        "an LVM-only row must explain that it is not registered"
+    );
+
+    let (status, snaps) = fetch(&app, "/snapshots?volume=mock-pgdata").await;
+    assert_eq!(status, StatusCode::OK, "/snapshots status");
+    assert!(snaps.contains("nightly"), "snapshots must list nightly");
+    assert!(
+        snaps.contains(r#"href="/snapshots/nightly""#),
+        "each snapshot must open its detail page"
+    );
+
+    let (status, snap) = fetch(&app, "/snapshots/nightly").await;
+    assert_eq!(status, StatusCode::OK, "/snapshots/nightly status");
+    assert!(
+        snap.contains("mock-pgdata"),
+        "snapshot detail must name the volume"
+    );
+
+    let (status, policies) = fetch(&app, "/snapshots/policies").await;
+    assert_eq!(status, StatusCode::OK, "/snapshots/policies status");
+    assert!(
+        policies.contains("Every day"),
+        "a daily schedule must be plain language"
+    );
+
+    let (status, policy) = fetch(&app, "/snapshots/policies/daily-pg").await;
+    assert_eq!(status, StatusCode::OK, "snapshot policy status");
+    assert!(
+        policy.contains("Volume mock-pgdata"),
+        "the schedule must say which volume it covers"
+    );
+
+    let (status, fs) = fetch(&app, "/ceph/fs/mock-home").await;
+    assert_eq!(status, StatusCode::OK, "/ceph/fs/mock-home status");
+    assert!(fs.contains("mock-home"), "CephFS detail must show the name");
+
+    let (status, store) = fetch(&app, "/ceph/rgw/mock-s3").await;
+    assert_eq!(status, StatusCode::OK, "/ceph/rgw/mock-s3 status");
+    assert!(
+        store.contains("7480"),
+        "object store detail must show the port"
+    );
+
+    let (status, op) = fetch(&app, "/operations/op-mock-1").await;
+    assert_eq!(status, StatusCode::OK, "/operations/op-mock-1 status");
+    assert!(op.contains("copy"), "operation detail must show the step");
+    assert!(
+        op.contains(r#"href="/vms/vm-mock-1""#),
+        "operation detail must open the virtual machine"
+    );
+
+    let (status, net) = fetch(&app, "/networks/node-mock-a/mock-overlay").await;
+    assert_eq!(status, StatusCode::OK, "network detail status");
+    assert!(
+        net.contains("Virtual machines cannot talk to each other"),
+        "east-west firewall must be a sentence"
+    );
+    assert!(net.contains(">None<"), "VLAN 0 must read as none");
+
+    let (status, containers) = fetch(&app, "/containers").await;
+    assert_eq!(status, StatusCode::OK, "/containers status");
+    assert!(
+        containers.contains("mock-web"),
+        "containers must list mock-web"
+    );
+    assert!(
+        containers.contains(r#"href="/containers/mock-web?node=node-mock-a""#),
+        "each container must open its detail page"
+    );
+
+    let (status, container) = fetch(&app, "/containers/mock-web?node=node-mock-a").await;
+    assert_eq!(status, StatusCode::OK, "container detail status");
+    assert!(
+        container.contains("nginx:1.27"),
+        "container detail must show the image"
+    );
+    assert!(
+        container.contains("SITE=lab"),
+        "container detail must show environment"
+    );
+
+    let (status, class) = fetch(&app, "/storage/classes/lvm").await;
+    assert_eq!(status, StatusCode::OK, "storage class status");
+    assert!(
+        class.contains("VM disks are LVM logical volumes."),
+        "storage class must explain itself"
+    );
+    assert!(
+        class.contains("mock-host-alpha"),
+        "storage class must list the nodes that use it"
+    );
+
+    let (status, layout) = fetch(&app, "/storage/layouts/node-a-os").await;
+    assert_eq!(status, StatusCode::OK, "disk layout status");
+    assert!(
+        layout.contains("Applied"),
+        "disk layout must show its phase"
+    );
+    assert!(
+        layout.contains("disk.sda"),
+        "disk layout must show the Nix expression"
+    );
+
+    let (status, certs) = fetch(&app, "/compliance/certificates").await;
+    assert_eq!(status, StatusCode::OK, "/compliance/certificates status");
+    assert!(certs.contains("0A1B"), "certificates must show the serial");
+    assert!(certs.contains("Active"), "certificates must show status");
+    assert!(
+        !certs.contains("BEGIN CERTIFICATE"),
+        "the page must not dump certificate PEM"
+    );
+
+    let (status, keys) = fetch(&app, "/ssh-keys").await;
+    assert_eq!(status, StatusCode::OK, "/ssh-keys status");
+    assert!(keys.contains("laptop"), "SSH keys must list the name");
+    assert!(
+        !keys.contains("ssh-ed25519"),
+        "the list must not show the public key"
+    );
+
+    let (status, key) = fetch(&app, "/ssh-keys/laptop").await;
+    assert_eq!(status, StatusCode::OK, "/ssh-keys/laptop status");
+    assert!(
+        key.contains("ssh-ed25519"),
+        "SSH key detail must show the public key"
+    );
+
+    assert!(
+        storage.contains("ZFS datasets are not scanned"),
+        "storage must explain why ZFS datasets are absent"
+    );
+    assert!(
+        storage.contains(r#"href="/storage/classes/lvm""#),
+        "storage must link each class"
+    );
+    assert!(
+        operations.contains(r#"href="/operations/op-mock-1""#),
+        "each operation must open its detail page"
+    );
+    assert!(
+        nets.contains(r#"href="/networks/node-mock-a/mock-overlay""#),
+        "each network must open its detail page"
     );
 
     // ── 404 for unknown path ─────────────────────────────────────────

@@ -78,8 +78,35 @@ a:hover {
 
 .nav-links {
   display: flex;
-  gap: 1.25rem;
+  gap: 0.35rem 1.1rem;
   flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.subnav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.25rem;
+  margin: 0.75rem 0 0;
+}
+.subnav a {
+  font-weight: 600;
+}
+.health-banner {
+  border-left: 3px solid var(--accent);
+}
+a.stat {
+  text-decoration: none;
+  color: inherit;
+}
+.code-block {
+  overflow: auto;
+  max-height: 24rem;
+  padding: 0.75rem 1rem;
+  background: #0c0e14;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
 }
 .nav-links a {
   color: var(--muted);

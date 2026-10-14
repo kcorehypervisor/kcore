@@ -78,8 +78,45 @@ impl Controller for MockController {
         Err(unimp("set_vm_desired_state"))
     }
 
-    async fn get_vm(&self, _: Request<GetVmRequest>) -> Result<Response<GetVmResponse>, Status> {
-        Err(unimp("get_vm"))
+    async fn get_vm(
+        &self,
+        request: Request<GetVmRequest>,
+    ) -> Result<Response<GetVmResponse>, Status> {
+        let id = request.into_inner().vm_id;
+        if id != "mock-vm-alpha" && id != "vm-mock-1" {
+            return Err(Status::not_found(format!("vm '{id}' not found")));
+        }
+        Ok(Response::new(GetVmResponse {
+            spec: Some(VmSpec {
+                id: "vm-mock-1".into(),
+                name: "mock-vm-alpha".into(),
+                cpu: 2,
+                memory_bytes: 512 * 1024 * 1024,
+                disks: vec![Disk {
+                    name: "root".into(),
+                    backend_handle: "/dev/vg_kcore/root".into(),
+                    bus: "virtio".into(),
+                    device: "vda".into(),
+                }],
+                nics: vec![Nic {
+                    network: "mock-net-stub".into(),
+                    model: "virtio".into(),
+                    mac_address: "52:54:00:00:00:01".into(),
+                }],
+                storage_backend: "lvm".into(),
+                storage_size_bytes: 20 * 1024 * 1024 * 1024,
+                desired_state: VmDesiredState::Running as i32,
+                pci_devices: vec!["0000:03:00.0".into()],
+                gpus: vec!["radeon0".into()],
+            }),
+            status: Some(VmStatus {
+                id: "vm-mock-1".into(),
+                state: VmState::Running as i32,
+                ..Default::default()
+            }),
+            node_id: "node-mock-a".into(),
+            assigned_ip: "10.0.0.50".into(),
+        }))
     }
 
     async fn list_gpus(
@@ -93,7 +130,22 @@ impl Controller for MockController {
         &self,
         _: Request<ListGpusRequest>,
     ) -> Result<Response<ListGpusResponse>, Status> {
-        Err(unimp("list_pci_devices"))
+        Ok(Response::new(ListGpusResponse {
+            gpus: vec![GpuInfo {
+                name: "radeon0".into(),
+                family: "radeon".into(),
+                model: "AMD 1002:744c".into(),
+                address: "0000:03:00.0".into(),
+                pci_devices: vec!["0000:03:00.0".into()],
+                iommu_group: 12,
+                assignable: true,
+                node_id: "node-mock-a".into(),
+                kind: "gpu".into(),
+                role: "compute".into(),
+                driver: "vfio-pci".into(),
+                ..Default::default()
+            }],
+        }))
     }
 
     type AttachVmConsoleStream =
@@ -179,16 +231,57 @@ impl Controller for MockController {
 
     async fn get_workload(
         &self,
-        _: Request<GetWorkloadRequest>,
+        request: Request<GetWorkloadRequest>,
     ) -> Result<Response<GetWorkloadResponse>, Status> {
-        Err(unimp("get_workload"))
+        let name = request.into_inner().workload_id;
+        if name != "mock-web" {
+            return Err(Status::not_found(format!("container '{name}' not found")));
+        }
+        Ok(Response::new(GetWorkloadResponse {
+            kind: WorkloadKind::Container as i32,
+            container_spec: Some(ContainerSpec {
+                name: "mock-web".into(),
+                image: "nginx:1.27".into(),
+                network: "mock-net-stub".into(),
+                command: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
+                env: [("SITE".into(), "lab".into())].into_iter().collect(),
+                ports: vec!["80".into()],
+                storage_backend: "lvm".into(),
+                storage_size_bytes: 1024 * 1024 * 1024,
+                mount_target: "/var/lib/nginx".into(),
+                desired_state: WorkloadDesiredState::Running as i32,
+            }),
+            container_info: Some(ContainerInfo {
+                id: "ctr-mock-1".into(),
+                name: "mock-web".into(),
+                image: "nginx:1.27".into(),
+                state: ContainerState::Running as i32,
+                status: "up".into(),
+                node_id: "node-mock-a".into(),
+                created_at: None,
+            }),
+            node_id: "node-mock-a".into(),
+            assigned_ip: "10.0.0.60".into(),
+            ..Default::default()
+        }))
     }
 
     async fn list_workloads(
         &self,
         _: Request<ListWorkloadsRequest>,
     ) -> Result<Response<ListWorkloadsResponse>, Status> {
-        Err(unimp("list_workloads"))
+        Ok(Response::new(ListWorkloadsResponse {
+            vms: vec![],
+            containers: vec![ContainerInfo {
+                id: "ctr-mock-1".into(),
+                name: "mock-web".into(),
+                image: "nginx:1.27".into(),
+                state: ContainerState::Running as i32,
+                status: "up".into(),
+                node_id: "node-mock-a".into(),
+                created_at: None,
+            }],
+        }))
     }
 
     async fn create_network(
@@ -328,14 +421,22 @@ impl Controller for MockController {
         &self,
         _: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
-        Err(unimp("list_nodes"))
+        Ok(Response::new(ListNodesResponse {
+            nodes: vec![sample_node()],
+        }))
     }
 
     async fn get_node(
         &self,
-        _: Request<GetNodeRequest>,
+        request: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeResponse>, Status> {
-        Err(unimp("get_node"))
+        let id = request.into_inner().node_id;
+        if id != "node-mock-a" {
+            return Err(Status::not_found(format!("node '{id}' not found")));
+        }
+        Ok(Response::new(GetNodeResponse {
+            node: Some(sample_node()),
+        }))
     }
 
     async fn create_ssh_key(
@@ -356,14 +457,22 @@ impl Controller for MockController {
         &self,
         _: Request<ListSshKeysRequest>,
     ) -> Result<Response<ListSshKeysResponse>, Status> {
-        Err(unimp("list_ssh_keys"))
+        Ok(Response::new(ListSshKeysResponse {
+            keys: vec![sample_ssh_key()],
+        }))
     }
 
     async fn get_ssh_key(
         &self,
-        _: Request<GetSshKeyRequest>,
+        request: Request<GetSshKeyRequest>,
     ) -> Result<Response<GetSshKeyResponse>, Status> {
-        Err(unimp("get_ssh_key"))
+        let name = request.into_inner().name;
+        if name != "laptop" {
+            return Err(Status::not_found(format!("ssh key '{name}' not found")));
+        }
+        Ok(Response::new(GetSshKeyResponse {
+            key: Some(sample_ssh_key()),
+        }))
     }
 
     async fn drain_node(
@@ -384,7 +493,26 @@ impl Controller for MockController {
         &self,
         _: Request<GetLiveMigrateReceiveStatusRequest>,
     ) -> Result<Response<GetLiveMigrateReceiveStatusResponse>, Status> {
-        Err(unimp("get_live_migrate_receive_status"))
+        Ok(Response::new(GetLiveMigrateReceiveStatusResponse {
+            success: true,
+            vm_id: "vm-mock-1".into(),
+            vm_name: "mock-vm-alpha".into(),
+            runtime_name: "mock-vm-alpha".into(),
+            current_node: "node-mock-a".into(),
+            nodes: vec![NodeLiveMigrateReceiveStatus {
+                node_id: "node-mock-a".into(),
+                node_address: "10.0.0.10:9443".into(),
+                reachable: true,
+                owns_vm: true,
+                state: Some(LiveMigrateReceiveState {
+                    has_session: false,
+                    summary: "no session".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))
     }
 
     async fn reset_live_migrate_receive(
@@ -433,7 +561,12 @@ impl Controller for MockController {
         &self,
         _: Request<GetClusterHealthRequest>,
     ) -> Result<Response<GetClusterHealthResponse>, Status> {
-        Err(unimp("get_cluster_health"))
+        Ok(Response::new(GetClusterHealthResponse {
+            status: "healthy".into(),
+            ready_nodes: 1,
+            vm_count: 1,
+            ..Default::default()
+        }))
     }
 
     async fn backup_cluster(
@@ -489,7 +622,18 @@ impl Controller for MockController {
         &self,
         _: Request<ListCertificatesRequest>,
     ) -> Result<Response<ListCertificatesResponse>, Status> {
-        Err(unimp("list_certificates"))
+        Ok(Response::new(ListCertificatesResponse {
+            certificates: vec![CertificateInfo {
+                serial_hex: "0A1B".into(),
+                subject_cn: "node-mock-a".into(),
+                identity_kind: "node".into(),
+                node_id: "node-mock-a".into(),
+                issuer_cn: "kcore-sub-ca".into(),
+                status: CertificateStatus::Active as i32,
+                days_until_expiry: 90,
+                ..Default::default()
+            }],
+        }))
     }
 
     async fn revoke_certificate(
@@ -500,14 +644,30 @@ impl Controller for MockController {
     }
 
     async fn get_crl(&self, _: Request<GetCrlRequest>) -> Result<Response<GetCrlResponse>, Status> {
-        Err(unimp("get_crl"))
+        Ok(Response::new(GetCrlResponse {
+            success: true,
+            crl_number: 4,
+            revoked_count: 0,
+            ..Default::default()
+        }))
     }
 
     async fn get_pki_status(
         &self,
         _: Request<GetPkiStatusRequest>,
     ) -> Result<Response<GetPkiStatusResponse>, Status> {
-        Err(unimp("get_pki_status"))
+        Ok(Response::new(GetPkiStatusResponse {
+            active_count: 3,
+            rotated_count: 1,
+            warn_before_days: 30,
+            renew_before_days: 14,
+            rotation_enabled: true,
+            crl_number: 4,
+            crl_available: true,
+            sub_ca_available: true,
+            revocation_fail_mode: "soft-fail".into(),
+            ..Default::default()
+        }))
     }
 
     async fn reload_tls(
@@ -701,14 +861,38 @@ impl Controller for MockController {
         &self,
         _: Request<GetCryptoConfigRequest>,
     ) -> Result<Response<GetCryptoConfigResponse>, Status> {
-        Ok(Response::new(GetCryptoConfigResponse::default()))
+        Ok(Response::new(GetCryptoConfigResponse {
+            fips_certificate: "CMVP-0000".into(),
+            rate_limit_enabled: true,
+            rate_limit_requests_per_second: 50,
+            rate_limit_burst: 100,
+            revocation_fail_mode: "soft-fail".into(),
+            signing_scheme: "sigstore".into(),
+            ..Default::default()
+        }))
     }
 
     async fn export_sbom(
         &self,
-        _: Request<ExportSbomRequest>,
+        request: Request<ExportSbomRequest>,
     ) -> Result<Response<ExportSbomResponse>, Status> {
-        Ok(Response::new(ExportSbomResponse::default()))
+        let kind = request.into_inner().kind;
+        let filename = if kind == "iso-closure" {
+            "kcore-iso.cdx.json"
+        } else {
+            "kcore-crates.cdx.json"
+        };
+        Ok(Response::new(ExportSbomResponse {
+            format: "CycloneDX".into(),
+            spec_version: "1.6".into(),
+            filename: filename.into(),
+            sha256: "abc123".into(),
+            source: "embedded".into(),
+            generator: "kcore".into(),
+            signature_present: false,
+            signing_scheme: "sigstore".into(),
+            ..Default::default()
+        }))
     }
 
     async fn list_volumes(
@@ -716,54 +900,7 @@ impl Controller for MockController {
         _: Request<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
         Ok(Response::new(ListVolumesResponse {
-            volumes: vec![
-                VolumeInfo {
-                    id: "vol-mock-1".into(),
-                    name: "mock-pgdata".into(),
-                    role: "data".into(),
-                    attach_state: "attached".into(),
-                    serial: "abc123".into(),
-                    pool: "kcore-vms".into(),
-                    image: "kcore-vol-abc123".into(),
-                    slot: 1,
-                    vm_id: "vm-mock-1".into(),
-                    vm_name: "mock-vm".into(),
-                    node_id: "node-mock-a".into(),
-                    storage_backend: "ceph".into(),
-                    storage_size_bytes: 10 * 1024 * 1024 * 1024,
-                    backend_handle: "/dev/rbd/kcore-vms/kcore-vol-abc123".into(),
-                    image_format: "raw".into(),
-                    vm_state: 0,
-                    guest_visible_bytes: -1,
-                    guest_checked_at: String::new(),
-                    encrypted: false,
-                    mount_point: String::new(),
-                    fs_type: String::new(),
-                },
-                VolumeInfo {
-                    id: "vol-mock-zfs".into(),
-                    name: "tank-data".into(),
-                    role: "data".into(),
-                    attach_state: "detached".into(),
-                    serial: String::new(),
-                    pool: "tank0".into(),
-                    image: "tank-data".into(),
-                    slot: 0,
-                    vm_id: String::new(),
-                    vm_name: String::new(),
-                    node_id: "node-mock-a".into(),
-                    storage_backend: "zfs".into(),
-                    storage_size_bytes: 8 * 1024 * 1024 * 1024,
-                    backend_handle: "/dev/zvol/tank0/tank-data".into(),
-                    image_format: "raw".into(),
-                    vm_state: 0,
-                    guest_visible_bytes: -1,
-                    guest_checked_at: String::new(),
-                    encrypted: false,
-                    mount_point: String::new(),
-                    fs_type: String::new(),
-                },
-            ],
+            volumes: sample_volumes(),
         }))
     }
 
@@ -776,9 +913,18 @@ impl Controller for MockController {
 
     async fn get_volume(
         &self,
-        _: Request<GetVolumeRequest>,
+        request: Request<GetVolumeRequest>,
     ) -> Result<Response<GetVolumeResponse>, Status> {
-        Err(unimp("get_volume"))
+        let name = request.into_inner().name;
+        sample_volumes()
+            .into_iter()
+            .find(|volume| volume.name == name || volume.id == name)
+            .map(|volume| {
+                Response::new(GetVolumeResponse {
+                    volume: Some(volume),
+                })
+            })
+            .ok_or_else(|| Status::not_found(format!("volume '{name}' not found")))
     }
 
     async fn attach_volume(
@@ -826,9 +972,24 @@ impl Controller for MockController {
 
     async fn get_vm_operation(
         &self,
-        _: Request<GetVmOperationRequest>,
+        request: Request<GetVmOperationRequest>,
     ) -> Result<Response<GetVmOperationResponse>, Status> {
-        Err(unimp("get_vm_operation"))
+        let id = request.into_inner().id;
+        if id != "op-mock-1" {
+            return Err(Status::not_found(format!("operation '{id}' not found")));
+        }
+        Ok(Response::new(GetVmOperationResponse {
+            operation: Some(VmOperation {
+                id: "op-mock-1".into(),
+                vm_id: "vm-mock-1".into(),
+                kind: "live_migrate".into(),
+                phase: "Preparing".into(),
+                source_node: "node-mock-a".into(),
+                target_node: "node-mock-b".into(),
+                detail_json: r#"{"step":"copy"}"#.into(),
+                ..Default::default()
+            }),
+        }))
     }
 
     async fn cancel_vm_operation(
@@ -847,9 +1008,26 @@ impl Controller for MockController {
 
     async fn list_volume_snapshots(
         &self,
-        _: Request<ListVolumeSnapshotsRequest>,
+        request: Request<ListVolumeSnapshotsRequest>,
     ) -> Result<Response<ListVolumeSnapshotsResponse>, Status> {
-        Err(unimp("list_volume_snapshots"))
+        let volume = request.into_inner().volume;
+        let snap = VolumeSnapshotInfo {
+            id: "snap-1".into(),
+            name: "nightly".into(),
+            volume_id: "vol-mock-1".into(),
+            volume_name: "mock-pgdata".into(),
+            rbd_snap: "nightly".into(),
+            protected: true,
+            size_bytes: 10 * 1024 * 1024 * 1024,
+            consistency: "crash".into(),
+            created_at: None,
+        };
+        let snapshots = if volume.is_empty() || volume == "mock-pgdata" || volume == "vol-mock-1" {
+            vec![snap]
+        } else {
+            vec![]
+        };
+        Ok(Response::new(ListVolumeSnapshotsResponse { snapshots }))
     }
 
     async fn delete_volume_snapshot(
@@ -917,16 +1095,26 @@ impl Controller for MockController {
 
     async fn get_snapshot_policy(
         &self,
-        _: Request<GetSnapshotPolicyRequest>,
+        request: Request<GetSnapshotPolicyRequest>,
     ) -> Result<Response<GetSnapshotPolicyResponse>, Status> {
-        Err(unimp("get_snapshot_policy"))
+        let name = request.into_inner().name;
+        if name != "daily-pg" {
+            return Err(Status::not_found(format!(
+                "snapshot policy '{name}' not found"
+            )));
+        }
+        Ok(Response::new(GetSnapshotPolicyResponse {
+            policy: Some(sample_snapshot_policy()),
+        }))
     }
 
     async fn list_snapshot_policies(
         &self,
         _: Request<ListSnapshotPoliciesRequest>,
     ) -> Result<Response<ListSnapshotPoliciesResponse>, Status> {
-        Err(unimp("list_snapshot_policies"))
+        Ok(Response::new(ListSnapshotPoliciesResponse {
+            policies: vec![sample_snapshot_policy()],
+        }))
     }
 
     async fn delete_snapshot_policy(
@@ -945,16 +1133,30 @@ impl Controller for MockController {
 
     async fn get_disk_layout(
         &self,
-        _: Request<GetDiskLayoutRequest>,
+        request: Request<GetDiskLayoutRequest>,
     ) -> Result<Response<GetDiskLayoutResponse>, Status> {
-        Err(unimp("get_disk_layout"))
+        let name = request.into_inner().name;
+        if name != "node-a-os" {
+            return Err(Status::not_found(format!("disk layout '{name}' not found")));
+        }
+        let (layout, status) = sample_disk_layout();
+        Ok(Response::new(GetDiskLayoutResponse {
+            disk_layout: Some(layout),
+            status: Some(status),
+        }))
     }
 
     async fn list_disk_layouts(
         &self,
         _: Request<ListDiskLayoutsRequest>,
     ) -> Result<Response<ListDiskLayoutsResponse>, Status> {
-        Err(unimp("list_disk_layouts"))
+        let (layout, status) = sample_disk_layout();
+        Ok(Response::new(ListDiskLayoutsResponse {
+            disk_layouts: vec![DiskLayoutSummary {
+                disk_layout: Some(layout),
+                status: Some(status),
+            }],
+        }))
     }
 
     async fn delete_disk_layout(
@@ -1075,9 +1277,35 @@ impl Controller for MockController {
 
     async fn get_shared_filesystem(
         &self,
-        _: Request<GetSharedFilesystemRequest>,
+        request: Request<GetSharedFilesystemRequest>,
     ) -> Result<Response<GetSharedFilesystemResponse>, Status> {
-        Err(unimp("get_shared_filesystem"))
+        let name = request.into_inner().name;
+        if name != "mock-home" {
+            return Err(Status::not_found(format!(
+                "shared filesystem '{name}' not found"
+            )));
+        }
+        Ok(Response::new(GetSharedFilesystemResponse {
+            shared_filesystem: Some(SharedFilesystem {
+                name: "mock-home".into(),
+                generation: 2,
+                spec: Some(SharedFilesystemSpec {
+                    ceph_cluster: "mock-ceph".into(),
+                    quota_bytes: 100 * 1024 * 1024 * 1024,
+                    clients: vec![SharedFilesystemClientSpec {
+                        name: "desk".into(),
+                        paths: vec!["/".into()],
+                    }],
+                    ..Default::default()
+                }),
+                status: Some(SharedFilesystemStatus {
+                    phase: SharedFilesystemPhase::Healthy as i32,
+                    health_message: "HEALTH_OK".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }))
     }
 
     async fn list_shared_filesystems(
@@ -1122,9 +1350,33 @@ impl Controller for MockController {
 
     async fn get_object_store(
         &self,
-        _: Request<GetObjectStoreRequest>,
+        request: Request<GetObjectStoreRequest>,
     ) -> Result<Response<GetObjectStoreResponse>, Status> {
-        Err(unimp("get_object_store"))
+        let name = request.into_inner().name;
+        if name != "mock-s3" {
+            return Err(Status::not_found(format!(
+                "object store '{name}' not found"
+            )));
+        }
+        Ok(Response::new(GetObjectStoreResponse {
+            object_store: Some(ObjectStore {
+                name: "mock-s3".into(),
+                generation: 1,
+                spec: Some(ObjectStoreSpec {
+                    ceph_cluster: "mock-ceph".into(),
+                    members: vec!["node-mock-a".into()],
+                    port: 7480,
+                    tls: true,
+                    ..Default::default()
+                }),
+                status: Some(ObjectStoreStatus {
+                    phase: ObjectStorePhase::Healthy as i32,
+                    health_message: "HEALTH_OK".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }))
     }
 
     async fn list_object_stores(
@@ -1486,8 +1738,22 @@ fn sample_kubernetes_clusters() -> Vec<KubernetesCluster> {
                     vip_interface: "enp6s0".into(),
                     method: "keepalived".into(),
                 }),
-                local_provisioner: None,
-                schedule_on_control_plane: false,
+                local_provisioner: Some(KubernetesLocalProvisioner {
+                    enabled: true,
+                    storage_class_name: String::new(),
+                    mode: "shared".into(),
+                    volumes: vec![KubernetesHostVolume {
+                        name: "kdata".into(),
+                        node_id: "node-107".into(),
+                        storage_class: "lvm".into(),
+                        size_bytes: 50 * 1024 * 1024 * 1024,
+                        fs_type: "ext4".into(),
+                        mount_path: "/mnt/kcore/lab/kdata".into(),
+                        role: "filesystem".into(),
+                        volume_group: String::new(),
+                    }],
+                }),
+                schedule_on_control_plane: true,
             }),
             status: Some(KubernetesClusterStatus {
                 phase: "ready".into(),
@@ -1592,4 +1858,107 @@ pub async fn spawn_mock_controller() -> SocketAddr {
     });
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     addr
+}
+
+fn sample_node() -> NodeInfo {
+    NodeInfo {
+        node_id: "node-mock-a".into(),
+        hostname: "mock-host-alpha".into(),
+        address: "10.0.0.10:9443".into(),
+        capacity: Some(NodeCapacity {
+            cpu_cores: 8,
+            memory_bytes: 32 * 1024 * 1024 * 1024,
+        }),
+        usage: Some(NodeUsage {
+            cpu_cores_used: 2,
+            memory_bytes_used: 512 * 1024 * 1024,
+        }),
+        status: "ready".into(),
+        labels: vec!["dc=lab".into()],
+        storage_backend: StorageBackendType::Lvm as i32,
+        approval_status: "approved".into(),
+        cert_expiry_days: 90,
+        luks_method: "key-file".into(),
+        dc_id: "lab".into(),
+        ..Default::default()
+    }
+}
+
+fn sample_ssh_key() -> SshKeyInfo {
+    SshKeyInfo {
+        name: "laptop".into(),
+        public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMock laptop".into(),
+        created_at: None,
+    }
+}
+
+fn sample_volumes() -> Vec<VolumeInfo> {
+    vec![
+        VolumeInfo {
+            id: "vol-mock-1".into(),
+            name: "mock-pgdata".into(),
+            role: "data".into(),
+            attach_state: "attached".into(),
+            serial: "abc123".into(),
+            pool: "kcore-vms".into(),
+            image: "kcore-vol-abc123".into(),
+            slot: 1,
+            vm_id: "vm-mock-1".into(),
+            vm_name: "mock-vm-alpha".into(),
+            node_id: "node-mock-a".into(),
+            storage_backend: "ceph".into(),
+            storage_size_bytes: 10 * 1024 * 1024 * 1024,
+            backend_handle: "/dev/rbd/kcore-vms/kcore-vol-abc123".into(),
+            image_format: "raw".into(),
+            guest_visible_bytes: -1,
+            ..Default::default()
+        },
+        VolumeInfo {
+            id: "vol-mock-zfs".into(),
+            name: "tank-data".into(),
+            role: "data".into(),
+            attach_state: "detached".into(),
+            pool: "tank0".into(),
+            image: "tank-data".into(),
+            node_id: "node-mock-a".into(),
+            storage_backend: "zfs".into(),
+            storage_size_bytes: 8 * 1024 * 1024 * 1024,
+            backend_handle: "/dev/zvol/tank0/tank-data".into(),
+            image_format: "raw".into(),
+            guest_visible_bytes: -1,
+            ..Default::default()
+        },
+    ]
+}
+
+fn sample_snapshot_policy() -> SnapshotPolicy {
+    SnapshotPolicy {
+        name: "daily-pg".into(),
+        selector_volume: "mock-pgdata".into(),
+        schedule: "@daily".into(),
+        keep: 7,
+        enabled: true,
+        last_run_at: "2026-10-13T00:00:00Z".into(),
+        last_message: "ok".into(),
+        ..Default::default()
+    }
+}
+
+fn sample_disk_layout() -> (DiskLayout, DiskLayoutStatus) {
+    (
+        DiskLayout {
+            name: "node-a-os".into(),
+            node_id: "node-mock-a".into(),
+            generation: 2,
+            layout_nix: "{ disk.sda = {}; }".into(),
+            evacuate: false,
+            ..Default::default()
+        },
+        DiskLayoutStatus {
+            observed_generation: 2,
+            phase: DiskLayoutPhase::Applied as i32,
+            message: "applied".into(),
+            ..Default::default()
+        },
+    )
 }

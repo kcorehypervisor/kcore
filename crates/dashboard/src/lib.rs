@@ -15,6 +15,7 @@ pub mod controller_client;
 pub mod dto;
 pub mod format;
 pub mod mappers;
+pub mod pages;
 pub mod paging;
 pub mod state;
 
