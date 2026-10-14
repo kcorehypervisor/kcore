@@ -8,13 +8,21 @@ use crate::api::{
 use crate::dto::{
     AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto,
     DbmsRowDto, HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto,
-    KubernetesNodeDto, KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
-    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
-    NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto,
-    SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto,
-    VmsPageDto, VolumeRowDto,
+    KubernetesHostVolumeDto, KubernetesNodeDto, KubernetesNodeHealthDto, LvmLogicalVolumeDto,
+    LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
+    NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto,
+    ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto,
+    VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
 };
 use crate::format::{paginate_by_name, paginate_preserve_order};
+use crate::pages::{
+    CertificatesPage, ContainerDetailPage, ContainersPage, CryptoCard, DiskLayoutPage,
+    DiskLayoutsSection, FilesystemDetailPage, HealthBanner, HealthPage, NetworkDetailPage,
+    NodeDetailPage, NodesPage, ObjectStoreDetailPage, OperationDetailPage, SbomSection,
+    SnapshotDetailPage, SnapshotPoliciesPage, SnapshotPolicyPage, SnapshotsPage, SshKeyPage,
+    SshKeysPage, SshKeysPreview, StorageClassPage, StorageClassesSection, VmDetailPage,
+    VolumeDetailPage,
+};
 use crate::paging::{
     list_pager, list_pager_named, list_paging, list_paging_named, paginate_items, query_string,
 };
@@ -72,8 +80,10 @@ pub fn App() -> impl IntoView {
                 </div>
                 <nav class="nav-links">
                     <a href="/">"Overview"</a>
-                    <a href="/compliance">"Compliance"</a>
+                    <a href="/health">"Health"</a>
+                    <a href="/nodes">"Nodes"</a>
                     <a href="/vms">"Virtual machines"</a>
+                    <a href="/containers">"Containers"</a>
                     <a href="/volumes">"Volumes"</a>
                     <a href="/ceph">"Ceph"</a>
                     <a href="/kds">"KDS"</a>
@@ -81,6 +91,7 @@ pub fn App() -> impl IntoView {
                     <a href="/networks">"Networks"</a>
                     <a href="/storage">"Storage"</a>
                     <a href="/operations">"Operations"</a>
+                    <a href="/compliance">"Compliance"</a>
                     <a href="/audit">"Audit"</a>
                 </nav>
             </header>
@@ -88,9 +99,23 @@ pub fn App() -> impl IntoView {
                 <Router>
                     <FlatRoutes fallback=|| view! { <p class="muted">"Not found."</p> }>
                         <Route path=path!("/") view=HomePage/>
+                        <Route path=path!("/health") view=HealthPage/>
+                        <Route path=path!("/compliance/certificates") view=CertificatesPage/>
                         <Route path=path!("/compliance") view=CompliancePage/>
+                        <Route path=path!("/nodes") view=NodesPage/>
+                        <Route path=path!("/nodes/:id") view=NodeDetailPage/>
                         <Route path=path!("/vms") view=VmsPage/>
+                        <Route path=path!("/vms/:name") view=VmDetailPage/>
+                        <Route path=path!("/containers") view=ContainersPage/>
+                        <Route path=path!("/containers/:name") view=ContainerDetailPage/>
                         <Route path=path!("/volumes") view=VolumesPage/>
+                        <Route path=path!("/volumes/:name") view=VolumeDetailPage/>
+                        <Route path=path!("/snapshots/policies") view=SnapshotPoliciesPage/>
+                        <Route path=path!("/snapshots/policies/:name") view=SnapshotPolicyPage/>
+                        <Route path=path!("/snapshots") view=SnapshotsPage/>
+                        <Route path=path!("/snapshots/:name") view=SnapshotDetailPage/>
+                        <Route path=path!("/ceph/fs/:name") view=FilesystemDetailPage/>
+                        <Route path=path!("/ceph/rgw/:name") view=ObjectStoreDetailPage/>
                         <Route path=path!("/ceph") view=CephPage/>
                         <Route path=path!("/ceph/:name") view=CephClusterDetailPage/>
                         <Route path=path!("/kds") view=KdsPage/>
@@ -98,9 +123,15 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/k8s") view=KubernetesPage/>
                         <Route path=path!("/k8s/:name") view=KubernetesDetailPage/>
                         <Route path=path!("/operations") view=OperationsPage/>
+                        <Route path=path!("/operations/:id") view=OperationDetailPage/>
                         <Route path=path!("/audit") view=AuditPage/>
                         <Route path=path!("/networks") view=NetworksPage/>
+                        <Route path=path!("/networks/:node/:name") view=NetworkDetailPage/>
+                        <Route path=path!("/storage/classes/:name") view=StorageClassPage/>
+                        <Route path=path!("/storage/layouts/:name") view=DiskLayoutPage/>
                         <Route path=path!("/storage") view=StoragePage/>
+                        <Route path=path!("/ssh-keys") view=SshKeysPage/>
+                        <Route path=path!("/ssh-keys/:name") view=SshKeyPage/>
                     </FlatRoutes>
                 </Router>
             </main>
@@ -122,14 +153,27 @@ fn HomePage() -> impl IntoView {
                 "No direct database access — everything goes through the controller API."
             </p>
         </section>
+        <HealthBanner/>
         <div class="card-grid cols-2">
+            <a href="/health" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Health"</h2>
+                <p class="muted">"Ready nodes, certificates, and replication in one place."</p>
+            </a>
+            <a href="/nodes" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Nodes"</h2>
+                <p class="muted">"Capacity, approval, and devices on each machine."</p>
+            </a>
             <a href="/compliance" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Compliance"</h2>
-                <p class="muted">"Cryptography, access control, and inventory aligned with kctl report."</p>
+                <p class="muted">"Cryptography, certificates, SSH keys, and the software bill of materials."</p>
             </a>
             <a href="/vms" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Virtual machines"</h2>
-                <p class="muted">"Cluster-wide VM list with paging when you have more than ten."</p>
+                <p class="muted">"Open a VM for disks, networks, devices, and migration."</p>
+            </a>
+            <a href="/containers" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Containers"</h2>
+                <p class="muted">"Images and state for containers on the cluster."</p>
             </a>
             <a href="/volumes" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Volumes"</h2>
@@ -182,6 +226,11 @@ fn CompliancePage() -> impl IntoView {
         <section class="hero">
             <h1>"Compliance report"</h1>
             <p class="muted">"Same evidence categories as "<code class="inline">"kctl report"</code>"."</p>
+            <p class="subnav">
+                <a href="/compliance/certificates">"Certificates"</a>
+                <a href="/ssh-keys">"SSH keys"</a>
+                <a href="#sbom">"Software bill of materials"</a>
+            </p>
         </section>
         <Suspense fallback=move || view! { <p class="muted">"Loading compliance…"</p> }>
             {move || {
@@ -228,6 +277,9 @@ fn CompliancePage() -> impl IntoView {
                 })}
             </Suspense>
         </section>
+        <CryptoCard/>
+        <SbomSection/>
+        <SshKeysPreview/>
     }
 }
 
@@ -654,10 +706,11 @@ fn vm_row(vm: VmRowDto) -> impl IntoView {
         vm.id.clone()
     };
     let console_href = format!("/vms/{}/console", urlencoding_path(&console_target));
+    let detail_href = format!("/vms/{}", urlencoding_path(&console_target));
     view! {
         <tr>
             <td>
-                <strong>{vm.name.clone()}</strong>
+                <a class="cell-link" href=detail_href><strong>{vm.name.clone()}</strong></a>
                 <div class="muted" style="font-size: 0.75rem;">
                     <code class="inline">{vm.id.clone()}</code>
                 </div>
@@ -694,6 +747,10 @@ fn VolumesPage() -> impl IntoView {
         <section class="hero">
             <h1>"Volumes"</h1>
             <p class="muted">"Ceph RBD volumes, LVM logical volumes, and ZFS zvols. Registered volumes come from the controller. LVM rows also include logical volumes reported by each node."</p>
+            <p class="subnav">
+                <a href="/snapshots">"Snapshots"</a>
+                <a href="/snapshots/policies">"Snapshot schedules"</a>
+            </p>
         </section>
         <Suspense fallback=move || view! { <p class="muted">"Loading volumes…"</p> }>
             {move || {
@@ -753,9 +810,18 @@ fn volumes_table(rows: Vec<VolumeRowDto>, page: u32, per_page: usize) -> impl In
                     {rows.into_iter().map(|v| {
                         let vm_cell = if v.vm.is_empty() { "-".to_string() } else { v.vm.clone() };
                         let enc = if v.encrypted { "yes" } else { "no" };
+                        let href = if v.node_id.is_empty() {
+                            format!("/volumes/{}", encode_path_segment(&v.name))
+                        } else {
+                            format!(
+                                "/volumes/{}?node={}",
+                                encode_path_segment(&v.name),
+                                encode_path_segment(&v.node_id)
+                            )
+                        };
                         view! {
                             <tr>
-                                <td><strong>{v.name.clone()}</strong></td>
+                                <td><a class="cell-link" href=href><strong>{v.name.clone()}</strong></a></td>
                                 <td>{v.backend.clone()}</td>
                                 <td><code class="inline">{if v.pool.is_empty() { "—".to_string() } else { v.pool.clone() }}</code></td>
                                 <td><code class="inline">{if v.node_id.is_empty() { "—".to_string() } else { v.node_id.clone() }}</code></td>
@@ -967,17 +1033,20 @@ fn operations_table(
                         <th>"Target"</th>
                         <th>"Started"</th>
                         <th>"Finished"</th>
+                        <th>"Data sent"</th>
                         <th>"Cancel"</th>
                     </tr>
                 </thead>
                 <tbody>
                     {rows.into_iter().map(|o| {
                         let cancel = if o.cancel_requested { "yes" } else { "no" };
+                        let sent = if o.send_succeeded { "yes" } else { "no" };
                         let source = display_or_dash(&o.source_node);
                         let target = display_or_dash(&o.target_node);
+                        let href = format!("/operations/{}", encode_path_segment(&o.id));
                         view! {
                             <tr>
-                                <td><code class="inline">{o.id.clone()}</code></td>
+                                <td><a class="cell-link" href=href><code class="inline">{o.id.clone()}</code></a></td>
                                 <td>{o.kind.clone()}</td>
                                 <td>{o.phase.clone()}</td>
                                 <td><code class="inline">{o.vm.clone()}</code></td>
@@ -985,6 +1054,7 @@ fn operations_table(
                                 <td><code class="inline">{target}</code></td>
                                 <td>{o.started_at.clone()}</td>
                                 <td>{o.finished_at.clone()}</td>
+                                <td>{sent}</td>
                                 <td>{cancel}</td>
                             </tr>
                         }
@@ -1121,7 +1191,7 @@ fn node_network_card(node: NodeNetworkDto) -> impl IntoView {
     view! {
         <section class="card node-card">
             <div class="node-card-header">
-                <span class="node-label">{node.hostname.clone()}</span>
+                <a class="node-label" href=format!("/nodes/{}", encode_path_segment(&node.node_id))>{node.hostname.clone()}</a>
                 <code class="inline">{node.node_id.clone()}</code>
                 <span class="muted">{node.address.clone()}</span>
             </div>
@@ -1251,9 +1321,14 @@ fn sdn_table(
                     {rows.into_iter().map(|n| {
                         let nat = if n.enable_outbound_nat { "yes" } else { "no" };
                         let east = if n.east_west_firewall { "yes" } else { "no" };
+                        let href = format!(
+                            "/networks/{}/{}",
+                            encode_path_segment(&n.node_id),
+                            encode_path_segment(&n.name)
+                        );
                         view! {
                         <tr>
-                            <td><strong>{n.name.clone()}</strong></td>
+                            <td><a class="cell-link" href=href><strong>{n.name.clone()}</strong></a></td>
                             <td>{n.network_type.clone()}</td>
                             <td><code class="inline">{n.node_id.clone()}</code></td>
                             <td>{n.external_ip.clone()}</td>
@@ -1358,6 +1433,9 @@ fn storage_overview_view(
             </section>
         </div>
 
+        <StorageClassesSection/>
+        <DiskLayoutsSection/>
+
         <h2 class="section-title" style="margin-top: 1.5rem;">"Nodes"</h2>
         {if has_nodes {
             view! {
@@ -1426,7 +1504,7 @@ fn storage_node_card(
     view! {
         <section class="card node-card">
             <div class="node-card-header">
-                <span class="node-label">{node.hostname.clone()}</span>
+                <a class="node-label" href=format!("/nodes/{}", encode_path_segment(&node.node_id))>{node.hostname.clone()}</a>
                 <code class="inline">{node.node_id.clone()}</code>
                 <span class="muted">{node.address.clone()}</span>
             </div>
@@ -2066,15 +2144,18 @@ fn shared_filesystems_table(
                     </tr>
                 </thead>
                 <tbody>
-                    {rows.into_iter().map(|fs| view! {
+                    {rows.into_iter().map(|fs| {
+                        let href = format!("/ceph/fs/{}", encode_path_segment(&fs.name));
+                        view! {
                         <tr>
-                            <td><strong>{fs.name.clone()}</strong></td>
+                            <td><a class="cell-link" href=href><strong>{fs.name.clone()}</strong></a></td>
                             <td><code class="inline">{display_or_dash(&fs.ceph_cluster)}</code></td>
                             <td>{fs.phase.clone()}</td>
                             <td>{display_or_dash(&fs.health_message)}</td>
                             <td>{fs.quota.clone()}</td>
                             <td>{fs.clients}</td>
                         </tr>
+                        }
                     }).collect_view()}
                 </tbody>
             </table>
@@ -2118,9 +2199,10 @@ fn object_stores_table(
                 <tbody>
                     {rows.into_iter().map(|store| {
                         let tls = if store.tls { "yes" } else { "no" };
+                        let href = format!("/ceph/rgw/{}", encode_path_segment(&store.name));
                         view! {
                             <tr>
-                                <td><strong>{store.name.clone()}</strong></td>
+                                <td><a class="cell-link" href=href><strong>{store.name.clone()}</strong></a></td>
                                 <td><code class="inline">{display_or_dash(&store.ceph_cluster)}</code></td>
                                 <td>{store.phase.clone()}</td>
                                 <td>{store.port}</td>
@@ -2411,6 +2493,11 @@ fn kubernetes_detail_view(detail: KubernetesClusterDetailDto) -> impl IntoView {
     let workers = detail.worker_nodes.clone();
     let health_nodes = detail.node_health.clone();
     let health_error = detail.health_error.clone();
+    let schedule_on_control_plane = detail.schedule_on_control_plane;
+    let local_on = detail.local_provisioner_configured;
+    let local_mode = detail.local_provisioner_mode.clone();
+    let local_class = detail.local_provisioner_class.clone();
+    let local_volumes = detail.local_volumes.clone();
     view! {
         <section class="hero">
             <p class="crumb"><a href="/k8s">"← Kubernetes"</a></p>
@@ -2470,6 +2557,32 @@ fn kubernetes_detail_view(detail: KubernetesClusterDetailDto) -> impl IntoView {
             view! { <div class="empty-note">"No Cilium config on this cluster."</div> }.into_any()
         }}
 
+        <h2 class="section-title">"Scheduling"</h2>
+        <div class="card">
+            <p style="margin: 0;">
+                {if schedule_on_control_plane {
+                    "Control-plane nodes accept workloads."
+                } else {
+                    "Workloads run on worker nodes."
+                }}
+            </p>
+        </div>
+
+        <h2 class="section-title">"Local volumes"</h2>
+        {if local_on {
+            let mode_note = if local_mode == "LVM thin pool" {
+                "One thin pool on each node. Kubernetes does not install a volume provisioner."
+            } else {
+                "Claims are directories on one formatted volume."
+            };
+            view! {
+                <p class="muted">{local_mode.clone()}" · storage class "<code class="inline">{local_class.clone()}</code>". "{mode_note}</p>
+                {k8s_volume_table(local_volumes)}
+            }.into_any()
+        } else {
+            view! { <div class="empty-note">"This cluster does not declare host volumes for Kubernetes."</div> }.into_any()
+        }}
+
         <h2 class="section-title">"High availability"</h2>
         {if detail.ha_configured {
             view! {
@@ -2490,6 +2603,40 @@ fn kubernetes_detail_view(detail: KubernetesClusterDetailDto) -> impl IntoView {
         {k8s_member_table("Workers", workers)}
         {k8s_health_table(health_nodes)}
     }
+}
+
+fn k8s_volume_table(volumes: Vec<KubernetesHostVolumeDto>) -> impl IntoView {
+    if volumes.is_empty() {
+        return view! { <div class="empty-note">"No host volumes are listed."</div> }.into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Node"</th>
+                        <th>"Kind"</th>
+                        <th>"Size"</th>
+                        <th>"Filesystem"</th>
+                        <th>"Where"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {volumes.into_iter().map(|volume| view! {
+                        <tr>
+                            <td><strong>{volume.name.clone()}</strong></td>
+                            <td><a href=format!("/nodes/{}", encode_path_segment(&volume.node_id))>{display_or_dash(&volume.node_id)}</a></td>
+                            <td>{volume.role.clone()}</td>
+                            <td>{volume.size.clone()}</td>
+                            <td>{volume.fs_type.clone()}</td>
+                            <td><code class="inline">{display_or_dash(&volume.mount_path)}</code></td>
+                        </tr>
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }.into_any()
 }
 
 fn k8s_member_table(title: &'static str, nodes: Vec<KubernetesNodeDto>) -> impl IntoView {

@@ -89,6 +89,128 @@ pub fn vm_state_label(state: i32) -> &'static str {
     }
 }
 
+/// Desired state from `VmDesiredState` / `WorkloadDesiredState`.
+pub fn desired_state_label(state: i32) -> &'static str {
+    match state {
+        1 => "Running",
+        2 => "Stopped",
+        _ => "Not set",
+    }
+}
+
+/// Container runtime state from `ContainerState`.
+pub fn container_state_label(state: i32) -> &'static str {
+    match state {
+        1 => "Created",
+        2 => "Running",
+        3 => "Stopped",
+        4 => "Error",
+        _ => "Unknown",
+    }
+}
+
+/// DiskLayout phase from `DiskLayoutPhase`.
+pub fn disk_layout_phase_label(phase: i32) -> &'static str {
+    match phase {
+        1 => "Pending",
+        2 => "Applied",
+        3 => "Refused",
+        4 => "Failed",
+        _ => "Unspecified",
+    }
+}
+
+/// Certificate inventory status from `CertificateStatus`.
+pub fn certificate_status_label(status: i32) -> &'static str {
+    match status {
+        1 => "Active",
+        2 => "Rotated",
+        3 => "Revoked",
+        _ => "Unknown",
+    }
+}
+
+/// Days until a certificate expires. `-1` means the controller does not know.
+pub fn cert_expiry_label(days: i32) -> String {
+    if days < 0 {
+        "Unknown".to_string()
+    } else if days == 0 {
+        "Expires today".to_string()
+    } else {
+        format!("{days} days")
+    }
+}
+
+/// Snapshot policy schedule in plain language.
+pub fn schedule_label(schedule: &str) -> String {
+    match schedule.trim() {
+        "" => "—".to_string(),
+        "@hourly" => "Every hour".to_string(),
+        "@daily" => "Every day".to_string(),
+        other => {
+            if let Some(secs) = other.strip_prefix("every:") {
+                if let Ok(n) = secs.parse::<u64>() {
+                    return format!("Every {n} seconds");
+                }
+            }
+            other.to_string()
+        }
+    }
+}
+
+/// Kubernetes local-provisioner mode. Empty means the shared-folder default.
+pub fn local_volume_mode_label(mode: &str) -> String {
+    match mode.trim() {
+        "" | "shared" => "Shared folder".to_string(),
+        "lvm" => "LVM thin pool".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Guest-visible size. Negative means the controller has not checked.
+pub fn guest_size_label(bytes: i64) -> String {
+    if bytes < 0 {
+        "Not checked".to_string()
+    } else {
+        bytes_human(bytes)
+    }
+}
+
+pub fn device_kind_label(kind: &str) -> &'static str {
+    match kind.trim() {
+        "" | "gpu" => "GPU",
+        "nic" => "Network card",
+        "nvme" => "NVMe",
+        "raw" => "Other PCI",
+        _ => "Device",
+    }
+}
+
+pub fn device_role_label(role: &str) -> String {
+    match role.trim() {
+        "" => "—".to_string(),
+        "compute" => "AI compute".to_string(),
+        "platform" => "Host graphics".to_string(),
+        "passthrough" => "Passthrough".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn revocation_reason_label(code: i32) -> &'static str {
+    match code {
+        1 => "Key compromise",
+        2 => "CA compromise",
+        3 => "Affiliation changed",
+        4 => "Superseded",
+        5 => "Cessation of operation",
+        6 => "Certificate hold",
+        8 => "Remove from CRL",
+        9 => "Privilege withdrawn",
+        10 => "AA compromise",
+        _ => "—",
+    }
+}
+
 /// Human-readable MB (decimal for parity with typical CLI output).
 pub fn memory_mebibytes(bytes: i64) -> String {
     if bytes <= 0 {

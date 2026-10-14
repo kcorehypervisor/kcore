@@ -496,4 +496,350 @@ pub struct KubernetesClusterDetailDto {
     pub node_health: Vec<KubernetesNodeHealthDto>,
     /// Empty when the health RPC succeeded.
     pub health_error: String,
+    /// Control-plane nodes also accept pods.
+    pub schedule_on_control_plane: bool,
+    pub local_provisioner_configured: bool,
+    /// "Shared folder" or "LVM thin pool".
+    pub local_provisioner_mode: String,
+    pub local_provisioner_class: String,
+    pub local_volumes: Vec<KubernetesHostVolumeDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KubernetesHostVolumeDto {
+    pub name: String,
+    pub node_id: String,
+    pub storage_class: String,
+    pub size: String,
+    pub fs_type: String,
+    pub mount_path: String,
+    pub role: String,
+    pub volume_group: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDiskDto {
+    pub name: String,
+    pub path: String,
+    pub bus: String,
+    pub device: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmNicDto {
+    pub network: String,
+    pub model: String,
+    pub mac: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrateNodeDto {
+    pub node_id: String,
+    pub address: String,
+    pub reachable: bool,
+    pub error: String,
+    pub has_session: bool,
+    pub owns_vm: bool,
+    pub summary: String,
+    pub port: i32,
+    pub vmm_alive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDetailDto {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub desired: String,
+    pub node_id: String,
+    pub cpu: i32,
+    pub memory: String,
+    pub disk_size: String,
+    pub backend: String,
+    pub created: String,
+    pub updated: String,
+    pub assigned_ip: String,
+    pub disks: Vec<VmDiskDto>,
+    pub nics: Vec<VmNicDto>,
+    pub gpus: Vec<String>,
+    pub pci: Vec<String>,
+    pub migrate: Vec<MigrateNodeDto>,
+    pub migrate_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeDetailDto {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub attach_state: String,
+    pub size: String,
+    pub guest_size: String,
+    pub vm: String,
+    pub encrypted: bool,
+    pub backend: String,
+    pub pool: String,
+    pub image: String,
+    pub node_id: String,
+    pub serial: String,
+    pub slot: String,
+    pub mount_point: String,
+    pub fs_type: String,
+    pub path: String,
+    pub image_format: String,
+    /// False when the row comes from node LVM inventory only.
+    pub registered: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRowDto {
+    pub id: String,
+    pub name: String,
+    pub volume_id: String,
+    pub volume_name: String,
+    pub size: String,
+    pub protected: bool,
+    pub consistency: String,
+    pub created: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotPolicyDto {
+    pub name: String,
+    pub selector_vm: String,
+    pub selector_volume: String,
+    pub applies_to: String,
+    pub schedule: String,
+    pub keep: i32,
+    pub enabled: bool,
+    pub last_run: String,
+    pub last_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedFilesystemDetailDto {
+    pub name: String,
+    pub ceph_cluster: String,
+    pub fs_name: String,
+    pub phase: String,
+    pub health_message: String,
+    pub quota: String,
+    pub generation: i64,
+    pub clients: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectStoreDetailDto {
+    pub name: String,
+    pub ceph_cluster: String,
+    pub rgw_id: String,
+    pub phase: String,
+    pub health_message: String,
+    pub port: i32,
+    pub tls: bool,
+    pub generation: i64,
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationDetailDto {
+    pub row: VmOperationRowDto,
+    pub updated_at: String,
+    pub detail_lines: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeRowDto {
+    pub id: String,
+    pub hostname: String,
+    pub address: String,
+    pub status: String,
+    pub approval: String,
+    pub dc: String,
+    pub cpu: String,
+    pub memory: String,
+    pub cpu_used: String,
+    pub memory_used: String,
+    pub backend: String,
+    pub luks: String,
+    pub cert: String,
+    pub heartbeat: String,
+    pub labels: String,
+    pub vxlan: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceDto {
+    pub name: String,
+    pub kind: String,
+    pub family: String,
+    pub model: String,
+    pub address: String,
+    pub availability: String,
+    pub blocked_reason: String,
+    pub assigned_vm: String,
+    pub role: String,
+    pub driver: String,
+    pub iommu: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeDetailDto {
+    pub node: NodeRowDto,
+    pub devices: Vec<DeviceDto>,
+    pub devices_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerRowDto {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub state: String,
+    pub status: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerDetailDto {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub state: String,
+    pub status: String,
+    pub node_id: String,
+    pub desired: String,
+    pub network: String,
+    pub command: String,
+    pub env: Vec<String>,
+    pub ports: String,
+    pub backend: String,
+    pub disk_size: String,
+    pub mount: String,
+    pub created: String,
+    pub assigned_ip: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskLayoutRowDto {
+    pub name: String,
+    pub node_id: String,
+    pub phase: String,
+    pub generation: i64,
+    pub observed_generation: i64,
+    pub evacuate: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskLayoutDetailDto {
+    pub row: DiskLayoutRowDto,
+    pub refusal_reason: String,
+    pub layout_nix: String,
+    pub updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageClassDto {
+    pub name: String,
+    pub blurb: String,
+    pub nodes: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageClassDetailDto {
+    pub name: String,
+    pub blurb: String,
+    pub nodes: Vec<NodeRowDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CertificateRowDto {
+    pub serial: String,
+    pub subject: String,
+    pub kind: String,
+    pub node_id: String,
+    pub issuer: String,
+    pub status: String,
+    pub expires: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PkiStatusDto {
+    pub active: i32,
+    pub rotated: i32,
+    pub revoked: i32,
+    pub expired: i32,
+    pub expiring_soon: i32,
+    pub warn_before_days: i32,
+    pub renew_before_days: i32,
+    pub rotation_enabled: bool,
+    pub crl_number: i64,
+    pub crl_available: bool,
+    pub sub_ca_available: bool,
+    pub revocation_mode: String,
+    pub pki_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrlSummaryDto {
+    pub available: bool,
+    pub number: i64,
+    pub revoked: i32,
+    pub this_update: String,
+    pub next_update: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterHealthDto {
+    pub status: String,
+    pub headline: String,
+    pub ready_nodes: i32,
+    pub not_ready_nodes: i32,
+    pub unschedulable_nodes: i32,
+    pub pending_nodes: i32,
+    pub vm_count: i32,
+    pub vms_on_not_ready_nodes: i32,
+    pub replication_conflicts: i32,
+    pub certificates_expiring_soon: i32,
+    pub conditions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshKeyRowDto {
+    pub name: String,
+    pub created: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshKeyDetailDto {
+    pub name: String,
+    pub created: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SbomSummaryDto {
+    pub kind: String,
+    pub title: String,
+    pub format: String,
+    pub spec_version: String,
+    pub filename: String,
+    pub sha256: String,
+    pub source: String,
+    pub generator: String,
+    pub signed: bool,
+    pub signing_scheme: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CryptoConfigDto {
+    pub fips_certificate: String,
+    pub rate_limit: String,
+    pub revocation_mode: String,
+    pub signing_scheme: String,
 }

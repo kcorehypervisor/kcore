@@ -4,13 +4,19 @@ use crate::ceph_status::{self, capacity_dto, capacity_from_status_json, health_f
 use crate::controller_client::controller_proto;
 use crate::dto::{
     AccessControlEntryDto, AuditEventDto, CephClusterDetailDto, CephClusterRowDto,
-    CephDeviceClassDto, CephMemberDto, CephPoolUsageDto, ComplianceDto, DbmsDetailDto, DbmsRowDto,
-    HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto, KubernetesNodeDto,
-    KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto, LvmVolumeGroupDto,
-    NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto, NodeSummaryDto,
-    ObjectStoreRowDto, ReplicationConflictDto, ReplicationIncomingDto, ReplicationOutgoingDto,
-    ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto,
-    VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
+    CephDeviceClassDto, CephMemberDto, CephPoolUsageDto, CertificateRowDto, ClusterHealthDto,
+    ComplianceDto, ContainerDetailDto, ContainerRowDto, CrlSummaryDto, CryptoConfigDto,
+    DbmsDetailDto, DbmsRowDto, DeviceDto, DiskLayoutDetailDto, DiskLayoutRowDto, HostInterfaceDto,
+    KubernetesClusterDetailDto, KubernetesClusterRowDto, KubernetesHostVolumeDto,
+    KubernetesNodeDto, KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
+    LvmVolumeGroupDto, MigrateNodeDto, NetworkOverviewDto, NetworkRowDto, NodeDetailDto,
+    NodeNetworkDto, NodeRowDto, NodeStorageDto, NodeSummaryDto, ObjectStoreDetailDto,
+    ObjectStoreRowDto, OperationDetailDto, PkiStatusDto, ReplicationConflictDto,
+    ReplicationIncomingDto, ReplicationOutgoingDto, ReplicationStatusDto, SbomSummaryDto,
+    SharedFilesystemDetailDto, SharedFilesystemRowDto, SnapshotPolicyDto, SnapshotRowDto,
+    SshKeyDetailDto, SshKeyRowDto, StorageClassDetailDto, StorageClassDto, StorageDiskRowDto,
+    StorageOverviewDto, VmDetailDto, VmDiskDto, VmNicDto, VmOperationRowDto, VmRowDto, VmsPageDto,
+    VolumeDetailDto, VolumeRowDto,
 };
 use crate::format::{self, paginate_by_name};
 
@@ -933,6 +939,27 @@ pub fn kubernetes_detail_from_proto(
     let cilium = spec.cilium_config.unwrap_or_default();
     let ha_configured = spec.high_availability.is_some();
     let ha = spec.high_availability.unwrap_or_default();
+    let schedule_on_control_plane = spec.schedule_on_control_plane;
+    let local = spec.local_provisioner.unwrap_or_default();
+    let local_provisioner_configured = local.enabled || !local.volumes.is_empty();
+    let local_provisioner_mode = if local_provisioner_configured {
+        format::local_volume_mode_label(&local.mode)
+    } else {
+        String::new()
+    };
+    let local_provisioner_class = if !local_provisioner_configured {
+        String::new()
+    } else if local.storage_class_name.trim().is_empty() {
+        "local-path".to_string()
+    } else {
+        local.storage_class_name.clone()
+    };
+    let cluster_name = cluster.name.clone();
+    let local_volumes = local
+        .volumes
+        .into_iter()
+        .map(|volume| kubernetes_host_volume(volume, &cluster_name))
+        .collect();
     let (overall_health, health_fields, health_error, node_health) = match health {
         Ok(health) => {
             let nodes = health
@@ -1003,6 +1030,820 @@ pub fn kubernetes_detail_from_proto(
         api_server_reachable: health_fields.6,
         node_health,
         health_error,
+        schedule_on_control_plane,
+        local_provisioner_configured,
+        local_provisioner_mode,
+        local_provisioner_class,
+        local_volumes,
+    }
+}
+
+fn kubernetes_host_volume(
+    volume: controller_proto::KubernetesHostVolume,
+    cluster_name: &str,
+) -> KubernetesHostVolumeDto {
+    let name = volume.name.clone();
+    let role = if volume.role.trim() == "pool" {
+        "Thin pool"
+    } else {
+        "Filesystem"
+    };
+    let mount_path = if role == "Thin pool" {
+        if volume.volume_group.trim().is_empty() {
+            "—".to_string()
+        } else {
+            volume.volume_group.clone()
+        }
+    } else if volume.mount_path.trim().is_empty() {
+        format!("/mnt/kcore/{cluster_name}/{name}")
+    } else {
+        volume.mount_path.clone()
+    };
+    let fs_type = if volume.fs_type.trim().is_empty() {
+        "ext4".to_string()
+    } else {
+        volume.fs_type
+    };
+    KubernetesHostVolumeDto {
+        name,
+        node_id: volume.node_id,
+        storage_class: format::storage_backend_name(&volume.storage_class),
+        size: format::bytes_human(volume.size_bytes),
+        fs_type,
+        mount_path,
+        role: role.to_string(),
+        volume_group: volume.volume_group,
+    }
+}
+
+pub fn vm_detail_from_proto(
+    response: controller_proto::GetVmResponse,
+    migrate: Result<controller_proto::GetLiveMigrateReceiveStatusResponse, String>,
+) -> VmDetailDto {
+    let spec = response.spec.unwrap_or_default();
+    let status = response.status.unwrap_or_default();
+    let (migrate_nodes, migrate_error) = match migrate {
+        Ok(status) => (migrate_nodes_from_proto(status), String::new()),
+        Err(error) => (Vec::new(), error),
+    };
+    VmDetailDto {
+        id: spec.id,
+        name: spec.name,
+        state: format::vm_state_label(status.state).to_string(),
+        desired: format::desired_state_label(spec.desired_state).to_string(),
+        node_id: response.node_id,
+        cpu: spec.cpu,
+        memory: format::memory_mebibytes(spec.memory_bytes),
+        disk_size: format::bytes_human(spec.storage_size_bytes),
+        backend: format::storage_backend_name(&spec.storage_backend),
+        created: timestamp_label(status.created_at),
+        updated: timestamp_label(status.updated_at),
+        assigned_ip: response.assigned_ip,
+        disks: spec
+            .disks
+            .into_iter()
+            .map(|disk| VmDiskDto {
+                name: disk.name,
+                path: disk.backend_handle,
+                bus: disk.bus,
+                device: disk.device,
+            })
+            .collect(),
+        nics: spec
+            .nics
+            .into_iter()
+            .map(|nic| VmNicDto {
+                network: nic.network,
+                model: nic.model,
+                mac: nic.mac_address,
+            })
+            .collect(),
+        gpus: spec.gpus,
+        pci: spec.pci_devices,
+        migrate: migrate_nodes,
+        migrate_error,
+    }
+}
+
+fn migrate_nodes_from_proto(
+    status: controller_proto::GetLiveMigrateReceiveStatusResponse,
+) -> Vec<MigrateNodeDto> {
+    status
+        .nodes
+        .into_iter()
+        .map(|node| {
+            let state = node.state.unwrap_or_default();
+            MigrateNodeDto {
+                node_id: node.node_id,
+                address: node.node_address,
+                reachable: node.reachable,
+                error: node.error,
+                has_session: state.has_session,
+                owns_vm: node.owns_vm,
+                summary: state.summary,
+                port: state.port,
+                vmm_alive: state.vmm_alive,
+            }
+        })
+        .collect()
+}
+
+pub fn volume_detail_from_info(
+    volume: controller_proto::VolumeInfo,
+    registered: bool,
+) -> VolumeDetailDto {
+    let vm = volume_vm_label(&volume);
+    let slot = if registered {
+        volume.slot.to_string()
+    } else {
+        "—".to_string()
+    };
+    VolumeDetailDto {
+        id: volume.id,
+        name: volume.name,
+        role: volume.role,
+        attach_state: volume.attach_state,
+        size: format::bytes_human(volume.storage_size_bytes),
+        guest_size: format::guest_size_label(volume.guest_visible_bytes),
+        vm,
+        encrypted: volume.encrypted,
+        backend: format::storage_backend_name(&volume.storage_backend),
+        pool: volume.pool,
+        image: volume.image,
+        node_id: volume.node_id,
+        serial: volume.serial,
+        slot,
+        mount_point: volume.mount_point,
+        fs_type: volume.fs_type,
+        path: volume.backend_handle,
+        image_format: volume.image_format,
+        registered,
+        note: String::new(),
+    }
+}
+
+/// An LVM logical volume that the node reported but the controller has not registered.
+pub fn inventory_volume_detail(
+    name: &str,
+    node: &str,
+    storage: &controller_proto::GetStorageOverviewResponse,
+) -> Option<VolumeDetailDto> {
+    let name = name.trim();
+    let node = node.trim();
+    for host in &storage.nodes {
+        if !node.is_empty() && host.node_id != node {
+            continue;
+        }
+        if !host.lvm_inventory_ok {
+            continue;
+        }
+        for lv in &host.lvm_logical_volumes {
+            if lv.name.trim() != name {
+                continue;
+            }
+            return Some(VolumeDetailDto {
+                id: String::new(),
+                name: lv.name.clone(),
+                role: String::new(),
+                attach_state: String::new(),
+                size: format::bytes_human(lv.size_bytes),
+                guest_size: "Not checked".to_string(),
+                vm: String::new(),
+                encrypted: false,
+                backend: "LVM".to_string(),
+                pool: lv.vg_name.clone(),
+                image: String::new(),
+                node_id: host.node_id.clone(),
+                serial: String::new(),
+                slot: "—".to_string(),
+                mount_point: String::new(),
+                fs_type: String::new(),
+                path: lv.path.clone(),
+                image_format: String::new(),
+                registered: false,
+                note: "Reported by the node. It is not a registered kcore volume, so attach state and encryption are unknown.".to_string(),
+            });
+        }
+    }
+    None
+}
+
+pub fn snapshots_from_proto(
+    snapshots: Vec<controller_proto::VolumeSnapshotInfo>,
+) -> Vec<SnapshotRowDto> {
+    let mut rows: Vec<SnapshotRowDto> = snapshots
+        .into_iter()
+        .map(|snap| SnapshotRowDto {
+            id: snap.id,
+            name: snap.name,
+            volume_id: snap.volume_id,
+            volume_name: snap.volume_name,
+            size: format::bytes_human(snap.size_bytes),
+            protected: snap.protected,
+            consistency: snap.consistency,
+            created: timestamp_label(snap.created_at),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn snapshot_policies_from_proto(
+    policies: Vec<controller_proto::SnapshotPolicy>,
+) -> Vec<SnapshotPolicyDto> {
+    let mut rows: Vec<SnapshotPolicyDto> = policies
+        .into_iter()
+        .map(snapshot_policy_from_proto)
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn snapshot_policy_from_proto(policy: controller_proto::SnapshotPolicy) -> SnapshotPolicyDto {
+    let applies_to = if !policy.selector_volume.is_empty() && !policy.selector_vm.is_empty() {
+        format!(
+            "Volume {} on VM {}",
+            policy.selector_volume, policy.selector_vm
+        )
+    } else if !policy.selector_volume.is_empty() {
+        format!("Volume {}", policy.selector_volume)
+    } else if !policy.selector_vm.is_empty() {
+        format!("VM {}", policy.selector_vm)
+    } else {
+        "Every volume".to_string()
+    };
+    SnapshotPolicyDto {
+        name: policy.name,
+        selector_vm: policy.selector_vm,
+        selector_volume: policy.selector_volume,
+        applies_to,
+        schedule: format::schedule_label(&policy.schedule),
+        keep: policy.keep,
+        enabled: policy.enabled,
+        last_run: policy.last_run_at,
+        last_message: policy.last_message,
+    }
+}
+
+pub fn shared_filesystem_detail_from_proto(
+    fs: controller_proto::SharedFilesystem,
+) -> SharedFilesystemDetailDto {
+    let spec = fs.spec.unwrap_or_default();
+    let status = fs.status.unwrap_or_default();
+    let quota = if spec.quota_bytes <= 0 {
+        "No quota".to_string()
+    } else {
+        format::bytes_human(spec.quota_bytes)
+    };
+    let fs_name = if spec.fs_name.trim().is_empty() {
+        fs.name.clone()
+    } else {
+        spec.fs_name
+    };
+    let clients = spec
+        .clients
+        .into_iter()
+        .map(|client| {
+            if client.paths.is_empty() {
+                client.name
+            } else {
+                format!("{} ({})", client.name, client.paths.join(", "))
+            }
+        })
+        .collect();
+    SharedFilesystemDetailDto {
+        name: fs.name,
+        ceph_cluster: spec.ceph_cluster,
+        fs_name,
+        phase: format::service_phase_label(status.phase).to_string(),
+        health_message: status.health_message,
+        quota,
+        generation: fs.generation,
+        clients,
+    }
+}
+
+pub fn object_store_detail_from_proto(
+    store: controller_proto::ObjectStore,
+) -> ObjectStoreDetailDto {
+    let spec = store.spec.unwrap_or_default();
+    let status = store.status.unwrap_or_default();
+    let rgw_id = if spec.rgw_id.trim().is_empty() {
+        store.name.clone()
+    } else {
+        spec.rgw_id
+    };
+    ObjectStoreDetailDto {
+        name: store.name,
+        ceph_cluster: spec.ceph_cluster,
+        rgw_id,
+        phase: format::service_phase_label(status.phase).to_string(),
+        health_message: status.health_message,
+        port: spec.port,
+        tls: spec.tls,
+        generation: store.generation,
+        members: spec.members,
+    }
+}
+
+pub fn operation_detail_from_proto(op: controller_proto::VmOperation) -> OperationDetailDto {
+    let updated_at = timestamp_label(op.updated_at);
+    let detail_lines = detail_lines(&op.detail_json);
+    let mut row = vm_operations_from_proto(vec![op]);
+    OperationDetailDto {
+        row: row.pop().unwrap_or_else(|| VmOperationRowDto {
+            id: String::new(),
+            kind: String::new(),
+            phase: String::new(),
+            vm: String::new(),
+            cancel_requested: false,
+            send_succeeded: false,
+            source_node: String::new(),
+            target_node: String::new(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            detail: String::new(),
+        }),
+        updated_at,
+        detail_lines,
+    }
+}
+
+pub fn detail_lines(raw: &str) -> Vec<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "{}" || trimmed == "null" {
+        return Vec::new();
+    }
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let mut lines: Vec<(String, String)> = map
+            .into_iter()
+            .map(|(key, value)| (key, json_scalar(value)))
+            .collect();
+        lines.sort_by(|a, b| a.0.cmp(&b.0));
+        return lines;
+    }
+    vec![("Detail".to_string(), trimmed.to_string())]
+}
+
+fn json_scalar(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text,
+        serde_json::Value::Null => "—".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn node_from_proto(node: controller_proto::NodeInfo) -> NodeRowDto {
+    let (cpu, memory) = match node.capacity {
+        Some(cap) => (
+            cap.cpu_cores.to_string(),
+            format::bytes_human(cap.memory_bytes),
+        ),
+        None => ("—".to_string(), "—".to_string()),
+    };
+    let (cpu_used, memory_used) = match node.usage {
+        Some(usage) => (
+            usage.cpu_cores_used.to_string(),
+            format::bytes_human(usage.memory_bytes_used),
+        ),
+        None => ("—".to_string(), "—".to_string()),
+    };
+    let labels = if node.labels.is_empty() {
+        "—".to_string()
+    } else {
+        node.labels.join(", ")
+    };
+    NodeRowDto {
+        id: node.node_id,
+        hostname: node.hostname,
+        address: node.address,
+        status: node.status,
+        approval: node.approval_status,
+        dc: node.dc_id,
+        cpu,
+        memory,
+        cpu_used,
+        memory_used,
+        backend: format::storage_backend_label(node.storage_backend).to_string(),
+        luks: if node.luks_method.is_empty() {
+            "Unknown".to_string()
+        } else {
+            node.luks_method
+        },
+        cert: format::cert_expiry_label(node.cert_expiry_days),
+        heartbeat: timestamp_label(node.last_heartbeat),
+        labels,
+        vxlan: if node.disable_vxlan {
+            "Off".to_string()
+        } else {
+            "On".to_string()
+        },
+    }
+}
+
+pub fn nodes_from_proto(nodes: Vec<controller_proto::NodeInfo>) -> Vec<NodeRowDto> {
+    let mut rows: Vec<NodeRowDto> = nodes.into_iter().map(node_from_proto).collect();
+    rows.sort_by(|a, b| a.hostname.cmp(&b.hostname).then(a.id.cmp(&b.id)));
+    rows
+}
+
+pub fn node_detail_from_proto(
+    node: controller_proto::NodeInfo,
+    devices: Result<Vec<controller_proto::GpuInfo>, String>,
+) -> NodeDetailDto {
+    let (devices, devices_error) = match devices {
+        Ok(rows) => (devices_from_proto(rows), String::new()),
+        Err(error) => (Vec::new(), error),
+    };
+    NodeDetailDto {
+        node: node_from_proto(node),
+        devices,
+        devices_error,
+    }
+}
+
+fn devices_from_proto(devices: Vec<controller_proto::GpuInfo>) -> Vec<DeviceDto> {
+    let mut rows: Vec<DeviceDto> = devices
+        .into_iter()
+        .map(|device| {
+            let availability = if !device.assigned_vm.is_empty() {
+                "In use".to_string()
+            } else if device.assignable {
+                "Free".to_string()
+            } else {
+                "Not assignable".to_string()
+            };
+            let iommu = if device.iommu_group < 0 {
+                "—".to_string()
+            } else {
+                device.iommu_group.to_string()
+            };
+            DeviceDto {
+                name: device.name,
+                kind: format::device_kind_label(&device.kind).to_string(),
+                family: device.family,
+                model: device.model,
+                address: device.address,
+                availability,
+                blocked_reason: device.blocked_reason,
+                assigned_vm: device.assigned_vm,
+                role: format::device_role_label(&device.role),
+                driver: device.driver,
+                iommu,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
+    rows
+}
+
+pub fn containers_from_proto(
+    containers: Vec<controller_proto::ContainerInfo>,
+) -> Vec<ContainerRowDto> {
+    let mut rows: Vec<ContainerRowDto> = containers
+        .into_iter()
+        .map(|container| ContainerRowDto {
+            id: container.id,
+            name: container.name,
+            image: container.image,
+            state: format::container_state_label(container.state).to_string(),
+            status: container.status,
+            node_id: container.node_id,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn container_detail_from_proto(
+    response: controller_proto::GetWorkloadResponse,
+) -> ContainerDetailDto {
+    let spec = response.container_spec.unwrap_or_default();
+    let info = response.container_info.unwrap_or_default();
+    let mut env: Vec<String> = spec
+        .env
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    env.sort();
+    ContainerDetailDto {
+        id: info.id,
+        name: if info.name.is_empty() {
+            spec.name
+        } else {
+            info.name
+        },
+        image: if info.image.is_empty() {
+            spec.image
+        } else {
+            info.image
+        },
+        state: format::container_state_label(info.state).to_string(),
+        status: info.status,
+        node_id: response.node_id,
+        desired: format::desired_state_label(spec.desired_state).to_string(),
+        network: spec.network,
+        command: if spec.command.is_empty() {
+            "—".to_string()
+        } else {
+            spec.command.join(" ")
+        },
+        env,
+        ports: if spec.ports.is_empty() {
+            "—".to_string()
+        } else {
+            spec.ports.join(", ")
+        },
+        backend: format::storage_backend_name(&spec.storage_backend),
+        disk_size: format::bytes_human(spec.storage_size_bytes),
+        mount: spec.mount_target,
+        created: timestamp_label(info.created_at),
+        assigned_ip: response.assigned_ip,
+    }
+}
+
+pub fn disk_layouts_from_proto(
+    layouts: Vec<controller_proto::DiskLayoutSummary>,
+) -> Vec<DiskLayoutRowDto> {
+    let mut rows: Vec<DiskLayoutRowDto> = layouts
+        .into_iter()
+        .map(|summary| disk_layout_row(summary.disk_layout.unwrap_or_default(), summary.status))
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+fn disk_layout_row(
+    layout: controller_proto::DiskLayout,
+    status: Option<controller_proto::DiskLayoutStatus>,
+) -> DiskLayoutRowDto {
+    let status = status.unwrap_or_default();
+    DiskLayoutRowDto {
+        name: layout.name,
+        node_id: layout.node_id,
+        phase: format::disk_layout_phase_label(status.phase).to_string(),
+        generation: layout.generation,
+        observed_generation: status.observed_generation,
+        evacuate: layout.evacuate,
+        message: status.message,
+    }
+}
+
+pub fn disk_layout_detail_from_proto(
+    response: controller_proto::GetDiskLayoutResponse,
+) -> DiskLayoutDetailDto {
+    let layout = response.disk_layout.unwrap_or_default();
+    let status = response.status.unwrap_or_default();
+    let updated = timestamp_label(layout.updated_at);
+    DiskLayoutDetailDto {
+        refusal_reason: status.refusal_reason.clone(),
+        layout_nix: layout.layout_nix.clone(),
+        updated,
+        row: disk_layout_row(layout, Some(status)),
+    }
+}
+
+pub fn storage_class_blurb(name: &str) -> &'static str {
+    match name {
+        "filesystem" => "VM disks are files on the node.",
+        "lvm" => "VM disks are LVM logical volumes.",
+        "zfs" => "VM disks are ZFS volumes.",
+        "ceph" => "VM disks are Ceph RBD images.",
+        _ => "This node has not declared a storage type.",
+    }
+}
+
+pub fn storage_classes_from_nodes(nodes: &[NodeRowDto]) -> Vec<StorageClassDto> {
+    const ORDER: [&str; 5] = ["filesystem", "lvm", "zfs", "ceph", "unspecified"];
+    ORDER
+        .into_iter()
+        .map(|name| {
+            let count = nodes
+                .iter()
+                .filter(|node| node.backend.eq_ignore_ascii_case(class_backend_label(name)))
+                .count() as i32;
+            StorageClassDto {
+                name: name.to_string(),
+                blurb: storage_class_blurb(name).to_string(),
+                nodes: count,
+            }
+        })
+        .collect()
+}
+
+fn class_backend_label(name: &str) -> &'static str {
+    match name {
+        "filesystem" => "Filesystem",
+        "lvm" => "LVM",
+        "zfs" => "ZFS",
+        "ceph" => "Ceph",
+        _ => "Unspecified",
+    }
+}
+
+pub fn storage_class_detail(name: &str, nodes: Vec<NodeRowDto>) -> StorageClassDetailDto {
+    let key = name.trim().to_ascii_lowercase();
+    let label = class_backend_label(&key);
+    let blurb = storage_class_blurb(&key).to_string();
+    let nodes = nodes
+        .into_iter()
+        .filter(|node| node.backend.eq_ignore_ascii_case(label))
+        .collect();
+    let name = if matches!(
+        key.as_str(),
+        "filesystem" | "lvm" | "zfs" | "ceph" | "unspecified"
+    ) {
+        key
+    } else {
+        name.trim().to_string()
+    };
+    StorageClassDetailDto { name, blurb, nodes }
+}
+
+pub fn certificates_from_proto(
+    certs: Vec<controller_proto::CertificateInfo>,
+) -> Vec<CertificateRowDto> {
+    let mut rows: Vec<CertificateRowDto> = certs
+        .into_iter()
+        .map(|cert| {
+            let kind = match cert.identity_kind.as_str() {
+                "node" => "Node",
+                "operator" => "Operator",
+                "controller" => "Controller",
+                "sub-ca" => "Sub-CA",
+                other => other,
+            };
+            CertificateRowDto {
+                serial: cert.serial_hex,
+                subject: cert.subject_cn,
+                kind: kind.to_string(),
+                node_id: cert.node_id,
+                issuer: cert.issuer_cn,
+                status: format::certificate_status_label(cert.status).to_string(),
+                expires: format::cert_expiry_label(cert.days_until_expiry),
+                reason: if cert.status == 3 {
+                    format::revocation_reason_label(cert.revocation_reason).to_string()
+                } else {
+                    "—".to_string()
+                },
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.expires.cmp(&b.expires).then(a.subject.cmp(&b.subject)));
+    rows
+}
+
+pub fn pki_status_from_proto(status: controller_proto::GetPkiStatusResponse) -> PkiStatusDto {
+    PkiStatusDto {
+        active: status.active_count,
+        rotated: status.rotated_count,
+        revoked: status.revoked_count,
+        expired: status.expired_count,
+        expiring_soon: status.expiring_soon_count,
+        warn_before_days: status.warn_before_days,
+        renew_before_days: status.renew_before_days,
+        rotation_enabled: status.rotation_enabled,
+        crl_number: status.crl_number,
+        crl_available: status.crl_available,
+        sub_ca_available: status.sub_ca_available,
+        revocation_mode: status.revocation_fail_mode,
+        pki_url: status.pki_http_base_url,
+    }
+}
+
+pub fn crl_summary_from_proto(crl: controller_proto::GetCrlResponse) -> CrlSummaryDto {
+    CrlSummaryDto {
+        available: crl.success,
+        number: crl.crl_number,
+        revoked: crl.revoked_count,
+        this_update: timestamp_label(crl.this_update),
+        next_update: timestamp_label(crl.next_update),
+        message: crl.message,
+    }
+}
+
+pub fn cluster_health_from_proto(
+    health: controller_proto::GetClusterHealthResponse,
+) -> ClusterHealthDto {
+    let headline = match health.status.trim().to_ascii_lowercase().as_str() {
+        "healthy" => "Cluster is healthy",
+        "degraded" => "Cluster needs attention",
+        "unhealthy" => "Cluster is unhealthy",
+        other => {
+            if other.is_empty() {
+                "Cluster status is unknown"
+            } else {
+                return ClusterHealthDto {
+                    headline: format::kubernetes_phase_label(other),
+                    status: health.status,
+                    ready_nodes: health.ready_nodes,
+                    not_ready_nodes: health.not_ready_nodes,
+                    unschedulable_nodes: health.unschedulable_nodes,
+                    pending_nodes: health.pending_nodes,
+                    vm_count: health.vm_count,
+                    vms_on_not_ready_nodes: health.vms_on_not_ready_nodes,
+                    replication_conflicts: health.replication_conflicts,
+                    certificates_expiring_soon: health.certificates_expiring_soon,
+                    conditions: health.conditions,
+                };
+            }
+        }
+    };
+    ClusterHealthDto {
+        status: health.status,
+        headline: headline.to_string(),
+        ready_nodes: health.ready_nodes,
+        not_ready_nodes: health.not_ready_nodes,
+        unschedulable_nodes: health.unschedulable_nodes,
+        pending_nodes: health.pending_nodes,
+        vm_count: health.vm_count,
+        vms_on_not_ready_nodes: health.vms_on_not_ready_nodes,
+        replication_conflicts: health.replication_conflicts,
+        certificates_expiring_soon: health.certificates_expiring_soon,
+        conditions: health.conditions,
+    }
+}
+
+pub fn ssh_keys_from_proto(keys: Vec<controller_proto::SshKeyInfo>) -> Vec<SshKeyRowDto> {
+    let mut rows: Vec<SshKeyRowDto> = keys
+        .into_iter()
+        .map(|key| SshKeyRowDto {
+            name: key.name,
+            created: timestamp_label(key.created_at),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn ssh_key_detail_from_proto(key: controller_proto::SshKeyInfo) -> SshKeyDetailDto {
+    SshKeyDetailDto {
+        name: key.name,
+        created: timestamp_label(key.created_at),
+        public_key: key.public_key,
+    }
+}
+
+pub fn sbom_summary_from_proto(
+    kind: &str,
+    response: Result<controller_proto::ExportSbomResponse, String>,
+) -> SbomSummaryDto {
+    let title = match kind {
+        "iso-closure" => "Install image",
+        _ => "Crate list",
+    };
+    match response {
+        Ok(doc) => {
+            let source = match doc.source.as_str() {
+                "file" => "Installed file".to_string(),
+                "embedded" => "Built into the controller".to_string(),
+                "" => "—".to_string(),
+                other => other.to_string(),
+            };
+            SbomSummaryDto {
+                kind: kind.to_string(),
+                title: title.to_string(),
+                format: doc.format,
+                spec_version: doc.spec_version,
+                filename: doc.filename,
+                sha256: doc.sha256,
+                source,
+                generator: doc.generator,
+                signed: doc.signature_present,
+                signing_scheme: doc.signing_scheme,
+                error: String::new(),
+            }
+        }
+        Err(error) => SbomSummaryDto {
+            kind: kind.to_string(),
+            title: title.to_string(),
+            format: String::new(),
+            spec_version: String::new(),
+            filename: String::new(),
+            sha256: String::new(),
+            source: String::new(),
+            generator: String::new(),
+            signed: false,
+            signing_scheme: String::new(),
+            error,
+        },
+    }
+}
+
+pub fn crypto_config_from_proto(cfg: controller_proto::GetCryptoConfigResponse) -> CryptoConfigDto {
+    let rate_limit = if cfg.rate_limit_enabled {
+        format!(
+            "{} requests/s, burst {}",
+            cfg.rate_limit_requests_per_second, cfg.rate_limit_burst
+        )
+    } else {
+        "Off".to_string()
+    };
+    CryptoConfigDto {
+        fips_certificate: cfg.fips_certificate,
+        rate_limit,
+        revocation_mode: cfg.revocation_fail_mode,
+        signing_scheme: cfg.signing_scheme,
     }
 }
 
@@ -1736,6 +2577,62 @@ mod tests {
                 active_node_ids: vec!["node-107".into(), "node-119".into()],
             }),
         }
+    }
+
+    #[test]
+    fn kubernetes_detail_explains_scheduling_and_local_volumes() {
+        let mut cluster = sample_k8s_cluster();
+        let spec = cluster.spec.as_mut().expect("spec");
+        spec.schedule_on_control_plane = true;
+        spec.local_provisioner = Some(controller_proto::KubernetesLocalProvisioner {
+            enabled: true,
+            storage_class_name: String::new(),
+            mode: "lvm".into(),
+            volumes: vec![controller_proto::KubernetesHostVolume {
+                name: "kdata".into(),
+                node_id: "node-107".into(),
+                storage_class: "lvm".into(),
+                size_bytes: 50 * 1024 * 1024 * 1024,
+                fs_type: String::new(),
+                mount_path: String::new(),
+                role: "pool".into(),
+                volume_group: "vg_kcore".into(),
+            }],
+        });
+        let detail = kubernetes_detail_from_proto(cluster, Err("health skipped".into()));
+        assert!(detail.schedule_on_control_plane);
+        assert_eq!(detail.local_provisioner_mode, "LVM thin pool");
+        assert_eq!(detail.local_provisioner_class, "local-path");
+        assert_eq!(detail.local_volumes[0].role, "Thin pool");
+        assert_eq!(detail.local_volumes[0].mount_path, "vg_kcore");
+        assert_eq!(detail.local_volumes[0].fs_type, "ext4");
+    }
+
+    #[test]
+    fn snapshot_policy_schedule_is_plain_language() {
+        let policy = snapshot_policy_from_proto(controller_proto::SnapshotPolicy {
+            name: "daily".into(),
+            selector_volume: "pg".into(),
+            schedule: "@daily".into(),
+            keep: 7,
+            enabled: true,
+            ..Default::default()
+        });
+        assert_eq!(policy.schedule, "Every day");
+        assert_eq!(policy.applies_to, "Volume pg");
+    }
+
+    #[test]
+    fn cluster_health_headline_uses_plain_words() {
+        let health = cluster_health_from_proto(controller_proto::GetClusterHealthResponse {
+            status: "degraded".into(),
+            ready_nodes: 2,
+            not_ready_nodes: 1,
+            conditions: vec!["node-103 is not ready".into()],
+            ..Default::default()
+        });
+        assert_eq!(health.headline, "Cluster needs attention");
+        assert_eq!(health.conditions.len(), 1);
     }
 }
 
