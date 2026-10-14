@@ -1989,6 +1989,15 @@ name = "kcore-sanitize"
 version = "0.3.0"
 
 [[package]]
+name = "kcore-verification"
+version = "0.3.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kctl"
 version = "0.3.0"
 dependencies = [

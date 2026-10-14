@@ -74,7 +74,8 @@ This is a form of lightweight formal verification. Every `cargo build` is a proo
 For the HA-specific replication and datacenter plan that will be modeled with TLA+, see:
 
 - `docs/ha-crdt-replication.md`
-- `specs/tla/` (starter Phase 1 model files and TLC configs)
+- `specs/tla/` (product TLC models and trace fixtures)
+- `specs/tla/model/` (compensation, replication reservations, and a second reconcile model, also run by `make test-tla`)
 
 ### Prusti and Creusot (deductive verification)
 
@@ -133,7 +134,7 @@ proptest! {
 
 ### Phase 2: Kani harnesses for critical pure functions
 
-**Status:** shipped. Every bounded model-checking proof lives in a single dedicated crate, [`crates/kcore-sanitize`](../crates/kcore-sanitize/src/lib.rs), which contains:
+**Status:** shipped. The proofs the CI job runs live in [`crates/kcore-sanitize`](../crates/kcore-sanitize/src/lib.rs). `kcore-disko-types` has more local harnesses. [`crates/kcore-verification`](../crates/kcore-verification/src/lib.rs) is a separate design model with its own proptest suites and four local Kani harnesses; those do not prove the product functions. `kcore-sanitize` contains:
 
 - `nix_escape` and `sanitize_nix_attr_key` — Nix string-literal escaping.
 - `path_segments_include_dot_dot` and `assert_safe_path` — generic path-traversal guards used by `kcore-controller` and `kctl`.
@@ -218,6 +219,7 @@ cargo test -p kcore-controller proptests
 - `ControllerNodeReconcile.tla` — controller ↔ node reconciliation.
 - `ControllerReplication.tla` — single-DC replication protocol.
 - `CrossDcReplication.tla` — multi-DC replication with safety **and** liveness properties; the latest local run explored 206 280 distinct states across 3 941 400 generated states with no error found.
+- `model/` — compensation executor, replication reservations, and a second reconcile and disk-layout model. The same `make test-tla` run checks them. They do not replace the product specs above.
 
 Run locally:
 
