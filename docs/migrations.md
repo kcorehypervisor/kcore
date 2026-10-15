@@ -26,15 +26,17 @@ schema_version
 
 ## Current schema version
 
-**57**
+**59**
 
 `Database::migrate` applies each `up`. `Database::migrate_down(target)` applies
 the matching `down` from `crates/controller/src/schema_down.rs` and refuses a
 version marked irreversible. Before an `up` from an older file, the controller
 writes a SQLite backup next to the database named
-`<db>.pre-migrate-<version>`. Version 57 adds `node_host_status` only, so a
-controller built for version 56 can still open the file. A controlled rollback
-to 56 drops that table before the old generation starts.
+`<db>.pre-migrate-<version>`. Version 57 adds `node_host_status`. Version 58
+has no schema change, so a database already stamped 58 still runs version 59
+and gains that table when it is missing. A controller built for version 56 can
+still open the file. A controlled rollback to 56 drops `node_host_status`
+before the old generation starts. Rolling back only to 57 keeps the table.
 
 ## Current schema version (historical note)
 
@@ -62,6 +64,8 @@ migrations are 38–45 in that file.
 | 46 → 47 | New `vm_placement` table. | Hard anti-affinity group for a VM, without a column on `vms`. |
 | 47 → 48 | New `network_policy`, `vm_ipv6`, `vxlan_released_ips`, and `ipv6_released` tables. | Optional IPv6 /64, east-west firewall flag, and reuse of VXLAN and IPv6 addresses after a VM is deleted. |
 | 48 → 49 | New `pending_node_config_push` table. | After automatic failover, the failed node's next heartbeat pushes a config that no longer starts the moved guests. |
+| 56 → 57 | New `node_host_status` table. | Record the booted NixOS generation and the update capability reported by each node. |
+| 58 → 59 | `CREATE TABLE IF NOT EXISTS node_host_status`. | Version 58 changes nothing. A database already stamped 58 never ran step 57, so version 59 creates the table. |
 
 ## Adding a new migration
 
