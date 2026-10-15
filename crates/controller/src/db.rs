@@ -758,10 +758,11 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 57;
+pub const SCHEMA_VERSION: i32 = 59;
 
 /// Oldest schema a previous controller binary can still open after this release.
-/// Version 57 only adds `node_host_status`.
+/// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
+/// database already stamped 58 still receives that table.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
 const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
@@ -1957,9 +1958,7 @@ impl Database {
             }
         }
 
-        if version < 57 {
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS node_host_status (
+        const NODE_HOST_STATUS_TABLE: &str = "CREATE TABLE IF NOT EXISTS node_host_status (
                     node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
                     kcore_version TEXT NOT NULL DEFAULT '',
                     booted_generation TEXT NOT NULL DEFAULT '',
@@ -1967,8 +1966,16 @@ impl Database {
                     update_capabilities TEXT NOT NULL DEFAULT '',
                     schema_version INTEGER NOT NULL DEFAULT 0,
                     nixpkgs_rev TEXT NOT NULL DEFAULT ''
-                );",
-            )?;
+                );";
+
+        if version < 57 {
+            conn.execute_batch(NODE_HOST_STATUS_TABLE)?;
+        }
+
+        // 58 is unused. A database can already be stamped 58 without this
+        // table, so the version 57 block never ran. 59 creates it.
+        if version < 59 {
+            conn.execute_batch(NODE_HOST_STATUS_TABLE)?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -9261,6 +9268,37 @@ mod tests {
             .get_ceph_dashboard_credentials("lab")
             .expect("get")
             .is_none());
+    }
+
+    #[test]
+    fn schema_v59_creates_host_status_skipped_at_v58() {
+        let db = Database::open(":memory:").expect("open");
+        db.upsert_node(&test_node()).expect("node");
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute_batch(
+                "DROP TABLE node_host_status;
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (58);",
+            )
+            .expect("stamp 58 without host status");
+        }
+        db.migrate().expect("heal");
+        assert_eq!(db.schema_version_for_test(), SCHEMA_VERSION);
+        db.upsert_node_host_status(
+            "n1",
+            "0.5.0",
+            "gen-1",
+            "gen-2",
+            "nixos-generation",
+            59,
+            "abc",
+        )
+        .expect("upsert");
+        assert!(db.get_node_host_status("n1").expect("get").is_some());
+        db.migrate_down(57).expect("down to 57");
+        assert_eq!(db.schema_version_for_test(), 57);
+        assert!(db.get_node_host_status("n1").expect("get").is_some());
     }
 }
 
