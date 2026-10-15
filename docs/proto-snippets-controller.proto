@@ -198,3 +198,165 @@ message GetKubernetesClusterHealthResponse {
   bool api_server_reachable = 8;
   repeated NodeHealth node_health = 9;
 }
+
+// ============================================================================
+// Volume export and backup hooks - Protocol Buffer Definitions (sketch)
+// ============================================================================
+//
+// Design: docs/backup.md. Controller-side passthroughs for the NodeStorage
+// hooks in proto-snippets-node.proto, resolved by volume name so callers never
+// need a node address, plus the new operator role and webhook events.
+//
+// Usage:
+// 1. Copy the RPC definitions to the Controller service block
+// 2. Copy the message definitions to the end of controller.proto
+// 3. Run: buf generate
+// 4. Verify: cargo check -p kcore-controller
+// 5. Add rows to grpc/rbac_matrix.rs and wire require_*_operator in handlers
+
+// ============================================================================
+// RPCs - Add to Controller service
+// ============================================================================
+
+// Snapshot RPCs (CreateVolumeSnapshot etc.) lose the ceph-only check and gain
+// `storage_class` awareness; SnapshotPolicy accepts selector.storageClass.
+
+// Expose / release a volume snapshot as a read-only device on its node.
+rpc ExposeVolumeSnapshot(ExposeVolumeSnapshotRequest) returns (ExposeVolumeSnapshotResponse);
+rpc UnexposeVolumeSnapshot(UnexposeVolumeSnapshotRequest) returns (UnexposeVolumeSnapshotResponse);
+
+// Changed extents between two snapshots of a volume.
+rpc ListVolumeChangedExtents(ListVolumeChangedExtentsRequest) returns (ListVolumeChangedExtentsResponse);
+
+// Stream blocks out of an exposed snapshot / into a fresh volume. The
+// controller proxies the node stream so kctl export/import need only the
+// controller endpoint. Direct-to-node access is available to callers that
+// hold a node-signed lease (kcore Vault mover path).
+rpc ReadVolumeBlocks(ReadVolumeBlocksRequest) returns (stream VolumeBlock);
+rpc WriteVolumeBlocks(stream WriteVolumeBlocksRequest) returns (WriteVolumeBlocksResponse);
+
+// Quiesce passthrough so a backup-operator can freeze/thaw without vm-admin.
+rpc FreezeVmFilesystems(FreezeVmFilesystemsRequest) returns (FreezeVmFilesystemsResponse);
+
+// ============================================================================
+// Message Definitions - Add to end of controller.proto
+// ============================================================================
+
+message ExposeVolumeSnapshotRequest {
+  string volume_name = 1;
+  string snapshot_name = 2;      // VolumeSnapshotInfo.name
+  int32 lease_seconds = 3;
+}
+
+message ExposeVolumeSnapshotResponse {
+  string lease_id = 1;
+  string node_id = 2;
+  string node_address = 3;       // for direct node streaming when permitted
+  string device_path = 4;
+  int64 size_bytes = 5;
+  int32 block_size = 6;
+}
+
+message UnexposeVolumeSnapshotRequest { string lease_id = 1; }
+message UnexposeVolumeSnapshotResponse {}
+
+message VolumeExtent {
+  int64 offset = 1;
+  int64 length = 2;
+}
+
+message ListVolumeChangedExtentsRequest {
+  string volume_name = 1;
+  string from_snapshot = 2;      // empty = allocated extents of to_snapshot
+  string to_snapshot = 3;
+}
+
+message ListVolumeChangedExtentsResponse {
+  repeated VolumeExtent extents = 1;
+  bool supported = 2;
+  string source = 3;
+}
+
+message ReadVolumeBlocksRequest {
+  string lease_id = 1;
+  repeated VolumeExtent extents = 2;
+  int32 block_size = 3;          // default 4 MiB
+  bool elide_zero_blocks = 4;
+}
+
+message VolumeBlock {
+  int64 offset = 1;
+  oneof body {
+    bytes data = 2;
+    int64 zero_length = 3;
+  }
+}
+
+message WriteVolumeBlocksRequest {
+  oneof msg {
+    WriteVolumeBlocksTarget target = 1;   // first message
+    VolumeBlock block = 2;
+  }
+}
+
+message WriteVolumeBlocksTarget {
+  string volume_name = 1;        // existing, unattached volume
+  bool punch_zero_runs = 2;
+}
+
+message WriteVolumeBlocksResponse {
+  int64 bytes_written = 1;
+  int64 blocks_written = 2;
+}
+
+message FreezeVmFilesystemsRequest {
+  string vm_name = 1;
+  bool freeze = 2;
+  int32 timeout_ms = 3;          // controller force-thaws on expiry
+}
+
+message FreezeVmFilesystemsResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ============================================================================
+// RBAC - rows for grpc/rbac_matrix.rs
+// ============================================================================
+
+// New OperatorRole::BackupOperator, ranked read-only < backup-operator < vm-admin.
+//
+//   ("CreateVolumeSnapshot",        "backup-operator"),
+//   ("DeleteVolumeSnapshot",        "backup-operator"),
+//   ("ExposeVolumeSnapshot",        "backup-operator"),
+//   ("UnexposeVolumeSnapshot",      "backup-operator"),
+//   ("ListVolumeChangedExtents",    "backup-operator"),
+//   ("ReadVolumeBlocks",            "backup-operator"),
+//   ("WriteVolumeBlocks",           "backup-operator"),
+//   ("FreezeVmFilesystems",         "backup-operator"),
+//   ("CreateVolume",                "backup-operator"),
+//   ("CreateVm",                    "backup-operator"),
+//   ("SetVmDesiredState",           "backup-operator"),
+//
+// DeleteVm / DeleteVolume stay vm-admin, except that handlers allow a
+// backup-operator to delete a resource labelled kcore-vault/restore=<job>.
+// No ControllerAdmin method is granted.
+
+// ============================================================================
+// Webhook events - webhooks.rs
+// ============================================================================
+
+// vm.created   { vm_id, name, node_id, storage_backend, volumes: [names] }
+// vm.deleted   { vm_id, name }
+// vm.migrated  { vm_id, name, from_node_id, to_node_id, mode: cold|live }
+// Emitted next to vm.state.changed with the same HMAC and retry semantics.
+
+// ============================================================================
+// kctl
+// ============================================================================
+
+// kctl export volume <name> --snapshot <s> [--from-snapshot <older>] -o file.raw
+//   ExposeVolumeSnapshot -> ListVolumeChangedExtents (when --from-snapshot)
+//   -> ReadVolumeBlocks -> sparse raw file (holes for zero runs) -> Unexpose.
+// kctl import volume -f file.raw --name <n> [--storage-class c] [--node id] [--base <existing>]
+//   CreateVolume (unless --base) -> WriteVolumeBlocks from the sparse file.

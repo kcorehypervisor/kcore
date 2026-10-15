@@ -1,11 +1,15 @@
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::auth::{self, CN_CONTROLLER_PREFIX, CN_KCTL};
 use crate::lvm_ops;
 use crate::proto;
-use crate::storage::{self, StorageAdapter};
+use crate::storage::{self, export, StorageAdapter};
 use crate::zfs_ops;
-use std::sync::Arc;
 
 pub struct StorageService {
     storage: Arc<dyn StorageAdapter>,
@@ -134,8 +138,13 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
         let req = request.into_inner();
         let resp = tokio::task::spawn_blocking(move || {
-            storage::ceph_snapshot_volume(&req.backend_handle, &req.snapshot_name, req.protect)
-                .map(|snapshot_handle| proto::SnapshotVolumeResponse { snapshot_handle })
+            export::snapshot_volume(
+                &req.storage_class,
+                &req.backend_handle,
+                &req.snapshot_name,
+                req.protect,
+            )
+            .map(|snapshot_handle| proto::SnapshotVolumeResponse { snapshot_handle })
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))??;
@@ -149,7 +158,12 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
         let req = request.into_inner();
         tokio::task::spawn_blocking(move || {
-            storage::ceph_delete_snapshot(&req.backend_handle, &req.snapshot_name, req.unprotect)
+            export::delete_volume_snapshot(
+                &req.storage_class,
+                &req.backend_handle,
+                &req.snapshot_name,
+                req.unprotect,
+            )
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))??;
@@ -163,8 +177,13 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
         let req = request.into_inner();
         let resp = tokio::task::spawn_blocking(move || {
-            storage::ceph_clone_volume(&req.parent_handle, &req.parent_snapshot, &req.child_image)
-                .map(|backend_handle| proto::CloneVolumeResponse { backend_handle })
+            export::clone_volume(
+                &req.storage_class,
+                &req.parent_handle,
+                &req.parent_snapshot,
+                &req.child_image,
+            )
+            .map(|backend_handle| proto::CloneVolumeResponse { backend_handle })
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))??;
@@ -192,11 +211,204 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
         let req = request.into_inner();
         tokio::task::spawn_blocking(move || {
-            storage::ceph_rollback_volume(&req.backend_handle, &req.snapshot_name)
+            export::rollback_volume(&req.storage_class, &req.backend_handle, &req.snapshot_name)
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))??;
         Ok(Response::new(proto::RollbackVolumeResponse {}))
+    }
+
+    async fn expose_snapshot(
+        &self,
+        request: Request<proto::ExposeSnapshotRequest>,
+    ) -> Result<Response<proto::ExposeSnapshotResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let leases = export::global_lease_table();
+        let lease = tokio::task::spawn_blocking(move || {
+            export::expose_snapshot(
+                &req.storage_class,
+                &req.backend_handle,
+                &req.snapshot_name,
+                req.lease_seconds,
+                &leases,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::ExposeSnapshotResponse {
+            lease_id: lease.lease_id,
+            device_path: lease.device_path,
+            size_bytes: lease.size_bytes,
+            block_size: lease.block_size,
+        }))
+    }
+
+    async fn unexpose_snapshot(
+        &self,
+        request: Request<proto::UnexposeSnapshotRequest>,
+    ) -> Result<Response<proto::UnexposeSnapshotResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let leases = export::global_lease_table();
+        tokio::task::spawn_blocking(move || export::unexpose_snapshot(&req.lease_id, &leases))
+            .await
+            .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::UnexposeSnapshotResponse {}))
+    }
+
+    async fn list_changed_extents(
+        &self,
+        request: Request<proto::ListChangedExtentsRequest>,
+    ) -> Result<Response<proto::ListChangedExtentsResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let (extents, supported, source) = tokio::task::spawn_blocking(move || {
+            export::list_changed_extents(
+                &req.storage_class,
+                &req.backend_handle,
+                &req.from_snapshot,
+                &req.to_snapshot,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::ListChangedExtentsResponse {
+            extents: extents
+                .into_iter()
+                .map(|e| proto::Extent {
+                    offset: e.offset,
+                    length: e.length,
+                })
+                .collect(),
+            supported,
+            source,
+        }))
+    }
+
+    type ReadVolumeExtentsStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::VolumeBlock, Status>> + Send>>;
+
+    async fn read_volume_extents(
+        &self,
+        request: Request<proto::ReadVolumeExtentsRequest>,
+    ) -> Result<Response<Self::ReadVolumeExtentsStream>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let leases = export::global_lease_table();
+        let lease = leases.get(&req.lease_id)?;
+        let extents: Vec<export::Extent> = req
+            .extents
+            .iter()
+            .map(|e| export::Extent {
+                offset: e.offset,
+                length: e.length,
+            })
+            .collect();
+        let block_size = if req.block_size > 0 {
+            req.block_size as i64
+        } else {
+            export::DEFAULT_BLOCK_SIZE
+        };
+        let elide = req.elide_zero_blocks;
+        let device = lease.device_path.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::task::spawn_blocking(move || {
+            let units =
+                match export::read_extent_units(Path::new(&device), &extents, block_size, elide) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(Status::from(e)));
+                        return;
+                    }
+                };
+            for (unit, data) in units {
+                let block = match unit {
+                    export::TransferUnit::Data { offset, .. } => proto::VolumeBlock {
+                        offset,
+                        body: Some(proto::volume_block::Body::Data(data.unwrap_or_default())),
+                    },
+                    export::TransferUnit::ZeroRun { offset, length } => proto::VolumeBlock {
+                        offset,
+                        body: Some(proto::volume_block::Body::ZeroLength(length)),
+                    },
+                };
+                if tx.blocking_send(Ok(block)).is_err() {
+                    break;
+                }
+            }
+        });
+        let stream: Self::ReadVolumeExtentsStream = Box::pin(ReceiverStream::new(rx));
+        Ok(Response::new(stream))
+    }
+
+    async fn write_volume_extents(
+        &self,
+        request: Request<tonic::Streaming<proto::WriteVolumeExtentsRequest>>,
+    ) -> Result<Response<proto::WriteVolumeExtentsResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let mut stream = request.into_inner();
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("write stream is empty"))?;
+        let target = match first.msg {
+            Some(proto::write_volume_extents_request::Msg::Target(t)) => t,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first write message must set target",
+                ));
+            }
+        };
+        let device = resolve_write_device(&target.backend_handle, &target.storage_class)?;
+        let punch = target.punch_zero_runs;
+        let mut bytes_written = 0i64;
+        let mut blocks_written = 0i64;
+        let mut zero_runs = 0i64;
+        while let Some(msg) = stream.message().await? {
+            let block = match msg.msg {
+                Some(proto::write_volume_extents_request::Msg::Block(b)) => b,
+                Some(proto::write_volume_extents_request::Msg::Target(_)) => {
+                    return Err(Status::invalid_argument(
+                        "target may only appear as the first message",
+                    ));
+                }
+                None => continue,
+            };
+            let (unit, data) = match block.body {
+                Some(proto::volume_block::Body::Data(d)) => (
+                    export::TransferUnit::Data {
+                        offset: block.offset,
+                        length: d.len() as i64,
+                    },
+                    Some(d),
+                ),
+                Some(proto::volume_block::Body::ZeroLength(len)) => (
+                    export::TransferUnit::ZeroRun {
+                        offset: block.offset,
+                        length: len,
+                    },
+                    None,
+                ),
+                None => {
+                    return Err(Status::invalid_argument("block missing body"));
+                }
+            };
+            let device_path = device.clone();
+            let (b, bl, z) = tokio::task::spawn_blocking(move || {
+                export::write_extent_unit(Path::new(&device_path), &unit, data.as_deref(), punch)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("task join: {e}")))??;
+            bytes_written += b;
+            blocks_written += bl;
+            zero_runs += z;
+        }
+        Ok(Response::new(proto::WriteVolumeExtentsResponse {
+            bytes_written,
+            blocks_written,
+            zero_runs,
+        }))
     }
 
     async fn flatten_volume(
@@ -430,6 +642,38 @@ fn lvm_to_storage(err: lvm_ops::LvmOpError) -> storage::StorageError {
         lvm_ops::Kind::Internal => storage::ErrorKind::Internal,
     };
     storage::StorageError::new(kind, err.message)
+}
+
+fn resolve_write_device(backend_handle: &str, storage_class: &str) -> Result<String, Status> {
+    let class =
+        export::resolve_storage_class(storage_class, backend_handle).map_err(Status::from)?;
+    match class {
+        export::StorageClass::Ceph => {
+            let (pool, image) =
+                export::validate_pool_image_handle(backend_handle).map_err(Status::from)?;
+            crate::live_migrate::ensure_rbd_mapped(&pool, &image).map_err(Status::internal)?;
+            Ok(format!("/dev/rbd/{pool}/{image}"))
+        }
+        export::StorageClass::Zfs => {
+            let (pool, dataset) =
+                export::validate_pool_image_handle(backend_handle).map_err(Status::from)?;
+            Ok(format!("/dev/zvol/{pool}/{dataset}"))
+        }
+        export::StorageClass::Lvm => {
+            let (vg, lv) =
+                export::validate_pool_image_handle(backend_handle).map_err(Status::from)?;
+            Ok(format!("/dev/{vg}/{lv}"))
+        }
+        export::StorageClass::Filesystem => {
+            let path = backend_handle.trim();
+            if !path.starts_with('/') {
+                return Err(Status::invalid_argument(
+                    "filesystem backend_handle must be an absolute path",
+                ));
+            }
+            Ok(path.to_string())
+        }
+    }
 }
 
 /// Accept either `/dev/rbd/pool/image` or `pool/image` and ensure mapped.
