@@ -47,6 +47,7 @@ mod vm_nics;
 mod vm_operation_policy;
 mod vm_operation_reconciler;
 mod volume_crypto;
+mod volume_export;
 mod volume_snapshot;
 mod webhooks;
 

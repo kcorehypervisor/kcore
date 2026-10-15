@@ -10,12 +10,13 @@ pub const CN_KCTL_PREFIX: &str = "kctl:";
 
 /// Minimum operator capability for management RPCs (human operators and bootstrap).
 ///
-/// Roadmap roles: `read-only` < `vm-admin` < `cluster-admin`.
+/// Roadmap roles: `read-only` < `backup-operator` < `vm-admin` < `cluster-admin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OperatorRole {
     ReadOnly = 1,
-    VmAdmin = 2,
-    ClusterAdmin = 3,
+    BackupOperator = 2,
+    VmAdmin = 3,
+    ClusterAdmin = 4,
 }
 
 impl OperatorRole {
@@ -26,6 +27,7 @@ impl OperatorRole {
     pub fn as_db_str(self) -> &'static str {
         match self {
             OperatorRole::ReadOnly => "read-only",
+            OperatorRole::BackupOperator => "backup-operator",
             OperatorRole::VmAdmin => "vm-admin",
             OperatorRole::ClusterAdmin => "cluster-admin",
         }
@@ -34,6 +36,7 @@ impl OperatorRole {
     pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "read-only" => Some(OperatorRole::ReadOnly),
+            "backup-operator" => Some(OperatorRole::BackupOperator),
             // Canonical name; accept legacy "admin" from earlier branch drafts.
             "vm-admin" | "admin" => Some(OperatorRole::VmAdmin),
             "cluster-admin" => Some(OperatorRole::ClusterAdmin),
@@ -325,6 +328,10 @@ mod tests {
     fn role_lattice() {
         assert!(OperatorRole::ClusterAdmin.satisfies(OperatorRole::ReadOnly));
         assert!(OperatorRole::VmAdmin.satisfies(OperatorRole::ReadOnly));
+        assert!(OperatorRole::BackupOperator.satisfies(OperatorRole::ReadOnly));
+        assert!(!OperatorRole::ReadOnly.satisfies(OperatorRole::BackupOperator));
+        assert!(!OperatorRole::BackupOperator.satisfies(OperatorRole::VmAdmin));
+        assert!(OperatorRole::VmAdmin.satisfies(OperatorRole::BackupOperator));
         assert!(!OperatorRole::ReadOnly.satisfies(OperatorRole::VmAdmin));
         assert!(OperatorRole::ClusterAdmin.satisfies(OperatorRole::VmAdmin));
         assert!(!OperatorRole::VmAdmin.satisfies(OperatorRole::ClusterAdmin));
@@ -340,6 +347,11 @@ mod tests {
         assert_eq!(
             OperatorRole::from_db_str("admin"),
             Some(OperatorRole::VmAdmin)
+        );
+        assert_eq!(OperatorRole::BackupOperator.as_db_str(), "backup-operator");
+        assert_eq!(
+            OperatorRole::from_db_str("backup-operator"),
+            Some(OperatorRole::BackupOperator)
         );
     }
 }

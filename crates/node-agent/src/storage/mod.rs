@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::{StorageBackendKind, StorageConfig};
 use crate::proto;
 
+pub mod export;
+
 #[derive(Debug, Clone, Copy)]
 pub enum ErrorKind {
     InvalidArgument,
@@ -638,7 +640,7 @@ fn rbd_snap_full_name(backend_handle: &str, snapshot_name: &str) -> Result<Strin
     Ok(format!("{handle}@{snap}"))
 }
 
-fn run_argv_plan(plan: &[Vec<String>], err_kind: ErrorKind) -> Result<(), StorageError> {
+pub(crate) fn run_argv_plan(plan: &[Vec<String>], err_kind: ErrorKind) -> Result<(), StorageError> {
     for args in plan {
         if args.is_empty() {
             continue;
