@@ -70,20 +70,11 @@ explicitly.
 
 | Field | Value |
 |---|---|
-| `--certificate-identity` | *(not yet published — see below)* |
-| `--certificate-oidc-issuer` | `https://oauth2.sigstore.dev/auth` |
+| `--certificate-identity` | `82217+rtacconi@users.noreply.github.com` |
+| `--certificate-oidc-issuer` | `https://github.com/login/oauth` |
 
-The issuer is Sigstore's own OIDC provider, which is what appears in the
-certificate when a maintainer signs interactively from their machine. The
-identity is the **email address** of the account chosen at that prompt, not a
-GitHub username or URL.
-
-> **This table is incomplete until the first signed release.** No kcore
-> release has been signed yet, so there is no identity to publish. The
-> maintainer who cuts the first signed release must record the value here,
-> and set `SIGNER_IDENTITY` in [`scripts/verify-release.sh`](../scripts/verify-release.sh)
-> and `DEFAULT_SIGNER_IDENTITY` in [`scripts/get-kctl.sh`](../scripts/get-kctl.sh).
-> Until then, pass the identity yourself with `KCORE_SIGNER_IDENTITY`.
+The identity is the email chosen at the Sigstore prompt. Signing in with
+GitHub records GitHub's OIDC issuer. It is not a GitHub username.
 
 To read the identity out of a bundle you already have — useful for
 confirming what was published:
@@ -149,8 +140,8 @@ gh release download v0.3.0 --repo kcorehypervisor/kcore \
 ```bash
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity 'MAINTAINER_EMAIL' \
-  --certificate-oidc-issuer 'https://oauth2.sigstore.dev/auth' \
+  --certificate-identity '82217+rtacconi@users.noreply.github.com' \
+  --certificate-oidc-issuer 'https://github.com/login/oauth' \
   SHA256SUMS
 ```
 
