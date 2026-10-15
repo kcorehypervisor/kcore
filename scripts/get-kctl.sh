@@ -17,13 +17,11 @@ set -euo pipefail
 DEFAULT_REPO="kcorehypervisor/kcore"
 REPO="${KCORE_GITHUB_REPO:-${DEFAULT_REPO}}"
 
-# Expected Fulcio certificate identity for kcore releases. Empty until a
-# maintainer has signed one and published the value; see
-# docs/release-verification.md. While empty, the signature check below is
-# skipped -- there is no point verifying that "somebody" signed the bytes.
-DEFAULT_SIGNER_IDENTITY=""
+# Fulcio certificate for releases signed with the rtacconi GitHub account.
+# See docs/release-verification.md.
+DEFAULT_SIGNER_IDENTITY="82217+rtacconi@users.noreply.github.com"
 SIGNER_IDENTITY="${KCTL_SIGNER_IDENTITY:-${DEFAULT_SIGNER_IDENTITY}}"
-SIGNER_ISSUER="${KCTL_SIGNER_ISSUER:-https://oauth2.sigstore.dev/auth}"
+SIGNER_ISSUER="${KCTL_SIGNER_ISSUER:-https://github.com/login/oauth}"
 SUMS_BUNDLE_ASSET="SHA256SUMS.sigstore.json"
 # cosign 3.0.0-3.0.4 rejects Rekor v2 bundles without --use-signed-timestamps.
 COSIGN_MIN_VERSION="3.0.5"

@@ -26,12 +26,10 @@ set -euo pipefail
 DEFAULT_REPO="kcorehypervisor/kcore"
 REPO="${KCORE_GITHUB_REPO:-${DEFAULT_REPO}}"
 
-# Sigstore's public Fulcio issues certificates through its Dex instance for
-# interactive (non-CI) signing, so this is the issuer recorded for a
-# maintainer signing on their own machine -- not github.com. The identity is
-# the email address of the account chosen at the OIDC prompt.
-SIGNER_ISSUER="${KCORE_SIGNER_ISSUER:-https://oauth2.sigstore.dev/auth}"
-SIGNER_IDENTITY="${KCORE_SIGNER_IDENTITY:-}"
+# Fulcio records the GitHub OIDC issuer when the maintainer signs in with
+# GitHub. The identity is the email chosen at that prompt.
+SIGNER_ISSUER="${KCORE_SIGNER_ISSUER:-https://github.com/login/oauth}"
+SIGNER_IDENTITY="${KCORE_SIGNER_IDENTITY:-82217+rtacconi@users.noreply.github.com}"
 SIGNER_IDENTITY_REGEXP="${KCORE_SIGNER_IDENTITY_REGEXP:-}"
 
 # cosign 3.0.0-3.0.4 fails to verify Rekor v2 bundles unless called with
