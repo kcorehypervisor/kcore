@@ -581,6 +581,51 @@ impl Controller for ManyVmsController {
         Err(Status::unimplemented(""))
     }
 
+    async fn expose_volume_snapshot(
+        &self,
+        _: TRequest<ExposeVolumeSnapshotRequest>,
+    ) -> Result<Response<ExposeVolumeSnapshotResponse>, Status> {
+        Err(Status::unimplemented("expose_volume_snapshot"))
+    }
+
+    async fn unexpose_volume_snapshot(
+        &self,
+        _: TRequest<UnexposeVolumeSnapshotRequest>,
+    ) -> Result<Response<UnexposeVolumeSnapshotResponse>, Status> {
+        Err(Status::unimplemented("unexpose_volume_snapshot"))
+    }
+
+    async fn list_volume_changed_extents(
+        &self,
+        _: TRequest<ListVolumeChangedExtentsRequest>,
+    ) -> Result<Response<ListVolumeChangedExtentsResponse>, Status> {
+        Err(Status::unimplemented("list_volume_changed_extents"))
+    }
+
+    type ReadVolumeBlocksStream =
+        tokio_stream::wrappers::ReceiverStream<Result<VolumeBlock, Status>>;
+
+    async fn read_volume_blocks(
+        &self,
+        _: TRequest<ReadVolumeBlocksRequest>,
+    ) -> Result<Response<Self::ReadVolumeBlocksStream>, Status> {
+        Err(Status::unimplemented("read_volume_blocks"))
+    }
+
+    async fn write_volume_blocks(
+        &self,
+        _: TRequest<tonic::Streaming<WriteVolumeBlocksRequest>>,
+    ) -> Result<Response<WriteVolumeBlocksResponse>, Status> {
+        Err(Status::unimplemented("write_volume_blocks"))
+    }
+
+    async fn freeze_vm_filesystems(
+        &self,
+        _: TRequest<FreezeVmFilesystemsRequest>,
+    ) -> Result<Response<FreezeVmFilesystemsResponse>, Status> {
+        Err(Status::unimplemented("freeze_vm_filesystems"))
+    }
+
     async fn format_volume(
         &self,
         _: TRequest<FormatVolumeRequest>,
