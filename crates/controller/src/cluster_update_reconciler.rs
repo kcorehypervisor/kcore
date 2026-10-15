@@ -89,8 +89,25 @@ async fn reconcile_update(
 
     let spec = spec_from_json(&update.spec_json).map_err(|e| format!("parse spec_json: {e}"))?;
     let activation = activation_mode_string(&spec).to_string();
+    let peers = db.list_controller_peers().unwrap_or_default();
+    nodes.sort_by(|left, right| {
+        let rank = |node_id: &str| {
+            let address = db
+                .get_node(node_id)
+                .ok()
+                .flatten()
+                .map(|node| node.address)
+                .unwrap_or_default();
+            let host = address.split(':').next().unwrap_or("").to_string();
+            let controller = peers.iter().any(|peer| {
+                peer.address == address || peer.address.split(':').next() == Some(host.as_str())
+            });
+            (u8::from(controller), node_id.to_string())
+        };
+        rank(&left.node_id).cmp(&rank(&right.node_id))
+    });
 
-    // Pick the first node still needing work (sorted order preserved from DB).
+    // Pick the first node still needing work. Controllers sort last.
     for node_row in &mut nodes {
         let node = db
             .get_node(&node_row.node_id)
@@ -104,6 +121,12 @@ async fn reconcile_update(
 
         match node_row.phase.as_str() {
             "pending" => {
+                let host = db.get_node_host_status(&node_row.node_id).ok().flatten();
+                let has_generation = host.as_ref().is_some_and(|row| {
+                    row.update_capabilities
+                        .split(',')
+                        .any(|cap| cap == "nixos-generation")
+                });
                 let req = node_proto::PrepareSystemUpdateRequest {
                     update_name: update.name.clone(),
                     flake_ref: update.flake_ref.clone(),
@@ -115,6 +138,21 @@ async fn reconcile_update(
                         .unwrap_or_default(),
                     host_system: String::new(),
                     timeout_seconds: NODE_PREPARE_TIMEOUT_SECS,
+                    update_kind: if has_generation {
+                        if spec.update_kind.is_empty() {
+                            "kcore".into()
+                        } else {
+                            spec.update_kind.clone()
+                        }
+                    } else {
+                        "bootstrap".into()
+                    },
+                    nixpkgs_rev: spec
+                        .target
+                        .as_ref()
+                        .map(|t| t.nixpkgs_rev.clone())
+                        .unwrap_or_default(),
+                    ..Default::default()
                 };
                 let result = prepare_on_node(clients, &address, req).await;
                 match result {
@@ -183,21 +221,37 @@ async fn reconcile_update(
                 let result = activate_on_node(clients, &address, req).await;
                 match result {
                     Ok(resp) if resp.success => {
+                        let has_generation = db
+                            .get_node_host_status(&node_row.node_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|row| {
+                                row.update_capabilities
+                                    .split(',')
+                                    .any(|cap| cap == "nixos-generation")
+                            });
+                        let phase = if resp.requires_reboot || resp.phase == "reboot_required" {
+                            "reboot_required"
+                        } else if !has_generation {
+                            "bootstrapping"
+                        } else {
+                            "succeeded"
+                        };
                         db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
                             update_name: update.name.clone(),
                             node_id: node_row.node_id.clone(),
                             observed_generation: update.generation,
-                            phase: "succeeded".into(),
+                            phase: phase.into(),
                             current_version: String::new(),
                             target_version: update.target_version.clone(),
                             prepared_closure: node_row.prepared_closure.clone(),
                             current_generation: node_row.current_generation.clone(),
                             target_generation: node_row.target_generation.clone(),
-                            requires_reboot: node_row.requires_reboot,
+                            requires_reboot: resp.requires_reboot,
                             last_error: String::new(),
                             last_transition_at: String::new(),
                         })
-                        .map_err(|e| format!("mark node succeeded: {e}"))?;
+                        .map_err(|e| format!("mark node {phase}: {e}"))?;
                     }
                     Ok(resp) => {
                         db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
@@ -236,7 +290,46 @@ async fn reconcile_update(
                 }
                 return Ok(());
             }
+            "bootstrapping" => {
+                let has_generation = db
+                    .get_node_host_status(&node_row.node_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| {
+                        row.update_capabilities
+                            .split(',')
+                            .any(|cap| cap == "nixos-generation")
+                    });
+                if has_generation {
+                    db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                        phase: "pending".into(),
+                        last_error: String::new(),
+                        ..node_row.clone()
+                    })
+                    .map_err(|e| format!("generation follow-up: {e}"))?;
+                }
+            }
+            "reboot_required" => {}
             "rolling_back" => {
+                let schema_owner = db
+                    .get_node_host_status(&node_row.node_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row.schema_version == crate::db::SCHEMA_VERSION);
+                if schema_owner
+                    && spec.previous_schema_version > 0
+                    && spec.previous_schema_version < crate::db::SCHEMA_VERSION
+                {
+                    if let Err(e) = db.migrate_down(spec.previous_schema_version) {
+                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                            phase: "failed".into(),
+                            last_error: e,
+                            ..node_row.clone()
+                        })
+                        .map_err(|err| format!("mark schema rollback failed: {err}"))?;
+                        return Ok(());
+                    }
+                }
                 let req = node_proto::RollbackSystemUpdateRequest {
                     update_name: update.name.clone(),
                 };

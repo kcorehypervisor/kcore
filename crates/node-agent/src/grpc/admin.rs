@@ -522,12 +522,17 @@ async fn run_ceph_dry_build(ceph_nix: &str) -> Result<(), String> {
             "pinned nixpkgs path unresolved (resolve_nixpkgs_path); refusing dry-build that would pull unstable"
                 .to_string()
         })?;
-    let out = Command::new("nixos-rebuild")
-        .args(["dry-build"])
-        .env(
+    let mut cmd = Command::new("nixos-rebuild");
+    cmd.args(["dry-build"]);
+    if std::path::Path::new("/etc/nixos/flake.nix").exists() {
+        cmd.args(["--flake", "/etc/nixos#kcore"]);
+    } else {
+        cmd.env(
             "NIX_PATH",
             format!("nixos-config={NIXOS_CONFIG_PATH}:nixpkgs={nixpkgs}"),
-        )
+        );
+    }
+    let out = cmd
         .output()
         .await
         .map_err(|e| format!("starting nixos-rebuild dry-build: {e}"))?;
@@ -885,6 +890,10 @@ async fn run_rebuild_mode(mode: &'static str) -> Result<std::process::Output, st
     }
     let mut cmd = Command::new("nixos-rebuild");
     cmd.args(rebuild_args(mode));
+    let flake = crate::system_update::flake_rebuild_suffix();
+    if !flake.is_empty() {
+        cmd.args(flake.split_whitespace());
+    }
     if let Some(ref p) = nixpkgs_path {
         cmd.env(
             "NIX_PATH",
@@ -1102,8 +1111,13 @@ async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>, 
     let state_display = state_file.display().to_string();
     let script = format!(
         "export PATH=\"/run/current-system/sw/bin:$PATH\"; \
-         export NIX_PATH='{nix_path_val}'; \
-         if nixos-rebuild test && nixos-rebuild switch; then \
+         if [ -f /etc/nixos/flake.nix ]; then \
+           flake='--flake /etc/nixos#kcore'; \
+         else \
+           flake=''; \
+           export NIX_PATH='{nix_path_val}'; \
+         fi; \
+         if nixos-rebuild test $flake && nixos-rebuild switch $flake; then \
            printf '{succeeded}\\nnixos-rebuild test+switch completed\\n' > '{state}.tmp'; \
          else \
            printf '{failed}\\nnixos-rebuild test+switch failed (exit %s)\\n' \"$?\" > '{state}.tmp'; \
@@ -3691,31 +3705,31 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         auth::require_peer_insecure_ok(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
         let update_name = sanitize_update_name(&req.update_name)?;
-        let flake_ref = req.flake_ref.trim();
+        let flake_ref = req.flake_ref.trim().to_string();
         if flake_ref.is_empty() {
             return Err(Status::invalid_argument("flake_ref is required"));
         }
-        let flake_rev = req.flake_rev.trim();
+        let flake_rev = req.flake_rev.trim().to_string();
         let timeout_sec = if req.timeout_seconds > 0 {
             req.timeout_seconds as u64
         } else {
             3600u64
         };
-        let host_system = if req.host_system.trim().is_empty() {
-            "x86_64-linux".to_string()
-        } else {
-            req.host_system.trim().to_string()
-        };
-
-        let flake_url = flake_url_with_rev(flake_ref, flake_rev);
-        let manifest_path = PathBuf::from("/var/lib/kcore/updates")
-            .join(&update_name)
-            .join("manifest.json");
+        let update_kind = req.update_kind.clone();
+        let nixpkgs_rev = req.nixpkgs_rev.clone();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_sec),
             tokio::task::spawn_blocking(move || {
-                prepare_system_update_blocking(flake_url, host_system, manifest_path)
+                crate::system_update::prepare_generation(&crate::system_update::PrepareRequest {
+                    update_name,
+                    update_kind,
+                    flake_ref,
+                    flake_rev: flake_rev.clone(),
+                    nixpkgs_rev,
+                    version: flake_rev,
+                    had_flake: false,
+                })
             }),
         )
         .await;
@@ -3724,11 +3738,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             Err(_) => Ok(Response::new(proto::PrepareSystemUpdateResponse {
                 success: false,
                 message: "nix prepare timed out".into(),
-                prepared_closure: String::new(),
-                manifest_path: String::new(),
-                current_generation: String::new(),
-                target_generation: String::new(),
-                requires_reboot: false,
+                ..Default::default()
             })),
             Ok(join_res) => match join_res {
                 Ok(Ok(manifest)) => Ok(Response::new(proto::PrepareSystemUpdateResponse {
@@ -3738,16 +3748,12 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                     manifest_path: manifest.manifest_path,
                     current_generation: manifest.current_generation,
                     target_generation: manifest.target_generation,
-                    requires_reboot: manifest.requires_reboot,
+                    requires_reboot: manifest.reboot_required,
                 })),
                 Ok(Err(e)) => Ok(Response::new(proto::PrepareSystemUpdateResponse {
                     success: false,
                     message: e,
-                    prepared_closure: String::new(),
-                    manifest_path: String::new(),
-                    current_generation: String::new(),
-                    target_generation: String::new(),
-                    requires_reboot: false,
+                    ..Default::default()
                 })),
                 Err(join_e) => Err(Status::internal(format!("prepare join: {join_e}"))),
             },
@@ -3780,7 +3786,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             ));
         }
         let effective_mode: String = if mode.is_empty() || mode == "auto" {
-            "switch".into()
+            "auto".into()
         } else {
             mode.to_string()
         };
@@ -3788,24 +3794,28 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             return Ok(Response::new(proto::ActivateSystemUpdateResponse {
                 success: true,
                 message: "test mode: manifest prepared only; no activation performed".into(),
+                ..Default::default()
             }));
         }
 
         let manifest_path_clone = manifest_path.clone();
         let res = tokio::task::spawn_blocking(move || {
-            activate_system_update_blocking(&manifest_path_clone, effective_mode)
+            crate::system_update::activate_staged(&manifest_path_clone, &effective_mode)
         })
         .await
         .map_err(|e| Status::internal(format!("activate join: {e}")))?;
 
         match res {
-            Ok(msg) => Ok(Response::new(proto::ActivateSystemUpdateResponse {
+            Ok(outcome) => Ok(Response::new(proto::ActivateSystemUpdateResponse {
                 success: true,
-                message: msg,
+                message: outcome.message,
+                requires_reboot: outcome.requires_reboot,
+                phase: outcome.phase,
             })),
             Err(e) => Ok(Response::new(proto::ActivateSystemUpdateResponse {
                 success: false,
                 message: e,
+                ..Default::default()
             })),
         }
     }
@@ -3854,9 +3864,19 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             .join(&update_name)
             .join("rollback_bin");
 
-        let res = tokio::task::spawn_blocking(move || rollback_blocking(&rollback_dir))
-            .await
-            .map_err(|e| Status::internal(format!("rollback join: {e}")))?;
+        let update_name_for_manifest = update_name.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let manifest = PathBuf::from("/var/lib/kcore/updates")
+                .join(&update_name_for_manifest)
+                .join("manifest.json");
+            if manifest.exists() {
+                crate::system_update::rollback_staged(&manifest)
+            } else {
+                rollback_blocking(&rollback_dir)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("rollback join: {e}")))?;
 
         match res {
             Ok(msg) => Ok(Response::new(proto::RollbackSystemUpdateResponse {
@@ -3866,6 +3886,28 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             Err(e) => Ok(Response::new(proto::RollbackSystemUpdateResponse {
                 success: false,
                 message: e,
+            })),
+        }
+    }
+
+    async fn reboot_staged_system_update(
+        &self,
+        request: Request<proto::RebootStagedSystemUpdateRequest>,
+    ) -> Result<Response<proto::RebootStagedSystemUpdateResponse>, Status> {
+        auth::require_peer_insecure_ok(&request, &[CN_KCTL, CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let _update_name = sanitize_update_name(&req.update_name)?;
+        let res = tokio::task::spawn_blocking(crate::system_update::reboot_staged)
+            .await
+            .map_err(|e| Status::internal(format!("reboot join: {e}")))?;
+        match res {
+            Ok(message) => Ok(Response::new(proto::RebootStagedSystemUpdateResponse {
+                success: true,
+                message,
+            })),
+            Err(message) => Ok(Response::new(proto::RebootStagedSystemUpdateResponse {
+                success: false,
+                message,
             })),
         }
     }
@@ -4237,7 +4279,7 @@ impl AdminService {
         // This ensures we have the correct nixpkgs path from the system configuration
         let switch_result = tokio::process::Command::new("bash")
             .arg("-lc")
-            .arg("NIX_PATH=\"$NIX_PATH:nixos-config=/etc/nixos/configuration.nix\" nixos-rebuild switch --fast")
+            .arg("if [ -f /etc/nixos/flake.nix ]; then nixos-rebuild switch --flake /etc/nixos#kcore --fast; else NIX_PATH=\"$NIX_PATH:nixos-config=/etc/nixos/configuration.nix\" nixos-rebuild switch --fast; fi")
             .output()
             .await;
 
@@ -4856,6 +4898,7 @@ mod tests {
                 system_profile: String::new(),
                 host_system: String::new(),
                 timeout_seconds: 60,
+                ..Default::default()
             }),
         )
         .await
@@ -4877,6 +4920,7 @@ mod tests {
                 system_profile: String::new(),
                 host_system: String::new(),
                 timeout_seconds: 60,
+                ..Default::default()
             }),
         )
         .await

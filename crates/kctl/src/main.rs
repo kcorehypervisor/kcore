@@ -424,6 +424,8 @@ enum UpdateClusterCmd {
     Cancel { name: String },
     /// Request rollback on nodes (best-effort)
     Rollback { name: String },
+    /// Boot a generation that was staged because the kernel or guest units changed.
+    Reboot { name: String, node: String },
 }
 
 #[derive(Subcommand)]
@@ -2293,6 +2295,9 @@ async fn main() {
                 }
                 UpdateClusterCmd::Rollback { name } => {
                     commands::cluster_update::rollback(&info, name).await
+                }
+                UpdateClusterCmd::Reboot { name, node } => {
+                    commands::cluster_update::reboot(&info, name, node).await
                 }
             }
         }

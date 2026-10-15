@@ -39,6 +39,7 @@ mod replication;
 mod replication_policy;
 mod sbom;
 mod scheduler;
+mod schema_down;
 mod shared_filesystem_reconciler;
 mod shared_filesystem_spec;
 mod snapshot_policy_reconciler;
@@ -128,6 +129,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let database = db::Database::open(&cfg.db_path)?;
+    if let Some(parent) = std::path::Path::new(&cfg.db_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::write(
+                parent.join("schema-version"),
+                format!("{}\n", db::SCHEMA_VERSION),
+            );
+        }
+    }
     let clients =
         node_client::NodeClients::new(cfg.tls.as_ref().map(|tls| node_client::TlsClientConfig {
             ca_file: tls.ca_file.clone(),

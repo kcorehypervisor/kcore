@@ -831,6 +831,12 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<RollbackClusterUpdateResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn reboot_cluster_update_node(
+        &self,
+        _: TRequest<RebootClusterUpdateNodeRequest>,
+    ) -> Result<Response<RebootClusterUpdateNodeResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
     async fn create_operator(
         &self,
         _: TRequest<CreateOperatorRequest>,

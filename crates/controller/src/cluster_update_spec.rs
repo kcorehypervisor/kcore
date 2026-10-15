@@ -7,6 +7,18 @@ use crate::controller_proto::{
 };
 use crate::db::{Database, NodeRow};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct StoredOsPin {
+    #[serde(default)]
+    pub nixpkgs_rev: String,
+    #[serde(default)]
+    pub ceph_rev: String,
+    #[serde(default)]
+    pub ceph_sha256: String,
+    #[serde(default)]
+    pub kubernetes_version: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredClusterUpdateSpec {
     pub name: String,
@@ -23,6 +35,18 @@ pub struct StoredClusterUpdateSpec {
     pub approval_policy: i32,
     #[serde(default)]
     pub automatic_rollback: bool,
+    #[serde(default)]
+    pub update_kind: String,
+    #[serde(default)]
+    pub requires_nixpkgs: bool,
+    #[serde(default)]
+    pub tested_os_pins: Vec<StoredOsPin>,
+    #[serde(default)]
+    pub schema_version: i32,
+    #[serde(default)]
+    pub previous_schema_version: i32,
+    #[serde(default)]
+    pub min_compatible_reader: i32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -100,6 +124,21 @@ fn stored_from_proto(spec: &ClusterUpdateSpec) -> StoredClusterUpdateSpec {
         reboot_policy: spec.reboot_policy.clone(),
         approval_policy: spec.approval_policy,
         automatic_rollback: spec.automatic_rollback,
+        update_kind: spec.update_kind.clone(),
+        requires_nixpkgs: spec.requires_nixpkgs,
+        tested_os_pins: spec
+            .tested_os_pins
+            .iter()
+            .map(|pin| StoredOsPin {
+                nixpkgs_rev: pin.nixpkgs_rev.clone(),
+                ceph_rev: pin.ceph_rev.clone(),
+                ceph_sha256: pin.ceph_sha256.clone(),
+                kubernetes_version: pin.kubernetes_version.clone(),
+            })
+            .collect(),
+        schema_version: spec.schema_version,
+        previous_schema_version: spec.previous_schema_version,
+        min_compatible_reader: spec.min_compatible_reader,
     }
 }
 
@@ -131,6 +170,21 @@ fn proto_from_stored(s: StoredClusterUpdateSpec) -> ClusterUpdateSpec {
         reboot_policy: s.reboot_policy,
         approval_policy: s.approval_policy,
         automatic_rollback: s.automatic_rollback,
+        update_kind: s.update_kind,
+        requires_nixpkgs: s.requires_nixpkgs,
+        tested_os_pins: s
+            .tested_os_pins
+            .into_iter()
+            .map(|pin| crate::controller_proto::TestedOsPin {
+                nixpkgs_rev: pin.nixpkgs_rev,
+                ceph_rev: pin.ceph_rev,
+                ceph_sha256: pin.ceph_sha256,
+                kubernetes_version: pin.kubernetes_version,
+            })
+            .collect(),
+        schema_version: s.schema_version,
+        previous_schema_version: s.previous_schema_version,
+        min_compatible_reader: s.min_compatible_reader,
     }
 }
 
@@ -216,6 +270,37 @@ pub fn validate_spec(spec: &ClusterUpdateSpec) -> Result<(), String> {
                 .into(),
         );
     }
+    let strategy = spec.strategy.unwrap_or_default();
+    match strategy.r#type {
+        t if t
+            == crate::controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyCanary
+                as i32
+            || t == crate::controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyBatch
+                as i32
+            || t == crate::controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyPerDc
+                as i32 =>
+        {
+            return Err(
+                "canary, batch, and per-datacenter strategies are refused until a node has rebooted and rolled back on this path"
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    if strategy.max_unavailable > 1 {
+        return Err("maxUnavailable must be 1".into());
+    }
+    let kind = spec.update_kind.trim();
+    if kind == "nixpkgs" {
+        let rev = spec
+            .target
+            .as_ref()
+            .map(|t| t.nixpkgs_rev.trim())
+            .unwrap_or("");
+        if !spec.tested_os_pins.iter().any(|pin| pin.nixpkgs_rev == rev) {
+            return Err("nixpkgs update must name a rev in testedOsPins".into());
+        }
+    }
     Ok(())
 }
 
@@ -264,6 +349,7 @@ mod tests {
             reboot_policy: "if-required".into(),
             approval_policy: ClusterUpdateApprovalPolicy::ClusterUpdateApprovalManual as i32,
             automatic_rollback: false,
+            ..Default::default()
         }
     }
 

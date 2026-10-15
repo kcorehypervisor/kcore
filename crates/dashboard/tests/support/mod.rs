@@ -1473,6 +1473,13 @@ impl Controller for MockController {
         Err(unimp("rollback_cluster_update"))
     }
 
+    async fn reboot_cluster_update_node(
+        &self,
+        _: Request<RebootClusterUpdateNodeRequest>,
+    ) -> Result<Response<RebootClusterUpdateNodeResponse>, Status> {
+        Err(unimp("reboot_cluster_update_node"))
+    }
+
     async fn create_operator(
         &self,
         _: Request<CreateOperatorRequest>,

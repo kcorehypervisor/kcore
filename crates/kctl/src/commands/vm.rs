@@ -1358,6 +1358,7 @@ mod tests {
                 cert_expiry_days: -1,
                 luks_method: String::new(),
                 dc_id: String::new(),
+                ..Default::default()
             },
             proto::NodeInfo {
                 node_id: "node-b".to_string(),
@@ -1374,6 +1375,7 @@ mod tests {
                 cert_expiry_days: -1,
                 luks_method: String::new(),
                 dc_id: String::new(),
+                ..Default::default()
             },
         ];
         let addr = node_address_for_vm_node_id(&nodes, "node-b");

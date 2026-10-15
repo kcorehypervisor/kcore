@@ -28,54 +28,81 @@ struct Spec {
     selector: Selector,
     #[serde(default)]
     strategy: Strategy,
-    #[serde(default)]
+    #[serde(default, alias = "drain_vms")]
     drain_vms: bool,
-    #[serde(default)]
+    #[serde(default, alias = "drain_timeout_seconds")]
     drain_timeout_seconds: i32,
     #[serde(default)]
     activation: Activation,
-    #[serde(default)]
+    #[serde(default, alias = "approval_policy")]
     approval_policy: String,
-    #[serde(default)]
+    #[serde(default, alias = "automatic_rollback")]
     automatic_rollback: bool,
+    #[serde(default, alias = "update_kind")]
+    update_kind: String,
+    #[serde(default, alias = "requires_nixpkgs")]
+    requires_nixpkgs: bool,
+    #[serde(default, alias = "tested_os_pins")]
+    tested_os_pins: Vec<TestedOsPin>,
+    #[serde(default, alias = "schema_version")]
+    schema_version: i32,
+    #[serde(default, alias = "previous_schema_version")]
+    previous_schema_version: i32,
+    #[serde(default, alias = "min_compatible_reader")]
+    min_compatible_reader: i32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Target {
     version: String,
+    #[serde(alias = "flake_ref")]
     flake_ref: String,
+    #[serde(alias = "flake_rev")]
     flake_rev: String,
-    #[serde(default)]
+    #[serde(default, alias = "nixpkgs_rev")]
     nixpkgs_rev: String,
-    #[serde(default)]
+    #[serde(default, alias = "system_profile")]
     system_profile: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Selector {
-    #[serde(default)]
+    #[serde(default, alias = "node_ids")]
     node_ids: Vec<String>,
     #[serde(default)]
     labels: Vec<String>,
     #[serde(default)]
     datacenters: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "all_nodes")]
     all_nodes: bool,
-    #[serde(default)]
+    #[serde(default, alias = "controllers_only")]
     controllers_only: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Strategy {
-    #[serde(default)]
+    #[serde(default, alias = "strategy_type")]
     strategy_type: String,
-    #[serde(default)]
+    #[serde(default, alias = "max_unavailable")]
     max_unavailable: i32,
-    #[serde(default)]
+    #[serde(default, alias = "batch_size")]
     batch_size: i32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TestedOsPin {
+    #[serde(default, alias = "nixpkgs_rev")]
+    nixpkgs_rev: String,
+    #[serde(default, alias = "ceph_rev")]
+    ceph_rev: String,
+    #[serde(default, alias = "ceph_sha256")]
+    ceph_sha256: String,
+    #[serde(default, alias = "kubernetes_version")]
+    kubernetes_version: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,18 +110,22 @@ struct Strategy {
 struct Activation {
     #[serde(default)]
     mode: String,
-    #[serde(default)]
+    #[serde(default, alias = "reboot_policy")]
     reboot_policy: String,
 }
 
-fn parse_manifest(path: &str) -> Result<ClusterUpdateManifest> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+fn parse_manifest_yaml(raw: &str) -> Result<ClusterUpdateManifest> {
     let m: ClusterUpdateManifest =
-        serde_yaml::from_str(&raw).with_context(|| format!("parsing YAML {path}"))?;
+        serde_yaml::from_str(raw).context("parsing ClusterUpdate YAML")?;
     if m.kind != "ClusterUpdate" {
         bail!("manifest kind must be ClusterUpdate, got {}", m.kind);
     }
     Ok(m)
+}
+
+fn parse_manifest(path: &str) -> Result<ClusterUpdateManifest> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    parse_manifest_yaml(&raw).with_context(|| format!("parsing YAML {path}"))
 }
 
 fn approval_policy_from_str(s: &str) -> i32 {
@@ -167,6 +198,22 @@ fn to_proto(m: ClusterUpdateManifest) -> controller_proto::ClusterUpdateSpec {
         reboot_policy: m.spec.activation.reboot_policy,
         approval_policy: approval_policy_from_str(&m.spec.approval_policy),
         automatic_rollback: m.spec.automatic_rollback,
+        update_kind: m.spec.update_kind.clone(),
+        requires_nixpkgs: m.spec.requires_nixpkgs,
+        tested_os_pins: m
+            .spec
+            .tested_os_pins
+            .into_iter()
+            .map(|pin| controller_proto::TestedOsPin {
+                nixpkgs_rev: pin.nixpkgs_rev,
+                ceph_rev: pin.ceph_rev,
+                ceph_sha256: pin.ceph_sha256,
+                kubernetes_version: pin.kubernetes_version,
+            })
+            .collect(),
+        schema_version: m.spec.schema_version,
+        previous_schema_version: m.spec.previous_schema_version,
+        min_compatible_reader: m.spec.min_compatible_reader,
     }
 }
 
@@ -278,4 +325,101 @@ pub async fn rollback(info: &ConnectionInfo, name: &str) -> Result<()> {
         .context("rollback_cluster_update rpc")?;
     println!("rollback requested for {name}");
     Ok(())
+}
+
+pub async fn reboot(info: &ConnectionInfo, name: &str, node: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .reboot_cluster_update_node(controller_proto::RebootClusterUpdateNodeRequest {
+            name: name.into(),
+            node_id: node.into(),
+        })
+        .await
+        .context("reboot_cluster_update_node rpc")?
+        .into_inner();
+    if !resp.success {
+        bail!("reboot refused: {}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_manifest_yaml;
+
+    const CAMEL: &str = r#"
+kind: ClusterUpdate
+metadata:
+  name: release-0-4-2
+spec:
+  target:
+    version: "0.4.2"
+    flakeRef: github:kcorehypervisor/kcore
+    flakeRev: "0123456789abcdef0123456789abcdef01234567"
+    nixpkgsRev: "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+  selector:
+    allNodes: true
+  strategy:
+    strategyType: one-at-a-time
+    maxUnavailable: 1
+    batchSize: 1
+  drainVms: false
+  activation:
+    mode: auto
+  approvalPolicy: manual
+  updateKind: kcore
+  schemaVersion: 52
+  previousSchemaVersion: 51
+  minCompatibleReader: 51
+  testedOsPins:
+    - nixpkgsRev: "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+      cephRev: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      cephSha256: "sha"
+      kubernetesVersion: "1.32.1"
+"#;
+
+    #[test]
+    fn release_yaml_parses_camel_case() {
+        let m = parse_manifest_yaml(CAMEL).unwrap();
+        assert_eq!(m.metadata.name, "release-0-4-2");
+        assert_eq!(m.spec.target.flake_ref, "github:kcorehypervisor/kcore");
+        assert_eq!(m.spec.target.flake_rev.len(), 40);
+        assert!(m.spec.selector.all_nodes);
+        assert_eq!(m.spec.strategy.strategy_type, "one-at-a-time");
+        assert_eq!(m.spec.strategy.max_unavailable, 1);
+        assert_eq!(m.spec.update_kind, "kcore");
+        assert_eq!(m.spec.schema_version, 52);
+        assert_eq!(m.spec.tested_os_pins.len(), 1);
+        assert_eq!(m.spec.activation.mode, "auto");
+    }
+
+    #[test]
+    fn release_yaml_parses_snake_case_aliases() {
+        let snake = CAMEL
+            .replace("flakeRef", "flake_ref")
+            .replace("flakeRev", "flake_rev")
+            .replace("nixpkgsRev", "nixpkgs_rev")
+            .replace("allNodes", "all_nodes")
+            .replace("strategyType", "strategy_type")
+            .replace("maxUnavailable", "max_unavailable")
+            .replace("batchSize", "batch_size")
+            .replace("drainVms", "drain_vms")
+            .replace("approvalPolicy", "approval_policy")
+            .replace("updateKind", "update_kind")
+            .replace("schemaVersion", "schema_version")
+            .replace("previousSchemaVersion", "previous_schema_version")
+            .replace("minCompatibleReader", "min_compatible_reader")
+            .replace("testedOsPins", "tested_os_pins")
+            .replace("cephRev", "ceph_rev")
+            .replace("cephSha256", "ceph_sha256")
+            .replace("kubernetesVersion", "kubernetes_version");
+        let m = parse_manifest_yaml(&snake).unwrap();
+        assert_eq!(
+            m.spec.target.flake_rev,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(m.spec.tested_os_pins[0].kubernetes_version, "1.32.1");
+        assert_eq!(m.spec.min_compatible_reader, 51);
+    }
 }
