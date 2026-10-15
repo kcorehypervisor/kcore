@@ -177,6 +177,11 @@
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
+            kcore-host-eval = import ./tests/kcore-host-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
             fmt-nix =
               pkgs.runCommand "check-nix-fmt"
                 {
@@ -248,6 +253,7 @@
             kcore-dashboard = dashboardModule;
             kcore-ceph = cephModule;
             kcore-metrics = metricsModule;
+            kcore-host = ./modules/kcore-host.nix;
           };
 
           nixosConfigurations =
@@ -267,10 +273,6 @@
                   dashboard = inputs.self.packages.x86_64-linux.kcore-dashboard;
                   kcoreConsole = inputs.self.packages.x86_64-linux.kcore-console;
                   diskoPackage = inputs.disko.packages.x86_64-linux.default;
-                  kcoreDiskoModule = ./modules/kcore-disko.nix;
-                  kcoreBrandingModule = ./modules/kcore-branding.nix;
-                  kcoreCephModule = ./modules/kcore-ceph.nix;
-                  kcoreMetricsModule = ./modules/kcore-metrics.nix;
                 in
                 {
                   imports = [
@@ -937,28 +939,7 @@
                                                                 echo "Generating kcoreOS hardware configuration..."
                                                                 nixos-generate-config --root /mnt
 
-                                                                echo "Copying kcore binaries..."
-                                                                mkdir -p /mnt/opt/kcore/bin
-                                                                cp "${nodeAgent}/bin/kcore-node-agent" /mnt/opt/kcore/bin/kcore-node-agent
-                                                                cp "${controller}/bin/kcore-controller" /mnt/opt/kcore/bin/kcore-controller
-                                                                cp "${kctl}/bin/kctl" /mnt/opt/kcore/bin/kctl
-                                                                cp "${dashboard}/bin/kcore-dashboard" /mnt/opt/kcore/bin/kcore-dashboard
-                                                                cp "${kcoreConsole}/bin/kcore-console" /mnt/opt/kcore/bin/kcore-console
-                                                                chmod +x /mnt/opt/kcore/bin/kcore-node-agent
-                                                                chmod +x /mnt/opt/kcore/bin/kcore-controller
-                                                                chmod +x /mnt/opt/kcore/bin/kctl
-                                                                chmod +x /mnt/opt/kcore/bin/kcore-dashboard
-                                                                chmod +x /mnt/opt/kcore/bin/kcore-console
-
-                                                                echo "Copying ch-vm module..."
-                                                                mkdir -p /mnt/etc/nixos/modules/ch-vm
-                                                                cp -r ${chVmModule}/* /mnt/etc/nixos/modules/ch-vm/
-
-                                                                echo "Copying disko configuration..."
-                                                                cp ${kcoreDiskoModule} /mnt/etc/nixos/modules/kcore-disko.nix
-                                                                cp ${kcoreBrandingModule} /mnt/etc/nixos/modules/kcore-branding.nix
-                                                                cp ${kcoreCephModule} /mnt/etc/nixos/modules/kcore-ceph.nix
-                                                                cp ${kcoreMetricsModule} /mnt/etc/nixos/modules/kcore-metrics.nix
+                                                                echo "kcore packages come from the host flake; not copying /opt/kcore/bin."
                                                                 printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-ceph.nix
                                                                 # The format already happened. The saved graph must not point at
                                                                 # /tmp, which is gone after reboot.
@@ -1292,30 +1273,14 @@
                                                                     ;;
                                                                 esac
 
-                                                                echo "Writing kcoreOS configuration..."
-                                                                cat > /mnt/etc/nixos/configuration.nix <<NIXEOF
-                      { config, pkgs, lib, ... }:
+                                                                RUN_CONTROLLER_NIX="false"
+                                                                if [ "$RUN_CONTROLLER" = "true" ]; then
+                                                                  RUN_CONTROLLER_NIX="true"
+                                                                fi
+                                                                echo "Writing node identity..."
+                                                                cat > /mnt/etc/nixos/node.nix <<NIXEOF
+                      { ... }:
                       {
-                        # disko-config.nix and modules/kcore-disko.nix are saved for
-                        # reference and day-2 data-disk operations (see docs/storage.md).
-                        imports = [
-                          ./hardware-configuration.nix
-                          ./modules/ch-vm
-                          ./modules/kcore-branding.nix
-                          ./modules/kcore-ceph.nix
-                          ./modules/kcore-metrics.nix
-                          ./kcore-ceph.nix
-                          ./kcore-vms.nix
-                        ];
-
-                        nix.settings.experimental-features = [ "nix-command" "flakes" ];
-                        nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
-
-                        boot.loader.systemd-boot.enable = true;
-                        boot.loader.efi.canTouchEfiVariables = true;
-                        boot.kernelModules = [ "kvm" "kvm-intel" "kvm-amd" "tap" "tun" "br_netfilter" ];
-                        boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
-
                       $STORAGE_BOOT_CONFIG
 
                       $LUKS_BOOT_CONFIG
@@ -1344,10 +1309,6 @@
                         };
                         users.mutableUsers = true;
 
-                        # Keep classic dbus. A later nixpkgs default of broker makes
-                        # nixos-rebuild refuse to switch a running node.
-                        services.dbus.implementation = "dbus";
-
                         services.openssh = {
                           enable = true;
                           listenAddresses = [ { addr = "0.0.0.0"; port = 22; } ];
@@ -1357,73 +1318,19 @@
                           };
                         };
 
-                        systemd.services.kcore-br0-forward-delay = {
-                          description = "Drop the bridge STP delay before DHCP";
-                          after = [ "network-setup.service" ];
-                          before = [ "dhcpcd.service" ];
-                          wantedBy = [ "multi-user.target" ];
-                          serviceConfig.Type = "oneshot";
-                          path = [ pkgs.iproute2 ];
-                          script = "ip link set br0 type bridge forward_delay 0 stp_state 0 || true";
-                        };
-
-                        systemd.services.kcore-node-agent = {
-                          description = "kcore Node Agent";
-                          wantedBy = [ "multi-user.target" ];
-                          after = [ $NODE_AGENT_AFTER ];
-                          wants = [ "network-online.target" ];
-                          serviceConfig = {
-                            Type = "simple";
-                            ExecStart = "/opt/kcore/bin/kcore-node-agent --config /etc/kcore/node-agent.yaml";
-                            Environment = "PATH=/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/run/wrappers/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-                            Restart = "always";
-                            RestartSec = "10s";
-                            User = "root";
-                            LimitNOFILE = 65536;
-                          };
-                        };
-
-                      $CONTROLLER_SERVICE
-
-                      $DASHBOARD_SERVICE
-
-                        systemd.tmpfiles.rules = [
-                          "d /var/lib/kcore 0755 root root -"
-                          "d /var/lib/kcore/images 0755 root root -"
-                          "d /var/lib/kcore/volumes 0755 root root -"
-                          "d /opt/kcore 0755 root root -"
-                          "d /opt/kcore/bin 0755 root root -"
-                          "d /etc/kcore 0755 root root -"
-                          "d /run/kcore 0755 root root -"
-                        ];
-
-                        environment.systemPackages = with pkgs; [
-                          vim
-                          htop
-                          curl
-                          wget
-                          iproute2
-                          cloud-hypervisor
-                          qemu-utils
-                          cloud-utils
-                          jq
-                          parted
-                          lvm2
-                          cryptsetup
-                          tpm2-tools
-                          disko
-                        ];
-
-                        system.activationScripts.kctl-path.text = "mkdir -p /usr/local/bin\nln -sfn /opt/kcore/bin/kctl /usr/local/bin/kctl\n";
+                        services.kcore.nodeAgent.enable = true;
+                        services.kcore.controller.enable = $RUN_CONTROLLER_NIX;
+                        services.kcore.dashboard.enable = $RUN_CONTROLLER_NIX;
+                        services.kcore.console.enable = true;
 
                         system.stateVersion = "25.05";
                       }
                       NIXEOF
 
-                                                                echo "Installing kcoreOS (this will take 10-20 minutes)..."
+                                                                cp /etc/kcore/installed-flake.nix /mnt/etc/nixos/flake.nix
+                                                                echo "Installing kcoreOS from the host flake (this will take 10-20 minutes)..."
                                                                 export NIX_CONFIG="experimental-features = nix-command flakes"
-                                                                export NIX_PATH="nixos-config=/mnt/etc/nixos/configuration.nix:nixpkgs=${pkgs.path}"
-                                                                nixos-install --no-root-passwd
+                                                                nixos-install --flake /mnt/etc/nixos#kcore --no-root-passwd
 
                                                                 # Enroll TPM2 and add recovery key
                                                                 if [ "$LUKS_METHOD" = "tpm2" ]; then
@@ -1508,6 +1415,44 @@
                     '')
                   ];
 
+                  environment.etc."kcore/installed-flake.nix".text = ''
+                    {
+                      description = "kcore node";
+                      inputs = {
+                        nixpkgs.url = "path:${inputs.nixpkgs.outPath}";
+                        kcore.url = "path:${./.}";
+                      };
+                      outputs =
+                        { nixpkgs, kcore, ... }:
+                        {
+                          nixosConfigurations.kcore = nixpkgs.lib.nixosSystem {
+                            system = "x86_64-linux";
+                            specialArgs = {
+                              inherit kcore;
+                            };
+                            modules = [
+                              kcore.nixosModules.kcore-host
+                              (
+                                { kcore, ... }:
+                                {
+                                  services.kcore.version = "${kcoreVersion}";
+                                  services.kcore.nodeAgent.package = kcore.packages.x86_64-linux.kcore-node-agent;
+                                  services.kcore.controller.package = kcore.packages.x86_64-linux.kcore-controller;
+                                  services.kcore.dashboard.package = kcore.packages.x86_64-linux.kcore-dashboard;
+                                  services.kcore.console.package = kcore.packages.x86_64-linux.kcore-console;
+                                  services.kcore.kctl.package = kcore.packages.x86_64-linux.kctl;
+                                }
+                              )
+                              ./hardware-configuration.nix
+                              ./node.nix
+                              ./kcore-vms.nix
+                              ./kcore-ceph.nix
+                            ];
+                          };
+                        };
+                    }
+                  '';
+
                   environment.etc."kcore/node-agent.yaml" = {
                     text = builtins.concatStringsSep "\n" [
                       "nodeId: kvm-node-01"
@@ -1580,6 +1525,28 @@
                   ./modules/kcore-branding.nix
                   kcoreInstallerModule
                   kcoreNetbootModule
+                ];
+              };
+
+              # Fixture installed node. Packages are hello so evaluating this
+              # configuration does not build the Rust workspace. A real host
+              # sets the packages from its kcore flake input.
+              kcore-node = inputs.nixpkgs.lib.nixosSystem {
+                system = "x86_64-linux";
+                modules = [
+                  ./modules/kcore-host.nix
+                  ./tests/fixtures/installed-node.nix
+                ];
+              };
+              kcore-controller-node = inputs.nixpkgs.lib.nixosSystem {
+                system = "x86_64-linux";
+                modules = [
+                  ./modules/kcore-host.nix
+                  ./tests/fixtures/installed-node.nix
+                  (_: {
+                    services.kcore.controller.enable = true;
+                    services.kcore.dashboard.enable = true;
+                  })
                 ];
               };
             };

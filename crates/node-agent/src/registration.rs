@@ -330,6 +330,7 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
                 (Vec::new(), false)
             }
         };
+        let host = crate::system_update::read_host_report();
         match client
             .heartbeat(controller_proto::HeartbeatRequest {
                 node_id: cfg.node_id.clone(),
@@ -341,6 +342,12 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
                 luks_method: detect_luks_method(),
                 gpus,
                 gpus_reported,
+                kcore_version: host.kcore_version,
+                booted_generation: host.booted_generation,
+                nixos_generation: host.nixos_generation,
+                update_capabilities: host.update_capabilities,
+                schema_version: host.schema_version,
+                nixpkgs_rev: host.nixpkgs_rev,
             })
             .await
         {

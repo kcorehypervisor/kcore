@@ -159,6 +159,78 @@ cmd_dist() {
 	echo "==> Copying $(basename "${ISO_SRC}") to dist/${ISO_NAME}..."
 	cp -f "${ISO_SRC}" "dist/${ISO_NAME}"
 
+	echo "==> Writing dist/kcore-${VERSION}-release.json..."
+	nixpkgs_rev="$(nix eval --raw --file flake.lock --apply 'lock: lock.nodes.nixpkgs.locked.rev' 2>/dev/null || python3 -c 'import json; print(json.load(open("flake.lock"))["nodes"]["nixpkgs"]["locked"]["rev"])')"
+	schema_version="$(sed -n 's/^pub const SCHEMA_VERSION: i32 = \([0-9]*\);/\1/p' crates/controller/src/db.rs | head -n 1)"
+	min_reader="$(sed -n 's/^pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = \([0-9]*\);/\1/p' crates/controller/src/db.rs | head -n 1)"
+	ceph_rev="$(sed -n 's|.*nixpkgs/archive/\([0-9a-f]*\)\.tar.gz.*|\1|p' modules/kcore-ceph.nix | head -n 1)"
+	ceph_sha="$(sed -n 's/.*sha256 = "\([^"]*\)".*/\1/p' modules/kcore-ceph.nix | head -n 1)"
+	k8s_version="$(nix eval --raw .#nixosConfigurations.kcore-node.config.services.kcore.version >/dev/null 2>&1; nix eval --raw nixpkgs#kubernetes.version 2>/dev/null || true)"
+	kcore_rev="$(git rev-parse HEAD)"
+	# Community nodes fetch this git commit and compile it. A later private
+	# cache will serve prebuilt closures, the provisioner, and backup.
+	cat >"dist/kcore-${VERSION}-release.json" <<EOF
+{
+  "version": "${VERSION}",
+  "channel": "community",
+  "nodeBuild": "source",
+  "kcoreRev": "${kcore_rev}",
+  "schemaVersion": ${schema_version:-0},
+  "previousSchemaVersion": ${min_reader:-0},
+  "minCompatibleReader": ${min_reader:-0},
+  "iso": "${ISO_NAME}",
+  "kctl": [
+    "${KCTL_LINUX_ARCHIVE}",
+    "${KCTL_MACOS_X86_64_ARCHIVE}",
+    "${KCTL_MACOS_AARCH64_ARCHIVE}"
+  ],
+  "docsUrl": "https://kcorehypervisor.com/docs/${VERSION}/",
+  "terraformProvider": {
+    "source": "kcorehypervisor/kcore",
+    "version": "${VERSION}"
+  },
+  "testedOsPins": [
+    {
+      "nixpkgsRev": "${nixpkgs_rev}",
+      "cephRev": "${ceph_rev}",
+      "cephSha256": "${ceph_sha}",
+      "kubernetesVersion": "${k8s_version}"
+    }
+  ]
+}
+EOF
+	echo "==> Writing dist/cluster-update-${VERSION}.yaml..."
+	cat >"dist/cluster-update-${VERSION}.yaml" <<EOF
+kind: ClusterUpdate
+metadata:
+  name: release-${VERSION//./-}
+spec:
+  target:
+    version: "${VERSION}"
+    flakeRef: github:kcorehypervisor/kcore
+    flakeRev: "${kcore_rev}"
+    nixpkgsRev: "${nixpkgs_rev}"
+  selector:
+    allNodes: true
+  strategy:
+    strategyType: one-at-a-time
+    maxUnavailable: 1
+    batchSize: 1
+  drainVms: false
+  activation:
+    mode: auto
+  approvalPolicy: manual
+  updateKind: kcore
+  schemaVersion: ${schema_version:-0}
+  previousSchemaVersion: ${min_reader:-0}
+  minCompatibleReader: ${min_reader:-0}
+  testedOsPins:
+    - nixpkgsRev: "${nixpkgs_rev}"
+      cephRev: "${ceph_rev}"
+      cephSha256: "${ceph_sha}"
+      kubernetesVersion: "${k8s_version}"
+EOF
+
 	# Generated here, before SHA256SUMS, so the SBOMs are covered by the
 	# checksums file and therefore by the single signature over it.
 	echo "==> Generating SBOMs..."
@@ -170,7 +242,7 @@ cmd_dist() {
 	echo "==> Writing dist/SHA256SUMS..."
 	(
 		cd dist
-		sha256sum "${ISO_NAME}" "${KCTL_ARCHIVES[@]}" "${SBOM_FILES[@]}" >SHA256SUMS
+		sha256sum "${ISO_NAME}" "${KCTL_ARCHIVES[@]}" "${SBOM_FILES[@]}" "kcore-${VERSION}-release.json" "cluster-update-${VERSION}.yaml" >SHA256SUMS
 	)
 	echo "==> dist layout:"
 	ls -lh dist/
@@ -233,6 +305,8 @@ cmd_publish() {
 		[[ -f "dist/${sbom}" ]] || die "run '${0} dist' first (missing dist/${sbom})"
 	done
 	[[ -f dist/SHA256SUMS ]] || die "run '${0} dist' first"
+	[[ -f "dist/kcore-${VERSION}-release.json" ]] || die "run '${0} dist' first (missing release.json)"
+	[[ -f "dist/cluster-update-${VERSION}.yaml" ]] || die "run '${0} dist' first (missing cluster-update yaml)"
 
 	cmd_sign
 
@@ -252,6 +326,8 @@ cmd_publish() {
 	for sbom in "${SBOM_FILES[@]}"; do
 		assets+=("dist/${sbom}")
 	done
+	assets+=("dist/kcore-${VERSION}-release.json")
+	assets+=("dist/cluster-update-${VERSION}.yaml")
 	assets+=(dist/SHA256SUMS)
 	# Absent only under --no-sign, which cmd_sign already warned about.
 	if [[ -f "dist/${SIGSTORE_BUNDLE}" ]]; then
