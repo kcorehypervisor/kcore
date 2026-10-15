@@ -58,6 +58,7 @@
               || pkgs.lib.hasPrefix "${toString ./.}/proto/" (toString path)
               || (toString path) == "${toString ./.}/modules"
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
+              || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/assets/" (toString path)
               || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path);
           };
