@@ -1058,6 +1058,51 @@ impl Controller for MockController {
         Err(unimp("resize_volume"))
     }
 
+    async fn expose_volume_snapshot(
+        &self,
+        _: Request<ExposeVolumeSnapshotRequest>,
+    ) -> Result<Response<ExposeVolumeSnapshotResponse>, Status> {
+        Err(unimp("expose_volume_snapshot"))
+    }
+
+    async fn unexpose_volume_snapshot(
+        &self,
+        _: Request<UnexposeVolumeSnapshotRequest>,
+    ) -> Result<Response<UnexposeVolumeSnapshotResponse>, Status> {
+        Err(unimp("unexpose_volume_snapshot"))
+    }
+
+    async fn list_volume_changed_extents(
+        &self,
+        _: Request<ListVolumeChangedExtentsRequest>,
+    ) -> Result<Response<ListVolumeChangedExtentsResponse>, Status> {
+        Err(unimp("list_volume_changed_extents"))
+    }
+
+    type ReadVolumeBlocksStream =
+        tokio_stream::wrappers::ReceiverStream<Result<VolumeBlock, Status>>;
+
+    async fn read_volume_blocks(
+        &self,
+        _: Request<ReadVolumeBlocksRequest>,
+    ) -> Result<Response<Self::ReadVolumeBlocksStream>, Status> {
+        Err(unimp("read_volume_blocks"))
+    }
+
+    async fn write_volume_blocks(
+        &self,
+        _: Request<tonic::Streaming<WriteVolumeBlocksRequest>>,
+    ) -> Result<Response<WriteVolumeBlocksResponse>, Status> {
+        Err(unimp("write_volume_blocks"))
+    }
+
+    async fn freeze_vm_filesystems(
+        &self,
+        _: Request<FreezeVmFilesystemsRequest>,
+    ) -> Result<Response<FreezeVmFilesystemsResponse>, Status> {
+        Err(unimp("freeze_vm_filesystems"))
+    }
+
     async fn format_volume(
         &self,
         _: Request<FormatVolumeRequest>,
