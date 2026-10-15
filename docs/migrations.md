@@ -26,7 +26,17 @@ schema_version
 
 ## Current schema version
 
-**49**
+**57**
+
+`Database::migrate` applies each `up`. `Database::migrate_down(target)` applies
+the matching `down` from `crates/controller/src/schema_down.rs` and refuses a
+version marked irreversible. Before an `up` from an older file, the controller
+writes a SQLite backup next to the database named
+`<db>.pre-migrate-<version>`. Version 57 adds `node_host_status` only, so a
+controller built for version 56 can still open the file. A controlled rollback
+to 56 drops that table before the old generation starts.
+
+## Current schema version (historical note)
 
 Versions 7 through 49 are applied by `Database::migrate()` in
 `crates/controller/src/db.rs`. The table below records the original

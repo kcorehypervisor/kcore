@@ -182,6 +182,8 @@ service Controller {
   rpc ApproveClusterUpdate(ApproveClusterUpdateRequest) returns (ApproveClusterUpdateResponse);
   rpc CancelClusterUpdate(CancelClusterUpdateRequest) returns (CancelClusterUpdateResponse);
   rpc RollbackClusterUpdate(RollbackClusterUpdateRequest) returns (RollbackClusterUpdateResponse);
+  // Migrate guests off one node, then boot a staged kernel. Not part of apply.
+  rpc RebootClusterUpdateNode(RebootClusterUpdateNodeRequest) returns (RebootClusterUpdateNodeResponse);
 
   // CephCluster — declarative cluster-scoped Ceph SAN configuration.
   rpc PlanCephCluster(PlanCephClusterRequest) returns (PlanCephClusterResponse);
@@ -262,6 +264,17 @@ message HeartbeatRequest {
   // inventory alone. Rows are GPUs, NICs, NVMe, and raw groups; see GpuInfo.kind.
   repeated GpuInfo gpus = 5;
   bool gpus_reported = 6;
+  // Product version from /etc/kcore/version when the node has one.
+  string kcore_version = 7;
+  // Nix store path of the booted system (`/run/booted-system`).
+  string booted_generation = 8;
+  // Nix store path of the current system profile.
+  string nixos_generation = 9;
+  // Includes "nixos-generation" once the agent can stage a host flake.
+  repeated string update_capabilities = 10;
+  // Controller schema this node opened. 0 on a worker.
+  int32 schema_version = 11;
+  string nixpkgs_rev = 12;
 }
 
 message GpuInfo {
@@ -786,6 +799,12 @@ message NodeInfo {
   int32 cert_expiry_days = 12; // Days until node TLS certificate expires (-1 = unknown)
   string luks_method = 13;     // "tpm2", "key-file", or "" (unknown/not reported)
   string dc_id = 14;           // Datacenter identifier (e.g., "DC1", "DC2")
+  string kcore_version = 15;
+  string booted_generation = 16;
+  string nixos_generation = 17;
+  repeated string update_capabilities = 18;
+  int32 schema_version = 19;
+  string nixpkgs_rev = 20;
 }
 
 message GetNodeRequest {
@@ -1980,6 +1999,13 @@ enum ClusterUpdateActivationMode {
   CLUSTER_UPDATE_ACTIVATION_AUTO = 4;
 }
 
+message TestedOsPin {
+  string nixpkgs_rev = 1;
+  string ceph_rev = 2;
+  string ceph_sha256 = 3;
+  string kubernetes_version = 4;
+}
+
 message ClusterUpdateSpec {
   string name = 1;
   ClusterUpdateTarget target = 2;
@@ -1991,6 +2017,13 @@ message ClusterUpdateSpec {
   string reboot_policy = 8;
   ClusterUpdateApprovalPolicy approval_policy = 9;
   bool automatic_rollback = 10;
+  // "kcore" moves the product pin. "nixpkgs" moves a published OS pin.
+  string update_kind = 11;
+  bool requires_nixpkgs = 12;
+  repeated TestedOsPin tested_os_pins = 13;
+  int32 schema_version = 14;
+  int32 previous_schema_version = 15;
+  int32 min_compatible_reader = 16;
 }
 
 enum ClusterUpdatePhase {
@@ -2027,6 +2060,7 @@ enum NodeUpdatePhase {
   NODE_UPDATE_PHASE_FAILED = 4;
   NODE_UPDATE_PHASE_CANCELLED = 5;
   NODE_UPDATE_PHASE_ROLLING_BACK = 6;
+  NODE_UPDATE_PHASE_REBOOT_REQUIRED = 7;
 }
 
 message NodeUpdateStatus {
@@ -2112,6 +2146,16 @@ message RollbackClusterUpdateRequest {
 message RollbackClusterUpdateResponse {
   bool success = 1;
   ClusterUpdate cluster_update = 2;
+}
+
+message RebootClusterUpdateNodeRequest {
+  string name = 1;
+  string node_id = 2;
+}
+
+message RebootClusterUpdateNodeResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 // --- CephCluster ----------------------------------------------------------------------------

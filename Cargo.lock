@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-console"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-controller"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-dashboard"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-node-agent"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "kctl"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",

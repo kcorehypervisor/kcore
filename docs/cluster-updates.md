@@ -1,11 +1,17 @@
 # NixOS-Native Cluster Updates
 
-This document designs the update path for running kcore nodes and whole
-clusters. The goal is to stop treating a new ISO as the only upgrade path and
-instead use NixOS generations, flake-pinned kcore packages, and controller-led
-rolling reconciliation.
+An installed node keeps its identity in `/etc/nixos/node.nix` and takes packages
+from a host flake, `/etc/nixos#kcore`. `kctl update apply` moves the kcore pin.
+A separate ClusterUpdate with `updateKind: nixpkgs` moves a published OS pin;
+its `nixpkgs` rev must be one of `testedOsPins`. A userspace switch does not reboot. A kernel or
+`kcore-vm-*` unit change is staged with `nixos-rebuild boot` and
+`bootctl set-oneshot`; `kctl update reboot` migrates guests when `drainVms` is
+set, then boots that generation. Schema changes run inside the controller
+binary. `Database::migrate_down` runs before a controlled rollback when the
+step is reversible. A panic reboot relies on the previous schema still opening
+the expanded file.
 
-The operator-facing intent should be declarative: `kctl`, Terraform, and
+The operator-facing intent is declarative: `kctl`, Terraform, and
 Crossplane all submit the same desired update object to the controller. The
 controller coordinates node-agent work, NixOS activation, workload draining,
 health checks, and rollback.
