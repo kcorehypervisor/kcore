@@ -4359,7 +4359,36 @@ fn node_update_phase_to_proto(s: &str) -> i32 {
         "failed" => controller_proto::NodeUpdatePhase::Failed as i32,
         "cancelled" => controller_proto::NodeUpdatePhase::Cancelled as i32,
         "rolling_back" => controller_proto::NodeUpdatePhase::RollingBack as i32,
+        "reboot_required" => controller_proto::NodeUpdatePhase::RebootRequired as i32,
         _ => controller_proto::NodeUpdatePhase::Unspecified as i32,
+    }
+}
+
+fn host_status_fields(
+    db: &crate::db::Database,
+    node_id: &str,
+) -> (String, String, String, Vec<String>, i32, String) {
+    match db.get_node_host_status(node_id) {
+        Ok(Some(row)) => (
+            row.kcore_version,
+            row.booted_generation,
+            row.nixos_generation,
+            row.update_capabilities
+                .split(',')
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_string())
+                .collect(),
+            row.schema_version,
+            row.nixpkgs_rev,
+        ),
+        _ => (
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            0,
+            String::new(),
+        ),
     }
 }
 
@@ -5521,6 +5550,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "node {} not registered",
                 req.node_id
             )));
+        }
+
+        let capabilities = req.update_capabilities.join(",");
+        if let Err(e) = self.db.upsert_node_host_status(
+            &req.node_id,
+            &req.kcore_version,
+            &req.booted_generation,
+            &req.nixos_generation,
+            &capabilities,
+            req.schema_version,
+            &req.nixpkgs_rev,
+        ) {
+            warn!(node_id = %req.node_id, error = %e, "heartbeat stored usage but not host generation");
         }
 
         if req.gpus_reported {
@@ -8718,6 +8760,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 } else {
                     parse_datetime_to_timestamp(&n.last_heartbeat)
                 };
+                let (
+                    kcore_version,
+                    booted_generation,
+                    nixos_generation,
+                    update_capabilities,
+                    schema_version,
+                    nixpkgs_rev,
+                ) = host_status_fields(&self.db, &n.id);
                 controller_proto::NodeInfo {
                     node_id: n.id,
                     hostname: n.hostname,
@@ -8739,6 +8789,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     cert_expiry_days: n.cert_expiry_days,
                     luks_method: n.luks_method,
                     dc_id: n.dc_id,
+                    kcore_version,
+                    booted_generation,
+                    nixos_generation,
+                    update_capabilities,
+                    schema_version,
+                    nixpkgs_rev,
                 }
             })
             .collect();
@@ -8767,6 +8823,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
             parse_datetime_to_timestamp(&node.last_heartbeat)
         };
 
+        let (
+            kcore_version,
+            booted_generation,
+            nixos_generation,
+            update_capabilities,
+            schema_version,
+            nixpkgs_rev,
+        ) = host_status_fields(&self.db, &node.id);
         Ok(Response::new(controller_proto::GetNodeResponse {
             node: Some(controller_proto::NodeInfo {
                 node_id: node.id.clone(),
@@ -8789,6 +8853,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 cert_expiry_days: node.cert_expiry_days,
                 luks_method: node.luks_method,
                 dc_id: node.dc_id,
+                kcore_version,
+                booted_generation,
+                nixos_generation,
+                update_capabilities,
+                schema_version,
+                nixpkgs_rev,
             }),
         }))
     }
@@ -12106,6 +12176,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 } else {
                     parse_datetime_to_timestamp(&n.last_heartbeat)
                 };
+                let (
+                    kcore_version,
+                    booted_generation,
+                    nixos_generation,
+                    update_capabilities,
+                    schema_version,
+                    nixpkgs_rev,
+                ) = host_status_fields(&self.db, &n.id);
                 controller_proto::NodeInfo {
                     node_id: n.id,
                     hostname: n.hostname,
@@ -12127,6 +12205,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     cert_expiry_days: n.cert_expiry_days,
                     luks_method: n.luks_method,
                     dc_id: n.dc_id,
+                    kcore_version,
+                    booted_generation,
+                    nixos_generation,
+                    update_capabilities,
+                    schema_version,
+                    nixpkgs_rev,
                 }
             })
             .collect();
@@ -13421,6 +13505,22 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     node_id: nid.clone(),
                     reason: "node not registered".into(),
                 });
+            } else if let Ok(Some(host)) = self.db.get_node_host_status(nid) {
+                if spec.schema_version > 0 && host.schema_version > spec.schema_version {
+                    issues.push(controller_proto::PlanIssue {
+                        node_id: nid.clone(),
+                        reason: "node schema is newer than this update".into(),
+                    });
+                }
+                if spec.min_compatible_reader > 0
+                    && host.schema_version > 0
+                    && host.schema_version < spec.min_compatible_reader
+                {
+                    issues.push(controller_proto::PlanIssue {
+                        node_id: nid.clone(),
+                        reason: "node schema is older than minCompatibleReader".into(),
+                    });
+                }
             }
         }
         let viable = !target_ids.is_empty() && issues.is_empty();
@@ -13567,7 +13667,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .list_cluster_update_nodes(&name)
             .map_err(|e| Status::internal(e.to_string()))?;
         for n in nodes {
-            if n.phase == "succeeded" || n.phase == "prepared" || n.phase == "pending" {
+            if n.phase == "succeeded"
+                || n.phase == "prepared"
+                || n.phase == "pending"
+                || n.phase == "reboot_required"
+                || n.phase == "bootstrapping"
+            {
                 self.db
                     .upsert_cluster_update_node(&ClusterUpdateNodeRow {
                         phase: "rolling_back".into(),
@@ -13595,6 +13700,86 @@ impl controller_proto::controller_server::Controller for ControllerService {
             controller_proto::RollbackClusterUpdateResponse {
                 success: true,
                 cluster_update: Some(cluster_update_row_to_proto(&stored, parsed)),
+            },
+        ))
+    }
+
+    async fn reboot_cluster_update_node(
+        &self,
+        request: Request<controller_proto::RebootClusterUpdateNodeRequest>,
+    ) -> Result<Response<controller_proto::RebootClusterUpdateNodeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if req.name.trim().is_empty() || req.node_id.trim().is_empty() {
+            return Err(Status::invalid_argument("name and node_id are required"));
+        }
+        let update = self
+            .db
+            .get_cluster_update(req.name.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("cluster update not found"))?;
+        let spec = cluster_update_spec::spec_from_json(&update.spec_json)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let node_row = self
+            .db
+            .list_cluster_update_nodes(req.name.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .find(|row| row.node_id == req.node_id)
+            .ok_or_else(|| Status::not_found("node is not part of this update"))?;
+        if node_row.phase != "reboot_required" {
+            return Err(Status::failed_precondition(
+                "node has no staged reboot; apply finishes userspace switches without one",
+            ));
+        }
+        let vms = self
+            .db
+            .list_vms_for_node(&req.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !vms.is_empty() {
+            if !spec.drain_vms {
+                return Err(Status::failed_precondition(
+                    "guests are still on this node; migrate them or set drainVms before reboot",
+                ));
+            }
+            let outcome = self
+                .drain_node_vms(&req.node_id, "", NodeDrainOptions::default())
+                .await?;
+            if !outcome.errors.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "drain failed: {}",
+                    outcome.errors.join("; ")
+                )));
+            }
+        }
+        let node = self
+            .db
+            .get_node(&req.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("node not registered"))?;
+        if self.clients.get_admin(&node.address).is_none() {
+            self.clients
+                .connect(&node.address)
+                .await
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+        }
+        let mut admin = self
+            .clients
+            .get_admin(&node.address)
+            .ok_or_else(|| Status::unavailable("node admin client unavailable"))?;
+        let resp = admin
+            .reboot_staged_system_update(Request::new(
+                crate::node_proto::RebootStagedSystemUpdateRequest {
+                    update_name: req.name,
+                },
+            ))
+            .await
+            .map_err(|e| Status::unavailable(format!("reboot: {e}")))?
+            .into_inner();
+        Ok(Response::new(
+            controller_proto::RebootClusterUpdateNodeResponse {
+                success: resp.success,
+                message: resp.message,
             },
         ))
     }
@@ -17617,6 +17802,7 @@ mod tests {
                 luks_method: "tpm2".to_string(),
                 gpus: vec![],
                 gpus_reported: false,
+                ..Default::default()
             }),
         )
         .await
@@ -18564,6 +18750,7 @@ mod tests {
             approval_policy:
                 controller_proto::ClusterUpdateApprovalPolicy::ClusterUpdateApprovalManual as i32,
             automatic_rollback: false,
+            ..Default::default()
         }
     }
 

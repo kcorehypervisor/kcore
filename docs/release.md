@@ -87,6 +87,8 @@ The release packaging step produces:
 - `dist/kcoreos-$(VERSION)-x86_64-linux.iso` (release asset name; copied from the single ISO produced under `result-iso/iso/`)
 - `dist/kcore-$(VERSION)-crates.cdx.json` (CycloneDX SBOM of the Rust dependency graph)
 - `dist/kcore-$(VERSION)-iso-closure.cdx.json` and `.spdx.json` (the ISO's Nix closure, both formats)
+- `dist/kcore-$(VERSION)-release.json` (the version contract: commit, schema, tested OS pins, docs URL, Terraform provider coordinate)
+- `dist/cluster-update-$(VERSION).yaml` (the `ClusterUpdate` manifest for that commit)
 - `dist/SHA256SUMS` for all assets
 - `dist/SHA256SUMS.sigstore.json` from the publish step (absent under `--no-sign`)
 
@@ -117,8 +119,7 @@ committed, so nothing about them runs in pull-request CI.
    KCORE_SIGNER_IDENTITY='you@example.org' make verify-release V=vX.Y.Z
    ```
 
-2. **Check the release page** lists all nine assets, including both SBOMs and
-   `SHA256SUMS.sigstore.json`.
+2. **Check the release page** lists the ISO, the three `kctl` archives, both SBOMs, `kcore-$(VERSION)-release.json`, `cluster-update-$(VERSION).yaml`, and `SHA256SUMS.sigstore.json`.
 
 3. **Spot-check an SBOM.** `make sbom` is fast and deterministic enough that a
    mismatch means something went wrong in packaging rather than in the tool.
@@ -134,6 +135,33 @@ exists. To force custom notes:
 ```bash
 RELEASE_NOTES=path/to/notes.md GH_TOKEN=... make release-publish
 ```
+
+## What one version ships
+
+`VERSION` names the ISO, the git tag, the docs tree, and the Terraform provider. `dist/kcore-$(VERSION)-release.json` is the contract those artifacts copy. `dist/cluster-update-$(VERSION).yaml` is the manifest an operator applies:
+
+```bash
+kctl update cluster plan -f cluster-update-X.Y.Z.yaml
+kctl update cluster apply -f cluster-update-X.Y.Z.yaml
+```
+
+`kctl` submits that file to the controller. It does not download a package. The node rewrites `/etc/nixos/flake.nix` so `inputs.kcore.url` is `github:kcorehypervisor/kcore/<commit>` and runs `nix build`. On the Community Edition that build compiles the Rust packages on the node. Nixpkgs still comes from `cache.nixos.org`.
+
+A later private channel will serve prebuilt closures of newer versions, plus the kcore provisioner and the backup service. That channel is not part of this Community release. Community nodes keep compiling the public git commit.
+
+After the GitHub Release is up:
+
+1. Snapshot the operator docs for this version and deploy the site. From the `kcore-site` repository:
+
+   ```bash
+   ./scripts/snapshot-docs.sh X.Y.Z <schemaVersion>
+   ```
+
+   `/docs/user/` stays the latest stable pages. `/docs/X.Y.Z/` is the frozen copy. The schema version is `SCHEMA_VERSION` in `crates/controller/src/db.rs`.
+
+2. Cut `terraform-provider-kcore` at the same `X.Y.Z`. Its `kcore_cluster_update` resource must accept the same target, strategy, `update_kind`, tested pins, and schema fields as the YAML. Publish it to the Terraform Registry. Reboot stays `kctl update cluster reboot`.
+
+3. `make verify-release` checks the signature. It does not deploy the site or the provider.
 
 ## Artifact notes
 

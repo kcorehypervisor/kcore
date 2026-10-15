@@ -25,6 +25,7 @@ mod rbd_nbd;
 mod registration;
 mod runtime;
 mod storage;
+mod system_update;
 mod vmm;
 mod volume_crypto;
 mod zfs_ops;

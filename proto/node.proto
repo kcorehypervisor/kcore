@@ -146,6 +146,8 @@ service NodeAdmin {
   rpc ActivateSystemUpdate(ActivateSystemUpdateRequest) returns (ActivateSystemUpdateResponse);
   rpc GetSystemUpdateStatus(GetSystemUpdateStatusRequest) returns (GetSystemUpdateStatusResponse);
   rpc RollbackSystemUpdate(RollbackSystemUpdateRequest) returns (RollbackSystemUpdateResponse);
+  // Migrate is the controller's job. This boots a generation that was already staged.
+  rpc RebootStagedSystemUpdate(RebootStagedSystemUpdateRequest) returns (RebootStagedSystemUpdateResponse);
 
   // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
   // Preflight checks (dry-build, OSD device, RAID, addresses, nixpkgs, DHCP mon)
@@ -1065,6 +1067,13 @@ message PrepareSystemUpdateRequest {
   string system_profile = 4;
   string host_system = 5;
   int32 timeout_seconds = 6;
+  // "kcore", "nixpkgs", or "bootstrap". Empty means kcore.
+  string update_kind = 7;
+  string nixpkgs_rev = 8;
+  string ceph_rev = 9;
+  string ceph_sha256 = 10;
+  string kubernetes_version = 11;
+  bool requires_nixpkgs = 12;
 }
 
 message PrepareSystemUpdateResponse {
@@ -1086,6 +1095,8 @@ message ActivateSystemUpdateRequest {
 message ActivateSystemUpdateResponse {
   bool success = 1;
   string message = 2;
+  bool requires_reboot = 3;
+  string phase = 4;
 }
 
 message GetSystemUpdateStatusRequest {
@@ -1107,6 +1118,15 @@ message RollbackSystemUpdateRequest {
 }
 
 message RollbackSystemUpdateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RebootStagedSystemUpdateRequest {
+  string update_name = 1;
+}
+
+message RebootStagedSystemUpdateResponse {
   bool success = 1;
   string message = 2;
 }

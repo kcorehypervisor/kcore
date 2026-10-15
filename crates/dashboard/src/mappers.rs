@@ -1896,6 +1896,7 @@ mod tests {
                 cert_expiry_days: 90,
                 luks_method: "tpm2".into(),
                 dc_id: "DC2".into(),
+                ..Default::default()
             }],
             nodes_luks_tpm2: 1,
             nodes_luks_keyfile: 0,

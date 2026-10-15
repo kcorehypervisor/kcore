@@ -72,6 +72,17 @@ pub struct NodeRow {
     pub dc_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeHostStatus {
+    pub node_id: String,
+    pub kcore_version: String,
+    pub booted_generation: String,
+    pub nixos_generation: String,
+    pub update_capabilities: String,
+    pub schema_version: i32,
+    pub nixpkgs_rev: String,
+}
+
 /// Result of [`Database::apply_vm_runtime_state`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmRuntimeApply {
@@ -747,7 +758,11 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 56;
+pub const SCHEMA_VERSION: i32 = 57;
+
+/// Oldest schema a previous controller binary can still open after this release.
+/// Version 57 only adds `node_host_status`.
+pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
 const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
                     name TEXT PRIMARY KEY,
@@ -845,7 +860,7 @@ impl Database {
         })
     }
 
-    fn migrate(&self) -> Result<()> {
+    pub fn migrate(&self) -> Result<()> {
         let conn = self.lock_conn()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (
@@ -979,6 +994,9 @@ impl Database {
         )?;
 
         let version = Self::schema_version(&conn);
+        if version < SCHEMA_VERSION {
+            let _ = Self::backup_before_migrate(&conn, version);
+        }
 
         if version < 1 {
             let _ = conn.execute(
@@ -1939,6 +1957,20 @@ impl Database {
             }
         }
 
+        if version < 57 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS node_host_status (
+                    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+                    kcore_version TEXT NOT NULL DEFAULT '',
+                    booted_generation TEXT NOT NULL DEFAULT '',
+                    nixos_generation TEXT NOT NULL DEFAULT '',
+                    update_capabilities TEXT NOT NULL DEFAULT '',
+                    schema_version INTEGER NOT NULL DEFAULT 0,
+                    nixpkgs_rev TEXT NOT NULL DEFAULT ''
+                );",
+            )?;
+        }
+
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
         if version < CURRENT_VERSION {
             conn.execute("DELETE FROM schema_version", [])?;
@@ -1949,6 +1981,133 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    fn backup_before_migrate(conn: &Connection, from_version: i32) -> Result<(), rusqlite::Error> {
+        let file: String = conn
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        if file.is_empty() {
+            return Ok(());
+        }
+        let dest = format!("{file}.pre-migrate-{from_version}");
+        conn.backup(
+            rusqlite::DatabaseName::Main,
+            dest,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+    }
+
+    /// Run `down` for every version above `target`. Refuses an irreversible step.
+    /// Does not restore the pre-migrate backup.
+    pub fn migrate_down(&self, target: i32) -> Result<(), String> {
+        if !(0..=SCHEMA_VERSION).contains(&target) {
+            return Err(format!(
+                "schema target {target} is outside 0..={SCHEMA_VERSION}"
+            ));
+        }
+        let conn = self.lock_conn().map_err(|e| e.to_string())?;
+        let current = Self::schema_version(&conn);
+        if target > current {
+            return Err(format!("schema target {target} is newer than {current}"));
+        }
+        if target == current {
+            return Ok(());
+        }
+        for version in (target + 1..=current).rev() {
+            let Some(step) = crate::schema_down::SCHEMA_DOWNS
+                .iter()
+                .find(|step| step.version == version)
+            else {
+                continue;
+            };
+            if step.irreversible {
+                return Err(format!(
+                    "schema version {version} is irreversible; refuse automatic rollback"
+                ));
+            }
+            if !step.sql.is_empty() {
+                conn.execute_batch(step.sql)
+                    .map_err(|e| format!("down schema {version}: {e}"))?;
+            }
+        }
+        conn.execute("DELETE FROM schema_version", [])
+            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![target],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn upsert_node_host_status(
+        &self,
+        node_id: &str,
+        kcore_version: &str,
+        booted_generation: &str,
+        nixos_generation: &str,
+        update_capabilities: &str,
+        schema_version: i32,
+        nixpkgs_rev: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO node_host_status (
+                node_id, kcore_version, booted_generation, nixos_generation,
+                update_capabilities, schema_version, nixpkgs_rev
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(node_id) DO UPDATE SET
+                kcore_version = excluded.kcore_version,
+                booted_generation = excluded.booted_generation,
+                nixos_generation = excluded.nixos_generation,
+                update_capabilities = excluded.update_capabilities,
+                schema_version = excluded.schema_version,
+                nixpkgs_rev = excluded.nixpkgs_rev",
+            params![
+                node_id,
+                kcore_version,
+                booted_generation,
+                nixos_generation,
+                update_capabilities,
+                schema_version,
+                nixpkgs_rev
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_node_host_status(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<NodeHostStatus>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, kcore_version, booted_generation, nixos_generation,
+                    update_capabilities, schema_version, nixpkgs_rev
+             FROM node_host_status WHERE node_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![node_id], |row| {
+            Ok(NodeHostStatus {
+                node_id: row.get(0)?,
+                kcore_version: row.get(1)?,
+                booted_generation: row.get(2)?,
+                nixos_generation: row.get(3)?,
+                update_capabilities: row.get(4)?,
+                schema_version: row.get(5)?,
+                nixpkgs_rev: row.get(6)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn schema_version_for_test(&self) -> i32 {
+        let conn = self.lock_conn().expect("lock");
+        Self::schema_version(&conn)
     }
 
     fn schema_version(conn: &Connection) -> i32 {
