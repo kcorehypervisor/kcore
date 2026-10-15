@@ -514,16 +514,16 @@ Complete each phase sequentially. Each phase has multiple tasks. No fixed calend
 **Goal:** Services can get real IPs from network (no external load balancer needed)
 
 ### Task 9.1: Configure Cilium LoadBalancer IP Pool
-- [ ] Create `CiliumLoadBalancerIPPool` resource
-  - CIDR: `192.168.40.220/29` (8 IPs: .220-.227)
+- [x] The controller creates `CiliumLoadBalancerIPPool` `kcore` from `loadBalancerIpPools`
+  - Example CIDR: `192.168.40.220/29` (8 IPs: .220-.227)
   - Reserve IPs outside DHCP range
 - [ ] Verify pool created: `kubectl get ciliumloadbalancerippool`
 
 ### Task 9.2: Configure L2 Announcement Policy
-- [ ] Create `CiliumL2AnnouncementPolicy` resource
-  - Interface: `enp6s0` (management NIC)
-  - Enable for LoadBalancer IPs
-- [ ] Verify: `kubectl get ciliumnodeconfig`
+- [x] The controller creates `CiliumL2AnnouncementPolicy` `kcore` on the node interfaces
+  - Interface: `enp6s0` unless the node sets another iface
+  - `loadBalancerIPs: true`
+- [ ] Verify: `kubectl get ciliuml2announcementpolicies`
 
 ### Task 9.3: Test LoadBalancer Service
 - [ ] Deploy test app:

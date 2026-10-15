@@ -161,25 +161,25 @@ spec:
 - **No router config:** Works on any L2 network
 
 **Configuration:**
+
+The controller installs this. The control-plane unit `kcore-kubernetes-cilium` runs `cilium install` and applies the manifest below. Names are `kcore`.
+
 ```yaml
-apiVersion: "cilium.io/v2alpha1"
+apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
-  name: default-pool
+  name: kcore
 spec:
-  cidrs:
+  blocks:
     - cidr: "192.168.40.220/29"  # 8 IPs: .220-.227
-  serviceSelector:
-    matchLabels: {}  # All LoadBalancer services
 ---
-apiVersion: "cilium.io/v2alpha1"
+apiVersion: cilium.io/v2alpha1
 kind: CiliumL2AnnouncementPolicy
 metadata:
-  name: default-l2-policy
+  name: kcore
 spec:
   interfaces:
     - enp6s0  # Management NIC
-  externalIPs: true
   loadBalancerIPs: true
 ```
 
@@ -340,69 +340,42 @@ spec:
 
 ---
 
-## 6. Cilium Installation (Phase 4, Task 4.7)
+## 6. Cilium Installation
 
-### Via Helm (Recommended)
+The controller installs Cilium on the primary cluster (API port 6443). The control-plane oneshot `kcore-kubernetes-cilium` waits for the API, then runs `cilium install` from the `cilium-cli` package. A later boot runs `cilium upgrade` when the DaemonSet is already present. The chart is the one shipped with that CLI.
 
-```bash
-# Add Cilium Helm repo
-helm repo add cilium https://helm.cilium.io/
-helm repo update
+The host does not run kube-proxy. The install sets `kubeProxyReplacement=true`, `ipam.mode=kubernetes`, `bpf.masquerade=true`, and `k8sServiceHost` / `k8sServicePort` from `apiServerEndpoint`. Native routing (the default) sets `routingMode=native`, `autoDirectNodeRoutes`, and `ipv4NativeRoutingCIDR` to the cluster CIDR. `mtu` comes from the cluster. `devices` is the list of node interfaces. An empty iface is `enp6s0`.
 
-# Install Cilium with native routing + L2 LoadBalancer
-helm install cilium cilium/cilium \
-  --namespace kube-system \
-  --set ipam.mode=kubernetes \
-  --set tunnel=disabled \
-  --set autoDirectNodeRoutes=true \
-  --set ipv4NativeRoutingCIDR=10.244.0.0/16 \
-  --set l2announcements.enabled=true \
-  --set kubeProxyReplacement=true \
-  --set k8sServiceHost=192.168.40.200 \
-  --set k8sServicePort=6443 \
-  --set hubble.enabled=true \
-  --set hubble.relay.enabled=true \
-  --set hubble.ui.enabled=true
-```
+When `loadBalancerIpPools` is not empty, the install also sets `l2announcements.enabled=true` and writes `/etc/kubernetes/cilium-l2.yaml`:
 
-### Configure LoadBalancer IP Pool
-
-```bash
-kubectl apply -f - <<EOF
-apiVersion: "cilium.io/v2alpha1"
+```yaml
+apiVersion: cilium.io/v2
 kind: CiliumLoadBalancerIPPool
 metadata:
-  name: default-pool
+  name: kcore
 spec:
-  cidrs:
+  blocks:
     - cidr: "192.168.40.220/29"
 ---
-apiVersion: "cilium.io/v2alpha1"
+apiVersion: cilium.io/v2alpha1
 kind: CiliumL2AnnouncementPolicy
 metadata:
-  name: default-l2-policy
+  name: kcore
 spec:
   interfaces:
     - enp6s0
-  externalIPs: true
   loadBalancerIPs: true
-EOF
 ```
+
+An empty pool list still installs Cilium and does not create the L2 objects. A second cluster on the same hosts uses the bridge CNI and does not start another Cilium agent.
 
 ### Verify
 
 ```bash
-# Check Cilium pods
-kubectl get pods -n kube-system -l k8s-app=cilium
-
-# Check Cilium status
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -l k8s-app=cilium
 cilium status
-
-# Check connectivity
-cilium connectivity test
-
-# Access Hubble UI
-cilium hubble ui
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get ciliumloadbalancerippool kcore
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get ciliuml2announcementpolicies kcore
 ```
 
 ---

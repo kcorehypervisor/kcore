@@ -262,12 +262,8 @@ kubectl apply -f nginx-ingress.yaml
 ```
 
 ### After (Cilium only)
-```bash
-helm install cilium cilium/cilium \
-  --set l2announcements.enabled=true
-  
-kubectl apply -f cilium-ippool.yaml
-```
+
+The controller unit `kcore-kubernetes-cilium` installs Cilium and applies the L2 pool. An operator does not run helm for this.
 
 ---
 

@@ -52,6 +52,123 @@ let
       exit 1
     '';
 
+  # Primary cluster only. Extra clusters use the bridge CNI and must not
+  # start a second Cilium agent.
+  ciliumUseTunnel = cfg.ciliumMode == "tunnel";
+  ciliumTunnelProto = if cfg.ciliumTunnel == "geneve" then "geneve" else "vxlan";
+  ciliumApiParts = lib.splitString ":" cfg.apiServerEndpoint;
+  ciliumApiLast = if ciliumApiParts == [ ] then "" else lib.last ciliumApiParts;
+  ciliumApiPortIsNumber = builtins.match "[0-9]+" ciliumApiLast != null;
+  ciliumApiPort =
+    if builtins.length ciliumApiParts >= 2 && ciliumApiPortIsNumber then ciliumApiLast else "6443";
+  ciliumApiHost =
+    if builtins.length ciliumApiParts >= 2 && ciliumApiPortIsNumber then
+      lib.concatStringsSep ":" (lib.init ciliumApiParts)
+    else
+      cfg.apiServerEndpoint;
+  ciliumL2Ifaces = if cfg.ciliumL2Interfaces != [ ] then cfg.ciliumL2Interfaces else [ cfg.iface ];
+  ciliumHelmSets = [
+    "ipam.mode=kubernetes"
+    "kubeProxyReplacement=true"
+    "bpf.masquerade=true"
+    "k8sServiceHost=${ciliumApiHost}"
+    "k8sServicePort=${ciliumApiPort}"
+    "mtu=${toString cfg.ciliumMtu}"
+  ]
+  ++ lib.optionals (!ciliumUseTunnel) [
+    "routingMode=native"
+    "autoDirectNodeRoutes=${if cfg.ciliumAutoDirectNodeRoutes then "true" else "false"}"
+    "ipv4NativeRoutingCIDR=${cfg.clusterCidr}"
+  ]
+  ++ lib.optionals ciliumUseTunnel [
+    "routingMode=tunnel"
+    "tunnelProtocol=${ciliumTunnelProto}"
+  ]
+  ++ lib.optionals (cfg.ciliumLoadBalancerIpPools != [ ]) [ "l2announcements.enabled=true" ]
+  ++ lib.imap0 (i: iface: "devices[${toString i}]=${iface}") ciliumL2Ifaces;
+  ciliumSetArgs = lib.concatMapStrings (
+    value: "  --set ${lib.escapeShellArg value}\n"
+  ) ciliumHelmSets;
+  ciliumL2Yaml =
+    if cfg.ciliumLoadBalancerIpPools == [ ] then
+      ""
+    else
+      ''
+        apiVersion: cilium.io/v2
+        kind: CiliumLoadBalancerIPPool
+        metadata:
+          name: kcore
+        spec:
+          blocks:
+      ''
+      + lib.concatMapStrings (cidr: "    - cidr: \"${cidr}\"\n") cfg.ciliumLoadBalancerIpPools
+      + ''
+        ---
+        apiVersion: cilium.io/v2alpha1
+        kind: CiliumL2AnnouncementPolicy
+        metadata:
+          name: kcore
+        spec:
+          interfaces:
+      ''
+      + lib.concatMapStrings (iface: "    - \"${iface}\"\n") ciliumL2Ifaces
+      + "  loadBalancerIPs: true\n";
+
+  ciliumApply = pkgs.writeShellScript "kcore-cilium-install" ''
+    set -eu
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    kube=${pkgs.kubectl}/bin/kubectl
+    cli=${pkgs.cilium-cli}/bin/cilium
+    ready=0
+    for _ in $(${pkgs.coreutils}/bin/seq 1 90); do
+      if "$kube" get --raw=/readyz >/dev/null 2>&1; then
+        ready=1
+        break
+      fi
+      sleep 2
+    done
+    if [ "$ready" -ne 1 ]; then
+      echo "Kubernetes API was not ready for Cilium" >&2
+      exit 1
+    fi
+    exec 9>/run/kcore-cilium.lock
+    ${pkgs.util-linux}/bin/flock 9
+    args=(
+      --namespace kube-system
+      --wait
+      --wait-duration=10m
+    ${ciliumSetArgs})
+    if "$kube" -n kube-system get ds/cilium >/dev/null 2>&1; then
+      "$cli" upgrade "''${args[@]}"
+    else
+      "$cli" install "''${args[@]}" || "$cli" upgrade "''${args[@]}"
+    fi
+    manifest=/etc/kubernetes/cilium-l2.yaml
+    if [ -s "$manifest" ]; then
+      found=0
+      for _ in $(${pkgs.coreutils}/bin/seq 1 60); do
+        if "$kube" get crd ciliumloadbalancerippools.cilium.io >/dev/null 2>&1 \
+          && "$kube" get crd ciliuml2announcementpolicies.cilium.io >/dev/null 2>&1; then
+          found=1
+          break
+        fi
+        sleep 2
+      done
+      if [ "$found" -ne 1 ]; then
+        echo "Cilium L2 CRDs were not installed" >&2
+        exit 1
+      fi
+      "$kube" apply -f "$manifest"
+    else
+      if "$kube" get crd ciliumloadbalancerippools.cilium.io >/dev/null 2>&1; then
+        "$kube" delete ciliumloadbalancerippool kcore --ignore-not-found
+      fi
+      if "$kube" get crd ciliuml2announcementpolicies.cilium.io >/dev/null 2>&1; then
+        "$kube" delete ciliuml2announcementpolicy kcore --ignore-not-found
+      fi
+    fi
+  '';
+
   # Kubelet 1.33 refuses node-role.kubernetes.io/* on --node-labels and
   # exits before the node registers. Apply those labels through the API.
   roleLabelArgs =
@@ -757,6 +874,15 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = "Cilium LoadBalancer IP pool CIDRs (e.g., ['192.168.40.220/29']).";
+    };
+
+    ciliumL2Interfaces = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Interfaces that announce LoadBalancer IPs. Empty uses iface.
+        The controller writes every node iface on the primary cluster.
+      '';
     };
 
     # High Availability
@@ -1574,6 +1700,7 @@ in
             after = [
               "kube-apiserver.service"
               "kubelet.service"
+              "kcore-kubernetes-cilium.service"
             ];
             serviceConfig = {
               Type = "oneshot";
@@ -1631,9 +1758,34 @@ in
               '';
           };
 
-      # The primary cluster's Cilium is installed into the API. An extra
-      # cluster on this host uses the bridge CNI from mkExtra, because a
-      # second Cilium agent would share the primary BPF pins.
+      environment.etc."kubernetes/cilium-l2.yaml" = lib.mkIf (ciliumL2Yaml != "") {
+        text = ciliumL2Yaml;
+        mode = "0644";
+      };
+
+      # Install Cilium and, when pools are set, the L2 load balancer.
+      # Only the primary cluster reaches this unit. mkExtra has no Cilium.
+      systemd.services.kcore-kubernetes-cilium = lib.mkIf (cfg.role == "control-plane") {
+        description = "Install Cilium and the L2 load balancer";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "kube-apiserver.service"
+          "kubelet.service"
+          "network-online.target"
+        ]
+        ++ lib.optionals cfg.haEnabled [ "keepalived.service" ];
+        path = with pkgs; [
+          kubernetes-helm
+        ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          TimeoutStartSec = "20min";
+          ExecStart = ciliumApply;
+          Restart = "on-failure";
+          RestartSec = "30s";
+        };
+      };
     })
     {
       assertions = lib.concatLists (map (extra: extra.assertions or [ ]) extras);
