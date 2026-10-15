@@ -1465,6 +1465,9 @@ pub struct KubernetesNodeConfig {
     pub cilium_tunnel: String,
     pub cilium_auto_direct_routes: bool,
     pub cilium_lb_ip_pools: Vec<String>,
+    /// Node interfaces that announce LoadBalancer IPs. Empty on an extra
+    /// cluster, which does not install Cilium.
+    pub cilium_l2_interfaces: Vec<String>,
     pub ha_enabled: bool,
     pub vip_address: String,
     pub vip_interface: String,
@@ -1568,6 +1571,13 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
             }
             out.push_str("    ];\n");
         }
+        if !k8s.cilium_l2_interfaces.is_empty() {
+            out.push_str("    ciliumL2Interfaces = [\n");
+            for iface in &k8s.cilium_l2_interfaces {
+                out.push_str(&format!("      \"{}\"\n", nix_escape(iface)));
+            }
+            out.push_str("    ];\n");
+        }
     }
 
     out.push_str(&format!("    haEnabled = {};\n", k8s.ha_enabled));
@@ -1662,6 +1672,7 @@ mod kubernetes_tests {
             cilium_tunnel: "disabled".to_string(),
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: vec!["192.168.40.220/29".to_string()],
+            cilium_l2_interfaces: vec!["enp6s0".to_string()],
             ha_enabled: true,
             vip_address: "192.168.40.200".to_string(),
             vip_interface: "enp6s0".to_string(),
@@ -1699,6 +1710,7 @@ mod kubernetes_tests {
             cilium_tunnel: "disabled".to_string(),
             cilium_auto_direct_routes: true,
             cilium_lb_ip_pools: vec![],
+            cilium_l2_interfaces: vec![],
             ha_enabled: false,
             vip_address: String::new(),
             vip_interface: String::new(),
@@ -1797,6 +1809,8 @@ mod kubernetes_tests {
         assert!(nix.contains("apiServerEndpoint = \"192.168.40.200:6443\""));
         assert!(nix.contains("haEnabled = true"));
         assert!(nix.contains("vipAddress = \"192.168.40.200\""));
+        assert!(nix.contains("ciliumL2Interfaces"));
+        assert!(nix.contains("\"enp6s0\""));
         assert!(!nix.contains("https://https://"));
         assert!(!nix.contains("environment.etc"));
         assert!(nix.ends_with("  };\n}\n"));
@@ -1912,6 +1926,9 @@ mod kubernetes_tests {
         assert!(nix.contains("clusterName = \"kcore-prod\""));
         let extra = &nix[extra_at..];
         assert!(!extra.contains("ciliumMode"));
+        assert!(!extra.contains("ciliumL2Interfaces"));
+        assert!(nix[..extra_at].contains("ciliumL2Interfaces"));
+        assert!(nix[..extra_at].contains("\"br0\""));
         assert!(!extra.contains("cni ="));
         assert!(extra.contains("scheduleOnControlPlane = true"));
         assert!(extra.contains("provisionerManifest"));
@@ -1924,6 +1941,104 @@ mod kubernetes_tests {
             3379
         );
     }
+
+    #[test]
+    fn cilium_l2_interfaces_are_sorted_unique_and_checked() {
+        use crate::kubernetes_orchestrator::ClusterNode;
+        let nodes = [
+            ClusterNode {
+                node_id: "b".into(),
+                hostname: "b".into(),
+                ip_address: "192.168.40.107".into(),
+                iface: "enp6s0".into(),
+                initial_cluster: false,
+                role: "worker".into(),
+            },
+            ClusterNode {
+                node_id: "a".into(),
+                hostname: "a".into(),
+                ip_address: "192.168.40.105".into(),
+                iface: String::new(),
+                initial_cluster: true,
+                role: "control-plane".into(),
+            },
+            ClusterNode {
+                node_id: "c".into(),
+                hostname: "c".into(),
+                ip_address: "192.168.40.103".into(),
+                iface: "eth0".into(),
+                initial_cluster: false,
+                role: "worker".into(),
+            },
+        ];
+        assert_eq!(
+            cilium_l2_interfaces(&nodes).unwrap(),
+            vec!["enp6s0".to_string(), "eth0".to_string()]
+        );
+        assert!(validate_cilium_pool("192.168.40.220/29").is_ok());
+        assert!(validate_cilium_pool("not-a-cidr").is_err());
+        assert!(validate_cilium_pool("192.168.40.220/33").is_err());
+        assert!(validate_cilium_iface("enp6s0").is_ok());
+        assert!(validate_cilium_iface("bad iface").is_err());
+    }
+}
+
+fn validate_cilium_iface(iface: &str) -> anyhow::Result<()> {
+    let ok = !iface.is_empty()
+        && iface.len() <= 15
+        && !iface.starts_with('-')
+        && iface
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("cilium interface {iface:?} is not a device name");
+    }
+}
+
+fn validate_cilium_pool(pool: &str) -> anyhow::Result<()> {
+    let Some((addr, prefix)) = pool.split_once('/') else {
+        anyhow::bail!("cilium load balancer pool {pool:?} is not an IPv4 CIDR");
+    };
+    let octets: Vec<&str> = addr.split('.').collect();
+    if octets.len() != 4 || octets.iter().any(|octet| octet.is_empty()) {
+        anyhow::bail!("cilium load balancer pool {pool:?} is not an IPv4 CIDR");
+    }
+    for octet in octets {
+        let n: u16 = octet.parse().map_err(|_| {
+            anyhow::anyhow!("cilium load balancer pool {pool:?} is not an IPv4 CIDR")
+        })?;
+        if n > 255 {
+            anyhow::bail!("cilium load balancer pool {pool:?} is not an IPv4 CIDR");
+        }
+    }
+    let bits: u8 = prefix
+        .parse()
+        .map_err(|_| anyhow::anyhow!("cilium load balancer pool {pool:?} is not an IPv4 CIDR"))?;
+    if bits > 32 {
+        anyhow::bail!("cilium load balancer pool {pool:?} is not an IPv4 CIDR");
+    }
+    Ok(())
+}
+
+/// Interfaces Cilium should attach and announce on. Empty iface becomes
+/// enp6s0, matching the module default. Names are sorted so a rebuild does
+/// not reorder the L2 policy.
+fn cilium_l2_interfaces(
+    nodes: &[crate::kubernetes_orchestrator::ClusterNode],
+) -> anyhow::Result<Vec<String>> {
+    let mut ifaces = std::collections::BTreeSet::new();
+    for node in nodes {
+        let iface = if node.iface.is_empty() {
+            "enp6s0".to_string()
+        } else {
+            node.iface.clone()
+        };
+        validate_cilium_iface(&iface)?;
+        ifaces.insert(iface);
+    }
+    Ok(ifaces.into_iter().collect())
 }
 
 /// Cluster-wide values copied into every node's `kcore.kubernetes` block.
@@ -2044,6 +2159,14 @@ pub fn generate_kubernetes_member(
         },
         cilium_auto_direct_routes: settings.cilium_auto_direct_routes,
         cilium_lb_ip_pools: settings.cilium_lb_ip_pools.clone(),
+        cilium_l2_interfaces: if layout.is_none() {
+            for pool in &settings.cilium_lb_ip_pools {
+                validate_cilium_pool(pool)?;
+            }
+            cilium_l2_interfaces(all_nodes)?
+        } else {
+            Vec::new()
+        },
         ha_enabled: settings.ha_enabled,
         vip_address: settings.vip_address.clone(),
         vip_interface: settings.vip_interface.clone(),
