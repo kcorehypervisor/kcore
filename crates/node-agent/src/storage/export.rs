@@ -178,15 +178,13 @@ pub fn align_extents_to_blocks(
 /// True iff every byte in `buf` is zero. Word-wide scan for speed.
 pub fn is_all_zero(buf: &[u8]) -> bool {
     const WORD: usize = std::mem::size_of::<u64>();
-    let mut chunks = buf.chunks_exact(WORD);
-    for chunk in chunks.by_ref() {
-        let mut arr = [0u8; WORD];
-        arr.copy_from_slice(chunk);
-        if u64::from_ne_bytes(arr) != 0 {
+    let (chunks, rem) = buf.as_chunks::<WORD>();
+    for chunk in chunks {
+        if u64::from_ne_bytes(*chunk) != 0 {
             return false;
         }
     }
-    chunks.remainder().iter().all(|&b| b == 0)
+    rem.iter().all(|&b| b == 0)
 }
 
 /// Coalesce a sequence of `(offset, is_zero, length)` into transfer units:
