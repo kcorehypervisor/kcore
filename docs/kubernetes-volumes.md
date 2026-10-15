@@ -1,12 +1,18 @@
 # Kubernetes volumes
 
-kcore gives a cluster two ways to store PersistentVolumeClaims. The default is a local-path StorageClass on a volume kcore creates. An operator who wants one block device per claim installs their own CSI and leaves those disks out of the kcore API.
+Pods get disk in one of two ways. kcore installs the Rancher local-path provisioner, so the filesystem behind those claims is a kcore volume declared in the cluster manifest. Otherwise install TopoLVM yourself and manage that data volume with Kubernetes only.
 
-## Local-path, the default
+## kcore volumes
 
-Set `localProvisioner.mode` to `shared`, or leave it empty. For each declared volume, kcore creates one LVM logical volume or one ZFS zvol, formats it (`ext4` or `xfs`), and mounts it on that node. The cluster then runs the Rancher local-path provisioner. The StorageClass name defaults to `local-path`.
+`localProvisioner.enabled` is required when volumes are listed. An enabled provisioner with an empty volume list is rejected. Set `mode` to `shared`, or leave it empty. That is the default.
 
-A claim is a directory on that mounted filesystem. Several claims on the same volume stay separated as directories and share the volume's size. The size written on a claim is not a quota. This StorageClass does not expand one claim on its own. To give every directory more room, resize the kcore volume.
+For each entry, kcore creates one LVM logical volume or one ZFS zvol, formats it, and mounts it. `storageClass` is `lvm` or `zfs`, and the node's storage backend must already be that class. `sizeBytes` must be positive. An empty `fsType` becomes ext4. The other accepted value is xfs. An empty role becomes filesystem. The default mount path is `/mnt/kcore/<cluster>/<name>`. A custom mount path is checked. The volume name is one path segment, and it cannot be `.` or `..`.
+
+The node must already be a member of the cluster. The same volume name may be listed on different nodes. The same name twice on one node is rejected. Two volumes on one node cannot share a mount path. After the volume is formatted, a later change of `fsType` is rejected. Shrinking is rejected. To give the directories more room, raise `sizeBytes` and apply again.
+
+The controller volume name is `k8s-<cluster>-<node>-<volume>`. The LVM device is `/dev/<vg>/<lv>`. The ZFS device is `/dev/zvol/<pool>/<dataset>`.
+
+Do not create this filesystem with kubectl. Do not point local-path at a directory you mounted yourself. The disk is the volume in the manifest.
 
 ```yaml
 localProvisioner:
@@ -22,18 +28,42 @@ localProvisioner:
       role: filesystem
 ```
 
-`storageClass: zfs` creates a zvol instead of a logical volume. The provisioner is the same: directories on the mounted filesystem.
+`storageClass: zfs` creates a zvol. The provisioner is the same.
 
-Declaring more than one volume adds mount paths to that same StorageClass. It does not create a separate StorageClass, and it does not give each claim its own logical volume.
+The control plane applies `rancher/local-path-provisioner:v0.0.30` from `/etc/kubernetes/provisioner.yaml`. The oneshot unit is `kcore-kubernetes-provisioner`. The StorageClass name defaults to `local-path`. If you set a name, it must be a DNS label. The provisioner is `rancher.io/local-path`. `volumeBindingMode` is `WaitForFirstConsumer`. `reclaimPolicy` is `Delete`. The helper creates the claim directory with mode 0777 and removes that directory when the claim is deleted. The kcore volume stays mounted.
 
-## A CSI the operator installs
+A claim is a directory on that filesystem. Several claims share the volume's size. The `storage` request is recorded and is not a quota. Another volume adds a mount path to the same StorageClass. It does not create a second StorageClass, and it does not give each claim its own logical volume.
 
-kcore does not install a CSI driver, and it does not ship a StorageClass for one. An operator who wants a claim to be its own logical volume, with its own size, can install that driver into the cluster. TopoLVM is one such driver. kcore does not configure it.
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+```
 
-Install that driver on the primary cluster, where the pod network can reach ClusterIP services. An extra cluster on the same machines uses a bridge network and has no kube-proxy, so a stock CSI chart cannot rely on ClusterIP there. Run one copy of the driver for a volume group. A second copy on another cluster on the same hosts would manage the same disks.
+`10Gi` is recorded. It is not a quota.
 
-Do not create the driver's pool, or the logical volumes inside it, with the kcore API. kcore deletes only the volumes it created. Volumes the driver creates are left in place. Point the driver at a new thin pool in free space on the volume group. Leave the local-path volume as a normal filesystem volume. Virtual-machine disks can still be created with the kcore API, under other names, in the space that pool is not using.
+## TopoLVM
+
+Leave that data out of `localProvisioner.volumes`. Install TopoLVM yourself and manage the data volume with Kubernetes only. kcore does not install TopoLVM and does not create its StorageClass or its pool.
+
+Make the pool with TopoLVM, or with LVM on the node, outside this API. kcore deletes only volumes it created. A logical volume TopoLVM creates is left in place.
+
+Install TopoLVM on the primary cluster, the one whose API port is 6443, where pods can reach ClusterIP. An extra cluster uses a bridge and has no kube-proxy, so a chart that calls ClusterIP will not work there. One TopoLVM owns a volume group. A second copy on another cluster on the same hosts would manage the same disks.
+
+Virtual-machine disks can still be created with the kcore volume API, under other names, in space that pool is not using.
 
 ## `mode: lvm`
 
-`localProvisioner.mode: lvm` creates one LVM thin pool of the declared size on each node. kcore does not install a provisioner and does not turn claims into logical volumes in that pool. Use `shared` for local-path. An operator who installs their own CSI creates that driver's pool with the driver, not with this mode.
+`localProvisioner.mode: lvm` creates one LVM thin pool of the declared size on each listed node. Nothing in Kubernetes consumes that pool. This mode does not install local-path. The provisioner manifest is empty. It is not TopoLVM. Do not use this pool as TopoLVM's pool.
+
+Every listed node must use the same name, volume group, size, and filesystem. The role is pool. `storageClass` must be `lvm`. `volumeGroup` is required. Leave `mountPath` empty.
+
+Use `shared` when you want the provisioner kcore installs.
