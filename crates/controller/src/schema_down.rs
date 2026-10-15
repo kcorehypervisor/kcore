@@ -358,6 +358,12 @@ ALTER TABLE volumes DROP COLUMN mount_point;",
         sql: "DROP TABLE IF EXISTS node_host_status;",
         irreversible: false,
     },
+    // 59 repeats the version 57 table. Rolling back to 57 keeps it.
+    SchemaDown {
+        version: 59,
+        sql: "",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]
