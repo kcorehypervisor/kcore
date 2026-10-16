@@ -122,7 +122,8 @@ message ClickhouseHostVolume {
 message ClickhouseUserSpec {
   string name = 1;
   string password_sha256_hex = 2;
-  // IP or CIDR entries for <networks><ip>. Empty means ::/0.
+  // IP or CIDR entries for <networks><ip>. Empty means client_networks,
+  // or 127.0.0.1 when client_networks is also empty. It does not mean ::/0.
   repeated string networks = 3;
   string profile = 4;         // settings profile name, empty means "default"
   string quota = 5;           // quota name, empty means "default"
@@ -134,6 +135,9 @@ message ClickhouseSettingsProfile {
   string name = 1;
   // Server-side settings such as max_memory_usage. Keys are validated as
   // [a-z_][a-z0-9_]* and values are strings as ClickHouse accepts them.
+  // User, database, profile and cluster names use [A-Za-z_][A-Za-z0-9_]*.
+  // Shard and replica names use [A-Za-z0-9][A-Za-z0-9._-]{0,63} so the
+  // defaults "1" and "node-105" are valid.
   map<string, string> settings = 2;
 }
 
@@ -145,10 +149,11 @@ message ClickhouseDatabaseSpec {
 }
 
 message ClickhouseTlsConfig {
-  // true (default when unset): kcore issues per-node certificates from the
-  // cluster PKI, enables tcp_port_secure / https_port /
-  // interserver_https_port / Keeper tcp_port_secure and binds the plaintext
-  // ports to 127.0.0.1 only.
+  // Unset is false. false means TLS is on: kcore issues per-node certificates
+  // from the cluster PKI and enables tcp_port_secure / https_port /
+  // interserver_https_port / Keeper tcp_port_secure. The packaged plaintext
+  // listeners (tcp 9000, http 8123, interserver 9009, Keeper 2181) are removed,
+  // not bound to localhost. true turns TLS off and renders the plaintext ports.
   bool disabled = 1;
   // Days before not_after at which the cert rotation reconciler reissues.
   int32 rotate_before_days = 2;
@@ -184,18 +189,21 @@ message ClickhouseClusterSpec {
 }
 
 // Every member uses the same port set. Zero selects the default. With TLS on
-// (the default) the plaintext tcp and http listeners are not rendered at all;
-// the node agent and the shipped clickhouse-client config use tcp_secure
-// against 127.0.0.1, which is in the certificate SANs.
+// (the default) the module removes the packaged plaintext listeners
+// (tcp 9000, http 8123, interserver 9009, Keeper tcp_port 2181). Omitting the
+// keys is not enough: config.xml ships them enabled. The node agent and the
+// shipped clickhouse-client config use tcp_secure against 127.0.0.1, which is
+// in the certificate SANs, and listen_host includes 127.0.0.1.
 message ClickhousePorts {
   int32 tcp = 1;              // 9000, only rendered when TLS is disabled
   int32 tcp_secure = 2;       // 9440
   int32 http = 3;             // 8123, only rendered when TLS is disabled
   int32 https = 4;            // 8443
   int32 interserver = 5;      // 9009 (http) or 9010 (https)
-  int32 keeper = 6;           // 9181 client, or 9281 secure
-  int32 keeper_raft = 7;      // 9234
-  int32 prometheus = 8;       // 9363, 0 disables
+  int32 keeper = 6;           // 9281 secure by default; 9181 only when TLS is off.
+                              // The compiled Keeper default if unset is 2181.
+  int32 keeper_raft = 7;      // 9234, TLS when raft_configuration.secure is set
+  int32 prometheus = 8;       // 9363, plaintext, 0 disables
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +347,9 @@ message ReplaceClickhouseReplicaRequest {
   string old_replica_name = 3;
   ClickhouseReplicaSpec new_replica = 4;
   bool confirm = 5;
+  // Skip the stop when the old node is unreachable. drop-replica still runs
+  // on a survivor before the new replica is created.
+  bool force = 6;
 }
 
 message ReplaceClickhouseReplicaResponse {
@@ -351,8 +362,10 @@ message UpgradeClickhouseClusterRequest {
   // "clickhouse" or "clickhouse-lts". The resolved version is whatever the
   // node's nixpkgs pin provides; plan prints it per node.
   string package = 2;
-  // A lower major version is refused without force. ClickHouse on-disk
-  // metadata does not downgrade.
+  // Any lower version is refused without force. ClickHouse on-disk metadata
+  // does not downgrade across any component. A roll that crosses 26.7 keeps
+  // interserver_tables_status_require_auth false on the new servers until
+  // every server is past that line.
   bool force = 3;
   bool confirm = 4;
 }
@@ -388,8 +401,9 @@ message ClickhouseKeeperHealth {
   string node_id = 1;
   int32 server_id = 2;
   bool unit_active = 3;
-  // From the `mntr` four-letter command: leader, follower, observer, or
-  // unknown when the port did not answer.
+  // From `mntr` written through a TLS handshake to the Keeper client port:
+  // leader, follower, observer, or unknown when the handshake or the port
+  // did not answer. A plaintext four-letter write does not work on 9281.
   string role = 4;
   int64 znode_count = 5;
   int64 outstanding_requests = 6;
@@ -546,7 +560,7 @@ service ClickhouseNodeAdmin {
   // from the typed request, then nixos-rebuild test+switch under the node
   // apply lock. Poll GetNixApplyStatus with the returned apply_id.
   rpc ApplyClickhouseConfig(ApplyClickhouseConfigRequest) returns (ApplyClickhouseConfigResponse);
-  // Units, Keeper `mntr`, and system.replicas aggregates over 127.0.0.1.
+  // Units, Keeper `mntr` over TLS to 127.0.0.1, and system.replicas aggregates.
   rpc GetClickhouseStatus(GetClickhouseStatusRequest) returns (GetClickhouseStatusResponse);
   // Start or stop the server or Keeper unit. Stop is graceful: the unit's
   // ExecStop waits for shutdown_wait_unfinished_queries.
@@ -607,7 +621,11 @@ message ClickhouseNodeSecrets {
   bytes tls_key_pem = 5;
   bytes tls_ca_pem = 6;
   // Keeper connection secret shared by servers and Keeper members.
+  // Plaintext "kcore:<password>", not a precomputed digest.
   string keeper_secret = 7;
+  // remote_servers.<cluster>.secret. Distributed queries and, from 26.7,
+  // interserver TablesStatus authentication.
+  string cluster_secret = 8;
 }
 
 message CheckClickhousePreflightRequest {
@@ -681,7 +699,7 @@ message GetClickhouseStatusResponse {
   int64 queue_size = 9;
   bool keeper_session_ok = 10;
   int64 data_free_bytes = 11;
-  // Keeper `mntr` fields; empty role when no Keeper here.
+  // Keeper `mntr` fields from the TLS client port; empty role when no Keeper.
   string keeper_role = 12;
   int64 keeper_znode_count = 13;
   int64 keeper_outstanding_requests = 14;
@@ -708,8 +726,8 @@ message RunClickhouseAdminRequest {
     // SYSTEM SYNC REPLICA for every replicated table in the database, or
     // all databases when empty.
     SyncReplica sync_replica = 2;
-    // SYSTEM DROP REPLICA '<replica>' for the given shard path; runs on a
-    // surviving replica.
+    // SYSTEM DROP REPLICA '<replica>' FROM DATABASE <db> for each database.
+    // shard_name selects the surviving replica; it is not part of the SQL.
     DropReplica drop_replica = 3;
     // CREATE DATABASE IF NOT EXISTS ... ENGINE = Replicated(...)
     EnsureReplicatedDatabase ensure_database = 4;
@@ -727,7 +745,12 @@ message RunClickhouseAdminRequest {
   }
 
   message SyncReplica { string database = 1; int32 timeout_seconds = 2; }
-  message DropReplica { string replica_name = 1; string shard_name = 2; }
+  message DropReplica {
+    string replica_name = 1;
+    string shard_name = 2;
+    // Empty means every database in the cluster spec.
+    repeated string databases = 3;
+  }
   message EnsureReplicatedDatabase { string database = 1; string shard_name = 2; string replica_name = 3; }
   message RestoreReplica { string database = 1; }
   message Backup {

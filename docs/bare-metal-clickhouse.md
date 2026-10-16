@@ -2,6 +2,8 @@
 
 Status: **design**. No module, API, or lab apply yet.
 
+Reviewed against ClickHouse commit [`ae3bcc01`](https://github.com/ClickHouse/ClickHouse/commit/ae3bcc01c681d35f0d778b310c0022407b65efd6) (2026-10-16, `v26.9.20.23-stable`) and against nixpkgs `b40629efe5d6`, whose `pkgs.clickhouse` is still `26.2.4.23-stable` (ClickHouse `94012846`). The module targets the pin. The upgrade section below is what changes when the pin moves to 26.7 or later. Latest LTS on that date is `v26.8.28.14-lts`.
+
 ClickHouse joins the Bare-Metal line next to Kubernetes and PostgreSQL: a declarative NixOS service on kcoreOS nodes, applied the same way as the rest of the host, orchestrated by the Rust controller over gRPC. It does not run inside a VM and it does not run on the Kubernetes cluster.
 
 The gRPC surface for this design is in [`proto-snippets-clickhouse.proto`](./proto-snippets-clickhouse.proto). That file compiles with `protoc` on its own so field numbers and comments can be reviewed before they are spliced into `proto/controller.proto` and `proto/node.proto`.
@@ -42,9 +44,9 @@ Two things differ from Kubernetes and are the reason this design has its own rol
 
 | Field | Default | Why |
 |---|---|---|
-| `package` | `clickhouse` | The pinned nixpkgs (`b40629ef`) resolves it to `26.2.4.23-stable`. `clickhouse-lts` is the other accepted value. |
-| `tls.disabled` | `false` | Member certs from the kcore CA. Plaintext `tcp`/`http` listeners are not rendered. |
-| `ports` | `tcpSecure 9440`, `https 8443`, `interserver 9010`, `keeper 9281`, `keeperRaft 9234`, `prometheus 9363` | Upstream secure defaults. Opened on `iface` only. |
+| `package` | `clickhouse` | The pinned nixpkgs (`b40629ef`) resolves it to `26.2.4.23-stable`. `clickhouse-lts` is the other accepted value. Upstream stable on 2026-10-16 is `26.9.20.23`; the pin does not move with it. |
+| `tls.disabled` | `false` | Member certs from the kcore CA. The packaged `config.xml` already opens plaintext `9000`, `8123` and `9009`, so the module removes those keys. It does not leave them bound to localhost. |
+| `ports` | `tcpSecure 9440`, `https 8443`, `interserver 9010`, `keeper 9281`, `keeperRaft 9234`, `prometheus 9363` | Upstream secure ports. Raft `9234` is TLS because `raft_configuration.secure` is true. Keeper’s compiled default client port, if the key is omitted, is `2181`, so the module always sets `tcp_port_secure` and removes `tcp_port`. Opened on `iface` only. Prometheus stays plaintext and is limited to `clientNetworks`. |
 | `maxServerMemoryRatio` | `0.5` | `max_server_memory_usage_to_ram_ratio`. Upstream’s 0.9 would starve guests and the agent; validation refuses values above 0.8. |
 | `maxReplicaDelaySeconds` | `30` | Rolling gate on `system.replicas.absolute_delay`. |
 | `stepTimeoutSeconds` | `600` | A rolling step that does not pass its gate in this time fails the operation. |
@@ -55,7 +57,8 @@ Two things differ from Kubernetes and are the reason this design has its own rol
 | Keeper path | `/var/lib/kcore-clickhouse/<cluster>/keeper` | Same rule. Keeper fsyncs every append; a separate device is recommended on nodes that also run a replica. |
 | `default` user | kcore-generated SHA-256 password, `networks` = `127.0.0.1` plus `clientNetworks` | Retrieved with `GetClickhouseClusterCredentials`. Cannot be redefined in `users`. |
 | Interserver credentials | kcore-generated | Written outside the Nix store. |
-| Keeper identity | kcore-generated digest secret | `zookeeper.identity` on servers, ACL on Keeper. |
+| Keeper identity | `kcore:<random password>` | Written as `zookeeper.identity`. ClickHouse hashes it for the digest ACL. The value is the plaintext `user:password`, not a precomputed digest. |
+| Cluster secret | kcore-generated | `remote_servers.<cluster>.secret`, via `from_env`. Distributed queries and, from 26.7, interserver `TablesStatus` use it. |
 
 Preflight rejects a spec whose advertise address is not present on `iface`, whose `iface` is DHCP-managed, `br0`, a `kbr-*` bridge, or the node’s Ceph cluster interface, whose ports are in use by another unit, or whose Keeper member count is even.
 
@@ -120,9 +123,9 @@ Node RPCs (`service NodeAdmin`): `CheckClickhousePreflight`, `ApplyClickhouseCon
 Messages and comments are in the proto file. Rules that the proto cannot express:
 
 - **Immutable after create:** `name`, `shardName`, `replicaName` once the replica has joined, `keepers` (count, ids, addresses), `tls.disabled`, `ports`. Plan returns `replace`; create of a new cluster is the path.
-- **Upgrade, not update:** `package`. `UpdateClickhouseCluster` with a different `package` returns `INVALID_ARGUMENT` pointing at `UpgradeClickhouseCluster`.
+- **Upgrade, not update:** `package`. `UpdateClickhouseCluster` with a different `package` returns `INVALID_ARGUMENT` pointing at `UpgradeClickhouseCluster`. A lower resolved version is refused without `force`. ClickHouse on-disk metadata does not downgrade across any component, not only the first.
 - **Scale, not update:** adding or removing shards or replicas through `Update` is accepted when the diff is only membership; the controller runs it as a scale operation and plan says so. `Scale` exists for the CLI verb and for MCP.
-- **Mutable with reload only:** `users`, `profiles`, `databases`, `clientNetworks`, `serverSettings` keys ClickHouse reloads, replica `weight`. ClickHouse re-reads `config.d` and `users.d`; no unit restart.
+- **Mutable with reload only:** `users`, `profiles`, `databases`, `clientNetworks`, `serverSettings` keys ClickHouse reloads, shard `weight`. ClickHouse re-reads `config.d` and `users.d`; no unit restart. Weight lives on the shard inside `remote_servers`.
 - **Mutable with rolling restart:** `serverSettings` keys ClickHouse does not reload (the agent keeps the list: `max_server_memory_usage`, `mark_cache_size`, `max_connections`, …), `maxServerMemoryRatio`, `dataVolume` (refused while the replica has data; `replace` otherwise).
 - **Controller-only:** `maxReplicaDelaySeconds` and `stepTimeoutSeconds` change how the next operation runs and touch no node.
 - **Owned keys:** `serverSettings` may not set `listen_host`, any `*_port`, `path`, `macros`, `remote_servers`, `zookeeper`, `openSSL`, `interserver_*`, `users_config`, `include_from`, `user_directories`. Plan reports the key.
@@ -133,7 +136,7 @@ Messages and comments are in the proto file. Rules that the proto cannot express
 
 - `clickhouse_clusters(name PK, spec_json, generation, observed_generation, phase, message, active_operation_id, created_at, updated_at)`
 - `clickhouse_cluster_members(cluster_name FK, node_id, roles, shard_name, replica_name, keeper_server_id, advertise_address, iface, joined_generation, state)` with PK `(cluster_name, node_id)`
-- `clickhouse_cluster_secrets(cluster_name PK, default_password_sha256_hex, default_password_enc, interserver_user, interserver_password_enc, keeper_secret_enc, ca_pem)` with the same at-rest handling as `ceph_dashboard_credentials`
+- `clickhouse_cluster_secrets(cluster_name PK, default_password_sha256_hex, default_password_enc, interserver_user, interserver_password_enc, keeper_secret_enc, cluster_secret_enc, ca_pem)` with the same at-rest handling as `ceph_dashboard_credentials`
 - `clickhouse_member_certs(cluster_name, node_id, cert_pem, not_after)` read by `cert_rotation_reconciler.rs`
 - `clickhouse_operations(id PK, cluster_name FK, kind, state, target_generation, steps_json, created_at, updated_at)`
 
@@ -150,31 +153,56 @@ Each table gets a `schema_down.rs` entry. Phases: `pending`, `bootstrapping`, `r
 - `server.enable`, `server.shard`, `server.replica`, `server.dataPath`, `server.remoteServers`, `server.users`, `server.profiles`, `server.databases`, `server.settings`, `server.clientNetworks`, `server.maxServerMemoryRatio`
 - `keeper.enable`, `keeper.serverId`, `keeper.dataPath`, `keeper.raftPeers`
 
-When `enable` is false the module turns `services.clickhouse` off, defines no Keeper unit and opens no ports.
+When `enable` is false the module turns `services.clickhouse` off, defines no Keeper unit and opens no ports. A Keeper-only member keeps `kcore.clickhouse.enable` true and `server.enable` false. That combination still creates the `clickhouse` user and group. `services.clickhouse.enable` stays false, so the NixOS module would not create the user on its own.
+
+A node that runs both roles uses one `advertiseAddress` and one `iface`. Plan rejects a spec that disagrees. The Keeper volume name, when set, must differ from the server volume name on that node.
 
 ### What the module renders
 
-- `services.clickhouse.enable`, `package`, and `serverConfig` (the NixOS module’s YAML attrset, written to `config.d/100-nixos-module-config.yaml`). The attrset carries `listen_host`, the port set, `path`, `macros`, `remote_servers`, `zookeeper`, `interserver_https_host`, `openSSL`, `prometheus`, `logger`, and `server.settings`. `usersConfig` carries profiles, quotas and users.
-- `systemd.services.clickhouse-keeper` running `${pkg}/bin/clickhouse-keeper --config=/etc/clickhouse-keeper/keeper.yaml`, `User=clickhouse`, `Type=notify`, its own YAML generated with `pkgs.formats.yaml`, `RequiresMountsFor = keeper.dataPath`.
+- `services.clickhouse.enable`, `package`, and `serverConfig` (the NixOS module’s YAML attrset, written to `config.d/100-nixos-module-config.yaml`). The packaged `config.xml` is still installed beside it, so keys that must disappear use ClickHouse’s `remove` attribute (`"@remove" = "remove"` in YAML). The attrset:
+  - replaces `listen_host` with `127.0.0.1` and the advertise address (the agent dials `127.0.0.1`, replicas dial the advertise address)
+  - removes `tcp_port`, `http_port` and `interserver_http_port` when TLS is on, and sets `tcp_port_secure`, `https_port`, `interserver_https_port`, `interserver_https_host`
+  - sets `path` and the absolute children the packaged file hard-codes (`tmp_path`, `user_files_path`, `format_schema_path`, `access_control_path`, logger files) under `dataPath`
+  - sets `macros`, `remote_servers.<clusterName>` with `internal_replication = true` on every shard, a `secret` taken from the environment, and `user_directories` (stock `users_xml` plus `replicated` at `/clickhouse/access/`)
+  - sets `zookeeper` nodes to Keeper port `9281` with `secure: 1`, and `identity` from the environment
+  - sets `openSSL`, `prometheus`, `logger`, and `server.settings`
+  - `usersConfig` carries profiles and users. Password hashes are `@from_env` references, never the hex digest.
+- `systemd.tmpfiles` rules create `dataPath`, the Keeper path, `secretsDir` and the TLS directory. Data and Keeper directories are `0750` `clickhouse:clickhouse`. The secrets directory is `0700` root.
+- `systemd.services.clickhouse-keeper` running `${pkg}/bin/clickhouse-keeper --config-file=/etc/clickhouse-keeper/keeper_config.yaml`, `User=clickhouse`, `Type=simple`, its own YAML generated with `pkgs.formats.yaml`, `RequiresMountsFor = keeper.dataPath`. `Type=simple` so a keeper that never sends systemd `READY` still becomes active; the reconciler’s quorum gate is the readiness check. Use `Type=notify` only after the packaged binary is shown to send `READY`. The YAML sets `tcp_port_secure`, removes `tcp_port` (compiled default `2181`), sets `raft_configuration.secure = true`, and includes the same `openSSL` material. Without that section a standalone keeper has no certificate and the secure port does not open.
 - `systemd.services.clickhouse.serviceConfig.RequiresMountsFor = server.dataPath`.
 - `restartIfChanged = false` and `stopIfChanged = false` on both units. `nixos-rebuild switch` never restarts ClickHouse; the controller restarts members one at a time through `SetClickhouseUnitState`. The `ExecStop` timeout covers `shutdown_wait_unfinished_queries`.
-- A `/etc/clickhouse-client/config.xml` with `secure`, the CA path and `host = 127.0.0.1`, so `clickhouse-client` on the host and in the agent needs no flags.
-- Firewall: `networking.firewall.interfaces.<iface>.allowedTCPPorts` for the port set, and `extraCommands` iptables rules that restrict `interserver`, `keeper` and `keeperRaft` to member addresses and the client ports to `clientNetworks`. Nothing opens on `br0`, `kbr-*` or the Ceph interface.
+- A `/etc/clickhouse-client/config.xml` with `secure`, `host = 127.0.0.1`, and an `openSSL.client` block (`caConfig` pointing at the CA, `verificationMode = strict`), so `clickhouse-client` on the host and in the agent needs no flags. The certificate SAN list includes `127.0.0.1`.
+- Firewall: `networking.firewall.interfaces.<iface>.allowedTCPPorts` for the port set, and `extraCommands` iptables rules that restrict `interserver`, `keeper` and `keeperRaft` to member addresses and the client ports (including plaintext Prometheus) to `clientNetworks`. Nothing opens on `br0`, `kbr-*` or the Ceph interface.
 - Assertions: `advertiseAddress` set when enabled; `server.enable || keeper.enable`; odd `raftPeers` count; `serverId` present in `raftPeers`; `shard`/`replica` present in `remoteServers`; `tls.enable` implies the three file paths; `ports` pairwise distinct; `dataPath` under `/var/lib/kcore-clickhouse/`.
 
 ### Secrets stay out of the store
 
-Nothing secret is interpolated into the Nix fragment. The agent writes `${secretsDir}/server.env` and `${secretsDir}/keeper.env` with mode `0400`, owner root, and the TLS material with owner `clickhouse`, mode `0400`. The units get `EnvironmentFile=` and the YAML uses `from_env` attributes:
+Nothing secret is interpolated into the Nix fragment. The agent writes `${secretsDir}/server.env` and `${secretsDir}/keeper.env` with mode `0400`, owner root, and the TLS material with owner `clickhouse`, mode `0400`. The units get `EnvironmentFile=` (systemd reads it as root) and the YAML uses `from_env` attributes. ClickHouse copies substituted values into `preprocessed_configs`, so each secret element also sets `hide_in_preprocessed`. The attribute form below is what the YAML parser turns into XML attributes:
 
 ```yaml
 interserver_http_credentials:
   user: kcore-interserver
-  password: { "@from_env": KCORE_CH_INTERSERVER_PASSWORD }
+  password:
+    "@from_env": KCORE_CH_INTERSERVER_PASSWORD
+    "@hide_in_preprocessed": "true"
+remote_servers:
+  analytics:
+    secret:
+      "@from_env": KCORE_CH_CLUSTER_SECRET
+      "@hide_in_preprocessed": "true"
 zookeeper:
-  identity: { "@from_env": KCORE_CH_KEEPER_IDENTITY }
+  node:
+    - host: 192.168.40.105
+      port: 9281
+      secure: 1
+  identity:
+    "@from_env": KCORE_CH_KEEPER_IDENTITY
+    "@hide_in_preprocessed": "true"
 ```
 
-The eval test asserts that no rendered `environment.etc` text contains an `@from_env` value, which is how a leaked secret would show up.
+`KCORE_CH_KEEPER_IDENTITY` is `kcore:<password>`. User rows use the same shape for `password_sha256_hex`, with one env var per user. The hex digest never appears in the Nix fragment or in `environment.etc`.
+
+The eval test asserts that rendered `environment.etc` text contains `@from_env` and `@hide_in_preprocessed`, and that it contains neither a `password_sha256_hex` hex digest nor the secret values. `@from_env` is the attribute name; its presence is required.
 
 ### Rendered fragment
 
@@ -204,6 +232,7 @@ The eval test asserts that no rendered `environment.etc` text contains an `@from
         {
           shard = "1";
           weight = 1;
+          internalReplication = true;
           replicas = [
             { replica = "node-105"; host = "192.168.40.105"; port = 9440; secure = true; }
             { replica = "node-106"; host = "192.168.40.106"; port = 9440; secure = true; }
@@ -211,7 +240,7 @@ The eval test asserts that no rendered `environment.etc` text contains an `@from
         }
       ];
       databases = [ "events" ];
-      users = [ { name = "ingest"; passwordSha256Hex = "36dd…"; networks = [ "192.168.40.0/24" ]; profile = "ingest"; } ];
+      users = [ { name = "ingest"; passwordEnv = "KCORE_CH_USER_INGEST"; networks = [ "192.168.40.0/24" ]; profile = "ingest"; } ];
       profiles = [ { name = "ingest"; settings = { max_memory_usage = "10000000000"; }; } ];
       settings = { max_concurrent_queries = "200"; };
       clientNetworks = [ "192.168.40.0/24" ];
@@ -230,7 +259,12 @@ The eval test asserts that no rendered `environment.etc` text contains an `@from
 }
 ```
 
-Every interpolated string passes through `kcore_sanitize::nix_escape`; every attribute key (settings names, user names, database names) passes through `sanitize_nix_attr_key` and is additionally validated as `[A-Za-z_][A-Za-z0-9_]*` before render, since the same names become ClickHouse identifiers.
+Every interpolated string passes through `kcore_sanitize::nix_escape`. Names split into two grammars, because the defaults do not fit one:
+
+- Database, user, profile, quota and cluster names are `[A-Za-z_][A-Za-z0-9_]*`. Setting keys are `[a-z_][a-z0-9_]*`. These become unquoted ClickHouse identifiers or Nix attribute keys and also pass through `sanitize_nix_attr_key`.
+- Shard and replica names are `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. The default shard name is `"1"` and the default replica name is the node id (`node-105`). Neither matches the identifier grammar. They are macro values and YAML scalars, not Nix attribute keys. Quotes, backticks, slashes, spaces and `${` are rejected.
+
+An empty `networks` list on a user means `clientNetworks`, or `127.0.0.1` when that list is also empty. `::/0` is never the default.
 
 If the pinned nixpkgs module changes shape (it is maintained by one person upstream), the fallback is the Ceph overlay approach: pin a nixpkgs revision for the package and keep the module in-tree.
 
@@ -260,7 +294,7 @@ Files: `crates/node-agent/src/nixgen_clickhouse.rs` (pure render), `crates/node-
 
 `enable = false` stops both units, runs the rebuild, then removes the secrets directory. Volumes are released by a separate storage call so `retain_data` is honoured.
 
-`GetClickhouseStatus` reads `systemctl is-active`, runs `mntr` against the Keeper port, and runs three fixed queries over `clickhouse-client --secure --host 127.0.0.1`: version, `system.replicas` aggregates (`countIf(is_readonly)`, `max(absolute_delay)`, `sum(queue_size)`), and a `system.zookeeper` probe for the session.
+`GetClickhouseStatus` reads `systemctl is-active`. Keeper’s client port is TLS, so a raw `mntr` write does not complete a handshake. The agent runs `openssl s_client -connect 127.0.0.1:9281 -CAfile <ca> -quiet` and writes `mntr`, then parses the body. It runs three fixed queries over `clickhouse-client --secure --host 127.0.0.1`: version, `system.replicas` aggregates (`countIf(is_readonly)`, `max(absolute_delay)`, `sum(queue_size)`), and a `system.zookeeper` probe for the session. `max()` over no rows is `NULL`; the parser treats that as zero. An empty `system.replicas` is not health. The Keeper session probe is.
 
 `RunClickhouseAdmin` accepts a `oneof` of commands. The agent builds each statement with `quote_identifier` and `quote_literal` from `kcore-sanitize`; the controller never sends SQL. A new command is a proto change plus a builder plus tests.
 
@@ -292,18 +326,20 @@ Create, Update, Upgrade, Scale, Replace, Delete, Backup and Restore each create 
 4. `wait-nix` on each node.
 5. `wait-keeper-quorum`: a leader exists and all followers are synced.
 6. Servers: unit active and Keeper session ok on every replica.
-7. `create-databases`: `CREATE DATABASE IF NOT EXISTS <db> ENGINE = Replicated('/clickhouse/databases/<db>', '{shard}', '{replica}')` on every replica.
+7. `create-databases`: on the first replica of the lowest shard, `CREATE DATABASE IF NOT EXISTS <db> ENGINE = Replicated('/clickhouse/databases/<db>', '{shard}', '{replica}')`, then wait until `EXISTS DATABASE` on every other replica. Parallel `CREATE` against the same Keeper path races. The macros stay quoted so ClickHouse expands them per replica.
 8. Verify `system.clusters` on one replica per shard lists every declared replica. Phase `ready`.
 
 **Update**: diff → reload-only or rolling. Reload-only applies in parallel. Rolling follows the planner. `observed_generation` moves when the last step succeeds; a failure leaves the cluster in `degraded` with the mixed generations recorded per member, and plan on the same spec shows the remaining nodes.
 
-**Upgrade**: preflight resolves the version on each node and refuses a lower major without `force`. Order: Keeper members (followers, leader), then one replica per shard at a time across shards. Each node: `apply-nix` (new package, no restart because of `restartIfChanged = false`), then `restart` through `SetClickhouseUnitState`, then gates. `running_version` reports `a,b` while mixed.
+**Upgrade**: preflight resolves the version on each node and refuses any lower version without `force`. Order: Keeper members (followers, leader), then one replica per shard at a time across shards. Each node: `apply-nix` (new package, no restart because of `restartIfChanged = false`), then `restart` through `SetClickhouseUnitState`, then gates. `running_version` reports `a,b` while mixed.
+
+From 26.7, `interserver_tables_status_require_auth` defaults to true and a node still on an older protocol does not send the cluster-secret hash. `TablesStatus` then fails for `Distributed` queries during the roll. The upgrade emits that setting as `false` only on members whose resolved version is at least 26.7, and drops the override with a reload once every server is past that line. The key is omitted on 26.2, which does not know it. The cluster secret itself is present from the first create, so a cluster that never mixes versions needs no override.
 
 **Scale out a replica**: apply the new `remote_servers` to existing members (reload only), apply the new node, `create-databases` on it (the Replicated engine brings the schema, `ReplicatedMergeTree` fetches parts), `wait-replica-caught-up`. **Scale out a shard**: same, with a plan warning that kcore does not redistribute existing data.
 
-**Scale in a replica**: refuse the last replica of a shard without `force`. Stop the unit, `drop-replica` from a surviving replica, apply `enable = false` or a Keeper-only fragment on the node, apply the new `remote_servers` everywhere, release the volume unless `retain_data`. **Scale in a shard**: `local-parts-count` on each replica must be zero, or `force`.
+**Scale in a replica**: refuse the last replica of a shard without `force`. Stop the unit, then `SYSTEM DROP REPLICA '<replica>' FROM DATABASE <db>` on a surviving replica for every database in the spec. `shard_name` chooses the survivor; it is not a SQL argument. Apply `enable = false` or a Keeper-only fragment on the node, apply the new `remote_servers` everywhere, release the volume unless `retain_data`. **Scale in a shard**: `local-parts-count` on each replica must be zero, or `force`.
 
-**Replace replica**: scale in the old (its node may be unreachable; `force` skips the stop) then scale out the new. The new replica may reuse the old name only after `drop-replica` succeeded.
+**Replace replica**: scale in the old (its node may be unreachable; `force` skips the stop) then scale out the new. The new replica may reuse the old name only after `drop-replica` succeeded. `ReplaceClickhouseReplica` carries `force` for the unreachable case.
 
 **Delete**: stop every server, stop every Keeper, apply `enable = false` on every node, release volumes unless `retain_data`, drop rows. `force` skips unreachable nodes; the next successful apply of the empty fragment on such a node removes the units.
 
@@ -311,7 +347,7 @@ Create, Update, Upgrade, Scale, Replace, Delete, Backup and Restore each create 
 
 ### Health and cert rotation
 
-A `clickhouse_health` loop polls `GetClickhouseStatus` from every member every 30 s, computes `phase` (`ready`, `degraded` when any replica is read-only or lagging or a Keeper member is down with quorum intact, `failed` when a shard has no replica or Keeper lost quorum), and feeds `metrics_targets.rs` with each member’s Prometheus port. `cert_rotation_reconciler.rs` reissues a member cert `rotate_before_days` before expiry, the agent rewrites the files and runs `ReloadConfig`.
+A `clickhouse_health` loop polls `GetClickhouseStatus` from every member every 30 s, computes `phase` (`ready`, `degraded` when any replica is read-only or lagging or a Keeper member is down with quorum intact, `failed` when a shard has no replica or Keeper lost quorum), and feeds `metrics_targets.rs` with each member’s Prometheus port. `cert_rotation_reconciler.rs` reissues a member cert `rotate_before_days` before expiry. The agent rewrites the files, runs `ReloadConfig` for `clickhouse-server`, and rolls Keeper with the same quorum rules. Keeper has no documented config reload that picks up a new certificate.
 
 ### Interaction with kcore cluster updates
 
@@ -340,10 +376,10 @@ Every layer gets its own test type, and the test lives next to the code it cover
 
 ### Unit tests (Rust, `cargo test --workspace`)
 
-- `clickhouse_cluster_spec.rs`: defaults fill (`replicaName`, `shardName`, `serverId`, ports, timeouts); validation errors for even Keeper count, duplicate names, owned `serverSettings` keys, `default` in `users`, non-identifier names, overlapping ports; diff classification (`unchanged`, `update` reload-only, `update` restart, `upgrade`, `scale`, `replace`) and `changed_fields` paths.
+- `clickhouse_cluster_spec.rs`: defaults fill (`replicaName`, `shardName`, `serverId`, ports, timeouts); validation errors for even Keeper count, duplicate names, owned `serverSettings` keys, `default` in `users`, names outside the two grammars (including shard `"1"` and replica `node-105` accepted, and `node-105` rejected as a database name), a user `networks` list left empty resolving to `clientNetworks` rather than `::/0`, the same node advertised on two interfaces, a shared volume name for server and Keeper, overlapping ports; diff classification (`unchanged`, `update` reload-only, `update` restart, `upgrade`, `scale`, `replace`) and `changed_fields` paths. A lower version of any component is `upgrade` refused without `force`.
 - `clickhouse_rollout.rs`: fixed topologies (1×1, 1×2, 2×2 with 3 Keepers, 3×3 with 5 Keepers) produce the expected step order; leader-last; single-replica shard yields a warning step; resume from a half-finished operation produces only the remaining steps.
 - `nixgen_clickhouse.rs`: escaping of `"`, `${`, newlines and non-ASCII in every string field; `enable = false` fragment is exactly the empty module shape; reloadable-vs-restart key list.
-- `clickhouse_ops.rs`: SQL builders for every `RunClickhouseAdmin` command with identifier and literal quoting, including names containing `'`, `` ` ``, `;` and `--`; `mntr` parser on recorded output from leader, follower and a port that answers nothing; `system.replicas` aggregate parser on TSV fixtures.
+- `clickhouse_ops.rs`: SQL builders for every `RunClickhouseAdmin` command with identifier and literal quoting, including names containing `'`, `` ` ``, `;` and `--`; `DROP REPLICA … FROM DATABASE` once per database; `mntr` parser on recorded output from leader, follower, a TLS transcript that never finishes the handshake, and a port that answers nothing; `system.replicas` aggregate parser on TSV fixtures including a `NULL` delay.
 - `db.rs`: CRUD for the five tables, cascade on cluster delete, up and down migration round-trip (`schema_down.rs`).
 - `kctl`: manifest parsing in camelCase and snake_case, unknown-field rejection, output rendering for plan/get/health from canned responses.
 
@@ -368,9 +404,9 @@ Every layer gets its own test type, and the test lives next to the code it cover
 `tests/clickhouse-module-eval.nix`, copied from `ceph-module-eval.nix`, evaluates every golden fragment and asserts:
 
 - `systemd.services.clickhouse` and `clickhouse-keeper` exist with `restartIfChanged = false`, `EnvironmentFile` set, `RequiresMountsFor` set
-- the generated `config.d` YAML has the right `macros`, `remote_servers`, `zookeeper` and port set; no plaintext port when TLS is on
+- the generated `config.d` YAML has the right `macros`, `remote_servers` (`internal_replication`, cluster secret via `@from_env`), `zookeeper` (`secure: 1`, port 9281) and port set; `tcp_port`, `http_port` and `interserver_http_port` carry `@remove` when TLS is on; Keeper YAML removes `tcp_port`, sets `tcp_port_secure`, and sets `raft_configuration.secure`
 - firewall ports are on `enp6s0` only and `iptables` rules mention the member addresses
-- no `environment.etc` text contains a `from_env` value or the strings `password_sha256_hex: [0-9a-f]`
+- `environment.etc` text contains `@from_env` and `@hide_in_preprocessed`, and contains no `password_sha256_hex` hex digest and no secret value
 - `kcore.clickhouse.enable = false` leaves `services.clickhouse.enable` false and no Keeper unit
 - the module’s assertions fire on an even Keeper count and on a missing `advertiseAddress` (evaluated with `lib.evalModules` and checked for the expected message)
 
@@ -378,7 +414,7 @@ Every layer gets its own test type, and the test lives next to the code it cover
 
 `tests/clickhouse-module.nix` with `pkgs.testers.runNixOSTest`, three machines, each running one Keeper member, two running a replica of one shard, with a static CA and certs generated in the test derivation. The script:
 
-1. waits for Keeper quorum (`mntr` reports one leader, two synced followers)
+1. waits for Keeper quorum (`mntr` over the TLS client port reports one leader, two synced followers)
 2. creates a `Replicated` database and a `ReplicatedMergeTree` table on replica A, inserts 1 000 rows, reads 1 000 rows on replica B
 3. stops the Keeper leader, confirms a new leader within 30 s and that inserts still succeed
 4. restarts replica A while inserting on B, confirms `system.replicas` catches up and row counts match
@@ -504,8 +540,22 @@ Exit: the lab e2e list above.
 - ClickHouse memory: upstream’s `max_server_memory_usage_to_ram_ratio` of 0.9 starves guests. `maxServerMemoryRatio` defaults to 0.5 and preflight warns when the remainder is below 2 GiB.
 - A single-replica shard has downtime on every restart. Plan prints that as a warning; the operator confirms.
 - The upstream NixOS module is small and maintained by one person; its `serverConfig` option is the integration point. If it changes, the fallback is an in-tree copy of the module with a pinned package, as with Ceph.
-- Package versions follow the node’s nixpkgs pin. A kcore release that moves the pin moves ClickHouse. The upgrade operation handles the restart order; the release notes name the ClickHouse version so an operator can hold a `ClusterUpdate`.
+- Package versions follow the node’s nixpkgs pin. A kcore release that moves the pin moves ClickHouse. The upgrade operation handles the restart order and the 26.7 `TablesStatus` window; the release notes name the ClickHouse version so an operator can hold a `ClusterUpdate`. Jumping the pin across a Keeper feature-flag boundary still has to follow that boundary’s upgrade notes. 26.2 is already past the 25.7 flag line.
 - Firewall rules use iptables `extraCommands`, matching the Kubernetes module. A move to nftables on the host must carry these along.
+
+## Still not designed
+
+Checked against `v26.9.20.23` and left out on purpose. These are not bugs in the text above; they have no procedure yet.
+
+- Quota objects other than the stock `default` quota. Users can name a quota; nothing creates one.
+- Dictionaries, executable and remote user-defined functions, named collections.
+- Prometheus authentication. The metrics port is plaintext and only the firewall limits it to `clientNetworks`.
+- A controller operation that calls `SYSTEM RESTORE REPLICA`. The node command exists for a replica whose Keeper metadata was lost; no operation uses it.
+- Query log, part log and trace log retention. The module does not set their TTLs.
+- Cross-datacenter placement and follower-only replicas.
+- Backup of the replicated access directory. Phase 8 backups cover databases, not SQL users and grants.
+- Read-only replicas and Keeper observers.
+- An intermediate package when a future pin jump crosses a Keeper on-disk feature flag. The 26.7 server window is specified; a later flag is not.
 
 ## Blocking questions before phase 7
 
