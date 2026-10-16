@@ -1,0 +1,11 @@
+# Smithery reads this from the repository root.
+# https://smithery.ai/docs/build/project-config
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    description: kcore reads cluster certificates from ~/.kcore on the machine that runs the server.
+    properties: {}
+  commandFunction: |-
+    (config) => ({ command: 'npx', args: ['-y', 'kcore-mcp'] })
+  exampleConfig: {}

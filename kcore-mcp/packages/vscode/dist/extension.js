@@ -34,8 +34,9 @@ __export(extension_exports, {
   deactivate: () => deactivate
 });
 module.exports = __toCommonJS(extension_exports);
-var vscode = __toESM(require("vscode"));
+var import_node_fs = require("node:fs");
 var import_node_path = require("node:path");
+var vscode = __toESM(require("vscode"));
 function activate(context) {
   const didChange = new vscode.EventEmitter();
   context.subscriptions.push(didChange);
@@ -44,7 +45,8 @@ function activate(context) {
       onDidChangeMcpServerDefinitions: didChange.event,
       provideMcpServerDefinitions: () => {
         const server = (0, import_node_path.join)(context.extensionPath, "dist", "mcp.js");
-        return [new vscode.McpStdioServerDefinition("kcore", "node", [server], {}, "0.1.0")];
+        const version = JSON.parse((0, import_node_fs.readFileSync)((0, import_node_path.join)(context.extensionPath, "package.json"), "utf8")).version;
+        return [new vscode.McpStdioServerDefinition("kcore", "node", [server], {}, version)];
       }
     })
   );

@@ -68,6 +68,7 @@ Per **physical CPU socket**, not per core (see [PRICING.md](PRICING.md)).
 - `kcore-controller`: gRPC orchestration API, SQLite-backed desired state, scheduler, and Nix config rendering/push.
 - `kcore-node-agent`: node-side gRPC service for admin operations, config apply, install flow, and VM runtime visibility.
 - `kctl`: operator CLI for cluster PKI setup, VM lifecycle, node install/admin operations, and image operations.
+- `kcore-mcp`: MCP server and Cursor / VS Code plugins. Registry and install steps are in [kcore-mcp/README.md](kcore-mcp/README.md).
 
 ## Architecture Snapshot
 

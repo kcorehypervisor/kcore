@@ -1,0 +1,128 @@
+name: Publish kcore MCP
+
+on:
+  push:
+    tags: ["kcore-mcp-v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        working-directory: kcore-mcp
+        run: npm ci
+
+      - name: Test
+        working-directory: kcore-mcp
+        run: npm test
+
+      - name: Set the release version from the tag
+        working-directory: kcore-mcp
+        run: |
+          version="${GITHUB_REF#refs/tags/kcore-mcp-v}"
+          node --input-type=module -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            const version = process.argv[1];
+            if (!/^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$/.test(version)) {
+              throw new Error("tag must look like kcore-mcp-v1.2.3");
+            }
+            for (const path of ["packages/server/package.json", "packages/vscode/package.json"]) {
+              const pkg = JSON.parse(readFileSync(path, "utf8"));
+              pkg.version = version;
+              writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+            }
+            const server = JSON.parse(readFileSync("packages/server/server.json", "utf8"));
+            server.version = version;
+            for (const entry of server.packages) entry.version = version;
+            writeFileSync("packages/server/server.json", JSON.stringify(server, null, 2) + "\n");
+          ' "$version"
+
+      - name: Build
+        working-directory: kcore-mcp
+        run: npm run build
+
+      - name: Publish to npm
+        working-directory: kcore-mcp
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "Add the NPM_TOKEN repository secret (an npm automation token that can publish kcore-mcp), then re-run this job."
+            exit 1
+          fi
+          npm publish --workspace=packages/server --access public --provenance
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher --help
+
+      - name: Publish to the official MCP Registry
+        working-directory: kcore-mcp
+        run: |
+          ../mcp-publisher login github-oidc
+          ../mcp-publisher publish packages/server/server.json
+
+  editors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install, test, and build
+        working-directory: kcore-mcp
+        run: |
+          version="${GITHUB_REF#refs/tags/kcore-mcp-v}"
+          npm ci
+          npm test
+          node --input-type=module -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            const version = process.argv[1];
+            const path = "packages/vscode/package.json";
+            const pkg = JSON.parse(readFileSync(path, "utf8"));
+            pkg.version = version;
+            writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
+          ' "$version"
+          npm run build
+
+      - name: Publish the VS Code extension
+        working-directory: kcore-mcp/packages/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "$VSCE_PAT" ]; then
+            echo "VSCE_PAT is not set. Create the Visual Studio Marketplace publisher \"kcore\" and add the secret to publish the extension."
+            exit 0
+          fi
+          npx --yes @vscode/vsce publish --no-dependencies -p "$VSCE_PAT"
+
+      - name: Publish to Open VSX
+        working-directory: kcore-mcp/packages/vscode
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          if [ -z "$OVSX_PAT" ]; then
+            echo "OVSX_PAT is not set. Add an Open VSX token to publish there."
+            exit 0
+          fi
+          npx --yes ovsx publish --no-dependencies -p "$OVSX_PAT"
