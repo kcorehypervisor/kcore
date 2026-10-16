@@ -37,7 +37,9 @@ Two things differ from Kubernetes and are the reason this design has its own rol
 - A **cluster** has a name, a package attribute (`clickhouse` or `clickhouse-lts` from the node’s nixpkgs pin), shards, Keeper members, users, profiles, databases and server settings.
 - A **shard** has a `shardName` (the `{shard}` macro) and one or more replicas.
 - A **replica** is one `clickhouse-server` on one kcoreOS node with a `replicaName` (the `{replica}` macro), an advertise address, an interface and an optional data volume. A node hosts at most one server per cluster. In v1 a node belongs to at most one ClickHouse cluster; the unit name `clickhouse.service` is fixed by the NixOS module and the data path, ports and firewall rules are per node.
-- A **Keeper member** is one `clickhouse-keeper` process with a Raft `serverId`. One, three or five members. Members may share a node with a replica; a dedicated Keeper node is also valid. Keeper membership is immutable in v1; plan returns `replace` when it changes. Dynamic `reconfig` is a later phase.
+- A **Keeper member** is one `clickhouse-keeper` process with a Raft `serverId`. Voting members are one, three or five. A `learner: true` member sets `can_become_leader: false` and does not vote, so it does not count toward that number and does not sit in the quorum. Learners are how a second datacenter can hold a Keeper copy. Members may share a node with a replica; a dedicated Keeper node is also valid. Keeper membership, including who is a learner, is immutable in v1; plan returns `replace` when it changes. Keeper cannot flip `can_become_leader` on an existing `serverId`. Dynamic `reconfig` is a later phase.
+- A **read replica** (`readOnly: true`) is in `remote_servers` at priority 100. The cluster uses `load_balancing: first_or_random`, so a Distributed insert lands on a writable replica (priority 1) and ReplicatedMergeTree copies the parts. A shard with no writable replica is a plan error. A read replica does not satisfy the rolling gate for a writable replica.
+- **Datacenter** is an optional label on replicas and keepers. If any member sets it, every member must. It is not a ClickHouse macro. With more than one datacenter, no datacenter may hold a majority of the voting Keepers. Plan warns when every writable replica of a shard sits in one datacenter.
 - `remote_servers.<cluster>` is rendered identically on every member from the shard list. `macros` are per replica. `zookeeper` lists every Keeper member.
 
 ### Defaults the module will ship
@@ -116,7 +118,7 @@ The example nodes are placeholders. `node-107` is the kcore controller in the ga
 
 ## API
 
-Controller RPCs (`service Controller`): `PlanClickhouseCluster`, `CreateClickhouseCluster`, `UpdateClickhouseCluster`, `GetClickhouseCluster`, `ListClickhouseClusters`, `DeleteClickhouseCluster`, `ScaleClickhouseCluster`, `ReplaceClickhouseReplica`, `UpgradeClickhouseCluster`, `GetClickhouseClusterHealth`, `Get/List/CancelClickhouseOperation`, `GetClickhouseClusterCredentials`, `Backup/Restore/ListClickhouseBackups`.
+Controller RPCs (`service Controller`): `PlanClickhouseCluster`, `CreateClickhouseCluster`, `UpdateClickhouseCluster`, `GetClickhouseCluster`, `ListClickhouseClusters`, `DeleteClickhouseCluster`, `ScaleClickhouseCluster`, `ReplaceClickhouseReplica`, `RestoreClickhouseReplica`, `UpgradeClickhouseCluster`, `GetClickhouseClusterHealth`, `Get/List/CancelClickhouseOperation`, `GetClickhouseClusterCredentials`, `Backup/Restore/ListClickhouseBackups`.
 
 Node RPCs (`service NodeAdmin`): `CheckClickhousePreflight`, `ApplyClickhouseConfig`, `GetClickhouseStatus`, `SetClickhouseUnitState`, `RunClickhouseAdmin`. The existing `GetNixApplyStatus` reports on the rebuild.
 
@@ -125,18 +127,18 @@ Messages and comments are in the proto file. Rules that the proto cannot express
 - **Immutable after create:** `name`, `shardName`, `replicaName` once the replica has joined, `keepers` (count, ids, addresses), `tls.disabled`, `ports`. Plan returns `replace`; create of a new cluster is the path.
 - **Upgrade, not update:** `package`. `UpdateClickhouseCluster` with a different `package` returns `INVALID_ARGUMENT` pointing at `UpgradeClickhouseCluster`. A lower resolved version is refused without `force`. ClickHouse on-disk metadata does not downgrade across any component, not only the first.
 - **Scale, not update:** adding or removing shards or replicas through `Update` is accepted when the diff is only membership; the controller runs it as a scale operation and plan says so. `Scale` exists for the CLI verb and for MCP.
-- **Mutable with reload only:** `users`, `profiles`, `databases`, `clientNetworks`, `serverSettings` keys ClickHouse reloads, shard `weight`. ClickHouse re-reads `config.d` and `users.d`; no unit restart. Weight lives on the shard inside `remote_servers`.
+- **Mutable with reload only:** `users`, `profiles`, `quotas`, `databases`, `clientNetworks`, config dictionaries, named collections, `serverSettings` keys ClickHouse reloads, shard `weight`, `readOnly`. ClickHouse re-reads `config.d` and `users.d`; no unit restart. Weight and read-replica priority live on the shard inside `remote_servers`. SQL functions are applied with `CREATE OR REPLACE FUNCTION` on one writable replica and replicate through the access storage. System-log retention is an `ALTER TABLE ... MODIFY TTL` on each server, not a unit restart: a config change does not alter an existing system log.
 - **Mutable with rolling restart:** `serverSettings` keys ClickHouse does not reload (the agent keeps the list: `max_server_memory_usage`, `mark_cache_size`, `max_connections`, …), `maxServerMemoryRatio`, `dataVolume` (refused while the replica has data; `replace` otherwise).
 - **Controller-only:** `maxReplicaDelaySeconds` and `stepTimeoutSeconds` change how the next operation runs and touch no node.
-- **Owned keys:** `serverSettings` may not set `listen_host`, any `*_port`, `path`, `macros`, `remote_servers`, `zookeeper`, `openSSL`, `interserver_*`, `users_config`, `include_from`, `user_directories`. Plan reports the key.
+- **Owned keys:** `serverSettings` may not set `listen_host`, any `*_port`, `path`, `macros`, `remote_servers`, `zookeeper`, `openSSL`, `interserver_*`, `users_config`, `include_from`, `user_directories`, `prometheus`, `http_handlers`, `query_log`, `part_log`, `trace_log`, `text_log`, `dictionaries_config`, `named_collections`, `user_defined_executable_functions`. Plan reports the key. `learner` and Keeper membership stay immutable. `datacenter` is controller-only.
 - **`confirm`:** every mutating RPC requires `confirm: true`. Dry-run is `Plan`.
 - **`force`:** delete with unreachable members, removal of a shard’s last replica, removal of a shard that still holds parts, major-version downgrade. Force never skips the operation log.
 
 ### SQLite
 
 - `clickhouse_clusters(name PK, spec_json, generation, observed_generation, phase, message, active_operation_id, created_at, updated_at)`
-- `clickhouse_cluster_members(cluster_name FK, node_id, roles, shard_name, replica_name, keeper_server_id, advertise_address, iface, joined_generation, state)` with PK `(cluster_name, node_id)`
-- `clickhouse_cluster_secrets(cluster_name PK, default_password_sha256_hex, default_password_enc, interserver_user, interserver_password_enc, keeper_secret_enc, cluster_secret_enc, ca_pem)` with the same at-rest handling as `ceph_dashboard_credentials`
+- `clickhouse_cluster_members(cluster_name FK, node_id, roles, shard_name, replica_name, keeper_server_id, advertise_address, iface, joined_generation, state, datacenter, read_only, learner)` with PK `(cluster_name, node_id)`
+- `clickhouse_cluster_secrets(cluster_name PK, default_password_sha256_hex, default_password_enc, interserver_user, interserver_password_enc, keeper_secret_enc, cluster_secret_enc, metrics_password_enc, named_collection_secrets_enc, ca_pem)` with the same at-rest handling as `ceph_dashboard_credentials`
 - `clickhouse_member_certs(cluster_name, node_id, cert_pem, not_after)` read by `cert_rotation_reconciler.rs`
 - `clickhouse_operations(id PK, cluster_name FK, kind, state, target_generation, steps_json, created_at, updated_at)`
 
@@ -150,8 +152,8 @@ Each table gets a `schema_down.rs` entry. Phases: `pending`, `bootstrapping`, `r
 - `advertiseAddress`, `iface`, `secretsDir`
 - `tls.enable`, `tls.certFile`, `tls.keyFile`, `tls.caFile`
 - `ports.{tcp,tcpSecure,http,https,interserver,keeper,keeperRaft,prometheus}`
-- `server.enable`, `server.shard`, `server.replica`, `server.dataPath`, `server.remoteServers`, `server.users`, `server.profiles`, `server.databases`, `server.settings`, `server.clientNetworks`, `server.maxServerMemoryRatio`
-- `keeper.enable`, `keeper.serverId`, `keeper.dataPath`, `keeper.raftPeers`
+- `server.enable`, `server.shard`, `server.replica`, `server.readOnly`, `server.dataPath`, `server.remoteServers`, `server.users`, `server.profiles`, `server.quotas`, `server.databases`, `server.dictionaries`, `server.namedCollections`, `server.functions`, `server.settings`, `server.systemLogs`, `server.clientNetworks`, `server.maxServerMemoryRatio`, `server.metricsPublic`
+- `keeper.enable`, `keeper.serverId`, `keeper.learner`, `keeper.dataPath`, `keeper.raftPeers`
 
 When `enable` is false the module turns `services.clickhouse` off, defines no Keeper unit and opens no ports. A Keeper-only member keeps `kcore.clickhouse.enable` true and `server.enable` false. That combination still creates the `clickhouse` user and group. `services.clickhouse.enable` stays false, so the NixOS module would not create the user on its own.
 
@@ -165,14 +167,16 @@ A node that runs both roles uses one `advertiseAddress` and one `iface`. Plan re
   - sets `path` and the absolute children the packaged file hard-codes (`tmp_path`, `user_files_path`, `format_schema_path`, `access_control_path`, logger files) under `dataPath`
   - sets `macros`, `remote_servers.<clusterName>` with `internal_replication = true` on every shard, a `secret` taken from the environment, and `user_directories` (stock `users_xml` plus `replicated` at `/clickhouse/access/`)
   - sets `zookeeper` nodes to Keeper port `9281` with `secure: 1`, and `identity` from the environment
-  - sets `openSSL`, `prometheus`, `logger`, and `server.settings`
-  - `usersConfig` carries profiles and users. Password hashes are `@from_env` references, never the hex digest.
+  - sets `openSSL`, `logger`, `server.settings`, and the system-log engine strings (`query_log`, `part_log`, `trace_log`, `text_log`) with the TTL in the engine
+  - binds `prometheus` to `127.0.0.1` only. `metrics_public` is the only way that port is also opened on `iface`. An `http_handlers` rule serves `GET /clickhouse/metrics` on the HTTPS port; the native port has no authentication
+  - renders config dictionaries and named collections. Named-collection secret keys use `@from_env` and `overridable: false`
+  - `usersConfig` carries profiles, quotas and users. Password hashes are `@from_env` references, never the hex digest. The `kcore-metrics` user is one of those rows. The name `default` is reserved for both users and quotas.
 - `systemd.tmpfiles` rules create `dataPath`, the Keeper path, `secretsDir` and the TLS directory. Data and Keeper directories are `0750` `clickhouse:clickhouse`. The secrets directory is `0700` root.
 - `systemd.services.clickhouse-keeper` running `${pkg}/bin/clickhouse-keeper --config-file=/etc/clickhouse-keeper/keeper_config.yaml`, `User=clickhouse`, `Type=simple`, its own YAML generated with `pkgs.formats.yaml`, `RequiresMountsFor = keeper.dataPath`. `Type=simple` so a keeper that never sends systemd `READY` still becomes active; the reconciler’s quorum gate is the readiness check. Use `Type=notify` only after the packaged binary is shown to send `READY`. The YAML sets `tcp_port_secure`, removes `tcp_port` (compiled default `2181`), sets `raft_configuration.secure = true`, and includes the same `openSSL` material. Without that section a standalone keeper has no certificate and the secure port does not open.
 - `systemd.services.clickhouse.serviceConfig.RequiresMountsFor = server.dataPath`.
 - `restartIfChanged = false` and `stopIfChanged = false` on both units. `nixos-rebuild switch` never restarts ClickHouse; the controller restarts members one at a time through `SetClickhouseUnitState`. The `ExecStop` timeout covers `shutdown_wait_unfinished_queries`.
 - A `/etc/clickhouse-client/config.xml` with `secure`, `host = 127.0.0.1`, and an `openSSL.client` block (`caConfig` pointing at the CA, `verificationMode = strict`), so `clickhouse-client` on the host and in the agent needs no flags. The certificate SAN list includes `127.0.0.1`.
-- Firewall: `networking.firewall.interfaces.<iface>.allowedTCPPorts` for the port set, and `extraCommands` iptables rules that restrict `interserver`, `keeper` and `keeperRaft` to member addresses and the client ports (including plaintext Prometheus) to `clientNetworks`. Nothing opens on `br0`, `kbr-*` or the Ceph interface.
+- Firewall: `networking.firewall.interfaces.<iface>.allowedTCPPorts` for the port set, and `extraCommands` iptables rules that restrict `interserver`, `keeper` and `keeperRaft` to member addresses and the client ports to `clientNetworks`. Prometheus `9363` is not in that set unless `metrics_public` is set, and then plan warns that the port has no authentication. Nothing opens on `br0`, `kbr-*` or the Ceph interface.
 - Assertions: `advertiseAddress` set when enabled; `server.enable || keeper.enable`; odd `raftPeers` count; `serverId` present in `raftPeers`; `shard`/`replica` present in `remoteServers`; `tls.enable` implies the three file paths; `ports` pairwise distinct; `dataPath` under `/var/lib/kcore-clickhouse/`.
 
 ### Secrets stay out of the store
@@ -307,9 +311,9 @@ Files: `clickhouse_cluster_spec.rs` (normalise, validate, defaults, diff → act
 `plan_rollout(spec, members, health, kind) -> Vec<Step>` is a pure function. The reconciler executes steps; the planner decides order. Invariants the planner guarantees and the tests check:
 
 1. At most one replica per shard is in flight.
-2. A replica is restarted only when another replica of the same shard is healthy (`unit_active`, `readonly_tables == 0`, delay below threshold). A single-replica shard produces a warning in plan and a downtime step; the operator sees it before confirming.
-3. Keeper steps come before server steps in an upgrade. Followers first, leader last; the leader is re-read from `mntr` at execution time because it may move.
-4. A Keeper member is restarted only when the ensemble has a leader and `zk_synced_followers == n − 1`.
+2. A writable replica is restarted only when another writable replica of the same shard is healthy (`unit_active`, `readonly_tables == 0`, delay below threshold). A read replica does not satisfy that gate. A read replica is restarted when any other replica of the shard is healthy. A shard whose only writable replica is restarting produces a warning in plan and a downtime step for inserts; the operator sees it before confirming.
+3. Keeper steps come before server steps in an upgrade. Voting followers first, leader last, learners after the voting members; the leader is re-read from `mntr` at execution time because it may move. A learner is never elected leader.
+4. A voting Keeper member is restarted only when the ensemble has a leader and every other voting member is synced. A learner is restarted when a leader exists. Quorum is computed from voting members only.
 5. Every restart step is followed by gate steps: `wait-nix`, unit active, Keeper session ok, `wait-replica-caught-up`.
 6. Reload-only changes produce `apply-nix` on every node in parallel and no restart steps.
 7. Steps are idempotent. A controller restart resumes the operation from the first step not in `succeeded`.
@@ -326,12 +330,22 @@ Create, Update, Upgrade, Scale, Replace, Delete, Backup and Restore each create 
 4. `wait-nix` on each node.
 5. `wait-keeper-quorum`: a leader exists and all followers are synced.
 6. Servers: unit active and Keeper session ok on every replica.
-7. `create-databases`: on the first replica of the lowest shard, `CREATE DATABASE IF NOT EXISTS <db> ENGINE = Replicated('/clickhouse/databases/<db>', '{shard}', '{replica}')`, then wait until `EXISTS DATABASE` on every other replica. Parallel `CREATE` against the same Keeper path races. The macros stay quoted so ClickHouse expands them per replica.
-8. Verify `system.clusters` on one replica per shard lists every declared replica. Phase `ready`.
+7. `create-databases`: on the first writable replica of the lowest shard, `CREATE DATABASE IF NOT EXISTS <db> ENGINE = Replicated('/clickhouse/databases/<db>', '{shard}', '{replica}')`, then wait until `EXISTS DATABASE` on every other replica. Parallel `CREATE` against the same Keeper path races. The macros stay quoted so ClickHouse expands them per replica.
+8. On that same replica, `CREATE FUNCTION` for each spec function and `CREATE DICTIONARY` for each dictionary whose `database` is set. Config dictionaries and named collections arrived with the Nix apply.
+9. `set-system-log-ttl` is a no-op on create: the engine string already has the TTL, and the tables are created on first start.
+10. Verify `system.clusters` on one replica per shard lists every declared replica. Phase `ready`.
 
 **Update**: diff → reload-only or rolling. Reload-only applies in parallel. Rolling follows the planner. `observed_generation` moves when the last step succeeds; a failure leaves the cluster in `degraded` with the mixed generations recorded per member, and plan on the same spec shows the remaining nodes.
 
-**Upgrade**: preflight resolves the version on each node and refuses any lower version without `force`. Order: Keeper members (followers, leader), then one replica per shard at a time across shards. Each node: `apply-nix` (new package, no restart because of `restartIfChanged = false`), then `restart` through `SetClickhouseUnitState`, then gates. `running_version` reports `a,b` while mixed.
+**Upgrade**: preflight resolves the version on each node and refuses any lower version without `force`. Order: voting Keeper followers, the leader, learners, then one writable replica per shard at a time, then read replicas. Each node: `apply-nix` (new package, no restart because of `restartIfChanged = false`), then `restart` through `SetClickhouseUnitState`, then gates. `running_version` reports `a,b` while mixed.
+
+Keeper on-disk feature flags are a static table in `clickhouse_rollout.rs`, reviewed when the pin moves:
+
+| Flag introduced | Minimum step already required | What 26.2 → 26.9 does |
+|---|---|---|
+| 25.7 | 24.9 | Nothing. 26.2 is already past 25.7. |
+
+A jump whose running version is below the minimum step and whose target is at or above the flag is refused until `intermediate_package` resolves inside the window (at least the minimum step, below the flag). The operation then upgrades every Keeper to that intermediate package, waits for quorum, upgrades every Keeper to the target, then rolls servers. `force` does not skip the window. The 26.7 server setting below is a separate gate and is not a Keeper flag.
 
 From 26.7, `interserver_tables_status_require_auth` defaults to true and a node still on an older protocol does not send the cluster-secret hash. `TablesStatus` then fails for `Distributed` queries during the roll. The upgrade emits that setting as `false` only on members whose resolved version is at least 26.7, and drops the override with a reload once every server is past that line. The key is omitted on 26.2, which does not know it. The cluster secret itself is present from the first create, so a cluster that never mixes versions needs no override.
 
@@ -343,11 +357,26 @@ From 26.7, `interserver_tables_status_require_auth` defaults to true and a node 
 
 **Delete**: stop every server, stop every Keeper, apply `enable = false` on every node, release volumes unless `retain_data`, drop rows. `force` skips unreachable nodes; the next successful apply of the empty fragment on such a node removes the units.
 
-**Backup / Restore**: `BACKUP DATABASE … TO Disk('kcore_backups', '<name>/<shard>') SETTINGS …` or the S3 form, run on one replica per shard through `RunClickhouseAdmin`, polled with `BackupStatus`. The S3 target may be a kcore ObjectStore bucket; the access key is a controller-stored credential reference and never travels to the client. The Phase-1 hooks in [backup.md](./backup.md) are where the later backup service picks this up.
+**Restore replica**: `RestoreClickhouseReplica` runs `SYSTEM RESTORE REPLICA` for each readonly replicated table on that node. It is the recovery for lost Keeper metadata, not a backup restore. Without `force` the replica must be reporting readonly tables or a failed Keeper session, Keeper must have quorum, and another replica of the shard must be healthy. One such operation at a time. Then `wait-replica-caught-up`.
+
+**Backup / Restore**: `BACKUP DATABASE … TO Disk('kcore_backups', '<name>/<shard>') SETTINGS …` or the S3 form, run on one writable replica per shard through `RunClickhouseAdmin`, polled with `BackupStatus`. The S3 target may be a kcore ObjectStore bucket; the access key is a controller-stored credential reference and never travels to the client. Unless `skip_access` is set, one writable replica also runs:
+
+```sql
+BACKUP
+  TABLE system.users,
+  TABLE system.roles,
+  TABLE system.row_policies,
+  TABLE system.quotas,
+  TABLE system.settings_profiles,
+  TABLE system.masking_policies
+TO Disk('kcore_backups', '<name>/access')
+```
+
+`user_directories.replicated` keeps the default `allow_backup: true`. `users_xml` stays `allow_backup: false`, so the kcore-managed users in the Nix config are not dumped into the backup; those secrets stay in the controller. Restore of access runs on one writable replica after Keeper quorum. Running it on every replica would apply the entities twice. The Phase-1 hooks in [backup.md](./backup.md) are where the later backup service picks this up.
 
 ### Health and cert rotation
 
-A `clickhouse_health` loop polls `GetClickhouseStatus` from every member every 30 s, computes `phase` (`ready`, `degraded` when any replica is read-only or lagging or a Keeper member is down with quorum intact, `failed` when a shard has no replica or Keeper lost quorum), and feeds `metrics_targets.rs` with each member’s Prometheus port. `cert_rotation_reconciler.rs` reissues a member cert `rotate_before_days` before expiry. The agent rewrites the files, runs `ReloadConfig` for `clickhouse-server`, and rolls Keeper with the same quorum rules. Keeper has no documented config reload that picks up a new certificate.
+A `clickhouse_health` loop polls `GetClickhouseStatus` from every member every 30 s, computes `phase` (`ready`, `degraded` when any replica has readonly replicated tables or is lagging or a voting Keeper is down with quorum intact, `failed` when a shard has no writable replica or Keeper lost quorum), and feeds `metrics_targets.rs` from the agent’s scrape of `127.0.0.1:9363`. External Prometheus uses `https://<advertise>:8443/clickhouse/metrics` with the `kcore-metrics` user from `GetClickhouseClusterCredentials`. A spec read replica that is caught up is healthy; `system.replicas.is_readonly` is a different signal. `cert_rotation_reconciler.rs` reissues a member cert `rotate_before_days` before expiry. The agent rewrites the files, runs `ReloadConfig` for `clickhouse-server`, and rolls Keeper with the same quorum rules. Keeper has no documented config reload that picks up a new certificate.
 
 ### Interaction with kcore cluster updates
 
@@ -360,10 +389,11 @@ A `clickhouse_health` loop polls `GetClickhouseStatus` from every member every 3
 - `kctl clickhouse get analytics`, `list`, `health analytics`, `credentials analytics`, `operations analytics`, `operation <id>`, `cancel <id>`.
 - `kctl clickhouse scale analytics --add-replica 1:node-110:192.168.40.110:enp6s0`, `--remove-replica 1/node-106`, `--add-shard -f shard.yaml`, `--remove-shard 2 --force`.
 - `kctl clickhouse replace-replica analytics --shard 1 --old node-106 -f new-replica.yaml`.
-- `kctl clickhouse upgrade analytics --package clickhouse-lts`.
-- `kctl clickhouse backup analytics --disk /mnt/backups`, `restore`, `backups`.
+- `kctl clickhouse restore-replica analytics --shard 1 --replica node-106 [--database events] [--force]`.
+- `kctl clickhouse upgrade analytics --package clickhouse-lts [--intermediate-package clickhouse-lts]`.
+- `kctl clickhouse backup analytics --disk /mnt/backups`, `restore`, `backups`. `--skip-access` omits SQL users and grants.
 - `kctl clickhouse delete analytics --confirm [--force] [--retain-data]`.
-- MCP kind `clickhouse-cluster` with advise questions: shard count, replicas per shard, member node ids, addresses and interfaces, Keeper placement, data volumes, client networks. Apply stays behind `confirm: true`.
+- MCP kind `clickhouse-cluster` with advise questions: shard count, replicas per shard, which replicas are read replicas, member node ids, addresses, interfaces and datacenters, Keeper placement and which members are learners, data volumes, client networks, quota and log retention. Apply stays behind `confirm: true`.
 - Dashboard: one status card (phase, replicas, Keeper quorum, running version, active operation) with the same weight as the Kubernetes card. The dashboard test mocks stub the new RPCs.
 
 ## Tests
@@ -376,8 +406,8 @@ Every layer gets its own test type, and the test lives next to the code it cover
 
 ### Unit tests (Rust, `cargo test --workspace`)
 
-- `clickhouse_cluster_spec.rs`: defaults fill (`replicaName`, `shardName`, `serverId`, ports, timeouts); validation errors for even Keeper count, duplicate names, owned `serverSettings` keys, `default` in `users`, names outside the two grammars (including shard `"1"` and replica `node-105` accepted, and `node-105` rejected as a database name), a user `networks` list left empty resolving to `clientNetworks` rather than `::/0`, the same node advertised on two interfaces, a shared volume name for server and Keeper, overlapping ports; diff classification (`unchanged`, `update` reload-only, `update` restart, `upgrade`, `scale`, `replace`) and `changed_fields` paths. A lower version of any component is `upgrade` refused without `force`.
-- `clickhouse_rollout.rs`: fixed topologies (1×1, 1×2, 2×2 with 3 Keepers, 3×3 with 5 Keepers) produce the expected step order; leader-last; single-replica shard yields a warning step; resume from a half-finished operation produces only the remaining steps.
+- `clickhouse_cluster_spec.rs`: defaults fill (`replicaName`, `shardName`, `serverId`, ports, timeouts, system-log days); validation errors for even voting-Keeper count, a learner counted as a voter, one datacenter holding a majority of voters, a shard with no writable replica, a partial `datacenter` labeling, duplicate names, owned `serverSettings` keys, `default` in `users` or `quotas`, executable dictionary or UDF sources, a named-collection secret left in `keys`, names outside the two grammars (including shard `"1"` and replica `node-105` accepted, and `node-105` rejected as a database name), a user `networks` list left empty resolving to `clientNetworks`, the same node advertised on two interfaces, a shared volume name for server and Keeper, overlapping ports; diff classification (`unchanged`, `update` reload-only, `update` restart, `upgrade`, `scale`, `replace`) and `changed_fields` paths. A lower version of any component is `upgrade` refused without `force`. A Keeper flag jump without `intermediate_package` is a blocking issue. Flipping `learner` on an existing id is `replace`.
+- `clickhouse_rollout.rs`: fixed topologies (1×1, 1×2, 2×2 with 3 Keepers, 3×3 with 5 Keepers, 2×2 with one read replica and two learners in a second datacenter) produce the expected step order; leader-last; learners after voters; a read replica does not unlock a writable restart; single writable replica yields a warning step; an intermediate Keeper package inserts a full Keeper pass before the target pass; resume from a half-finished operation produces only the remaining steps.
 - `nixgen_clickhouse.rs`: escaping of `"`, `${`, newlines and non-ASCII in every string field; `enable = false` fragment is exactly the empty module shape; reloadable-vs-restart key list.
 - `clickhouse_ops.rs`: SQL builders for every `RunClickhouseAdmin` command with identifier and literal quoting, including names containing `'`, `` ` ``, `;` and `--`; `DROP REPLICA … FROM DATABASE` once per database; `mntr` parser on recorded output from leader, follower, a TLS transcript that never finishes the handshake, and a port that answers nothing; `system.replicas` aggregate parser on TSV fixtures including a `NULL` delay.
 - `db.rs`: CRUD for the five tables, cascade on cluster delete, up and down migration round-trip (`schema_down.rs`).
@@ -430,7 +460,8 @@ An in-process tonic `NodeAdmin` implementation (served over a `tokio::io::duplex
 - create on 2×2 + 3 Keepers calls apply on every node once, waits for quorum before database creation, ends `ready`
 - update with a reload-only diff never calls `SetClickhouseUnitState`
 - update with a restart diff restarts one replica per shard at a time and waits for the lag gate; a replica that never catches up fails the operation at `stepTimeoutSeconds` and leaves `degraded`
-- upgrade restarts Keeper followers before the leader and servers after Keeper
+- upgrade restarts voting Keeper followers before the leader, learners after voters, and servers after Keeper; a jump across a Keeper flag boundary runs the intermediate package on Keepers before the target
+- restore-replica runs `SYSTEM RESTORE REPLICA` on the named node and waits for the lag gate; a healthy replica is refused without `force`
 - scale in refuses the last replica without `force`; with `force` it drops the replica from the survivor
 - delete with an unreachable node fails without `force` and drops rows with it
 - controller restart in the middle of an operation resumes at the first non-succeeded step
@@ -527,7 +558,7 @@ Exit: the lab e2e list above.
 
 ### 8. Day-2 and later
 
-- Backup and restore RPCs wired to the Disk and S3 targets; ObjectStore bucket as target.
+- Backup and restore RPCs wired to the Disk and S3 targets, including the access-entity backup specified above. ObjectStore bucket as target.
 - Cluster-update gate (“safe to take down”).
 - Keeper dynamic `reconfig` behind a flag, lifting the immutable-membership rule.
 - Tiered storage: an S3 disk in `storage_configuration` pointing at kcore ObjectStore.
@@ -540,22 +571,30 @@ Exit: the lab e2e list above.
 - ClickHouse memory: upstream’s `max_server_memory_usage_to_ram_ratio` of 0.9 starves guests. `maxServerMemoryRatio` defaults to 0.5 and preflight warns when the remainder is below 2 GiB.
 - A single-replica shard has downtime on every restart. Plan prints that as a warning; the operator confirms.
 - The upstream NixOS module is small and maintained by one person; its `serverConfig` option is the integration point. If it changes, the fallback is an in-tree copy of the module with a pinned package, as with Ceph.
-- Package versions follow the node’s nixpkgs pin. A kcore release that moves the pin moves ClickHouse. The upgrade operation handles the restart order and the 26.7 `TablesStatus` window; the release notes name the ClickHouse version so an operator can hold a `ClusterUpdate`. Jumping the pin across a Keeper feature-flag boundary still has to follow that boundary’s upgrade notes. 26.2 is already past the 25.7 flag line.
+- Package versions follow the node’s nixpkgs pin. A kcore release that moves the pin moves ClickHouse. The upgrade operation handles the restart order, the 26.7 `TablesStatus` window, and any Keeper feature-flag window in the static table. The release notes name the ClickHouse version so an operator can hold a `ClusterUpdate`. 26.2 is already past the 25.7 flag line, so that pin jump needs no intermediate package.
 - Firewall rules use iptables `extraCommands`, matching the Kubernetes module. A move to nftables on the host must carry these along.
 
-## Still not designed
+## Quotas, dictionaries, functions, collections
 
-Checked against `v26.9.20.23` and left out on purpose. These are not bugs in the text above; they have no procedure yet.
+Checked against `v26.9.20.23`. These objects are part of the spec.
 
-- Quota objects other than the stock `default` quota. Users can name a quota; nothing creates one.
-- Dictionaries, executable and remote user-defined functions, named collections.
-- Prometheus authentication. The metrics port is plaintext and only the firewall limits it to `clientNetworks`.
-- A controller operation that calls `SYSTEM RESTORE REPLICA`. The node command exists for a replica whose Keeper metadata was lost; no operation uses it.
-- Query log, part log and trace log retention. The module does not set their TTLs.
-- Cross-datacenter placement and follower-only replicas.
-- Backup of the replicated access directory. Phase 8 backups cover databases, not SQL users and grants.
-- Read-only replicas and Keeper observers.
-- An intermediate package when a future pin jump crosses a Keeper on-disk feature flag. The 26.7 server window is specified; a later flag is not.
+**Quotas.** `spec.quotas` is a list of `{ name, intervals: [{ durationSeconds, queries, errors, resultRows, readRows, executionTimeSeconds }] }`. A user `quota` names one of them. The stock quota `default` stays the one from the packaged `users.xml` and cannot be redefined. A counter of 0 is unlimited. Quotas render into `usersConfig` and reload.
+
+**Dictionaries.** `source: clickhouse` runs `query` against `127.0.0.1` over TLS. `source: https` fetches `url`; the URL has no userinfo and uses `https`. `source: executable` is a validation error. `layout` is `flat`, `hashed` or `cache`. With `database` empty the dictionary is XML in `config.d` and identical on every server. With `database` set, one writable replica runs `CREATE DICTIONARY` in that replicated database and Keeper copies it. Attribute types are a ClickHouse type name plus an optional length, and `nullable`.
+
+**Functions.** `spec.functions` is `{ name, parameters, expression }` applied as `CREATE FUNCTION name AS (parameters) -> expression` on one writable replica. The expression is one expression: a semicolon is rejected. `executable` and `executable_pool` UDFs are refused. They would run a host binary as the `clickhouse` user on the hypervisor. SQL functions land in the replicated access storage, so a new replica receives them, and the access backup includes them.
+
+**Named collections.** `keys` are non-secret values in the config. `secretRefs` maps a key to a controller credential ref. The agent writes the resolved value to the env file and the YAML uses `@from_env` with `overridable: false` and `@hide_in_preprocessed`. A secret value in `keys` is a validation error. DDL `CREATE NAMED COLLECTION` is not the path for these; the config copy is what every replica must have before startup.
+
+## Metrics, system logs, restore, access backup
+
+**Prometheus.** The native port 9363 does not authenticate. That is still true in 26.9. The module binds it to `127.0.0.1` and the agent scrapes it for `metrics_targets.rs`. Operators scrape `https://<advertise>:8443/clickhouse/metrics` as `kcore-metrics`, whose password is in `GetClickhouseClusterCredentials`. `metricsPublic: true` also opens 9363 on `iface` toward `clientNetworks` and plan warns that the scrape is unauthenticated.
+
+**System logs.** Defaults are query log 14 days, part log 14 days, trace log 3 days, text log 7 days. The TTL is inside the engine string so the first start creates the table with it. A later change runs `ALTER TABLE system.<log> MODIFY TTL event_date + INTERVAL N DAY` through `SetSystemLogTtl` on every server. Reloading the config does not change the TTL of a table that already exists.
+
+**Restore replica.** `RestoreClickhouseReplica` is the controller operation for `SYSTEM RESTORE REPLICA`. The node command was already in `RunClickhouseAdmin`. The operation refuses a replica whose Keeper session is healthy and whose replicated tables are writable, unless `force` is set. It restores one replica, then waits until that replica is caught up.
+
+**Access backup.** Database backup is per shard, on one writable replica of that shard. Access backup is once per cluster, because the entities live in Keeper under `/clickhouse/access/`. `skip_access` omits it. Restore of access is also once.
 
 ## Blocking questions before phase 7
 

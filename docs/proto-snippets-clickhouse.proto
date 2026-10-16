@@ -45,6 +45,9 @@ service ClickhouseController {
   rpc ScaleClickhouseCluster(ScaleClickhouseClusterRequest) returns (ScaleClickhouseClusterResponse);
   // Replace one failed replica with a new node under the same shard.
   rpc ReplaceClickhouseReplica(ReplaceClickhouseReplicaRequest) returns (ReplaceClickhouseReplicaResponse);
+  // Rebuild Keeper metadata for one replica from the surviving replicas.
+  // This is SYSTEM RESTORE REPLICA, not a backup RESTORE.
+  rpc RestoreClickhouseReplica(RestoreClickhouseReplicaRequest) returns (RestoreClickhouseReplicaResponse);
   // Change the package pin. Keeper members roll first, then one replica per
   // shard at a time.
   rpc UpgradeClickhouseCluster(UpgradeClickhouseClusterRequest) returns (UpgradeClickhouseClusterResponse);
@@ -83,6 +86,16 @@ message ClickhouseReplicaSpec {
   // Data directory volume. Empty uses the OS disk under
   // /var/lib/kcore-clickhouse/<cluster>/data.
   ClickhouseHostVolume data_volume = 5;
+  // Placement label. If any replica or keeper sets it, every member must.
+  // Controller-only: it is not a ClickHouse macro, so changing it does not
+  // rewrite a table path.
+  string datacenter = 6;
+  // Unset is false. true lists this replica at priority 100 with
+  // load_balancing first_or_random, so Distributed inserts land on a
+  // writable replica. ReplicatedMergeTree still fetches parts here.
+  // A shard with no writable replica is a plan error. A read replica does
+  // not satisfy the rolling gate for a writable replica.
+  bool read_only = 7;
 }
 
 message ClickhouseShardSpec {
@@ -104,6 +117,14 @@ message ClickhouseKeeperSpec {
   // Log and snapshot volume. Keeper fsyncs every Raft append; a separate
   // device keeps server merges from adding latency. Empty uses the OS disk.
   ClickhouseHostVolume data_volume = 5;
+  // Same rule as ClickhouseReplicaSpec.datacenter.
+  string datacenter = 6;
+  // Unset is false: the member votes and may become leader. true sets
+  // raft can_become_leader to false (a NuRaft learner). Learners do not
+  // vote and do not count toward the 1/3/5 voting-member rule. Changing
+  // this on an existing server_id is replace; Keeper cannot flip the role
+  // of an existing id.
+  bool learner = 7;
 }
 
 // Local LVM or ZFS storage on the node. Mirrors KubernetesHostVolume so the
@@ -148,6 +169,78 @@ message ClickhouseDatabaseSpec {
   string name = 1;
 }
 
+// A quota rendered into users.d. The stock quota "default" is reserved.
+// Zero on a counter means unlimited, matching ClickHouse.
+message ClickhouseQuotaInterval {
+  int32 duration_seconds = 1;
+  int64 queries = 2;
+  int64 errors = 3;
+  int64 result_rows = 4;
+  int64 read_rows = 5;
+  int64 execution_time_seconds = 6;
+}
+
+message ClickhouseQuotaSpec {
+  string name = 1;
+  repeated ClickhouseQuotaInterval intervals = 2;
+}
+
+message ClickhouseDictionaryAttribute {
+  string name = 1;
+  // ClickHouse type name: [A-Za-z_][A-Za-z0-9_]* with an optional (n) or
+  // (n, n) suffix. Nested and experimental types are refused.
+  string type = 2;
+  bool nullable = 3;
+}
+
+// A dictionary every server loads. source "executable" is refused.
+// database empty: a config dictionary, identical on every replica.
+// database set: CREATE DICTIONARY in that replicated database, run on one
+// writable replica so Keeper replicates it.
+message ClickhouseDictionarySpec {
+  string name = 1;
+  // "clickhouse" or "https"
+  string source = 2;
+  string query = 3;
+  string url = 4;
+  string primary_key = 5;
+  // "flat", "hashed", or "cache"
+  string layout = 6;
+  int32 lifetime_seconds = 7;
+  repeated ClickhouseDictionaryAttribute attributes = 8;
+  string database = 9;
+}
+
+// Config named collection. Non-secret keys are values. secret_refs maps a
+// key name to a controller credential ref; the value is written to the env
+// file and referenced with from_env. Secret keys are overridable=false.
+message ClickhouseNamedCollectionSpec {
+  string name = 1;
+  map<string, string> keys = 2;
+  map<string, string> secret_refs = 3;
+}
+
+// SQL function, CREATE FUNCTION ... AS (parameters) -> expression, applied
+// on one writable replica. Replicated access storage copies it. An
+// executable command is not a field: executable and executable_pool UDFs
+// are refused.
+message ClickhouseFunctionSpec {
+  string name = 1;
+  string parameters = 2;
+  string expression = 3;
+}
+
+// Retention for system logs. Zero selects the default: query 14, part 14,
+// trace 3, text 7. The engine string sets TTL at first create. A later
+// change is ALTER TABLE ... MODIFY TTL, because ClickHouse does not alter
+// an existing system log when the config TTL changes.
+message ClickhouseSystemLogs {
+  int32 query_log_days = 1;
+  int32 part_log_days = 2;
+  int32 trace_log_days = 3;
+  int32 text_log_days = 4;
+}
+
 message ClickhouseTlsConfig {
   // Unset is false. false means TLS is on: kcore issues per-node certificates
   // from the cluster PKI and enables tcp_port_secure / https_port /
@@ -164,7 +257,8 @@ message ClickhouseClusterSpec {
   // or "clickhouse-lts". Changing it is an upgrade, not an update.
   string package = 1;
   repeated ClickhouseShardSpec shards = 2;
-  // 1, 3 or 5 members. Immutable in v1 (plan returns "replace").
+  // 1, 3 or 5 voting members, plus any number of learners. Membership is
+  // immutable in v1 (plan returns "replace").
   repeated ClickhouseKeeperSpec keepers = 3;
   repeated ClickhouseUserSpec users = 4;
   repeated ClickhouseSettingsProfile profiles = 5;
@@ -186,6 +280,16 @@ message ClickhouseClusterSpec {
   // max_server_memory_usage_to_ram_ratio. 0 means 0.5: the host still runs
   // guests and the agent. Upstream's 0.9 is refused by validation.
   double max_server_memory_ratio = 13;
+  repeated ClickhouseQuotaSpec quotas = 14;
+  repeated ClickhouseDictionarySpec dictionaries = 15;
+  repeated ClickhouseNamedCollectionSpec named_collections = 16;
+  repeated ClickhouseFunctionSpec functions = 17;
+  ClickhouseSystemLogs system_logs = 18;
+  // Unset is false. The native Prometheus port stays on 127.0.0.1 and
+  // /clickhouse/metrics is served on HTTPS as the kcore-metrics user.
+  // true opens 9363 on iface to clientNetworks. Plan warns: that port
+  // has no authentication (ClickHouse issue 73774, still true in 26.9).
+  bool metrics_public = 19;
 }
 
 // Every member uses the same port set. Zero selects the default. With TLS on
@@ -203,7 +307,7 @@ message ClickhousePorts {
   int32 keeper = 6;           // 9281 secure by default; 9181 only when TLS is off.
                               // The compiled Keeper default if unset is 2181.
   int32 keeper_raft = 7;      // 9234, TLS when raft_configuration.secure is set
-  int32 prometheus = 8;       // 9363, plaintext, 0 disables
+  int32 prometheus = 8;       // 9363 on 127.0.0.1. 0 disables. Public bind is metrics_public.
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +472,33 @@ message UpgradeClickhouseClusterRequest {
   // every server is past that line.
   bool force = 3;
   bool confirm = 4;
+  // Set when the jump from the running version to `package` crosses a
+  // Keeper on-disk feature-flag boundary. The resolved version must sit
+  // inside the window (at least the boundary's minimum step, and below
+  // the version that introduced the flag). Empty when the jump crosses
+  // no boundary. 26.2 to 26.9 does not cross the 25.7 boundary.
+  string intermediate_package = 5;
 }
 
 message UpgradeClickhouseClusterResponse {
+  ClickhouseCluster cluster = 1;
+  string operation_id = 2;
+}
+
+message RestoreClickhouseReplicaRequest {
+  string name = 1;
+  string shard_name = 2;
+  string replica_name = 3;
+  // Empty means every database in spec.databases.
+  string database = 4;
+  bool confirm = 5;
+  // Run even when the replica's Keeper session looks healthy. Without
+  // force the replica must have readonly replicated tables or a failed
+  // Keeper session.
+  bool force = 6;
+}
+
+message RestoreClickhouseReplicaResponse {
   ClickhouseCluster cluster = 1;
   string operation_id = 2;
 }
@@ -478,6 +606,11 @@ message GetClickhouseClusterCredentialsResponse {
   repeated string endpoints = 3;
   // PEM of the CA that signed the member certificates.
   string ca_pem = 4;
+  // HTTPS scrape of /clickhouse/metrics. The native 9363 port is localhost
+  // and is not in this list.
+  string metrics_user = 5;
+  string metrics_password = 6;
+  repeated string metrics_urls = 7;
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +640,9 @@ message BackupClickhouseClusterRequest {
   // BACKUP ... SETTINGS base_backup for incremental backups.
   string base_backup_name = 5;
   bool confirm = 6;
+  // Skip SQL access entities. Default false backs them up from the
+  // replicated access storage. users.xml stays allow_backup false.
+  bool skip_access = 7;
 }
 
 message BackupClickhouseClusterResponse {
@@ -522,6 +658,9 @@ message RestoreClickhouseClusterRequest {
   // RESTORE ... SETTINGS allow_non_empty_tables. Default false.
   bool allow_non_empty_tables = 5;
   bool confirm = 6;
+  // Skip restoring SQL access entities. Default false restores them on
+  // one writable replica; Keeper replicates them to the others.
+  bool skip_access = 7;
 }
 
 message RestoreClickhouseClusterResponse {
@@ -584,6 +723,15 @@ message ClickhouseNodeServerConfig {
   map<string, string> server_settings = 8;
   repeated string client_networks = 9;
   double max_server_memory_ratio = 10;
+  repeated ClickhouseQuotaSpec quotas = 11;
+  repeated ClickhouseDictionarySpec dictionaries = 12;
+  repeated ClickhouseNamedCollectionSpec named_collections = 13;
+  repeated ClickhouseFunctionSpec functions = 14;
+  ClickhouseSystemLogs system_logs = 15;
+  bool metrics_public = 16;
+  // This replica is a read replica. The remote_shards list still carries
+  // every member; priority on each remote replica encodes read_only.
+  bool read_only = 17;
 }
 
 message ClickhouseRemoteShard {
@@ -597,6 +745,8 @@ message ClickhouseRemoteReplica {
   string host = 2;
   int32 port = 3;
   bool secure = 4;
+  // 1 for a writable replica, 100 for a read replica. 0 means 1.
+  int32 priority = 5;
 }
 
 message ClickhouseNodeKeeperConfig {
@@ -609,6 +759,8 @@ message ClickhouseRaftPeer {
   int32 server_id = 1;
   string host = 2;
   int32 port = 3;
+  // true renders can_become_leader: false.
+  bool learner = 4;
 }
 
 // Material the agent writes to /var/lib/kcore-clickhouse/<cluster>/ with
@@ -626,6 +778,10 @@ message ClickhouseNodeSecrets {
   // remote_servers.<cluster>.secret. Distributed queries and, from 26.7,
   // interserver TablesStatus authentication.
   string cluster_secret = 8;
+  // Password of the kcore-metrics user, as a SHA-256 hex digest.
+  string metrics_password_sha256_hex = 9;
+  // Named-collection secret values keyed by "<collection>.<key>".
+  map<string, string> named_collection_secrets = 10;
 }
 
 message CheckClickhousePreflightRequest {
@@ -742,6 +898,12 @@ message RunClickhouseAdminRequest {
     LocalPartsCount local_parts_count = 9;
     // SYSTEM RELOAD CONFIG after the agent rewrote certificates or secrets.
     ReloadConfig reload_config = 10;
+    // ALTER TABLE system.<log> MODIFY TTL. Config changes do not alter an
+    // existing system log table.
+    SetSystemLogTtl set_system_log_ttl = 11;
+    // BACKUP of replicated access entities. One replica only.
+    BackupAccess backup_access = 12;
+    RestoreAccess restore_access = 13;
   }
 
   message SyncReplica { string database = 1; int32 timeout_seconds = 2; }
@@ -752,7 +914,25 @@ message RunClickhouseAdminRequest {
     repeated string databases = 3;
   }
   message EnsureReplicatedDatabase { string database = 1; string shard_name = 2; string replica_name = 3; }
-  message RestoreReplica { string database = 1; }
+  message RestoreReplica {
+    // Empty means every database in the cluster spec. The agent lists
+    // system.replicas and runs SYSTEM RESTORE REPLICA for each readonly
+    // table. The per-table statement is the stable one.
+    string database = 1;
+  }
+  message SetSystemLogTtl {
+    // query_log, part_log, trace_log, or text_log
+    string table = 1;
+    int32 days = 2;
+  }
+  message BackupAccess {
+    ClickhouseBackupTarget target = 1;
+    string backup_name = 2;
+  }
+  message RestoreAccess {
+    ClickhouseBackupTarget target = 1;
+    string backup_name = 2;
+  }
   message Backup {
     ClickhouseBackupTarget target = 1;
     repeated string databases = 2;
