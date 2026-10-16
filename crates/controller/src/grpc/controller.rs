@@ -14225,16 +14225,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(internal_db)?;
 
         // Store nodes
-        for (idx, cp_node) in spec.control_plane_nodes.iter().enumerate() {
+        for cp_node in &spec.control_plane_nodes {
             let node_row = crate::db::KubernetesClusterNodeRow {
                 cluster_name: req.name.clone(),
                 node_id: cp_node.node_id.clone(),
                 role: "control-plane".to_string(),
                 advertise_address: cp_node.advertise_address.clone(),
                 iface: cp_node.iface.clone(),
-                initial_cluster: idx == 0,
-                join_existing: idx > 0,
+                initial_cluster: true,
+                join_existing: false,
                 kubelet_ready: false,
+                pending_join: false,
+                pending_removal: false,
+                k8s_node_name: String::new(),
             };
             self.db
                 .upsert_kubernetes_cluster_node(&node_row)
@@ -14251,6 +14254,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 initial_cluster: false,
                 join_existing: true,
                 kubelet_ready: false,
+                pending_join: false,
+                pending_removal: false,
+                k8s_node_name: String::new(),
             };
             self.db
                 .upsert_kubernetes_cluster_node(&node_row)
@@ -14308,6 +14314,33 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
         let provisioner = Self::local_provisioner_of(&req.name, &spec)?;
+        let existing_members = self
+            .db
+            .list_kubernetes_cluster_nodes(&req.name)
+            .map_err(internal_db)?;
+        let mut desired = Vec::new();
+        for node in &spec.control_plane_nodes {
+            desired.push((node.node_id.clone(), "control-plane".to_string()));
+        }
+        for node in &spec.worker_nodes {
+            desired.push((node.node_id.clone(), "worker".to_string()));
+        }
+        let existing_pairs: Vec<(String, String)> = existing_members
+            .iter()
+            .map(|row| (row.node_id.clone(), row.role.clone()))
+            .collect();
+        let crate::kubernetes_lifecycle::MembershipDelta { add, remove } =
+            crate::kubernetes_lifecycle::membership_delta(&existing_pairs, &desired)
+                .map_err(Status::invalid_argument)?;
+        let add_specs: Vec<controller_proto::KubernetesNodeSpec> = spec
+            .control_plane_nodes
+            .iter()
+            .chain(spec.worker_nodes.iter())
+            .filter(|node| add.iter().any(|(id, _)| id == &node.node_id))
+            .cloned()
+            .collect();
+        let membership_changed =
+            self.stage_kubernetes_membership(&req.name, &add_specs, &remove)?;
 
         // Update cluster
         let mut cluster_row = crate::db::KubernetesClusterRow {
@@ -14371,7 +14404,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 Some(format!("{err:#}"))
             }
         };
-        if let Some(message) = deploy_error.or(volume_error) {
+        if membership_changed {
+            cluster_row.phase = "scaling".to_string();
+            cluster_row.status_message = match deploy_error.or(volume_error) {
+                Some(message) => format!("cluster scaling in progress; {message}"),
+                None => "cluster scaling in progress".to_string(),
+            };
+        } else if let Some(message) = deploy_error.or(volume_error) {
             cluster_row.phase = "degraded".to_string();
             cluster_row.status_message = message;
         } else {
@@ -14484,38 +14523,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(internal_db)?
             .ok_or_else(|| Status::not_found(format!("cluster {} not found", req.name)))?;
 
-        // Add new nodes
-        for node in &req.add_nodes {
-            let node_row = crate::db::KubernetesClusterNodeRow {
-                cluster_name: req.name.clone(),
-                node_id: node.node_id.clone(),
-                role: node.role.clone(),
-                advertise_address: node.advertise_address.clone(),
-                iface: node.iface.clone(),
-                initial_cluster: false,
-                join_existing: true,
-                kubelet_ready: false,
+        let changed =
+            self.stage_kubernetes_membership(&req.name, &req.add_nodes, &req.remove_node_ids)?;
+        if changed {
+            let cluster_row = crate::db::KubernetesClusterRow {
+                generation: existing.generation + 1,
+                phase: "scaling".to_string(),
+                status_message: "cluster scaling in progress".to_string(),
+                ..existing
             };
             self.db
-                .upsert_kubernetes_cluster_node(&node_row)
+                .upsert_kubernetes_cluster(&cluster_row)
                 .map_err(internal_db)?;
         }
-
-        // Remove nodes - would need drain logic here
-        for node_id in &req.remove_node_ids {
-            info!(cluster = %req.name, node = %node_id, "removing node from cluster");
-        }
-
-        // Update generation
-        let cluster_row = crate::db::KubernetesClusterRow {
-            generation: existing.generation + 1,
-            phase: "scaling".to_string(),
-            status_message: "cluster scaling in progress".to_string(),
-            ..existing
-        };
-        self.db
-            .upsert_kubernetes_cluster(&cluster_row)
-            .map_err(internal_db)?;
 
         let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
         Ok(Response::new(
@@ -14633,6 +14653,141 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
 // Helper methods for Kubernetes cluster management
 impl ControllerService {
+    fn stage_kubernetes_membership(
+        &self,
+        cluster_name: &str,
+        add_nodes: &[controller_proto::KubernetesNodeSpec],
+        remove_node_ids: &[String],
+    ) -> Result<bool, Status> {
+        let current = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)
+            .map_err(internal_db)?;
+        for node in add_nodes {
+            if node.role != "control-plane" && node.role != "worker" {
+                return Err(Status::invalid_argument(format!(
+                    "node {} role must be control-plane or worker",
+                    node.node_id
+                )));
+            }
+            match self.db.get_node(&node.node_id).map_err(internal_db)? {
+                None => {
+                    let message = format!("node {} is not an approved kcore node", node.node_id);
+                    self.db
+                        .set_kubernetes_cluster_status(cluster_name, "scaling", &message)
+                        .map_err(internal_db)?;
+                    return Err(Status::failed_precondition(message));
+                }
+                Some(row) if row.approval_status != "approved" => {
+                    let message = format!("node {} is not an approved kcore node", node.node_id);
+                    self.db
+                        .set_kubernetes_cluster_status(cluster_name, "scaling", &message)
+                        .map_err(internal_db)?;
+                    return Err(Status::failed_precondition(message));
+                }
+                Some(_) => {}
+            }
+        }
+        let snapshots: Vec<crate::kubernetes_lifecycle::MemberSnapshot> = current
+            .iter()
+            .map(|row| crate::kubernetes_lifecycle::MemberSnapshot {
+                node_id: row.node_id.clone(),
+                role: row.role.clone(),
+                pending_join: row.pending_join,
+                pending_removal: row.pending_removal,
+                kubelet_ready: row.kubelet_ready,
+                kcore_exists: true,
+                kcore_ready: true,
+                in_etcd: row.role != "worker" && !row.pending_join,
+                etcd_healthy: row.role != "worker" && !row.pending_join,
+                in_api: row.kubelet_ready,
+                api_ready: row.kubelet_ready,
+                registered_name: row.k8s_node_name.clone(),
+            })
+            .collect();
+        for node_id in remove_node_ids {
+            if let Some(message) =
+                crate::kubernetes_lifecycle::etcd_removal_refusal(&snapshots, node_id)
+            {
+                return Err(Status::failed_precondition(message));
+            }
+        }
+
+        let mut changed = false;
+        for node in add_nodes {
+            if let Some(existing) = current.iter().find(|row| row.node_id == node.node_id) {
+                if crate::kubernetes_lifecycle::scale_add_noop(
+                    &crate::kubernetes_lifecycle::MemberSnapshot {
+                        node_id: existing.node_id.clone(),
+                        role: existing.role.clone(),
+                        pending_join: existing.pending_join,
+                        pending_removal: existing.pending_removal,
+                        kubelet_ready: existing.kubelet_ready,
+                        kcore_exists: true,
+                        kcore_ready: true,
+                        in_etcd: existing.role != "worker",
+                        etcd_healthy: existing.role != "worker",
+                        in_api: existing.kubelet_ready,
+                        api_ready: existing.kubelet_ready,
+                        registered_name: existing.k8s_node_name.clone(),
+                    },
+                ) {
+                    continue;
+                }
+            }
+            let kcore = self
+                .db
+                .get_node(&node.node_id)
+                .map_err(internal_db)?
+                .ok_or_else(|| Status::failed_precondition("node disappeared"))?;
+            if kcore.status != "ready" {
+                self.db
+                    .set_kubernetes_cluster_status(
+                        cluster_name,
+                        "scaling",
+                        &format!("node {} is not ready", node.node_id),
+                    )
+                    .map_err(internal_db)?;
+            }
+            self.db
+                .upsert_kubernetes_cluster_node(&crate::db::KubernetesClusterNodeRow {
+                    cluster_name: cluster_name.to_string(),
+                    node_id: node.node_id.clone(),
+                    role: node.role.clone(),
+                    advertise_address: node.advertise_address.clone(),
+                    iface: node.iface.clone(),
+                    initial_cluster: false,
+                    join_existing: true,
+                    kubelet_ready: false,
+                    pending_join: true,
+                    pending_removal: false,
+                    k8s_node_name: current
+                        .iter()
+                        .find(|row| row.node_id == node.node_id)
+                        .map(|row| row.k8s_node_name.clone())
+                        .unwrap_or_default(),
+                })
+                .map_err(internal_db)?;
+            changed = true;
+        }
+        for node_id in remove_node_ids {
+            let Some(existing) = current.iter().find(|row| row.node_id == *node_id) else {
+                continue;
+            };
+            if existing.pending_removal {
+                changed = true;
+                continue;
+            }
+            let mut row = existing.clone();
+            row.pending_removal = true;
+            self.db
+                .upsert_kubernetes_cluster_node(&row)
+                .map_err(internal_db)?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     fn kubernetes_members(
         spec: &controller_proto::KubernetesClusterSpec,
     ) -> std::collections::BTreeSet<String> {

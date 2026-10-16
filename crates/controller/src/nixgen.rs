@@ -1740,6 +1740,7 @@ mod kubernetes_tests {
             iface: "enp6s0".to_string(),
             initial_cluster: true,
             role: "control-plane".to_string(),
+            kubelet_kubeconfig: String::new(),
         };
         let peer = "-----BEGIN CERTIFICATE-----\nMIIBPEER\n-----END CERTIFICATE-----\n".to_string();
         let server =
@@ -1830,6 +1831,7 @@ mod kubernetes_tests {
             iface: "br0".to_string(),
             initial_cluster: true,
             role: "control-plane".to_string(),
+            kubelet_kubeconfig: String::new(),
         };
         let pki = KubernetesPki {
             ca_cert: "CA".to_string(),
@@ -1953,6 +1955,7 @@ mod kubernetes_tests {
                 iface: "enp6s0".into(),
                 initial_cluster: false,
                 role: "worker".into(),
+                kubelet_kubeconfig: String::new(),
             },
             ClusterNode {
                 node_id: "a".into(),
@@ -1961,6 +1964,7 @@ mod kubernetes_tests {
                 iface: String::new(),
                 initial_cluster: true,
                 role: "control-plane".into(),
+                kubelet_kubeconfig: String::new(),
             },
             ClusterNode {
                 node_id: "c".into(),
@@ -1969,6 +1973,7 @@ mod kubernetes_tests {
                 iface: "eth0".into(),
                 initial_cluster: false,
                 role: "worker".into(),
+                kubelet_kubeconfig: String::new(),
             },
         ];
         assert_eq!(
@@ -2143,7 +2148,7 @@ pub fn generate_kubernetes_member(
             node.iface.clone()
         },
         api_server_endpoint: api_endpoint_for_nix(&settings.api_server_endpoint, &node.ip_address),
-        initial_cluster: true, // Every member starts together on a new static cluster
+        initial_cluster: node.initial_cluster,
         etcd_initial_cluster,
         cni: "cilium".to_string(),
         cilium_mode: if settings.cilium_mode.is_empty() {
@@ -2218,6 +2223,7 @@ pub fn generate_kubernetes_member(
         ("etcdPeerCrt", etcd_peer_cert),
         ("etcdPeerKey", etcd_peer_key),
         ("kubeconfigData", pki.admin_kubeconfig.as_str()),
+        ("kubeletKubeconfigData", node.kubelet_kubeconfig.as_str()),
     ] {
         nix.push_str(&format!("    {name} = {};\n", nix_multiline(value)));
     }

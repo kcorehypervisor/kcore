@@ -349,6 +349,75 @@ users:
     Ok(kubeconfig)
 }
 
+/// Issue a kubelet client certificate for a node joining an existing cluster,
+/// and the etcd server and peer certificates that node's Nix module expects.
+/// The stored CA and admin kubeconfig are left as they are.
+pub fn issue_node_certificates(
+    pki: &mut KubernetesPki,
+    cluster_name: &str,
+    api_endpoint: &str,
+    node: &NodeInfo,
+) -> Result<String> {
+    if !pki.etcd_node_certs.contains_key(&node.node_id)
+        || !pki.etcd_node_peer_certs.contains_key(&node.node_id)
+    {
+        let (etcd_server, etcd_peer) = etcd_certs_for_node(pki, node)?;
+        pki.etcd_node_certs
+            .insert(node.node_id.clone(), etcd_server);
+        pki.etcd_node_peer_certs
+            .insert(node.node_id.clone(), etcd_peer);
+    }
+    let (cert, key) = generate_client_cert(
+        &format!("system:node:{}", node.hostname),
+        "system:nodes",
+        &pki.ca_cert,
+        &pki.ca_key,
+        365,
+    )?;
+    let server = if api_endpoint.starts_with("https://") || api_endpoint.starts_with("http://") {
+        api_endpoint.to_string()
+    } else {
+        format!("https://{api_endpoint}")
+    };
+    generate_kubeconfig(
+        cluster_name,
+        &server,
+        &pki.ca_cert,
+        &cert,
+        &key,
+        &format!("system:node:{}", node.hostname),
+    )
+}
+
+fn etcd_certs_for_node(
+    pki: &KubernetesPki,
+    node: &NodeInfo,
+) -> Result<((String, String), (String, String))> {
+    let sans = vec![
+        SanType::DnsName(node.hostname.as_str().try_into().unwrap()),
+        SanType::DnsName("localhost".try_into().unwrap()),
+        SanType::IpAddress(node.ip_address.parse().context("invalid node IP")?),
+        SanType::IpAddress("127.0.0.1".parse().unwrap()),
+    ];
+    let server = generate_server_cert(
+        &node.hostname,
+        "etcd",
+        &sans,
+        &pki.etcd_ca_cert,
+        &pki.etcd_ca_key,
+        365,
+    )?;
+    let peer = generate_server_cert(
+        &node.hostname,
+        "etcd",
+        &sans,
+        &pki.etcd_ca_cert,
+        &pki.etcd_ca_key,
+        365,
+    )?;
+    Ok((server, peer))
+}
+
 fn parse_first_ip(cidr: &str) -> Result<String> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {

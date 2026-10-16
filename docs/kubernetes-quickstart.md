@@ -237,29 +237,21 @@ ssh node-107 'sudo systemctl start kube-apiserver'
 
 ### Scale Cluster (Add Worker)
 
-Edit `lab-cluster.yaml`, add to `workers.nodes`:
+The worker must already be an approved kcore node. `kctl kubernetes scale` joins it. Applying a manifest whose membership differs from the cluster scales that difference. A node added after the first create uses `initial-cluster-state=existing` and does not bootstrap etcd again. Workers do not join etcd.
 
-```yaml
-  - nodeId: worker-4
-    advertiseAddress: 192.168.40.108
-    iface: enp6s0
-```
-
-Then:
 ```bash
-kctl kubernetes plan -f lab-cluster.yaml   # Shows "add worker-4"
-kctl kubernetes apply -f lab-cluster.yaml
+kctl kubernetes scale lab --add-workers node-108:192.168.40.108
+kctl kubernetes scale lab --remove node-108
 ```
+
+`--remove` cordons and drains the node, then deletes it from the API. A control-plane node leaves the etcd member list first. The command refuses a removal that would drop etcd below quorum, and it refuses to remove the last control-plane node.
 
 ### Drain Node for Maintenance
 
+A host generation update cordons and drains a Kubernetes member before the new NixOS generation is activated, one member at a time, then uncordons it after the node is Ready on that generation. A drain that does not finish within 300s does not activate the generation. Nodes that are not members of a cluster are updated without a cordon. `drainVms` is only the virtual-machine flag.
+
 ```bash
-ssh node-105
-kubectl drain worker-2 --ignore-daemonsets --delete-emptydir-data
-
-# Perform maintenance on worker-2
-
-kubectl uncordon worker-2
+kctl update cluster apply -f cluster-update.yaml
 ```
 
 ### Update Cluster (e.g., Change MTU)

@@ -364,6 +364,13 @@ ALTER TABLE volumes DROP COLUMN mount_point;",
         sql: "",
         irreversible: false,
     },
+    SchemaDown {
+        version: 60,
+        sql: "ALTER TABLE kubernetes_cluster_nodes DROP COLUMN pending_join;
+ALTER TABLE kubernetes_cluster_nodes DROP COLUMN pending_removal;
+ALTER TABLE kubernetes_cluster_nodes DROP COLUMN k8s_node_name;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

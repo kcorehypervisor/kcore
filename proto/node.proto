@@ -223,6 +223,9 @@ service NodeAdmin {
   rpc ApplyRawKubernetesConfig(ApplyRawKubernetesConfigRequest) returns (ApplyKubernetesConfigResponse);
   rpc GetKubernetesStatus(GetKubernetesStatusRequest) returns (GetKubernetesStatusResponse);
   rpc DrainKubernetesNode(DrainKubernetesNodeRequest) returns (DrainKubernetesNodeResponse);
+  // Read /etc/kubernetes/admin.conf on this node and call the Kubernetes API.
+  // The controller uses this instead of running kubectl.
+  rpc KubernetesAdmin(KubernetesAdminRequest) returns (KubernetesAdminResponse);
 }
 
 // VM specification
@@ -1586,4 +1589,17 @@ message DrainKubernetesNodeRequest {
 message DrainKubernetesNodeResponse {
   string status = 1;
   string message = 2;
+}
+
+message KubernetesAdminRequest {
+  string method = 1;
+  string path = 2;
+  string body = 3;
+  string content_type = 4;
+}
+
+message KubernetesAdminResponse {
+  int32 status_code = 1;
+  string body = 2;
+  string message = 3;
 }

@@ -2,6 +2,7 @@ mod admin;
 mod compute;
 mod container;
 mod info;
+mod kubernetes_api;
 mod storage;
 
 pub use admin::AdminService;

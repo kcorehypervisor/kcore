@@ -4220,6 +4220,29 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             Err(Status::internal(format!("drain failed: {}", stderr)))
         }
     }
+
+    async fn kubernetes_admin(
+        &self,
+        request: Request<proto::KubernetesAdminRequest>,
+    ) -> Result<Response<proto::KubernetesAdminResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        match super::kubernetes_api::call_admin_conf(
+            &req.method,
+            &req.path,
+            &req.body,
+            &req.content_type,
+        )
+        .await
+        {
+            Ok((status_code, body)) => Ok(Response::new(proto::KubernetesAdminResponse {
+                status_code,
+                body,
+                message: String::new(),
+            })),
+            Err(err) => Err(Status::internal(format!("{err:#}"))),
+        }
+    }
 }
 
 // Helper methods for Kubernetes operations
