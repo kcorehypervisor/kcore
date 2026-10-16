@@ -1921,6 +1921,22 @@ impl ControllerService {
         Err("no healthy CephCluster member is registered".into())
     }
 
+    /// Node that should run snapshot/expose for this volume (host node for
+    /// LVM/ZFS, any healthy Ceph member for RBD).
+    async fn resolve_snapshot_node(&self, vol: &VolumeRow) -> Result<NodeRow, String> {
+        let preferred = crate::volume_export::snapshot_node_id(vol)?;
+        if preferred.is_empty() {
+            return self.pick_healthy_ceph_node().await;
+        }
+        let node = self
+            .db
+            .get_node(&preferred)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("node '{preferred}' not found"))?;
+        crate::volume_export::node_ready(&node)?;
+        Ok(node)
+    }
+
     fn vm_operation_to_proto(row: &VmOperationRow) -> controller_proto::VmOperation {
         controller_proto::VmOperation {
             id: row.id.clone(),
@@ -10810,6 +10826,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     parent_handle: format!("{}/{}", parent_vol.pool, parent_vol.image),
                     parent_snapshot: snap.rbd_snap.clone(),
                     child_image: row.image.clone(),
+                    storage_class: crate::volume_export::storage_class_for(&parent_vol),
                 })
                 .await
                 .map_err(|e| Status::internal(format!("cloning RBD volume: {e}")))?;
@@ -11248,13 +11265,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateVolumeSnapshotRequest>,
     ) -> Result<Response<controller_proto::CreateVolumeSnapshotResponse>, Status> {
-        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let vol = self
             .resolve_volume_row(req.volume.trim())?
             .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume)))?;
-        crate::host_volume::require_ceph(&vol.storage_class, "snapshot")
+        crate::host_volume::require_snapshotable(&vol.storage_class, "snapshot")
             .map_err(Status::failed_precondition)?;
         if !vol.vm_id.is_empty() {
             if let Ok(Some(open)) = self.db.get_open_vm_operation(&vol.vm_id) {
@@ -11307,7 +11324,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
         let rbd_snap = VolumeRow::serial_from_id(&Uuid::new_v4().to_string());
         let node = self
-            .pick_healthy_ceph_node()
+            .resolve_snapshot_node(&vol)
             .await
             .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
@@ -11316,15 +11333,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut storage = self
             .clients
             .get_storage(&node.address)
-            .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+            .ok_or_else(|| Status::unavailable("storage client unavailable"))?;
+        let storage_class = crate::volume_export::storage_class_for(&vol);
         let snap_result = storage
             .snapshot_volume(node_proto::SnapshotVolumeRequest {
-                backend_handle: format!("{}/{}", vol.pool, vol.image),
+                backend_handle: crate::volume_export::backend_handle_for(&vol),
                 snapshot_name: rbd_snap.clone(),
                 protect: true,
+                storage_class,
             })
             .await
-            .map_err(|e| Status::internal(format!("rbd snap create: {e}")));
+            .map_err(|e| Status::internal(format!("snap create: {e}")));
         if guest_frozen {
             if let Some(ref vm_row) = vm_for_quiesce {
                 if let Err(unfreeze_err) = self.guest_fs_freeze_for_vm(vm_row, false).await {
@@ -11410,7 +11429,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteVolumeSnapshotRequest>,
     ) -> Result<Response<controller_proto::DeleteVolumeSnapshotResponse>, Status> {
-        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
         let actor = Self::audit_actor(&request);
         let key = request.into_inner().name.trim().to_string();
         let snap = self
@@ -11438,7 +11457,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::failed_precondition("parent volume missing"))?;
         let node = self
-            .pick_healthy_ceph_node()
+            .resolve_snapshot_node(&vol)
             .await
             .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
@@ -11447,12 +11466,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
         if let Some(mut storage) = self.clients.get_storage(&node.address) {
             storage
                 .delete_volume_snapshot(node_proto::DeleteVolumeSnapshotRequest {
-                    backend_handle: format!("{}/{}", vol.pool, vol.image),
+                    backend_handle: crate::volume_export::backend_handle_for(&vol),
                     snapshot_name: snap.rbd_snap.clone(),
                     unprotect: snap.protected,
+                    storage_class: crate::volume_export::storage_class_for(&vol),
                 })
                 .await
-                .map_err(|e| Status::internal(format!("rbd snap rm: {e}")))?;
+                .map_err(|e| Status::internal(format!("snap rm: {e}")))?;
         }
         self.db
             .delete_volume_snapshot(&snap.id)
@@ -11485,7 +11505,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut vol = self
             .resolve_volume_row(req.volume.trim())?
             .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume)))?;
-        crate::host_volume::require_ceph(&vol.storage_class, "restore")
+        crate::host_volume::require_snapshotable(&vol.storage_class, "restore")
             .map_err(Status::failed_precondition)?;
         let snap = self
             .db
@@ -11514,14 +11534,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::failed_precondition("VM node missing"))?;
             // Unmap via cold release so rbd rollback has no watchers.
-            self.cold_release_ceph_vm(&vm, &node).await?;
+            if crate::host_volume::normalized_storage_class(&vol.storage_class) == "ceph" {
+                self.cold_release_ceph_vm(&vm, &node).await?;
+            }
         } else if vol.attach_state != VolumeRow::ATTACH_DETACHED {
             return Err(Status::failed_precondition(
                 "volume must be detached (or its VM stopped) before in-place restore",
             ));
         }
         let node = self
-            .pick_healthy_ceph_node()
+            .resolve_snapshot_node(&vol)
             .await
             .map_err(Status::failed_precondition)?;
         if self.clients.get_storage(&node.address).is_none() {
@@ -11530,14 +11552,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut storage = self
             .clients
             .get_storage(&node.address)
-            .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+            .ok_or_else(|| Status::unavailable("storage client unavailable"))?;
         storage
             .rollback_volume(node_proto::RollbackVolumeRequest {
-                backend_handle: format!("{}/{}", vol.pool, vol.image),
+                backend_handle: crate::volume_export::backend_handle_for(&vol),
                 snapshot_name: snap.rbd_snap.clone(),
+                storage_class: crate::volume_export::storage_class_for(&vol),
             })
             .await
-            .map_err(|e| Status::internal(format!("rbd snap rollback: {e}")))?;
+            .map_err(|e| Status::internal(format!("snap rollback: {e}")))?;
         vol.generation += 1;
         self.db
             .upsert_volume(&vol)
@@ -11602,6 +11625,351 @@ impl controller_proto::controller_server::Controller for ControllerService {
             success: true,
             message: format!("flattened volume '{}'", vol.name),
         }))
+    }
+
+    async fn expose_volume_snapshot(
+        &self,
+        request: Request<controller_proto::ExposeVolumeSnapshotRequest>,
+    ) -> Result<Response<controller_proto::ExposeVolumeSnapshotResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let req = request.into_inner();
+        let vol = self
+            .resolve_volume_row(req.volume_name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume_name)))?;
+        crate::host_volume::require_snapshotable(&vol.storage_class, "expose")
+            .map_err(Status::failed_precondition)?;
+        let snap = self
+            .db
+            .get_volume_snapshot_by_name(req.snapshot_name.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::not_found(format!("snapshot '{}' not found", req.snapshot_name))
+            })?;
+        if snap.volume_id != vol.id {
+            return Err(Status::invalid_argument(
+                "snapshot does not belong to this volume",
+            ));
+        }
+        let node = self
+            .resolve_snapshot_node(&vol)
+            .await
+            .map_err(Status::failed_precondition)?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("storage client unavailable"))?;
+        let exposed = storage
+            .expose_snapshot(node_proto::ExposeSnapshotRequest {
+                backend_handle: crate::volume_export::backend_handle_for(&vol),
+                snapshot_name: snap.rbd_snap.clone(),
+                storage_class: crate::volume_export::storage_class_for(&vol),
+                lease_seconds: req.lease_seconds,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("expose snapshot: {e}")))?
+            .into_inner();
+        crate::volume_export::global_export_leases().insert(crate::volume_export::ExportLease {
+            lease_id: exposed.lease_id.clone(),
+            node_id: node.id.clone(),
+            node_address: node.address.clone(),
+            volume_name: vol.name.clone(),
+            snapshot_name: snap.name.clone(),
+            device_path: exposed.device_path.clone(),
+            size_bytes: exposed.size_bytes,
+            block_size: exposed.block_size,
+            expires_at: std::time::Instant::now()
+                + crate::volume_export::lease_ttl(req.lease_seconds),
+        });
+        Ok(Response::new(
+            controller_proto::ExposeVolumeSnapshotResponse {
+                lease_id: exposed.lease_id,
+                node_id: node.id,
+                node_address: node.address,
+                device_path: exposed.device_path,
+                size_bytes: exposed.size_bytes,
+                block_size: exposed.block_size,
+            },
+        ))
+    }
+
+    async fn unexpose_volume_snapshot(
+        &self,
+        request: Request<controller_proto::UnexposeVolumeSnapshotRequest>,
+    ) -> Result<Response<controller_proto::UnexposeVolumeSnapshotResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let lease_id = request.into_inner().lease_id;
+        let lease = crate::volume_export::global_export_leases()
+            .remove(&lease_id)
+            .ok_or_else(|| Status::not_found(format!("lease '{lease_id}' not found")))?;
+        if self.clients.get_storage(&lease.node_address).is_none() {
+            let _ = self.clients.connect(&lease.node_address).await;
+        }
+        if let Some(mut storage) = self.clients.get_storage(&lease.node_address) {
+            storage
+                .unexpose_snapshot(node_proto::UnexposeSnapshotRequest {
+                    lease_id: lease.lease_id,
+                })
+                .await
+                .map_err(|e| Status::internal(format!("unexpose snapshot: {e}")))?;
+        }
+        Ok(Response::new(
+            controller_proto::UnexposeVolumeSnapshotResponse {},
+        ))
+    }
+
+    async fn list_volume_changed_extents(
+        &self,
+        request: Request<controller_proto::ListVolumeChangedExtentsRequest>,
+    ) -> Result<Response<controller_proto::ListVolumeChangedExtentsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let req = request.into_inner();
+        let vol = self
+            .resolve_volume_row(req.volume_name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume_name)))?;
+        crate::host_volume::require_snapshotable(&vol.storage_class, "list changed extents")
+            .map_err(Status::failed_precondition)?;
+        let to = self
+            .db
+            .get_volume_snapshot_by_name(req.to_snapshot.trim())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::not_found(format!("snapshot '{}' not found", req.to_snapshot))
+            })?;
+        if to.volume_id != vol.id {
+            return Err(Status::invalid_argument(
+                "to_snapshot does not belong to this volume",
+            ));
+        }
+        let from_backend = if req.from_snapshot.trim().is_empty() {
+            String::new()
+        } else {
+            let from = self
+                .db
+                .get_volume_snapshot_by_name(req.from_snapshot.trim())
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| {
+                    Status::not_found(format!("snapshot '{}' not found", req.from_snapshot))
+                })?;
+            if from.volume_id != vol.id {
+                return Err(Status::invalid_argument(
+                    "from_snapshot does not belong to this volume",
+                ));
+            }
+            from.rbd_snap
+        };
+        let node = self
+            .resolve_snapshot_node(&vol)
+            .await
+            .map_err(Status::failed_precondition)?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("storage client unavailable"))?;
+        let resp = storage
+            .list_changed_extents(node_proto::ListChangedExtentsRequest {
+                backend_handle: crate::volume_export::backend_handle_for(&vol),
+                storage_class: crate::volume_export::storage_class_for(&vol),
+                from_snapshot: from_backend,
+                to_snapshot: to.rbd_snap,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("list changed extents: {e}")))?
+            .into_inner();
+        Ok(Response::new(
+            controller_proto::ListVolumeChangedExtentsResponse {
+                extents: resp
+                    .extents
+                    .into_iter()
+                    .map(|e| controller_proto::VolumeExtent {
+                        offset: e.offset,
+                        length: e.length,
+                    })
+                    .collect(),
+                supported: resp.supported,
+                source: resp.source,
+            },
+        ))
+    }
+
+    type ReadVolumeBlocksStream =
+        Pin<Box<dyn Stream<Item = Result<controller_proto::VolumeBlock, Status>> + Send>>;
+
+    async fn read_volume_blocks(
+        &self,
+        request: Request<controller_proto::ReadVolumeBlocksRequest>,
+    ) -> Result<Response<Self::ReadVolumeBlocksStream>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let req = request.into_inner();
+        let lease = crate::volume_export::global_export_leases()
+            .get(&req.lease_id)
+            .ok_or_else(|| Status::not_found(format!("lease '{}' not found", req.lease_id)))?;
+        if self.clients.get_storage(&lease.node_address).is_none() {
+            let _ = self.clients.connect(&lease.node_address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&lease.node_address)
+            .ok_or_else(|| Status::unavailable("storage client unavailable"))?;
+        let node_stream = storage
+            .read_volume_extents(node_proto::ReadVolumeExtentsRequest {
+                lease_id: req.lease_id,
+                extents: req
+                    .extents
+                    .into_iter()
+                    .map(|e| node_proto::Extent {
+                        offset: e.offset,
+                        length: e.length,
+                    })
+                    .collect(),
+                block_size: req.block_size,
+                elide_zero_blocks: req.elide_zero_blocks,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("read volume blocks: {e}")))?
+            .into_inner();
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let mut stream = node_stream;
+            while let Ok(Some(block)) = stream.message().await {
+                let mapped = controller_proto::VolumeBlock {
+                    offset: block.offset,
+                    body: match block.body {
+                        Some(node_proto::volume_block::Body::Data(d)) => {
+                            Some(controller_proto::volume_block::Body::Data(d))
+                        }
+                        Some(node_proto::volume_block::Body::ZeroLength(n)) => {
+                            Some(controller_proto::volume_block::Body::ZeroLength(n))
+                        }
+                        None => None,
+                    },
+                };
+                if tx.send(Ok(mapped)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let out: Self::ReadVolumeBlocksStream = Box::pin(ReceiverStream::new(rx));
+        Ok(Response::new(out))
+    }
+
+    async fn write_volume_blocks(
+        &self,
+        request: Request<tonic::Streaming<controller_proto::WriteVolumeBlocksRequest>>,
+    ) -> Result<Response<controller_proto::WriteVolumeBlocksResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("write stream is empty"))?;
+        let target = match first.msg {
+            Some(controller_proto::write_volume_blocks_request::Msg::Target(t)) => t,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first write message must set target",
+                ));
+            }
+        };
+        let vol = self
+            .resolve_volume_row(target.volume_name.trim())?
+            .ok_or_else(|| {
+                Status::not_found(format!("volume '{}' not found", target.volume_name))
+            })?;
+        if vol.is_attached() {
+            return Err(Status::failed_precondition(
+                "volume must be detached before WriteVolumeBlocks",
+            ));
+        }
+        let node = self
+            .resolve_snapshot_node(&vol)
+            .await
+            .map_err(Status::failed_precondition)?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self
+            .clients
+            .get_storage(&node.address)
+            .ok_or_else(|| Status::unavailable("storage client unavailable"))?;
+        let (tx, rx) = mpsc::channel(8);
+        let backend_handle = crate::volume_export::backend_handle_for(&vol);
+        let storage_class = crate::volume_export::storage_class_for(&vol);
+        let punch = target.punch_zero_runs;
+        tx.send(node_proto::WriteVolumeExtentsRequest {
+            msg: Some(node_proto::write_volume_extents_request::Msg::Target(
+                node_proto::WriteVolumeTarget {
+                    backend_handle,
+                    storage_class,
+                    punch_zero_runs: punch,
+                },
+            )),
+        })
+        .await
+        .map_err(|_| Status::internal("failed to queue write target"))?;
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = inbound.message().await {
+                let block = match msg.msg {
+                    Some(controller_proto::write_volume_blocks_request::Msg::Block(b)) => b,
+                    _ => continue,
+                };
+                let mapped = node_proto::WriteVolumeExtentsRequest {
+                    msg: Some(node_proto::write_volume_extents_request::Msg::Block(
+                        node_proto::VolumeBlock {
+                            offset: block.offset,
+                            body: match block.body {
+                                Some(controller_proto::volume_block::Body::Data(d)) => {
+                                    Some(node_proto::volume_block::Body::Data(d))
+                                }
+                                Some(controller_proto::volume_block::Body::ZeroLength(n)) => {
+                                    Some(node_proto::volume_block::Body::ZeroLength(n))
+                                }
+                                None => None,
+                            },
+                        },
+                    )),
+                };
+                if tx.send(mapped).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let outbound = ReceiverStream::new(rx);
+        let resp = storage
+            .write_volume_extents(outbound)
+            .await
+            .map_err(|e| Status::internal(format!("write volume blocks: {e}")))?
+            .into_inner();
+        Ok(Response::new(controller_proto::WriteVolumeBlocksResponse {
+            bytes_written: resp.bytes_written,
+            blocks_written: resp.blocks_written,
+            zero_runs: resp.zero_runs,
+        }))
+    }
+
+    async fn freeze_vm_filesystems(
+        &self,
+        request: Request<controller_proto::FreezeVmFilesystemsRequest>,
+    ) -> Result<Response<controller_proto::FreezeVmFilesystemsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let req = request.into_inner();
+        let vm = self.resolve_vm(req.vm_name.trim())?;
+        self.guest_fs_freeze_for_vm(&vm, req.freeze).await?;
+        Ok(Response::new(
+            controller_proto::FreezeVmFilesystemsResponse {
+                success: true,
+                message: if req.freeze {
+                    "frozen".into()
+                } else {
+                    "thawed".into()
+                },
+            },
+        ))
     }
 
     async fn encrypt_volume(
@@ -15173,6 +15541,7 @@ fn operator_role_kind_to_auth(kind: i32) -> Result<OperatorRole, Status> {
         .unwrap_or(controller_proto::OperatorRoleKind::Unspecified);
     match k {
         controller_proto::OperatorRoleKind::ReadOnly => Ok(OperatorRole::ReadOnly),
+        controller_proto::OperatorRoleKind::BackupOperator => Ok(OperatorRole::BackupOperator),
         controller_proto::OperatorRoleKind::VmAdmin => Ok(OperatorRole::VmAdmin),
         controller_proto::OperatorRoleKind::ClusterAdmin => Ok(OperatorRole::ClusterAdmin),
         controller_proto::OperatorRoleKind::Unspecified => Err(Status::invalid_argument(
@@ -15187,6 +15556,9 @@ fn operator_roles_to_proto_kinds(roles: &[String]) -> Vec<i32> {
         .filter_map(|s| {
             OperatorRole::from_db_str(s).map(|r| match r {
                 OperatorRole::ReadOnly => controller_proto::OperatorRoleKind::ReadOnly as i32,
+                OperatorRole::BackupOperator => {
+                    controller_proto::OperatorRoleKind::BackupOperator as i32
+                }
                 OperatorRole::VmAdmin => controller_proto::OperatorRoleKind::VmAdmin as i32,
                 OperatorRole::ClusterAdmin => {
                     controller_proto::OperatorRoleKind::ClusterAdmin as i32

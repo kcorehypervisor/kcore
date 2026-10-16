@@ -33,6 +33,18 @@ blocks routine day-2 work, P2 is operational comfort.
 | **Pool tuning is fixed** | `kcore-vms` is created with `size`/`min_size` only; PG count is whatever `pg_autoscaler` picks, and there is no way to set a CRUSH rule (e.g. SSD-only), compression, or a second pool. | Pool spec in the manifest: `pools: [{name, size, minSize, crushRule, pgNum, compression}]`; `EnsureCephPool` becomes idempotent per pool. |
 | **Volume data movement between clusters** | One `CephCluster` per controller is the tested shape. A second SAN (or a rebuild) has no path to move images. | `rbd export | rbd import` through the controller with a resumable operation, or `rbd-mirror` configuration for a planned cutover. |
 
+## P1: backup and export
+
+Design and command sketches: [`backup.md`](./backup.md).
+
+| Gap | Why it matters | Shape of the fix |
+|-----|----------------|------------------|
+| **Guest data never leaves the cluster** | `kctl backup` copies the controller database only. Snapshots live in the same pool or on the same node as the volume, so a lost pool, a dead LVM/ZFS host, or an attacker with cluster-admin takes the copies with the data. | `NodeStorage.ExposeSnapshot` + `ReadVolumeExtents` behind a controller passthrough, surfaced as `kctl export volume --snapshot <s> -o file.raw` (sparse). The same hooks are what the kcore Vault service pulls from. |
+| **Snapshots are Ceph-only** | `require_ceph` rejects `zfs` and `lvm` volumes, so `SnapshotPolicy` and `kctl snapshot volume` do nothing for host-backed VMs, which are the common case on single-node and lab installs. | `zfs snapshot` + `zfs hold`, `lvcreate -s` (thin) in `storage/mod.rs` behind the existing `SnapshotVolume` RPC; drop the Ceph check in the controller. |
+| **No changed-block tracking** | Any export is a full read of the volume, which on a 1 TiB data disk is hours per run and most of it unchanged. | `ListChangedExtents` from `rbd diff`, `zstream dump` WRITE records, `thin_delta`; `--from-snapshot` on `kctl export` writes a sparse delta. |
+| **No way to write a volume from outside** | Restoring or moving a disk image in means `qemu-img convert` by hand on the node, with the VM's `storage_backend` and volume rows edited afterwards. | `WriteVolumeExtents` into a fresh unattached volume, surfaced as `kctl import volume -f file.raw`. Also the plumbing for the backend-conversion item above. |
+| **Backup tools need vm-admin** | The only roles are `read-only`, `vm-admin`, `cluster-admin`; a backup identity that can snapshot and read must also be able to delete every VM. | `backup-operator` role: read-only plus snapshot/expose/read/write and create-for-restore; deletes only for resources it labelled. |
+
 ## P2: visibility and comfort
 
 | Gap | Why it matters | Shape of the fix |

@@ -192,3 +192,155 @@ message DrainKubernetesNodeResponse {
 // - Verify Nix files are written correctly
 // - Verify nixos-rebuild is called
 // - Verify service status checks
+
+// ============================================================================
+// Volume snapshot export hooks - Protocol Buffer Definitions (sketch)
+// ============================================================================
+//
+// Design: docs/backup.md. These RPCs let any backup tool (and the kcore Vault
+// service) expose a snapshot read-only, learn which extents changed between
+// two snapshots, and stream blocks in and out. They are backend-neutral; the
+// node agent dispatches on the volume's storage class.
+//
+// Usage:
+// 1. Copy the RPC definitions to the NodeStorage service block
+// 2. Copy the message definitions to the end of node.proto
+// 3. Run: buf generate
+// 4. Verify: cargo check -p kcore-node-agent
+//
+// tonic tuning for the streaming RPCs (server and client):
+//   .initial_stream_window_size(16 << 20)
+//   .initial_connection_window_size(64 << 20)
+//   .max_decoding_message_size(8 << 20)
+//   .tcp_nodelay(true)
+// and build prost with `bytes = ["."]` so `data` fields decode to bytes::Bytes
+// without a copy. Without these a single stream stalls far below 10 GbE.
+
+// ============================================================================
+// RPCs - Add to NodeStorage service
+// ============================================================================
+
+// Existing SnapshotVolume / DeleteVolumeSnapshot / CloneVolume / RollbackVolume
+// gain zfs and lvm-thin implementations; backend_handle becomes
+// "pool/image" (ceph), "pool/dataset" (zfs) or "vg/lv" (lvm). No proto change.
+
+// Map a snapshot as a read-only block device for the life of a lease.
+rpc ExposeSnapshot(ExposeSnapshotRequest) returns (ExposeSnapshotResponse);
+rpc UnexposeSnapshot(UnexposeSnapshotRequest) returns (UnexposeSnapshotResponse);
+
+// Extents that differ between two snapshots of the same volume.
+rpc ListChangedExtents(ListChangedExtentsRequest) returns (ListChangedExtentsResponse);
+
+// Read the given extents of an exposed device in fixed, aligned blocks.
+rpc ReadVolumeExtents(ReadVolumeExtentsRequest) returns (stream VolumeBlock);
+
+// Write blocks into a fresh, unattached volume (restore / import).
+rpc WriteVolumeExtents(stream WriteVolumeExtentsRequest) returns (WriteVolumeExtentsResponse);
+
+// ============================================================================
+// Message Definitions - Add to end of node.proto
+// ============================================================================
+
+message ExposeSnapshotRequest {
+  string backend_handle = 1;     // pool/image | pool/dataset | vg/lv
+  string snapshot_name = 2;
+  string storage_class = 3;      // ceph | zfs | lvm (dispatch)
+  int32 lease_seconds = 4;       // auto-unexpose after idle; default 900, max 86400
+}
+
+message ExposeSnapshotResponse {
+  string lease_id = 1;
+  string device_path = 2;        // /dev/nbdN, /dev/zvol/pool/vol@snap, /dev/vg/lv_snap
+  int64 size_bytes = 3;
+  int32 block_size = 4;          // backend logical block size
+}
+
+message UnexposeSnapshotRequest {
+  string lease_id = 1;
+}
+
+message UnexposeSnapshotResponse {}
+
+message Extent {
+  int64 offset = 1;
+  int64 length = 2;
+}
+
+message ListChangedExtentsRequest {
+  string backend_handle = 1;
+  string storage_class = 2;
+  string from_snapshot = 3;      // empty = everything allocated in to_snapshot
+  string to_snapshot = 4;
+}
+
+message ListChangedExtentsResponse {
+  // Sorted, non-overlapping. Empty with supported=false means the caller
+  // must read the whole device.
+  repeated Extent extents = 1;
+  bool supported = 2;            // false for lvm linear / filesystem
+  string source = 3;             // "rbd diff" | "zstream dump" | "thin_delta" | ""
+}
+
+message ReadVolumeExtentsRequest {
+  string lease_id = 1;           // from ExposeSnapshot
+  repeated Extent extents = 2;   // empty = whole device
+  int32 block_size = 3;          // fixed, aligned; default 4 MiB, max 8 MiB
+  bool elide_zero_blocks = 4;    // send ZeroRun instead of zero-filled data
+}
+
+message VolumeBlock {
+  int64 offset = 1;
+  oneof body {
+    bytes data = 2;              // exactly block_size bytes except the last block
+    int64 zero_length = 3;       // run of zeros starting at offset
+  }
+}
+
+message WriteVolumeExtentsRequest {
+  // First message sets target; later messages carry blocks only.
+  oneof msg {
+    WriteVolumeTarget target = 1;
+    VolumeBlock block = 2;
+  }
+}
+
+message WriteVolumeTarget {
+  string backend_handle = 1;     // must exist, must not be attached to a VM
+  string storage_class = 2;
+  bool punch_zero_runs = 3;      // fallocate PUNCH_HOLE / blkdiscard for zero runs
+}
+
+message WriteVolumeExtentsResponse {
+  int64 bytes_written = 1;
+  int64 blocks_written = 2;
+  int64 zero_runs = 3;
+}
+
+// ============================================================================
+// Node Agent Implementation Notes
+// ============================================================================
+
+// ExposeSnapshot
+//   ceph: rbd-nbd map --read-only pool/image@snap   (unmap on release)
+//   zfs:  zfs set snapdev=visible pool/vol; device /dev/zvol/pool/vol@snap
+//   lvm:  lvchange -ay -K vg/lv_snap; device /dev/vg/lv_snap (deactivate on release)
+// Leases live in an in-memory table keyed by lease_id with an idle deadline;
+// a ticker unexposes expired leases so a crashed client never pins a device.
+//
+// ListChangedExtents
+//   ceph: rbd diff --from-snap <A> --whole-object --format json pool/image@<B>
+//   zfs:  zfs send -i @<A> pool/vol@<B> | zstream dump -v, WRITE records on
+//         object 1 (offset, length); the stream is discarded after parsing
+//   lvm thin: dmsetup message <pool> 0 reserve_metadata_snap;
+//         thin_delta --snap1 <id A> --snap2 <id B> -m <metadata dev>;
+//         dmsetup message <pool> 0 release_metadata_snap
+// Parsers for all three are pure functions and get proptest coverage; the
+// argv builders follow the rbd_*_command_plan pattern in storage/mod.rs.
+//
+// ReadVolumeExtents
+//   open device O_RDONLY (O_DIRECT when aligned), read block_size at a time,
+//   detect all-zero blocks with a word-wide scan, coalesce into zero runs.
+//
+// WriteVolumeExtents
+//   refuse if the volume is attached (check VM units / rbd status / holders),
+//   write with O_DIRECT, punch holes for zero runs when supported, fsync at end.

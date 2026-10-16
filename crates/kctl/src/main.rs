@@ -216,6 +216,16 @@ enum Command {
         #[arg(short = 'o', long)]
         output: PathBuf,
     },
+    /// Export a volume snapshot to a sparse raw file
+    Export {
+        #[command(subcommand)]
+        resource: ExportResource,
+    },
+    /// Import a sparse raw file into a new (or existing) volume
+    Import {
+        #[command(subcommand)]
+        resource: ImportResource,
+    },
     /// Drain a node (migrate all VMs to other nodes)
     Drain {
         #[command(subcommand)]
@@ -959,6 +969,55 @@ enum EncryptResource {
     },
 }
 
+#[derive(Subcommand)]
+enum ExportResource {
+    /// Export a volume snapshot to a sparse raw image
+    Volume {
+        /// Volume id or name
+        name: String,
+        /// Snapshot name (VolumeSnapshotInfo.name)
+        #[arg(long)]
+        snapshot: String,
+        /// Optional older snapshot; only changed extents are written
+        #[arg(long = "from-snapshot")]
+        from_snapshot: Option<String>,
+        /// Output path for the sparse raw file
+        #[arg(short = 'o', long)]
+        output: PathBuf,
+        /// Transfer block size in bytes (default 4 MiB)
+        #[arg(long = "block-size", default_value_t = 4 * 1024 * 1024)]
+        block_size: i32,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportResource {
+    /// Import a sparse raw image into a volume
+    Volume {
+        /// Input sparse raw file
+        #[arg(short = 'f', long)]
+        file: PathBuf,
+        /// New volume name (required unless --base is set)
+        #[arg(long)]
+        name: Option<String>,
+        /// Existing detached volume to overwrite instead of creating
+        #[arg(long)]
+        base: Option<String>,
+        /// Size in bytes for a new volume (default: file logical size)
+        #[arg(long = "size-bytes")]
+        size_bytes: Option<i64>,
+        /// ceph, lvm, or zfs
+        #[arg(long, default_value = "ceph")]
+        storage_class: String,
+        /// Node id (required for lvm/zfs)
+        #[arg(long)]
+        node: Option<String>,
+        /// Punch holes for zero runs where the backend supports it
+        #[arg(long, default_value_t = true)]
+        punch_zeros: bool,
+    },
+}
+
 #[derive(Clone, ValueEnum)]
 enum DesiredVmState {
     Running,
@@ -1436,6 +1495,8 @@ enum OperatorAction {
 pub enum OperatorRoleArg {
     #[value(name = "read-only")]
     ReadOnly,
+    #[value(name = "backup-operator")]
+    BackupOperator,
     #[value(name = "vm-admin")]
     VmAdmin,
     #[value(name = "cluster-admin")]
@@ -2179,6 +2240,52 @@ async fn main() {
         Command::Backup { output } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::cluster_ops::backup(&info, output).await
+        }
+        Command::Export {
+            resource:
+                ExportResource::Volume {
+                    name,
+                    snapshot,
+                    from_snapshot,
+                    output,
+                    block_size,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::export(
+                &info,
+                name,
+                snapshot,
+                from_snapshot.as_deref(),
+                output,
+                *block_size,
+            )
+            .await
+        }
+        Command::Import {
+            resource:
+                ImportResource::Volume {
+                    file,
+                    name,
+                    base,
+                    size_bytes,
+                    storage_class,
+                    node,
+                    punch_zeros,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::import(
+                &info,
+                file,
+                name.as_deref(),
+                base.as_deref(),
+                *size_bytes,
+                storage_class,
+                node.as_deref(),
+                *punch_zeros,
+            )
+            .await
         }
         Command::Flatten {
             resource: FlattenResource::Volume { name },

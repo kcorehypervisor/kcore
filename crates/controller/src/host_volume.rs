@@ -12,6 +12,34 @@ pub fn require_ceph(storage_class: &str, action: &str) -> Result<(), String> {
     }
 }
 
+/// Snapshot / expose / changed-extents are supported for Ceph, ZFS, and LVM.
+pub fn supports_snapshot(storage_class: &str) -> bool {
+    matches!(storage_class, "ceph" | "lvm" | "zfs" | "")
+}
+
+pub fn require_snapshotable(storage_class: &str, action: &str) -> Result<(), String> {
+    if supports_snapshot(storage_class) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{action} is only supported for ceph, zfs, or lvm volumes (got '{storage_class}')"
+        ))
+    }
+}
+
+/// Backend handle form expected by NodeStorage snapshot RPCs.
+pub fn snapshot_backend_handle(_storage_class: &str, pool: &str, image: &str) -> String {
+    format!("{pool}/{image}")
+}
+
+pub fn normalized_storage_class(storage_class: &str) -> &str {
+    if storage_class.is_empty() {
+        "ceph"
+    } else {
+        storage_class
+    }
+}
+
 pub fn device_path(storage_class: &str, pool: &str, image: &str) -> Result<String, String> {
     if !component_ok(pool) || !component_ok(image) {
         return Err("volume is missing its pool or image name".into());
@@ -76,5 +104,10 @@ mod tests {
         assert!(split_backend_handle("lvm", "/dev/vg_kcore/../sda").is_err());
         assert!(require_ceph("zfs", "snapshot").is_err());
         assert!(require_ceph("ceph", "snapshot").is_ok());
+        assert!(require_snapshotable("zfs", "snapshot").is_ok());
+        assert!(require_snapshotable("lvm", "snapshot").is_ok());
+        assert!(require_snapshotable("filesystem", "snapshot").is_err());
+        assert_eq!(normalized_storage_class(""), "ceph");
+        assert_eq!(snapshot_backend_handle("zfs", "tank0", "vol"), "tank0/vol");
     }
 }
