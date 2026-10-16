@@ -175,10 +175,7 @@ fn parse_http_response(bytes: &[u8]) -> Result<(i32, String)> {
 fn decode_chunked(body: &str) -> Result<String> {
     let mut rest = body;
     let mut out = String::new();
-    loop {
-        let Some((size_line, after)) = rest.split_once("\r\n") else {
-            break;
-        };
+    while let Some((size_line, after)) = rest.split_once("\r\n") {
         let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0"), 16)
             .map_err(|_| anyhow!("bad chunk size"))?;
         if size == 0 {
