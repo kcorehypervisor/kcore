@@ -37,6 +37,8 @@ time = "0.3"
 # verify-aws: CRL and OCSP signature verification through aws-lc-rs, not ring.
 x509-parser = { version = "0.18", features = ["verify-aws"] }
 anyhow = "1.0.102"
+base64 = "0.22.1"
+tokio-rustls = "0.26"
 libc = "0.2"
 tempfile = "3"
 

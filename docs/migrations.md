@@ -26,7 +26,7 @@ schema_version
 
 ## Current schema version
 
-**59**
+**60**
 
 `Database::migrate` applies each `up`. `Database::migrate_down(target)` applies
 the matching `down` from `crates/controller/src/schema_down.rs` and refuses a
@@ -34,9 +34,12 @@ version marked irreversible. Before an `up` from an older file, the controller
 writes a SQLite backup next to the database named
 `<db>.pre-migrate-<version>`. Version 57 adds `node_host_status`. Version 58
 has no schema change, so a database already stamped 58 still runs version 59
-and gains that table when it is missing. A controller built for version 56 can
-still open the file. A controlled rollback to 56 drops `node_host_status`
-before the old generation starts. Rolling back only to 57 keeps the table.
+and gains that table when it is missing. Version 60 adds `pending_join`,
+`pending_removal`, and `k8s_node_name` on `kubernetes_cluster_nodes`. A
+controller built for version 56 can still open the file. A controlled rollback
+to 56 drops `node_host_status` before the old generation starts. Rolling back
+only to 57 keeps the table. Rolling back from 60 drops the three membership
+columns.
 
 ## Current schema version (historical note)
 

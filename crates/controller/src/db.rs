@@ -368,6 +368,9 @@ pub struct KubernetesClusterNodeRow {
     pub initial_cluster: bool,
     pub join_existing: bool,
     pub kubelet_ready: bool,
+    pub pending_join: bool,
+    pub pending_removal: bool,
+    pub k8s_node_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -758,11 +761,13 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 59;
+pub const SCHEMA_VERSION: i32 = 60;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
-/// database already stamped 58 still receives that table.
+/// database already stamped 58 still receives that table. Version 60 adds
+/// membership columns with defaults. Older readers select the original columns
+/// and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
 const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
@@ -789,6 +794,9 @@ const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_c
                     initial_cluster INTEGER NOT NULL DEFAULT 0,
                     join_existing INTEGER NOT NULL DEFAULT 0,
                     kubelet_ready INTEGER NOT NULL DEFAULT 0,
+                    pending_join INTEGER NOT NULL DEFAULT 0,
+                    pending_removal INTEGER NOT NULL DEFAULT 0,
+                    k8s_node_name TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (cluster_name, node_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_cluster ON kubernetes_cluster_nodes(cluster_name);
@@ -1976,6 +1984,27 @@ impl Database {
         // table, so the version 57 block never ran. 59 creates it.
         if version < 59 {
             conn.execute_batch(NODE_HOST_STATUS_TABLE)?;
+        }
+
+        if version < 60 {
+            for column in [
+                "pending_join INTEGER NOT NULL DEFAULT 0",
+                "pending_removal INTEGER NOT NULL DEFAULT 0",
+                "k8s_node_name TEXT NOT NULL DEFAULT ''",
+            ] {
+                let name = column.split_whitespace().next().unwrap_or(column);
+                let has: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('kubernetes_cluster_nodes') WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if has == 0 {
+                    conn.execute(
+                        &format!("ALTER TABLE kubernetes_cluster_nodes ADD COLUMN {column}"),
+                        [],
+                    )?;
+                }
+            }
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -6851,15 +6880,22 @@ impl Database {
         conn.execute(
             "INSERT INTO kubernetes_cluster_nodes (
                 cluster_name, node_id, role, advertise_address, iface,
-                initial_cluster, join_existing, kubelet_ready
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                initial_cluster, join_existing, kubelet_ready,
+                pending_join, pending_removal, k8s_node_name
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(cluster_name, node_id) DO UPDATE SET
                 role=excluded.role,
                 advertise_address=excluded.advertise_address,
                 iface=excluded.iface,
                 initial_cluster=excluded.initial_cluster,
                 join_existing=excluded.join_existing,
-                kubelet_ready=excluded.kubelet_ready",
+                kubelet_ready=excluded.kubelet_ready,
+                pending_join=excluded.pending_join,
+                pending_removal=excluded.pending_removal,
+                k8s_node_name=CASE
+                    WHEN excluded.k8s_node_name != '' THEN excluded.k8s_node_name
+                    ELSE kubernetes_cluster_nodes.k8s_node_name
+                END",
             params![
                 row.cluster_name,
                 row.node_id,
@@ -6868,7 +6904,10 @@ impl Database {
                 row.iface,
                 row.initial_cluster,
                 row.join_existing,
-                row.kubelet_ready
+                row.kubelet_ready,
+                row.pending_join,
+                row.pending_removal,
+                row.k8s_node_name
             ],
         )?;
         Ok(())
@@ -6881,7 +6920,8 @@ impl Database {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT cluster_name, node_id, role, advertise_address, iface,
-                    initial_cluster, join_existing, kubelet_ready
+                    initial_cluster, join_existing, kubelet_ready,
+                    pending_join, pending_removal, k8s_node_name
              FROM kubernetes_cluster_nodes WHERE cluster_name=?1 ORDER BY node_id",
         )?;
         let rows = stmt.query_map(params![cluster_name], |r| {
@@ -6894,9 +6934,53 @@ impl Database {
                 initial_cluster: r.get(5)?,
                 join_existing: r.get(6)?,
                 kubelet_ready: r.get(7)?,
+                pending_join: r.get(8)?,
+                pending_removal: r.get(9)?,
+                k8s_node_name: r.get(10)?,
             })
         })?;
         rows.collect()
+    }
+
+    pub fn list_kubernetes_nodes_by_node_id(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<KubernetesClusterNodeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT cluster_name, node_id, role, advertise_address, iface,
+                    initial_cluster, join_existing, kubelet_ready,
+                    pending_join, pending_removal, k8s_node_name
+             FROM kubernetes_cluster_nodes WHERE node_id=?1 ORDER BY cluster_name",
+        )?;
+        let rows = stmt.query_map(params![node_id], |r| {
+            Ok(KubernetesClusterNodeRow {
+                cluster_name: r.get(0)?,
+                node_id: r.get(1)?,
+                role: r.get(2)?,
+                advertise_address: r.get(3)?,
+                iface: r.get(4)?,
+                initial_cluster: r.get(5)?,
+                join_existing: r.get(6)?,
+                kubelet_ready: r.get(7)?,
+                pending_join: r.get(8)?,
+                pending_removal: r.get(9)?,
+                k8s_node_name: r.get(10)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn delete_kubernetes_cluster_node(
+        &self,
+        cluster_name: &str,
+        node_id: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute(
+            "DELETE FROM kubernetes_cluster_nodes WHERE cluster_name=?1 AND node_id=?2",
+            params![cluster_name, node_id],
+        )? > 0)
     }
 
     pub fn upsert_kubernetes_cluster_config(
@@ -7064,6 +7148,22 @@ impl Database {
         conn.execute(
             "UPDATE kubernetes_clusters SET phase=?1 WHERE name=?2",
             params![phase, cluster_name],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_status(
+        &self,
+        cluster_name: &str,
+        phase: &str,
+        message: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_clusters
+             SET phase=?1, status_message=?2, updated_at=datetime('now')
+             WHERE name=?3",
+            params![phase, message, cluster_name],
         )?;
         Ok(())
     }

@@ -212,6 +212,35 @@ async fn reconcile_update(
                 return Ok(());
             }
             "prepared" => {
+                match kubernetes_host_action(db, &node_row.node_id, "prepared") {
+                    Ok(crate::kubernetes_lifecycle::HostAction::WaitOtherControlPlane) => {
+                        return Ok(());
+                    }
+                    Ok(crate::kubernetes_lifecycle::HostAction::Drain { status }) => {
+                        let recorded = status.unwrap_or("").to_string();
+                        match drain_kubernetes_member(db, clients, &node_row.node_id).await {
+                            Ok(()) => {
+                                db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                                    phase: "drained".into(),
+                                    last_error: recorded,
+                                    ..node_row.clone()
+                                })
+                                .map_err(|e| format!("mark node drained: {e}"))?;
+                            }
+                            Err(err) => {
+                                db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                                    phase: "failed".into(),
+                                    last_error: err,
+                                    ..node_row.clone()
+                                })
+                                .map_err(|e| format!("mark drain failed: {e}"))?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(err) => return Err(err),
+                }
                 let closure = node_row.prepared_closure.clone();
                 let req = node_proto::ActivateSystemUpdateRequest {
                     update_name: update.name.clone(),
@@ -290,6 +319,73 @@ async fn reconcile_update(
                 }
                 return Ok(());
             }
+            "drained" => {
+                let closure = node_row.prepared_closure.clone();
+                let req = node_proto::ActivateSystemUpdateRequest {
+                    update_name: update.name.clone(),
+                    activation_mode: activation.clone(),
+                    prepared_closure: closure,
+                };
+                match activate_on_node(clients, &address, req).await {
+                    Ok(resp) if resp.success => {
+                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                            phase: "waiting_ready".into(),
+                            requires_reboot: resp.requires_reboot,
+                            last_error: node_row.last_error.clone(),
+                            ..node_row.clone()
+                        })
+                        .map_err(|e| format!("mark node waiting_ready: {e}"))?;
+                    }
+                    Ok(resp) => {
+                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                            phase: "failed".into(),
+                            last_error: resp.message,
+                            ..node_row.clone()
+                        })
+                        .map_err(|e| format!("mark activate failed: {e}"))?;
+                    }
+                    Err(err) => {
+                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                            phase: "failed".into(),
+                            last_error: err,
+                            ..node_row.clone()
+                        })
+                        .map_err(|e| format!("mark activate rpc failed: {e}"))?;
+                    }
+                }
+                return Ok(());
+            }
+            "waiting_ready" => {
+                match kubernetes_ready_for_uncordon(db, clients, node_row).await {
+                    Ok(true) => {
+                        if let Err(err) =
+                            uncordon_kubernetes_member(db, clients, &node_row.node_id).await
+                        {
+                            db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                                last_error: err,
+                                ..node_row.clone()
+                            })
+                            .map_err(|e| format!("record uncordon error: {e}"))?;
+                            return Ok(());
+                        }
+                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                            phase: "succeeded".into(),
+                            last_error: String::new(),
+                            ..node_row.clone()
+                        })
+                        .map_err(|e| format!("mark node succeeded: {e}"))?;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(
+                            node_id = %node_row.node_id,
+                            error = %err,
+                            "kubernetes node is not ready for uncordon"
+                        );
+                    }
+                }
+                return Ok(());
+            }
             "bootstrapping" => {
                 let has_generation = db
                     .get_node_host_status(&node_row.node_id)
@@ -355,6 +451,170 @@ async fn reconcile_update(
         }
     }
     Ok(())
+}
+
+fn kubernetes_host_action(
+    db: &Database,
+    node_id: &str,
+    phase: &str,
+) -> Result<crate::kubernetes_lifecycle::HostAction, String> {
+    let memberships = db
+        .list_kubernetes_nodes_by_node_id(node_id)
+        .map_err(|e| format!("list kubernetes membership: {e}"))?;
+    let is_member = !memberships.is_empty();
+    let is_control_plane = memberships.iter().any(|row| row.role == "control-plane");
+    let mut control_plane_count = 0usize;
+    for membership in &memberships {
+        if membership.role == "worker" {
+            continue;
+        }
+        let rows = db
+            .list_kubernetes_cluster_nodes(&membership.cluster_name)
+            .map_err(|e| format!("list cluster members: {e}"))?;
+        control_plane_count = control_plane_count.max(
+            rows.iter()
+                .filter(|row| row.role == "control-plane")
+                .count(),
+        );
+    }
+    let another_control_plane_draining = other_control_plane_is_mid_update(db, node_id)?;
+    Ok(crate::kubernetes_lifecycle::host_update_action(
+        &crate::kubernetes_lifecycle::HostUpdateView {
+            is_member,
+            is_control_plane,
+            control_plane_count,
+            another_control_plane_draining,
+            phase: phase.to_string(),
+            drain: crate::kubernetes_lifecycle::DrainOutcome::NotRun,
+            activate: crate::kubernetes_lifecycle::ActivateOutcome::NotRun,
+            node_ready: false,
+            on_generation: false,
+        },
+    ))
+}
+
+fn other_control_plane_is_mid_update(db: &Database, node_id: &str) -> Result<bool, String> {
+    let updates = db
+        .list_cluster_updates()
+        .map_err(|e| format!("list cluster updates: {e}"))?;
+    for update in updates {
+        let nodes = db
+            .list_cluster_update_nodes(&update.name)
+            .map_err(|e| format!("list update nodes: {e}"))?;
+        for node in nodes {
+            if node.node_id == node_id {
+                continue;
+            }
+            if node.phase != "drained" && node.phase != "waiting_ready" {
+                continue;
+            }
+            let memberships = db
+                .list_kubernetes_nodes_by_node_id(&node.node_id)
+                .map_err(|e| format!("list kubernetes membership: {e}"))?;
+            if memberships.iter().any(|row| row.role == "control-plane") {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn drain_kubernetes_member(
+    db: &Database,
+    clients: &NodeClients,
+    node_id: &str,
+) -> Result<(), String> {
+    let (peer, name) = kubernetes_peer_and_name(db, clients, node_id).await?;
+    crate::kubernetes_admin::drain_node(clients, &peer, &name).await
+}
+
+async fn uncordon_kubernetes_member(
+    db: &Database,
+    clients: &NodeClients,
+    node_id: &str,
+) -> Result<(), String> {
+    let (peer, name) = kubernetes_peer_and_name(db, clients, node_id).await?;
+    crate::kubernetes_admin::cordon(clients, &peer, &name, false).await
+}
+
+async fn kubernetes_ready_for_uncordon(
+    db: &Database,
+    clients: &NodeClients,
+    node_row: &ClusterUpdateNodeRow,
+) -> Result<bool, String> {
+    let (peer, name) = kubernetes_peer_and_name(db, clients, &node_row.node_id).await?;
+    let nodes = crate::kubernetes_admin::list_nodes(clients, &peer).await?;
+    let ready = crate::kubernetes_admin::node_is_ready(&nodes, &name);
+    let host = db.get_node_host_status(&node_row.node_id).ok().flatten();
+    let on_generation = crate::kubernetes_lifecycle::generation_is_current(
+        host.as_ref()
+            .map(|row| row.nixos_generation.as_str())
+            .unwrap_or(""),
+        host.as_ref()
+            .map(|row| row.booted_generation.as_str())
+            .unwrap_or(""),
+        &node_row.target_generation,
+        node_row.requires_reboot,
+    );
+    Ok(ready && on_generation)
+}
+
+async fn kubernetes_peer_and_name(
+    db: &Database,
+    clients: &NodeClients,
+    node_id: &str,
+) -> Result<(String, String), String> {
+    let memberships = db
+        .list_kubernetes_nodes_by_node_id(node_id)
+        .map_err(|e| format!("list kubernetes membership: {e}"))?;
+    let membership = memberships
+        .first()
+        .ok_or_else(|| format!("node {node_id} is not a kubernetes member"))?;
+    let rows = db
+        .list_kubernetes_cluster_nodes(&membership.cluster_name)
+        .map_err(|e| format!("list cluster members: {e}"))?;
+    let control_planes: Vec<_> = rows
+        .iter()
+        .filter(|row| row.role == "control-plane")
+        .collect();
+    let chosen = control_planes
+        .iter()
+        .find(|row| row.node_id != node_id)
+        .or_else(|| control_planes.first())
+        .ok_or_else(|| format!("cluster {} has no control-plane", membership.cluster_name))?;
+    let peer = db
+        .get_node(&chosen.node_id)
+        .map_err(|e| format!("get node: {e}"))?
+        .ok_or_else(|| format!("control-plane {} disappeared", chosen.node_id))?;
+    if peer.address.is_empty() {
+        return Err(format!(
+            "control-plane {} has no agent address",
+            chosen.node_id
+        ));
+    }
+    let node = db
+        .get_node(node_id)
+        .map_err(|e| format!("get node: {e}"))?
+        .ok_or_else(|| format!("node {node_id} disappeared"))?;
+    let listed = crate::kubernetes_admin::list_nodes(clients, &peer.address).await?;
+    let ip = if membership.advertise_address.is_empty() {
+        node.address.split(':').next().unwrap_or("").to_string()
+    } else {
+        membership.advertise_address.clone()
+    };
+    let name = crate::kubernetes_admin::registered_node_name(
+        &listed,
+        &membership.k8s_node_name,
+        &node.hostname,
+        &ip,
+    )?;
+    if membership.k8s_node_name != name {
+        let mut stored = membership.clone();
+        stored.k8s_node_name = name.clone();
+        db.upsert_kubernetes_cluster_node(&stored)
+            .map_err(|e| format!("store kubernetes node name: {e}"))?;
+    }
+    Ok((peer.address, name))
 }
 
 async fn prepare_on_node(

@@ -182,6 +182,9 @@ mod kubernetes_cluster_tests {
             initial_cluster: true,
             join_existing: false,
             kubelet_ready: true,
+            pending_join: false,
+            pending_removal: false,
+            k8s_node_name: String::new(),
         };
 
         db.upsert_kubernetes_cluster_node(&node_row).unwrap();
@@ -298,6 +301,9 @@ mod kubernetes_cluster_tests {
             initial_cluster: true,
             join_existing: false,
             kubelet_ready: false,
+            pending_join: false,
+            pending_removal: false,
+            k8s_node_name: String::new(),
         };
         db.upsert_kubernetes_cluster_node(&node_row).unwrap();
 
@@ -377,6 +383,9 @@ mod kubernetes_cluster_tests {
                 initial_cluster: i == 0,
                 join_existing: i > 0,
                 kubelet_ready: true,
+                pending_join: false,
+                pending_removal: false,
+                k8s_node_name: String::new(),
             };
             db.upsert_kubernetes_cluster_node(&node_row).unwrap();
         }
@@ -423,6 +432,9 @@ mod kubernetes_cluster_tests {
             initial_cluster: true,
             join_existing: false,
             kubelet_ready: false,
+            pending_join: false,
+            pending_removal: false,
+            k8s_node_name: String::new(),
         };
         db.upsert_kubernetes_cluster_node(&node_row).unwrap();
 

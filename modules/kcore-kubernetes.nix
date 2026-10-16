@@ -345,14 +345,18 @@ let
         text = c.kubeconfigData;
         mode = "0600";
       };
-      environment.etc."kubernetes/${name}/kubelet.conf" = lib.mkIf (c.kubeconfigData != "") {
-        text = c.kubeconfigData;
-        mode = "0600";
-      };
-      environment.etc."kubernetes/${name}/bootstrap-kubelet.conf" = lib.mkIf (c.kubeconfigData != "") {
-        text = c.kubeconfigData;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/${name}/kubelet.conf" =
+        lib.mkIf (c.kubeconfigData != "" || c.kubeletKubeconfigData != "")
+          {
+            text = if c.kubeletKubeconfigData != "" then c.kubeletKubeconfigData else c.kubeconfigData;
+            mode = "0600";
+          };
+      environment.etc."kubernetes/${name}/bootstrap-kubelet.conf" =
+        lib.mkIf (c.kubeconfigData != "" || c.kubeletKubeconfigData != "")
+          {
+            text = if c.kubeletKubeconfigData != "" then c.kubeletKubeconfigData else c.kubeconfigData;
+            mode = "0600";
+          };
 
       environment.etc."kubernetes/${name}/pki/ca.crt" = lib.mkIf (c.caCrt != "") {
         text = c.caCrt;
@@ -908,7 +912,13 @@ in
     kubeconfigData = lib.mkOption {
       type = lib.types.str;
       default = "";
-      description = "Base64-encoded kubeconfig content (written by node-agent).";
+      description = "Admin kubeconfig written to admin.conf.";
+    };
+
+    kubeletKubeconfigData = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "Kubelet client kubeconfig. Empty uses kubeconfigData.";
     };
 
     provisionerManifest = lib.mkOption {
@@ -1127,6 +1137,10 @@ in
               description = "Per-node pod CIDR for the bridge CNI.";
             };
             kubeconfigData = lib.mkOption {
+              type = lib.types.str;
+              default = "";
+            };
+            kubeletKubeconfigData = lib.mkOption {
               type = lib.types.str;
               default = "";
             };
@@ -1473,16 +1487,20 @@ in
       };
 
       # Bootstrap kubeconfig for kubelet (minimal, will be replaced after TLS bootstrap)
-      environment.etc."kubernetes/bootstrap-kubelet.conf" = lib.mkIf (cfg.kubeconfigData != "") {
-        text = cfg.kubeconfigData;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/bootstrap-kubelet.conf" =
+        lib.mkIf (cfg.kubeconfigData != "" || cfg.kubeletKubeconfigData != "")
+          {
+            text = if cfg.kubeletKubeconfigData != "" then cfg.kubeletKubeconfigData else cfg.kubeconfigData;
+            mode = "0600";
+          };
 
-      # Kubelet kubeconfig (will be created by kubelet TLS bootstrap)
-      environment.etc."kubernetes/kubelet.conf" = lib.mkIf (cfg.kubeconfigData != "") {
-        text = cfg.kubeconfigData;
-        mode = "0600";
-      };
+      # Kubelet kubeconfig. A joining node uses its own client certificate.
+      environment.etc."kubernetes/kubelet.conf" =
+        lib.mkIf (cfg.kubeconfigData != "" || cfg.kubeletKubeconfigData != "")
+          {
+            text = if cfg.kubeletKubeconfigData != "" then cfg.kubeletKubeconfigData else cfg.kubeconfigData;
+            mode = "0600";
+          };
 
       # etcd service (control-plane only)
       systemd.services.etcd = lib.mkIf (cfg.role == "control-plane") {
