@@ -2,6 +2,12 @@
   "name": "kcore",
   "version": "0.1.0",
   "description": "Create and operate kcore clusters and VMs. The agent asks before it plans or applies.",
+  "author": {
+    "name": "kcore",
+    "url": "https://kcorehypervisor.com"
+  },
+  "homepage": "https://kcorehypervisor.com",
+  "repository": "https://github.com/kcorehypervisor/kcore",
   "license": "Apache-2.0",
   "keywords": ["kcore", "mcp", "vm", "cluster"],
   "mcpServers": "./mcp.json",

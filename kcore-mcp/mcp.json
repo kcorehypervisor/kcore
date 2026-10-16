@@ -1,8 +1,9 @@
 {
   "mcpServers": {
     "kcore": {
+      "type": "stdio",
       "command": "node",
-      "args": ["./packages/server/dist/index.js"]
+      "args": ["${CURSOR_PLUGIN_ROOT}/packages/server/dist/index.js"]
     }
   }
 }
