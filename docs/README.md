@@ -20,6 +20,10 @@ This directory contains the complete implementation plan for running Kubernetes 
 - **Original plan:** [bare-metal-kubernetes.md](./bare-metal-kubernetes.md) - Single-node design (superseded)
 - **Security:** [security-k8s-vs-kcore.md](./security-k8s-vs-kcore.md) - Security model comparison
 
+### Other bare-metal services
+- **ClickHouse design:** [bare-metal-clickhouse.md](./bare-metal-clickhouse.md) - Shards, replicas, Keeper, rolling operations, test plan
+- **ClickHouse proto:** [proto-snippets-clickhouse.proto](./proto-snippets-clickhouse.proto) - Controller and node RPCs (compiles standalone)
+
 ## 🎯 What This Implements
 
 **Production-ready Kubernetes on kcoreOS with:**
