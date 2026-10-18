@@ -2032,11 +2032,21 @@ impl Database {
         }
 
         if version < 62 {
-            conn.execute_batch(
-                "ALTER TABLE node_gpus ADD COLUMN parent TEXT NOT NULL DEFAULT '';
-                ALTER TABLE node_gpus ADD COLUMN profile TEXT NOT NULL DEFAULT '';
-                ALTER TABLE node_gpus ADD COLUMN profiles TEXT NOT NULL DEFAULT '';",
-            )?;
+            for column in [
+                "parent TEXT NOT NULL DEFAULT ''",
+                "profile TEXT NOT NULL DEFAULT ''",
+                "profiles TEXT NOT NULL DEFAULT ''",
+            ] {
+                let name = column.split_whitespace().next().unwrap_or(column);
+                let has: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('node_gpus') WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if has == 0 {
+                    conn.execute(&format!("ALTER TABLE node_gpus ADD COLUMN {column}"), [])?;
+                }
+            }
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
