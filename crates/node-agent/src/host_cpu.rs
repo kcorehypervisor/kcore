@@ -81,6 +81,7 @@ pub fn from_cpuinfo(cpuinfo: &str, tsc_khz: u32) -> HostCpu {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)] // __cpuid is safe on newer Rust and unsafe on CI's toolchain.
 fn cpuid_base_khz() -> u32 {
     // SAFETY: CPUID leaf 0 and 0x16 only read processor identity. Leaf 0
     // reports the highest leaf, so 0x16 is not queried when the CPU lacks it.
