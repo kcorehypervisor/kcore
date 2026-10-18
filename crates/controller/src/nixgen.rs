@@ -37,14 +37,19 @@ use kcore_sanitize::{nix_escape, sanitize_nix_attr_key};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleFeatures {
     pub image_sha256: bool,
+    pub vgpu_profile: bool,
 }
 
 impl ModuleFeatures {
     pub const IMAGE_SHA256: &'static str = "imageSha256";
+    pub const VGPU_PROFILE: &'static str = "vgpuProfile";
 
     /// Everything on: what a node installed from this tree supports.
     pub fn all() -> Self {
-        Self { image_sha256: true }
+        Self {
+            image_sha256: true,
+            vgpu_profile: true,
+        }
     }
 
     /// From the list the node agent reports. An agent without the RPC, or a
@@ -53,8 +58,18 @@ impl ModuleFeatures {
         let has = |name: &str| features.iter().any(|f| f.as_ref() == name);
         Self {
             image_sha256: has(Self::IMAGE_SHA256),
+            vgpu_profile: has(Self::VGPU_PROFILE),
         }
     }
+}
+
+/// One vGPU slice placed on this node. The address is the virtual function.
+#[derive(Debug, Clone)]
+pub struct VgpuSliceNix {
+    pub vm_id: String,
+    pub address: String,
+    pub profile: String,
+    pub host_address: String,
 }
 
 pub fn generate_node_config(
@@ -100,6 +115,7 @@ pub fn generate_node_config_with_security_groups(
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &ModuleFeatures::all(),
+        &[],
     )
 }
 
@@ -130,6 +146,7 @@ pub fn generate_node_config_inner(
     network_policies: &std::collections::HashMap<String, crate::db::NetworkPolicyRow>,
     vm_ipv6: &std::collections::HashMap<String, Vec<crate::db::VmIpv6Row>>,
     features: &ModuleFeatures,
+    vgpu: &[VgpuSliceNix],
 ) -> String {
     let mut out = String::from("{ pkgs, ... }: {\n");
     out.push_str("  ch-vm.vms = {\n");
@@ -402,6 +419,19 @@ pub fn generate_node_config_inner(
         if !pci_devices.is_empty() {
             out.push_str("      pciDevices = [\n");
             for addr in &pci_devices {
+                let profile = vgpu
+                    .iter()
+                    .find(|slice| slice.vm_id == vm.id && slice.address.eq_ignore_ascii_case(addr));
+                if features.vgpu_profile {
+                    if let Some(slice) = profile {
+                        out.push_str(&format!(
+                            "        {{ address = \"{}\"; vgpuProfile = \"{}\"; }}\n",
+                            nix_escape(addr),
+                            nix_escape(&slice.profile)
+                        ));
+                        continue;
+                    }
+                }
                 out.push_str(&format!(
                     "        {{ address = \"{}\"; }}\n",
                     nix_escape(addr)
@@ -510,8 +540,31 @@ pub fn generate_node_config_inner(
     }
 
     out.push_str("  };\n");
-    if vms.iter().any(|vm| !vm.pci_devices.is_empty()) {
+    let slice_addrs: std::collections::HashSet<String> = vgpu
+        .iter()
+        .map(|slice| slice.address.to_ascii_lowercase())
+        .collect();
+    let needs_vfio = vms.iter().any(|vm| {
+        crate::pci::split_pci_devices(&vm.pci_devices)
+            .iter()
+            .any(|addr| !slice_addrs.contains(&addr.to_ascii_lowercase()))
+    });
+    if needs_vfio {
         out.push_str("  ch-vm.vfio.enable = true;\n");
+    }
+    if features.vgpu_profile && !vgpu.is_empty() {
+        out.push_str("  ch-vm.vgpu.enable = true;\n");
+        let mut hosts: Vec<&str> = vgpu
+            .iter()
+            .map(|slice| slice.host_address.as_str())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        out.push_str("  ch-vm.vgpu.hostCards = [\n");
+        for host in hosts {
+            out.push_str(&format!("    \"{}\"\n", nix_escape(host)));
+        }
+        out.push_str("  ];\n");
     }
     out.push_str("}\n");
     out
@@ -768,6 +821,7 @@ mod tests {
                 &std::collections::HashMap::new(),
                 &std::collections::HashMap::new(),
                 features,
+                &[],
             )
         };
         assert!(render(&ModuleFeatures::all()).contains("imageSha256"));
@@ -775,8 +829,50 @@ mod tests {
 
         let reported = ModuleFeatures::from_reported(&["cloudHypervisorPatches", "imageSha256"]);
         assert!(reported.image_sha256);
+        assert!(!reported.vgpu_profile);
         assert!(!ModuleFeatures::from_reported::<&str>(&[]).image_sha256);
+        assert!(ModuleFeatures::from_reported(&[ModuleFeatures::VGPU_PROFILE]).vgpu_profile);
         assert!(!ModuleFeatures::from_reported(&["imagesha256"]).image_sha256);
+    }
+
+    #[test]
+    fn vgpu_profile_is_rendered_only_when_the_module_reports_it() {
+        let mut guest = vm(true, "slice-guest");
+        guest.pci_devices = "0000:af:00.4".into();
+        let slices = [VgpuSliceNix {
+            vm_id: guest.id.clone(),
+            address: "0000:af:00.4".into(),
+            profile: "A2-4C".into(),
+            host_address: "0000:af:00.0".into(),
+        }];
+        let render = |features: &ModuleFeatures| {
+            generate_node_config_inner(
+                &[guest.clone()],
+                "eno1",
+                &default_net(),
+                &[],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
+                &[],
+                &[],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                features,
+                &slices,
+            )
+        };
+        let enabled = render(&ModuleFeatures::all());
+        assert!(enabled.contains("vgpuProfile = \"A2-4C\""));
+        assert!(enabled.contains("ch-vm.vgpu.enable = true;"));
+        assert!(enabled.contains("0000:af:00.0"));
+        assert!(!enabled.contains("ch-vm.vfio.enable"));
+        let baseline = render(&ModuleFeatures::default());
+        assert!(!baseline.contains("vgpuProfile"));
+        assert!(!baseline.contains("ch-vm.vgpu.enable"));
+        assert!(baseline.contains("address = \"0000:af:00.4\""));
     }
 
     #[test]
@@ -943,6 +1039,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &ModuleFeatures::all(),
+            &[],
         );
         assert!(config.contains("cloudInitUserConfigFile"));
         assert!(config.contains("cloudInitGuestOpsKeys"));
@@ -1112,6 +1209,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &ModuleFeatures::all(),
+            &[],
         );
         assert!(config.contains("extraNics"));
         assert!(!config.contains("eastWestFirewall"));
@@ -1180,6 +1278,7 @@ mod tests {
             &policies,
             &addresses,
             &ModuleFeatures::all(),
+            &[],
         );
         assert!(config.contains("eastWestFirewall = true;"));
         assert!(config.contains("ipv6Prefix = \"fd00:10:240::/64\";"));
@@ -1280,6 +1379,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &ModuleFeatures::all(),
+            &[],
         );
         assert!(
             config.contains("rbdImage = \"kcore-vol-clone01\""),

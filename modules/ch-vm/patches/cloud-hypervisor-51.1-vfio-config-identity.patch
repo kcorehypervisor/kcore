@@ -1,0 +1,312 @@
+Seed the VFIO PCI shadow from the device config space, and return the live
+vendor, class, and subsystem dwords to the guest.
+
+NVIDIA vGPU virtual functions keep the physical GPU's PCI ids. Cloud
+Hypervisor 51.1 already serves non-BAR config from the VFIO region, but the
+shadow starts as vendor 0 and a ConfigPatch can mask the identity registers.
+Those bits are read-only, so write_reg cannot seed them. On a fresh device
+this reads dwords 0x00, 0x08, and 0x2c (a restored snapshot keeps its saved
+shadow). read_config_register returns those three dwords from VFIO and does
+not apply ConfigPatch.
+
+Whole-device passthrough is unchanged: the VFIO region already matches the
+physical card, so the guest still sees that card's ids. Drafted against
+v51.1 without an A2. The guest-visible check waits for the card. A passthrough
+of a card that is not a vGPU host is a null test of this patch.
+
+--- a/pci/src/vfio.rs
++++ b/pci/src/vfio.rs
+@@ -42,7 +42,8 @@
+     BarReprogrammingParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig, MsixCap,
+     MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
+     PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
+-    PciExpressCapabilityId, PciHeaderType, PciSubclass, msi_num_enabled_vectors,
++    PciExpressCapabilityId, PciHeaderType, PciProgrammingInterface, PciSubclass,
++    msi_num_enabled_vectors,
+ };
+ 
+ pub(crate) const VFIO_COMMON_ID: &str = "vfio_common";
+@@ -497,6 +498,72 @@
+     x_nv_gpudirect_clique: Option<u8>,
+ }
+ 
++struct VfioConfigSubclass(u8);
++
++impl PciSubclass for VfioConfigSubclass {
++    fn get_register_value(&self) -> u8 {
++        self.0
++    }
++}
++
++struct VfioConfigProgIf(u8);
++
++impl PciProgrammingInterface for VfioConfigProgIf {
++    fn get_register_value(&self) -> u8 {
++        self.0
++    }
++}
++
++struct VfioIdentity {
++    vendor: u16,
++    device: u16,
++    revision: u8,
++    prog_if: u8,
++    subclass: u8,
++    class: u8,
++    subsystem_vendor: u16,
++    subsystem: u16,
++}
++
++fn read_vfio_identity(vfio: &dyn Vfio) -> VfioIdentity {
++    let id = vfio.read_config_dword(0x00);
++    let class_rev = vfio.read_config_dword(0x08);
++    let subsystem = vfio.read_config_dword(0x2c);
++    VfioIdentity {
++        vendor: id as u16,
++        device: (id >> 16) as u16,
++        revision: class_rev as u8,
++        prog_if: (class_rev >> 8) as u8,
++        subclass: (class_rev >> 16) as u8,
++        class: (class_rev >> 24) as u8,
++        subsystem_vendor: subsystem as u16,
++        subsystem: (subsystem >> 16) as u16,
++    }
++}
++
++fn pci_class_code(class: u8) -> PciClassCode {
++    match class {
++        0x00 => PciClassCode::TooOld,
++        0x01 => PciClassCode::MassStorage,
++        0x02 => PciClassCode::NetworkController,
++        0x03 => PciClassCode::DisplayController,
++        0x04 => PciClassCode::MultimediaController,
++        0x05 => PciClassCode::MemoryController,
++        0x06 => PciClassCode::BridgeDevice,
++        0x07 => PciClassCode::SimpleCommunicationController,
++        0x08 => PciClassCode::BaseSystemPeripheral,
++        0x09 => PciClassCode::InputDevice,
++        0x0a => PciClassCode::DockingStation,
++        0x0b => PciClassCode::Processor,
++        0x0c => PciClassCode::SerialBusController,
++        0x0d => PciClassCode::WirelessController,
++        0x0e => PciClassCode::IntelligentIoController,
++        0x0f => PciClassCode::EncryptionController,
++        0x10 => PciClassCode::DataAcquisitionSignalProcessing,
++        _ => PciClassCode::Other,
++    }
++}
++
+ impl VfioCommon {
+     pub(crate) fn new(
+         msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
+@@ -514,19 +581,41 @@
+             ))
+         })?;
+ 
+-        let configuration = PciConfiguration::new(
+-            0,
+-            0,
+-            0,
+-            PciClassCode::Other,
+-            subclass,
+-            None,
+-            PciHeaderType::Device,
+-            0,
+-            0,
+-            None,
+-            pci_configuration_state,
+-        );
++        // A restored snapshot already carries the shadow. A fresh device takes
++        // its identity from the VFIO config region. write_reg cannot seed these
++        // registers: the identity bits are read-only.
++        let configuration = if pci_configuration_state.is_none() {
++            let ident = read_vfio_identity(vfio_wrapper.as_ref());
++            let owned_subclass = VfioConfigSubclass(ident.subclass);
++            let owned_prog_if = VfioConfigProgIf(ident.prog_if);
++            PciConfiguration::new(
++                ident.vendor,
++                ident.device,
++                ident.revision,
++                pci_class_code(ident.class),
++                &owned_subclass,
++                Some(&owned_prog_if),
++                PciHeaderType::Device,
++                ident.subsystem_vendor,
++                ident.subsystem,
++                None,
++                pci_configuration_state,
++            )
++        } else {
++            PciConfiguration::new(
++                0,
++                0,
++                0,
++                PciClassCode::Other,
++                subclass,
++                None,
++                PciHeaderType::Device,
++                0,
++                0,
++                None,
++                pci_configuration_state,
++            )
++        };
+ 
+         let mut vfio_common = VfioCommon {
+             mmio_regions: Vec::new(),
+@@ -1339,6 +1428,13 @@
+     }
+ 
+     pub(crate) fn read_config_register(&mut self, reg_idx: usize) -> u32 {
++        // Vendor, class, and subsystem come from the device. A ConfigPatch
++        // must not mask them: an NVIDIA vGPU virtual function reports the
++        // physical GPU's ids in these dwords.
++        if matches!(reg_idx, 0 | 2 | 11) {
++            return self.vfio_wrapper.read_config_dword((reg_idx * 4) as u32);
++        }
++
+         // When reading the BARs, we trap it and return what comes
+         // from our local configuration space. We want the guest to
+         // use that and not the VFIO device BARs as it does not map
+@@ -2090,3 +2186,141 @@
+         })
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use vfio_bindings::bindings::vfio::VFIO_PCI_CONFIG_REGION_INDEX;
++    use vm_device::interrupt::{InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig};
++
++    use super::{
++        pci_class_code, read_vfio_identity, ConfigPatch, Interrupt, PciVfioSubclass, Vfio,
++        VfioCommon,
++    };
++    use crate::{PciClassCode, PciConfiguration, PciHeaderType};
++
++    struct IdentityVfio {
++        config: [u8; 256],
++    }
++
++    impl Vfio for IdentityVfio {
++        fn region_read(&self, index: u32, offset: u64, data: &mut [u8]) {
++            if index != VFIO_PCI_CONFIG_REGION_INDEX {
++                return;
++            }
++            let start = offset as usize;
++            for (i, byte) in data.iter_mut().enumerate() {
++                let pos = start + i;
++                *byte = if pos < self.config.len() {
++                    self.config[pos]
++                } else {
++                    0
++                };
++            }
++        }
++    }
++
++    struct IdleInterrupts;
++
++    impl InterruptManager for IdleInterrupts {
++        type GroupConfig = MsiIrqGroupConfig;
++
++        fn create_group(
++            &self,
++            _config: Self::GroupConfig,
++        ) -> std::io::Result<Arc<dyn InterruptSourceGroup>> {
++            unimplemented!("identity test does not create interrupt groups")
++        }
++
++        fn destroy_group(&self, _group: Arc<dyn InterruptSourceGroup>) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++
++    fn identity_config() -> [u8; 256] {
++        let mut config = [0u8; 256];
++        // vendor 0x10de, device 0x2237
++        config[0] = 0xde;
++        config[1] = 0x10;
++        config[2] = 0x37;
++        config[3] = 0x22;
++        // revision 0xa1, prog-if 0x00, subclass 0x02, class 0x03 (display)
++        config[8] = 0xa1;
++        config[9] = 0x00;
++        config[10] = 0x02;
++        config[11] = 0x03;
++        // subsystem vendor 0x10de, subsystem 0x14a0
++        config[0x2c] = 0xde;
++        config[0x2d] = 0x10;
++        config[0x2e] = 0xa0;
++        config[0x2f] = 0x14;
++        config
++    }
++
++    fn identity_common(config: [u8; 256]) -> VfioCommon {
++        let configuration = PciConfiguration::new(
++            0,
++            0,
++            0,
++            PciClassCode::Other,
++            &PciVfioSubclass::VfioSubclass,
++            None,
++            PciHeaderType::Device,
++            0,
++            0,
++            None,
++            None,
++        );
++        VfioCommon {
++            configuration,
++            mmio_regions: Vec::new(),
++            interrupt: Interrupt {
++                intx: None,
++                msi: None,
++                msix: None,
++            },
++            msi_interrupt_manager: Arc::new(IdleInterrupts),
++            legacy_interrupt_group: None,
++            vfio_wrapper: Arc::new(IdentityVfio { config }),
++            patches: std::collections::HashMap::new(),
++            x_nv_gpudirect_clique: None,
++        }
++    }
++
++    #[test]
++    fn read_vfio_identity_parses_config_dwords() {
++        let vfio = IdentityVfio {
++            config: identity_config(),
++        };
++        let ident = read_vfio_identity(&vfio);
++        assert_eq!(ident.vendor, 0x10de);
++        assert_eq!(ident.device, 0x2237);
++        assert_eq!(ident.revision, 0xa1);
++        assert_eq!(ident.prog_if, 0x00);
++        assert_eq!(ident.subclass, 0x02);
++        assert_eq!(ident.class, 0x03);
++        assert_eq!(ident.subsystem_vendor, 0x10de);
++        assert_eq!(ident.subsystem, 0x14a0);
++        assert!(matches!(
++            pci_class_code(0x03),
++            PciClassCode::DisplayController
++        ));
++        assert!(matches!(pci_class_code(0x11), PciClassCode::Other));
++    }
++
++    #[test]
++    fn read_config_register_returns_vfio_identity_despite_patch() {
++        let mut common = identity_common(identity_config());
++        common.patches.insert(
++            0,
++            ConfigPatch {
++                mask: 0xffff_ffff,
++                patch: 0x1eb8_10de,
++            },
++        );
++        assert_eq!(common.read_config_register(0), 0x2237_10de);
++        assert_eq!(common.read_config_register(2), 0x0302_00a1);
++        assert_eq!(common.read_config_register(11), 0x14a0_10de);
++    }
++}

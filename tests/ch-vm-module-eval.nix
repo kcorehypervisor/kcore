@@ -127,6 +127,113 @@ assert
       )
     ];
   }).config.environment.etc."kcore/cloud-hypervisor".text == unpatched + "\n";
+
+let
+  vgpuBase = {
+    networking.hostName = "chvm-vgpu";
+    system.stateVersion = "25.05";
+    boot.loader.grub.enable = false;
+    fileSystems."/" = {
+      device = "nodev";
+      fsType = "tmpfs";
+    };
+  };
+  vgpuEval = nixosSystem {
+    system = pkgs.stdenv.hostPlatform.system;
+    modules = [
+      ../modules/ch-vm
+      (
+        { pkgs, ... }:
+        {
+          imports = [ vgpuBase ];
+          ch-vm.vgpu = {
+            enable = true;
+            managerPackage = pkgs.hello;
+            hostCards = [ "0000:AF:00.0" ];
+          };
+          ch-vm.vms = {
+            enable = true;
+            cloudHypervisorPackage = pkgs.cloud-hypervisor;
+            gatewayInterface = "eth0";
+            networks.default = {
+              externalIP = "10.0.2.15";
+              gatewayIP = "192.168.100.1";
+            };
+            virtualMachines.whole = {
+              image = "/var/lib/kcore/images/guest.img";
+              cores = 1;
+              memorySize = 256;
+              network = "default";
+              pciDevices = [ { address = "0000:03:00.0"; } ];
+              autoStart = false;
+            };
+            virtualMachines.slice = {
+              image = "/var/lib/kcore/images/guest.img";
+              cores = 1;
+              memorySize = 256;
+              network = "default";
+              pciDevices = [
+                {
+                  address = "0000:af:00.4";
+                  vgpuProfile = "A2-4C";
+                }
+              ];
+              autoStart = false;
+            };
+          };
+        }
+      )
+    ];
+  };
+  vgpuCfg = vgpuEval.config;
+  wholeUnit = vgpuCfg.systemd.services."kcore-vm-whole";
+  sliceUnit = vgpuCfg.systemd.services."kcore-vm-slice";
+  sriov = vgpuCfg.systemd.services.kcore-vgpu-sriov;
+  asList =
+    value:
+    if builtins.isList value then
+      value
+    else if value == null then
+      [ ]
+    else
+      [ value ];
+  mentions = name: value: lib.any (item: lib.hasInfix name (toString item)) (asList value);
+  missingManager = nixosSystem {
+    system = pkgs.stdenv.hostPlatform.system;
+    modules = [
+      ../modules/ch-vm
+      {
+        networking.hostName = "chvm-vgpu-assert";
+        system.stateVersion = "25.05";
+        boot.loader.grub.enable = false;
+        fileSystems."/" = {
+          device = "nodev";
+          fsType = "tmpfs";
+        };
+        ch-vm.vgpu.enable = true;
+      }
+    ];
+  };
+  managerAssertion = lib.findFirst (
+    item: lib.hasInfix "managerPackage" item.message
+  ) null missingManager.config.assertions;
+in
+assert managerAssertion != null;
+assert managerAssertion.assertion == false;
+assert lib.elem "iommu=pt" vgpuCfg.boot.kernelParams;
+assert lib.elem "nouveau" vgpuCfg.boot.blacklistedKernelModules;
+assert vgpuCfg.environment.etc."kcore/vgpu-hosts".text == "0000:af:00.0\n";
+assert lib.hasInfix "vgpuProfile" vgpuCfg.environment.etc."kcore/ch-vm-features".text;
+assert lib.hasInfix "sriov-manage" sriov.script;
+assert lib.hasInfix "-e" sriov.script;
+assert !(lib.hasInfix "sriov_numvfs" sriov.script);
+assert mentions "vfio-bind-whole" wholeUnit.serviceConfig.ExecStartPre;
+assert !(mentions "vgpu-bind-whole" wholeUnit.serviceConfig.ExecStartPre);
+assert mentions "vgpu-bind-slice" sliceUnit.serviceConfig.ExecStartPre;
+assert !(mentions "vfio-bind-slice" sliceUnit.serviceConfig.ExecStartPre);
+assert lib.elem "kcore-vgpu-sriov.service" sliceUnit.requires;
+assert !(lib.elem "kcore-vgpu-sriov.service" wholeUnit.requires);
+assert mentions "vgpu-clear-slice" sliceUnit.serviceConfig.ExecStopPost;
 pkgs.runCommand "ch-vm-module-eval-ok" { } ''
   echo ok > "$out"
 ''

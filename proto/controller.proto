@@ -301,6 +301,12 @@ message GpuInfo {
   string class_code = 13;     // 0x030200
   string characteristics = 14; // purpose=ai class=... vendor=... iommu-companions=...
   string driver = 15;
+  // Card name for a slice (nvidia0). Empty on a whole device.
+  string parent = 16;
+  // Current vGPU type on a slice (A2-4C). Empty when none is programmed.
+  string profile = 17;
+  // Types this slice can take now.
+  repeated string profiles = 18;
 }
 
 message ListGpusRequest {
@@ -850,6 +856,9 @@ message VmSpec {
   // GPUs are AI compute devices. Empty leaves a stored assignment unchanged.
   repeated string gpus = 11;
   map<string, string> labels = 12;
+  // NVIDIA vGPU slices. A profile is always present: A2-4C, nvidia0=A2-4C,
+  // or nvidia0/3=A2-4C. Empty leaves a stored list unchanged.
+  repeated string vgpus = 13;
 }
 
 message Disk {
@@ -1064,6 +1073,8 @@ message MigrateVmRequest {
   // each named device the VM has now (a radeon on the source becomes a free
   // radeon on the target). Ignored for VMs with no PCI devices.
   repeated string gpus = 4;
+  // Destination vGPU slices. Empty takes a free slice of the same profile.
+  repeated string vgpus = 5;
 }
 
 message MigrateVmResponse {

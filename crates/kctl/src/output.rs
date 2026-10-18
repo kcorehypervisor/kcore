@@ -62,6 +62,12 @@ pub fn print_vm_detail(
             println!("  - {name}");
         }
     }
+    if !spec.vgpus.is_empty() {
+        println!("\nvGPU slices:");
+        for name in &spec.vgpus {
+            println!("  - {name}");
+        }
+    }
     if !spec.pci_devices.is_empty() {
         println!("\nPCI functions:");
         for addr in &spec.pci_devices {

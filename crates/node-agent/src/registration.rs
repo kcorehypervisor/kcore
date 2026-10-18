@@ -299,9 +299,11 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
             }
         };
         let mut client = controller_proto::controller_client::ControllerClient::new(channel);
-        let (gpus, gpus_reported) = match kcore_gpu::scan_pci(std::path::Path::new(
-            "/sys/bus/pci/devices",
-        )) {
+        let vgpu_hosts = kcore_gpu::load_vgpu_hosts(std::path::Path::new("/etc/kcore/vgpu-hosts"));
+        let (gpus, gpus_reported) = match kcore_gpu::scan_pci_with(
+            std::path::Path::new("/sys/bus/pci/devices"),
+            &vgpu_hosts,
+        ) {
             Ok(found) => (
                 found
                     .into_iter()
@@ -321,6 +323,9 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
                         class_code: gpu.class_code,
                         characteristics: gpu.characteristics,
                         driver: gpu.driver,
+                        parent: gpu.parent,
+                        profile: gpu.profile,
+                        profiles: gpu.profiles,
                     })
                     .collect(),
                 true,

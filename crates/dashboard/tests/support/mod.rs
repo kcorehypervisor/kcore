@@ -109,6 +109,7 @@ impl Controller for MockController {
                 pci_devices: vec!["0000:03:00.0".into()],
                 gpus: vec!["radeon0".into()],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             status: Some(VmStatus {
                 id: "vm-mock-1".into(),

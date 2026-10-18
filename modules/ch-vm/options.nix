@@ -307,6 +307,12 @@ let
                 example = "0000:03:00.0";
                 description = "PCI address to pass through, for example 0000:03:00.0. List every function in the device IOMMU group.";
               };
+              vgpuProfile = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                example = "A2-4C";
+                description = "NVIDIA vGPU profile to program on this virtual function before the guest starts. Null means whole-device vfio-pci passthrough.";
+              };
             };
           }
         );
@@ -365,14 +371,25 @@ in
 
     cloudHypervisorPatches = lib.mkOption {
       type = lib.types.listOf lib.types.path;
-      default = [ ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch ];
-      defaultText = lib.literalExpression "[ ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch ]";
+      default = [
+        ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch
+        ./patches/cloud-hypervisor-51.1-vfio-config-identity.patch
+      ];
+      defaultText = lib.literalExpression ''
+        [
+          ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch
+          ./patches/cloud-hypervisor-51.1-vfio-config-identity.patch
+        ]
+      '';
       description = ''
-        Patches applied on top of cloudHypervisorPackage. The default lets a
+        Patches applied on top of cloudHypervisorPackage. The TSC patch lets a
         live migration restore a guest whose TSC rate is below the destination
         host's on CPUs without hardware TSC scaling (KVM returns EINVAL there;
-        QEMU warns and continues, upstream Cloud Hypervisor aborts). Set to []
-        to run the package unmodified.
+        QEMU warns and continues, upstream Cloud Hypervisor aborts). The VFIO
+        identity patch keeps a guest's vendor, class, and subsystem registers
+        equal to the device config space. An NVIDIA vGPU virtual function
+        needs that, because those registers carry the physical GPU's id. Set
+        to [] to run the package unmodified.
       '';
     };
 
@@ -380,6 +397,12 @@ in
       type = lib.types.str;
       default = "/run/kcore";
       description = "Directory for Cloud Hypervisor API sockets.";
+    };
+
+    sysfsRoot = lib.mkOption {
+      type = lib.types.str;
+      default = "/sys";
+      description = "Sysfs root the PCI bind scripts read. Tests point this at a fake tree. Cloud Hypervisor still opens /sys/bus/pci/devices.";
     };
 
     firmwarePath = lib.mkOption {
