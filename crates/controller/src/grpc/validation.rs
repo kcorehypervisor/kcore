@@ -273,6 +273,29 @@ pub fn validate_storage_size_bytes(size_bytes: i64) -> Result<i64, Status> {
     Ok(size_bytes)
 }
 
+/// Image path stored on a boot-test VM. The Ceph seed script sees this path
+/// and leaves the already-written RBD alone.
+pub const VAULT_BOOT_IMAGE: &str = "/var/lib/kcore/vault-restore";
+
+/// Volume name on a VM labelled `kcore-vault/restore=boot-test`.
+/// The first disk's backend handle (or its name) is that volume.
+pub fn vault_boot_volume_name(spec: &controller_proto::VmSpec) -> Option<String> {
+    if spec.labels.get("kcore-vault/restore").map(String::as_str) != Some("boot-test") {
+        return None;
+    }
+    let disk = spec.disks.first()?;
+    let name = if disk.backend_handle.is_empty() {
+        disk.name.clone()
+    } else {
+        disk.backend_handle.clone()
+    };
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +600,28 @@ mod proptests {
             let f2 = derive_image_format_from_path(&s);
             prop_assert!(f2 == "raw" || f2 == "qcow2");
         }
+    }
+}
+
+#[cfg(test)]
+mod vault_boot_tests {
+    use super::*;
+
+    #[test]
+    fn boot_test_label_names_the_restored_volume() {
+        let mut spec = controller_proto::VmSpec::default();
+        assert!(vault_boot_volume_name(&spec).is_none());
+        spec.labels
+            .insert("kcore-vault/restore".into(), "boot-test".into());
+        spec.disks.push(controller_proto::Disk {
+            name: "vault-boot-disk".into(),
+            backend_handle: "vault-boot-abc".into(),
+            bus: String::new(),
+            device: String::new(),
+        });
+        assert_eq!(
+            vault_boot_volume_name(&spec).as_deref(),
+            Some("vault-boot-abc")
+        );
     }
 }

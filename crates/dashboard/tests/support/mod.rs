@@ -580,6 +580,20 @@ impl Controller for MockController {
         Err(unimp("backup_cluster"))
     }
 
+    async fn prepare_instant_recovery(
+        &self,
+        _: Request<PrepareInstantRecoveryRequest>,
+    ) -> Result<Response<PrepareInstantRecoveryResponse>, Status> {
+        Err(unimp("prepare_instant_recovery"))
+    }
+
+    async fn finalize_instant_recovery(
+        &self,
+        _: Request<FinalizeInstantRecoveryRequest>,
+    ) -> Result<Response<FinalizeInstantRecoveryResponse>, Status> {
+        Err(unimp("finalize_instant_recovery"))
+    }
+
     async fn restore_cluster(
         &self,
         _: Request<RestoreClusterRequest>,

@@ -119,6 +119,21 @@ impl Client {
         put_json(&self.socket_path(name), "/api/v1/vm.remove-device", &body).await
     }
 
+    /// Create the VM on an already-running API socket and boot it.
+    pub async fn create_and_boot(
+        &self,
+        name: &str,
+        config: &serde_json::Value,
+    ) -> Result<(), String> {
+        put_json(&self.socket_path(name), "/api/v1/vm.create", config).await?;
+        put_json(
+            &self.socket_path(name),
+            "/api/v1/vm.boot",
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     /// Wait until the VMM answers on its API socket (or timeout).
     ///
     /// Uses `vmm.ping`, not `vm.info`: a receive-mode VMM has no VM yet, so

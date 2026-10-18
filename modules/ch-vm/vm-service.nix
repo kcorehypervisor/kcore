@@ -232,6 +232,11 @@ let
           SEEDED=1
           ${pkgs.ceph}/bin/rbd image-meta set "$IMAGE" kcore.seeded 1 || true
         fi
+        # Vault boot tests restore the guest into this RBD before the VM
+        # exists. The sentinel image path means the bytes are already there.
+        if [ "$SOURCE" = "/var/lib/kcore/vault-restore" ]; then
+          SEEDED=1
+        fi
         if [ "$SEEDED" -eq 0 ]; then
           test -e "$SOURCE" || { echo "missing source image: $SOURCE"; exit 1; }
           verify_source "$SOURCE"

@@ -1,6 +1,6 @@
 # Install the kcore backup appliance onto a disk. The live ISO is not a
-# hypervisor: the installed system imports kcore-backup-host and leaves
-# kcore-vault for the operator to add.
+# hypervisor: the installed system imports kcore-backup-host and the
+# kcore-vault module.
 set -euo pipefail
 
 DISK=""
@@ -21,8 +21,8 @@ Usage: install-backup --disk /dev/disk/by-id/DISK [options]
   --reboot            Reboot after nixos-install succeeds.
 
 The installed host is a backup appliance. It does not run the hypervisor,
-Ceph, Kubernetes, the node agent, or the console. Add the kcore-vault module
-after the first boot; see /etc/kcore/vault.nix.example.
+Ceph, Kubernetes, or the node agent. The install imports the kcore-vault
+module, which runs the coordinator and opens the console on 443 and NBD on 10809.
 EOF
 }
 
@@ -266,19 +266,25 @@ cat > /mnt/etc/nixos/flake.nix <<'EOF'
   inputs = {
     nixpkgs.url = "path:@NIXPKGS@";
     kcore.url = "path:@KCORE@";
+    kcore-vault.url = "github:kcorehypervisor/kcore-vault";
   };
 
   outputs =
-    { nixpkgs, kcore, ... }:
+    { nixpkgs, kcore, kcore-vault, ... }:
     {
       nixosConfigurations.kcore-backup = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
         modules = [
           kcore.nixosModules.kcore-backup-host
+          kcore-vault.nixosModules.kcore-vault
           (
             { ... }:
             {
               services.kcoreBackup.version = "@KCORE_VERSION@";
+              services.kcore-vault.enable = true;
+              services.kcore-vault.package = kcore-vault.packages.x86_64-linux.kcore-vault;
+              # Console and instant-recovery export. 10809 also comes from the vault module.
+              networking.firewall.allowedTCPPorts = [ 443 10809 ];
             }
           )
           ./hardware-configuration.nix
@@ -292,18 +298,10 @@ EOF
 install -d -m 0755 /mnt/etc/kcore
 sed 's|passwordFile = "/tmp/luks/password"|passwordFile = "/etc/kcore/recovery/crypto_keyfile.bin"|' /tmp/disko-config.nix > /mnt/etc/kcore/disko-config.nix
 cat > /mnt/etc/kcore/vault.nix.example <<'EOF'
-# After the first boot, add the private vault flake to /etc/nixos/flake.nix:
-#
-#   kcore-vault.url = "github:kcorehypervisor/kcore-vault";
-#
-# Pass it through outputs, import the module, and set:
-#
-#   kcore-vault.nixosModules.kcore-vault
-#   services.kcore-vault.enable = true;
-#   services.kcore-vault.package = kcore-vault.packages.x86_64-linux.kcore-vault;
-#
-# The coordinator listens on 0.0.0.0:9191. The dashboard stays on localhost.
-# Point controllerEndpoint at the cluster controller when the repository is ready.
+# The installed flake already imports kcore-vault and sets
+# services.kcore-vault.enable = true. The console listens on 443 and the
+# instant-recovery export listens on 10809. Point controllerEndpoint at the
+# cluster controller when the repository is ready.
 EOF
 
 echo "Installing the backup appliance (this builds the system from the ISO store)..."
@@ -313,7 +311,7 @@ nixos-install --flake /mnt/etc/nixos#kcore-backup --no-root-passwd
 echo
 echo "Installed. LUKS recovery key: /root/luks-recovery-key.txt on the new system."
 echo "Root SSH password is the kcore installer password. Change it after login."
-echo "Vault is not installed yet. See /etc/kcore/vault.nix.example."
+echo "Vault coordinator and console are enabled. See /etc/kcore/vault.nix.example."
 if [[ "$REBOOT_AFTER_INSTALL" == "true" ]]; then
   sync
   reboot

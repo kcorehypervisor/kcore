@@ -202,6 +202,12 @@
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
+            kcore-backup-host-eval = import ./tests/kcore-backup-host-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+              consoleModule = ./modules/kcore-branding.nix;
+            };
             kcore-host-eval = import ./tests/kcore-host-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;

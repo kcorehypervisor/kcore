@@ -155,6 +155,10 @@ service Controller {
   rpc ReadVolumeBlocks(ReadVolumeBlocksRequest) returns (stream VolumeBlock);
   rpc WriteVolumeBlocks(stream WriteVolumeBlocksRequest) returns (WriteVolumeBlocksResponse);
   rpc FreezeVmFilesystems(FreezeVmFilesystemsRequest) returns (FreezeVmFilesystemsResponse);
+  // Instant recovery: the node builds a qcow2 overlay on a vault NBD export and boots it.
+  rpc PrepareInstantRecovery(PrepareInstantRecoveryRequest) returns (PrepareInstantRecoveryResponse);
+  // Copy overlay extents onto a cluster volume and leave that volume as the guest disk.
+  rpc FinalizeInstantRecovery(FinalizeInstantRecoveryRequest) returns (FinalizeInstantRecoveryResponse);
   // Format, mount, and unmount an LVM or ZFS volume on the node that owns it.
   rpc FormatVolume(FormatVolumeRequest) returns (FormatVolumeResponse);
   rpc MountVolume(MountVolumeRequest) returns (MountVolumeResponse);
@@ -1892,6 +1896,31 @@ message FreezeVmFilesystemsRequest {
 message FreezeVmFilesystemsResponse {
   bool success = 1;
   string message = 2;
+}
+
+message PrepareInstantRecoveryRequest {
+  string node = 1;
+  string nbd_url = 2;
+  string vm_name = 3;
+  int64 memory_bytes = 4;
+  int32 vcpus = 5;
+}
+message PrepareInstantRecoveryResponse {
+  bool success = 1;
+  string message = 2;
+  string disk_path = 3;
+}
+message FinalizeInstantRecoveryRequest {
+  string node = 1;
+  string overlay_path = 2;
+  string volume_name = 3;
+  string vm_name = 4;
+}
+message FinalizeInstantRecoveryResponse {
+  bool success = 1;
+  string message = 2;
+  int64 bytes_written = 3;
+  string volume_path = 4;
 }
 
 message ResizeVolumeRequest {
