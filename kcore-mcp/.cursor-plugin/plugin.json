@@ -6,8 +6,11 @@
     "name": "kcore"
   },
   "homepage": "https://kcorehypervisor.com",
+  "repository": "https://github.com/kcorehypervisor/kcore",
   "license": "Apache-2.0",
   "keywords": ["kcore", "mcp", "vm", "cluster", "infrastructure"],
+  "logo": "https://raw.githubusercontent.com/kcorehypervisor/kcore/main/assets/kcore-logo.png",
+  "mcpServers": "./mcp.json",
   "rules": "./rules",
   "skills": "./skills",
   "commands": "./commands"

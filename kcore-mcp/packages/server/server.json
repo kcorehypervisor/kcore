@@ -1,0 +1,48 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.kcorehypervisor/kcore",
+  "title": "kcore",
+  "description": "Operate kcore clusters and VMs. Asks, plans, then applies over the controller API.",
+  "websiteUrl": "https://kcorehypervisor.com",
+  "repository": {
+    "url": "https://github.com/kcorehypervisor/kcore",
+    "source": "github",
+    "id": "1225646583",
+    "subfolder": "kcore-mcp"
+  },
+  "version": "0.1.0",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/kcorehypervisor/kcore/main/assets/kcore-logo.png",
+      "mimeType": "image/png",
+      "sizes": ["1997x788"],
+      "theme": "dark"
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "kcore-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "KCORE_CONFIG",
+          "description": "Path to the kcore context file. Defaults to ~/.kcore/config.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "KCORE_PROVISIONING",
+          "description": "host:port of kcore-provisioning when a call does not set connection.provisioning.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

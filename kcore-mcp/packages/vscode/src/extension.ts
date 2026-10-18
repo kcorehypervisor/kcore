@@ -1,5 +1,6 @@
-import * as vscode from "vscode";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import * as vscode from "vscode";
 
 export function activate(context: vscode.ExtensionContext): void {
   const didChange = new vscode.EventEmitter<void>();
@@ -9,7 +10,8 @@ export function activate(context: vscode.ExtensionContext): void {
       onDidChangeMcpServerDefinitions: didChange.event,
       provideMcpServerDefinitions: () => {
         const server = join(context.extensionPath, "dist", "mcp.js");
-        return [new vscode.McpStdioServerDefinition("kcore", "node", [server], {}, "0.1.0")];
+        const version = JSON.parse(readFileSync(join(context.extensionPath, "package.json"), "utf8")).version as string;
+        return [new vscode.McpStdioServerDefinition("kcore", "node", [server], {}, version)];
       },
     }),
   );

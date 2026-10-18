@@ -108,8 +108,14 @@ service Controller {
   // and per-node block inventory from each node agent (lsblk).
   rpc GetStorageOverview(GetStorageOverviewRequest) returns (GetStorageOverviewResponse);
 
-  // Volume inventory: list all provisioned VM volumes across the cluster.
+  // Volume inventory and lifecycle. Ceph RBD, plus LVM and ZFS volumes on one node.
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+  rpc CreateVolume(CreateVolumeRequest) returns (CreateVolumeResponse);
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
+  rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
+  rpc FormatVolume(FormatVolumeRequest) returns (FormatVolumeResponse);
+  rpc MountVolume(MountVolumeRequest) returns (MountVolumeResponse);
+  rpc UnmountVolume(UnmountVolumeRequest) returns (UnmountVolumeResponse);
 
   // DiskLayout resource — per-node declarative disk layout. Implemented on the
   // node via disko; the operator surface uses the plain word "disk". Each
@@ -1350,6 +1356,94 @@ message VolumeInfo {
   string backend_handle = 6;     // Actual path: /dev/vg_kcore/kcore-<vm> or /var/lib/...
   string image_format = 7;       // raw, qcow2
   VmState vm_state = 8;
+  string id = 9;
+  string name = 10;
+  string role = 11;
+  string attach_state = 12;
+  string serial = 13;
+  string pool = 14;
+  string image = 15;
+  int32 slot = 16;
+  int64 guest_visible_bytes = 17;
+  string guest_checked_at = 18;
+  bool encrypted = 19;
+  string mount_point = 20;
+  string fs_type = 21;
+}
+
+message CreateVolumeRequest {
+  string name = 1;
+  int64 size_bytes = 2;
+  string storage_class = 3; // ceph, lvm, or zfs. Empty means ceph.
+  string vm = 4;
+  string guest_format_json = 5;
+  string from_snapshot = 6;
+  bool encrypt = 7;
+  string node = 8;
+  string volume_name = 9;
+}
+
+message CreateVolumeResponse {
+  bool success = 1;
+  VolumeInfo volume = 2;
+  string message = 3;
+}
+
+message DeleteVolumeRequest { string name = 1; }
+message DeleteVolumeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ResizeVolumeRequest {
+  string name = 1;
+  int64 size_bytes = 2;
+  bool grow_filesystem = 3;
+  bool allow_shrink = 4;
+}
+
+message ResizeVolumeResponse {
+  bool success = 1;
+  string message = 2;
+  VolumeInfo volume = 3;
+  string operation_id = 4;
+  string guest_status_note = 5;
+}
+
+message FormatVolumeRequest {
+  string name = 1;
+  string fs_type = 2;
+  bool force = 3;
+}
+
+message FormatVolumeResponse {
+  bool success = 1;
+  string message = 2;
+  VolumeInfo volume = 3;
+}
+
+message MountVolumeRequest {
+  string name = 1;
+  string mount_point = 2;
+  string fs_type = 3;
+  bool persistent = 4;
+}
+
+message MountVolumeResponse {
+  bool success = 1;
+  string message = 2;
+  VolumeInfo volume = 3;
+}
+
+message UnmountVolumeRequest {
+  string name = 1;
+  bool persistent = 2;
+}
+
+message UnmountVolumeResponse {
+  bool success = 1;
+  string message = 2;
+  VolumeInfo volume = 3;
 }
 
 // DiskLayout resource ---------------------------------------------------
