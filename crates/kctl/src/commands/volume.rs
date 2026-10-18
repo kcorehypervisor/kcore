@@ -1,7 +1,11 @@
+use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
+
 use crate::client::{self, controller_proto};
 use crate::config::ConnectionInfo;
 use crate::output;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use tokio_stream::StreamExt;
 
 pub async fn list(info: &ConnectionInfo, vm: Option<String>) -> Result<()> {
     let mut client = client::controller_client(info).await?;
@@ -443,5 +447,216 @@ pub async fn unmount(info: &ConnectionInfo, name: &str, persistent: bool) -> Res
         bail!("{}", resp.message);
     }
     println!("{}", resp.message);
+    Ok(())
+}
+
+/// Export a volume snapshot to a sparse raw file.
+pub async fn export(
+    info: &ConnectionInfo,
+    volume: &str,
+    snapshot: &str,
+    from_snapshot: Option<&str>,
+    output: &Path,
+    block_size: i32,
+) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let extents = if let Some(from) = from_snapshot {
+        let resp = client
+            .list_volume_changed_extents(controller_proto::ListVolumeChangedExtentsRequest {
+                volume_name: volume.to_string(),
+                from_snapshot: from.to_string(),
+                to_snapshot: snapshot.to_string(),
+            })
+            .await?
+            .into_inner();
+        if !resp.supported {
+            eprintln!(
+                "warning: changed-extent listing not supported ({}); reading whole snapshot",
+                resp.source
+            );
+            Vec::new()
+        } else {
+            resp.extents
+        }
+    } else {
+        Vec::new()
+    };
+
+    let exposed = client
+        .expose_volume_snapshot(controller_proto::ExposeVolumeSnapshotRequest {
+            volume_name: volume.to_string(),
+            snapshot_name: snapshot.to_string(),
+            lease_seconds: 3600,
+        })
+        .await?
+        .into_inner();
+
+    let result = export_blocks(
+        &mut client,
+        &exposed.lease_id,
+        &extents,
+        block_size,
+        exposed.size_bytes,
+        output,
+    )
+    .await;
+
+    let _ = client
+        .unexpose_volume_snapshot(controller_proto::UnexposeVolumeSnapshotRequest {
+            lease_id: exposed.lease_id,
+        })
+        .await;
+
+    result?;
+    println!(
+        "exported volume '{volume}' snapshot '{snapshot}' -> {} ({} logical)",
+        output.display(),
+        crate::client::format_bytes(exposed.size_bytes)
+    );
+    Ok(())
+}
+
+async fn export_blocks(
+    client: &mut controller_proto::controller_client::ControllerClient<tonic::transport::Channel>,
+    lease_id: &str,
+    extents: &[controller_proto::VolumeExtent],
+    block_size: i32,
+    size_bytes: i64,
+    output: &Path,
+) -> Result<()> {
+    let mut file =
+        std::fs::File::create(output).with_context(|| format!("create {}", output.display()))?;
+    if size_bytes > 0 {
+        file.set_len(size_bytes as u64)
+            .with_context(|| format!("truncate {}", output.display()))?;
+    }
+
+    let mut stream = client
+        .read_volume_blocks(controller_proto::ReadVolumeBlocksRequest {
+            lease_id: lease_id.to_string(),
+            extents: extents.to_vec(),
+            block_size,
+            elide_zero_blocks: true,
+        })
+        .await?
+        .into_inner();
+
+    let mut bytes_written = 0i64;
+    let mut zero_runs = 0i64;
+    while let Some(item) = stream.next().await {
+        let block = item?;
+        match block.body {
+            Some(controller_proto::volume_block::Body::Data(data)) => {
+                file.seek(SeekFrom::Start(block.offset as u64))?;
+                file.write_all(&data)?;
+                bytes_written += data.len() as i64;
+            }
+            Some(controller_proto::volume_block::Body::ZeroLength(len)) => {
+                // Sparse: leave a hole (file already sized).
+                zero_runs += 1;
+                let _ = len;
+            }
+            None => {}
+        }
+    }
+    file.sync_all()?;
+    eprintln!("wrote {bytes_written} bytes, {zero_runs} zero-runs elided");
+    Ok(())
+}
+
+/// Import a sparse raw file into a new or existing volume.
+#[allow(clippy::too_many_arguments)]
+pub async fn import(
+    info: &ConnectionInfo,
+    file: &Path,
+    name: Option<&str>,
+    base: Option<&str>,
+    size_bytes: Option<i64>,
+    storage_class: &str,
+    node: Option<&str>,
+    punch_zeros: bool,
+) -> Result<()> {
+    let meta = std::fs::metadata(file).with_context(|| format!("stat {}", file.display()))?;
+    let logical_size = size_bytes.unwrap_or(meta.len() as i64);
+    if logical_size <= 0 {
+        bail!("import size must be positive");
+    }
+
+    let mut client = client::controller_client(info).await?;
+    let volume_name = if let Some(base) = base {
+        base.to_string()
+    } else {
+        let name =
+            name.ok_or_else(|| anyhow::anyhow!("--name is required unless --base is set"))?;
+        let resp = client
+            .create_volume(controller_proto::CreateVolumeRequest {
+                name: name.to_string(),
+                size_bytes: logical_size,
+                storage_class: storage_class.to_string(),
+                vm: String::new(),
+                guest_format_json: String::new(),
+                from_snapshot: String::new(),
+                encrypt: false,
+                node: node.unwrap_or("").to_string(),
+                volume_name: String::new(),
+            })
+            .await?
+            .into_inner();
+        if !resp.success {
+            bail!("{}", resp.message);
+        }
+        name.to_string()
+    };
+
+    let data = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let block_size = 4 * 1024 * 1024i64;
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let volume_name_for_stream = volume_name.clone();
+    tokio::spawn(async move {
+        let _ = tx
+            .send(controller_proto::WriteVolumeBlocksRequest {
+                msg: Some(controller_proto::write_volume_blocks_request::Msg::Target(
+                    controller_proto::WriteVolumeBlocksTarget {
+                        volume_name: volume_name_for_stream,
+                        punch_zero_runs: punch_zeros,
+                    },
+                )),
+            })
+            .await;
+        let mut offset = 0i64;
+        while offset < data.len() as i64 {
+            let end = ((offset + block_size) as usize).min(data.len());
+            let chunk = &data[offset as usize..end];
+            let body = if chunk.iter().all(|&b| b == 0) {
+                controller_proto::volume_block::Body::ZeroLength(chunk.len() as i64)
+            } else {
+                controller_proto::volume_block::Body::Data(chunk.to_vec())
+            };
+            if tx
+                .send(controller_proto::WriteVolumeBlocksRequest {
+                    msg: Some(controller_proto::write_volume_blocks_request::Msg::Block(
+                        controller_proto::VolumeBlock {
+                            offset,
+                            body: Some(body),
+                        },
+                    )),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            offset = end as i64;
+        }
+    });
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let resp = client.write_volume_blocks(outbound).await?.into_inner();
+    println!(
+        "imported {} into volume '{volume_name}' ({} bytes, {} blocks, {} zero-runs)",
+        file.display(),
+        resp.bytes_written,
+        resp.blocks_written,
+        resp.zero_runs
+    );
     Ok(())
 }

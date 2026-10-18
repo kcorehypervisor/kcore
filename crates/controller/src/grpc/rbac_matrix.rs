@@ -90,6 +90,18 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_AFTER_RENEW: &[(&str, &str)] = &[
     ("GetNetworkOverview", "read-only"),
     ("GetStorageOverview", "read-only"),
     ("ListVolumes", "read-only"),
+    ("CreateVolumeSnapshot", "backup-operator"),
+    ("ListVolumeSnapshots", "read-only"),
+    ("DeleteVolumeSnapshot", "backup-operator"),
+    ("RestoreVolume", "vm-admin"),
+    ("FlattenVolume", "vm-admin"),
+    ("ExposeVolumeSnapshot", "backup-operator"),
+    ("UnexposeVolumeSnapshot", "backup-operator"),
+    ("ListVolumeChangedExtents", "backup-operator"),
+    ("ReadVolumeBlocks", "backup-operator"),
+    ("WriteVolumeBlocks", "backup-operator"),
+    ("FreezeVmFilesystems", "backup-operator"),
+    ("CreateVolume", "backup-operator"),
     ("CreateDiskLayout", "cluster-admin"),
     ("GetDiskLayout", "read-only"),
     ("ListDiskLayouts", "read-only"),
@@ -266,6 +278,7 @@ mod tests {
         fn operator_rpc_role_matrix_matches_partial_order(
             eff in prop::sample::select(vec![
                 OperatorRole::ReadOnly,
+                OperatorRole::BackupOperator,
                 OperatorRole::VmAdmin,
                 OperatorRole::ClusterAdmin,
             ])

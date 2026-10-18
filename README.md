@@ -128,6 +128,7 @@ See:
 - [File structure](docs/file-structure.md)
 - [kcore SAN (Ceph)](docs/ceph.md)
 - [VM migration (cold / live)](docs/vm-migration.md)
+- [Backup, snapshots and volume export](docs/backup.md)
 
 ## Developer Workflow
 

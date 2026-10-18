@@ -48,6 +48,14 @@ service NodeStorage {
   rpc FlattenVolume(FlattenVolumeRequest) returns (FlattenVolumeResponse);
   rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
 
+  // Snapshot export hooks (docs/backup.md). Backend-neutral; dispatch on
+  // storage_class (ceph | zfs | lvm).
+  rpc ExposeSnapshot(ExposeSnapshotRequest) returns (ExposeSnapshotResponse);
+  rpc UnexposeSnapshot(UnexposeSnapshotRequest) returns (UnexposeSnapshotResponse);
+  rpc ListChangedExtents(ListChangedExtentsRequest) returns (ListChangedExtentsResponse);
+  rpc ReadVolumeExtents(ReadVolumeExtentsRequest) returns (stream VolumeBlock);
+  rpc WriteVolumeExtents(stream WriteVolumeExtentsRequest) returns (WriteVolumeExtentsResponse);
+
   // Format, mount, and unmount a logical volume in this node's volume group.
   // Mount points must be under /var/lib/kcore or /mnt/kcore.
   rpc FormatVolume(FormatVolumeRequest) returns (FormatVolumeResponse);
@@ -532,40 +540,117 @@ message DetachVolumeRequest {
 message DetachVolumeResponse {}
 
 message SnapshotVolumeRequest {
-  // pool/image
+  // pool/image (ceph), pool/dataset (zfs), or vg/lv (lvm)
   string backend_handle = 1;
   string snapshot_name = 2;
   bool protect = 3;
+  // ceph | zfs | lvm; empty = infer from handle
+  string storage_class = 4;
 }
 
 message SnapshotVolumeResponse {
-  string snapshot_handle = 1; // pool/image@snap
+  string snapshot_handle = 1; // pool/image@snap (or class-equivalent)
 }
 
 message DeleteVolumeSnapshotRequest {
-  string backend_handle = 1; // pool/image
+  string backend_handle = 1;
   string snapshot_name = 2;
   bool unprotect = 3;
+  string storage_class = 4;
 }
 
 message DeleteVolumeSnapshotResponse {}
 
 message CloneVolumeRequest {
-  string parent_handle = 1; // pool/image
+  string parent_handle = 1;
   string parent_snapshot = 2;
   string child_image = 3;
+  string storage_class = 4;
 }
 
 message CloneVolumeResponse {
-  string backend_handle = 1; // pool/child_image
+  string backend_handle = 1;
 }
 
 message RollbackVolumeRequest {
-  string backend_handle = 1; // pool/image
+  string backend_handle = 1;
   string snapshot_name = 2;
+  string storage_class = 3;
 }
 
 message RollbackVolumeResponse {}
+
+message ExposeSnapshotRequest {
+  string backend_handle = 1;
+  string snapshot_name = 2;
+  string storage_class = 3;
+  int32 lease_seconds = 4;
+}
+
+message ExposeSnapshotResponse {
+  string lease_id = 1;
+  string device_path = 2;
+  int64 size_bytes = 3;
+  int32 block_size = 4;
+}
+
+message UnexposeSnapshotRequest {
+  string lease_id = 1;
+}
+
+message UnexposeSnapshotResponse {}
+
+message Extent {
+  int64 offset = 1;
+  int64 length = 2;
+}
+
+message ListChangedExtentsRequest {
+  string backend_handle = 1;
+  string storage_class = 2;
+  string from_snapshot = 3;
+  string to_snapshot = 4;
+}
+
+message ListChangedExtentsResponse {
+  repeated Extent extents = 1;
+  bool supported = 2;
+  string source = 3;
+}
+
+message ReadVolumeExtentsRequest {
+  string lease_id = 1;
+  repeated Extent extents = 2;
+  int32 block_size = 3;
+  bool elide_zero_blocks = 4;
+}
+
+message VolumeBlock {
+  int64 offset = 1;
+  oneof body {
+    bytes data = 2;
+    int64 zero_length = 3;
+  }
+}
+
+message WriteVolumeExtentsRequest {
+  oneof msg {
+    WriteVolumeTarget target = 1;
+    VolumeBlock block = 2;
+  }
+}
+
+message WriteVolumeTarget {
+  string backend_handle = 1;
+  string storage_class = 2;
+  bool punch_zero_runs = 3;
+}
+
+message WriteVolumeExtentsResponse {
+  int64 bytes_written = 1;
+  int64 blocks_written = 2;
+  int64 zero_runs = 3;
+}
 
 message FlattenVolumeRequest {
   string backend_handle = 1; // pool/image (clone)

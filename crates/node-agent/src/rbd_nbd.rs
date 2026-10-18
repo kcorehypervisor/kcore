@@ -35,17 +35,34 @@ pub fn device_link(pool: &str, image: &str) -> PathBuf {
 
 /// Extract the `/dev/nbdN` node for `pool/image` from `rbd device list -t nbd --format json`.
 pub fn parse_mapped_device(json: &str, pool: &str, image: &str) -> Option<String> {
+    parse_mapped_device_snap(json, pool, image, None)
+}
+
+/// Like [`parse_mapped_device`], but match a specific snapshot name.
+/// `snap = None` matches the image head (`snap` absent, `"-"`, or `""`).
+pub fn parse_mapped_device_snap(
+    json: &str,
+    pool: &str,
+    image: &str,
+    snap: Option<&str>,
+) -> Option<String> {
     let entries: serde_json::Value = serde_json::from_str(json).ok()?;
     entries.as_array()?.iter().find_map(|e| {
         let same_image = e.get("pool")?.as_str()? == pool && e.get("image")?.as_str()? == image;
-        let head = matches!(
-            e.get("snap").and_then(|s| s.as_str()),
-            None | Some("-" | "")
-        );
-        (same_image && head)
+        let entry_snap = e.get("snap").and_then(|s| s.as_str());
+        let snap_ok = match snap {
+            None => matches!(entry_snap, None | Some("-" | "")),
+            Some(want) => entry_snap == Some(want),
+        };
+        (same_image && snap_ok)
             .then(|| e.get("device").and_then(|d| d.as_str()).map(str::to_string))
             .flatten()
     })
+}
+
+/// The nbd node currently serving `pool/image@snap`, if mapped.
+pub fn mapped_device_snap(pool: &str, image: &str, snap: &str) -> Option<String> {
+    parse_mapped_device_snap(&list_nbd_json(), pool, image, Some(snap))
 }
 
 fn list_nbd_json() -> String {
@@ -264,6 +281,18 @@ mod tests {
     fn finds_head_image_device() {
         assert_eq!(
             parse_mapped_device(LIST, "kcore-vms", "kcore-vm-b").as_deref(),
+            Some("/dev/nbd1")
+        );
+    }
+
+    #[test]
+    fn finds_snapshot_device() {
+        assert_eq!(
+            parse_mapped_device_snap(LIST, "kcore-vms", "kcore-vm-b", Some("s1")).as_deref(),
+            Some("/dev/nbd2")
+        );
+        assert_eq!(
+            parse_mapped_device_snap(LIST, "kcore-vms", "kcore-vm-b", None).as_deref(),
             Some("/dev/nbd1")
         );
     }

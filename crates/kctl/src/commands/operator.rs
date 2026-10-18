@@ -8,6 +8,7 @@ use crate::OperatorRoleArg;
 pub fn role_kind_from_cli(r: OperatorRoleArg) -> proto::OperatorRoleKind {
     match r {
         OperatorRoleArg::ReadOnly => proto::OperatorRoleKind::ReadOnly,
+        OperatorRoleArg::BackupOperator => proto::OperatorRoleKind::BackupOperator,
         OperatorRoleArg::VmAdmin => proto::OperatorRoleKind::VmAdmin,
         OperatorRoleArg::ClusterAdmin => proto::OperatorRoleKind::ClusterAdmin,
     }

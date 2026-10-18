@@ -90,6 +90,7 @@ async fn reconcile_policy(
                 backend_handle: format!("{}/{}", vol.pool, vol.image),
                 snapshot_name: rbd_snap.clone(),
                 protect: true,
+                storage_class: crate::volume_export::storage_class_for(vol),
             })
             .await
             .map_err(|e| format!("snap {}: {e}", vol.name))?;
@@ -155,6 +156,7 @@ async fn prune_volume(
                 backend_handle: format!("{}/{}", vol.pool, vol.image),
                 snapshot_name: snap.rbd_snap.clone(),
                 unprotect: snap.protected,
+                storage_class: crate::volume_export::storage_class_for(vol),
             })
             .await
         {

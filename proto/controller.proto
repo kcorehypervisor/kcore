@@ -140,13 +140,21 @@ service Controller {
   rpc GetVmOperation(GetVmOperationRequest) returns (GetVmOperationResponse);
   rpc CancelVmOperation(CancelVmOperationRequest) returns (CancelVmOperationResponse);
 
-  // Volume snapshots (Ceph RBD crash-consistent).
+  // Volume snapshots (Ceph RBD, ZFS, LVM thin).
   rpc CreateVolumeSnapshot(CreateVolumeSnapshotRequest) returns (CreateVolumeSnapshotResponse);
   rpc ListVolumeSnapshots(ListVolumeSnapshotsRequest) returns (ListVolumeSnapshotsResponse);
   rpc DeleteVolumeSnapshot(DeleteVolumeSnapshotRequest) returns (DeleteVolumeSnapshotResponse);
   rpc RestoreVolume(RestoreVolumeRequest) returns (RestoreVolumeResponse);
   rpc FlattenVolume(FlattenVolumeRequest) returns (FlattenVolumeResponse);
   rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
+
+  // Snapshot export hooks (docs/backup.md). Controllers proxy to NodeStorage.
+  rpc ExposeVolumeSnapshot(ExposeVolumeSnapshotRequest) returns (ExposeVolumeSnapshotResponse);
+  rpc UnexposeVolumeSnapshot(UnexposeVolumeSnapshotRequest) returns (UnexposeVolumeSnapshotResponse);
+  rpc ListVolumeChangedExtents(ListVolumeChangedExtentsRequest) returns (ListVolumeChangedExtentsResponse);
+  rpc ReadVolumeBlocks(ReadVolumeBlocksRequest) returns (stream VolumeBlock);
+  rpc WriteVolumeBlocks(stream WriteVolumeBlocksRequest) returns (WriteVolumeBlocksResponse);
+  rpc FreezeVmFilesystems(FreezeVmFilesystemsRequest) returns (FreezeVmFilesystemsResponse);
   // Format, mount, and unmount an LVM or ZFS volume on the node that owns it.
   rpc FormatVolume(FormatVolumeRequest) returns (FormatVolumeResponse);
   rpc MountVolume(MountVolumeRequest) returns (MountVolumeResponse);
@@ -1345,6 +1353,7 @@ enum OperatorRoleKind {
   OPERATOR_ROLE_KIND_READ_ONLY = 1;
   OPERATOR_ROLE_KIND_VM_ADMIN = 2;
   OPERATOR_ROLE_KIND_CLUSTER_ADMIN = 3;
+  OPERATOR_ROLE_KIND_BACKUP_OPERATOR = 4;
 }
 
 message Operator {
@@ -1779,6 +1788,85 @@ message ListSnapshotPoliciesRequest {}
 message ListSnapshotPoliciesResponse { repeated SnapshotPolicy policies = 1; }
 message DeleteSnapshotPolicyRequest { string name = 1; }
 message DeleteSnapshotPolicyResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ExposeVolumeSnapshotRequest {
+  string volume_name = 1;
+  string snapshot_name = 2;
+  int32 lease_seconds = 3;
+}
+
+message ExposeVolumeSnapshotResponse {
+  string lease_id = 1;
+  string node_id = 2;
+  string node_address = 3;
+  string device_path = 4;
+  int64 size_bytes = 5;
+  int32 block_size = 6;
+}
+
+message UnexposeVolumeSnapshotRequest { string lease_id = 1; }
+message UnexposeVolumeSnapshotResponse {}
+
+message VolumeExtent {
+  int64 offset = 1;
+  int64 length = 2;
+}
+
+message ListVolumeChangedExtentsRequest {
+  string volume_name = 1;
+  string from_snapshot = 2;
+  string to_snapshot = 3;
+}
+
+message ListVolumeChangedExtentsResponse {
+  repeated VolumeExtent extents = 1;
+  bool supported = 2;
+  string source = 3;
+}
+
+message ReadVolumeBlocksRequest {
+  string lease_id = 1;
+  repeated VolumeExtent extents = 2;
+  int32 block_size = 3;
+  bool elide_zero_blocks = 4;
+}
+
+message VolumeBlock {
+  int64 offset = 1;
+  oneof body {
+    bytes data = 2;
+    int64 zero_length = 3;
+  }
+}
+
+message WriteVolumeBlocksRequest {
+  oneof msg {
+    WriteVolumeBlocksTarget target = 1;
+    VolumeBlock block = 2;
+  }
+}
+
+message WriteVolumeBlocksTarget {
+  string volume_name = 1;
+  bool punch_zero_runs = 2;
+}
+
+message WriteVolumeBlocksResponse {
+  int64 bytes_written = 1;
+  int64 blocks_written = 2;
+  int64 zero_runs = 3;
+}
+
+message FreezeVmFilesystemsRequest {
+  string vm_name = 1;
+  bool freeze = 2;
+  int32 timeout_ms = 3;
+}
+
+message FreezeVmFilesystemsResponse {
   bool success = 1;
   string message = 2;
 }
