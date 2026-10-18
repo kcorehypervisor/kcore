@@ -101,6 +101,8 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_AFTER_RENEW: &[(&str, &str)] = &[
     ("ReadVolumeBlocks", "backup-operator"),
     ("WriteVolumeBlocks", "backup-operator"),
     ("FreezeVmFilesystems", "backup-operator"),
+    ("PrepareInstantRecovery", "backup-operator"),
+    ("FinalizeInstantRecovery", "backup-operator"),
     ("CreateVolume", "backup-operator"),
     ("DeleteVolume", "backup-operator"),
     ("CreateDiskLayout", "cluster-admin"),
