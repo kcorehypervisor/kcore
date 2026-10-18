@@ -1,4 +1,5 @@
 //! Tests that the dashboard renders graceful error messages when the controller is unreachable.
+#![cfg(not(dashboard_spa))]
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};

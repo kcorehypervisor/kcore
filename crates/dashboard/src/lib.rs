@@ -1,4 +1,5 @@
-//! kcore web dashboard (Leptos SSR, controller gRPC).
+//! kcore web dashboard. `/api/v1` is the controller control plane. `/` is the
+//! React app when `web/dist` was built, and the Leptos pages otherwise.
 
 // Nested list tables + shared pagers produce deep Leptos view types.
 #![recursion_limit = "256"]
@@ -11,6 +12,7 @@ pub mod app_server;
 pub mod ceph_status;
 pub mod config;
 pub mod console;
+pub mod control;
 pub mod controller_client;
 pub mod dto;
 pub mod format;

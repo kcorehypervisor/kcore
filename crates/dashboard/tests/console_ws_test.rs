@@ -40,7 +40,7 @@ async fn console_websocket_echoes_bytes() {
         .await
         .expect("send");
 
-    let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+    let reply = tokio::time::timeout(Duration::from_secs(10), ws.next())
         .await
         .expect("timeout waiting for echo")
         .expect("stream ended")

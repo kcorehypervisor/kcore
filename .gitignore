@@ -3,6 +3,8 @@
 
 /target
 /result
+crates/dashboard/web/node_modules
+crates/dashboard/web/dist
 /result-*
 /result-kctl
 /dist
