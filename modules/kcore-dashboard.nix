@@ -1,4 +1,4 @@
-# NixOS module: kcore Leptos dashboard (gRPC client to controller; no SQLite).
+# NixOS module: kcore dashboard (React control plane; controller gRPC).
 {
   config,
   lib,
@@ -9,7 +9,7 @@ let
 in
 {
   options.services.kcore-dashboard = {
-    enable = lib.mkEnableOption "kcore web dashboard (reads controller over gRPC)";
+    enable = lib.mkEnableOption "kcore web dashboard (manages the cluster through the controller API)";
 
     package = lib.mkOption {
       type = lib.types.package;

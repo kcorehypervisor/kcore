@@ -112,6 +112,30 @@
               inherit cargoArtifacts;
               pname = "kcore-dashboard";
               cargoExtraArgs = "-p kcore-dashboard";
+              src = pkgs.lib.cleanSourceWith {
+                src = ./.;
+                filter =
+                  path: type:
+                  (craneLib.filterCargoSources path type)
+                  || pkgs.lib.hasPrefix "${toString ./.}/proto/" (toString path)
+                  || (toString path) == "${toString ./.}/modules"
+                  || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
+                  || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
+                  || pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/assets/" (toString path)
+                  || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path)
+                  || (
+                    pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/web/" (toString path)
+                    && !pkgs.lib.hasInfix "/node_modules/" (toString path)
+                    && !pkgs.lib.hasInfix "/dist/" (toString path)
+                  );
+              };
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.nodejs ];
+              preBuild = ''
+                cd crates/dashboard/web
+                npm ci --ignore-scripts
+                npm run build
+                cd ../..
+              '';
             }
           );
 

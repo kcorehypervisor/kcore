@@ -1,6 +1,7 @@
 //! End-to-end HTTP tests: Axum + Leptos SSR + server functions against a mock gRPC controller.
 //!
 //! Uses `OnceLock` for config, so all assertions live in a single `#[tokio::test]`.
+#![cfg(not(dashboard_spa))]
 
 mod support;
 
@@ -77,6 +78,13 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(home.contains(r#"href="/health""#));
     assert!(home.contains(r#"href="/nodes""#));
     assert!(home.contains(r#"href="/containers""#));
+
+    let (status, catalog) = fetch(&app, "/api/v1/catalog").await;
+    assert_eq!(status, StatusCode::OK, "catalog status");
+    assert!(
+        catalog.contains("kcore_vm"),
+        "catalog must name the terraform VM resource"
+    );
 
     // ── Compliance ────────────────────────────────────────────────────
     let (status, compliance) = fetch(&app, "/compliance").await;

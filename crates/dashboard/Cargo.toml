@@ -2,7 +2,7 @@
 name = "kcore-dashboard"
 version = "0.5.0"
 edition = "2021"
-description = "kcore web dashboard (Leptos SSR, controller gRPC)"
+description = "kcore web dashboard (React control plane, controller gRPC)"
 
 [lib]
 crate-type = ["rlib"]
@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22.1"
 http = "1"
 leptos = { version = "0.8", features = ["ssr"] }
 leptos_axum = "0.8"
@@ -30,6 +31,7 @@ tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["tls", "transport"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
+rust-embed = "8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

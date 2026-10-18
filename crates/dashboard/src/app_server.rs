@@ -14,7 +14,7 @@ use crate::console;
 /// the result is `Router<()>` and can be used with [`axum::serve`].
 pub fn dashboard_router(leptos_options: LeptosOptions) -> Router<()> {
     let routes = generate_route_list(App);
-    let leptos_app = Router::new()
+    let leptos_app: Router<()> = Router::new()
         .route(
             "/dashboard.css",
             get(|| async {
@@ -32,7 +32,17 @@ pub fn dashboard_router(leptos_options: LeptosOptions) -> Router<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(leptos_options);
 
-    Router::new()
+    let api = Router::new()
         .merge(console::console_routes())
-        .merge(leptos_app)
+        .nest("/api/v1", crate::control::router());
+
+    #[cfg(not(dashboard_spa))]
+    {
+        api.merge(leptos_app)
+    }
+    #[cfg(dashboard_spa)]
+    {
+        let _ = leptos_app;
+        api.fallback(crate::control::spa)
+    }
 }

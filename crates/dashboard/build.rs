@@ -12,5 +12,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
     println!("cargo:rerun-if-changed={}", controller_proto.display());
+    println!("cargo:rustc-check-cfg=cfg(dashboard_spa)");
+
+    let spa = manifest_dir.join("web").join("dist").join("index.html");
+    println!("cargo:rerun-if-changed={}", spa.display());
+    if spa.is_file() {
+        println!("cargo:rustc-cfg=dashboard_spa");
+    }
     Ok(())
 }

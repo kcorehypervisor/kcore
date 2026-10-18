@@ -1,6 +1,7 @@
 //! Pagination test: 15 VMs across 2 pages, multiple networks.
 //!
 //! Separate binary so `OnceLock` / `set_dashboard_config` doesn't conflict.
+#![cfg(not(dashboard_spa))]
 
 mod support;
 
