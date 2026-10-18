@@ -7,6 +7,7 @@
   consoleModule,
 }:
 let
+  installScript = builtins.readFile ../modules/kcore-backup-install.sh;
   eval = nixosSystem {
     inherit (pkgs.stdenv.hostPlatform) system;
     modules = [
@@ -52,5 +53,10 @@ pkgs.runCommand "kcore-backup-host-eval"
     test ${flag (cfg.systemd.services ? kcore-controller)} = 0
     echo ${lib.escapeShellArg cfg.environment.etc."kcore/version".text} | grep -q 0.5.0
     echo ${lib.escapeShellArg (lib.concatStringsSep " " cfg.systemd.tmpfiles.rules)} | grep -q /var/lib/kcore-vault
+    test ${flag (lib.hasInfix "kcore-vault.url = \"github:kcorehypervisor/kcore-vault\"" installScript)} = 1
+    test ${flag (lib.hasInfix "kcore-vault.nixosModules.kcore-vault" installScript)} = 1
+    test ${flag (lib.hasInfix "services.kcore-vault.enable = true;" installScript)} = 1
+    test ${flag (lib.hasInfix "443" installScript)} = 1
+    test ${flag (lib.hasInfix "10809" installScript)} = 1
     touch $out
   ''

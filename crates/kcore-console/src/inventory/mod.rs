@@ -9,7 +9,24 @@ pub mod network;
 pub mod route;
 pub mod system;
 
+use std::sync::OnceLock;
+
 use self::system::Meta;
+
+static PRODUCT: OnceLock<String> = OnceLock::new();
+
+/// Records the `--product` name for the overview card. The first call wins.
+pub fn set_product(name: &str) {
+    let _ = PRODUCT.set(name.to_string());
+}
+
+pub(crate) fn product_label() -> String {
+    match PRODUCT.get().map(String::as_str) {
+        Some("vault") => "kcore vault".to_string(),
+        Some(name) if !name.is_empty() => format!("kcore {name}"),
+        _ => "kcore hypervisor".to_string(),
+    }
+}
 
 /// Full snapshot for one UI refresh.
 #[derive(Debug, Clone, Default)]
