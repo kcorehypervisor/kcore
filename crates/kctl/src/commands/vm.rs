@@ -38,6 +38,7 @@ pub struct CreateArgs {
     pub nvme: Vec<String>,
     pub pci: Vec<String>,
     pub node_labels: Vec<String>,
+    pub labels: Vec<String>,
     pub anti_affinity: Option<String>,
 }
 
@@ -73,6 +74,7 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
         nvme: vec![],
         pci: vec![],
         node_labels: vec![],
+        labels: vec![],
         anti_affinity: None,
     };
     create(info, args).await
@@ -134,6 +136,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_gpus,
         manifest_node_labels,
         manifest_anti_affinity,
+        manifest_labels,
     ) = if let Some(path) = &args.filename {
         let manifest = parse_vm_manifest(path)?;
         let n = args.name.clone().unwrap_or(manifest.name);
@@ -156,6 +159,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             manifest.gpus,
             manifest.node_labels,
             manifest.anti_affinity,
+            manifest.labels,
         )
     } else {
         let n = args
@@ -194,6 +198,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             vec![],
             vec![],
             None,
+            std::collections::HashMap::new(),
         )
     };
     if nics.is_empty() && !args.extra_networks.is_empty() {
@@ -264,6 +269,16 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             args.pci.clone()
         },
         gpus: device_names(&args, manifest_gpus),
+        labels: {
+            let mut labels = manifest_labels;
+            for pair in &args.labels {
+                let Some((key, value)) = pair.split_once('=') else {
+                    bail!("--label expects key=value, got {pair}");
+                };
+                labels.insert(key.to_string(), value.to_string());
+            }
+            labels
+        },
     };
 
     let target_node = args
@@ -467,12 +482,32 @@ pub async fn delete(
     Ok(())
 }
 
+pub async fn label(
+    info: &ConnectionInfo,
+    vm_id: &str,
+    pairs: &[String],
+    target_node: Option<String>,
+) -> Result<()> {
+    let mut labels = std::collections::HashMap::new();
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--label expects key=value, got {pair}"))?;
+        if key.is_empty() {
+            anyhow::bail!("--label expects key=value, got {pair}");
+        }
+        labels.insert(key.to_string(), value.to_string());
+    }
+    update(info, vm_id, None, None, target_node, labels).await
+}
+
 pub async fn update(
     info: &ConnectionInfo,
     vm_id: &str,
     cpu: Option<i32>,
     memory: Option<String>,
     target_node: Option<String>,
+    labels: std::collections::HashMap<String, String>,
 ) -> Result<()> {
     let memory_bytes = match &memory {
         Some(m) => client::parse_size_bytes(m).map_err(|e| anyhow::anyhow!(e))?,
@@ -486,6 +521,7 @@ pub async fn update(
             target_node: target_node.unwrap_or_default(),
             cpu: cpu.unwrap_or(0),
             memory_bytes,
+            labels,
         })
         .await?
         .into_inner();
@@ -792,6 +828,7 @@ struct VmManifest {
     gpus: Vec<String>,
     node_labels: Vec<String>,
     anti_affinity: Option<String>,
+    labels: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -1240,6 +1277,14 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
             .as_str()
             .or_else(|| doc["spec"]["anti_affinity"].as_str())
             .map(|s| s.to_string()),
+        labels: doc["spec"]["labels"]
+            .as_mapping()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -1459,6 +1504,7 @@ mod tests {
             nvme: vec![],
             pci: vec![],
             node_labels: vec![],
+            labels: vec![],
             anti_affinity: None,
         }
     }

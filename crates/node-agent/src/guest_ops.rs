@@ -171,6 +171,7 @@ pub fn fsfreeze_script(freeze: bool) -> &'static str {
 }
 
 /// Run fsfreeze in the guest over SSH (same identity/options as grow/probe).
+#[allow(clippy::too_many_arguments)]
 pub async fn guest_fsfreeze(
     paths: &GuestOpsPaths,
     user: &str,
@@ -178,7 +179,12 @@ pub async fn guest_fsfreeze(
     port: u16,
     freeze: bool,
     timeout: Duration,
+    pre_script: &str,
+    post_script: &str,
 ) -> Result<(), String> {
+    if freeze && !pre_script.trim().is_empty() {
+        ssh_exec(&paths.identity_file(), user, ip, port, pre_script, timeout).await?;
+    }
     ssh_exec(
         &paths.identity_file(),
         user,
@@ -187,8 +193,11 @@ pub async fn guest_fsfreeze(
         fsfreeze_script(freeze),
         timeout,
     )
-    .await
-    .map(|_| ())
+    .await?;
+    if !post_script.trim().is_empty() {
+        ssh_exec(&paths.identity_file(), user, ip, port, post_script, timeout).await?;
+    }
+    Ok(())
 }
 
 pub async fn ssh_exec(

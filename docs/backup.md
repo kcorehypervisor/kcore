@@ -105,6 +105,14 @@ write extents, `CreateVolume`, `CreateVm`, `SetVmDesiredState`,
 access to `ControllerAdmin`. Issue it with `kctl create operator backup --role
 backup-operator`.
 
+### VM labels
+
+`kctl create vm web --vm-label env=lab` stores labels on the VM. `kctl label vm web --label kcore-vault/restore=job-1` merges keys into the stored map. The same map is `spec.labels` in a YAML manifest. A backup-operator can delete a VM or volume only when that VM (or the volume's VM) carries `kcore-vault/restore`.
+
+### Guest freeze scripts and reachability
+
+`FreezeVmFilesystems` takes `pre_script` and `post_script`. The node agent runs `pre_script` over GuestOps SSH before `fsfreeze`, then `post_script` after the freeze (or after thaw when `freeze` is false). An empty script is skipped. `pre_script` must be idempotent and exit 0, or the freeze fails. `GetVm` sets `guest_reachable` when the guest answers a short SSH probe, which a boot test can use without reading the serial console.
+
 ### Webhook events
 
 `vm.created`, `vm.deleted` and `vm.migrated` join `vm.state.changed` in
@@ -136,3 +144,20 @@ private channel. In outline:
 Community users can build their own flow with `kctl export` on a schedule and
 any object-storage or deduplicating tool of their choice; the hooks above are
 all that is needed.
+
+## Backup appliance ISO
+
+The backup server is a kcore Vault release, not a cut-down hypervisor ISO.
+Download `kcore-vault-X.Y.Z-x86_64-linux.iso` from the private
+`kcorehypervisor/kcore-vault` GitHub Release. That image installs the
+coordinator, the dashboard, and the console in vault mode. It does not
+install Cloud Hypervisor, Ceph, Kubernetes, the node agent, or the controller.
+
+Boot the image. The local screen is read-only. Administration is the browser
+console at `https://<appliance-ip>/` or `kcore-vault` over SSH. The installer
+in the kcore-vault repository formats an optional ZFS pool named `vault` at
+`/var/lib/kcore-vault`. The OS disk is LUKS with a key in the initrd; a copy
+is left at `/root/luks-recovery-key.txt`.
+
+The release process is `VERSION`, tag `vX.Y.Z`, and `make release` in
+`kcore-vault`. See that repository's `docs/release.md`.

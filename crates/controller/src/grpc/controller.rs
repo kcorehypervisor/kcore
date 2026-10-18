@@ -111,6 +111,14 @@ fn merge_detail_json(base: &str, extra: &str) -> String {
     }
     serde_json::Value::Object(map).to_string()
 }
+
+fn vm_labels(raw: &str) -> std::collections::HashMap<String, String> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn restore_labelled(raw: &str) -> bool {
+    vm_labels(raw).contains_key("kcore-vault/restore")
+}
 use super::rbac_matrix;
 use super::signing;
 use super::validation::{
@@ -1727,7 +1735,38 @@ impl ControllerService {
         Ok(false)
     }
 
-    async fn guest_fs_freeze_for_vm(&self, vm: &VmRow, freeze: bool) -> Result<(), Status> {
+    async fn guest_reachable_for(&self, vm: &VmRow) -> bool {
+        let running = vm.runtime_state == "running" || vm.auto_start;
+        if vm.vm_ip.is_empty() || !running {
+            return false;
+        }
+        let Ok(Some(node)) = self.db.get_node(&vm.node_id) else {
+            return false;
+        };
+        let Some(mut admin) = self.clients.get_admin(&node.address) else {
+            return true;
+        };
+        let req = node_proto::GuestDiskProbeRequest {
+            vm_name: sanitize_nix_attr_key(&vm.name),
+            network: vm.network.clone(),
+            disk_serial: String::new(),
+            ssh_user: String::new(),
+            port: 22,
+            timeout_ms: 1500,
+        };
+        match tokio::time::timeout(Duration::from_secs(2), admin.guest_disk_probe(req)).await {
+            Ok(Ok(resp)) => resp.into_inner().success,
+            _ => false,
+        }
+    }
+
+    async fn guest_fs_freeze_for_vm(
+        &self,
+        vm: &VmRow,
+        freeze: bool,
+        pre_script: &str,
+        post_script: &str,
+    ) -> Result<(), Status> {
         let node = self
             .db
             .get_node(&vm.node_id)
@@ -1750,6 +1789,8 @@ impl ControllerService {
                 port: 22,
                 timeout_ms: 60_000,
                 freeze,
+                pre_script: pre_script.to_string(),
+                post_script: post_script.to_string(),
             })
             .await
             .map_err(|e| {
@@ -3082,6 +3123,17 @@ impl ControllerService {
         } else {
             previous_names
         };
+        self.webhooks.emit(
+            crate::webhooks::EVENT_VM_MIGRATED,
+            format!("vm/{}", vm.id),
+            serde_json::json!({
+                "vmId": vm.id,
+                "vmName": vm.name,
+                "sourceNode": source_node.id,
+                "targetNode": target.id,
+                "mode": "cold",
+            }),
+        );
         self.log_replication_event_required(
             actor,
             Some("MigrateVm"),
@@ -4940,6 +4992,17 @@ impl ControllerService {
             if let Err(e) = self.db.mark_node_config_push(node_id) {
                 warn!(node_id, error = %e, "failed to record config refresh for failed node");
             }
+            self.webhooks.emit(
+                crate::webhooks::EVENT_VM_MIGRATED,
+                format!("vm/{}", vm.id),
+                serde_json::json!({
+                    "vmId": vm.id,
+                    "vmName": vm.name,
+                    "sourceNode": node_id,
+                    "targetNode": target.id,
+                    "mode": "failover",
+                }),
+            );
             let _ = self.log_replication_event_required(
                 "controller",
                 Some("FailoverVm"),
@@ -5776,7 +5839,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::CreateVmRequest>,
     ) -> Result<Response<controller_proto::CreateVmResponse>, Status> {
-        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
         let actor = Self::audit_actor(&request);
         let mut req = request.into_inner();
         let spec = req
@@ -6080,6 +6143,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             storage_size_bytes: requested_storage_size_bytes,
             vm_ip,
             pci_devices,
+            labels: serde_json::to_string(&spec.labels).unwrap_or_else(|_| "{}".into()),
         };
 
         if vm.storage_backend == "ceph" {
@@ -6244,6 +6308,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
             })
             .collect();
 
+        self.webhooks.emit(
+            crate::webhooks::EVENT_VM_CREATED,
+            format!("vm/{vm_id}"),
+            serde_json::json!({ "vmId": vm_id, "name": vm.name, "labels": vm.labels }),
+        );
         self.log_replication_event(
             &actor,
             Some("CreateVm"),
@@ -6268,6 +6337,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "storageSizeBytes": vm.storage_size_bytes,
                 "vmIp": vm.vm_ip,
                 "pciDevices": crate::pci::split_pci_devices(&vm.pci_devices),
+                "labels": vm.labels,
                 "gpuName": assigned_gpus,
                 "sshKeyNames": ssh_key_names,
                 "extraNics": extra_nic_body,
@@ -6306,18 +6376,48 @@ impl controller_proto::controller_server::Controller for ControllerService {
             None
         };
 
-        if cpu.is_none() && mem.is_none() {
+        if cpu.is_none() && mem.is_none() && req.labels.is_empty() {
             return Err(Status::invalid_argument(
-                "at least one of cpu or memory_bytes must be set",
+                "at least one of cpu, memory_bytes, or labels must be set",
             ));
         }
 
-        let updated = self
-            .db
-            .update_vm_spec(&req.vm_id, cpu, mem)
-            .map_err(|e| Status::internal(format!("updating vm: {e}")))?;
-        if !updated {
-            return Err(Status::not_found(format!("VM '{}' not found", req.vm_id)));
+        if cpu.is_some() || mem.is_some() {
+            let updated = self
+                .db
+                .update_vm_spec(&req.vm_id, cpu, mem)
+                .map_err(|e| Status::internal(format!("updating vm: {e}")))?;
+            if !updated {
+                return Err(Status::not_found(format!("VM '{}' not found", req.vm_id)));
+            }
+        }
+
+        let mut labels_body = serde_json::Value::Null;
+        if !req.labels.is_empty() {
+            let existing = self
+                .db
+                .get_vm(&req.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .or_else(|| {
+                    self.db
+                        .list_vms()
+                        .ok()
+                        .and_then(|rows| rows.into_iter().find(|v| v.name == req.vm_id))
+                })
+                .ok_or_else(|| Status::not_found(format!("VM '{}' not found", req.vm_id)))?;
+            let mut labels = vm_labels(&existing.labels);
+            for (key, value) in &req.labels {
+                labels.insert(key.clone(), value.clone());
+            }
+            let encoded = serde_json::to_string(&labels).unwrap_or_else(|_| "{}".into());
+            let updated = self
+                .db
+                .set_vm_labels(&existing.id, &encoded)
+                .map_err(|e| Status::internal(format!("storing labels: {e}")))?;
+            if !updated {
+                return Err(Status::not_found(format!("VM '{}' not found", req.vm_id)));
+            }
+            labels_body = serde_json::json!(labels);
         }
 
         info!(vm_id = %req.vm_id, cpu = ?cpu, memory_bytes = ?mem, "updated VM spec, pushing config");
@@ -6332,6 +6432,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "nodeId": node.id,
                 "cpu": cpu,
                 "memoryBytes": mem,
+                "labels": labels_body,
             }),
         );
 
@@ -6345,7 +6446,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteVmRequest>,
     ) -> Result<Response<controller_proto::DeleteVmResponse>, Status> {
-        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let role = crate::auth::controller_operator_role(
+            &request,
+            &self.db,
+            self.tls_paths.is_some(),
+            self.bootstrap_kctl,
+        )?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let node = self.resolve_node_for_vm(&req.vm_id, &req.target_node)?;
@@ -6360,6 +6467,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     .and_then(|rows| rows.into_iter().find(|v| v.name == req.vm_id))
             })
             .ok_or_else(|| Status::not_found(format!("VM '{}' not found", req.vm_id)))?;
+        if !role.satisfies(OperatorRole::VmAdmin) && !restore_labelled(&db_vm.labels) {
+            return Err(Status::permission_denied(
+                "backup-operator can delete only VMs labelled kcore-vault/restore",
+            ));
+        }
         let volumes = self
             .db
             .list_volumes_for_vm(&db_vm.id)
@@ -6420,6 +6532,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
         info!(vm_id = %db_vm.id, node_id = %node.id, "deleted VM, pushing config");
 
         self.push_config_to_node(&node).await?;
+        self.webhooks.emit(
+            crate::webhooks::EVENT_VM_DELETED,
+            format!("vm/{}", db_vm.id),
+            serde_json::json!({ "vmId": db_vm.id, "nodeId": node.id }),
+        );
         self.log_replication_event(
             &actor,
             Some("DeleteVm"),
@@ -6440,7 +6557,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::SetVmDesiredStateRequest>,
     ) -> Result<Response<controller_proto::SetVmDesiredStateResponse>, Status> {
-        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let auto_start = match controller_proto::VmDesiredState::try_from(req.desired_state)
@@ -6537,6 +6654,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     },
                     pci_devices: crate::pci::split_pci_devices(&db_vm.pci_devices),
                     gpus: self.vm_gpu_names(&db_vm.id)?,
+                    labels: vm_labels(&db_vm.labels),
                 });
                 let status = Some(controller_proto::VmStatus {
                     id: db_vm.id.clone(),
@@ -6544,11 +6662,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     created_at: None,
                     updated_at: None,
                 });
+                let guest_reachable = self.guest_reachable_for(&db_vm).await;
                 return Ok(Response::new(controller_proto::GetVmResponse {
                     spec,
                     status,
                     node_id: node.id,
                     assigned_ip: db_vm.vm_ip.clone(),
+                    guest_reachable,
                 }));
             }
         };
@@ -6660,6 +6780,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 },
                 pci_devices: crate::pci::split_pci_devices(&db_vm.pci_devices),
                 gpus: gpu_names.clone(),
+                labels: vm_labels(&db_vm.labels),
             }
         });
 
@@ -6670,11 +6791,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
             updated_at: s.updated_at,
         });
 
+        let guest_reachable = self.guest_reachable_for(&db_vm).await;
         Ok(Response::new(controller_proto::GetVmResponse {
             spec,
             status,
             node_id: node.id,
             assigned_ip: db_vm.vm_ip,
+            guest_reachable,
         }))
     }
 
@@ -6899,6 +7022,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     created_at: None,
                     storage_backend: vm.storage_backend,
                     storage_size_bytes: vm.storage_size_bytes,
+                    labels: vm_labels(&vm.labels),
                 }
             })
             .collect();
@@ -9183,6 +9307,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 operation_id,
                 warnings,
             }) => {
+                self.webhooks.emit(
+                    crate::webhooks::EVENT_VM_MIGRATED,
+                    format!("vm/{}", vm.id),
+                    serde_json::json!({
+                        "vmId": vm.id,
+                        "vmName": vm.name,
+                        "sourceNode": source_node.id,
+                        "targetNode": target.id,
+                        "mode": "live",
+                    }),
+                );
                 self.log_replication_event_required(
                     &actor,
                     Some("MigrateVm"),
@@ -9240,6 +9375,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
                             ),
                         )
                     })?;
+                self.webhooks.emit(
+                    crate::webhooks::EVENT_VM_MIGRATED,
+                    format!("vm/{}", vm.id),
+                    serde_json::json!({
+                        "vmId": vm.id,
+                        "vmName": vm.name,
+                        "sourceNode": source_node.id,
+                        "targetNode": target.id,
+                        "mode": "cold",
+                    }),
+                );
                 self.log_replication_event_required(
                     &actor,
                     Some("MigrateVm"),
@@ -11111,12 +11257,32 @@ impl controller_proto::controller_server::Controller for ControllerService {
         &self,
         request: Request<controller_proto::DeleteVolumeRequest>,
     ) -> Result<Response<controller_proto::DeleteVolumeResponse>, Status> {
-        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let role = crate::auth::controller_operator_role(
+            &request,
+            &self.db,
+            self.tls_paths.is_some(),
+            self.bootstrap_kctl,
+        )?;
         let actor = Self::audit_actor(&request);
         let name = request.into_inner().name;
         let row = self
             .resolve_volume_row(name.trim())?
             .ok_or_else(|| Status::not_found(format!("volume '{name}' not found")))?;
+        let labelled = if row.vm_id.is_empty() {
+            false
+        } else {
+            self.db
+                .get_vm(&row.vm_id)
+                .ok()
+                .flatten()
+                .is_some_and(|vm| restore_labelled(&vm.labels))
+        };
+        if !role.satisfies(OperatorRole::VmAdmin) && !labelled {
+            return Err(Status::permission_denied(
+                "backup-operator can delete only volumes of a VM labelled kcore-vault/restore",
+            ));
+        }
         if row.role == VolumeRow::ROLE_ROOT {
             return Err(Status::failed_precondition(
                 "root volumes are deleted with the VM",
@@ -11319,7 +11485,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut guest_frozen = false;
         if needs_quiesce {
             let vm_row = vm_for_quiesce.as_ref().expect("attached volume has vm");
-            self.guest_fs_freeze_for_vm(vm_row, true).await?;
+            self.guest_fs_freeze_for_vm(vm_row, true, "", "").await?;
             guest_frozen = true;
         }
         let rbd_snap = VolumeRow::serial_from_id(&Uuid::new_v4().to_string());
@@ -11346,7 +11512,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(|e| Status::internal(format!("snap create: {e}")));
         if guest_frozen {
             if let Some(ref vm_row) = vm_for_quiesce {
-                if let Err(unfreeze_err) = self.guest_fs_freeze_for_vm(vm_row, false).await {
+                if let Err(unfreeze_err) = self.guest_fs_freeze_for_vm(vm_row, false, "", "").await
+                {
                     warn!(
                         vm = %vm_row.name,
                         error = %unfreeze_err,
@@ -11959,7 +12126,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.require_operator(&request, OperatorRole::BackupOperator)?;
         let req = request.into_inner();
         let vm = self.resolve_vm(req.vm_name.trim())?;
-        self.guest_fs_freeze_for_vm(&vm, req.freeze).await?;
+        self.guest_fs_freeze_for_vm(&vm, req.freeze, &req.pre_script, &req.post_script)
+            .await?;
         Ok(Response::new(
             controller_proto::FreezeVmFilesystemsResponse {
                 success: true,
@@ -15872,6 +16040,7 @@ mod tests {
             storage_size_bytes: 10 * 1024 * 1024 * 1024,
             vm_ip: String::new(),
             pci_devices: String::new(),
+            labels: String::new(),
         }
     }
 
@@ -16157,6 +16326,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16213,6 +16383,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: "https://example.com/debian.raw".to_string(),
             image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -16275,6 +16446,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16331,6 +16503,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16394,6 +16567,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16451,6 +16625,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16514,6 +16689,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16570,6 +16746,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16914,6 +17091,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec!["03:00.1".into()],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -18058,6 +18236,7 @@ mod tests {
                         desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                         pci_devices: vec![],
                         gpus: vec![],
+                        labels: std::collections::HashMap::new(),
                     }),
                     image_url: "https://example.com/img.raw".to_string(),
                     image_sha256:
@@ -19206,6 +19385,7 @@ mod tests {
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             image_url: "https://example.com/debian.raw".to_string(),
             image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

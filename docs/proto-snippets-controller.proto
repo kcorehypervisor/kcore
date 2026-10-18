@@ -338,8 +338,9 @@ message FreezeVmFilesystemsResponse {
 //   ("CreateVm",                    "backup-operator"),
 //   ("SetVmDesiredState",           "backup-operator"),
 //
-// DeleteVm / DeleteVolume stay vm-admin, except that handlers allow a
-// backup-operator to delete a resource labelled kcore-vault/restore=<job>.
+// DeleteVm and DeleteVolume are backup-operator in the matrix. Handlers still
+// deny them unless the caller is vm-admin or the VM is labelled
+// kcore-vault/restore=<job> (a volume follows its parent VM).
 // No ControllerAdmin method is granted.
 
 // ============================================================================

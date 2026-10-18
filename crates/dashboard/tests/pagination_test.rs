@@ -119,6 +119,7 @@ impl Controller for ManyVmsController {
                 created_at: None,
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                labels: std::collections::HashMap::new(),
             })
             .collect();
         Ok(Response::new(ListVmsResponse { vms }))

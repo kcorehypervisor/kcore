@@ -988,6 +988,8 @@ message GuestFsFreezeRequest {
   int32 port = 4;
   int32 timeout_ms = 5;
   bool freeze = 6; // true = --freeze /, false = --unfreeze /
+  string pre_script = 7;
+  string post_script = 8;
 }
 
 message GuestFsFreezeResponse {

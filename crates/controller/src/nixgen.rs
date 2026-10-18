@@ -596,6 +596,7 @@ mod tests {
             storage_size_bytes: 10 * 1024 * 1024 * 1024,
             vm_ip: String::new(),
             pci_devices: String::new(),
+            labels: String::new(),
         }
     }
 

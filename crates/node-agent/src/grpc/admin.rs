@@ -3465,9 +3465,18 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         } else {
             30_000
         });
-        crate::guest_ops::guest_fsfreeze(&paths, user, &ip, port, req.freeze, timeout)
-            .await
-            .map_err(Status::failed_precondition)?;
+        crate::guest_ops::guest_fsfreeze(
+            &paths,
+            user,
+            &ip,
+            port,
+            req.freeze,
+            timeout,
+            &req.pre_script,
+            &req.post_script,
+        )
+        .await
+        .map_err(Status::failed_precondition)?;
         let action = if req.freeze { "froze" } else { "unfroze" };
         Ok(Response::new(proto::GuestFsFreezeResponse {
             success: true,

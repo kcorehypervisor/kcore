@@ -130,6 +130,11 @@ enum Command {
         #[command(subcommand)]
         resource: UpdateResource,
     },
+    /// Set labels on a resource
+    Label {
+        #[command(subcommand)]
+        resource: LabelResource,
+    },
     /// Restore a volume from a snapshot (in-place rollback; VM must be stopped)
     Restore {
         #[command(subcommand)]
@@ -589,6 +594,9 @@ enum CreateResource {
         /// Required node label (key=value). Repeat to require every label.
         #[arg(long = "label")]
         node_labels: Vec<String>,
+        /// VM label key=value. Repeat for more than one. Example: kcore-vault/restore=job
+        #[arg(long = "vm-label")]
+        vm_label: Vec<String>,
         /// Keep this VM off nodes that already host the same anti-affinity group
         #[arg(long = "anti-affinity")]
         anti_affinity: Option<String>,
@@ -1051,6 +1059,21 @@ enum SetResource {
         /// Dashboard password (Ceph stores only a hash; kcore keeps the plaintext)
         #[arg(long)]
         password: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum LabelResource {
+    /// Merge key=value labels onto a virtual machine
+    Vm {
+        /// VM ID or name
+        vm_id: String,
+        /// Label key=value. Repeat to set more than one.
+        #[arg(long = "label", required = true)]
+        label: Vec<String>,
+        /// Target node (optional)
+        #[arg(long = "target-node")]
+        target_node: Option<String>,
     },
 }
 
@@ -1880,6 +1903,7 @@ async fn main() {
                     nvme,
                     pci,
                     node_labels,
+                    vm_label,
                     anti_affinity,
                 },
         } => {
@@ -1922,6 +1946,7 @@ async fn main() {
                     nvme: nvme.clone(),
                     pci: pci.clone(),
                     node_labels: node_labels.clone(),
+                    labels: vm_label.clone(),
                     anti_affinity: anti_affinity.clone(),
                 },
             )
@@ -2379,7 +2404,26 @@ async fn main() {
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::vm::update(&info, vm_id, *cpu, memory.clone(), target_node.clone()).await
+            commands::vm::update(
+                &info,
+                vm_id,
+                *cpu,
+                memory.clone(),
+                target_node.clone(),
+                std::collections::HashMap::new(),
+            )
+            .await
+        }
+        Command::Label {
+            resource:
+                LabelResource::Vm {
+                    vm_id,
+                    label,
+                    target_node,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::vm::label(&info, vm_id, label, target_node.clone()).await
         }
         Command::Update {
             resource: UpdateResource::Cluster { action },

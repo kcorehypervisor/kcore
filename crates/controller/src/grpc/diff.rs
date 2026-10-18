@@ -463,6 +463,7 @@ mod tests {
             storage_size_bytes: 20 * 1024 * 1024 * 1024,
             vm_ip: "10.0.0.5".into(),
             pci_devices: String::new(),
+            labels: String::new(),
         }
     }
 
@@ -479,6 +480,7 @@ mod tests {
             desired_state: controller_proto::VmDesiredState::Unspecified as i32,
             pci_devices: vec![],
             gpus: vec![],
+            labels: std::collections::HashMap::new(),
         }
     }
 
@@ -1209,6 +1211,7 @@ mod proptests {
                 storage_size_bytes: 0,
                 vm_ip: String::new(),
                 pci_devices: String::new(),
+                labels: String::new(),
             };
             let desired_state = if auto_start {
                 controller_proto::VmDesiredState::Running as i32
@@ -1227,6 +1230,7 @@ mod proptests {
                 desired_state,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             };
             let apply = VmApply {
                 spec: &spec,
@@ -1276,6 +1280,7 @@ mod proptests {
                 storage_size_bytes: 0,
                 vm_ip: String::new(),
                 pci_devices: String::new(),
+                labels: String::new(),
             };
             let spec = controller_proto::VmSpec {
                 id: String::new(),
@@ -1289,6 +1294,7 @@ mod proptests {
                 desired_state: controller_proto::VmDesiredState::Running as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             };
             let apply = VmApply {
                 spec: &spec,

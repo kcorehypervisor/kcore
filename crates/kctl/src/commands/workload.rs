@@ -37,6 +37,7 @@ pub async fn create(
                 desired_state: controller_proto::VmDesiredState::Unspecified as i32,
                 pci_devices: vec![],
                 gpus: vec![],
+                labels: std::collections::HashMap::new(),
             }),
             container_spec: None,
             image_url: image.unwrap_or_default().to_string(),

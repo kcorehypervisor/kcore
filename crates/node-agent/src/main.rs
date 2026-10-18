@@ -14,6 +14,7 @@ mod disk;
 mod grpc;
 mod guest_ops;
 mod host_cpu;
+mod instant;
 mod issue_screen;
 mod live_migrate;
 mod lvm_ops;

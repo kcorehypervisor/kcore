@@ -31,10 +31,10 @@ pub(crate) fn acl_entry(
 /// Operator / peer-controller RPCs on [`Controller`](crate::grpc::ControllerService)
 /// **before** the node-agent `RenewNodeCert` row in the compliance report (deterministic order).
 pub(crate) static CONTROLLER_OPERATOR_RPC_BEFORE_RENEW: &[(&str, &str)] = &[
-    ("CreateVm", "vm-admin"),
+    ("CreateVm", "backup-operator"),
     ("UpdateVm", "vm-admin"),
-    ("DeleteVm", "vm-admin"),
-    ("SetVmDesiredState", "vm-admin"),
+    ("DeleteVm", "backup-operator"),
+    ("SetVmDesiredState", "backup-operator"),
     ("GetVm", "read-only"),
     ("ListVms", "read-only"),
     ("AttachVmConsole", "vm-admin"),
@@ -102,6 +102,7 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_AFTER_RENEW: &[(&str, &str)] = &[
     ("WriteVolumeBlocks", "backup-operator"),
     ("FreezeVmFilesystems", "backup-operator"),
     ("CreateVolume", "backup-operator"),
+    ("DeleteVolume", "backup-operator"),
     ("CreateDiskLayout", "cluster-admin"),
     ("GetDiskLayout", "read-only"),
     ("ListDiskLayouts", "read-only"),

@@ -12,6 +12,9 @@ the event.
 | `node.heartbeat.missed` | A node in `ready` passes the 90-second heartbeat deadline and is marked `not-ready`. The next miss fires again only after a later heartbeat has marked it `ready`. |
 | `cert.expiry.warning` | An active certificate is inside `certRotation.warnBeforeDays` (default 45), or a node with no inventory row reports `certExpiryDays` inside that window. Emitted once per certificate until it leaves the window. A renewed certificate emits again. |
 | `vm.state.changed` | A node reports a VM runtime state that differs from the value stored for that VM. The node agent sends this report on each successful heartbeat, from the Cloud Hypervisor API sockets in `vmSocketDir`. |
+| `vm.created` | `CreateVm` stored a new VM. |
+| `vm.deleted` | `DeleteVm` removed a VM. |
+| `vm.migrated` | `MigrateVm` finished a live or cold move. |
 
 Each controller delivers events it observes itself. Set `replication.controllerId`
 when several controllers post to the same URL; the field is copied onto every
@@ -36,6 +39,9 @@ webhooks:
         - node.heartbeat.missed
         - cert.expiry.warning
         - vm.state.changed
+        - vm.created
+        - vm.deleted
+        - vm.migrated
       # caFile: /etc/kcore/certs/webhook-ca.crt
 ```
 
