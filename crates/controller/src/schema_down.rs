@@ -376,6 +376,13 @@ ALTER TABLE kubernetes_cluster_nodes DROP COLUMN k8s_node_name;",
         sql: "ALTER TABLE vms DROP COLUMN labels;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 62,
+        sql: "ALTER TABLE node_gpus DROP COLUMN profiles;
+ALTER TABLE node_gpus DROP COLUMN profile;
+ALTER TABLE node_gpus DROP COLUMN parent;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

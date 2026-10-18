@@ -288,6 +288,9 @@ let
       '';
 
       normalizedPci = map (dev: dev // { address = lib.toLower dev.address; }) vmCfg.pciDevices;
+      vfioDevices = builtins.filter (dev: dev.vgpuProfile == null) normalizedPci;
+      vgpuDevices = builtins.filter (dev: dev.vgpuProfile != null) normalizedPci;
+      sysfs = config.ch-vm.vms.sysfsRoot;
 
       # Live migration requires MAP_SHARED guest RAM (`shared=on`).
       memoryArg =
@@ -324,11 +327,27 @@ let
           exit 0
         fi
         ${pkgs.kmod}/bin/modprobe vfio-pci
-        requested="${lib.concatStringsSep " " (map (dev: dev.address) normalizedPci)}"
+        requested="${lib.concatStringsSep " " (map (dev: dev.address) vfioDevices)}"
+        sys="${sysfs}"
         for addr in $requested; do
-          dev="/sys/bus/pci/devices/$addr"
+          dev="$sys/bus/pci/devices/$addr"
           if [ ! -e "$dev" ]; then
             echo "PCI device $addr does not exist on this node"
+            exit 1
+          fi
+          if [ -e "$dev/physfn" ]; then
+            echo "PCI device $addr is a virtual function; a vGPU slice is not bound to vfio-pci"
+            exit 1
+          fi
+          if [ -e "$dev/sriov_numvfs" ] && [ "$(cat "$dev/sriov_numvfs")" -gt 0 ] && [ -e "$dev/driver" ]; then
+            drv=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/driver")")
+            if [ "$drv" = "nvidia" ]; then
+              echo "PCI device $addr is a vGPU host card; request a slice with --vgpu"
+              exit 1
+            fi
+          fi
+          if [ -f /etc/kcore/vgpu-hosts ] && ${pkgs.gnugrep}/bin/grep -qx "$addr" /etc/kcore/vgpu-hosts; then
+            echo "PCI device $addr is listed in /etc/kcore/vgpu-hosts; request a slice with --vgpu"
             exit 1
           fi
           if [ ! -e "$dev/iommu_group" ]; then
@@ -356,7 +375,7 @@ let
             if [ -n "$current" ]; then
               echo "$addr" > "$dev/driver/unbind"
             fi
-            echo "$addr" > /sys/bus/pci/drivers_probe
+            echo "$addr" > "$sys/bus/pci/drivers_probe"
           fi
           if [ ! -e "$dev/driver" ]; then
             echo "Failed to bind $addr to vfio-pci"
@@ -368,6 +387,71 @@ let
             exit 1
           fi
         done
+      '';
+
+      vgpuBindScript = pkgs.writeShellScript "vgpu-bind-${vmName}" ''
+        set -euo pipefail
+        if [ -f "${liveMigratedMarker}" ]; then
+          echo "live-migrated marker present; not programming vGPU profiles"
+          exit 0
+        fi
+        sys="${sysfs}"
+        ${lib.concatMapStrings (dev: ''
+          addr=${lib.toLower dev.address}
+          dev="$sys/bus/pci/devices/$addr"
+          if [ ! -e "$dev/physfn" ]; then
+            echo "vGPU slice $addr is not a virtual function"
+            exit 1
+          fi
+          parent=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/physfn")")
+          parent_drv=""
+          if [ -e "$sys/bus/pci/devices/$parent/driver" ]; then
+            parent_drv=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$sys/bus/pci/devices/$parent/driver")")
+          fi
+          if [ "$parent_drv" != "nvidia" ]; then
+            echo "vGPU slice $addr parent $parent driver is ''${parent_drv:-unbound}, not nvidia"
+            exit 1
+          fi
+          current=""
+          if [ -e "$dev/driver" ]; then
+            current=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/driver")")
+          fi
+          if [ "$current" = "vfio-pci" ]; then
+            echo "vGPU slice $addr is bound to vfio-pci; a vGPU slice stays on nvidia-vgpu-vfio"
+            exit 1
+          fi
+          if [ "$current" != "nvidia-vgpu-vfio" ]; then
+            echo "vGPU slice $addr driver is ''${current:-unbound}; a vGPU slice must use nvidia-vgpu-vfio"
+            exit 1
+          fi
+          types="$dev/nvidia/creatable_vgpu_types"
+          current_file="$dev/nvidia/current_vgpu_type"
+          id=$(${pkgs.gnugrep}/bin/grep -E '^[[:space:]]*[0-9]+[[:space:]]*:[[:space:]]*NVIDIA[[:space:]]+${dev.vgpuProfile}[[:space:]]*$' "$types" | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.coreutils}/bin/head -n1)
+          if [ -z "$id" ]; then
+            echo "vGPU slice $addr cannot take profile ${dev.vgpuProfile}"
+            exit 1
+          fi
+          now=$(${pkgs.coreutils}/bin/cat "$current_file")
+          if [ "$now" = "$id" ]; then
+            :
+          elif [ "$now" != "0" ]; then
+            echo "vGPU slice $addr is already profile id $now, not ${dev.vgpuProfile} ($id)"
+            exit 1
+          else
+            echo "$id" > "$current_file"
+          fi
+        '') vgpuDevices}
+      '';
+
+      vgpuClearScript = pkgs.writeShellScript "vgpu-clear-${vmName}" ''
+        set -eu
+        if [ -f "${liveMigratedMarker}" ]; then
+          exit 0
+        fi
+        sys="${sysfs}"
+        ${lib.concatMapStrings (dev: ''
+          echo 0 > "$sys/bus/pci/devices/${lib.toLower dev.address}/nvidia/current_vgpu_type" || true
+        '') vgpuDevices}
       '';
 
       # A VMM for this VM may already run outside the unit's cgroup: the
@@ -484,8 +568,12 @@ let
     in
     {
       description = "kcore VM ${vmName}";
-      requires = map (iface: "${iface.unit}.service") ifaces;
-      after = map (iface: "${iface.unit}.service") ifaces;
+      requires =
+        map (iface: "${iface.unit}.service") ifaces
+        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service";
+      after =
+        map (iface: "${iface.unit}.service") ifaces
+        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service";
       wantedBy = lib.optionals (vmCfg.autoStart && !vmCfg.incomingMigration) [ "multi-user.target" ];
       # stopIfChanged/restartIfChanged keep their NixOS defaults so VM spec
       # updates (cpu/memory/extraArgs) take effect for Ceph-backed VMs too. The
@@ -498,12 +586,15 @@ let
 
       serviceConfig = {
         Type = "simple";
-        ExecStartPre = lib.optionals (normalizedPci != [ ]) [ "${vfioBindScript}" ] ++ [
-          "${startPreScript}"
-        ];
+        ExecStartPre =
+          lib.optionals (vfioDevices != [ ]) [ "${vfioBindScript}" ]
+          ++ lib.optionals (vgpuDevices != [ ]) [ "${vgpuBindScript}" ]
+          ++ [ "${startPreScript}" ];
         ExecStart = "${startScript}";
         ExecStop = "${stopScript}";
-        ExecStopPost = lib.optionalString isCeph "-${cephUnmapScript}";
+        ExecStopPost =
+          lib.optional (vgpuDevices != [ ]) "-${vgpuClearScript}"
+          ++ lib.optional isCeph "-${cephUnmapScript}";
         TimeoutStopSec = 30;
         # ExecStartPre copies the image onto the volume. The 90s default is
         # shorter than a Windows qcow2 convert, which then fails the unit.
@@ -559,6 +650,7 @@ in
     environment.etc."kcore/ch-vm-features".text = ''
       imageSha256
       cloudHypervisorPatches
+      vgpuProfile
     '';
 
     systemd.services = lib.mapAttrs' (

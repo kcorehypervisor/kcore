@@ -481,6 +481,7 @@ mod tests {
             pci_devices: vec![],
             gpus: vec![],
             labels: std::collections::HashMap::new(),
+            vgpus: vec![],
         }
     }
 
@@ -1231,6 +1232,7 @@ mod proptests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             };
             let apply = VmApply {
                 spec: &spec,
@@ -1295,6 +1297,7 @@ mod proptests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             };
             let apply = VmApply {
                 spec: &spec,

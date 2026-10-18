@@ -105,3 +105,16 @@ On start, before cloud-hypervisor runs, the unit:
 
 The device stays on `vfio-pci` after the guest stops. Bind it back to the
 host driver by hand when the host should use it again.
+
+## vGPU slices
+
+`--gpu nvidia0` is still the whole card, and the node binds that card to
+`vfio-pci`. A slice of one NVIDIA card is a different request: `--vgpu A2-4C`,
+`--vgpu nvidia0=A2-4C`, or `--vgpu nvidia0/0=A2-4C`. The physical function
+stays on the NVIDIA host driver. The node writes the profile onto one virtual
+function and never binds that card, or the function, to `vfio-pci`.
+
+The procedure for the A2, including the QEMU reference to run before Cloud
+Hypervisor, is `scripts/vgpu-lab/README.md`. It is a lab note, not a node
+service. `scripts/capture-vgpu-sysfs.sh` is what to run on the machine the day
+the card is installed. Neither script redeems an NVIDIA licence.

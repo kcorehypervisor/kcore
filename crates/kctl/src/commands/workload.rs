@@ -38,6 +38,7 @@ pub async fn create(
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             container_spec: None,
             image_url: image.unwrap_or_default().to_string(),

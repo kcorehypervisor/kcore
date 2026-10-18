@@ -28,7 +28,27 @@ pub struct GpuDevice {
     pub class_code: String,
     pub characteristics: String,
     pub driver: String,
+    /// Card name for a slice (`nvidia0`). Empty on a whole device.
+    pub parent: String,
+    /// Current vGPU type (`A2-4C`). Empty when the slice has none.
+    pub profile: String,
+    /// Types this slice can take now.
+    pub profiles: Vec<String>,
 }
+
+/// A vGPU request. A profile is always present: a slice without one has no size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VgpuSelector {
+    /// Any host card with a free slice of this profile.
+    Profile(String),
+    /// A free slice of this profile on one card (`nvidia0=A2-4C`).
+    Card { card: String, profile: String },
+    /// One virtual function (`nvidia0/3=A2-4C`).
+    Slice { name: String, profile: String },
+}
+
+/// NVIDIA's SR-IOV vGPU driver. A slice stays on this driver.
+pub const NVIDIA_VFIO_DRIVER: &str = "nvidia-vgpu-vfio";
 
 /// `radeon0` picks that device. `radeon` picks the first free device of that family.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +65,14 @@ struct PciFn {
     class: u32,
     iommu_group: Option<i32>,
     driver: String,
+    physfn: Option<String>,
+    sriov_numvfs: Option<u32>,
+    sriov_totalvfs: Option<u32>,
+    virtfns: Vec<(u32, String)>,
+    /// `nvidia/current_vgpu_type`. `None` when the file is absent. `0` means no profile.
+    vgpu_current: Option<u32>,
+    vgpu_types: Vec<(u32, String)>,
+    mdev: bool,
 }
 
 const FAMILIES: &[&str] = &["nvme", "radeon", "nvidia", "intel", "accel", "nic"];
@@ -53,12 +81,18 @@ const FAMILIES: &[&str] = &["nvme", "radeon", "nvidia", "intel", "accel", "nic"]
 /// Returns GPUs only. Use [`scan_pci`] for NICs, NVMe, and raw groups too.
 pub fn scan_sysfs(devices_dir: &Path) -> Result<Vec<GpuDevice>, String> {
     let mut devices = scan_pci(devices_dir)?;
-    devices.retain(|dev| dev.kind == "gpu");
+    devices.retain(|dev| dev.kind == "gpu" || dev.kind == "vgpu");
     Ok(devices)
 }
 
 /// Every named GPU, NIC, and NVMe, plus raw groups the typed scan did not claim.
 pub fn scan_pci(devices_dir: &Path) -> Result<Vec<GpuDevice>, String> {
+    scan_pci_with(devices_dir, &[])
+}
+
+/// Like [`scan_pci`], and treats addresses in `vgpu_hosts` as vGPU cards even
+/// before `sriov-manage` has created virtual functions.
+pub fn scan_pci_with(devices_dir: &Path, vgpu_hosts: &[String]) -> Result<Vec<GpuDevice>, String> {
     let entries =
         fs::read_dir(devices_dir).map_err(|e| format!("reading {}: {e}", devices_dir.display()))?;
     let mut devices = Vec::new();
@@ -84,9 +118,27 @@ pub fn scan_pci(devices_dir: &Path) -> Result<Vec<GpuDevice>, String> {
             class,
             iommu_group: iommu_group_of(&path),
             driver: driver_of(&path),
+            physfn: link_bdf(&path.join("physfn")),
+            sriov_numvfs: read_u32_file(&path.join("sriov_numvfs")),
+            sriov_totalvfs: read_u32_file(&path.join("sriov_totalvfs")),
+            virtfns: virtfns_of(&path),
+            vgpu_current: read_u32_file(&path.join("nvidia").join("current_vgpu_type")),
+            vgpu_types: read_vgpu_types(&path.join("nvidia").join("creatable_vgpu_types")),
+            mdev: path.join("mdev_supported_types").is_dir(),
         });
     }
-    Ok(classify(devices))
+    Ok(classify(devices, vgpu_hosts))
+}
+
+/// Addresses in `/etc/kcore/vgpu-hosts`, one PCI address per line.
+pub fn load_vgpu_hosts(path: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
 }
 
 pub fn parse_selector(raw: &str) -> Result<GpuSelector, String> {
@@ -101,6 +153,131 @@ pub fn parse_selector(raw: &str) -> Result<GpuSelector, String> {
             "device '{raw}' should look like radeon0, nvidia1, nic0, nvme0, or a family such as radeon"
         )),
     }
+}
+
+/// Device half of a stored slice binding (`nvidia0/3=A2-4C` → `nvidia0/3`).
+pub fn binding_device_name(stored: &str) -> &str {
+    stored
+        .split_once('=')
+        .map(|(name, _)| name)
+        .unwrap_or(stored)
+}
+
+/// Profile half of a stored slice binding.
+pub fn binding_profile(stored: &str) -> Option<&str> {
+    stored
+        .split_once('=')
+        .map(|(_, profile)| profile)
+        .filter(|profile| !profile.is_empty())
+}
+
+/// `A2-4C`, `nvidia0=A2-4C`, or `nvidia0/3=A2-4C`.
+pub fn parse_vgpu_selector(raw: &str) -> Result<VgpuSelector, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("vGPU request is empty".into());
+    }
+    if let Some((left, profile)) = raw.split_once('=') {
+        let profile = normalize_profile(profile)?;
+        let left = left.trim().to_ascii_lowercase();
+        if left.is_empty() {
+            return Err(format!(
+                "vGPU request '{raw}' needs a card or slice before the profile"
+            ));
+        }
+        if left.contains('/') {
+            if !left.split_once('/').is_some_and(|(card, index)| {
+                family_of_name(card).is_some()
+                    && card != family_of_name(card).unwrap_or("")
+                    && !index.is_empty()
+                    && index.bytes().all(|b| b.is_ascii_digit())
+            }) {
+                return Err(format!(
+                    "vGPU slice '{raw}' needs a profile, for example nvidia0/3=A2-4C"
+                ));
+            }
+            return Ok(VgpuSelector::Slice {
+                name: left,
+                profile,
+            });
+        }
+        match family_of_name(&left) {
+            Some(family) if left != family => {
+                return Ok(VgpuSelector::Card {
+                    card: left,
+                    profile,
+                });
+            }
+            _ => {
+                return Err(format!("vGPU card '{left}' should look like nvidia0=A2-4C"));
+            }
+        }
+    }
+    if raw.contains('/') {
+        return Err(format!(
+            "vGPU slice '{raw}' needs a profile, for example nvidia0/3=A2-4C"
+        ));
+    }
+    Ok(VgpuSelector::Profile(normalize_profile(raw)?))
+}
+
+fn normalize_profile(raw: &str) -> Result<String, String> {
+    let mut profile = raw.trim();
+    if let Some(rest) = profile
+        .strip_prefix("NVIDIA ")
+        .or_else(|| profile.strip_prefix("nvidia "))
+    {
+        profile = rest.trim();
+    }
+    if profile.is_empty() {
+        return Err("vGPU profile is empty".into());
+    }
+    if !profile
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        || !profile.chars().any(|c| c.is_ascii_alphabetic())
+        || !profile.chars().any(|c| c.is_ascii_digit())
+    {
+        return Err(format!("vGPU profile '{profile}' should look like A2-4C"));
+    }
+    Ok(profile.to_string())
+}
+
+/// Pick slices for `requests`. `taken` holds stored bindings (`nvidia0/3=A2-4C`
+/// or a whole-device name). A card already running the profile is used before
+/// an empty card. A card running a different profile offers nothing.
+pub fn select_vgpus<'a>(
+    inventory: &'a [GpuDevice],
+    requests: &[VgpuSelector],
+    taken: &HashSet<String>,
+) -> Result<Vec<(&'a GpuDevice, String)>, String> {
+    if requests.is_empty() {
+        return Err("no vGPU slice requested".into());
+    }
+    let mut claimed: HashSet<String> = taken
+        .iter()
+        .map(|name| binding_device_name(name).to_string())
+        .collect();
+    let mut chosen = Vec::with_capacity(requests.len());
+    for request in requests {
+        let (device, profile) = match request {
+            VgpuSelector::Profile(profile) => (
+                pick_profile(inventory, profile, taken, &claimed)?,
+                profile.clone(),
+            ),
+            VgpuSelector::Card { card, profile } => (
+                pick_card(inventory, card, profile, taken, &claimed)?,
+                profile.clone(),
+            ),
+            VgpuSelector::Slice { name, profile } => (
+                pick_slice(inventory, name, profile, taken, &claimed)?,
+                profile.clone(),
+            ),
+        };
+        claimed.insert(device.name.clone());
+        chosen.push((device, profile));
+    }
+    Ok(chosen)
 }
 
 /// `radeon0` and `radeon` both yield `radeon`. `nic0` yields `nic`.
@@ -130,7 +307,7 @@ pub fn select_gpus<'a>(
         let device = match request {
             GpuSelector::Exact(name) => inventory
                 .iter()
-                .find(|dev| &dev.name == name && dev.kind != "raw")
+                .find(|dev| &dev.name == name && dev.kind != "raw" && dev.kind != "vgpu")
                 .ok_or_else(|| missing_exact(name, inventory))?,
             GpuSelector::Family(family) => first_free(inventory, family, &claimed)?,
         };
@@ -168,7 +345,7 @@ fn first_free<'a>(
 ) -> Result<&'a GpuDevice, String> {
     let mut same_family: Vec<&GpuDevice> = inventory
         .iter()
-        .filter(|dev| dev.family == family && dev.kind != "raw")
+        .filter(|dev| dev.family == family && dev.kind != "raw" && dev.kind != "vgpu")
         .collect();
     same_family.sort_by(|a, b| a.address.cmp(&b.address));
     let label = match family {
@@ -227,7 +404,7 @@ fn missing_exact(name: &str, inventory: &[GpuDevice]) -> String {
     )
 }
 
-fn classify(mut devices: Vec<PciFn>) -> Vec<GpuDevice> {
+fn classify(mut devices: Vec<PciFn>, vgpu_hosts: &[String]) -> Vec<GpuDevice> {
     devices.sort_by(|a, b| a.address.cmp(&b.address));
     let mut claimed: HashSet<String> = HashSet::new();
     let mut counters: HashMap<&'static str, u32> = HashMap::new();
@@ -235,7 +412,7 @@ fn classify(mut devices: Vec<PciFn>) -> Vec<GpuDevice> {
 
     let primaries: Vec<PciFn> = devices
         .iter()
-        .filter(|dev| is_gpu(dev) || is_nic(dev) || is_nvme(dev))
+        .filter(|dev| !is_nvidia_gpu_vf(dev) && (is_gpu(dev) || is_nic(dev) || is_nvme(dev)))
         .cloned()
         .collect();
     for primary in primaries {
@@ -266,7 +443,7 @@ fn classify(mut devices: Vec<PciFn>) -> Vec<GpuDevice> {
 
     let mut raw_groups: HashMap<String, Vec<&PciFn>> = HashMap::new();
     for dev in &devices {
-        if claimed.contains(&dev.address) {
+        if claimed.contains(&dev.address) || is_nvidia_gpu_vf(dev) {
             continue;
         }
         let key = dev
@@ -291,6 +468,7 @@ fn classify(mut devices: Vec<PciFn>) -> Vec<GpuDevice> {
             primary.address.clone(),
         ));
     }
+    apply_vgpu(&mut found, &devices, vgpu_hosts, &mut claimed);
     found
 }
 
@@ -334,6 +512,9 @@ fn build_device(
         class_code: format!("0x{:06x}", primary.class & 0xffffff),
         characteristics: characteristics(kind, role, primary, &companions),
         driver: primary.driver.clone(),
+        parent: String::new(),
+        profile: String::new(),
+        profiles: Vec::new(),
     }
 }
 
@@ -538,6 +719,406 @@ fn read_hex_u32(path: &Path) -> Option<u32> {
     u32::from_str_radix(text, 16).ok()
 }
 
+fn is_nvidia_gpu_vf(dev: &PciFn) -> bool {
+    dev.physfn.is_some() && dev.vendor == 0x10de && is_gpu(dev)
+}
+
+fn is_vgpu_host(pci: &PciFn, vgpu_hosts: &[String]) -> bool {
+    pci.vendor == 0x10de
+        && pci.driver == "nvidia"
+        && (pci.sriov_numvfs.is_some_and(|count| count > 0)
+            || vgpu_hosts.iter().any(|addr| addr == &pci.address))
+}
+
+fn apply_vgpu(
+    found: &mut Vec<GpuDevice>,
+    devices: &[PciFn],
+    vgpu_hosts: &[String],
+    claimed: &mut HashSet<String>,
+) {
+    let mut slices = Vec::new();
+    for dev in found.iter_mut() {
+        if dev.kind != "gpu" || dev.family != "nvidia" {
+            continue;
+        }
+        let Some(pci) = devices.iter().find(|row| row.address == dev.address) else {
+            continue;
+        };
+        if !is_vgpu_host(pci, vgpu_hosts) {
+            continue;
+        }
+        dev.role = "vgpu-host".into();
+        dev.assignable = false;
+        dev.blocked_reason = "vGPU host card; request a slice with --vgpu".into();
+        let vfs = pci.sriov_totalvfs.unwrap_or_else(|| {
+            pci.sriov_numvfs
+                .filter(|count| *count > 0)
+                .unwrap_or(pci.virtfns.len() as u32)
+        });
+        dev.characteristics
+            .push_str(&format!(" sriov=pf vfs={vfs}"));
+    }
+
+    let hosts: Vec<(String, String)> = found
+        .iter()
+        .filter(|dev| dev.role == "vgpu-host")
+        .map(|dev| (dev.address.clone(), dev.name.clone()))
+        .collect();
+    for (address, name) in hosts {
+        let Some(pci) = devices.iter().find(|row| row.address == address) else {
+            continue;
+        };
+        let Some(parent) = found.iter().find(|dev| dev.name == name).cloned() else {
+            continue;
+        };
+        for (index, vf_addr) in &pci.virtfns {
+            let Some(vf) = devices.iter().find(|row| &row.address == vf_addr) else {
+                continue;
+            };
+            if claimed.contains(&vf.address) {
+                continue;
+            }
+            let slice = build_slice(&parent, vf, *index, devices);
+            for addr in &slice.functions {
+                claimed.insert(addr.clone());
+            }
+            claimed.insert(slice.address.clone());
+            slices.push(slice);
+        }
+    }
+
+    for vf in devices.iter().filter(|row| is_nvidia_gpu_vf(row)) {
+        if claimed.contains(&vf.address) {
+            continue;
+        }
+        let Some(parent_addr) = vf.physfn.as_deref() else {
+            continue;
+        };
+        let Some(parent) = found
+            .iter()
+            .find(|dev| dev.address == parent_addr && dev.family == "nvidia")
+            .cloned()
+        else {
+            continue;
+        };
+        let index = devices
+            .iter()
+            .find(|row| row.address == parent.address)
+            .and_then(|row| {
+                row.virtfns
+                    .iter()
+                    .find(|(_, addr)| addr == &vf.address)
+                    .map(|(index, _)| *index)
+            })
+            .unwrap_or_else(|| vf_function(vf));
+        let slice = build_slice(&parent, vf, index, devices);
+        for addr in &slice.functions {
+            claimed.insert(addr.clone());
+        }
+        claimed.insert(slice.address.clone());
+        slices.push(slice);
+    }
+    found.extend(slices);
+}
+
+fn vf_function(vf: &PciFn) -> u32 {
+    vf.address
+        .rsplit_once('.')
+        .and_then(|(_, func)| func.parse().ok())
+        .unwrap_or(0)
+}
+
+fn build_slice(parent: &GpuDevice, vf: &PciFn, index: u32, devices: &[PciFn]) -> GpuDevice {
+    let (mut assignable, mut blocked_reason, functions, group) = assignment(vf, devices);
+    let (profile, profiles) = slice_profile(vf);
+    if assignable && vf.mdev && vf.vgpu_types.is_empty() && vf.vgpu_current.is_none() {
+        assignable = false;
+        blocked_reason = "mdev vGPU is not supported; install vGPU 17 or later".into();
+    } else if assignable && parent.driver != "nvidia" {
+        assignable = false;
+        let driver = if parent.driver.is_empty() {
+            "unbound"
+        } else {
+            parent.driver.as_str()
+        };
+        blocked_reason = format!("parent {} driver is {driver}, not nvidia", parent.address);
+    } else if assignable && vf.driver == "vfio-pci" {
+        assignable = false;
+        blocked_reason = "bound to vfio-pci; a vGPU slice stays on nvidia-vgpu-vfio".into();
+    } else if assignable && vf.driver != NVIDIA_VFIO_DRIVER {
+        assignable = false;
+        let driver = if vf.driver.is_empty() {
+            "unbound"
+        } else {
+            vf.driver.as_str()
+        };
+        blocked_reason = format!("bound to {driver}; a vGPU slice must use nvidia-vgpu-vfio");
+    }
+    let mut parts = vec![
+        "purpose=ai".to_string(),
+        format!("parent={}", parent.name),
+        format!("class=0x{:06x}", vf.class & 0xffffff),
+        format!("vendor={:04x}:{:04x}", vf.vendor, vf.device),
+    ];
+    if !profile.is_empty() {
+        parts.push(format!("profile={profile}"));
+    }
+    if !profiles.is_empty() {
+        parts.push(format!("profiles={}", profiles.join(",")));
+    }
+    if !vf.driver.is_empty() {
+        parts.push(format!("driver={}", vf.driver));
+    }
+    GpuDevice {
+        name: format!("{}/{index}", parent.name),
+        family: "nvidia".into(),
+        model: format!("{} VF", parent.model),
+        address: vf.address.clone(),
+        functions,
+        iommu_group: group,
+        assignable,
+        blocked_reason,
+        kind: "vgpu".into(),
+        role: "slice".into(),
+        class_code: format!("0x{:06x}", vf.class & 0xffffff),
+        characteristics: parts.join(" "),
+        driver: vf.driver.clone(),
+        parent: parent.name.clone(),
+        profile,
+        profiles,
+    }
+}
+
+fn slice_profile(vf: &PciFn) -> (String, Vec<String>) {
+    let profiles: Vec<String> = vf.vgpu_types.iter().map(|(_, name)| name.clone()).collect();
+    let profile = match vf.vgpu_current {
+        Some(id) if id != 0 => vf
+            .vgpu_types
+            .iter()
+            .find(|(type_id, _)| *type_id == id)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| id.to_string()),
+        _ => String::new(),
+    };
+    (profile, profiles)
+}
+
+fn slices_of<'a>(inventory: &'a [GpuDevice], card: &str) -> Vec<&'a GpuDevice> {
+    let mut slices: Vec<&GpuDevice> = inventory
+        .iter()
+        .filter(|dev| dev.kind == "vgpu" && dev.parent == card)
+        .collect();
+    slices.sort_by_key(|slice| slice_index(&slice.name));
+    slices
+}
+
+fn slice_index(name: &str) -> u32 {
+    name.rsplit_once('/')
+        .and_then(|(_, index)| index.parse().ok())
+        .unwrap_or(0)
+}
+
+fn card_lock(slices: &[&GpuDevice], taken: &HashSet<String>) -> Result<Option<String>, String> {
+    let mut profiles = Vec::new();
+    for slice in slices {
+        if !slice.profile.is_empty() {
+            profiles.push(slice.profile.clone());
+        }
+        for binding in taken {
+            if binding_device_name(binding) == slice.name {
+                if let Some(profile) = binding_profile(binding) {
+                    profiles.push(profile.to_string());
+                }
+            }
+        }
+    }
+    profiles.sort();
+    profiles.dedup();
+    match profiles.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        many => Err(format!(
+            "vGPU card {} has more than one profile ({})",
+            slices.first().map(|dev| dev.parent.as_str()).unwrap_or("?"),
+            many.join(", ")
+        )),
+    }
+}
+
+fn pick_profile<'a>(
+    inventory: &'a [GpuDevice],
+    profile: &str,
+    taken: &HashSet<String>,
+    claimed: &HashSet<String>,
+) -> Result<&'a GpuDevice, String> {
+    let mut cards: Vec<&GpuDevice> = inventory
+        .iter()
+        .filter(|dev| dev.role == "vgpu-host")
+        .collect();
+    cards.sort_by(|a, b| a.address.cmp(&b.address));
+    let mut running = Vec::new();
+    let mut empty = Vec::new();
+    for card in cards {
+        let slices = slices_of(inventory, &card.name);
+        let lock = card_lock(&slices, taken)?;
+        match lock.as_deref() {
+            Some(current) if current == profile => running.push(card),
+            Some(_) => {}
+            None if slices
+                .iter()
+                .any(|slice| slice.profiles.iter().any(|name| name == profile)) =>
+            {
+                empty.push(card);
+            }
+            None => {}
+        }
+    }
+    for card in running.into_iter().chain(empty) {
+        if let Some(slice) = free_slice(inventory, &card.name, profile, taken, claimed)? {
+            return Ok(slice);
+        }
+    }
+    Err(format!("no free {profile} slice on this node"))
+}
+
+fn pick_card<'a>(
+    inventory: &'a [GpuDevice],
+    card: &str,
+    profile: &str,
+    taken: &HashSet<String>,
+    claimed: &HashSet<String>,
+) -> Result<&'a GpuDevice, String> {
+    let host = inventory
+        .iter()
+        .find(|dev| dev.name == card && dev.role == "vgpu-host")
+        .ok_or_else(|| format!("vGPU card {card} was not found on this node"))?;
+    let slices = slices_of(inventory, &host.name);
+    if let Some(lock) = card_lock(&slices, taken)? {
+        if lock != profile {
+            return Err(format!("vGPU card {card} is running {lock}, not {profile}"));
+        }
+    }
+    free_slice(inventory, card, profile, taken, claimed)?
+        .ok_or_else(|| format!("no free {profile} slice on {card}"))
+}
+
+fn pick_slice<'a>(
+    inventory: &'a [GpuDevice],
+    name: &str,
+    profile: &str,
+    taken: &HashSet<String>,
+    claimed: &HashSet<String>,
+) -> Result<&'a GpuDevice, String> {
+    let slice = inventory
+        .iter()
+        .find(|dev| dev.name == name && dev.kind == "vgpu")
+        .ok_or_else(|| format!("vGPU slice {name} was not found on this node"))?;
+    if claimed.contains(&slice.name) {
+        return Err(format!(
+            "vGPU slice {name} is already assigned on this node"
+        ));
+    }
+    if !slice.assignable {
+        return Err(format!(
+            "vGPU slice {name} is not assignable: {}",
+            slice.blocked_reason
+        ));
+    }
+    if !slice.profiles.iter().any(|have| have == profile) && slice.profile != profile {
+        return Err(format!("vGPU slice {name} cannot take {profile}"));
+    }
+    let slices = slices_of(inventory, &slice.parent);
+    if let Some(lock) = card_lock(&slices, taken)? {
+        if lock != profile {
+            return Err(format!(
+                "vGPU card {} is running {lock}, not {profile}",
+                slice.parent
+            ));
+        }
+    }
+    Ok(slice)
+}
+
+fn free_slice<'a>(
+    inventory: &'a [GpuDevice],
+    card: &str,
+    profile: &str,
+    taken: &HashSet<String>,
+    claimed: &HashSet<String>,
+) -> Result<Option<&'a GpuDevice>, String> {
+    let slices = slices_of(inventory, card);
+    if let Some(lock) = card_lock(&slices, taken)? {
+        if lock != profile {
+            return Ok(None);
+        }
+    }
+    Ok(slices.into_iter().find(|slice| {
+        slice.assignable
+            && !claimed.contains(&slice.name)
+            && (slice.profile.is_empty() || slice.profile == profile)
+            && (slice.profiles.iter().any(|name| name == profile) || slice.profile == profile)
+    }))
+}
+
+fn link_bdf(path: &Path) -> Option<String> {
+    let target = fs::read_link(path).ok()?;
+    let name = target.file_name()?.to_str()?;
+    normalize_bdf(name)
+}
+
+fn read_u32_file(path: &Path) -> Option<u32> {
+    let text = fs::read_to_string(path).ok()?;
+    text.trim().parse().ok()
+}
+
+fn virtfns_of(device_dir: &Path) -> Vec<(u32, String)> {
+    let Ok(entries) = fs::read_dir(device_dir) else {
+        return Vec::new();
+    };
+    let mut virtfns = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(index) = name.strip_prefix("virtfn") else {
+            continue;
+        };
+        let Ok(index) = index.parse::<u32>() else {
+            continue;
+        };
+        if let Some(address) = link_bdf(&entry.path()) {
+            virtfns.push((index, address));
+        }
+    }
+    virtfns.sort_by_key(|(index, _)| *index);
+    virtfns
+}
+
+fn read_vgpu_types(path: &Path) -> Vec<(u32, String)> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut types = Vec::new();
+    for line in text.lines() {
+        let Some((id, name)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(id) = id.trim().parse::<u32>() else {
+            continue;
+        };
+        let mut name = name.trim();
+        if let Some(rest) = name.strip_prefix("NVIDIA ") {
+            name = rest;
+        }
+        if name.is_empty() {
+            continue;
+        }
+        types.push((id, name.to_string()));
+    }
+    types
+}
+
 fn normalize_bdf(raw: &str) -> Option<String> {
     let parts: Vec<&str> = raw.split([':', '.']).collect();
     if parts.len() != 4 {
@@ -599,6 +1180,32 @@ mod tests {
             class_code: "0x030000".into(),
             characteristics: "purpose=ai".into(),
             driver: String::new(),
+            parent: String::new(),
+            profile: String::new(),
+            profiles: Vec::new(),
+        }
+    }
+
+    fn link_driver(root: &std::path::Path, address: &str, driver: &str) {
+        let drivers = root.join("drivers").join(driver);
+        fs::create_dir_all(&drivers).unwrap();
+        symlink(&drivers, root.join(address).join("driver")).unwrap();
+    }
+
+    fn write_sriov_card(root: &std::path::Path, card: &str, vfs: &[&str]) {
+        fs::write(
+            root.join(card).join("sriov_totalvfs"),
+            vfs.len().to_string(),
+        )
+        .unwrap();
+        fs::write(root.join(card).join("sriov_numvfs"), vfs.len().to_string()).unwrap();
+        for (index, vf) in vfs.iter().enumerate() {
+            symlink(
+                root.join(vf),
+                root.join(card).join(format!("virtfn{index}")),
+            )
+            .unwrap();
+            symlink(root.join(card), root.join(vf).join("physfn")).unwrap();
         }
     }
 
@@ -864,5 +1471,333 @@ mod tests {
         assert_eq!(igpu.role, "platform");
         assert!(!igpu.assignable, "{}", igpu.blocked_reason);
         assert!(igpu.blocked_reason.contains("0000:0e:00.0"));
+    }
+
+    #[test]
+    fn sriov_card_is_one_host_and_named_slices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:af:00.0",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("42"),
+        );
+        link_driver(root, "0000:af:00.0", "nvidia");
+        for (index, addr) in [
+            "0000:af:00.4",
+            "0000:af:00.5",
+            "0000:af:00.6",
+            "0000:af:00.7",
+        ]
+        .iter()
+        .enumerate()
+        {
+            write_fn(
+                root,
+                addr,
+                "0x10de",
+                "0x25b6",
+                "0x030200",
+                Some(&format!("{}", 43 + index)),
+            );
+            link_driver(root, addr, NVIDIA_VFIO_DRIVER);
+            fs::create_dir_all(root.join(addr).join("nvidia")).unwrap();
+            fs::write(
+                root.join(addr).join("nvidia").join("creatable_vgpu_types"),
+                "468 : NVIDIA A2-4C\n469 : NVIDIA A2-8C\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join(addr).join("nvidia").join("current_vgpu_type"),
+                "0",
+            )
+            .unwrap();
+        }
+        write_sriov_card(
+            root,
+            "0000:af:00.0",
+            &[
+                "0000:af:00.4",
+                "0000:af:00.5",
+                "0000:af:00.6",
+                "0000:af:00.7",
+            ],
+        );
+        let rows = scan_pci(root).unwrap();
+        let hosts: Vec<_> = rows.iter().filter(|dev| dev.role == "vgpu-host").collect();
+        let slices: Vec<_> = rows.iter().filter(|dev| dev.role == "slice").collect();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "nvidia0");
+        assert!(!hosts[0].assignable);
+        assert!(hosts[0].blocked_reason.contains("--vgpu"));
+        assert!(hosts[0].characteristics.contains("sriov=pf"));
+        assert_eq!(slices.len(), 4);
+        assert_eq!(slices[0].name, "nvidia0/0");
+        assert_eq!(slices[0].kind, "vgpu");
+        assert_eq!(slices[0].parent, "nvidia0");
+        assert!(slices[0].model.ends_with(" VF"));
+        assert!(slices[0].assignable, "{}", slices[0].blocked_reason);
+        assert!(slices[0].profiles.iter().any(|name| name == "A2-4C"));
+        assert!(rows.iter().all(|dev| dev.name != "nvidia1"));
+    }
+
+    #[test]
+    fn programmed_slice_reports_its_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:af:00.0",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("42"),
+        );
+        link_driver(root, "0000:af:00.0", "nvidia");
+        write_fn(
+            root,
+            "0000:af:00.4",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("43"),
+        );
+        link_driver(root, "0000:af:00.4", NVIDIA_VFIO_DRIVER);
+        fs::create_dir_all(root.join("0000:af:00.4").join("nvidia")).unwrap();
+        fs::write(
+            root.join("0000:af:00.4")
+                .join("nvidia")
+                .join("creatable_vgpu_types"),
+            "468 : NVIDIA A2-4C\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("0000:af:00.4")
+                .join("nvidia")
+                .join("current_vgpu_type"),
+            "468",
+        )
+        .unwrap();
+        write_sriov_card(root, "0000:af:00.0", &["0000:af:00.4"]);
+        let rows = scan_pci(root).unwrap();
+        let slice = rows.iter().find(|dev| dev.role == "slice").unwrap();
+        assert_eq!(slice.profile, "A2-4C");
+    }
+
+    #[test]
+    fn slice_on_vfio_pci_is_blocked_and_names_the_driver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:af:00.0",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("42"),
+        );
+        link_driver(root, "0000:af:00.0", "nvidia");
+        write_fn(
+            root,
+            "0000:af:00.4",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("43"),
+        );
+        link_driver(root, "0000:af:00.4", "vfio-pci");
+        fs::create_dir_all(root.join("0000:af:00.4").join("nvidia")).unwrap();
+        fs::write(
+            root.join("0000:af:00.4")
+                .join("nvidia")
+                .join("creatable_vgpu_types"),
+            "468 : NVIDIA A2-4C\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("0000:af:00.4")
+                .join("nvidia")
+                .join("current_vgpu_type"),
+            "0",
+        )
+        .unwrap();
+        write_sriov_card(root, "0000:af:00.0", &["0000:af:00.4"]);
+        let rows = scan_pci(root).unwrap();
+        let slice = rows.iter().find(|dev| dev.role == "slice").unwrap();
+        assert!(!slice.assignable);
+        assert!(
+            slice.blocked_reason.contains("vfio-pci"),
+            "{}",
+            slice.blocked_reason
+        );
+    }
+
+    #[test]
+    fn hosts_file_marks_a_card_before_sriov_manage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:af:00.0",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("42"),
+        );
+        link_driver(root, "0000:af:00.0", "nvidia");
+        fs::write(root.join("0000:af:00.0").join("sriov_numvfs"), "0").unwrap();
+        fs::write(root.join("0000:af:00.0").join("sriov_totalvfs"), "16").unwrap();
+        let rows = scan_pci_with(root, &["0000:af:00.0".into()]).unwrap();
+        let host = rows.iter().find(|dev| dev.name == "nvidia0").unwrap();
+        assert_eq!(host.role, "vgpu-host");
+        assert!(!host.assignable);
+    }
+
+    #[test]
+    fn mdev_slice_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:af:00.0",
+            "0x10de",
+            "0x1eb8",
+            "0x030200",
+            Some("42"),
+        );
+        link_driver(root, "0000:af:00.0", "nvidia");
+        write_fn(
+            root,
+            "0000:af:00.4",
+            "0x10de",
+            "0x1eb8",
+            "0x030200",
+            Some("43"),
+        );
+        link_driver(root, "0000:af:00.4", "vfio-pci");
+        fs::create_dir_all(root.join("0000:af:00.4").join("mdev_supported_types")).unwrap();
+        write_sriov_card(root, "0000:af:00.0", &["0000:af:00.4"]);
+        let rows = scan_pci(root).unwrap();
+        let slice = rows.iter().find(|dev| dev.role == "slice").unwrap();
+        assert!(
+            slice.blocked_reason.contains("mdev"),
+            "{}",
+            slice.blocked_reason
+        );
+    }
+
+    #[test]
+    fn nic_virtual_function_stays_a_nic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:01:00.0",
+            "0x8086",
+            "0x1572",
+            "0x020000",
+            Some("3"),
+        );
+        write_fn(
+            root,
+            "0000:01:10.0",
+            "0x8086",
+            "0x1572",
+            "0x020000",
+            Some("9"),
+        );
+        symlink(
+            root.join("0000:01:00.0"),
+            root.join("0000:01:10.0").join("physfn"),
+        )
+        .unwrap();
+        let rows = scan_pci(root).unwrap();
+        assert!(rows
+            .iter()
+            .any(|dev| dev.kind == "nic" && dev.address == "0000:01:10.0"));
+        assert!(rows.iter().all(|dev| dev.kind != "vgpu"));
+    }
+
+    #[test]
+    fn parses_vgpu_requests() {
+        assert_eq!(
+            parse_vgpu_selector("A2-4C").unwrap(),
+            VgpuSelector::Profile("A2-4C".into())
+        );
+        assert_eq!(
+            parse_vgpu_selector("nvidia0=A2-4C").unwrap(),
+            VgpuSelector::Card {
+                card: "nvidia0".into(),
+                profile: "A2-4C".into(),
+            }
+        );
+        assert_eq!(
+            parse_vgpu_selector("nvidia0/3=A2-4C").unwrap(),
+            VgpuSelector::Slice {
+                name: "nvidia0/3".into(),
+                profile: "A2-4C".into(),
+            }
+        );
+        assert!(parse_vgpu_selector("nvidia0/3").is_err());
+        assert!(family_of_name("nvidia0/3=A2-4C").is_none());
+    }
+
+    #[test]
+    fn profile_selector_prefers_a_card_already_running_it() {
+        let mut host_a = sample("nvidia0", "nvidia", "0000:af:00.0");
+        host_a.role = "vgpu-host".into();
+        host_a.assignable = false;
+        host_a.blocked_reason = "vGPU host card; request a slice with --vgpu".into();
+        let mut host_b = sample("nvidia1", "nvidia", "0000:c1:00.0");
+        host_b.role = "vgpu-host".into();
+        host_b.assignable = false;
+        let mut running = sample("nvidia0/0", "nvidia", "0000:af:00.4");
+        running.kind = "vgpu".into();
+        running.role = "slice".into();
+        running.parent = "nvidia0".into();
+        running.profile = "A2-4C".into();
+        running.profiles = vec!["A2-4C".into(), "A2-8C".into()];
+        let mut free_on_running = sample("nvidia0/1", "nvidia", "0000:af:00.5");
+        free_on_running.kind = "vgpu".into();
+        free_on_running.role = "slice".into();
+        free_on_running.parent = "nvidia0".into();
+        free_on_running.profiles = vec!["A2-4C".into(), "A2-8C".into()];
+        let mut empty = sample("nvidia1/0", "nvidia", "0000:c1:00.4");
+        empty.kind = "vgpu".into();
+        empty.role = "slice".into();
+        empty.parent = "nvidia1".into();
+        empty.profiles = vec!["A2-4C".into(), "A2-8C".into()];
+        let mut locked = sample("nvidia1/1", "nvidia", "0000:c1:00.5");
+        locked.kind = "vgpu".into();
+        locked.role = "slice".into();
+        locked.parent = "nvidia1".into();
+        locked.profile = "A2-8C".into();
+        locked.profiles = vec!["A2-4C".into(), "A2-8C".into()];
+        let inventory = [host_a, host_b, running, free_on_running, empty, locked];
+        let taken = HashSet::from(["nvidia0/0=A2-4C".to_string()]);
+        let picked =
+            select_vgpus(&inventory, &[VgpuSelector::Profile("A2-4C".into())], &taken).unwrap();
+        assert_eq!(picked[0].0.name, "nvidia0/1");
+        assert_eq!(picked[0].1, "A2-4C");
+        let err = select_vgpus(
+            &inventory,
+            &[VgpuSelector::Card {
+                card: "nvidia1".into(),
+                profile: "A2-4C".into(),
+            }],
+            &taken,
+        )
+        .unwrap_err();
+        assert!(err.contains("A2-8C"), "{err}");
+        let refused = select_gpus(
+            &inventory,
+            &[GpuSelector::Exact("nvidia0".into())],
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert!(refused.contains("--vgpu"), "{refused}");
     }
 }

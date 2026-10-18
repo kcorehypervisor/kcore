@@ -188,6 +188,15 @@ fn gpu_info_from_row(
         class_code: row.class_code,
         characteristics: row.characteristics,
         driver: row.driver,
+        parent: row.parent,
+        profile: row.profile,
+        profiles: row
+            .profiles
+            .split(',')
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty())
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -1122,6 +1131,13 @@ impl ControllerService {
         let guest_ops_keys = crate::guest_ops::all_guest_ops_keys(&self.db);
         let mut admin = self.ensure_admin_client_for_node(node).await?;
         let module_features = self.ch_vm_module_features(node, &mut admin).await;
+        let vgpu = self.vgpu_slices_for(&node.id, &vms)?;
+        if !vgpu.is_empty() && !module_features.vgpu_profile {
+            return Err(Status::failed_precondition(format!(
+                "node {} cannot start a vGPU slice until its ch-vm module reports vgpuProfile",
+                node.id
+            )));
+        }
         let nix_config = nixgen::with_postgresql(
             nixgen::generate_node_config_inner(
                 &vms,
@@ -1141,6 +1157,7 @@ impl ControllerService {
                 &network_policies_by_name(&self.db, &node.id)?,
                 &vm_ipv6_by_vm(&self.db, &vms)?,
                 &module_features,
+                &vgpu,
             ),
             postgresql_nix.as_ref(),
         );
@@ -2947,6 +2964,15 @@ impl ControllerService {
                 class_code: row.class_code,
                 characteristics: row.characteristics,
                 driver: row.driver,
+                parent: row.parent,
+                profile: row.profile,
+                profiles: row
+                    .profiles
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|profile| !profile.is_empty())
+                    .map(str::to_string)
+                    .collect(),
             })
             .collect())
     }
@@ -3012,14 +3038,136 @@ impl ControllerService {
         Ok((names, pci_devices))
     }
 
-    /// Point a GPU VM at free or named GPUs on `target` and store that assignment.
+    /// Resolve vGPU requests against one node's inventory. Stored as `name=profile`.
+    fn assign_vgpus_on_node(
+        &self,
+        node_id: &str,
+        requests: &[String],
+        except_vm: Option<&str>,
+    ) -> Result<(String, String), Status> {
+        let selectors = requests
+            .iter()
+            .map(|raw| kcore_gpu::parse_vgpu_selector(raw).map_err(Status::invalid_argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let inventory = self.node_gpu_inventory(node_id)?;
+        let taken = self.taken_gpu_names(node_id, except_vm)?;
+        let chosen = kcore_gpu::select_vgpus(&inventory, &selectors, &taken)
+            .map_err(Status::failed_precondition)?;
+        let names = chosen
+            .iter()
+            .map(|(gpu, profile)| format!("{}={profile}", gpu.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut functions = Vec::new();
+        for (gpu, _) in &chosen {
+            functions.extend(gpu.functions.iter().cloned());
+        }
+        let pci_devices =
+            crate::pci::join_pci_devices(&functions).map_err(Status::invalid_argument)?;
+        Ok((names, pci_devices))
+    }
+
+    fn vgpu_slices_for(
+        &self,
+        node_id: &str,
+        vms: &[VmRow],
+    ) -> Result<Vec<nixgen::VgpuSliceNix>, Status> {
+        let inventory = self.node_gpu_inventory(node_id)?;
+        let mut slices = Vec::new();
+        for vm in vms {
+            if vm.node_id != node_id {
+                continue;
+            }
+            let names = self.vm_gpu_names(&vm.id)?;
+            let addrs = crate::pci::split_pci_devices(&vm.pci_devices);
+            for (name, addr) in names.iter().zip(addrs.iter()) {
+                let Some(profile) = kcore_gpu::binding_profile(name) else {
+                    continue;
+                };
+                let device = kcore_gpu::binding_device_name(name);
+                let host_address = inventory
+                    .iter()
+                    .find(|row| row.name == device)
+                    .and_then(|slice| inventory.iter().find(|host| host.name == slice.parent))
+                    .map(|host| host.address.clone())
+                    .unwrap_or_default();
+                slices.push(nixgen::VgpuSliceNix {
+                    vm_id: vm.id.clone(),
+                    address: addr.clone(),
+                    profile: profile.to_string(),
+                    host_address,
+                });
+            }
+        }
+        Ok(slices)
+    }
+
+    fn store_gpu_assignment(
+        &self,
+        vm: &VmRow,
+        names: &str,
+        pci_devices: &str,
+    ) -> Result<(), Status> {
+        let previous_pci = vm.pci_devices.clone();
+        self.db
+            .set_vm_pci_devices(&vm.id, pci_devices)
+            .map_err(|e| Status::internal(format!("storing PCI devices: {e}")))?;
+        if let Err(e) = self.db.set_vm_gpu(&vm.id, names) {
+            let _ = self.db.set_vm_pci_devices(&vm.id, &previous_pci);
+            return Err(Status::internal(format!("storing GPU assignment: {e}")));
+        }
+        Ok(())
+    }
+
+    /// Point a GPU or vGPU VM at free or named devices on `target` and store that assignment.
     /// The VM's node id is left unchanged; the caller moves it.
     fn retarget_vm_gpus(
         &self,
         vm: &VmRow,
         target: &NodeRow,
         explicit: &[String],
+        explicit_vgpus: &[String],
     ) -> Result<String, Status> {
+        let current = self.vm_gpu_names(&vm.id)?;
+        let has_slice = current.iter().any(|name| name.contains('='));
+        if has_slice || explicit_vgpus.iter().any(|gpu| !gpu.trim().is_empty()) {
+            if explicit.iter().any(|gpu| !gpu.trim().is_empty()) {
+                return Err(Status::invalid_argument(format!(
+                    "VM '{}' has vGPU slices; migrate it with --vgpu, not --gpu",
+                    vm.name
+                )));
+            }
+            let requests = if explicit_vgpus.iter().any(|gpu| !gpu.trim().is_empty()) {
+                explicit_vgpus
+                    .iter()
+                    .map(|gpu| gpu.trim().to_string())
+                    .filter(|gpu| !gpu.is_empty())
+                    .collect::<Vec<_>>()
+            } else if current.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "VM '{}' has PCI devices ({}) and no vGPU profile; migrate it with --vgpu A2-4C",
+                    vm.name, vm.pci_devices
+                )));
+            } else {
+                current
+                    .iter()
+                    .map(|name| {
+                        kcore_gpu::binding_profile(name)
+                            .map(str::to_string)
+                            .ok_or_else(|| {
+                                Status::failed_precondition(format!(
+                                    "VM '{}' slice '{name}' has no profile; migrate it with --vgpu",
+                                    vm.name
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let (names, pci_devices) =
+                self.assign_vgpus_on_node(&target.id, &requests, Some(&vm.id))?;
+            self.store_gpu_assignment(vm, &names, &pci_devices)?;
+            return Ok(names);
+        }
         let requests = if explicit.iter().any(|gpu| !gpu.trim().is_empty()) {
             explicit
                 .iter()
@@ -3047,17 +3195,7 @@ impl ControllerService {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let (names, pci_devices) = self.assign_gpus_on_node(&target.id, &requests, Some(&vm.id))?;
-        let previous_pci = vm.pci_devices.clone();
-        let previous_gpu = self.vm_gpu_names(&vm.id)?.join(",");
-        self.db
-            .set_vm_pci_devices(&vm.id, &pci_devices)
-            .map_err(|e| Status::internal(format!("storing PCI devices: {e}")))?;
-        if let Err(e) = self.db.set_vm_gpu(&vm.id, &names) {
-            let _ = self.db.set_vm_pci_devices(&vm.id, &previous_pci);
-            return Err(Status::internal(format!("storing GPU assignment: {e}")));
-        }
-        // previous_gpu is restored by the caller if the node move fails.
-        let _ = previous_gpu;
+        self.store_gpu_assignment(vm, &names, &pci_devices)?;
         Ok(names)
     }
 
@@ -3076,6 +3214,7 @@ impl ControllerService {
         vm: VmRow,
         target_node: &str,
         gpus: &[String],
+        vgpus: &[String],
     ) -> Result<Response<controller_proto::MigrateVmResponse>, Status> {
         let source_node = self
             .db
@@ -3105,7 +3244,7 @@ impl ControllerService {
         }
         let previous_pci = vm.pci_devices.clone();
         let previous_names = self.vm_gpu_names(&vm.id)?.join(",");
-        let names = self.retarget_vm_gpus(&vm, &target, gpus)?;
+        let names = self.retarget_vm_gpus(&vm, &target, gpus, vgpus)?;
         if let Err(e) = self.cold_release_ceph_vm(&vm, &source_node).await {
             self.restore_vm_gpu(&vm.id, &previous_pci, &previous_names);
             return Err(e);
@@ -3151,8 +3290,15 @@ impl ControllerService {
         Ok(Response::new(controller_proto::MigrateVmResponse {
             success: true,
             message: format!(
-                "cold-migrated '{}' from {} to {} and assigned {names} (was {from}). Whole-device GPUs are not live-migrated; the guest starts on the destination GPU",
-                vm.name, source_node.id, target.id
+                "cold-migrated '{}' from {} to {} and assigned {names} (was {from}). {} are not live-migrated; the guest starts on the destination",
+                vm.name,
+                source_node.id,
+                target.id,
+                if names.contains('=') {
+                    "vGPU slices"
+                } else {
+                    "Whole-device GPUs"
+                }
             ),
             mode: "cold".into(),
             source_node: source_node.id,
@@ -3385,6 +3531,34 @@ impl ControllerService {
                 );
             if !same {
                 diff.immutable.push("gpu".into());
+            }
+        }
+        if spec.vgpus.iter().any(|gpu| !gpu.trim().is_empty()) {
+            let current = self.vm_gpu_names(&stored.id)?;
+            let requested: Vec<String> = spec
+                .vgpus
+                .iter()
+                .map(|gpu| gpu.trim().to_string())
+                .filter(|gpu| !gpu.is_empty())
+                .collect();
+            let same = requested.len() == current.len()
+                && requested.iter().zip(&current).all(|(want, have)| {
+                    match kcore_gpu::parse_vgpu_selector(want) {
+                        Ok(kcore_gpu::VgpuSelector::Profile(profile)) => {
+                            kcore_gpu::binding_profile(have) == Some(profile.as_str())
+                        }
+                        Ok(kcore_gpu::VgpuSelector::Card { card, profile }) => have
+                            .strip_prefix(&format!("{card}/"))
+                            .and_then(|rest| rest.split_once('='))
+                            .is_some_and(|(_, got)| got == profile),
+                        Ok(kcore_gpu::VgpuSelector::Slice { name, profile }) => {
+                            have == &format!("{name}={profile}")
+                        }
+                        Err(_) => false,
+                    }
+                });
+            if !same {
+                diff.immutable.push("vgpu".into());
             }
         }
         if spec.nics.len() > 1 {
@@ -4591,7 +4765,7 @@ impl ControllerService {
                 for target in &gpu_targets {
                     let previous_pci = vm.pci_devices.clone();
                     let previous_gpu = self.vm_gpu_names(&vm.id).unwrap_or_default().join(",");
-                    if let Err(e) = self.retarget_vm_gpus(vm, target, &[]) {
+                    if let Err(e) = self.retarget_vm_gpus(vm, target, &[], &[]) {
                         gpu_error = e.message().to_string();
                         continue;
                     }
@@ -5673,6 +5847,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     class_code: gpu.class_code.trim().to_ascii_lowercase(),
                     characteristics: gpu.characteristics.clone(),
                     driver: gpu.driver.trim().to_string(),
+                    parent: gpu.parent.trim().to_ascii_lowercase(),
+                    profile: gpu.profile.trim().to_string(),
+                    profiles: gpu
+                        .profiles
+                        .iter()
+                        .map(|profile| profile.trim())
+                        .filter(|profile| !profile.is_empty())
+                        .map(|profile| profile.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
                 });
             }
             self.db
@@ -5849,9 +6033,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut pci_devices =
             crate::pci::join_pci_devices(&spec.pci_devices).map_err(Status::invalid_argument)?;
         let wants_gpu = spec.gpus.iter().any(|gpu| !gpu.trim().is_empty());
-        if wants_gpu && !pci_devices.is_empty() {
+        let wants_vgpu = spec.vgpus.iter().any(|gpu| !gpu.trim().is_empty());
+        let modes =
+            usize::from(wants_gpu) + usize::from(wants_vgpu) + usize::from(!pci_devices.is_empty());
+        if modes > 1 {
             return Err(Status::invalid_argument(
-                "pass devices by name (--gpu radeon0, --nic nic0, --nvme nvme0) or by raw PCI address, not both",
+                "pass a whole device (--gpu), a vGPU slice (--vgpu), or a raw PCI address, not more than one",
             ));
         }
         let required_labels = req
@@ -5881,7 +6068,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         let requested_storage_backend = normalize_storage_backend(req.storage_backend, true)?;
         let requested_storage_size_bytes = validate_storage_size_bytes(req.storage_size_bytes)?;
-        if (!pci_devices.is_empty() || wants_gpu) && req.target_node.trim().is_empty() {
+        if (!pci_devices.is_empty() || wants_gpu || wants_vgpu) && req.target_node.trim().is_empty()
+        {
             return Err(Status::invalid_argument(
                 "a PCI assignment requires target_node; the controller does not place passthrough devices automatically",
             ));
@@ -5949,7 +6137,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     .err()
             };
             if let Some(err) = preflight_error {
-                if !pci_devices.is_empty() || wants_gpu {
+                if !pci_devices.is_empty() || wants_gpu || wants_vgpu {
                     return Err(err);
                 }
                 if let Some(fallback) = self
@@ -5991,6 +6179,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut assigned_gpus = String::new();
         if wants_gpu {
             let (names, functions) = self.assign_gpus_on_node(&node.id, &spec.gpus, None)?;
+            assigned_gpus = names;
+            pci_devices = functions;
+        } else if wants_vgpu {
+            let (names, functions) = self.assign_vgpus_on_node(&node.id, &spec.vgpus, None)?;
             assigned_gpus = names;
             pci_devices = functions;
         }
@@ -6653,7 +6845,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         controller_proto::VmDesiredState::Stopped as i32
                     },
                     pci_devices: crate::pci::split_pci_devices(&db_vm.pci_devices),
-                    gpus: self.vm_gpu_names(&db_vm.id)?,
+                    gpus: self
+                        .vm_gpu_names(&db_vm.id)?
+                        .into_iter()
+                        .filter(|name| !name.contains('='))
+                        .collect(),
+                    vgpus: self
+                        .vm_gpu_names(&db_vm.id)?
+                        .into_iter()
+                        .filter(|name| name.contains('='))
+                        .collect(),
                     labels: vm_labels(&db_vm.labels),
                 });
                 let status = Some(controller_proto::VmStatus {
@@ -6779,7 +6980,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     controller_proto::VmDesiredState::Stopped as i32
                 },
                 pci_devices: crate::pci::split_pci_devices(&db_vm.pci_devices),
-                gpus: gpu_names.clone(),
+                gpus: gpu_names
+                    .iter()
+                    .filter(|name| !name.contains('='))
+                    .cloned()
+                    .collect(),
+                vgpus: gpu_names
+                    .iter()
+                    .filter(|name| name.contains('='))
+                    .cloned()
+                    .collect(),
                 labels: vm_labels(&db_vm.labels),
             }
         });
@@ -8819,12 +9029,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
             std::collections::HashMap::new();
         for vm in &vms {
             for name in self.vm_gpu_names(&vm.id)? {
-                assigned.insert((vm.node_id.clone(), name), vm.name.clone());
+                assigned.insert(
+                    (
+                        vm.node_id.clone(),
+                        kcore_gpu::binding_device_name(&name).to_string(),
+                    ),
+                    vm.name.clone(),
+                );
             }
         }
         let gpus = rows
             .into_iter()
-            .filter(|row| row.kind.is_empty() || row.kind == "gpu")
+            .filter(|row| row.kind.is_empty() || row.kind == "gpu" || row.kind == "vgpu")
             .map(|row| gpu_info_from_row(row, &assigned))
             .collect();
         Ok(Response::new(controller_proto::ListGpusResponse { gpus }))
@@ -8853,7 +9069,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
             std::collections::HashMap::new();
         for vm in &vms {
             for name in self.vm_gpu_names(&vm.id)? {
-                assigned.insert((vm.node_id.clone(), name), vm.name.clone());
+                assigned.insert(
+                    (
+                        vm.node_id.clone(),
+                        kcore_gpu::binding_device_name(&name).to_string(),
+                    ),
+                    vm.name.clone(),
+                );
             }
             let owned = crate::pci::split_pci_devices(&vm.pci_devices);
             for row in &rows {
@@ -9235,7 +9457,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         if !vm.pci_devices.is_empty() || !self.vm_gpu_names(&vm.id)?.is_empty() {
             return self
-                .migrate_gpu_vm(&actor, vm, &req.target_node, &req.gpus)
+                .migrate_gpu_vm(&actor, vm, &req.target_node, &req.gpus, &req.vgpus)
                 .await;
         }
 
@@ -16327,6 +16549,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16384,6 +16607,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: "https://example.com/debian.raw".to_string(),
             image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -16447,6 +16671,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16504,6 +16729,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16568,6 +16794,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16626,6 +16853,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16690,6 +16918,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16747,6 +16976,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -16886,6 +17116,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: false,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -16923,6 +17154,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: true,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -16949,6 +17181,9 @@ mod tests {
             class_code: "0x030000".into(),
             characteristics: "purpose=ai".into(),
             driver: String::new(),
+            parent: String::new(),
+            profile: String::new(),
+            profiles: String::new(),
         }
     }
 
@@ -16987,6 +17222,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: false,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -16998,6 +17234,186 @@ mod tests {
         assert_eq!(moved.node_id, "node-b");
         assert_eq!(moved.pci_devices, "0000:41:00.0");
         assert_eq!(db.get_vm_gpu(&vm.id).unwrap().as_deref(), Some("radeon0"));
+    }
+
+    fn vgpu_host(node: &str, name: &str, address: &str) -> crate::db::NodeGpuRow {
+        let mut row = gpu_row(node, name, address);
+        row.family = "nvidia".into();
+        row.model = "NVIDIA 10de:25b6".into();
+        row.role = "vgpu-host".into();
+        row.assignable = false;
+        row.blocked_reason = "vGPU host card; request a slice with --vgpu".into();
+        row.driver = "nvidia".into();
+        row
+    }
+
+    fn vgpu_slice(
+        node: &str,
+        name: &str,
+        address: &str,
+        parent: &str,
+        profile: &str,
+        profiles: &str,
+    ) -> crate::db::NodeGpuRow {
+        let mut row = gpu_row(node, name, address);
+        row.family = "nvidia".into();
+        row.model = "NVIDIA 10de:25b6 VF".into();
+        row.kind = "vgpu".into();
+        row.role = "slice".into();
+        row.parent = parent.into();
+        row.profile = profile.into();
+        row.profiles = profiles.into();
+        row.driver = "nvidia-vgpu-vfio".into();
+        row
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_reassigns_a_free_vgpu_slice_of_the_same_profile() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".into();
+        db.upsert_node(&node_a).unwrap();
+        let mut node_b = test_node();
+        node_b.id = "node-b".into();
+        node_b.address = "127.0.0.2:9091".into();
+        db.upsert_node(&node_b).unwrap();
+        db.replace_node_gpus(
+            "node-a",
+            &[
+                vgpu_host("node-a", "nvidia0", "0000:af:00.0"),
+                vgpu_slice(
+                    "node-a",
+                    "nvidia0/0",
+                    "0000:af:00.4",
+                    "nvidia0",
+                    "A2-4C",
+                    "A2-4C,A2-8C",
+                ),
+            ],
+        )
+        .unwrap();
+        db.replace_node_gpus(
+            "node-b",
+            &[
+                vgpu_host("node-b", "nvidia0", "0000:c1:00.0"),
+                vgpu_slice(
+                    "node-b",
+                    "nvidia0/0",
+                    "0000:c1:00.4",
+                    "nvidia0",
+                    "",
+                    "A2-4C,A2-8C",
+                ),
+            ],
+        )
+        .unwrap();
+        let mut vm = test_vm("node-a");
+        vm.pci_devices = "0000:af:00.4".into();
+        db.insert_vm(&vm).unwrap();
+        db.set_vm_gpu(&vm.id, "nvidia0/0=A2-4C").unwrap();
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id.clone(),
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: false,
+                    gpus: vec![],
+                    vgpus: vec![],
+                }),
+            )
+            .await
+            .expect("vgpu vm should cold-migrate")
+            .into_inner();
+        assert!(resp.success, "{}", resp.message);
+        assert!(resp.message.contains("A2-4C"), "{}", resp.message);
+        let moved = db.get_vm(&vm.id).unwrap().unwrap();
+        assert_eq!(moved.node_id, "node-b");
+        assert_eq!(moved.pci_devices, "0000:c1:00.4");
+        assert_eq!(
+            db.get_vm_gpu(&vm.id).unwrap().as_deref(),
+            Some("nvidia0/0=A2-4C")
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_leaves_a_vgpu_vm_when_no_node_has_its_profile() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".into();
+        db.upsert_node(&node_a).unwrap();
+        let mut node_b = test_node();
+        node_b.id = "node-b".into();
+        node_b.address = "127.0.0.2:9091".into();
+        db.upsert_node(&node_b).unwrap();
+        db.replace_node_gpus(
+            "node-a",
+            &[
+                vgpu_host("node-a", "nvidia0", "0000:af:00.0"),
+                vgpu_slice(
+                    "node-a",
+                    "nvidia0/0",
+                    "0000:af:00.4",
+                    "nvidia0",
+                    "A2-4C",
+                    "A2-4C",
+                ),
+            ],
+        )
+        .unwrap();
+        db.replace_node_gpus(
+            "node-b",
+            &[
+                vgpu_host("node-b", "nvidia0", "0000:c1:00.0"),
+                vgpu_slice(
+                    "node-b",
+                    "nvidia0/0",
+                    "0000:c1:00.4",
+                    "nvidia0",
+                    "A2-8C",
+                    "A2-8C",
+                ),
+            ],
+        )
+        .unwrap();
+        let mut vm = test_vm("node-a");
+        vm.pci_devices = "0000:af:00.4".into();
+        db.insert_vm(&vm).unwrap();
+        db.set_vm_gpu(&vm.id, "nvidia0/0=A2-4C").unwrap();
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let resp =
+            <ControllerService as controller_proto::controller_server::Controller>::drain_node(
+                &svc,
+                Request::new(controller_proto::DrainNodeRequest {
+                    node_id: "node-a".into(),
+                    target_node: String::new(),
+                }),
+            )
+            .await
+            .expect("drain rpc")
+            .into_inner();
+        assert!(resp.message.contains("A2-4C"), "{}", resp.message);
+        let stayed = db.get_vm(&vm.id).unwrap().unwrap();
+        assert_eq!(stayed.node_id, "node-a");
+        let node = db.get_node("node-a").unwrap().unwrap();
+        assert_ne!(node.status, "drained");
     }
 
     #[tokio::test]
@@ -17092,6 +17508,7 @@ mod tests {
                 pci_devices: vec!["03:00.1".into()],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: String::new(),
             image_sha256: String::new(),
@@ -17222,6 +17639,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: true,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -17252,6 +17670,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: true,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -17352,6 +17771,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: true,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -17421,6 +17841,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: true,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -17670,6 +18091,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: true,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -17949,6 +18371,7 @@ mod tests {
                     target_node: "node-b".into(),
                     allow_cold_fallback: true,
                     gpus: vec![],
+                    vgpus: vec![],
                 }),
             )
             .await
@@ -18237,6 +18660,7 @@ mod tests {
                         pci_devices: vec![],
                         gpus: vec![],
                         labels: std::collections::HashMap::new(),
+                        vgpus: vec![],
                     }),
                     image_url: "https://example.com/img.raw".to_string(),
                     image_sha256:
@@ -19386,6 +19810,7 @@ mod tests {
                 pci_devices: vec![],
                 gpus: vec![],
                 labels: std::collections::HashMap::new(),
+                vgpus: vec![],
             }),
             image_url: "https://example.com/debian.raw".to_string(),
             image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

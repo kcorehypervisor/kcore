@@ -579,6 +579,10 @@ enum CreateResource {
         /// Example: --gpu radeon0. A family (`radeon`, `nvidia`, `intel`, `accel`) takes the first free one.
         #[arg(long = "gpu")]
         gpu: Vec<String>,
+        /// NVIDIA vGPU slice (repeatable). Requires --target-node.
+        /// Example: --vgpu A2-4C, --vgpu nvidia0=A2-4C, or --vgpu nvidia0/3=A2-4C.
+        #[arg(long = "vgpu")]
+        vgpu: Vec<String>,
         /// Ethernet NIC to assign, by inventory name or family (repeatable).
         /// Example: --nic nic0. Family `nic` takes the first free one.
         #[arg(long = "nic")]
@@ -1652,6 +1656,11 @@ enum MigrateResource {
         /// Example: --gpu radeon0
         #[arg(long = "gpu")]
         gpu: Vec<String>,
+        /// vGPU slice to attach on the destination (repeatable).
+        /// Omit this to take a free slice of the same profile.
+        /// Example: --vgpu nvidia1=A2-4C
+        #[arg(long = "vgpu")]
+        vgpu: Vec<String>,
         /// NIC to attach on the destination (repeatable).
         /// Omit this to take a free NIC of the same family.
         #[arg(long = "nic")]
@@ -1899,6 +1908,7 @@ async fn main() {
                     storage_size_bytes,
                     target_dc,
                     gpu,
+                    vgpu,
                     nic,
                     nvme,
                     pci,
@@ -1942,6 +1952,7 @@ async fn main() {
                     storage_size_bytes: *storage_size_bytes,
                     target_dc: target_dc.clone(),
                     gpu: gpu.clone(),
+                    vgpu: vgpu.clone(),
                     nic: nic.clone(),
                     nvme: nvme.clone(),
                     pci: pci.clone(),
@@ -3109,6 +3120,7 @@ async fn main() {
                     gpu,
                     nic,
                     nvme,
+                    vgpu,
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -3124,6 +3136,7 @@ async fn main() {
                     target_node: target_node.to_string(),
                     allow_cold_fallback: *allow_cold_fallback,
                     gpus: devices,
+                    vgpus: vgpu.clone(),
                 })
                 .await;
             match resp {

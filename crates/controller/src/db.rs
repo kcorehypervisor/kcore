@@ -146,6 +146,12 @@ pub struct NodeGpuRow {
     pub class_code: String,
     pub characteristics: String,
     pub driver: String,
+    /// Card name for a slice. Empty on a whole device.
+    pub parent: String,
+    /// Current vGPU type. Empty when none is programmed. Case is preserved.
+    pub profile: String,
+    /// Comma-separated types the slice can take now.
+    pub profiles: String,
 }
 
 /// A NIC after the primary. Position 0 stays on `vms.network` / `vms.vm_ip`.
@@ -763,13 +769,14 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 61;
+pub const SCHEMA_VERSION: i32 = 62;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
 /// database already stamped 58 still receives that table. Version 60 adds
 /// membership columns with defaults. Version 61 adds `vms.labels` with a
-/// default. Older readers select the original columns and still open the file.
+/// default. Version 62 adds vGPU parent and profile columns on `node_gpus`.
+/// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
 const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
@@ -2021,6 +2028,24 @@ impl Database {
                     "ALTER TABLE vms ADD COLUMN labels TEXT NOT NULL DEFAULT ''",
                     [],
                 )?;
+            }
+        }
+
+        if version < 62 {
+            for column in [
+                "parent TEXT NOT NULL DEFAULT ''",
+                "profile TEXT NOT NULL DEFAULT ''",
+                "profiles TEXT NOT NULL DEFAULT ''",
+            ] {
+                let name = column.split_whitespace().next().unwrap_or(column);
+                let has: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('node_gpus') WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if has == 0 {
+                    conn.execute(&format!("ALTER TABLE node_gpus ADD COLUMN {column}"), [])?;
+                }
             }
         }
 
@@ -5992,8 +6017,8 @@ impl Database {
                 gpu.kind.clone()
             };
             tx.execute(
-                "INSERT INTO node_gpus (node_id, name, family, model, address, pci_devices, iommu_group, assignable, blocked_reason, kind, role, class_code, characteristics, driver)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                "INSERT INTO node_gpus (node_id, name, family, model, address, pci_devices, iommu_group, assignable, blocked_reason, kind, role, class_code, characteristics, driver, parent, profile, profiles)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     node_id,
                     gpu.name,
@@ -6009,6 +6034,9 @@ impl Database {
                     gpu.class_code,
                     gpu.characteristics,
                     gpu.driver,
+                    gpu.parent,
+                    gpu.profile,
+                    gpu.profiles,
                 ],
             )?;
         }
@@ -6022,7 +6050,7 @@ impl Database {
     ) -> Result<Vec<NodeGpuRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT node_id, name, family, model, address, pci_devices, iommu_group, assignable, blocked_reason, kind, role, class_code, characteristics, driver
+            "SELECT node_id, name, family, model, address, pci_devices, iommu_group, assignable, blocked_reason, kind, role, class_code, characteristics, driver, parent, profile, profiles
              FROM node_gpus
              WHERE (?1 = '' OR node_id = ?1)
              ORDER BY node_id, address",
@@ -6044,6 +6072,9 @@ impl Database {
                 class_code: row.get(11)?,
                 characteristics: row.get(12)?,
                 driver: row.get(13)?,
+                parent: row.get(14)?,
+                profile: row.get(15)?,
+                profiles: row.get(16)?,
             })
         })?;
         rows.collect()

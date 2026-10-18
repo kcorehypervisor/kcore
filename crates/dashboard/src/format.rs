@@ -179,6 +179,7 @@ pub fn guest_size_label(bytes: i64) -> String {
 pub fn device_kind_label(kind: &str) -> &'static str {
     match kind.trim() {
         "" | "gpu" => "GPU",
+        "vgpu" => "vGPU",
         "nic" => "Network card",
         "nvme" => "NVMe",
         "raw" => "Other PCI",
@@ -192,6 +193,8 @@ pub fn device_role_label(role: &str) -> String {
         "compute" => "AI compute".to_string(),
         "platform" => "Host graphics".to_string(),
         "passthrough" => "Passthrough".to_string(),
+        "vgpu-host" => "vGPU host".to_string(),
+        "slice" => "Slice".to_string(),
         other => other.to_string(),
     }
 }

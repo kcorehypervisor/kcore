@@ -34,6 +34,7 @@ pub struct CreateArgs {
     pub storage_size_bytes: Option<i64>,
     pub target_dc: Option<String>,
     pub gpu: Vec<String>,
+    pub vgpu: Vec<String>,
     pub nic: Vec<String>,
     pub nvme: Vec<String>,
     pub pci: Vec<String>,
@@ -70,6 +71,7 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
         storage_size_bytes: None,
         target_dc: None,
         gpu: vec![],
+        vgpu: vec![],
         nic: vec![],
         nvme: vec![],
         pci: vec![],
@@ -134,6 +136,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_desired_state,
         manifest_pci_devices,
         manifest_gpus,
+        manifest_vgpus,
         manifest_node_labels,
         manifest_anti_affinity,
         manifest_labels,
@@ -157,6 +160,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             manifest.desired_state,
             manifest.pci_devices,
             manifest.gpus,
+            manifest.vgpus,
             manifest.node_labels,
             manifest.anti_affinity,
             manifest.labels,
@@ -194,6 +198,7 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             vec![],
             None,
             proto::VmDesiredState::Unspecified,
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -269,6 +274,11 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             args.pci.clone()
         },
         gpus: device_names(&args, manifest_gpus),
+        vgpus: if args.vgpu.is_empty() {
+            manifest_vgpus
+        } else {
+            args.vgpu.clone()
+        },
         labels: {
             let mut labels = manifest_labels;
             for pair in &args.labels {
@@ -285,7 +295,9 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         .target_node
         .or(manifest_target_node)
         .unwrap_or_default();
-    if (!spec.pci_devices.is_empty() || !spec.gpus.is_empty()) && target_node.trim().is_empty() {
+    if (!spec.pci_devices.is_empty() || !spec.gpus.is_empty() || !spec.vgpus.is_empty())
+        && target_node.trim().is_empty()
+    {
         bail!("a GPU assignment requires --target-node (or spec.targetNode)");
     }
     let target_dc = args.target_dc.or(manifest_target_dc).unwrap_or_default();
@@ -826,6 +838,7 @@ struct VmManifest {
     desired_state: proto::VmDesiredState,
     pci_devices: Vec<String>,
     gpus: Vec<String>,
+    vgpus: Vec<String>,
     node_labels: Vec<String>,
     anti_affinity: Option<String>,
     labels: std::collections::HashMap<String, String>,
@@ -1247,6 +1260,17 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         })
         .unwrap_or_default();
 
+    let vgpus = doc["spec"]["vgpus"]
+        .as_sequence()
+        .or_else(|| doc["spec"]["vgpu"].as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .or_else(|| doc["spec"]["vgpu"].as_str().map(|s| vec![s.to_string()]))
+        .unwrap_or_default();
+
     Ok(VmManifest {
         name,
         cpu,
@@ -1264,6 +1288,7 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
         desired_state,
         pci_devices,
         gpus,
+        vgpus,
         node_labels: doc["spec"]["nodeLabels"]
             .as_sequence()
             .or_else(|| doc["spec"]["node_labels"].as_sequence())
@@ -1500,6 +1525,7 @@ mod tests {
             storage_size_bytes: Some(10 * 1024 * 1024 * 1024),
             target_dc: None,
             gpu: vec![],
+            vgpu: vec![],
             nic: vec![],
             nvme: vec![],
             pci: vec![],
