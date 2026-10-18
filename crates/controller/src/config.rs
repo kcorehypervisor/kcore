@@ -1113,7 +1113,7 @@ webhooks:
     - name: pager
       url: http://127.0.0.1/hook
       events:
-        - vm.deleted
+        - vm.exploded
 "#,
                 "unknown event",
             ),

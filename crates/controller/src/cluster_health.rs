@@ -163,6 +163,7 @@ mod tests {
             storage_size_bytes: 0,
             vm_ip: String::new(),
             pci_devices: String::new(),
+            labels: String::new(),
         }
     }
 

@@ -520,7 +520,8 @@ Top-level commands:
 
 - `kctl create vm ... --storage-backend <filesystem|lvm|zfs|ceph> --storage-size-bytes <bytes>`
 - `kctl create cluster ...`
-- `kctl create vm ... [--extra-network <name>]... [--label key=value]... [--anti-affinity <group>]`
+- `kctl create vm ... [--extra-network <name>]... [--label key=value]... [--vm-label key=value]... [--anti-affinity <group>]`
+- `kctl label vm <name> --label key=value` merges VM labels. `--label` on create is still a node selector.
 - `kctl create network <name> --external-ip ... --gateway-ip ... [--type nat|bridge|vxlan] [--no-outbound-nat] [--ipv6-prefix ...] [--ipv6-gateway ...] [--east-west-firewall] [--vlan-id ...] [--target-node ...]`
 - `kctl create ssh-key <name> --public-key "ssh-rsa ..."`
 - `kctl delete vm ...`

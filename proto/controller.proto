@@ -441,6 +441,8 @@ message UpdateVmRequest {
   string target_node = 2;  // Optional
   int32 cpu = 3;            // New CPU count (0 = no change)
   int64 memory_bytes = 4;   // New memory (0 = no change)
+  // Keys merged into the stored VM label map. Empty leaves labels unchanged.
+  map<string, string> labels = 5;
 }
 
 message UpdateVmResponse {
@@ -486,6 +488,9 @@ message GetVmResponse {
   VmStatus status = 2;
   string node_id = 3;  // Which node it's on
   string assigned_ip = 4; // Controller-assigned VM IP (static/reserved when available)
+  // Cheap GuestOps signal: true when the guest answered an SSH probe, or when
+  // the VM is running and already has an assigned IP and no admin client is up.
+  bool guest_reachable = 5;
 }
 
 message ListVmsRequest {
@@ -782,6 +787,7 @@ message VmInfo {
   google.protobuf.Timestamp created_at = 7;
   string storage_backend = 8;   // filesystem, lvm, zfs
   int64 storage_size_bytes = 9; // Provisioned volume size
+  map<string, string> labels = 10;
 }
 
 // Node Operations
@@ -843,6 +849,7 @@ message VmSpec {
   // (radeon, nic, nvme) meaning the first free device of that family.
   // GPUs are AI compute devices. Empty leaves a stored assignment unchanged.
   repeated string gpus = 11;
+  map<string, string> labels = 12;
 }
 
 message Disk {
@@ -1864,6 +1871,11 @@ message FreezeVmFilesystemsRequest {
   string vm_name = 1;
   bool freeze = 2;
   int32 timeout_ms = 3;
+  // Shell run in the guest over GuestOps SSH before fsfreeze. Empty skips it.
+  // The script must be idempotent. A non-zero exit fails the freeze.
+  string pre_script = 4;
+  // Shell run after fsfreeze (or after unfreeze when freeze is false).
+  string post_script = 5;
 }
 
 message FreezeVmFilesystemsResponse {

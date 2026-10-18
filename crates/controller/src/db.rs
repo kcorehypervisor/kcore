@@ -124,6 +124,8 @@ pub struct VmRow {
     pub vm_ip: String,
     /// Comma-separated canonical PCI addresses (`0000:03:00.0`). Empty means none.
     pub pci_devices: String,
+    /// JSON object of VM labels. Empty string means none.
+    pub labels: String,
 }
 
 #[derive(Debug, Clone)]
@@ -761,13 +763,13 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 60;
+pub const SCHEMA_VERSION: i32 = 61;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
 /// database already stamped 58 still receives that table. Version 60 adds
-/// membership columns with defaults. Older readers select the original columns
-/// and still open the file.
+/// membership columns with defaults. Version 61 adds `vms.labels` with a
+/// default. Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
 const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
@@ -911,7 +913,8 @@ impl Database {
                 storage_backend TEXT NOT NULL DEFAULT 'filesystem',
                 storage_size_bytes INTEGER NOT NULL DEFAULT 0,
                 vm_ip TEXT NOT NULL DEFAULT '',
-                pci_devices TEXT NOT NULL DEFAULT ''
+                pci_devices TEXT NOT NULL DEFAULT '',
+                labels TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS networks (
                 name TEXT NOT NULL,
@@ -2004,6 +2007,20 @@ impl Database {
                         [],
                     )?;
                 }
+            }
+        }
+
+        if version < 61 {
+            let has_labels: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('vms') WHERE name = 'labels'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_labels == 0 {
+                conn.execute(
+                    "ALTER TABLE vms ADD COLUMN labels TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
             }
         }
 
@@ -3219,8 +3236,8 @@ impl Database {
     pub fn insert_vm(&self, vm: &VmRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices, labels)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 vm.id,
                 vm.name,
@@ -3240,6 +3257,7 @@ impl Database {
                 vm.storage_size_bytes,
                 vm.vm_ip,
                 vm.pci_devices,
+                vm.labels,
             ],
         )?;
         Ok(())
@@ -3394,8 +3412,8 @@ impl Database {
     pub fn upsert_vm(&self, vm: &VmRow) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17, ?18)
+            "INSERT INTO vms (id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices, labels)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), ?13, ?14, ?15, ?16, ?17, ?18, ?19)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 cpu=excluded.cpu,
@@ -3413,7 +3431,8 @@ impl Database {
                 storage_backend=excluded.storage_backend,
                 storage_size_bytes=excluded.storage_size_bytes,
                 vm_ip=excluded.vm_ip,
-                pci_devices=excluded.pci_devices",
+                pci_devices=excluded.pci_devices,
+                labels=excluded.labels",
             params![
                 vm.id,
                 vm.name,
@@ -3433,6 +3452,7 @@ impl Database {
                 vm.storage_size_bytes,
                 vm.vm_ip,
                 vm.pci_devices,
+                vm.labels,
             ],
         )?;
         Ok(())
@@ -3579,7 +3599,7 @@ impl Database {
     pub fn get_vm(&self, vm_id: &str) -> Result<Option<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices FROM vms WHERE id = ?1",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices, labels FROM vms WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![vm_id], row_to_vm)?;
         rows.next().transpose()
@@ -3588,7 +3608,7 @@ impl Database {
     pub fn list_vms(&self) -> Result<Vec<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices FROM vms",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices, labels FROM vms",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
         rows.collect()
@@ -3597,7 +3617,7 @@ impl Database {
     pub fn list_vms_for_node(&self, node_id: &str) -> Result<Vec<VmRow>, rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices FROM vms WHERE node_id = ?1",
+            "SELECT id, name, cpu, memory_bytes, image_path, image_url, image_sha256, image_format, image_size, network, auto_start, node_id, created_at, runtime_state, cloud_init_user_data, storage_backend, storage_size_bytes, vm_ip, pci_devices, labels FROM vms WHERE node_id = ?1",
         )?;
         let rows = stmt.query_map(params![node_id], row_to_vm)?;
         rows.collect()
@@ -6075,6 +6095,20 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Replace the JSON label map for a VM addressed by id or name.
+    pub fn set_vm_labels(
+        &self,
+        id_or_name: &str,
+        labels_json: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE vms SET labels = ?1 WHERE id = ?2 OR name = ?2",
+            rusqlite::params![labels_json, id_or_name],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn upsert_node_labels(
         &self,
         node_id: &str,
@@ -7287,6 +7321,7 @@ fn row_to_vm(row: &rusqlite::Row) -> Result<VmRow, rusqlite::Error> {
         storage_size_bytes: row.get(16)?,
         vm_ip: row.get(17)?,
         pci_devices: row.get(18)?,
+        labels: row.get(19)?,
     })
 }
 
@@ -7594,6 +7629,7 @@ mod tests {
             storage_size_bytes: 0,
             vm_ip: String::new(),
             pci_devices: String::new(),
+            labels: String::new(),
         }
     }
 
@@ -7723,6 +7759,7 @@ mod tests {
             storage_size_bytes: 0,
             vm_ip: String::new(),
             pci_devices: String::new(),
+            labels: String::new(),
         })
         .expect("insert qcow vm");
 
@@ -8847,6 +8884,7 @@ mod tests {
             storage_size_bytes: 1024 * 1024,
             vm_ip: "10.240.0.22".to_string(),
             pci_devices: String::new(),
+            labels: String::new(),
         })
         .expect("vm");
         db.insert_network(&NetworkRow {
@@ -9485,6 +9523,7 @@ mod proptests {
             storage_size_bytes: 0,
             vm_ip: String::new(),
             pci_devices: String::new(),
+            labels: String::new(),
         }
     }
 

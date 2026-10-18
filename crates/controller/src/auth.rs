@@ -174,28 +174,40 @@ pub fn require_controller_operator<T>(
     bootstrap_kctl: bool,
     required: OperatorRole,
 ) -> Result<(), Status> {
-    let cn = match peer_cn(request) {
-        Some(cn) => cn,
-        None => {
-            if !tls_active {
-                return Ok(());
-            }
-            // TLS is configured but no client cert was presented — allow only when
-            // the transport layer already accepted the connection (rare).
-            return Ok(());
-        }
-    };
-
-    let peer = classify_management_peer(&cn)?;
-    let effective = effective_operator_role(db, &peer, bootstrap_kctl)?;
-
+    if peer_cn(request).is_none() {
+        return Ok(());
+    }
+    let effective = controller_operator_role(request, db, tls_active, bootstrap_kctl)?;
     if effective.satisfies(required) {
         Ok(())
     } else {
+        let cn = peer_cn(request).unwrap_or_default();
         Err(Status::permission_denied(format!(
             "identity '{cn}' lacks required role {required:?} (effective {effective:?})"
         )))
     }
+}
+
+/// Effective operator role for this request. Without TLS, management RPCs are
+/// open and the caller is treated as cluster-admin.
+#[allow(clippy::result_large_err)]
+pub fn controller_operator_role<T>(
+    request: &Request<T>,
+    db: &Database,
+    tls_active: bool,
+    bootstrap_kctl: bool,
+) -> Result<OperatorRole, Status> {
+    let cn = match peer_cn(request) {
+        Some(cn) => cn,
+        None => {
+            if !tls_active {
+                return Ok(OperatorRole::ClusterAdmin);
+            }
+            return Ok(OperatorRole::ClusterAdmin);
+        }
+    };
+    let peer = classify_management_peer(&cn)?;
+    effective_operator_role(db, &peer, bootstrap_kctl)
 }
 
 /// Authorize `ControllerAdmin` RPCs (historically CN=kctl only — never peer controllers).

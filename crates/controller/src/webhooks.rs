@@ -34,11 +34,17 @@ use crate::config::{WebhookEndpoint, WebhooksConfig};
 pub const EVENT_NODE_HEARTBEAT_MISSED: &str = "node.heartbeat.missed";
 pub const EVENT_CERT_EXPIRY_WARNING: &str = "cert.expiry.warning";
 pub const EVENT_VM_STATE_CHANGED: &str = "vm.state.changed";
+pub const EVENT_VM_CREATED: &str = "vm.created";
+pub const EVENT_VM_DELETED: &str = "vm.deleted";
+pub const EVENT_VM_MIGRATED: &str = "vm.migrated";
 
 pub const KNOWN_EVENTS: &[&str] = &[
     EVENT_NODE_HEARTBEAT_MISSED,
     EVENT_CERT_EXPIRY_WARNING,
     EVENT_VM_STATE_CHANGED,
+    EVENT_VM_CREATED,
+    EVENT_VM_DELETED,
+    EVENT_VM_MIGRATED,
 ];
 
 const QUEUE_CAPACITY: usize = 256;

@@ -1330,6 +1330,16 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                     .unwrap_or_default()
                     .to_string(),
                 pci_devices: pci_devices_from_replication_body(&body)?,
+                labels: body
+                    .get("labels")
+                    .map(|v| {
+                        if let Some(s) = v.as_str() {
+                            s.to_string()
+                        } else {
+                            v.to_string()
+                        }
+                    })
+                    .unwrap_or_default(),
             };
             // In place, not delete-then-insert: replaying `vm.create` for a VM
             // this controller already holds would otherwise cascade away its
@@ -1471,6 +1481,16 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let _ = db
                 .update_vm_spec(vm_id, cpu, memory_bytes)
                 .map_err(|e| format!("update vm spec {vm_id}: {e}"))?;
+            if let Some(labels) = body.get("labels").filter(|v| !v.is_null()) {
+                let encoded = if let Some(s) = labels.as_str() {
+                    s.to_string()
+                } else {
+                    labels.to_string()
+                };
+                let _ = db
+                    .set_vm_labels(vm_id, &encoded)
+                    .map_err(|e| format!("update vm labels {vm_id}: {e}"))?;
+            }
             Ok(())
         }
         "vm.delete" => {
@@ -2253,6 +2273,7 @@ mod tests {
             storage_size_bytes: 0,
             vm_ip: String::new(),
             pci_devices: String::new(),
+            labels: String::new(),
         }
     }
 
@@ -3190,6 +3211,7 @@ mod tests {
             storage_size_bytes: 10 * 1024 * 1024 * 1024,
             vm_ip: String::new(),
             pci_devices: String::new(),
+            labels: String::new(),
         };
         db.insert_vm(&vm).expect("insert vm");
         db.associate_vm_ssh_keys("vm-ssh", &[String::from("operator-key")])

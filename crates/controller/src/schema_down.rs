@@ -371,6 +371,11 @@ ALTER TABLE kubernetes_cluster_nodes DROP COLUMN pending_removal;
 ALTER TABLE kubernetes_cluster_nodes DROP COLUMN k8s_node_name;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 61,
+        sql: "ALTER TABLE vms DROP COLUMN labels;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

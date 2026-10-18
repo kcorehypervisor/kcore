@@ -1924,6 +1924,7 @@ mod tests {
                 created_at: None,
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                labels: std::collections::HashMap::new(),
             },
             controller_proto::VmInfo {
                 id: "2".into(),
@@ -1935,6 +1936,7 @@ mod tests {
                 created_at: None,
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
+                labels: std::collections::HashMap::new(),
             },
         ];
         let p = vms_page_from_proto(vms, 1, 10);

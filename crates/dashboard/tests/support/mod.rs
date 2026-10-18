@@ -108,6 +108,7 @@ impl Controller for MockController {
                 desired_state: VmDesiredState::Running as i32,
                 pci_devices: vec!["0000:03:00.0".into()],
                 gpus: vec!["radeon0".into()],
+                labels: std::collections::HashMap::new(),
             }),
             status: Some(VmStatus {
                 id: "vm-mock-1".into(),
@@ -116,6 +117,7 @@ impl Controller for MockController {
             }),
             node_id: "node-mock-a".into(),
             assigned_ip: "10.0.0.50".into(),
+            guest_reachable: false,
         }))
     }
 
@@ -204,6 +206,7 @@ impl Controller for MockController {
                 created_at: None,
                 storage_backend: "lvm".into(),
                 storage_size_bytes: 0,
+                labels: std::collections::HashMap::new(),
             }],
         }))
     }
