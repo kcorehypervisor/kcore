@@ -146,7 +146,7 @@ fn kea_command(socket: &str, command: &str) -> Result<String> {
 
 pub fn sync_dns(layout: &Layout, zones: &[ZonePlan]) -> Result<()> {
     let key = fs::read_to_string(layout.pdns_key()).context("reading the powerdns api key")?;
-    pdns::sync("http://127.0.0.1:8081", key.trim(), zones)
+    pdns::sync("http://127.0.0.1:8082", key.trim(), zones)
 }
 
 fn systemctl(args: &[&str]) -> String {
@@ -162,7 +162,11 @@ fn systemctl(args: &[&str]) -> String {
 }
 
 fn rec_control(args: &[&str]) -> String {
-    let mut command = Command::new("rec_control");
+    let program = ["/run/current-system/sw/bin/rec_control", "rec_control"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .unwrap_or("rec_control");
+    let mut command = Command::new(program);
     command.arg("--socket-dir=/run/pdns-recursor").args(args);
     match command.output() {
         Ok(output) if output.status.success() => format!("rec_control {} ok", args.join(" ")),
