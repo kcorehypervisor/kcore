@@ -13,5 +13,7 @@ pub mod routeros;
 pub mod store;
 
 pub mod proto {
+    // Generated tonic stubs trip the same lints as the other kcore protos.
+    #![allow(clippy::result_large_err, clippy::double_must_use)]
     tonic::include_proto!("kcore.network.v1");
 }
