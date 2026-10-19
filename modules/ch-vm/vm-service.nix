@@ -561,7 +561,7 @@ let
           # the agent's cgroup. Restarting that unit kills every process there,
           # the tail below exits, and systemd cold-boots the guest. Move the
           # hypervisor into this unit's cgroup before waiting on it.
-          cg="$(${pkgs.coreutils}/bin/sed -n 's/^0:://p' /proc/self/cgroup | ${pkgs.coreutils}/bin/head -n1)"
+          cg="$(${pkgs.gnused}/bin/sed -n 's/^0:://p' /proc/self/cgroup | ${pkgs.coreutils}/bin/head -n1)"
           if [ -n "$cg" ]; then
             echo "$1" > "/sys/fs/cgroup$cg/cgroup.procs" \
               || echo "warning: could not move cloud-hypervisor pid $1 into $cg"
