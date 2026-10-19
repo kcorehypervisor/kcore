@@ -557,6 +557,15 @@ let
         ${vmmFunctions}
         adopt() {
           echo "$2 cloud-hypervisor pid $1"
+          # The node-agent spawns this hypervisor, so the process is still in
+          # the agent's cgroup. Restarting that unit kills every process there,
+          # the tail below exits, and systemd cold-boots the guest. Move the
+          # hypervisor into this unit's cgroup before waiting on it.
+          cg="$(${pkgs.coreutils}/bin/sed -n 's/^0:://p' /proc/self/cgroup | ${pkgs.coreutils}/bin/head -n1)"
+          if [ -n "$cg" ]; then
+            echo "$1" > "/sys/fs/cgroup$cg/cgroup.procs" \
+              || echo "warning: could not move cloud-hypervisor pid $1 into $cg"
+          fi
           exec ${pkgs.coreutils}/bin/tail --pid="$1" -f /dev/null
         }
         if [ -f "${liveMigratedMarker}" ]; then
@@ -585,10 +594,10 @@ let
         exec ${chBin} ${chArgs}
       '';
 
-      # Press the ACPI power button, then wait for the VMM to exit. systemd
-      # only waits for (and finally kills) processes inside the unit's cgroup,
-      # and an adopted VMM is not in it: without this wait the unit would be
-      # "stopped" while the guest runs on, and the next start would adopt it
+      # Press the ACPI power button, then wait for the VMM to exit. Adoption
+      # moves the hypervisor into this unit's cgroup; if that move failed it is
+      # still outside, and systemd would report the unit stopped while the
+      # guest kept running. Wait here so a restart does not adopt the old VMM
       # again instead of applying whatever the restart was meant to apply.
       stopGraceSec = 25;
       stopScript = pkgs.writeShellScript "kcore-vm-${vmName}-stop" ''

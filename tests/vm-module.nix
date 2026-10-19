@@ -234,6 +234,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(f"journalctl -u kcore-vm-lvm-goodsha.service | grep -F 'Adopting already-running (guest Running) cloud-hypervisor pid {fake_pid}'")
     machine.succeed("test \"$(systemctl show -p ActiveState --value kcore-vm-lvm-goodsha.service)\" = active")
     machine.succeed(f"ps -o args= -p $(systemctl show -p MainPID --value kcore-vm-lvm-goodsha.service) | grep -F -- 'tail --pid={fake_pid} -f /dev/null'")
+    machine.succeed(f"grep -F kcore-vm-lvm-goodsha.service /proc/{fake_pid}/cgroup")
     machine.succeed(f"kill -0 {fake_pid}")
     machine.succeed("systemctl stop kcore-vm-lvm-goodsha.service")
     machine.fail(f"kill -0 {fake_pid}")
