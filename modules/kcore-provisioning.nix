@@ -226,7 +226,7 @@ in
       "d ${cfg.stateDir} 0750 root root -"
       "d /var/lib/kea 0750 root root -"
       "d /var/lib/pdns 0750 root root -"
-      "d /run/kea 0755 root root -"
+      "d /run/kea 0750 root root -"
       "d /run/pdns-recursor 0755 root root -"
     ];
 
@@ -310,6 +310,7 @@ in
       wants = [ "network-online.target" ];
       serviceConfig = {
         RuntimeDirectory = "kea";
+        RuntimeDirectoryMode = "0750";
         AmbientCapabilities = [
           "CAP_NET_BIND_SERVICE"
           "CAP_NET_RAW"
