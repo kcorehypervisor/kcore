@@ -3,10 +3,20 @@ title = "kcore"
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Lockfiles and generated dashboards are not credentials."
+[[allowlists]]
+description = "Lockfiles are not credentials."
 paths = [
-  '''Cargo\.lock''',
-  '''flake\.lock''',
-  '''package-lock\.json''',
+  '''(^|/)Cargo\.lock$''',
+  '''(^|/)flake\.lock$''',
+  '''(^|/)package-lock\.json$''',
 ]
+
+[[allowlists]]
+description = "Published MCP bundles. Minified identifiers trip generic-api-key."
+paths = ['''kcore-mcp/packages/(server|vscode)/dist/''']
+
+[[allowlists]]
+description = "Design-doc example of a ClickHouse password hash, not a live credential."
+paths = ['''docs/bare-metal-clickhouse\.md''']
+regexTarget = "line"
+regexes = ['''passwordSha256Hex:\s*[0-9a-fA-F]{64}''']
