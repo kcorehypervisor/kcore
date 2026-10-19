@@ -165,6 +165,17 @@ fn effective_operator_role(
     }
 }
 
+/// TLS with no parseable client CN is not an anonymous administrator.
+fn deny_unparseable_cn_when_tls(tls_active: bool) -> Result<(), Status> {
+    if tls_active {
+        Err(Status::unauthenticated(
+            "TLS is enabled but the client certificate has no parseable common name",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Authorize a management RPC on the main `Controller` service (`kctl` or `kcore-controller-*`).
 #[allow(clippy::result_large_err)]
 pub fn require_controller_operator<T>(
@@ -175,7 +186,7 @@ pub fn require_controller_operator<T>(
     required: OperatorRole,
 ) -> Result<(), Status> {
     if peer_cn(request).is_none() {
-        return Ok(());
+        return deny_unparseable_cn_when_tls(tls_active);
     }
     let effective = controller_operator_role(request, db, tls_active, bootstrap_kctl)?;
     if effective.satisfies(required) {
@@ -200,9 +211,7 @@ pub fn controller_operator_role<T>(
     let cn = match peer_cn(request) {
         Some(cn) => cn,
         None => {
-            if !tls_active {
-                return Ok(OperatorRole::ClusterAdmin);
-            }
+            deny_unparseable_cn_when_tls(tls_active)?;
             return Ok(OperatorRole::ClusterAdmin);
         }
     };
@@ -221,12 +230,7 @@ pub fn require_admin_operator<T>(
 ) -> Result<(), Status> {
     let cn = match peer_cn(request) {
         Some(cn) => cn,
-        None => {
-            if !tls_active {
-                return Ok(());
-            }
-            return Ok(());
-        }
+        None => return deny_unparseable_cn_when_tls(tls_active),
     };
 
     if cn.starts_with(CN_NODE_PREFIX) {
@@ -326,6 +330,23 @@ mod tests {
     fn require_peer_allows_missing_tls_info() {
         let request = Request::new(());
         assert!(require_peer(&request, &[CN_KCTL]).is_ok());
+    }
+
+    #[test]
+    fn tls_without_a_parseable_cn_is_not_cluster_admin() {
+        let db = Database::open(":memory:").expect("memory db");
+        let request = Request::new(());
+        let role = controller_operator_role(&request, &db, true, false).expect_err("tls cn");
+        assert_eq!(role.code(), tonic::Code::Unauthenticated);
+        let open = controller_operator_role(&request, &db, false, false).expect("insecure");
+        assert_eq!(open, OperatorRole::ClusterAdmin);
+        let admin = require_admin_operator(&request, &db, true, false, OperatorRole::ReadOnly)
+            .expect_err("admin");
+        assert_eq!(admin.code(), tonic::Code::Unauthenticated);
+        let controller =
+            require_controller_operator(&request, &db, true, false, OperatorRole::ReadOnly)
+                .expect_err("controller");
+        assert_eq!(controller.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]
