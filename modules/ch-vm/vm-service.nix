@@ -59,9 +59,16 @@ let
       # format is sniffed in the start script (see srcFormatFn).
       actualFormat = if isBlockBackend then "raw" else "$ROOT_FMT";
 
+      # LVM and ZFS guests open a stable device-mapper name so a live migration
+      # can reload the table (linear → mirror) without Cloud Hypervisor seeing
+      # a path that only exists on one node. `direct=on` keeps guest writes
+      # synchronous, which is what makes the mirror a complete copy.
       vmDiskArg =
-        "path=${actualDisk},image_type=${actualFormat}"
-        + lib.optionalString isCeph ",direct=on,serial=root-${vmName}";
+        if isLvm || isZfs then
+          "path=/dev/mapper/kcore-vm-${vmName},image_type=raw,direct=on,serial=root-${vmName}"
+        else
+          "path=${actualDisk},image_type=${actualFormat}"
+          + lib.optionalString isCeph ",direct=on,serial=root-${vmName}";
       seedDiskArg = "path=${seedIso},readonly=on,image_type=raw";
       dataDiskArgs = lib.concatMapStringsSep " " (
         disk:
@@ -292,9 +299,11 @@ let
       vgpuDevices = builtins.filter (dev: dev.vgpuProfile != null) normalizedPci;
       sysfs = config.ch-vm.vms.sysfsRoot;
 
-      # Live migration requires MAP_SHARED guest RAM (`shared=on`).
+      # Live migration requires MAP_SHARED guest RAM (`shared=on`). Every
+      # block backend can move: Ceph because the disk is shared, LVM and ZFS
+      # because the disk is mirrored onto the destination first.
       memoryArg =
-        if isCeph then
+        if isBlockBackend then
           "--memory size=${toString vmCfg.memorySize}M,shared=on"
         else
           "--memory size=${toString vmCfg.memorySize}M";
@@ -477,6 +486,40 @@ let
 
       # After a live receive, CH is already running outside systemd. Skip
       # destructive socket cleanup so the handoff ExecStart can adopt it.
+      # `/dev/mapper/kcore-vm-<name>` is the path Cloud Hypervisor records. It is
+      # a linear map over the LV or zvol until a migration reloads it. Creating
+      # it is idempotent: a live-migrated guest, or one already running, is
+      # left alone.
+      localMapperScript = pkgs.writeShellScript "local-mapper-${vmName}" ''
+        set -euo pipefail
+        if [ -f "${liveMigratedMarker}" ]; then
+          exit 0
+        fi
+        name="kcore-vm-${vmName}"
+        mapper="/dev/mapper/$name"
+        backing="${if isLvm then lvDevice else zvolDevice}"
+        if [ -b "$mapper" ]; then
+          exit 0
+        fi
+        ${pkgs.kmod}/bin/modprobe dm-mod || true
+        sectors="$(${pkgs.util-linux}/bin/blockdev --getsz "$backing")"
+        printf '0 %s linear %s 0\n' "$sectors" "$backing" | ${pkgs.lvm2.bin}/bin/dmsetup create "$name"
+        test -b "$mapper"
+      '';
+
+      localMapperRemoveScript = pkgs.writeShellScript "local-mapper-remove-${vmName}" ''
+        name="kcore-vm-${vmName}"
+        mapper="/dev/mapper/$name"
+        if [ ! -b "$mapper" ]; then
+          exit 0
+        fi
+        open="$(${pkgs.lvm2.bin}/bin/dmsetup info -c --noheadings -o open "$name" 2>/dev/null || echo 0)"
+        if [ "$open" != "0" ]; then
+          exit 0
+        fi
+        ${pkgs.lvm2.bin}/bin/dmsetup remove "$name" || true
+      '';
+
       startPreScript = pkgs.writeShellScript "kcore-vm-${vmName}-pre" ''
         set -e
         if [ -f "${liveMigratedMarker}" ]; then
@@ -589,12 +632,14 @@ let
         ExecStartPre =
           lib.optionals (vfioDevices != [ ]) [ "${vfioBindScript}" ]
           ++ lib.optionals (vgpuDevices != [ ]) [ "${vgpuBindScript}" ]
-          ++ [ "${startPreScript}" ];
+          ++ [ "${startPreScript}" ]
+          ++ lib.optionals (isLvm || isZfs) [ "${localMapperScript}" ];
         ExecStart = "${startScript}";
         ExecStop = "${stopScript}";
         ExecStopPost =
           lib.optional (vgpuDevices != [ ]) "-${vgpuClearScript}"
-          ++ lib.optional isCeph "-${cephUnmapScript}";
+          ++ lib.optional isCeph "-${cephUnmapScript}"
+          ++ lib.optional (isLvm || isZfs) "-${localMapperRemoveScript}";
         TimeoutStopSec = 30;
         # ExecStartPre copies the image onto the volume. The 90s default is
         # shorter than a Windows qcow2 convert, which then fails the unit.
@@ -651,7 +696,18 @@ in
       imageSha256
       cloudHypervisorPatches
       vgpuProfile
+      localLiveMigrate
     '';
+
+    # qemu-nbd and nbd-client replicate an LV/zvol during migration. dmsetup
+    # and lvcreate come from lvm2; zfs is already on the system when a guest
+    # uses it. The node agent finds them on PATH.
+    environment.systemPackages = [
+      pkgs.qemu-utils
+      pkgs.nbd
+      pkgs.lvm2
+    ]
+    ++ lib.optional anyVmUsesZfs pkgs.zfs;
 
     systemd.services = lib.mapAttrs' (
       vmName: vmCfg: lib.nameValuePair "kcore-vm-${vmName}" (mkVmService vmName vmCfg)

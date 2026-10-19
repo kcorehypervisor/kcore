@@ -1,17 +1,32 @@
 # VM migration (cold and live)
 
-kcore moves VMs between nodes in two ways. Both assume the guest disk is **shared** (today: **Ceph RBD**). Local backends (`filesystem` / `lvm` / `zfs`) keep disks on one host, so they are not live-migratable across nodes.
+kcore moves VMs between nodes in two ways. Ceph RBD is shared, so the disk itself does not move. LVM and ZFS disks are copied onto the destination first (a device-mapper mirror while the guest runs, or `qemu-img` after it stops). A `filesystem` disk stays on its node.
 
 | Mode | Operator command | Guest downtime | Disk copy | Typical use |
 |------|------------------|----------------|-----------|-------------|
-| **Cold** | `kctl migrate vm … --allow-cold-fallback` after a live send did not start, or a local-disk VM during drain | Full stop/start | None (shared RBD) | Fallback, local disks |
-| **Live** | `kctl migrate vm <id> --target-node <node>`, and `kctl drain node` for Ceph guests | Brief pause during CH cutover | None (shared RBD) | Keep the workload running |
+| **Cold** | `kctl migrate vm … --allow-cold-fallback` after a live send did not start, or any stopped guest | Full stop/start | None for Ceph; full copy for LVM/ZFS | Fallback, stopped local disks |
+| **Live** | `kctl migrate vm <id> --target-node <node>`, and `kctl drain node` | Brief pause during CH cutover | None for Ceph; dm-mirror resync for LVM/ZFS | Keep the workload running |
 
 Product docs: [VM migration](https://kcorehypervisor.com/docs/user/vm-migration.html) · SAN overview: [`ceph.md`](./ceph.md).
 
+## Local disks (LVM and ZFS)
+
+An LVM or ZFS guest boots on `/dev/mapper/kcore-vm-<name>`, a linear device-mapper table over `vg_kcore/kcore-<name>` or `tank0/kcore-<name>`, with `shared=on` memory. Both nodes must list `localLiveMigrate` in `/etc/kcore/ch-vm-features`. A guest that is still on the old path needs one restart before it can move live; `--allow-cold-fallback` copies the disk while the guest is stopped instead.
+
+Live move:
+
+1. The destination creates an LV or zvol at least as large as the source and exports the backing device with `qemu-nbd` on TCP **18128–18255**.
+2. The source reloads its mapper to a `dm-mirror` whose second leg is that export, and waits until the mirror reports in sync.
+3. Cloud Hypervisor then sends memory the same way it does for Ceph (`local_disk` on the receive, so no RBD is mapped).
+4. The destination keeps the volume. The source copy is deleted only after that send succeeds.
+
+A stopped guest, or a running guest whose operator passed `--allow-cold-fallback`, is quiesced, copied with `qemu-img convert`, marked seeded, and then reassigned. Drain uses this path for LVM and ZFS and does not fall through to a cold reassignment that would create an empty disk. `filesystem` VMs, and LVM/ZFS VMs that also have a GPU or PCI device, stay where they are. Failover of a node that missed heartbeats still leaves local disks on that node: there is no second copy to start.
+
+`kctl cancel operation <id>` is accepted during `MirrorSyncing` and `Copying`, before memory is sent. After the send, cancel is refused.
+
 ## Prerequisites (both modes)
 
-- VM `storage_backend = ceph`.
+- VM `storage_backend` is `ceph`, `lvm`, or `zfs`. `filesystem` is refused.
 - Source and destination are members of the same `CephCluster`, and that cluster's reconciled status is `healthy`. `MigrateVm` rejects a destination outside a healthy cluster with `FAILED_PRECONDITION`, and `DrainNode` will not pick one as a target.
 - RBD image exists in pool `kcore-vms` as `kcore-<vm-id>` (controller `volumes` row).
 - Live only: Cloud Hypervisor on both nodes; guest memory configured with `shared=on` (Ceph VM units in `modules/ch-vm/vm-service.nix`); TCP allowed between node data IPs for an ephemeral migration port.
@@ -220,7 +235,8 @@ First boot seeds the RBD with `qemu-img convert` and sets Ceph image-meta `kcore
 ### Networking
 
 - Migration stream uses a TCP port on the destination from the fixed range **18000–18127** (`MIGRATE_PORT_BASE`/`MIGRATE_PORT_COUNT` in `crates/node-agent/src/live_migrate.rs`). The range sits deliberately **below** the kernel's default ephemeral range (32768–60999), so the kernel never hands one of these ports to an unrelated outbound connection while Cloud Hypervisor is starting up. The node-agent holds a listener on the port it picked until Cloud Hypervisor is about to bind it, so nothing else can win the race in between.
-- Allow that traffic between Ceph member hosts on 18000–18127 (public/client fabric is fine).
+- Allow that traffic between hosts on 18000–18127 (public/client fabric is fine).
+- LVM and ZFS migration also needs TCP **18128–18255** on the same interface (`qemu-nbd`).
 
 ### RBD features
 
@@ -233,7 +249,7 @@ Each live migrate creates a **`vm_operations`** row (phases: Preparing → Sendi
 ```bash
 kctl get operations
 kctl get operation <id>      # includes estimate progress (elapsed + guest memory bound)
-kctl cancel operation <id>   # only while still Preparing
+kctl cancel operation <id>   # Preparing, MirrorSyncing, or Copying, before send
 ```
 
 Cancel after send is refused: the guest may already run only on the destination.

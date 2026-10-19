@@ -595,6 +595,12 @@ in
         from = 18000;
         to = 18127;
       }
+      # NBD export used while mirroring an LVM or ZFS volume. Same constant
+      # as NBD_PORT_BASE/NBD_PORT_COUNT in crates/node-agent/src/volume_mirror.rs.
+      {
+        from = 18128;
+        to = 18255;
+      }
     ];
 
     networking.firewall.allowedUDPPorts = lib.optional (lib.any (n: n.networkType == "vxlan") (

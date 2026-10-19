@@ -2286,31 +2286,36 @@ impl ControllerService {
         }
     }
 
-    async fn live_migrate_vm(
+    fn local_fail(operation_id: impl Into<String>, status: Status) -> LiveMigrateFailure {
+        LiveMigrateFailure {
+            send_succeeded: false,
+            status,
+            operation_id: operation_id.into(),
+        }
+    }
+
+    fn begin_local_op(
         &self,
         vm: &VmRow,
         source: &NodeRow,
         target: &NodeRow,
-        volume: &VolumeRow,
-        runtime_name: &str,
-        dest_host: &str,
-    ) -> Result<LiveMigrateOutcome, LiveMigrateFailure> {
+        phase: &str,
+    ) -> Result<String, LiveMigrateFailure> {
         if let Ok(Some(open)) = self.db.get_open_vm_operation(&vm.id) {
-            return Err(LiveMigrateFailure {
-                send_succeeded: false,
-                status: Status::failed_precondition(format!(
+            return Err(Self::local_fail(
+                open.id.clone(),
+                Status::failed_precondition(format!(
                     "VM '{}' already has open operation {} in phase {}",
                     vm.name, open.id, open.phase
                 )),
-                operation_id: open.id,
-            });
+            ));
         }
         let op_id = Uuid::new_v4().to_string();
         if let Err(e) = self.db.insert_vm_operation(&VmOperationRow {
             id: op_id.clone(),
             vm_id: vm.id.clone(),
             kind: VmOperationRow::KIND_LIVE_MIGRATE.into(),
-            phase: VmOperationRow::PHASE_PREPARING.into(),
+            phase: phase.to_string(),
             source_node: source.id.clone(),
             target_node: target.id.clone(),
             cancel_requested: false,
@@ -2320,53 +2325,872 @@ impl ControllerService {
             updated_at: String::new(),
             finished_at: String::new(),
         }) {
-            return Err(LiveMigrateFailure {
-                send_succeeded: false,
-                status: Status::internal(format!("recording migrate operation: {e}")),
-                operation_id: op_id,
-            });
+            return Err(Self::local_fail(
+                op_id,
+                Status::internal(format!("recording migrate operation: {e}")),
+            ));
         }
-        let attached =
-            self.db
-                .list_attached_volumes_for_vm(&vm.id)
-                .map_err(|e| LiveMigrateFailure {
+        Ok(op_id)
+    }
+
+    fn close_local_op(&self, op_id: &str, phase: &str) {
+        let _ = self
+            .db
+            .update_vm_operation_phase(op_id, phase, Some(false), None, true);
+    }
+
+    async fn node_has_local_migrate(&self, node: &NodeRow) -> Result<bool, Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        match admin
+            .get_ch_vm_module_features(node_proto::GetChVmModuleFeaturesRequest {})
+            .await
+        {
+            Ok(resp) => Ok(resp
+                .into_inner()
+                .features
+                .iter()
+                .any(|feature| feature == crate::local_migrate::FEATURE)),
+            Err(e) if e.code() == tonic::Code::Unimplemented => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Refuse an LVM destination that has already reported too little free
+    /// space. A node that does not implement `GetLvmInfo` is left to `lvcreate`.
+    async fn ensure_lvm_room(&self, node: &NodeRow, need_bytes: i64) -> Result<(), Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let info = match admin.get_lvm_info(node_proto::GetLvmInfoRequest {}).await {
+            Ok(resp) => resp.into_inner(),
+            Err(e) if e.code() == tonic::Code::Unimplemented => return Ok(()),
+            Err(e) => {
+                warn!(node = %node.id, error = %e, "GetLvmInfo failed; lvcreate will report space");
+                return Ok(());
+            }
+        };
+        if !info.available {
+            return Ok(());
+        }
+        let Some(group) = info
+            .volume_groups
+            .iter()
+            .find(|group| group.name == crate::local_migrate::LVM_VG)
+        else {
+            return Ok(());
+        };
+        if group.free_bytes < need_bytes {
+            return Err(Status::failed_precondition(format!(
+                "volume group {} on {} has {} bytes free, need {need_bytes}",
+                crate::local_migrate::LVM_VG,
+                node.id,
+                group.free_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    async fn abort_volume_on(
+        &self,
+        node: &NodeRow,
+        vm_name: &str,
+        destroy_volume: bool,
+    ) -> Result<(), Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let resp = admin
+            .abort_volume_mirror(node_proto::AbortVolumeMirrorRequest {
+                vm_name: vm_name.to_string(),
+                destroy_volume,
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!("aborting volume mirror for {vm_name} on {}", node.id),
+                )
+            })?
+            .into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(Status::internal(format!(
+                "abort volume mirror on {}: {}",
+                node.id, resp.message
+            )))
+        }
+    }
+
+    async fn release_volume_on(
+        &self,
+        node: &NodeRow,
+        vm_name: &str,
+        role: &str,
+    ) -> Result<(), Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let resp = admin
+            .release_volume_mirror(node_proto::ReleaseVolumeMirrorRequest {
+                vm_name: vm_name.to_string(),
+                role: role.to_string(),
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!(
+                        "releasing volume mirror ({role}) for {vm_name} on {}",
+                        node.id
+                    ),
+                )
+            })?
+            .into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(Status::internal(format!(
+                "release volume mirror on {}: {}",
+                node.id, resp.message
+            )))
+        }
+    }
+
+    async fn set_local_quiesced(
+        &self,
+        node: &NodeRow,
+        vm_name: &str,
+        quiesced: bool,
+        start: bool,
+    ) -> Result<(), Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let resp = admin
+            .set_local_vm_quiesced(node_proto::SetLocalVmQuiescedRequest {
+                vm_name: vm_name.to_string(),
+                quiesced,
+                start,
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!("changing quiesce for {vm_name} on {}", node.id),
+                )
+            })?
+            .into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(resp.message))
+        }
+    }
+
+    /// Move an LVM or ZFS VM by copying its block device, then either live
+    /// migrating memory or reassigning the stopped guest.
+    ///
+    /// The destination copy is destroyed only when this attempt still owns it
+    /// and the guest has not been sent. After a successful send both copies
+    /// are kept until the source copy is explicitly released.
+    async fn migrate_local_disk(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        allow_cold: bool,
+    ) -> Result<(LiveMigrateOutcome, &'static str), LiveMigrateFailure> {
+        if !self.node_supports_backend(source, &vm.storage_backend) {
+            return Err(Self::local_fail(
+                "",
+                Status::failed_precondition(format!(
+                    "source node {} uses storage backend {}, which cannot host this {} VM",
+                    source.id, source.storage_backend, vm.storage_backend
+                )),
+            ));
+        }
+        if !self.node_supports_backend(target, &vm.storage_backend) {
+            return Err(Self::local_fail(
+                "",
+                Status::failed_precondition(format!(
+                    "target node {} uses storage backend {}, which cannot host this {} VM",
+                    target.id, target.storage_backend, vm.storage_backend
+                )),
+            ));
+        }
+        for node in [source, target] {
+            match self.node_has_local_migrate(node).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Self::local_fail(
+                        "",
+                        Status::failed_precondition(format!(
+                            "node {} does not advertise local disk migration ({}); upgrade it and apply its configuration",
+                            node.id,
+                            crate::local_migrate::FEATURE
+                        )),
+                    ));
+                }
+                Err(status) => return Err(Self::local_fail("", status)),
+            }
+        }
+
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        let mut source_admin = self
+            .ensure_admin_client_for_node(source)
+            .await
+            .map_err(|status| Self::local_fail("", status))?;
+        let inspected = source_admin
+            .inspect_local_vm_disk(node_proto::InspectLocalVmDiskRequest {
+                vm_name: runtime_name.clone(),
+                storage_backend: vm.storage_backend.clone(),
+                vg_name: crate::local_migrate::LVM_VG.into(),
+                pool_name: crate::local_migrate::ZFS_POOL.into(),
+            })
+            .await
+            .map_err(|e| {
+                Self::local_fail(
+                    "",
+                    status_with_context(&e, &format!("inspecting disk of VM '{}'", vm.name)),
+                )
+            })?
+            .into_inner();
+        if !inspected.success || inspected.size_bytes <= 0 {
+            return Err(Self::local_fail(
+                "",
+                Status::failed_precondition(format!(
+                    "VM '{}' has no local disk on {}: {}",
+                    vm.name, source.id, inspected.message
+                )),
+            ));
+        }
+        let plan = crate::local_migrate::plan_local_move(
+            inspected.running,
+            inspected.guest_uses_mapper,
+            inspected.memory_shared,
+            allow_cold,
+        )
+        .map_err(|message| Self::local_fail("", Status::failed_precondition(message)))?;
+        if vm.storage_backend == "lvm" {
+            self.ensure_lvm_room(target, inspected.size_bytes)
+                .await
+                .map_err(|status| Self::local_fail("", status))?;
+        }
+
+        match plan {
+            crate::local_migrate::LocalMove::Live => {
+                self.live_mirror_local_disk(vm, source, target, &runtime_name, inspected.size_bytes)
+                    .await
+            }
+            crate::local_migrate::LocalMove::ColdCopy => {
+                self.cold_copy_local_disk(vm, source, target, &runtime_name, inspected.size_bytes)
+                    .await
+            }
+        }
+    }
+
+    async fn prepare_mirror_target(
+        &self,
+        target: &NodeRow,
+        vm: &VmRow,
+        runtime_name: &str,
+        size_bytes: i64,
+    ) -> Result<node_proto::PrepareVolumeMirrorTargetResponse, Status> {
+        let mut dest_admin = self.ensure_admin_client_for_node(target).await?;
+        let prepared = dest_admin
+            .prepare_volume_mirror_target(node_proto::PrepareVolumeMirrorTargetRequest {
+                vm_name: runtime_name.to_string(),
+                storage_backend: vm.storage_backend.clone(),
+                size_bytes,
+                bind_addr: grpc_address_host(&target.address),
+                vg_name: crate::local_migrate::LVM_VG.into(),
+                pool_name: crate::local_migrate::ZFS_POOL.into(),
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!("preparing mirror target for '{}' on {}", vm.name, target.id),
+                )
+            })?
+            .into_inner();
+        if !prepared.success || prepared.listen_port <= 0 {
+            return Err(Status::internal(format!(
+                "prepare mirror target failed: {}",
+                prepared.message
+            )));
+        }
+        Ok(prepared)
+    }
+
+    async fn live_mirror_local_disk(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        runtime_name: &str,
+        size_bytes: i64,
+    ) -> Result<(LiveMigrateOutcome, &'static str), LiveMigrateFailure> {
+        let op_id =
+            self.begin_local_op(vm, source, target, VmOperationRow::PHASE_MIRROR_SYNCING)?;
+        let prepared = match self
+            .prepare_mirror_target(target, vm, runtime_name, size_bytes)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                if let Err(abort) = self.abort_volume_on(target, runtime_name, true).await {
+                    warn!(vm = %vm.name, error = %abort, "mirror target cleanup after prepare failure");
+                }
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        let mut source_admin = match self.ensure_admin_client_for_node(source).await {
+            Ok(admin) => admin,
+            Err(status) => {
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        if let Err(e) = source_admin
+            .start_volume_mirror(node_proto::StartVolumeMirrorRequest {
+                vm_name: runtime_name.to_string(),
+                target_host: prepared.listen_addr.clone(),
+                target_port: prepared.listen_port,
+                export_name: prepared.export_name.clone(),
+                storage_backend: vm.storage_backend.clone(),
+                vg_name: crate::local_migrate::LVM_VG.into(),
+                pool_name: crate::local_migrate::ZFS_POOL.into(),
+            })
+            .await
+        {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(
+                op_id,
+                status_with_context(&e, &format!("starting disk mirror for '{}'", vm.name)),
+            ));
+        }
+
+        let started = std::time::Instant::now();
+        let limit = Duration::from_secs(6 * 60 * 60);
+        let mut status_errors = 0u32;
+        loop {
+            if started.elapsed() > limit {
+                let _ = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(
+                    op_id,
+                    Status::deadline_exceeded(format!(
+                        "disk mirror of '{}' did not reach sync within 6h",
+                        vm.name
+                    )),
+                ));
+            }
+            let cancel = self
+                .db
+                .get_vm_operation(&op_id)
+                .ok()
+                .flatten()
+                .is_some_and(|op| op.cancel_requested);
+            if cancel {
+                match self.abort_volume_on(source, runtime_name, false).await {
+                    Ok(()) => {}
+                    Err(status) => {
+                        return Err(Self::local_fail(
+                            op_id,
+                            status_with_context(
+                                &status,
+                                "cancelled, but the source mirror could not be restored",
+                            ),
+                        ));
+                    }
+                }
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_CANCELLED);
+                return Err(Self::local_fail(
+                    op_id,
+                    Status::cancelled(format!("disk mirror of '{}' cancelled", vm.name)),
+                ));
+            }
+            match source_admin
+                .get_volume_mirror_status(node_proto::GetVolumeMirrorStatusRequest {
+                    vm_name: runtime_name.to_string(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    status_errors = 0;
+                    let status = resp.into_inner();
+                    let detail = crate::local_migrate::mirror_detail(
+                        status.bytes_synced,
+                        status.bytes_total,
+                        status.in_sync,
+                    );
+                    let _ = self.db.update_vm_operation_phase(
+                        &op_id,
+                        VmOperationRow::PHASE_MIRROR_SYNCING,
+                        None,
+                        Some(&detail),
+                        false,
+                    );
+                    if !status.success || status.degraded {
+                        let _ = self.abort_volume_on(source, runtime_name, false).await;
+                        let _ = self.abort_volume_on(target, runtime_name, true).await;
+                        self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                        return Err(Self::local_fail(
+                            op_id,
+                            Status::failed_precondition(format!(
+                                "disk mirror of '{}' became unusable ({})",
+                                vm.name, status.message
+                            )),
+                        ));
+                    }
+                    if status.in_sync {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    status_errors += 1;
+                    warn!(vm = %vm.name, error = %e, "volume mirror status");
+                    if status_errors >= 3 {
+                        let _ = self.abort_volume_on(source, runtime_name, false).await;
+                        let _ = self.abort_volume_on(target, runtime_name, true).await;
+                        self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                        return Err(Self::local_fail(
+                            op_id,
+                            status_with_context(&e, "reading disk mirror status"),
+                        ));
+                    }
+                    if let Ok(fresh) = self.ensure_admin_client_for_node(source).await {
+                        source_admin = fresh;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        let mut dest_admin = match self.ensure_admin_client_for_node(target).await {
+            Ok(admin) => admin,
+            Err(status) => {
+                let _ = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        if let Err(e) = dest_admin
+            .commit_volume_mirror_target(node_proto::CommitVolumeMirrorTargetRequest {
+                vm_name: runtime_name.to_string(),
+            })
+            .await
+        {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(
+                op_id,
+                status_with_context(&e, "writing the destination seed marker"),
+            ));
+        }
+
+        let dest_host = grpc_address_host(&target.address);
+        match self
+            .live_migrate_vm(vm, source, target, None, runtime_name, &dest_host)
+            .await
+        {
+            Ok(mut outcome) => {
+                if let Err(e) = self.release_volume_on(target, runtime_name, "target").await {
+                    warn!(vm = %vm.name, error = %e, "destination NBD export still running");
+                    outcome.warnings.push(format!(
+                        "destination NBD export for '{}' was not stopped: {e}",
+                        vm.name
+                    ));
+                }
+                if let Err(e) = self.release_volume_on(source, runtime_name, "source").await {
+                    warn!(vm = %vm.name, error = %e, "source disk was not deleted");
+                    outcome
+                        .warnings
+                        .push(format!("source disk of '{}' was not deleted: {e}", vm.name));
+                }
+                Ok((outcome, "live"))
+            }
+            Err(err) if err.send_succeeded => {
+                if let Err(e) = self.release_volume_on(target, runtime_name, "target").await {
+                    warn!(vm = %vm.name, error = %e, "stop destination NBD after send");
+                }
+                if let Err(e) = self.abort_volume_on(source, runtime_name, false).await {
+                    warn!(vm = %vm.name, error = %e, "restore source linear after send");
+                }
+                Err(err)
+            }
+            Err(err) => {
+                match self.abort_volume_on(source, runtime_name, false).await {
+                    Ok(()) => {
+                        let _ = self.abort_volume_on(target, runtime_name, true).await;
+                    }
+                    Err(status) => {
+                        warn!(
+                            vm = %vm.name,
+                            error = %status,
+                            "source mirror still active after a failed send; destination copy kept"
+                        );
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn cold_copy_local_disk(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        runtime_name: &str,
+        size_bytes: i64,
+    ) -> Result<(LiveMigrateOutcome, &'static str), LiveMigrateFailure> {
+        let op_id = self.begin_local_op(vm, source, target, VmOperationRow::PHASE_COPYING)?;
+        if let Err(status) = self
+            .set_local_quiesced(source, runtime_name, true, false)
+            .await
+        {
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(op_id, status));
+        }
+        let prepared = match self
+            .prepare_mirror_target(target, vm, runtime_name, size_bytes)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                let _ = self
+                    .set_local_quiesced(source, runtime_name, false, true)
+                    .await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+
+        let stop_heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat_stop = std::sync::Arc::clone(&stop_heartbeat);
+        let heartbeat_db = self.db.clone();
+        let heartbeat_op = op_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if heartbeat_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let _ = heartbeat_db.update_vm_operation_phase(
+                    &heartbeat_op,
+                    VmOperationRow::PHASE_COPYING,
+                    None,
+                    None,
+                    false,
+                );
+            }
+        });
+        let mut source_admin = match self.ensure_admin_client_for_node(source).await {
+            Ok(admin) => admin,
+            Err(status) => {
+                stop_heartbeat.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                let _ = self
+                    .set_local_quiesced(source, runtime_name, false, true)
+                    .await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        let copied = source_admin
+            .copy_local_volume(node_proto::CopyLocalVolumeRequest {
+                vm_name: runtime_name.to_string(),
+                storage_backend: vm.storage_backend.clone(),
+                vg_name: crate::local_migrate::LVM_VG.into(),
+                pool_name: crate::local_migrate::ZFS_POOL.into(),
+                target_host: prepared.listen_addr,
+                target_port: prepared.listen_port,
+                export_name: prepared.export_name,
+            })
+            .await;
+        stop_heartbeat.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = copied {
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(
+                op_id,
+                status_with_context(&e, &format!("copying disk of '{}'", vm.name)),
+            ));
+        }
+        let cancel = self
+            .db
+            .get_vm_operation(&op_id)
+            .ok()
+            .flatten()
+            .is_some_and(|op| op.cancel_requested);
+        if cancel {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_CANCELLED);
+            return Err(Self::local_fail(
+                op_id,
+                Status::cancelled(format!("disk copy of '{}' cancelled", vm.name)),
+            ));
+        }
+
+        let mut dest_admin = match self.ensure_admin_client_for_node(target).await {
+            Ok(admin) => admin,
+            Err(status) => {
+                let _ = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                let _ = self
+                    .set_local_quiesced(source, runtime_name, false, true)
+                    .await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        if let Err(e) = dest_admin
+            .commit_volume_mirror_target(node_proto::CommitVolumeMirrorTargetRequest {
+                vm_name: runtime_name.to_string(),
+            })
+            .await
+        {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(
+                op_id,
+                status_with_context(&e, "writing the destination seed marker"),
+            ));
+        }
+        if let Err(status) = self.release_volume_on(target, runtime_name, "target").await {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(op_id, status));
+        }
+
+        if let Err(status) = self.cold_reassign_vm(vm, source, target).await {
+            let moved = self
+                .db
+                .get_vm(&vm.id)
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.node_id == target.id);
+            if !moved {
+                let _ = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                let _ = self
+                    .set_local_quiesced(source, runtime_name, false, true)
+                    .await;
+            }
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(op_id, status));
+        }
+        if let Err(e) = self.release_volume_on(source, runtime_name, "source").await {
+            warn!(vm = %vm.name, error = %e, "source disk was not deleted after cold copy");
+        }
+        let _ = self
+            .set_local_quiesced(source, runtime_name, false, false)
+            .await;
+        self.close_local_op(&op_id, VmOperationRow::PHASE_DONE);
+        Ok((
+            LiveMigrateOutcome {
+                operation_id: op_id,
+                warnings: Vec::new(),
+            },
+            "cold",
+        ))
+    }
+
+    async fn respond_local_migrate(
+        &self,
+        actor: &str,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        allow_cold: bool,
+    ) -> Result<Response<controller_proto::MigrateVmResponse>, Status> {
+        match self
+            .migrate_local_disk(vm, source, target, allow_cold)
+            .await
+        {
+            Ok((outcome, mode)) => {
+                self.webhooks.emit(
+                    crate::webhooks::EVENT_VM_MIGRATED,
+                    format!("vm/{}", vm.id),
+                    serde_json::json!({
+                        "vmId": vm.id,
+                        "vmName": vm.name,
+                        "sourceNode": source.id,
+                        "targetNode": target.id,
+                        "mode": mode,
+                    }),
+                );
+                self.log_replication_event_required(
+                    actor,
+                    Some("MigrateVm"),
+                    EVT_VM_MIGRATE,
+                    &format!("vm/{}", vm.id),
+                    serde_json::json!({
+                        "vmId": vm.id,
+                        "vmName": vm.name,
+                        "sourceNode": source.id,
+                        "targetNode": target.id,
+                        "mode": mode,
+                        "operationId": outcome.operation_id,
+                        "hostWarnings": outcome.warnings,
+                    }),
+                )?;
+                let mut message = format!(
+                    "{mode}-migrated '{}' from {} to {}",
+                    vm.name, source.id, target.id
+                );
+                for line in &outcome.warnings {
+                    message.push_str("\nwarning: ");
+                    message.push_str(line);
+                }
+                Ok(Response::new(controller_proto::MigrateVmResponse {
+                    success: true,
+                    message,
+                    mode: mode.into(),
+                    source_node: source.id.clone(),
+                    target_node: target.id.clone(),
+                    operation_id: outcome.operation_id,
+                }))
+            }
+            Err(err) => {
+                warn!(
+                    vm = %vm.name,
+                    send_succeeded = err.send_succeeded,
+                    operation_id = %err.operation_id,
+                    error = %err.status,
+                    "local disk migrate failed"
+                );
+                Err(err.status)
+            }
+        }
+    }
+
+    async fn live_migrate_vm(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        volume: Option<&VolumeRow>,
+        runtime_name: &str,
+        dest_host: &str,
+    ) -> Result<LiveMigrateOutcome, LiveMigrateFailure> {
+        // A local-disk move records MirrorSyncing/Copying before calling in.
+        // That row is this attempt, not a conflict.
+        let local_disk = volume.is_none();
+        let op_id = if let Ok(Some(open)) = self.db.get_open_vm_operation(&vm.id) {
+            if local_disk && crate::local_migrate::local_phase_is_open(&open.phase) {
+                open.id
+            } else {
+                return Err(LiveMigrateFailure {
                     send_succeeded: false,
-                    status: Status::internal(e.to_string()),
+                    status: Status::failed_precondition(format!(
+                        "VM '{}' already has open operation {} in phase {}",
+                        vm.name, open.id, open.phase
+                    )),
+                    operation_id: open.id,
+                });
+            }
+        } else {
+            let op_id = Uuid::new_v4().to_string();
+            if let Err(e) = self.db.insert_vm_operation(&VmOperationRow {
+                id: op_id.clone(),
+                vm_id: vm.id.clone(),
+                kind: VmOperationRow::KIND_LIVE_MIGRATE.into(),
+                phase: VmOperationRow::PHASE_PREPARING.into(),
+                source_node: source.id.clone(),
+                target_node: target.id.clone(),
+                cancel_requested: false,
+                send_succeeded: false,
+                detail_json: "{}".into(),
+                started_at: String::new(),
+                updated_at: String::new(),
+                finished_at: String::new(),
+            }) {
+                return Err(LiveMigrateFailure {
+                    send_succeeded: false,
+                    status: Status::internal(format!("recording migrate operation: {e}")),
+                    operation_id: op_id,
+                });
+            }
+            op_id
+        };
+        if local_disk {
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_PREPARING,
+                Some(false),
+                None,
+                false,
+            );
+        }
+        let (rbd_volumes, encrypted_volumes, root_pool, root_image) = if let Some(volume) = volume {
+            let attached =
+                self.db
+                    .list_attached_volumes_for_vm(&vm.id)
+                    .map_err(|e| LiveMigrateFailure {
+                        send_succeeded: false,
+                        status: Status::internal(e.to_string()),
+                        operation_id: op_id.clone(),
+                    })?;
+            let rbd_volumes: Vec<node_proto::RbdImageRef> = if attached.is_empty() {
+                vec![node_proto::RbdImageRef {
+                    pool: volume.pool.clone(),
+                    image: volume.image.clone(),
+                }]
+            } else {
+                attached
+                    .iter()
+                    .map(|v| node_proto::RbdImageRef {
+                        pool: v.pool.clone(),
+                        image: v.image.clone(),
+                    })
+                    .collect()
+            };
+            let encrypted_volumes = self
+                .encrypted_volume_keys_for_vols(if attached.is_empty() {
+                    std::slice::from_ref(volume)
+                } else {
+                    attached.as_slice()
+                })
+                .map_err(|status| LiveMigrateFailure {
+                    send_succeeded: false,
+                    status,
                     operation_id: op_id.clone(),
                 })?;
-        let rbd_volumes: Vec<node_proto::RbdImageRef> = if attached.is_empty() {
-            vec![node_proto::RbdImageRef {
-                pool: volume.pool.clone(),
-                image: volume.image.clone(),
-            }]
+            let root_pool = rbd_volumes
+                .first()
+                .map(|v| v.pool.clone())
+                .unwrap_or_else(|| volume.pool.clone());
+            let root_image = rbd_volumes
+                .first()
+                .map(|v| v.image.clone())
+                .unwrap_or_else(|| volume.image.clone());
+            (rbd_volumes, encrypted_volumes, root_pool, root_image)
         } else {
-            attached
-                .iter()
-                .map(|v| node_proto::RbdImageRef {
-                    pool: v.pool.clone(),
-                    image: v.image.clone(),
-                })
-                .collect()
+            (Vec::new(), Vec::new(), String::new(), String::new())
         };
-        let encrypted_volumes = self
-            .encrypted_volume_keys_for_vols(if attached.is_empty() {
-                std::slice::from_ref(volume)
-            } else {
-                attached.as_slice()
-            })
-            .map_err(|status| LiveMigrateFailure {
-                send_succeeded: false,
-                status,
-                operation_id: op_id.clone(),
-            })?;
-        let root_pool = rbd_volumes
-            .first()
-            .map(|v| v.pool.clone())
-            .unwrap_or_else(|| volume.pool.clone());
-        let root_image = rbd_volumes
-            .first()
-            .map(|v| v.image.clone())
-            .unwrap_or_else(|| volume.image.clone());
         let mut dest_admin = self
             .ensure_admin_client_for_node(target)
             .await
@@ -2456,6 +3280,7 @@ impl ControllerService {
                 rbd_volumes: rbd_volumes.clone(),
                 encrypted_volumes: encrypted_volumes.clone(),
                 source_cpu,
+                local_disk,
             })
             .await
         {
@@ -4746,6 +5571,13 @@ impl ControllerService {
                     .ok()
                     .is_some_and(|names| !names.is_empty())
             {
+                if crate::local_migrate::is_local_block(&vm.storage_backend) {
+                    errors.push(format!(
+                        "VM '{}' uses a GPU or PCI device with {} storage and stays on {}",
+                        vm.name, vm.storage_backend, source_node.id
+                    ));
+                    continue;
+                }
                 let mut gpu_targets: Vec<NodeRow> = eligible_nodes
                     .iter()
                     .filter(|n| {
@@ -4860,7 +5692,7 @@ impl ControllerService {
                             vm,
                             &source_node,
                             &target,
-                            &volume,
+                            Some(&volume),
                             &runtime_name,
                             &dest_host,
                         )
@@ -4886,6 +5718,34 @@ impl ControllerService {
                                 "live migrate during drain failed before send; falling back to cold"
                             );
                         }
+                    }
+                }
+            }
+
+            if crate::local_migrate::is_local_block(&vm.storage_backend) {
+                match self
+                    .migrate_local_disk(vm, &source_node, &target, true)
+                    .await
+                {
+                    Ok(_) => {
+                        migrated += 1;
+                        destination_node_ids.insert(target.id.clone());
+                        continue;
+                    }
+                    Err(err) if err.send_succeeded => {
+                        errors.push(format!(
+                            "VM '{}' left mid-migration from {} to {}: {}",
+                            vm.name, source_node.id, target.id, err.status
+                        ));
+                        destination_node_ids.insert(target.id.clone());
+                        continue;
+                    }
+                    Err(err) => {
+                        errors.push(format!(
+                            "VM '{}' left on {}: {}",
+                            vm.name, source_node.id, err.status
+                        ));
+                        continue;
                     }
                 }
             }
@@ -9461,12 +10321,6 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .await;
         }
 
-        if vm.storage_backend != "ceph" {
-            return Err(Status::failed_precondition(
-                "live migrate requires storage_backend=ceph (shared RBD)",
-            ));
-        }
-
         let source_node = self
             .db
             .get_node(&vm.node_id)
@@ -9489,6 +10343,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
             ));
         }
         accepts_migrated_vms(target)?;
+
+        if crate::local_migrate::is_local_block(&vm.storage_backend) {
+            return self
+                .respond_local_migrate(&actor, &vm, &source_node, target, req.allow_cold_fallback)
+                .await;
+        }
+
+        if vm.storage_backend != "ceph" {
+            return Err(Status::failed_precondition(
+                "live migrate supports ceph (shared RBD) and lvm/zfs (disk mirror); filesystem disks stay on the node",
+            ));
+        }
         if !self.node_supports_backend(target, "ceph") {
             return Err(Status::failed_precondition(
                 "target node is not a CephCluster member",
@@ -9519,7 +10385,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 &vm,
                 &source_node,
                 target,
-                &volume,
+                Some(&volume),
                 &runtime_name,
                 &dest_host,
             )
@@ -9809,6 +10675,28 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "cleared a live-migrate receive session that still looked active"
             );
         }
+        let mut mirror_note = String::new();
+        if crate::local_migrate::is_local_block(&vm.storage_backend) {
+            // This node does not own the VM, so its copy is a stranded target.
+            // The owner keeps its disk; only the mirror leg is removed.
+            if let Err(e) = self.abort_volume_on(&node, &runtime_name, true).await {
+                warn!(vm = %vm.name, node = %node.id, error = %e, "destination mirror cleanup");
+                mirror_note = format!(" destination mirror cleanup failed: {e}");
+            }
+            if let Ok(Some(owner)) = self.db.get_node(&vm.node_id) {
+                self.abort_volume_on(&owner, &runtime_name, false)
+                    .await
+                    .map_err(|e| {
+                        status_with_context(
+                            &e,
+                            &format!(
+                                "receive session on {} was cleared, but {} is still mirroring",
+                                node.id, owner.id
+                            ),
+                        )
+                    })?;
+            }
+        }
         self.record_audit(
             &actor,
             "ResetLiveMigrateReceive",
@@ -9824,7 +10712,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 success: true,
                 cleared: true,
                 message: format!(
-                    "cleared live-migrate receive session for '{}' on node {}{} ({})",
+                    "cleared live-migrate receive session for '{}' on node {}{} ({}){mirror_note}",
                     vm.name,
                     node.id,
                     if killed_live_receive {
@@ -11627,7 +12515,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
         if !crate::vm_operation_policy::cancel_allowed(&op.phase, op.send_succeeded) {
             return Err(Status::failed_precondition(format!(
-                "cancel refused in phase {} (send_succeeded={}; only Preparing before send is cancellable; after send the guest may already be on the destination)",
+                "cancel refused in phase {} (send_succeeded={}; only Preparing, MirrorSyncing, or Copying before send is cancellable; after send the guest may already be on the destination)",
                 op.phase, op.send_succeeded
             )));
         }
@@ -17122,6 +18010,55 @@ mod tests {
             .await
             .expect_err("non-ceph should fail");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("filesystem"),
+            "filesystem refusal should name the backend: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_rejects_lvm_on_a_filesystem_node_without_dialing() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".into();
+        db.upsert_node(&node_a).unwrap();
+        let mut node_b = test_node();
+        node_b.id = "node-b".into();
+        node_b.address = "127.0.0.2:9091".into();
+        node_b.storage_backend = "lvm".into();
+        db.upsert_node(&node_b).unwrap();
+        let mut vm = test_vm("node-a");
+        vm.storage_backend = "lvm".into();
+        db.insert_vm(&vm).unwrap();
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db,
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let err =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id,
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: true,
+                    gpus: vec![],
+                    vgpus: vec![],
+                }),
+            )
+            .await
+            .expect_err("lvm VM on a filesystem node should fail before any RPC");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("node-a"),
+            "refusal should name the source: {}",
+            err.message()
+        );
     }
 
     #[tokio::test]

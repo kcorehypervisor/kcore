@@ -531,7 +531,7 @@ Top-level commands:
 - `kctl set vm ... --state <running|stopped>`
 - `kctl start vm ...`
 - `kctl stop vm ...`
-- `kctl migrate vm <id|name> --target-node <node> [--allow-cold-fallback]` (Ceph / shared RBD live migrate)
+- `kctl migrate vm <id|name> --target-node <node> [--allow-cold-fallback]` (Ceph live migrate, or LVM/ZFS disk mirror then live migrate)
 - `kctl migrate reset-session <id|name> --node <node> [--force]` (clear a stranded live-migrate receive session; reports only without `--force`)
 - `kctl drain node <node-id> [--target-node <node>]` (cold-reassign all VMs off a node)
 - `kctl get migrate-session <id|name> [--node <node>]` (read-only live-migrate receive session state)

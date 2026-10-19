@@ -168,6 +168,11 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"grep -F 'CLOUDHV.fd' {long_start}")
     machine.succeed(f"grep -F 'image_type=raw' {long_start}")
     machine.succeed(f"grep -F 'kvm_hyperv=on' {long_start}")
+    machine.fail(f"grep -F 'shared=on' {long_start}")
+    lvm_start = start_script("kcore-vm-lvm-goodsha.service")
+    machine.succeed(f"grep -F '/dev/mapper/kcore-vm-lvm-goodsha' {lvm_start}")
+    machine.succeed(f"grep -F 'shared=on' {lvm_start}")
+    machine.succeed("grep -F localLiveMigrate /etc/kcore/ch-vm-features")
     machine.succeed("systemctl cat kcore-vm-this-name-is-way-too-long.service | grep -F 'TimeoutStartSec=15min'")
 
     machine.succeed("test -d /run/kcore")

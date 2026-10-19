@@ -558,6 +558,10 @@ pub struct VmOperationRow {
 impl VmOperationRow {
     pub const KIND_LIVE_MIGRATE: &'static str = "live_migrate";
     pub const PHASE_PREPARING: &'static str = "Preparing";
+    /// Local-disk live move: dm-mirror is copying the volume, memory has not moved.
+    pub const PHASE_MIRROR_SYNCING: &'static str = "MirrorSyncing";
+    /// Local-disk cold move: the guest is stopped and its volume is being copied.
+    pub const PHASE_COPYING: &'static str = "Copying";
     pub const PHASE_SENDING: &'static str = "Sending";
     pub const PHASE_WAITING: &'static str = "Waiting";
     pub const PHASE_REASSIGNED: &'static str = "Reassigned";
@@ -5151,12 +5155,34 @@ impl Database {
         )? > 0)
     }
 
-    /// Close `Preparing` live-migrate rows that no request is driving any more.
+    /// True when an open operation has not been updated for `idle_secs`.
+    ///
+    /// A live mirror poll touches the row every second, so a stale row means
+    /// the controller that was driving it is gone.
+    pub fn vm_operation_is_stale(&self, id: &str, idle_secs: i64) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        match conn.query_row(
+            "SELECT 1 FROM vm_operations WHERE id=?1 AND finished_at=''
+             AND updated_at < datetime('now', ?2 || ' seconds')",
+            params![id, -idle_secs],
+            |_| Ok(1i32),
+        ) {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Close live-migrate rows that no request is driving any more.
     ///
     /// `Preparing` is owned by an in-flight RPC. If the controller restarted or
     /// the RPC died, nothing would ever finish the row and the VM would be
-    /// locked out of further operations. A cancelled row idles for
-    /// `cancelled_idle_secs`; any other row for `idle_secs`.
+    /// locked out of further operations. A cancelled `Preparing` row idles for
+    /// `cancelled_idle_secs`; any other `Preparing` row for `idle_secs`.
+    /// `MirrorSyncing` and `Copying` stay open until `idle_secs` (30 minutes)
+    /// so the reconciler can abort the disk copy first. A cancelled mirror
+    /// that is still being polled keeps its `updated_at` fresh and is not
+    /// closed here.
     pub fn expire_stale_preparing_operations(
         &self,
         cancelled_idle_secs: i64,
@@ -5168,10 +5194,15 @@ impl Database {
              SET phase = CASE WHEN cancel_requested = 1 THEN 'Cancelled' ELSE 'Failed' END,
                  updated_at = datetime('now'),
                  finished_at = datetime('now')
-             WHERE finished_at = '' AND kind = 'live_migrate' AND phase = 'Preparing'
-               AND ((cancel_requested = 1
-                     AND updated_at < datetime('now', ?1 || ' seconds'))
-                    OR updated_at < datetime('now', ?2 || ' seconds'))",
+             WHERE finished_at = '' AND kind = 'live_migrate'
+               AND (
+                 (phase = 'Preparing'
+                   AND ((cancel_requested = 1
+                         AND updated_at < datetime('now', ?1 || ' seconds'))
+                        OR updated_at < datetime('now', ?2 || ' seconds')))
+                 OR (phase IN ('MirrorSyncing', 'Copying')
+                     AND updated_at < datetime('now', ?2 || ' seconds'))
+               )",
             params![-cancelled_idle_secs, -idle_secs],
         )
     }

@@ -158,10 +158,16 @@ pub fn generate_node_config_inner(
     ));
 
     if vms.iter().any(|v| v.storage_backend == "lvm") {
-        out.push_str("    lvmVgName = \"vg_kcore\";\n");
+        out.push_str(&format!(
+            "    lvmVgName = \"{}\";\n",
+            crate::local_migrate::LVM_VG
+        ));
     }
     if vms.iter().any(|v| v.storage_backend == "zfs") {
-        out.push_str("    zfsPoolName = \"tank0\";\n");
+        out.push_str(&format!(
+            "    zfsPoolName = \"{}\";\n",
+            crate::local_migrate::ZFS_POOL
+        ));
     }
 
     out.push_str("    networks.default = {\n");

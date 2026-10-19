@@ -15,7 +15,7 @@ For a deep operational runbook focused specifically on day-2 filesystem changes,
 For **kcore SAN** (shared Ceph / RBD), see:
 
 - `docs/ceph.md` — fabric + RBD integration
-- `docs/vm-migration.md` — cold drain and Cloud Hypervisor live migration
+- `docs/vm-migration.md` — cold drain, Cloud Hypervisor live migration, and LVM/ZFS disk copy
 
 Kubernetes claims on a node-local volume are a separate path from VM disks. See [kubernetes-volumes.md](./kubernetes-volumes.md).
 
@@ -338,6 +338,8 @@ Example generated VM block:
 
 - `storageBackend = "filesystem" | "lvm" | "zfs"`
 - `storageSizeBytes = <positive integer>`
+
+LVM and ZFS guests open `/dev/mapper/kcore-vm-<name>` (a linear map over the LV or zvol) with shared memory, so the disk can be mirrored to another node. See `docs/vm-migration.md`. The volume group is `vg_kcore` and the ZFS pool is `tank0`, the same names the controller writes into the unit.
 
 ## Node-Agent YAML Storage Config
 

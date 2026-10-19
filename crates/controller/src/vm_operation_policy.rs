@@ -10,7 +10,7 @@ pub fn cancel_allowed(phase: &str, send_succeeded: bool) -> bool {
     if send_succeeded {
         return false;
     }
-    phase == VmOperationRow::PHASE_PREPARING
+    phase == VmOperationRow::PHASE_PREPARING || crate::local_migrate::local_phase_is_open(phase)
 }
 
 /// True when the guest would be treated as still runnable on source after send
@@ -27,12 +27,16 @@ mod tests {
     #[test]
     fn preparing_without_send_is_cancellable() {
         assert!(cancel_allowed(VmOperationRow::PHASE_PREPARING, false));
+        assert!(cancel_allowed(VmOperationRow::PHASE_MIRROR_SYNCING, false));
+        assert!(cancel_allowed(VmOperationRow::PHASE_COPYING, false));
     }
 
     #[test]
     fn send_succeeded_never_cancellable() {
         for phase in [
             VmOperationRow::PHASE_PREPARING,
+            VmOperationRow::PHASE_MIRROR_SYNCING,
+            VmOperationRow::PHASE_COPYING,
             VmOperationRow::PHASE_SENDING,
             VmOperationRow::PHASE_WAITING,
             VmOperationRow::PHASE_REASSIGNED,
