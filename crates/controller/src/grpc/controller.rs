@@ -548,6 +548,78 @@ fn explicit_net_policy(
     )))
 }
 
+/// Restores a live disk mirror if the migrate RPC is cancelled while the
+/// resync is still running. A client timeout drops this future at the next
+/// `.await`, and `Drop` does not await, so the cleanup is spawned.
+struct LiveMirrorGuard {
+    armed: bool,
+    service: ControllerService,
+    source: NodeRow,
+    target: NodeRow,
+    runtime_name: String,
+    op_id: String,
+}
+
+impl LiveMirrorGuard {
+    fn arm(
+        service: ControllerService,
+        source: NodeRow,
+        target: NodeRow,
+        runtime_name: String,
+        op_id: String,
+    ) -> Self {
+        Self {
+            armed: true,
+            service,
+            source,
+            target,
+            runtime_name,
+            op_id,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LiveMirrorGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let service = self.service.clone();
+        let source = self.source.clone();
+        let target = self.target.clone();
+        let runtime_name = self.runtime_name.clone();
+        let op_id = self.op_id.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            warn!(
+                op = %op_id,
+                vm = %runtime_name,
+                "live mirror RPC dropped; restoring the source disk"
+            );
+            match service.abort_volume_on(&source, &runtime_name, false).await {
+                Ok(()) => {
+                    let _ = service.abort_volume_on(&target, &runtime_name, true).await;
+                    service.close_local_op(&op_id, VmOperationRow::PHASE_CANCELLED);
+                }
+                Err(status) => {
+                    warn!(
+                        op = %op_id,
+                        error = %status,
+                        "dropped mirror could not restore the source; destination copy kept"
+                    );
+                }
+            }
+        });
+    }
+}
+
 fn extra_nics_by_vm(
     db: &Database,
     vms: &[VmRow],
@@ -2668,11 +2740,19 @@ impl ControllerService {
             ));
         }
 
+        let mut mirror_guard = LiveMirrorGuard::arm(
+            self.clone(),
+            source.clone(),
+            target.clone(),
+            runtime_name.to_string(),
+            op_id.clone(),
+        );
         let started = std::time::Instant::now();
         let limit = Duration::from_secs(6 * 60 * 60);
         let mut status_errors = 0u32;
         loop {
             if started.elapsed() > limit {
+                mirror_guard.disarm();
                 let _ = self.abort_volume_on(source, runtime_name, false).await;
                 let _ = self.abort_volume_on(target, runtime_name, true).await;
                 self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
@@ -2691,6 +2771,7 @@ impl ControllerService {
                 .flatten()
                 .is_some_and(|op| op.cancel_requested);
             if cancel {
+                mirror_guard.disarm();
                 let restored = self.abort_volume_on(source, runtime_name, false).await;
                 let _ = self.abort_volume_on(target, runtime_name, true).await;
                 if let Err(status) = restored {
@@ -2730,6 +2811,7 @@ impl ControllerService {
                         false,
                     );
                     if !status.success || status.degraded {
+                        mirror_guard.disarm();
                         let _ = self.abort_volume_on(source, runtime_name, false).await;
                         let _ = self.abort_volume_on(target, runtime_name, true).await;
                         self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
@@ -2749,6 +2831,7 @@ impl ControllerService {
                     status_errors += 1;
                     warn!(vm = %vm.name, error = %e, "volume mirror status");
                     if status_errors >= 3 {
+                        mirror_guard.disarm();
                         let _ = self.abort_volume_on(source, runtime_name, false).await;
                         let _ = self.abort_volume_on(target, runtime_name, true).await;
                         self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
@@ -2768,6 +2851,7 @@ impl ControllerService {
         let mut dest_admin = match self.ensure_admin_client_for_node(target).await {
             Ok(admin) => admin,
             Err(status) => {
+                mirror_guard.disarm();
                 let _ = self.abort_volume_on(source, runtime_name, false).await;
                 let _ = self.abort_volume_on(target, runtime_name, true).await;
                 self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
@@ -2780,6 +2864,7 @@ impl ControllerService {
             })
             .await
         {
+            mirror_guard.disarm();
             let _ = self.abort_volume_on(source, runtime_name, false).await;
             let _ = self.abort_volume_on(target, runtime_name, true).await;
             self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
@@ -2789,6 +2874,9 @@ impl ControllerService {
             ));
         }
 
+        // Memory send has its own cleanup. A drop from here on must not tear
+        // the mirror down out from under Cloud Hypervisor.
+        mirror_guard.disarm();
         let dest_host = grpc_address_host(&target.address);
         match self
             .live_migrate_vm(vm, source, target, None, runtime_name, &dest_host)

@@ -212,7 +212,22 @@ fn validate_tls_materials(
     Ok(())
 }
 
+const DEFAULT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Local-disk migration blocks in one RPC until the copy finishes. This matches
+/// the controller's six-hour mirror deadline. Every other RPC keeps the 900s
+/// channel timeout.
+pub const LOCAL_DISK_MOVE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
 pub async fn connect(info: &ConnectionInfo) -> Result<Channel> {
+    connect_with_timeout(info, DEFAULT_RPC_TIMEOUT).await
+}
+
+pub async fn connect_with_timeout(
+    info: &ConnectionInfo,
+    request_timeout: std::time::Duration,
+) -> Result<Channel> {
     let addresses = if info.addresses.is_empty() {
         vec![info.address.clone()]
     } else {
@@ -236,7 +251,15 @@ pub async fn connect(info: &ConnectionInfo) -> Result<Channel> {
         let mut endpoint = Endpoint::from_shared(uri.clone())?
             .connect_timeout(std::time::Duration::from_secs(5))
             // VM create waits for the image fetch and nixos-rebuild on the node.
-            .timeout(std::time::Duration::from_secs(900));
+            // `Request::set_timeout` does not raise this; the channel uses the
+            // shorter of the two.
+            .timeout(request_timeout);
+        if request_timeout > DEFAULT_RPC_TIMEOUT {
+            endpoint = endpoint
+                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                .keep_alive_timeout(std::time::Duration::from_secs(10))
+                .keep_alive_while_idle(true);
+        }
 
         if let Some((ca_pem, client_cert_pem, client_key_pem)) = &tls_pems {
             let mut tls = ClientTlsConfig::new();
@@ -287,7 +310,14 @@ fn endpoint_host(address: &str) -> Option<&str> {
 pub async fn controller_client(
     info: &ConnectionInfo,
 ) -> Result<controller_proto::controller_client::ControllerClient<Channel>> {
-    let channel = connect(info).await?;
+    controller_client_with_timeout(info, DEFAULT_RPC_TIMEOUT).await
+}
+
+pub async fn controller_client_with_timeout(
+    info: &ConnectionInfo,
+    request_timeout: std::time::Duration,
+) -> Result<controller_proto::controller_client::ControllerClient<Channel>> {
+    let channel = connect_with_timeout(info, request_timeout).await?;
     Ok(
         controller_proto::controller_client::ControllerClient::new(channel)
             .max_decoding_message_size(40 * 1024 * 1024)

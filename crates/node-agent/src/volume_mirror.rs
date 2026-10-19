@@ -29,8 +29,16 @@ use crate::lvm_ops::{self, LvmOpError};
 pub const NBD_PORT_BASE: u16 = 18128;
 pub const NBD_PORT_COUNT: u16 = 128;
 
-/// `dm-mirror` region size in 512-byte sectors (512 KiB).
-pub const MIRROR_REGION_SECTORS: u64 = 1024;
+/// `dm-mirror` region size in 512-byte sectors (16 MiB).
+///
+/// Recovery copies one region and waits for the NBD write before the next.
+/// A 512 KiB region stayed near 11 MiB/s on the lab's 10 GbE link, so a 20 GiB
+/// disk took about half an hour. The kernel accepts a power-of-two region no
+/// larger than the device; 16 MiB divides a 20 GiB volume evenly. Shorter
+/// disks use the largest power of two that still fits.
+pub const MIRROR_REGION_SECTORS: u64 = 32768;
+
+const MIN_MIRROR_REGION_SECTORS: u64 = 8;
 
 pub const SEED_MARKER_DIR: &str = "/var/lib/kcore/volume-seeded";
 
@@ -226,9 +234,31 @@ pub fn mirror_table(sectors: u64, leg0: &str, leg1: &str) -> Result<String, Stri
     }
     let leg0 = require_dev_path(leg0)?;
     let leg1 = require_dev_path(leg1)?;
+    let region = mirror_region_sectors(sectors)?;
     Ok(format!(
-        "0 {sectors} mirror core 1 {MIRROR_REGION_SECTORS} 2 {leg0} 0 {leg1} 0\n"
+        "0 {sectors} mirror core 1 {region} 2 {leg0} 0 {leg1} 0\n"
     ))
+}
+
+/// Largest power-of-two region that `dm-mirror` will load for this device.
+fn mirror_region_sectors(device_sectors: u64) -> Result<u64, String> {
+    if device_sectors < MIN_MIRROR_REGION_SECTORS {
+        return Err(format!(
+            "device is {device_sectors} sectors; dm-mirror needs at least {MIN_MIRROR_REGION_SECTORS}"
+        ));
+    }
+    let capped = MIRROR_REGION_SECTORS.min(device_sectors);
+    let region = if capped.is_power_of_two() {
+        capped
+    } else {
+        capped.next_power_of_two() / 2
+    };
+    if region < MIN_MIRROR_REGION_SECTORS {
+        return Err(format!(
+            "device is {device_sectors} sectors; no power-of-two mirror region fits"
+        ));
+    }
+    Ok(region)
 }
 
 fn require_dev_path(path: &str) -> Result<&str, String> {
@@ -1068,16 +1098,25 @@ mod tests {
 
     #[test]
     fn mirror_table_resyncs_and_linear_round_trips() {
-        let table = mirror_table(2048, "/dev/vg_kcore/kcore-web", "/dev/nbd3").unwrap();
-        assert!(table.contains("mirror core 1 1024 2"));
+        let table = mirror_table(41_943_040, "/dev/vg_kcore/kcore-web", "/dev/nbd3").unwrap();
+        assert!(table.contains("mirror core 1 32768 2"));
         assert!(!table.contains("nosync"));
         let back = linear_table_from_mirror_table(&table).unwrap();
-        assert_eq!(back, "0 2048 linear /dev/vg_kcore/kcore-web 0\n");
+        assert_eq!(back, "0 41943040 linear /dev/vg_kcore/kcore-web 0\n");
         // `dmsetup table` prints legs as major:minor, not the path that was loaded.
         let numeric =
             linear_table_from_mirror_table("0 41943040 mirror core 1 1024 2 254:0 0 43:0 0")
                 .unwrap();
         assert_eq!(numeric, "0 41943040 linear 254:0 0\n");
+    }
+
+    #[test]
+    fn mirror_region_shrinks_to_fit_a_short_device() {
+        let table = mirror_table(2048, "/dev/vg_kcore/kcore-web", "/dev/nbd3").unwrap();
+        assert!(table.contains("mirror core 1 2048 2"));
+        let odd = mirror_table(3000, "/dev/vg_kcore/kcore-web", "/dev/nbd0").unwrap();
+        assert!(odd.contains("mirror core 1 2048 2"));
+        assert!(mirror_table(7, "/dev/vg_kcore/kcore-web", "/dev/nbd0").is_err());
     }
 
     #[test]
