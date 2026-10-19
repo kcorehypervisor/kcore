@@ -512,7 +512,7 @@ pub fn set_dhcp_disabled(
     login(&mut stream, user, password)?;
     let rows = print_cmd(&mut stream, "/ip/dhcp-server/print")?;
     let mut changed = Vec::new();
-    let flag = if disabled { "yes" } else { "no" };
+    let flag_word = if disabled { "yes" } else { "no" };
     for row in rows {
         let Some(id) = row.get(".id").and_then(|v| v.as_str()) else {
             continue;
@@ -524,7 +524,7 @@ pub fn set_dhcp_disabled(
             .to_string();
         let already = flag(&row, "disabled") == Some(disabled);
         if already {
-            changed.push(format!("{name} already disabled={flag}"));
+            changed.push(format!("{name} already disabled={flag_word}"));
             continue;
         }
         sentence(
@@ -532,11 +532,11 @@ pub fn set_dhcp_disabled(
             &[
                 "/ip/dhcp-server/set",
                 &format!("=.id={id}"),
-                &format!("=disabled={flag}"),
+                &format!("=disabled={flag_word}"),
             ],
         )?;
         expect_done(&mut stream).with_context(|| format!("updating dhcp server {name}"))?;
-        changed.push(format!("{name} disabled={flag}"));
+        changed.push(format!("{name} disabled={flag_word}"));
     }
     Ok(changed)
 }
