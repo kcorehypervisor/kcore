@@ -212,7 +212,7 @@ pub fn linear_table(sectors: u64, backing: &str) -> Result<String, String> {
     if sectors == 0 {
         return Err("device mapper length must be non-zero".into());
     }
-    let backing = require_dev_path(backing)?;
+    let backing = require_table_device(backing)?;
     Ok(format!("0 {sectors} linear {backing} 0\n"))
 }
 
@@ -237,6 +237,22 @@ fn require_dev_path(path: &str) -> Result<&str, String> {
         return Err(format!("refusing device path '{path}'"));
     }
     Ok(path)
+}
+
+/// A device-mapper table leg is either a `/dev` path or the `major:minor`
+/// pair `dmsetup table` prints back.
+fn require_table_device(spec: &str) -> Result<&str, String> {
+    let spec = spec.trim();
+    if let Some((major, minor)) = spec.split_once(':') {
+        if !major.is_empty()
+            && !minor.is_empty()
+            && major.chars().all(|c| c.is_ascii_digit())
+            && minor.chars().all(|c| c.is_ascii_digit())
+        {
+            return Ok(spec);
+        }
+    }
+    require_dev_path(spec)
 }
 
 /// Rebuild the linear table from a mirror table, keeping leg 0 (the local disk).
@@ -1057,6 +1073,11 @@ mod tests {
         assert!(!table.contains("nosync"));
         let back = linear_table_from_mirror_table(&table).unwrap();
         assert_eq!(back, "0 2048 linear /dev/vg_kcore/kcore-web 0\n");
+        // `dmsetup table` prints legs as major:minor, not the path that was loaded.
+        let numeric =
+            linear_table_from_mirror_table("0 41943040 mirror core 1 1024 2 254:0 0 43:0 0")
+                .unwrap();
+        assert_eq!(numeric, "0 41943040 linear 254:0 0\n");
     }
 
     #[test]

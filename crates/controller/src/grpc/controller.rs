@@ -2691,19 +2691,17 @@ impl ControllerService {
                 .flatten()
                 .is_some_and(|op| op.cancel_requested);
             if cancel {
-                match self.abort_volume_on(source, runtime_name, false).await {
-                    Ok(()) => {}
-                    Err(status) => {
-                        return Err(Self::local_fail(
-                            op_id,
-                            status_with_context(
-                                &status,
-                                "cancelled, but the source mirror could not be restored",
-                            ),
-                        ));
-                    }
-                }
+                let restored = self.abort_volume_on(source, runtime_name, false).await;
                 let _ = self.abort_volume_on(target, runtime_name, true).await;
+                if let Err(status) = restored {
+                    return Err(Self::local_fail(
+                        op_id,
+                        status_with_context(
+                            &status,
+                            "cancelled, but the source mirror could not be restored",
+                        ),
+                    ));
+                }
                 self.close_local_op(&op_id, VmOperationRow::PHASE_CANCELLED);
                 return Err(Self::local_fail(
                     op_id,
