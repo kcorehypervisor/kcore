@@ -20,7 +20,9 @@ Live move:
 3. Cloud Hypervisor then sends memory the same way it does for Ceph (`local_disk` on the receive, so no RBD is mapped).
 4. The destination keeps the volume. The source copy is deleted only after that send succeeds.
 
-A stopped guest, or a running guest whose operator passed `--allow-cold-fallback`, is quiesced, copied with `qemu-img convert`, marked seeded, and then reassigned. Drain uses this path for LVM and ZFS and does not fall through to a cold reassignment that would create an empty disk. `filesystem` VMs, and LVM/ZFS VMs that also have a GPU or PCI device, stay where they are. Failover of a node that missed heartbeats still leaves local disks on that node: there is no second copy to start.
+A stopped guest, or a running guest whose operator passed `--allow-cold-fallback`, is quiesced, copied with `qemu-img convert`, marked seeded, and then reassigned.
+
+The disk copy is rehearsed without the lab machines by `nix build .#checks.x86_64-linux.local-disk-migrate`. That NixOS test builds `kcore-volume-mirror-check` from the same crate the node agent calls, then runs a live mirror and a cold copy between two VMs. It fails unless the kernel's `dmsetup status` line parses as in sync (`1 AA`) and the destination LV has the bytes written on the source, including a write made after the resync. GitHub `nix-checks` runs it on every pull request. Drain uses this path for LVM and ZFS and does not fall through to a cold reassignment that would create an empty disk. `filesystem` VMs, and LVM/ZFS VMs that also have a GPU or PCI device, stay where they are. Failover of a node that missed heartbeats still leaves local disks on that node: there is no second copy to start.
 
 `kctl cancel operation <id>` is accepted during `MirrorSyncing` and `Copying`, before memory is sent. After the send, cancel is refused.
 

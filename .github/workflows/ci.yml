@@ -66,7 +66,7 @@ jobs:
 
   nix-checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -89,6 +89,9 @@ jobs:
 
       - name: Ceph module eval (kcore.ceph.enable + firewall)
         run: nix build --no-link .#checks.x86_64-linux.ceph-module-eval
+
+      - name: Local disk migration rehearsal
+        run: nix build --no-link .#checks.x86_64-linux.local-disk-migrate
 
       - name: Nix format check
         run: nix build --no-link .#checks.x86_64-linux.fmt-nix

@@ -191,6 +191,7 @@
             );
             fmt-rust = craneLib.cargoFmt { inherit src; };
             vm-module = import ./tests/vm-module.nix { inherit pkgs; };
+            local-disk-migrate = import ./tests/local-disk-migrate.nix { inherit pkgs; };
             disko-module = import ./tests/disko-module.nix { inherit pkgs; };
             ceph-module-eval = import ./tests/ceph-module-eval.nix {
               inherit pkgs;
