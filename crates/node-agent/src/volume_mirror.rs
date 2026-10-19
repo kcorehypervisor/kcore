@@ -256,7 +256,9 @@ pub fn linear_table_from_mirror_table(table: &str) -> Result<String, String> {
 /// Parse one `dmsetup status <name>` line.
 pub fn parse_dmsetup_status(line: &str) -> Result<DmStatus, String> {
     let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 4 {
+    // `dmsetup status` for linear is `START LEN linear`. The table line is
+    // longer (`START LEN linear DEV OFFSET`); both are the same target.
+    if fields.len() < 3 {
         return Err(format!("dmsetup status line is too short: {line}"));
     }
     let sectors: u64 = fields[1]
@@ -265,6 +267,9 @@ pub fn parse_dmsetup_status(line: &str) -> Result<DmStatus, String> {
     match fields[2] {
         "linear" => Ok(DmStatus::Linear { sectors }),
         "mirror" => {
+            if fields.len() < 4 {
+                return Err(format!("mirror status is truncated: {line}"));
+            }
             let nr: usize = fields[3]
                 .parse()
                 .map_err(|_| format!("mirror leg count is not a number: {}", fields[3]))?;
@@ -1098,6 +1103,10 @@ mod tests {
 
     #[test]
     fn linear_status_is_not_a_mirror() {
+        assert_eq!(
+            parse_dmsetup_status("0 41943040 linear").unwrap(),
+            DmStatus::Linear { sectors: 41943040 }
+        );
         assert_eq!(
             parse_dmsetup_status("0 2048 linear 253:1 0").unwrap(),
             DmStatus::Linear { sectors: 2048 }
