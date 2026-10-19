@@ -522,7 +522,7 @@ pub fn set_dhcp_disabled(
             .and_then(|v| v.as_str())
             .unwrap_or(id)
             .to_string();
-        let already = row.get("disabled").and_then(|v| v.as_str()) == Some(flag);
+        let already = flag(&row, "disabled") == Some(disabled);
         if already {
             changed.push(format!("{name} already disabled={flag}"));
             continue;
