@@ -29,6 +29,10 @@ pub struct CpuConfig {
 pub struct MemoryConfig {
     /// Memory size in bytes.
     pub size: u64,
+    /// `shared=on`. Absent in the JSON means the guest RAM is private, which
+    /// Cloud Hypervisor refuses to live-migrate.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +43,8 @@ pub struct NetConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct DiskConfig {
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]

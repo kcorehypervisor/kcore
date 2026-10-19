@@ -71,6 +71,11 @@ assert lib.hasSuffix "/bin/cloud-hypervisor" chBin;
 assert chBin != unpatched;
 assert lib.hasInfix "cloud-hypervisor-51.1" chBin;
 assert cfg.environment.etc."kcore/vm-socket-dir".text == "/run/kcore\n";
+assert lib.hasInfix "localLiveMigrate" cfg.environment.etc."kcore/ch-vm-features".text;
+assert lib.elem {
+  from = 18128;
+  to = 18255;
+} cfg.networking.firewall.interfaces.eth0.allowedTCPPortRanges;
 # A second VMM for the same VM is refused with a status systemd will not retry.
 assert cephUnit.serviceConfig.RestartPreventExitStatus == "75";
 assert lvmUnit.serviceConfig.RestartPreventExitStatus == "75";

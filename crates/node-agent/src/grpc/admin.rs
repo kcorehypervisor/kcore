@@ -20,6 +20,8 @@ use crate::live_migrate::{self, LiveMigrateState, ReceiveSession};
 use crate::proto;
 use crate::storage::{self, StorageAdapter};
 use crate::vmm;
+use crate::volume_mirror;
+
 pub struct AdminService {
     nix_config_path: PathBuf,
     vm_socket_dir: PathBuf,
@@ -2774,10 +2776,19 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let vm_name = req.vm_name.trim();
         let images =
             rbd_images_from_migrate_request(&req.rbd_pool, &req.rbd_image, &req.rbd_volumes);
-        if vm_name.is_empty() || images.is_empty() {
+        if vm_name.is_empty() || (!req.local_disk && images.is_empty()) {
             return Err(Status::invalid_argument(
                 "vm_name and at least one RBD image (rbd_volumes or rbd_pool/rbd_image) are required",
             ));
+        }
+        if req.local_disk {
+            let mapper =
+                crate::volume_mirror::mapper_path(vm_name).map_err(Status::invalid_argument)?;
+            if !std::path::Path::new(&mapper).exists() {
+                return Err(Status::failed_precondition(format!(
+                    "local-disk receive for {vm_name} needs {mapper} to exist before Cloud Hypervisor opens it"
+                )));
+            }
         }
         if self.live_migrate.get_port(vm_name).await.is_some()
             || live_migrate::migrate_pid_path(&self.vm_socket_dir, vm_name).exists()
@@ -3149,6 +3160,331 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         Ok(Response::new(proto::FinalizeLiveMigrateDestResponse {
             success: true,
             message: format!("adopted migrated VM via {unit}"),
+        }))
+    }
+
+    async fn inspect_local_vm_disk(
+        &self,
+        request: Request<proto::InspectLocalVmDiskRequest>,
+    ) -> Result<Response<proto::InspectLocalVmDiskResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim().to_string();
+        let backend = req.storage_backend.trim().to_string();
+        let vg = req.vg_name.clone();
+        let pool = req.pool_name.clone();
+        let mapper = volume_mirror::mapper_path(&vm_name).map_err(Status::invalid_argument)?;
+        let backing = volume_mirror::backing_path(&backend, &vg, &pool, &vm_name)
+            .map_err(Status::invalid_argument)?;
+        let client = vmm::Client::new(self.vm_socket_dir.to_str().unwrap_or("/run/kcore"));
+        let info = client.get_vm_info(&vm_name).await;
+        let state = info.as_ref().map(|i| i.state.clone());
+        let paths: Vec<String> = info
+            .as_ref()
+            .map(|i| {
+                i.config
+                    .disks
+                    .iter()
+                    .filter_map(|d| d.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shared = info
+            .as_ref()
+            .and_then(|i| i.config.memory.as_ref())
+            .is_some_and(|m| m.shared);
+        let facts = volume_mirror::guest_disk_facts(state.as_deref(), &paths, shared, &mapper);
+        let mapper_present = std::path::Path::new(&mapper).exists();
+        let measure_path = if mapper_present {
+            mapper.clone()
+        } else {
+            backing.clone()
+        };
+        let size_bytes = if std::path::Path::new(&measure_path).exists() {
+            tokio::task::spawn_blocking(move || volume_mirror::device_bytes(&measure_path))
+                .await
+                .map_err(|e| Status::internal(format!("task join: {e}")))?
+                .map_err(Status::failed_precondition)?
+        } else {
+            0
+        };
+        Ok(Response::new(proto::InspectLocalVmDiskResponse {
+            success: size_bytes > 0,
+            message: if size_bytes > 0 {
+                format!("inspected {vm_name}")
+            } else {
+                format!("{backing} does not exist on this node")
+            },
+            mapper_path: mapper,
+            backing_path: backing,
+            size_bytes: size_bytes as i64,
+            mapper_present,
+            guest_uses_mapper: facts.guest_uses_mapper,
+            memory_shared: facts.memory_shared,
+            running: facts.running,
+            state: state.unwrap_or_default(),
+        }))
+    }
+
+    async fn prepare_volume_mirror_target(
+        &self,
+        request: Request<proto::PrepareVolumeMirrorTargetRequest>,
+    ) -> Result<Response<proto::PrepareVolumeMirrorTargetResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let bind =
+            volume_mirror::parse_bind_addr(&req.bind_addr).map_err(Status::invalid_argument)?;
+        if req.size_bytes <= 0 {
+            return Err(Status::invalid_argument("size_bytes must be positive"));
+        }
+        let socket_dir = self.vm_socket_dir.clone();
+        let session = tokio::task::spawn_blocking(move || {
+            volume_mirror::prepare_target(
+                &socket_dir,
+                &req.vm_name,
+                &req.storage_backend,
+                &req.vg_name,
+                &req.pool_name,
+                req.size_bytes as u64,
+                bind,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(proto::PrepareVolumeMirrorTargetResponse {
+            success: true,
+            message: format!(
+                "exporting {} on {}:{}",
+                session.export_name, session.bind_addr, session.port
+            ),
+            listen_port: session.port as i32,
+            export_name: session.export_name,
+            listen_addr: session.bind_addr,
+            device_bytes: session.size_bytes as i64,
+            mapper_path: session.mapper_path,
+        }))
+    }
+
+    async fn start_volume_mirror(
+        &self,
+        request: Request<proto::StartVolumeMirrorRequest>,
+    ) -> Result<Response<proto::StartVolumeMirrorResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if req.target_port <= 0 || req.target_port > u16::MAX as i32 {
+            return Err(Status::invalid_argument("target_port is not a TCP port"));
+        }
+        let socket_dir = self.vm_socket_dir.clone();
+        let port = req.target_port as u16;
+        let session = tokio::task::spawn_blocking(move || {
+            volume_mirror::start_mirror(
+                &socket_dir,
+                &req.vm_name,
+                &req.storage_backend,
+                &req.vg_name,
+                &req.pool_name,
+                volume_mirror::NbdTarget {
+                    host: &req.target_host,
+                    port,
+                    export: &req.export_name,
+                },
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(proto::StartVolumeMirrorResponse {
+            success: true,
+            message: format!(
+                "mirroring {} onto {}",
+                session.mapper_path, session.nbd_device
+            ),
+            nbd_device: session.nbd_device,
+        }))
+    }
+
+    async fn get_volume_mirror_status(
+        &self,
+        request: Request<proto::GetVolumeMirrorStatusRequest>,
+    ) -> Result<Response<proto::GetVolumeMirrorStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let vm_name = request.into_inner().vm_name;
+        let progress = tokio::task::spawn_blocking(move || volume_mirror::mirror_status(&vm_name))
+            .await
+            .map_err(|e| Status::internal(format!("task join: {e}")))?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(proto::GetVolumeMirrorStatusResponse {
+            success: true,
+            message: if progress.in_sync {
+                "mirror is in sync".into()
+            } else {
+                format!(
+                    "mirrored {} of {} bytes",
+                    progress.bytes_synced, progress.bytes_total
+                )
+            },
+            in_sync: progress.in_sync,
+            bytes_synced: progress.bytes_synced as i64,
+            bytes_total: progress.bytes_total as i64,
+            degraded: progress.degraded,
+        }))
+    }
+
+    async fn copy_local_volume(
+        &self,
+        request: Request<proto::CopyLocalVolumeRequest>,
+    ) -> Result<Response<proto::CopyLocalVolumeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if req.target_port <= 0 || req.target_port > u16::MAX as i32 {
+            return Err(Status::invalid_argument("target_port is not a TCP port"));
+        }
+        let host = req.target_host.clone();
+        let export = req.export_name.clone();
+        let port = req.target_port as u16;
+        let copied = req.vm_name.clone();
+        let socket_dir = self.vm_socket_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            volume_mirror::copy_quiescent(
+                &socket_dir,
+                &req.vm_name,
+                &req.storage_backend,
+                &req.vg_name,
+                &req.pool_name,
+                volume_mirror::NbdTarget {
+                    host: &host,
+                    port,
+                    export: &export,
+                },
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(Status::internal)?;
+        Ok(Response::new(proto::CopyLocalVolumeResponse {
+            success: true,
+            message: format!("copied {copied}"),
+        }))
+    }
+
+    async fn commit_volume_mirror_target(
+        &self,
+        request: Request<proto::CommitVolumeMirrorTargetRequest>,
+    ) -> Result<Response<proto::CommitVolumeMirrorTargetResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let vm_name = request.into_inner().vm_name;
+        tokio::task::spawn_blocking(move || volume_mirror::write_seed_marker(&vm_name))
+            .await
+            .map_err(|e| Status::internal(format!("task join: {e}")))?
+            .map_err(Status::internal)?;
+        Ok(Response::new(proto::CommitVolumeMirrorTargetResponse {
+            success: true,
+            message: "seed marker written; the unit will not re-seed this volume".into(),
+        }))
+    }
+
+    async fn abort_volume_mirror(
+        &self,
+        request: Request<proto::AbortVolumeMirrorRequest>,
+    ) -> Result<Response<proto::AbortVolumeMirrorResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let socket_dir = self.vm_socket_dir.clone();
+        let message = tokio::task::spawn_blocking(move || {
+            volume_mirror::abort_session(&socket_dir, &req.vm_name, req.destroy_volume)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(Status::internal)?;
+        Ok(Response::new(proto::AbortVolumeMirrorResponse {
+            success: true,
+            message,
+        }))
+    }
+
+    async fn release_volume_mirror(
+        &self,
+        request: Request<proto::ReleaseVolumeMirrorRequest>,
+    ) -> Result<Response<proto::ReleaseVolumeMirrorResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let socket_dir = self.vm_socket_dir.clone();
+        let role = req.role.trim().to_string();
+        let vm_name = req.vm_name.clone();
+        let message = tokio::task::spawn_blocking(move || match role.as_str() {
+            "source" => volume_mirror::destroy_source_copy(&socket_dir, &vm_name)
+                .map(|()| format!("deleted source copy of {vm_name}")),
+            "target" => volume_mirror::release_target_export(&socket_dir, &vm_name)
+                .map(|()| format!("stopped NBD export for {vm_name}")),
+            other => Err(format!("role must be source or target, not {other}")),
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(Status::failed_precondition)?;
+        Ok(Response::new(proto::ReleaseVolumeMirrorResponse {
+            success: true,
+            message,
+        }))
+    }
+
+    async fn set_local_vm_quiesced(
+        &self,
+        request: Request<proto::SetLocalVmQuiescedRequest>,
+    ) -> Result<Response<proto::SetLocalVmQuiescedResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let vm_name = req.vm_name.trim();
+        if vm_name.is_empty() {
+            return Err(Status::invalid_argument("vm_name is required"));
+        }
+        let unit = live_migrate::vm_unit_name(vm_name);
+        if req.quiesced {
+            live_migrate::disable_unit_restart(&unit)
+                .await
+                .map_err(Status::internal)?;
+            if let Err(e) = live_migrate::stop_unit(&unit).await {
+                warn!(error = %e, unit = %unit, "quiesce stop");
+            }
+            let stopped = live_migrate::unit_is_stopped(&unit)
+                .await
+                .map_err(Status::internal)?;
+            if !stopped {
+                return Err(Status::failed_precondition(format!(
+                    "{unit} is still running; refusing to copy its disk"
+                )));
+            }
+            return Ok(Response::new(proto::SetLocalVmQuiescedResponse {
+                success: true,
+                message: format!("stopped {unit}"),
+                vmm_stopped: true,
+            }));
+        }
+        live_migrate::enable_unit_restart(&unit)
+            .await
+            .map_err(Status::internal)?;
+        if !req.start {
+            return Ok(Response::new(proto::SetLocalVmQuiescedResponse {
+                success: true,
+                message: format!("cleared the restart hold on {unit}"),
+                vmm_stopped: true,
+            }));
+        }
+        let out = Command::new("systemctl")
+            .args(["start", &unit])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("systemctl start {unit}: {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "systemctl start {unit} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(Response::new(proto::SetLocalVmQuiescedResponse {
+            success: true,
+            message: format!("restarted {unit}"),
+            vmm_stopped: false,
         }))
     }
 

@@ -1,0 +1,21 @@
+[package]
+name = "kcore-volume-mirror"
+version = "0.5.0"
+edition = "2021"
+description = "LVM and ZFS block copy used to migrate a local VM disk"
+
+[dependencies]
+kcore-sanitize = { path = "../kcore-sanitize" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "kcore-volume-mirror-check"
+path = "src/bin/check.rs"
+
+[lints]
+workspace = true

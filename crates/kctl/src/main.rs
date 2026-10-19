@@ -3124,21 +3124,25 @@ async fn main() {
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            let mut client = client::controller_client(&info)
-                .await
-                .unwrap_or_else(|e| fatal(&format!("{e}")));
+            let mut client =
+                client::controller_client_with_timeout(&info, client::LOCAL_DISK_MOVE_TIMEOUT)
+                    .await
+                    .unwrap_or_else(|e| fatal(&format!("{e}")));
             let mut devices = gpu.clone();
             devices.extend(nic.clone());
             devices.extend(nvme.clone());
-            let resp = client
-                .migrate_vm(client::controller_proto::MigrateVmRequest {
-                    vm_id: vm_id.to_string(),
-                    target_node: target_node.to_string(),
-                    allow_cold_fallback: *allow_cold_fallback,
-                    gpus: devices,
-                    vgpus: vgpu.clone(),
-                })
-                .await;
+            let mut request = tonic::Request::new(client::controller_proto::MigrateVmRequest {
+                vm_id: vm_id.to_string(),
+                target_node: target_node.to_string(),
+                allow_cold_fallback: *allow_cold_fallback,
+                gpus: devices,
+                vgpus: vgpu.clone(),
+            });
+            // The channel timeout is the shorter of this header and the
+            // endpoint timeout. Both are six hours so a local-disk resync
+            // is not abandoned while the controller is still copying.
+            request.set_timeout(client::LOCAL_DISK_MOVE_TIMEOUT);
+            let resp = client.migrate_vm(request).await;
             match resp {
                 Ok(r) => {
                     let r = r.into_inner();

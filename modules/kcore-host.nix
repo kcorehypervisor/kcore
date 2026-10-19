@@ -145,13 +145,16 @@ in
       ];
       # A later nixpkgs default of broker makes nixos-rebuild refuse to switch
       # a running node. Callers do not set this.
-      services.dbus.implementation = "dbus";
+      services.dbus.implementation = lib.mkDefault "dbus";
 
-      boot.loader.systemd-boot.enable = true;
-      boot.loader.systemd-boot.configurationLimit = 8;
-      boot.loader.timeout = 5;
-      boot.loader.efi.canTouchEfiVariables = true;
-      boot.kernel.sysctl."kernel.panic" = 10;
+      boot.loader.systemd-boot.enable = lib.mkDefault true;
+      boot.loader.systemd-boot.configurationLimit = lib.mkDefault 8;
+      boot.loader.timeout = lib.mkDefault 5;
+      boot.loader.efi.canTouchEfiVariables = lib.mkDefault true;
+      boot.kernel.sysctl."kernel.panic" = lib.mkDefault 10;
+      # Plain priority outranks the mkDefault copies in the VM networking
+      # module and the Kubernetes module. Making this mkDefault too makes
+      # those copies conflict with each other.
       boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
       boot.kernelModules = [
         "kvm"

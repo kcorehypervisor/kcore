@@ -60,6 +60,12 @@ pub async fn get(info: &ConnectionInfo, id: &str) -> Result<()> {
                 println!("Progress msg:     {msg}");
             }
         }
+        if let Some(m) = v.get("mirror") {
+            let synced = m.get("bytesSynced").and_then(|x| x.as_i64()).unwrap_or(0);
+            let total = m.get("bytesTotal").and_then(|x| x.as_i64()).unwrap_or(0);
+            let in_sync = m.get("inSync").and_then(|x| x.as_bool()).unwrap_or(false);
+            println!("Mirror:           {synced}/{total} bytes inSync={in_sync}");
+        }
     }
     Ok(())
 }

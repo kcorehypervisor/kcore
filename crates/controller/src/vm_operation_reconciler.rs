@@ -8,6 +8,8 @@
 //!
 //! `Sending` is left alone (operator reset-session). A `Preparing` row that is
 //! cancelled and idle, or idle for 30 minutes, is closed because no RPC owns it.
+//! `MirrorSyncing` and `Copying` are aborted on the nodes first: the source
+//! disk is restored, and only then is the destination copy deleted.
 
 use std::time::Duration;
 
@@ -60,6 +62,13 @@ async fn reconcile_once(db: &Database, clients: &NodeClients) -> Result<(), Stri
             {
                 if let Err(e) = resume_finalize(db, clients, &op).await {
                     warn!(op = %op.id, error = %e, "resume finalize failed");
+                }
+            }
+            p if p == VmOperationRow::PHASE_MIRROR_SYNCING
+                || p == VmOperationRow::PHASE_COPYING =>
+            {
+                if let Err(e) = reap_local_copy(db, clients, &op).await {
+                    warn!(op = %op.id, error = %e, "reap local disk copy failed");
                 }
             }
             _ => {}
@@ -217,5 +226,98 @@ async fn resume_finalize(
         }
     } else {
         Err("source admin unavailable".into())
+    }
+}
+
+/// Drop a local-disk copy whose driver is gone.
+///
+/// The source abort comes first and never deletes that disk. The destination
+/// copy is removed only after the source is linear again. A failure leaves
+/// the operation open so the next tick retries.
+async fn reap_local_copy(
+    db: &Database,
+    clients: &NodeClients,
+    op: &VmOperationRow,
+) -> Result<(), String> {
+    let stale = db
+        .vm_operation_is_stale(&op.id, 600)
+        .map_err(|e| e.to_string())?;
+    if !op.cancel_requested && !stale {
+        return Ok(());
+    }
+    // A live poll rewrites updated_at every second. Take over a cancel only
+    // once that poll has stopped, so this does not pull the mirror down while
+    // the RPC is still driving it.
+    if op.cancel_requested && !stale {
+        let idle = db
+            .vm_operation_is_stale(&op.id, 60)
+            .map_err(|e| e.to_string())?;
+        if !idle {
+            return Ok(());
+        }
+    }
+    let vm = db
+        .get_vm(&op.vm_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "VM missing".to_string())?;
+    if !crate::local_migrate::is_local_block(&vm.storage_backend) {
+        return Ok(());
+    }
+    let runtime_name = sanitize_nix_attr_key(&vm.name);
+    let source = db
+        .get_node(&op.source_node)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "source node missing".to_string())?;
+    abort_volume_mirror(clients, &source.address, &runtime_name, false)
+        .await
+        .map_err(|e| format!("source abort failed, leaving destination copy: {e}"))?;
+    let target = db
+        .get_node(&op.target_node)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "target node missing".to_string())?;
+    abort_volume_mirror(clients, &target.address, &runtime_name, true)
+        .await
+        .map_err(|e| format!("destination abort failed after source was restored: {e}"))?;
+    let phase = if op.cancel_requested {
+        VmOperationRow::PHASE_CANCELLED
+    } else {
+        VmOperationRow::PHASE_FAILED
+    };
+    db.update_vm_operation_phase(
+        &op.id,
+        phase,
+        Some(false),
+        Some(r#"{"reaped":"local-disk copy aborted"}"#),
+        true,
+    )
+    .map_err(|e| e.to_string())?;
+    info!(op = %op.id, phase, "reaped local disk copy");
+    Ok(())
+}
+
+async fn abort_volume_mirror(
+    clients: &NodeClients,
+    address: &str,
+    vm_name: &str,
+    destroy_volume: bool,
+) -> Result<(), String> {
+    if clients.get_admin(address).is_none() {
+        clients.connect(address).await.map_err(|e| e.to_string())?;
+    }
+    let mut admin = clients
+        .get_admin(address)
+        .ok_or_else(|| format!("admin client unavailable for {address}"))?;
+    let resp = admin
+        .abort_volume_mirror(node_proto::AbortVolumeMirrorRequest {
+            vm_name: vm_name.to_string(),
+            destroy_volume,
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .into_inner();
+    if resp.success {
+        Ok(())
+    } else {
+        Err(resp.message)
     }
 }

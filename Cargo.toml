@@ -7,6 +7,7 @@ members = [
     "crates/kcore-disk-layout-yaml",
     "crates/kcore-console",
     "crates/kcore-disk-verify",
+    "crates/kcore-volume-mirror",
     "crates/node-agent",
     "crates/controller",
     "crates/kctl",
