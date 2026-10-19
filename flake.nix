@@ -159,6 +159,15 @@
               cargoExtraArgs = "-p kcore-disk-verify";
             }
           );
+
+          kcore-provisioning = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "kcore-provisioning";
+              cargoExtraArgs = "-p kcore-provisioning";
+            }
+          );
         in
         {
           packages = {
@@ -170,6 +179,7 @@
               kcore-dashboard
               kcore-console
               kcore-disk-verify
+              kcore-provisioning
               ;
           };
 
@@ -181,6 +191,7 @@
               kcore-dashboard
               kcore-console
               kcore-disk-verify
+              kcore-provisioning
               ;
             clippy = craneLib.cargoClippy (
               commonArgs
@@ -203,6 +214,11 @@
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
             kcore-host-eval = import ./tests/kcore-host-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
+            provisioning-module-eval = import ./tests/provisioning-module-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
@@ -279,6 +295,7 @@
             kcore-ceph = cephModule;
             kcore-metrics = metricsModule;
             kcore-host = ./modules/kcore-host.nix;
+            kcore-provisioning = ./modules/kcore-provisioning.nix;
           };
 
           nixosConfigurations =

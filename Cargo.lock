@@ -2042,6 +2042,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcore-provisioning"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "prost",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kcore-sanitize"
 version = "0.3.0"
 
