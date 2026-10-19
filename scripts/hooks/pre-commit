@@ -3,6 +3,9 @@
 # Installed automatically by `nix develop` shellHook or `make install-hooks`.
 set -euo pipefail
 
+echo "pre-commit: scanning staged changes for secrets..."
+"$(dirname "$0")/gitleaks"
+
 echo "pre-commit: checking Rust formatting..."
 cargo fmt --check || {
     echo ""
