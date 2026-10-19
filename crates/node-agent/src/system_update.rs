@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 
 pub const NIXOS_GENERATION: &str = "nixos-generation";
 pub const HOST_FLAKE: &str = "/etc/nixos/flake.nix";
+/// nixos-rebuild `--flake` name. This is the `nixosConfigurations` key, not a package.
 pub const HOST_FLAKE_ATTR: &str = "/etc/nixos#kcore";
+/// `nix build` attribute. `#kcore` is not a package output of the host flake.
+pub const HOST_TOPLEVEL_ATTR: &str =
+    "/etc/nixos#nixosConfigurations.kcore.config.system.build.toplevel";
 pub const BOOT_PENDING: &str = "/var/lib/kcore/updates/boot-pending";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,7 +337,12 @@ fn ensure_free_space(path: &str, min_bytes: u64) -> Result<(), String> {
 
 fn build_toplevel() -> Result<String, String> {
     let out = Command::new("nix")
-        .args(["build", HOST_FLAKE_ATTR, "--no-link", "--print-out-paths"])
+        .args([
+            "build",
+            HOST_TOPLEVEL_ATTR,
+            "--no-link",
+            "--print-out-paths",
+        ])
         .output()
         .map_err(|e| format!("nix build: {e}"))?;
     if !out.status.success() {
@@ -414,7 +423,7 @@ fn write_migration_flake(
     nixpkgs.url = "{nixpkgs}";
     kcore.url = "{kcore}";
   }};
-  outputs = {{ nixpkgs, kcore, ... }}: {{
+  outputs = {{ self, nixpkgs, kcore, ... }}: {{
     nixosConfigurations.kcore = nixpkgs.lib.nixosSystem {{
       system = "x86_64-linux";
       specialArgs = {{ inherit kcore; }};
@@ -435,6 +444,9 @@ fn write_migration_flake(
         ./legacy-configuration.nix
       ];
     }};
+    # The installed updater builds `/etc/nixos#kcore`. That is a package
+    # attribute, not the nixosConfiguration name nixos-rebuild uses.
+    packages.x86_64-linux.kcore = self.nixosConfigurations.kcore.config.system.build.toplevel;
   }};
 }}
 "#
