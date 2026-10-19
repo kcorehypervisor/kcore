@@ -323,7 +323,17 @@ pub fn parse_dmsetup_status(line: &str) -> Result<DmStatus, String> {
                 return Err(format!("mirror status is truncated: {line}"));
             }
             let sync_field = fields[4 + nr];
-            let health = fields[5 + nr];
+            // dm-raid1 prints `synced/total 1 AA`: the `1` is a literal in
+            // the kernel format string, then one health character per leg.
+            // A line without that literal is still accepted.
+            let mut health_at = 5 + nr;
+            if fields.get(health_at) == Some(&"1") {
+                health_at += 1;
+            }
+            let health = fields
+                .get(health_at)
+                .copied()
+                .ok_or_else(|| format!("mirror status is missing leg health: {line}"))?;
             let (synced, total) = sync_field
                 .split_once('/')
                 .ok_or_else(|| format!("mirror sync field '{sync_field}' is not synced/total"))?;
@@ -1147,12 +1157,32 @@ mod tests {
             }
             other => panic!("expected mirror, got {other:?}"),
         }
+        // Linux dm-raid1: "%llu/%llu 1 %s" then the log status ("1 core").
+        let kernel =
+            parse_dmsetup_status("0 41943040 mirror 2 254:0 43:0 1280/1280 1 AA 1 core").unwrap();
+        match kernel {
+            DmStatus::Mirror(p) => {
+                assert!(p.in_sync);
+                assert!(!p.degraded);
+                assert_eq!(p.bytes_synced, p.bytes_total);
+            }
+            other => panic!("expected mirror, got {other:?}"),
+        }
     }
 
     #[test]
     fn a_failed_leg_is_not_in_sync() {
         let status = parse_dmsetup_status("0 100 mirror 2 253:0 253:1 100/100 AD 1 core").unwrap();
         match status {
+            DmStatus::Mirror(p) => {
+                assert!(!p.in_sync);
+                assert!(p.degraded);
+            }
+            other => panic!("expected mirror, got {other:?}"),
+        }
+        let kernel =
+            parse_dmsetup_status("0 41943040 mirror 2 254:0 43:0 1280/1280 1 AD 1 core").unwrap();
+        match kernel {
             DmStatus::Mirror(p) => {
                 assert!(!p.in_sync);
                 assert!(p.degraded);
