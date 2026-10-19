@@ -1,0 +1,12 @@
+title = "kcore"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Lockfiles and generated dashboards are not credentials."
+paths = [
+  '''Cargo\.lock''',
+  '''flake\.lock''',
+  '''package-lock\.json''',
+]

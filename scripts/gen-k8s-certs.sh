@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generate Kubernetes PKI certificates for bare-metal cluster
+# Generate Kubernetes PKI certificates for bare-metal cluster.
 # Usage: ./gen-k8s-certs.sh <cluster-name> <api-endpoint> <node-105-ip> <node-107-ip> <node-119-ip>
+# Output directory: $KCORE_K8S_PKI_DIR, or ${XDG_STATE_HOME:-$HOME/.local/state}/kcore/k8s-pki.
+# Do not point this at the git checkout.
 
 CLUSTER_NAME="${1:-kcore-prod}"
 API_ENDPOINT="${2:-192.168.40.200}"
@@ -10,8 +12,16 @@ NODE_105="${3:-192.168.40.105}"
 NODE_107="${4:-192.168.40.107}"
 NODE_119="${5:-192.168.40.119}"
 
-OUT_DIR="./k8s-pki"
+OUT_DIR="${KCORE_K8S_PKI_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/kcore/k8s-pki}"
+case "$OUT_DIR" in
+  /*) ;;
+  *)
+    echo "Error: KCORE_K8S_PKI_DIR must be an absolute path (got $OUT_DIR)" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$OUT_DIR"
+chmod 700 "$OUT_DIR"
 
 echo "==> Generating Kubernetes PKI for cluster: $CLUSTER_NAME"
 echo "    API endpoint: $API_ENDPOINT"

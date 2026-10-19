@@ -93,6 +93,29 @@ jobs:
       - name: Nix format check
         run: nix build --no-link .#checks.x86_64-linux.fmt-nix
 
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          version=8.28.0
+          archive="gitleaks_${version}_linux_x64.tar.gz"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}" -o "/tmp/${archive}"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_checksums.txt" -o /tmp/gitleaks-checksums.txt
+          (cd /tmp && grep " ${archive}$" gitleaks-checksums.txt | sha256sum -c -)
+          tar -C /tmp -xzf "/tmp/${archive}" gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan the tree
+        run: gitleaks detect --no-git --redact --config .gitleaks.toml --source .
+
   semgrep:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && vars.SEMGREP_APP_TOKEN != ''
