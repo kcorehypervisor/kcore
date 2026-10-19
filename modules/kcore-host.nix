@@ -152,7 +152,10 @@ in
       boot.loader.timeout = lib.mkDefault 5;
       boot.loader.efi.canTouchEfiVariables = lib.mkDefault true;
       boot.kernel.sysctl."kernel.panic" = lib.mkDefault 10;
-      boot.kernel.sysctl."net.ipv4.ip_forward" = lib.mkDefault 1;
+      # Plain priority outranks the mkDefault copies in the VM networking
+      # module and the Kubernetes module. Making this mkDefault too makes
+      # those copies conflict with each other.
+      boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
       boot.kernelModules = [
         "kvm"
         "kvm-intel"
