@@ -1023,16 +1023,40 @@ pub fn plan_fence(
 /// True when `token` is `ip/prefix` rather than an entity address
 /// (`ip:port/nonce`). Prefixes above 128 are nonces.
 pub fn is_blocklist_range(token: &str) -> bool {
-    let Some((addr, bits)) = token.rsplit_once('/') else {
-        return false;
+    canonical_blocklist_range(token).is_some() && !token.starts_with("cidr:")
+}
+
+/// `ip/prefix` form of a blocklist range.
+///
+/// `ceph osd blocklist range add` and `range rm` take `192.0.2.1/32`.
+/// Ceph Tentacle's `blocklist ls` prints that same range as
+/// `cidr:192.0.2.1:0/32`. Both name one range; removal always uses the
+/// command form.
+pub fn canonical_blocklist_range(token: &str) -> Option<String> {
+    let token = token.trim();
+    let (body, from_listing) = if let Some(rest) = token.strip_prefix("cidr:") {
+        (rest, true)
+    } else {
+        (token, false)
     };
-    let Ok(prefix) = bits.parse::<u8>() else {
-        return false;
-    };
+    let (addr, bits) = body.rsplit_once('/')?;
+    let prefix: u8 = bits.parse().ok()?;
     if prefix > 128 {
-        return false;
+        return None;
     }
-    addr.parse::<std::net::Ipv4Addr>().is_ok() || addr.parse::<std::net::Ipv6Addr>().is_ok()
+    let ip = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if from_listing {
+        // `192.0.2.1:0/32` — the `:0` is the entity port, not part of the IP.
+        addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr)
+    } else {
+        addr
+    };
+    if ip.parse::<std::net::Ipv4Addr>().is_ok() || ip.parse::<std::net::Ipv6Addr>().is_ok() {
+        Some(format!("{ip}/{prefix}"))
+    } else {
+        None
+    }
 }
 
 /// Entity addresses and ranges in a `ceph osd blocklist ls` listing that
@@ -1051,19 +1075,36 @@ pub fn select_blocklist_removals(listing: &str, hosts: &[String]) -> Vec<String>
         if token == "listed" || token.starts_with('#') {
             continue;
         }
-        let hit = if is_blocklist_range(token) {
-            hosts
+        let stored = if let Some(range) = canonical_blocklist_range(token) {
+            let owned = hosts
                 .iter()
-                .any(|host| token.starts_with(&format!("{host}/")))
+                .any(|host| range.starts_with(&format!("{host}/")));
+            if !owned {
+                continue;
+            }
+            range
         } else {
             let host = entity_addr_host(token);
-            hosts.contains(&host)
+            if !hosts.contains(&host) {
+                continue;
+            }
+            token.to_string()
         };
-        if hit && !out.iter().any(|have| have == token) {
-            out.push(token.to_string());
+        if !out.iter().any(|have| have == &stored) {
+            out.push(stored);
         }
     }
     out
+}
+
+/// `ceph osd blocklist add` on an address that is already listed exits
+/// non-zero. A second fence of the same lost host must still succeed.
+fn blocklist_add(args: &[&str]) -> Result<(), StorageError> {
+    match run_cmd_capture("ceph", args, ErrorKind::Internal) {
+        Ok(_) => Ok(()),
+        Err(e) if e.message().to_ascii_lowercase().contains("already") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn run_cmd_capture(
@@ -1141,20 +1182,12 @@ pub fn ceph_fence_volume(
     let expire = FENCE_BLOCKLIST_EXPIRE_SECS.to_string();
     let mut blocklisted = Vec::new();
     for addr in &plan.clients {
-        run_cmd_capture(
-            "ceph",
-            &["osd", "blocklist", "add", addr, &expire],
-            ErrorKind::Internal,
-        )?;
+        blocklist_add(&["osd", "blocklist", "add", addr, &expire])?;
         tracing::info!(handle, addr = %addr, "blocklisted Ceph client");
         blocklisted.push(addr.clone());
     }
     for range in &plan.ranges {
-        run_cmd_capture(
-            "ceph",
-            &["osd", "blocklist", "range", "add", range, &expire],
-            ErrorKind::Internal,
-        )?;
+        blocklist_add(&["osd", "blocklist", "range", "add", range, &expire])?;
         tracing::info!(handle, range = %range, "blocklisted Ceph client range");
         blocklisted.push(format!("range:{range}"));
     }
@@ -1950,6 +1983,32 @@ listed 2 entries
         assert!(is_blocklist_range("192.168.40.145/32"));
         assert!(is_blocklist_range("2001:db8::7/128"));
         assert!(!is_blocklist_range("192.168.40.145:0/11"));
+        assert!(!is_blocklist_range("cidr:192.168.40.145:0/32"));
+        assert_eq!(
+            canonical_blocklist_range("cidr:192.168.40.145:0/32").as_deref(),
+            Some("192.168.40.145/32")
+        );
+    }
+
+    #[test]
+    fn blocklist_removal_accepts_tentacle_cidr_ranges() {
+        // Ceph 20 prints a range added as `192.168.40.145/32` like this.
+        // `range rm` still wants the command form, not the listing token.
+        let listing = "\
+listed 4 entries
+cidr:192.168.40.145:0/32 2026-10-27T15:47:52.961960+0000
+cidr:192.168.47.4:0/32 2026-10-27T15:47:53.253734+0000
+192.168.40.143:0/303618515 2026-10-21T12:57:27.149030+0000
+192.168.40.145/32
+";
+        let hosts = vec!["192.168.40.145".to_string(), "192.168.47.4".to_string()];
+        assert_eq!(
+            select_blocklist_removals(listing, &hosts),
+            vec![
+                "192.168.40.145/32".to_string(),
+                "192.168.47.4/32".to_string()
+            ]
+        );
     }
 
     #[test]

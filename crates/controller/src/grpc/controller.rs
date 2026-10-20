@@ -200,6 +200,13 @@ fn gpu_info_from_row(
     }
 }
 
+/// A fence counts only when it covers the lost host's address, not merely
+/// a watcher that happened to still be listed. The node agent prefixes
+/// those entries with `range:`.
+fn fence_covers_lost_host(entries: &[String]) -> bool {
+    entries.iter().any(|entry| entry.starts_with("range:"))
+}
+
 fn accepts_migrated_vms(node: &NodeRow) -> Result<(), Status> {
     if node.approval_status != "approved" {
         return Err(Status::failed_precondition(format!(
@@ -6033,8 +6040,8 @@ impl ControllerService {
     }
 
     /// Addresses under which `node` can appear as a Ceph client: its Ceph
-    /// public (mon) address from every CephCluster it belongs to, plus the
-    /// host part of its gRPC address.
+    /// public (mon) address and its cluster-network address from every
+    /// CephCluster it belongs to, plus the host part of its gRPC address.
     fn ceph_client_hosts_for_node(&self, node: &NodeRow) -> Result<Vec<String>, Status> {
         let mut hosts = vec![grpc_address_host(&node.address)];
         for cluster in self
@@ -6049,6 +6056,10 @@ impl ControllerService {
                 let addr = member.mon_addr.trim();
                 if !addr.is_empty() {
                     hosts.push(grpc_address_host(addr));
+                }
+                let cluster = grpc_address_host(member.cluster_addr.trim());
+                if !cluster.is_empty() {
+                    hosts.push(cluster);
                 }
             }
         }
@@ -6066,8 +6077,9 @@ impl ControllerService {
     /// unreachable node keeps writing after the guest restarts elsewhere and
     /// the filesystem is torn apart by two kernels. Any failure here aborts
     /// the failover of this VM: a guest that stays down is recoverable, a
-    /// corrupted disk is not. A member that cannot be reached is skipped; a
-    /// member that answers with an error ends the attempt, because that
+    /// corrupted disk is not. A member that cannot be reached, does not
+    /// implement FenceVolume, or reports success without an IP range for the
+    /// lost host is skipped. Any other error ends the attempt, because that
     /// answer (image open from the wrong host, blocklist refused) is the
     /// cluster's verdict and not a transport problem.
     async fn fence_vm_volumes(
@@ -6092,7 +6104,13 @@ impl ControllerService {
             let handle = format!("{}/{}", vol.pool, vol.image);
             #[cfg(test)]
             if let Some(hook) = &self.test_fence_hook {
-                blocklisted.extend(hook(&handle, &hosts)?);
+                let added = hook(&handle, &hosts)?;
+                if !fence_covers_lost_host(&added) {
+                    return Err(Status::failed_precondition(format!(
+                        "fence of {handle} did not blocklist an IP range for the lost host"
+                    )));
+                }
+                blocklisted.extend(added);
                 continue;
             }
             let mut last_err = Status::unavailable(format!(
@@ -6120,16 +6138,32 @@ impl ControllerService {
                     .await
                 {
                     Ok(resp) => {
-                        blocklisted.extend(resp.into_inner().blocklisted);
-                        fenced = true;
-                        break;
-                    }
-                    Err(e) if e.code() == tonic::Code::Unavailable => {
-                        last_err = Status::unavailable(format!(
-                            "{} did not answer FenceVolume for {handle}: {}",
-                            member.id,
-                            e.message()
+                        let added = resp.into_inner().blocklisted;
+                        if fence_covers_lost_host(&added) {
+                            blocklisted.extend(added);
+                            fenced = true;
+                            break;
+                        }
+                        // An older agent answers success with an empty list
+                        // after the watchers have already dropped. That is
+                        // not a fence: the lost host can still map the image.
+                        last_err = Status::failed_precondition(format!(
+                            "{} reported {handle} fenced without a blocklist range for the lost host",
+                            member.id
                         ));
+                    }
+                    Err(e)
+                        if e.code() == tonic::Code::Unavailable
+                            || e.code() == tonic::Code::Unimplemented =>
+                    {
+                        last_err = Status::new(
+                            e.code(),
+                            format!(
+                                "{} did not answer FenceVolume for {handle}: {}",
+                                member.id,
+                                e.message()
+                            ),
+                        );
                     }
                     Err(e) => {
                         return Err(Status::new(
@@ -20921,7 +20955,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((handle.to_string(), hosts.to_vec()));
-            Ok(vec!["127.0.0.1:0/4242".to_string()])
+            Ok(vec![
+                "127.0.0.1:0/4242".to_string(),
+                "range:10.10.0.11/32".to_string(),
+            ])
         });
         let svc = svc_for(&db).with_test_fence_hook(hook);
 
@@ -20952,7 +20989,11 @@ mod tests {
         assert_eq!(fenced[0].0, format!("kcore-vms/kcore-{}", vm.id));
         assert_eq!(
             fenced[0].1,
-            vec!["10.10.0.11".to_string(), "127.0.0.1".to_string()]
+            vec![
+                "10.10.0.11".to_string(),
+                "10.20.0.11".to_string(),
+                "127.0.0.1".to_string()
+            ]
         );
     }
 
@@ -20986,6 +21027,33 @@ mod tests {
             "node-a"
         );
         assert!(!db.node_needs_config_push("node-a").expect("flag"));
+    }
+
+    #[tokio::test]
+    async fn failover_leaves_the_vm_in_place_when_the_fence_has_no_range() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-a", "not-ready").expect("mark");
+        let hook: FenceHook = Arc::new(|_handle: &str, _hosts: &[String]| Ok(Vec::new()));
+        let svc = svc_for(&db).with_test_fence_hook(hook);
+
+        let outcome = svc
+            .failover_unreachable_node("node-a")
+            .await
+            .expect("failover pass");
+        assert_eq!(outcome.migrated, 0);
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("could not be fenced") && e.contains("IP range")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("ceph").node_id,
+            "node-a"
+        );
     }
 
     #[tokio::test]
