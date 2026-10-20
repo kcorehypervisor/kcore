@@ -56,7 +56,15 @@ pub fn placement_actions(
     }
     let mut actions = Vec::new();
     for vm in local {
-        let owned = !confirmed || assigned.iter().any(|id| id == &vm.name);
+        // An old controller never confirms, so after the wait local disks
+        // boot and Ceph stays masked: that disk may already be running
+        // somewhere else. A confirmed assignment masks only the Ceph guests
+        // the controller has moved away.
+        let owned = if confirmed {
+            assigned.iter().any(|id| id == &vm.name)
+        } else {
+            vm.backend != "ceph"
+        };
         if vm.backend == "ceph" && !owned {
             actions.push(HostAction::Mask(vm.name.clone()));
         } else {
