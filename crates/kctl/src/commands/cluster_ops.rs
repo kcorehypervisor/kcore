@@ -24,6 +24,22 @@ pub async fn health(info: &ConnectionInfo) -> Result<()> {
         "certificates expiring soon: {}",
         resp.certificates_expiring_soon
     );
+    println!(
+        "ha: tolerate {} host failure(s), capacity {}, lease {} term {}, unprotected VMs on lost nodes {}",
+        resp.host_failures_tolerated,
+        if resp.failover_capacity.is_empty() {
+            "unknown"
+        } else {
+            resp.failover_capacity.as_str()
+        },
+        if resp.ha_lease_holder.is_empty() {
+            "none"
+        } else {
+            resp.ha_lease_holder.as_str()
+        },
+        resp.ha_lease_term,
+        resp.unprotected_vms_on_lost_nodes
+    );
     if resp.conditions.is_empty() {
         println!("conditions: none");
     } else {
@@ -31,6 +47,60 @@ pub async fn health(info: &ConnectionInfo) -> Result<()> {
         for condition in resp.conditions {
             println!("  - {condition}");
         }
+    }
+    Ok(())
+}
+
+pub async fn ha_status(info: &ConnectionInfo) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .get_ha_status(controller_proto::GetHaStatusRequest {})
+        .await?
+        .into_inner();
+    println!("enabled: {}", resp.enabled);
+    println!("acting: {}", resp.acting);
+    println!("controller: {}", resp.controller_id);
+    println!(
+        "lease: holder {} term {} expires {}",
+        if resp.lease_holder.is_empty() {
+            "none"
+        } else {
+            resp.lease_holder.as_str()
+        },
+        resp.lease_term,
+        resp.lease_expires_at_ms
+    );
+    println!(
+        "timeouts: node {}s, detect {}s, isolation {}",
+        resp.node_timeout_secs, resp.detect_interval_secs, resp.isolation_response
+    );
+    println!(
+        "admission: tolerate {} host failure(s), capacity {}, memory headroom {}",
+        resp.host_failures_to_tolerate,
+        resp.failover_capacity,
+        client::format_bytes(resp.memory_headroom_bytes)
+    );
+    Ok(())
+}
+
+pub async fn ha_events(info: &ConnectionInfo, limit: i32) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .list_ha_events(controller_proto::ListHaEventsRequest {
+            limit,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    if resp.events.is_empty() {
+        println!("no HA events");
+        return Ok(());
+    }
+    for event in resp.events {
+        println!(
+            "{}  {:<12}  node={}  vm={}  {}",
+            event.created_at, event.phase, event.node_id, event.vm_id, event.detail
+        );
     }
     Ok(())
 }

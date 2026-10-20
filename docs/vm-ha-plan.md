@@ -1,5 +1,16 @@
 # VM High Availability: plan
 
+Status: implemented in the controller, node agent, `kctl`, dashboard, and
+the `ch-vm` module. A lost host is detected after `failover.nodeTimeoutSecs`
+(default 30s, polled every `detectIntervalSecs`, default 5s). Ceph guests
+are range-blocklisted and restarted by priority. ZFS guests with a replica
+restart on the replica node. Admission control refuses a placement that
+would leave protected VMs without a surviving host, except on a cluster too
+small to reserve that capacity. The node masks Ceph units the controller
+has moved away until `kcore-placement-confirmed.target` is reached, and
+powers protected guests off only when Ceph shows this host is fenced or
+Ceph itself is unreachable.
+
 The first question a vSphere buyer asks is "when a host dies, do its VMs
 restart somewhere else without anyone doing anything?" This document is the
 plan to make the answer an unqualified yes, and to make the gaps that remain

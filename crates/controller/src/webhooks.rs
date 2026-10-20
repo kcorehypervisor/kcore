@@ -37,6 +37,10 @@ pub const EVENT_VM_STATE_CHANGED: &str = "vm.state.changed";
 pub const EVENT_VM_CREATED: &str = "vm.created";
 pub const EVENT_VM_DELETED: &str = "vm.deleted";
 pub const EVENT_VM_MIGRATED: &str = "vm.migrated";
+pub const EVENT_NODE_LOST: &str = "node.lost";
+pub const EVENT_VM_FAILOVER_STARTED: &str = "vm.failover.started";
+pub const EVENT_VM_FAILOVER_COMPLETED: &str = "vm.failover.completed";
+pub const EVENT_VM_FAILOVER_FAILED: &str = "vm.failover.failed";
 
 pub const KNOWN_EVENTS: &[&str] = &[
     EVENT_NODE_HEARTBEAT_MISSED,
@@ -45,6 +49,10 @@ pub const KNOWN_EVENTS: &[&str] = &[
     EVENT_VM_CREATED,
     EVENT_VM_DELETED,
     EVENT_VM_MIGRATED,
+    EVENT_NODE_LOST,
+    EVENT_VM_FAILOVER_STARTED,
+    EVENT_VM_FAILOVER_COMPLETED,
+    EVENT_VM_FAILOVER_FAILED,
 ];
 
 const QUEUE_CAPACITY: usize = 256;

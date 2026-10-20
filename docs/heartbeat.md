@@ -124,7 +124,9 @@ Mem used:  12 GiB
 ## Staleness detection
 
 A background tokio task runs inside the controller process, checking every
-**30 seconds** for nodes whose `last_heartbeat` is older than **90 seconds**.
+`failover.detectIntervalSecs` (default **5 seconds**) for nodes whose
+`last_heartbeat` is older than `failover.nodeTimeoutSecs` (default **30
+seconds**, and never less than two heartbeat intervals).
 
 When a node exceeds the deadline:
 
@@ -141,7 +143,7 @@ If the node comes back and sends a heartbeat, the heartbeat handler sets
 │  not-ready  │ ─────────────►│   ready    │
 └─────────────┘               └────────────┘
       ▲                             │
-      │  90s without heartbeat      │
+      │  30s without heartbeat      │
       └─────────────────────────────┘
 ```
 

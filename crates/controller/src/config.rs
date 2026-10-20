@@ -51,19 +51,79 @@ pub struct Config {
 
 /// Automatic placement of shared-disk VMs when a node becomes unreachable.
 ///
-/// Local-disk VMs stay on the failed node. Set `enabled` to false to leave
-/// every VM where it is until an operator drains the node.
+/// Local-disk VMs stay on the failed node unless they have a ZFS replica.
+/// Set `enabled` to false to leave every VM where it is until an operator
+/// drains the node.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FailoverConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Seconds without a heartbeat before a host is lost. At least two node
+    /// heartbeat intervals (30s).
+    #[serde(default = "default_node_timeout_secs")]
+    pub node_timeout_secs: i64,
+    #[serde(default = "default_detect_interval_secs")]
+    pub detect_interval_secs: u64,
+    /// `powerOff` stops protected guests on a host that cannot reach a
+    /// controller and cannot write its images. `leaveRunning` only fences
+    /// storage from the controller side.
+    #[serde(default = "default_isolation_response")]
+    pub isolation_response: String,
+    #[serde(default)]
+    pub admission_control: AdmissionControlConfig,
+    #[serde(default = "default_lease_renew_secs")]
+    pub lease_renew_secs: i64,
+}
+
+/// Refuse new protected VMs that would leave the cluster unable to restart
+/// guests after `hostFailuresToTolerate` hosts are lost.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionControlConfig {
+    #[serde(default = "default_host_failures")]
+    pub host_failures_to_tolerate: i32,
+}
+
+impl Default for AdmissionControlConfig {
+    fn default() -> Self {
+        Self {
+            host_failures_to_tolerate: default_host_failures(),
+        }
+    }
 }
 
 impl Default for FailoverConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            node_timeout_secs: default_node_timeout_secs(),
+            detect_interval_secs: default_detect_interval_secs(),
+            isolation_response: default_isolation_response(),
+            admission_control: AdmissionControlConfig::default(),
+            lease_renew_secs: default_lease_renew_secs(),
+        }
     }
+}
+
+fn default_node_timeout_secs() -> i64 {
+    30
+}
+
+fn default_detect_interval_secs() -> u64 {
+    5
+}
+
+fn default_isolation_response() -> String {
+    "powerOff".to_string()
+}
+
+fn default_host_failures() -> i32 {
+    1
+}
+
+fn default_lease_renew_secs() -> i64 {
+    5
 }
 
 /// Rewrite Prometheus `file_sd` targets so VictoriaMetrics scrapes every node.
@@ -604,6 +664,45 @@ impl Config {
         self.validate_sbom_paths()?;
         self.validate_webhooks()?;
         self.validate_scheduler()?;
+        self.validate_failover()?;
+        Ok(())
+    }
+
+    fn validate_failover(&self) -> Result<()> {
+        let failover = &self.failover;
+        if failover.node_timeout_secs < crate::ha::NODE_HEARTBEAT_INTERVAL_SECS * 2 {
+            anyhow::bail!(
+                "failover.nodeTimeoutSecs must be at least {} (got {})",
+                crate::ha::NODE_HEARTBEAT_INTERVAL_SECS * 2,
+                failover.node_timeout_secs
+            );
+        }
+        if !(1..=30).contains(&failover.detect_interval_secs) {
+            anyhow::bail!(
+                "failover.detectIntervalSecs must be from 1 to 30 (got {})",
+                failover.detect_interval_secs
+            );
+        }
+        if failover.isolation_response != "powerOff"
+            && failover.isolation_response != "leaveRunning"
+        {
+            anyhow::bail!(
+                "failover.isolationResponse must be powerOff or leaveRunning (got {})",
+                failover.isolation_response
+            );
+        }
+        if !(0..=5).contains(&failover.admission_control.host_failures_to_tolerate) {
+            anyhow::bail!(
+                "failover.admissionControl.hostFailuresToTolerate must be from 0 to 5 (got {})",
+                failover.admission_control.host_failures_to_tolerate
+            );
+        }
+        if !(1..=60).contains(&failover.lease_renew_secs) {
+            anyhow::bail!(
+                "failover.leaseRenewSecs must be from 1 to 60 (got {})",
+                failover.lease_renew_secs
+            );
+        }
         Ok(())
     }
 

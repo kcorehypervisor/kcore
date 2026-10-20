@@ -86,6 +86,7 @@ pub fn vms_page_from_proto(
             memory: format::memory_mebibytes(v.memory_bytes),
             node_id: v.node_id,
             storage_backend: format::storage_backend_name(&v.storage_backend),
+            ha: ha_label(&v.ha_protection, &v.restart_priority),
         })
         .collect();
     let page = page.max(1);
@@ -1122,6 +1123,23 @@ pub fn vm_detail_from_proto(
         pci: spec.pci_devices,
         migrate: migrate_nodes,
         migrate_error,
+        ha_protection: response.ha_protection,
+        restart_priority: response.restart_priority,
+        replica_node: response.replica_node,
+        vm_monitoring: response.vm_monitoring,
+    }
+}
+
+fn ha_label(protection: &str, priority: &str) -> String {
+    let protection = if protection.is_empty() {
+        "unprotected"
+    } else {
+        protection
+    };
+    if priority.is_empty() {
+        protection.to_string()
+    } else {
+        format!("{protection} · {priority}")
     }
 }
 
@@ -1745,6 +1763,10 @@ pub fn cluster_health_from_proto(
                     replication_conflicts: health.replication_conflicts,
                     certificates_expiring_soon: health.certificates_expiring_soon,
                     conditions: health.conditions,
+                    host_failures_tolerated: health.host_failures_tolerated,
+                    failover_capacity: health.failover_capacity,
+                    ha_lease_holder: health.ha_lease_holder,
+                    unprotected_on_lost_nodes: health.unprotected_vms_on_lost_nodes,
                 };
             }
         }
@@ -1761,6 +1783,10 @@ pub fn cluster_health_from_proto(
         replication_conflicts: health.replication_conflicts,
         certificates_expiring_soon: health.certificates_expiring_soon,
         conditions: health.conditions,
+        host_failures_tolerated: health.host_failures_tolerated,
+        failover_capacity: health.failover_capacity.clone(),
+        ha_lease_holder: health.ha_lease_holder,
+        unprotected_on_lost_nodes: health.unprotected_vms_on_lost_nodes,
     }
 }
 
@@ -1925,6 +1951,7 @@ mod tests {
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             },
             controller_proto::VmInfo {
                 id: "2".into(),
@@ -1937,6 +1964,7 @@ mod tests {
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             },
         ];
         let p = vms_page_from_proto(vms, 1, 10);

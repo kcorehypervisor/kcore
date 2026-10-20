@@ -68,6 +68,12 @@ service NodeStorage {
   // a node the controller can no longer reach. It fails when the image is
   // open from any other host; the caller must not move the guest then.
   rpc FenceVolume(FenceVolumeRequest) returns (FenceVolumeResponse);
+  // Lift the address-range blocklist added for a host that has come back.
+  rpc UnfenceHost(UnfenceHostRequest) returns (UnfenceHostResponse);
+  // Full or incremental `zfs send` of one VM volume.
+  rpc PullZfsSend(PullZfsSendRequest) returns (stream ZfsSendChunk);
+  // Receive that stream onto the replica dataset and mark it bootable.
+  rpc RecvZfsSend(stream ZfsSendChunk) returns (RecvZfsSendResponse);
 
   // Host-side LUKS over a mapped RBD device (E2 per-volume encryption).
   rpc FormatEncryptedVolume(FormatEncryptedVolumeRequest)
@@ -740,9 +746,45 @@ message FenceVolumeRequest {
 }
 
 message FenceVolumeResponse {
-  // Entity addresses (`ip:port/nonce`) that were added to the OSD blocklist.
-  // Empty when nobody had the image open.
+  // Entity addresses (`ip:port/nonce`) that were added to the OSD blocklist,
+  // plus `range:<ip>/32` entries for the lost host. Empty when nobody had
+  // the image open and no range was added.
   repeated string blocklisted = 1;
+  // dead: the lost host has no Ceph clients. isolated: it still has the
+  // image open. unknown: the member could not tell.
+  string host_state = 2;
+}
+
+message UnfenceHostRequest {
+  repeated string source_hosts = 1;
+}
+
+message UnfenceHostResponse {
+  bool success = 1;
+  repeated string removed = 2;
+}
+
+message PullZfsSendRequest {
+  string vm_name = 1;
+  // Snapshot name (not the full dataset@snap) already on the replica.
+  // Empty sends the whole volume.
+  string incremental_from = 2;
+  string pool = 3;
+  string dataset_prefix = 4;
+}
+
+message ZfsSendChunk {
+  string vm_name = 1;
+  string snapshot = 2;
+  string dataset = 3;
+  bytes data = 4;
+  bool last = 5;
+}
+
+message RecvZfsSendResponse {
+  bool success = 1;
+  string snapshot = 2;
+  string message = 3;
 }
 
 message FormatEncryptedVolumeRequest {

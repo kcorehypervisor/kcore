@@ -3,16 +3,26 @@ use crate::client::node_proto;
 
 pub fn print_vm_table(vms: &[controller_proto::VmInfo]) {
     println!(
-        "{:<36}  {:<20}  {:>4}  {:>10}  {:>8}  {:<10}  {:<16}",
-        "ID", "NAME", "CPU", "MEMORY", "DISK", "STATE", "NODE"
+        "{:<36}  {:<20}  {:>4}  {:>10}  {:>8}  {:<10}  {:<16}  {:<12}  {:<8}",
+        "ID", "NAME", "CPU", "MEMORY", "DISK", "STATE", "NODE", "HA", "PRIORITY"
     );
     for vm in vms {
         let state = vm_state_str(vm.state);
         let mem = crate::client::format_bytes(vm.memory_bytes);
         let disk = crate::client::format_bytes(vm.storage_size_bytes);
+        let ha = if vm.ha_protection.is_empty() {
+            "unprotected"
+        } else {
+            vm.ha_protection.as_str()
+        };
+        let priority = if vm.restart_priority.is_empty() {
+            "medium"
+        } else {
+            vm.restart_priority.as_str()
+        };
         println!(
-            "{:<36}  {:<20}  {:>4}  {:>10}  {:>8}  {:<10}  {:<16}",
-            vm.id, vm.name, vm.cpu, mem, disk, state, vm.node_id
+            "{:<36}  {:<20}  {:>4}  {:>10}  {:>8}  {:<10}  {:<16}  {:<12}  {:<8}",
+            vm.id, vm.name, vm.cpu, mem, disk, state, vm.node_id, ha, priority
         );
     }
 }

@@ -154,6 +154,10 @@ fn health_view(health: ClusterHealthDto) -> impl IntoView {
             <a class="stat" href="/vms"><div class="label">"VMs on a not-ready node"</div><div class="value">{health.vms_on_not_ready_nodes}</div></a>
             <a class="stat" href="/compliance"><div class="label">"Replication conflicts"</div><div class="value">{health.replication_conflicts}</div></a>
             <a class="stat" href="/compliance/certificates"><div class="label">"Certificates expiring soon"</div><div class="value">{health.certificates_expiring_soon}</div></a>
+            <a class="stat" href="/vms"><div class="label">"Host failures tolerated"</div><div class="value">{health.host_failures_tolerated}</div></a>
+            <a class="stat" href="/vms"><div class="label">"Failover capacity"</div><div class="value">{dash(&health.failover_capacity)}</div></a>
+            <a class="stat" href="/nodes"><div class="label">"HA lease holder"</div><div class="value">{dash(&health.ha_lease_holder)}</div></a>
+            <a class="stat" href="/vms"><div class="label">"Unprotected VMs on lost nodes"</div><div class="value">{health.unprotected_on_lost_nodes}</div></a>
         </div>
         <h2 class="section-title">"What needs attention"</h2>
         {if conditions.is_empty() {
@@ -381,6 +385,10 @@ fn vm_detail_view(detail: VmDetailDto) -> impl IntoView {
             ("Memory", detail.memory.clone()),
             ("Disk", detail.disk_size.clone()),
             ("Storage", detail.backend.clone()),
+            ("HA", dash(&detail.ha_protection)),
+            ("Restart priority", dash(&detail.restart_priority)),
+            ("Replica node", dash(&detail.replica_node)),
+            ("Guest monitoring", dash(&detail.vm_monitoring)),
             ("Created", detail.created.clone()),
             ("Updated", detail.updated.clone()),
         ])}

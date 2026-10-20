@@ -171,6 +171,17 @@ let
           fi
           rm -f "$SEED_MARKER"
         fi
+        REPLICA_MARKER="/var/lib/kcore/replica-ready/${vmName}"
+        if [ -f "$REPLICA_MARKER" ]; then
+          SNAP="$(${pkgs.coreutils}/bin/tr -d '[:space:]' < "$REPLICA_MARKER")"
+          if [ -n "$SNAP" ] && ${pkgs.zfs}/bin/zfs list -H -t snapshot "$ZVOL_DATASET@$SNAP" >/dev/null 2>&1; then
+            echo "Rolling $ZVOL_DATASET back to replica snapshot $SNAP"
+            ${pkgs.zfs}/bin/zfs rollback -r "$ZVOL_DATASET@$SNAP"
+          fi
+          mkdir -p "$(dirname "$SEED_MARKER")"
+          touch "$SEED_MARKER"
+          rm -f "$REPLICA_MARKER"
+        fi
         if [ ! -f "$SEED_MARKER" ]; then
           verify_source ${toString vmCfg.image}
           echo "Converting source image to zvol..."
@@ -622,10 +633,12 @@ let
       description = "kcore VM ${vmName}";
       requires =
         map (iface: "${iface.unit}.service") ifaces
-        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service";
+        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service"
+        ++ [ "kcore-placement-confirmed.target" ];
       after =
         map (iface: "${iface.unit}.service") ifaces
-        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service";
+        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service"
+        ++ [ "kcore-placement-confirmed.target" ];
       wantedBy = lib.optionals (vmCfg.autoStart && !vmCfg.incomingMigration) [ "multi-user.target" ];
       # stopIfChanged/restartIfChanged keep their NixOS defaults so VM spec
       # updates (cpu/memory/extraArgs) take effect for Ceph-backed VMs too. The
@@ -698,6 +711,12 @@ in
     # unit later adopts a process it could not have started.
     environment.etc."kcore/cloud-hypervisor".text = chBin + "\n";
     environment.etc."kcore/vm-socket-dir".text = cfg.socketDir + "\n";
+    # name<space>backend, one VM per line. The node agent masks every Ceph
+    # unit the controller no longer places here before it starts
+    # kcore-placement-confirmed.target, which these units require.
+    environment.etc."kcore/vm-placement".text = lib.concatStrings (
+      lib.mapAttrsToList (name: vm: "${name} ${vm.storageBackend}\n") cfg.virtualMachines
+    );
     # Options the controller may only emit once this module version is
     # installed on the node (an unknown option fails the whole evaluation).
     # Append here when adding a per-VM option the controller renders.
@@ -721,5 +740,12 @@ in
     systemd.services = lib.mapAttrs' (
       vmName: vmCfg: lib.nameValuePair "kcore-vm-${vmName}" (mkVmService vmName vmCfg)
     ) cfg.virtualMachines;
+
+    # Not wanted by multi-user. The node agent starts it after the controller
+    # lists the VMs that still belong here, so a host that reboots cannot
+    # start a Ceph guest the cluster has already moved.
+    systemd.targets.kcore-placement-confirmed = {
+      description = "Controller confirmed which VMs belong on this host";
+    };
   };
 }

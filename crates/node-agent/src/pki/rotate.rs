@@ -709,6 +709,7 @@ mod tests {
             cert_rotation: CertRotationConfig::default(),
             revocation: crate::config::NodeRevocationConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
         };
 
         let reload = ReloadHandle::new();
@@ -753,6 +754,7 @@ mod tests {
             cert_rotation: CertRotationConfig::default(),
             revocation: crate::config::NodeRevocationConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
         };
 
         let reload = ReloadHandle::new();
@@ -791,6 +793,7 @@ mod tests {
             cert_rotation: CertRotationConfig::default(),
             revocation: crate::config::NodeRevocationConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
         };
         let reload = ReloadHandle::new();
         let err = rotate_once(&cfg, &cfg.cert_rotation, true, "test", &reload)

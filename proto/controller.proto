@@ -84,6 +84,9 @@ service Controller {
   // Summary of node readiness, VM placement, certificate expiry, and
   // replication conflicts. Read-only.
   rpc GetClusterHealth(GetClusterHealthRequest) returns (GetClusterHealthResponse);
+  // Failover lease, admission headroom, and the loss deadline.
+  rpc GetHaStatus(GetHaStatusRequest) returns (GetHaStatusResponse);
+  rpc ListHaEvents(ListHaEventsRequest) returns (ListHaEventsResponse);
   // Consistent SQLite snapshot of the controller database.
   rpc BackupCluster(BackupClusterRequest) returns (BackupClusterResponse);
   // Replace the controller database from a snapshot. `confirm` must be true.
@@ -283,6 +286,10 @@ message HeartbeatRequest {
   // Controller schema this node opened. 0 on a worker.
   int32 schema_version = 11;
   string nixpkgs_rev = 12;
+  // Actions this host took while it could not reach a controller, or while
+  // a guest heartbeat went stale. "isolation-poweroff:<vm>" and
+  // "monitor-restart:<vm>".
+  repeated string ha_actions = 13;
 }
 
 message GpuInfo {
@@ -319,6 +326,19 @@ message ListGpusResponse {
 
 message HeartbeatResponse {
   bool success = 1;
+  // VM names (the unit and socket name) the controller still places on this
+  // node. Meaningful only when assignment_confirmed is true; an older
+  // controller leaves both empty.
+  repeated string assigned_vm_ids = 2;
+  bool assignment_confirmed = 3;
+  // Guest-heartbeat restarts the node should perform. restart_after_secs
+  // of 0 means monitoring is off for that VM.
+  repeated VmMonitor vm_monitors = 4;
+}
+
+message VmMonitor {
+  string vm_name = 1;
+  int32 restart_after_secs = 2;
 }
 
 message SyncVmStateRequest {
@@ -432,6 +452,16 @@ message CreateVmRequest {
   string target_dc = 11;    // Datacenter preference (optional; controller picks any DC if empty)
   repeated string node_labels = 12; // required node labels, e.g. "dc=dc-a"
   string anti_affinity = 13; // HA group: do not colocate two VMs with the same value
+  // high, medium (default), or low. Failover restarts higher priorities first.
+  string restart_priority = 14;
+  // ZFS only. The node that receives asynchronous replicas of this VM.
+  string replica_node = 15;
+  int32 replica_interval_secs = 16;
+  // off (default) or restart. Restart needs a guest heartbeat file.
+  string vm_monitoring = 17;
+  int32 vm_monitoring_secs = 18;
+  // Place the VM even when it would leave a host failure unabsorbable.
+  bool ignore_admission_control = 19;
 }
 
 message CreateVmResponse {
@@ -497,6 +527,11 @@ message GetVmResponse {
   // Cheap GuestOps signal: true when the guest answered an SSH probe, or when
   // the VM is running and already has an assigned IP and no admin client is up.
   bool guest_reachable = 5;
+  string ha_protection = 6;
+  string restart_priority = 7;
+  string replica_node = 8;
+  int32 replica_interval_secs = 9;
+  string vm_monitoring = 10;
 }
 
 message ListVmsRequest {
@@ -794,6 +829,14 @@ message VmInfo {
   string storage_backend = 8;   // filesystem, lvm, zfs
   int64 storage_size_bytes = 9; // Provisioned volume size
   map<string, string> labels = 10;
+  // protected, async, or unprotected. Derived from storage; empty on a
+  // heartbeat sync from a node.
+  string ha_protection = 11;
+  string restart_priority = 12;
+  string replica_node = 13;
+  int32 replica_interval_secs = 14;
+  // Unix seconds the guest last reported in. 0 when the node has no sample.
+  int64 guest_heartbeat_unix = 15;
 }
 
 // Node Operations
@@ -1069,6 +1112,7 @@ message MigrateVmRequest {
   string target_node = 2;
   // When true, fall back to cold reassignment (drain-style) if live migrate fails.
   bool allow_cold_fallback = 3;
+  bool ignore_admission_control = 6;
   // Destination devices. Empty picks a free device of the same family for
   // each named device the VM has now (a radeon on the source becomes a free
   // radeon on the target). Ignored for VMs with no PCI devices.
@@ -1224,6 +1268,51 @@ message GetClusterHealthResponse {
   int32 replication_conflicts = 8;
   int32 certificates_expiring_soon = 9;
   repeated string conditions = 10;
+  // How many host failures admission control can currently absorb. 0 when
+  // it is off, not applicable, or the placement does not fit.
+  int32 host_failures_tolerated = 11;
+  // sufficient, insufficient, disabled, or not-applicable.
+  string failover_capacity = 12;
+  int64 failover_memory_headroom_bytes = 13;
+  string ha_lease_holder = 14;
+  int64 ha_lease_term = 15;
+  int32 unprotected_vms_on_lost_nodes = 16;
+}
+
+message GetHaStatusRequest {}
+
+message GetHaStatusResponse {
+  bool enabled = 1;
+  bool acting = 2;
+  string lease_holder = 3;
+  int64 lease_term = 4;
+  int64 lease_expires_at_ms = 5;
+  int32 node_timeout_secs = 6;
+  int32 detect_interval_secs = 7;
+  string isolation_response = 8;
+  int32 host_failures_to_tolerate = 9;
+  string failover_capacity = 10;
+  int64 memory_headroom_bytes = 11;
+  string controller_id = 12;
+}
+
+message ListHaEventsRequest {
+  string node_id = 1;
+  string vm_id = 2;
+  int32 limit = 3;
+}
+
+message HaEvent {
+  int64 id = 1;
+  string node_id = 2;
+  string vm_id = 3;
+  string phase = 4;
+  string detail = 5;
+  string created_at = 6;
+}
+
+message ListHaEventsResponse {
+  repeated HaEvent events = 1;
 }
 
 message BackupClusterRequest {}

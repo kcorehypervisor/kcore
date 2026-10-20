@@ -128,6 +128,38 @@ pub struct VmRow {
     pub labels: String,
 }
 
+/// Per-VM high availability policy. Absent row means the defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmHaRow {
+    pub vm_id: String,
+    pub restart_priority: String,
+    pub vm_monitoring: String,
+    pub vm_monitoring_secs: i64,
+    pub replica_node: String,
+    pub replica_interval_secs: i64,
+    pub last_replica_at: i64,
+    pub last_replica_snapshot: String,
+    pub last_guest_heartbeat: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaEventRow {
+    pub id: i64,
+    pub node_id: String,
+    pub vm_id: String,
+    pub phase: String,
+    pub detail: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterLeaseRow {
+    pub name: String,
+    pub holder: String,
+    pub expires_at_ms: i64,
+    pub term: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeGpuRow {
     pub node_id: String,
@@ -773,7 +805,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 62;
+pub const SCHEMA_VERSION: i32 = 63;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -2033,6 +2065,42 @@ impl Database {
                     [],
                 )?;
             }
+        }
+
+        if version < 63 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS vm_ha (
+                    vm_id TEXT PRIMARY KEY REFERENCES vms(id) ON DELETE CASCADE,
+                    restart_priority TEXT NOT NULL DEFAULT 'medium',
+                    vm_monitoring TEXT NOT NULL DEFAULT 'off',
+                    vm_monitoring_secs INTEGER NOT NULL DEFAULT 0,
+                    replica_node TEXT NOT NULL DEFAULT '',
+                    replica_interval_secs INTEGER NOT NULL DEFAULT 0,
+                    last_replica_at INTEGER NOT NULL DEFAULT 0,
+                    last_replica_snapshot TEXT NOT NULL DEFAULT '',
+                    last_guest_heartbeat INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS node_ha (
+                    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+                    lost_at TEXT NOT NULL DEFAULT '',
+                    direct_seen_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS ha_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT NOT NULL DEFAULT '',
+                    vm_id TEXT NOT NULL DEFAULT '',
+                    phase TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_ha_events_created ON ha_events(id);
+                CREATE TABLE IF NOT EXISTS cluster_leases (
+                    name TEXT PRIMARY KEY,
+                    holder TEXT NOT NULL,
+                    expires_at_ms INTEGER NOT NULL,
+                    term INTEGER NOT NULL
+                );",
+            )?;
         }
 
         if version < 62 {
@@ -6475,6 +6543,244 @@ impl Database {
         rows.collect()
     }
 
+    /// Approved hosts that can still be running guests: ready, cordoned, or
+    /// draining. A drained host has already given its VMs up.
+    pub fn get_heartbeat_expired(
+        &self,
+        timeout_seconds: i64,
+    ) -> Result<Vec<NodeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, hostname, address, cpu_cores, memory_bytes, status, last_heartbeat, gateway_interface, cpu_used, memory_used, storage_backend, disable_vxlan, approval_status, cert_expiry_days, luks_method, dc_id FROM nodes WHERE approval_status = 'approved' AND status IN ('ready', 'cordoned', 'draining') AND last_heartbeat != '' AND (julianday('now') - julianday(last_heartbeat)) * 86400 > ?1",
+        )?;
+        let rows = stmt.query_map(params![timeout_seconds], row_to_node)?;
+        rows.collect()
+    }
+
+    pub fn mark_node_lost(&self, node_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO node_ha (node_id, lost_at) VALUES (?1, datetime('now'))
+             ON CONFLICT(node_id) DO UPDATE SET lost_at = CASE WHEN node_ha.lost_at = '' THEN datetime('now') ELSE node_ha.lost_at END",
+            params![node_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn node_lost_at(&self, node_id: &str) -> Result<String, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT lost_at FROM node_ha WHERE node_id = ?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(value.unwrap_or_default())
+    }
+
+    /// Clear the lost mark. Returns true when the node had been marked lost.
+    pub fn clear_node_lost(&self, node_id: &str) -> Result<bool, rusqlite::Error> {
+        let was = !self.node_lost_at(node_id)?.is_empty();
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE node_ha SET lost_at = '' WHERE node_id = ?1",
+            params![node_id],
+        )?;
+        Ok(was)
+    }
+
+    pub fn mark_direct_seen(&self, node_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO node_ha (node_id, direct_seen_at) VALUES (?1, datetime('now'))
+             ON CONFLICT(node_id) DO UPDATE SET direct_seen_at = datetime('now')",
+            params![node_id],
+        )?;
+        Ok(())
+    }
+
+    /// True when this controller heard from an approved node inside `within_secs`.
+    pub fn has_fresh_direct_heartbeat(&self, within_secs: i64) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM node_ha h JOIN nodes n ON n.id = h.node_id
+             WHERE n.approval_status = 'approved' AND h.direct_seen_at != ''
+             AND (julianday('now') - julianday(h.direct_seen_at)) * 86400 <= ?1",
+            params![within_secs],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn list_lost_node_ids(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT n.id FROM nodes n LEFT JOIN node_ha h ON h.node_id = n.id
+             WHERE n.status = 'not-ready' OR (h.lost_at IS NOT NULL AND h.lost_at != '')",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    pub fn upsert_vm_ha(&self, row: &VmHaRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vm_ha (vm_id, restart_priority, vm_monitoring, vm_monitoring_secs, replica_node, replica_interval_secs, last_replica_at, last_replica_snapshot, last_guest_heartbeat)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(vm_id) DO UPDATE SET
+               restart_priority = excluded.restart_priority,
+               vm_monitoring = excluded.vm_monitoring,
+               vm_monitoring_secs = excluded.vm_monitoring_secs,
+               replica_node = excluded.replica_node,
+               replica_interval_secs = excluded.replica_interval_secs",
+            params![
+                row.vm_id,
+                row.restart_priority,
+                row.vm_monitoring,
+                row.vm_monitoring_secs,
+                row.replica_node,
+                row.replica_interval_secs,
+                row.last_replica_at,
+                row.last_replica_snapshot,
+                row.last_guest_heartbeat,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_vm_ha(&self, vm_id: &str) -> Result<Option<VmHaRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT vm_id, restart_priority, vm_monitoring, vm_monitoring_secs, replica_node, replica_interval_secs, last_replica_at, last_replica_snapshot, last_guest_heartbeat FROM vm_ha WHERE vm_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![vm_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_vm_ha(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_vm_ha(&self) -> Result<Vec<VmHaRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT vm_id, restart_priority, vm_monitoring, vm_monitoring_secs, replica_node, replica_interval_secs, last_replica_at, last_replica_snapshot, last_guest_heartbeat FROM vm_ha",
+        )?;
+        let rows = stmt.query_map([], row_to_vm_ha)?;
+        rows.collect()
+    }
+
+    pub fn set_vm_replica_progress(
+        &self,
+        vm_id: &str,
+        at_unix: i64,
+        snapshot: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE vm_ha SET last_replica_at = ?2, last_replica_snapshot = ?3 WHERE vm_id = ?1",
+            params![vm_id, at_unix, snapshot],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_guest_heartbeat_for_name(
+        &self,
+        node_id: &str,
+        name: &str,
+        unix: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vm_ha (vm_id, last_guest_heartbeat)
+             SELECT id, ?3 FROM vms WHERE node_id = ?1 AND (name = ?2 OR id = ?2)
+             ON CONFLICT(vm_id) DO UPDATE SET last_guest_heartbeat = excluded.last_guest_heartbeat",
+            params![node_id, name, unix],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_vm_guest_heartbeat(&self, vm_id: &str, unix: i64) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vm_ha (vm_id, last_guest_heartbeat) VALUES (?1, ?2)
+             ON CONFLICT(vm_id) DO UPDATE SET last_guest_heartbeat = excluded.last_guest_heartbeat",
+            params![vm_id, unix],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_ha_event(
+        &self,
+        node_id: &str,
+        vm_id: &str,
+        phase: &str,
+        detail: &str,
+    ) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO ha_events (node_id, vm_id, phase, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![node_id, vm_id, phase, detail],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_ha_events(
+        &self,
+        node_id: &str,
+        vm_id: &str,
+        limit: i64,
+    ) -> Result<Vec<HaEventRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let limit = limit.clamp(1, 500);
+        let mut stmt = conn.prepare(
+            "SELECT id, node_id, vm_id, phase, detail, created_at FROM ha_events
+             WHERE (?1 = '' OR node_id = ?1) AND (?2 = '' OR vm_id = ?2)
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![node_id, vm_id, limit], |row| {
+            Ok(HaEventRow {
+                id: row.get(0)?,
+                node_id: row.get(1)?,
+                vm_id: row.get(2)?,
+                phase: row.get(3)?,
+                detail: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_cluster_lease(
+        &self,
+        name: &str,
+    ) -> Result<Option<ClusterLeaseRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, holder, expires_at_ms, term FROM cluster_leases WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query(params![name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(ClusterLeaseRow {
+                name: row.get(0)?,
+                holder: row.get(1)?,
+                expires_at_ms: row.get(2)?,
+                term: row.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_cluster_lease(&self, row: &ClusterLeaseRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO cluster_leases (name, holder, expires_at_ms, term) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET holder = excluded.holder, expires_at_ms = excluded.expires_at_ms, term = excluded.term",
+            params![row.name, row.holder, row.expires_at_ms, row.term],
+        )?;
+        Ok(())
+    }
+
     pub fn count_nodes_by_approval(&self) -> Result<(i32, i32, i32), rusqlite::Error> {
         let conn = self.lock_conn()?;
         let mut stmt =
@@ -7334,6 +7640,20 @@ fn map_issued_cert_row(row: &rusqlite::Row<'_>) -> Result<IssuedCertRow, rusqlit
         status: row.get(9)?,
         revocation_reason: row.get(10)?,
         revoked_at: row.get(11)?,
+    })
+}
+
+fn row_to_vm_ha(row: &rusqlite::Row) -> Result<VmHaRow, rusqlite::Error> {
+    Ok(VmHaRow {
+        vm_id: row.get(0)?,
+        restart_priority: row.get(1)?,
+        vm_monitoring: row.get(2)?,
+        vm_monitoring_secs: row.get(3)?,
+        replica_node: row.get(4)?,
+        replica_interval_secs: row.get(5)?,
+        last_replica_at: row.get(6)?,
+        last_replica_snapshot: row.get(7)?,
+        last_guest_heartbeat: row.get(8)?,
     })
 }
 

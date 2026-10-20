@@ -383,6 +383,14 @@ ALTER TABLE node_gpus DROP COLUMN profile;
 ALTER TABLE node_gpus DROP COLUMN parent;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 63,
+        sql: "DROP TABLE IF EXISTS cluster_leases;
+DROP TABLE IF EXISTS ha_events;
+DROP TABLE IF EXISTS node_ha;
+DROP TABLE IF EXISTS vm_ha;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]
