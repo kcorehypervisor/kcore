@@ -60,6 +60,8 @@ with the unhelpful "Failed to receive migratable component snapshot".
 
 ## Automatic failover
 
+The plan to turn this into full VM HA (faster detection, restart priority, admission control, host isolation response, a redundant failover controller, and a ZFS replica for local disks) is [`vm-ha-plan.md`](./vm-ha-plan.md).
+
 When a node misses heartbeats for 90 seconds the controller marks it `not-ready` and, unless `failover.enabled` is false, moves each Ceph VM onto another healthy member of the same cluster. The move is a cold reassignment: the failed node is not contacted. Local `filesystem`, `lvm`, and `zfs` VMs stay on that node and show up in `kctl get cluster-health` as VMs on a not-ready node.
 
 ### Fencing before the move
