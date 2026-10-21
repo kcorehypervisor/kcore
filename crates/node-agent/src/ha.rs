@@ -203,7 +203,7 @@ pub fn placement_mask_dropin() -> &'static str {
      ExecStart=\n\
      ExecStop=\n\
      ExecStopPost=\n\
-     ExecStart=/bin/true\n"
+     ExecStart=/run/current-system/sw/bin/true\n"
 }
 
 fn vm_unit(name: &str) -> String {
@@ -244,9 +244,19 @@ fn apply_mask(name: &str) -> bool {
 fn apply_unmask(name: &str) -> bool {
     let unit = vm_unit(name);
     let path = format!("/run/systemd/system/{unit}.d/placement-mask.conf");
-    let _ = std::fs::remove_file(&path);
+    let was_masked = std::fs::remove_file(&path).is_ok();
     let _ = systemctl_ok(&["daemon-reload"]);
     let _ = systemctl_ok(&["unmask", "--runtime", &unit]);
+    // The mask can win the race with the unit's first start. A failed or
+    // dummy start has to be replaced with the real program once this guest
+    // belongs here again.
+    if was_masked {
+        let failed = systemctl_ok(&["is-failed", "--quiet", &unit]);
+        let active = systemctl_ok(&["is-active", "--quiet", &unit]);
+        if failed || active {
+            let _ = systemctl_ok(&["restart", &unit]);
+        }
+    }
     true
 }
 
@@ -317,6 +327,7 @@ pub fn spawn_ha_supervisor(
         let started = Instant::now();
         let mut placement_done = false;
         let mut last_assigned: Vec<String> = Vec::new();
+        let mut last_placement = String::new();
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let (assigned, confirmed, monitors, last_ok, mut last_restart) = {
@@ -329,11 +340,11 @@ pub fn spawn_ha_supervisor(
                     guard.last_restart.clone(),
                 )
             };
-            let local = std::fs::read_to_string(&ha.placement_file)
-                .map(|text| parse_placement_file(&text))
-                .unwrap_or_default();
+            let placement_text = std::fs::read_to_string(&ha.placement_file).unwrap_or_default();
+            let local = parse_placement_file(&placement_text);
             let now = Instant::now();
-            let placement_due = !placement_done || assigned != last_assigned;
+            let placement_due =
+                !placement_done || assigned != last_assigned || placement_text != last_placement;
             let isolate =
                 isolation_due(last_ok, now, Duration::from_secs(ha.isolation_timeout_secs));
             let storage = if isolate && local.iter().any(|vm| vm.backend == "ceph") {
@@ -377,6 +388,7 @@ pub fn spawn_ha_supervisor(
             {
                 placement_done = true;
                 last_assigned = assigned;
+                last_placement = placement_text;
             }
             let reports = apply_host_actions(&actions);
             if Path::new("/run/systemd/system").exists() {
@@ -521,7 +533,7 @@ mod tests {
         assert!(dropin.contains("ExecStartPre=\n"));
         assert!(dropin.contains("ExecStart=\n"));
         assert!(dropin.contains("ExecStopPost=\n"));
-        assert!(dropin.contains("ExecStart=/bin/true\n"));
+        assert!(dropin.contains("ExecStart=/run/current-system/sw/bin/true\n"));
     }
 
     #[test]
