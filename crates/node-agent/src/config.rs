@@ -28,6 +28,62 @@ pub struct Config {
     /// Per-identity token bucket on the node-agent gRPC services.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Placement confirmation and guest isolation when the controller is gone.
+    #[serde(default)]
+    pub ha: NodeHaConfig,
+}
+
+/// What this host does for HA without waiting for a controller round trip.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeHaConfig {
+    /// `powerOff` stops Ceph guests once this host is fenced or cannot reach
+    /// Ceph. `leaveRunning` never stops them from the node.
+    #[serde(default = "default_isolation_response")]
+    pub isolation_response: String,
+    /// Seconds without a successful heartbeat before isolation runs.
+    #[serde(default = "default_isolation_timeout_secs")]
+    pub isolation_timeout_secs: u64,
+    /// Seconds to wait for a controller assignment before local-disk VMs may
+    /// boot and Ceph VMs stay masked.
+    #[serde(default = "default_placement_timeout_secs")]
+    pub placement_timeout_secs: u64,
+    #[serde(default = "default_placement_file")]
+    pub placement_file: String,
+    #[serde(default = "default_guest_heartbeat_dir")]
+    pub guest_heartbeat_dir: String,
+}
+
+impl Default for NodeHaConfig {
+    fn default() -> Self {
+        Self {
+            isolation_response: default_isolation_response(),
+            isolation_timeout_secs: default_isolation_timeout_secs(),
+            placement_timeout_secs: default_placement_timeout_secs(),
+            placement_file: default_placement_file(),
+            guest_heartbeat_dir: default_guest_heartbeat_dir(),
+        }
+    }
+}
+
+fn default_isolation_response() -> String {
+    "powerOff".to_string()
+}
+
+fn default_isolation_timeout_secs() -> u64 {
+    60
+}
+
+fn default_placement_timeout_secs() -> u64 {
+    300
+}
+
+fn default_placement_file() -> String {
+    "/etc/kcore/vm-placement".to_string()
+}
+
+fn default_guest_heartbeat_dir() -> String {
+    "/run/kcore/guest-heartbeat".to_string()
 }
 
 /// Node-side certificate rotation. The controller drives rotation too

@@ -88,6 +88,8 @@ pub struct VmRowDto {
     pub memory: String,
     pub node_id: String,
     pub storage_backend: String,
+    /// `protected · high`, `async · medium`, or `unprotected`.
+    pub ha: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -565,6 +567,10 @@ pub struct VmDetailDto {
     pub pci: Vec<String>,
     pub migrate: Vec<MigrateNodeDto>,
     pub migrate_error: String,
+    pub ha_protection: String,
+    pub restart_priority: String,
+    pub replica_node: String,
+    pub vm_monitoring: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -806,6 +812,10 @@ pub struct ClusterHealthDto {
     pub replication_conflicts: i32,
     pub certificates_expiring_soon: i32,
     pub conditions: Vec<String>,
+    pub host_failures_tolerated: i32,
+    pub failover_capacity: String,
+    pub ha_lease_holder: String,
+    pub unprotected_on_lost_nodes: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -41,6 +41,12 @@ pub struct CreateArgs {
     pub node_labels: Vec<String>,
     pub labels: Vec<String>,
     pub anti_affinity: Option<String>,
+    pub restart_priority: Option<String>,
+    pub replica_node: Option<String>,
+    pub replica_interval_secs: Option<i32>,
+    pub vm_monitoring: Option<String>,
+    pub vm_monitoring_secs: Option<i32>,
+    pub ignore_admission_control: bool,
 }
 
 pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<()> {
@@ -78,6 +84,12 @@ pub async fn create_from_manifest(info: &ConnectionInfo, path: &str) -> Result<(
         node_labels: vec![],
         labels: vec![],
         anti_affinity: None,
+        restart_priority: None,
+        replica_node: None,
+        replica_interval_secs: None,
+        vm_monitoring: None,
+        vm_monitoring_secs: None,
+        ignore_admission_control: false,
     };
     create(info, args).await
 }
@@ -140,6 +152,11 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         manifest_node_labels,
         manifest_anti_affinity,
         manifest_labels,
+        manifest_restart_priority,
+        manifest_replica_node,
+        manifest_replica_interval,
+        manifest_vm_monitoring,
+        manifest_vm_monitoring_secs,
     ) = if let Some(path) = &args.filename {
         let manifest = parse_vm_manifest(path)?;
         let n = args.name.clone().unwrap_or(manifest.name);
@@ -164,6 +181,11 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             manifest.node_labels,
             manifest.anti_affinity,
             manifest.labels,
+            manifest.restart_priority,
+            manifest.replica_node,
+            manifest.replica_interval_secs,
+            manifest.vm_monitoring,
+            manifest.vm_monitoring_secs,
         )
     } else {
         let n = args
@@ -204,6 +226,11 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
             vec![],
             None,
             std::collections::HashMap::new(),
+            args.restart_priority.clone(),
+            args.replica_node.clone(),
+            args.replica_interval_secs,
+            args.vm_monitoring.clone(),
+            args.vm_monitoring_secs,
         )
     };
     if nics.is_empty() && !args.extra_networks.is_empty() {
@@ -334,6 +361,30 @@ pub async fn create(info: &ConnectionInfo, args: CreateArgs) -> Result<()> {
         target_dc,
         node_labels,
         anti_affinity,
+        restart_priority: args
+            .restart_priority
+            .clone()
+            .or(manifest_restart_priority)
+            .unwrap_or_default(),
+        replica_node: args
+            .replica_node
+            .clone()
+            .or(manifest_replica_node)
+            .unwrap_or_default(),
+        replica_interval_secs: args
+            .replica_interval_secs
+            .or(manifest_replica_interval)
+            .unwrap_or(0),
+        vm_monitoring: args
+            .vm_monitoring
+            .clone()
+            .or(manifest_vm_monitoring)
+            .unwrap_or_default(),
+        vm_monitoring_secs: args
+            .vm_monitoring_secs
+            .or(manifest_vm_monitoring_secs)
+            .unwrap_or(0),
+        ignore_admission_control: args.ignore_admission_control,
     };
 
     let resp = client.create_vm(req).await?.into_inner();
@@ -609,8 +660,33 @@ pub async fn get(info: &ConnectionInfo, vm_id: &str, target_node: Option<String>
     let spec = resp.spec.as_ref().context("no spec in response")?;
     let status = resp.status.as_ref().context("no status in response")?;
     output::print_vm_detail(spec, status, &resp.node_id);
+    print_vm_ha(&resp);
 
     Ok(())
+}
+
+fn print_vm_ha(resp: &proto::GetVmResponse) {
+    let protection = if resp.ha_protection.is_empty() {
+        "unprotected"
+    } else {
+        resp.ha_protection.as_str()
+    };
+    let priority = if resp.restart_priority.is_empty() {
+        "medium"
+    } else {
+        resp.restart_priority.as_str()
+    };
+    println!("HA:       {protection}");
+    println!("Priority: {priority}");
+    if !resp.replica_node.is_empty() {
+        println!(
+            "Replica:  {} every {}s",
+            resp.replica_node, resp.replica_interval_secs
+        );
+    }
+    if !resp.vm_monitoring.is_empty() {
+        println!("Monitor:  {}", resp.vm_monitoring);
+    }
 }
 
 pub async fn describe(
@@ -630,6 +706,7 @@ pub async fn describe(
     let spec = resp.spec.as_ref().context("no spec in response")?;
     let status = resp.status.as_ref().context("no status in response")?;
     output::print_vm_detail(spec, status, &resp.node_id);
+    print_vm_ha(&resp);
 
     if spec.nics.is_empty() {
         return Ok(());
@@ -842,6 +919,11 @@ struct VmManifest {
     node_labels: Vec<String>,
     anti_affinity: Option<String>,
     labels: std::collections::HashMap<String, String>,
+    restart_priority: Option<String>,
+    replica_node: Option<String>,
+    replica_interval_secs: Option<i32>,
+    vm_monitoring: Option<String>,
+    vm_monitoring_secs: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -1302,6 +1384,26 @@ fn parse_vm_manifest(path: &str) -> Result<VmManifest> {
             .as_str()
             .or_else(|| doc["spec"]["anti_affinity"].as_str())
             .map(|s| s.to_string()),
+        restart_priority: doc["spec"]["restartPriority"]
+            .as_str()
+            .or_else(|| doc["spec"]["restart_priority"].as_str())
+            .map(|s| s.to_string()),
+        replica_node: doc["spec"]["replicaNode"]
+            .as_str()
+            .or_else(|| doc["spec"]["replica_node"].as_str())
+            .map(|s| s.to_string()),
+        replica_interval_secs: doc["spec"]["replicaIntervalSecs"]
+            .as_i64()
+            .or_else(|| doc["spec"]["replica_interval_secs"].as_i64())
+            .and_then(|n| i32::try_from(n).ok()),
+        vm_monitoring: doc["spec"]["vmMonitoring"]
+            .as_str()
+            .or_else(|| doc["spec"]["vm_monitoring"].as_str())
+            .map(|s| s.to_string()),
+        vm_monitoring_secs: doc["spec"]["vmMonitoringSecs"]
+            .as_i64()
+            .or_else(|| doc["spec"]["vm_monitoring_secs"].as_i64())
+            .and_then(|n| i32::try_from(n).ok()),
         labels: doc["spec"]["labels"]
             .as_mapping()
             .map(|map| {
@@ -1532,6 +1634,12 @@ mod tests {
             node_labels: vec![],
             labels: vec![],
             anti_affinity: None,
+            restart_priority: None,
+            replica_node: None,
+            replica_interval_secs: None,
+            vm_monitoring: None,
+            vm_monitoring_secs: None,
+            ignore_admission_control: false,
         }
     }
 

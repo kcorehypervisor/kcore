@@ -892,6 +892,7 @@ mod tests {
             cert_rotation: crate::config::CertRotationConfig::default(),
             revocation: NodeRevocationConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
         };
         let state = RevocationState::new(FailMode::SoftFail, Duration::hours(6));
         let err = ocsp_backfill(&cfg, &state)
@@ -923,6 +924,7 @@ mod tests {
             cert_rotation: crate::config::CertRotationConfig::default(),
             revocation: NodeRevocationConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
         };
         assert!(issuer_candidates(&cfg).is_empty());
     }
@@ -957,6 +959,7 @@ mod tests {
             cert_rotation: crate::config::CertRotationConfig::default(),
             revocation: NodeRevocationConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
         };
 
         // Seed a known-good set, then fail a refresh: the set must survive so

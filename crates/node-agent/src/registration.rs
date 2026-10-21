@@ -267,10 +267,12 @@ fn parse_first_ipv4_addr(addr_stdout: &str) -> Option<String> {
 }
 
 pub fn start_heartbeat_loop(cfg: Config, registration_done: Arc<Notify>) {
+    let shared = Arc::new(std::sync::Mutex::new(crate::ha::HaShared::default()));
+    crate::ha::spawn_ha_supervisor(Arc::clone(&shared), cfg.ha.clone());
     tokio::spawn(async move {
         registration_done.notified().await;
         loop {
-            if let Err(e) = send_heartbeat_once(&cfg).await {
+            if let Err(e) = send_heartbeat_once(&cfg, &shared).await {
                 warn!(error = %e, "heartbeat failed on all controller endpoints");
             }
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
@@ -278,7 +280,14 @@ pub fn start_heartbeat_loop(cfg: Config, registration_done: Arc<Notify>) {
     });
 }
 
-async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn send_heartbeat_once(
+    cfg: &Config,
+    ha: &Arc<std::sync::Mutex<crate::ha::HaShared>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ha_actions = {
+        let mut guard = ha.lock().unwrap_or_else(|err| err.into_inner());
+        std::mem::take(&mut guard.pending_reports)
+    };
     let cert_expiry_days = cfg
         .tls
         .as_ref()
@@ -353,13 +362,28 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
                 update_capabilities: host.update_capabilities,
                 schema_version: host.schema_version,
                 nixpkgs_rev: host.nixpkgs_rev,
+                ha_actions: ha_actions.clone(),
             })
             .await
         {
-            Ok(_) => {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                {
+                    let mut guard = ha.lock().unwrap_or_else(|err| err.into_inner());
+                    guard.last_ok = Some(std::time::Instant::now());
+                    if resp.assignment_confirmed {
+                        guard.assigned = resp.assigned_vm_ids;
+                        guard.confirmed = true;
+                    }
+                    guard.monitors = resp
+                        .vm_monitors
+                        .into_iter()
+                        .map(|monitor| (monitor.vm_name, i64::from(monitor.restart_after_secs)))
+                        .collect();
+                }
                 let vms = match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    collect_local_vm_runtime(&cfg.vm_socket_dir),
+                    collect_local_vm_runtime(&cfg.vm_socket_dir, &cfg.ha.guest_heartbeat_dir),
                 )
                 .await
                 {
@@ -393,6 +417,12 @@ async fn send_heartbeat_once(cfg: &Config) -> Result<(), Box<dyn std::error::Err
             }
         }
     }
+    {
+        let mut guard = ha.lock().unwrap_or_else(|err| err.into_inner());
+        let mut pending = ha_actions;
+        pending.append(&mut guard.pending_reports);
+        guard.pending_reports = pending;
+    }
     Err(last_err.unwrap_or_else(|| Box::new(std::io::Error::other("heartbeat failed"))))
 }
 
@@ -407,17 +437,26 @@ fn ch_state_to_controller(state: &str) -> i32 {
 
 /// Read Cloud Hypervisor `vm.info` for every API socket and report it to the
 /// controller. Socket names are the VM names the controller stored.
-async fn collect_local_vm_runtime(socket_dir: &str) -> Vec<controller_proto::VmInfo> {
+async fn collect_local_vm_runtime(
+    socket_dir: &str,
+    heartbeat_dir: &str,
+) -> Vec<controller_proto::VmInfo> {
     let client = crate::vmm::Client::new(socket_dir);
+    let heartbeat_dir = heartbeat_dir.to_string();
     client
         .list_vms()
         .await
         .into_iter()
-        .map(|(name, info)| controller_proto::VmInfo {
-            id: name.clone(),
-            name,
-            state: ch_state_to_controller(&info.state),
-            ..Default::default()
+        .map(|(name, info)| {
+            let guest_heartbeat_unix =
+                crate::ha::read_guest_heartbeat(std::path::Path::new(&heartbeat_dir), &name);
+            controller_proto::VmInfo {
+                id: name.clone(),
+                name,
+                state: ch_state_to_controller(&info.state),
+                guest_heartbeat_unix,
+                ..Default::default()
+            }
         })
         .collect()
 }
@@ -634,6 +673,7 @@ mod tests {
             cert_rotation: crate::config::CertRotationConfig::default(),
             revocation: crate::config::NodeRevocationConfig::default(),
             rate_limit: crate::config::RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
         };
         let endpoints = super::controller_endpoints(&cfg);
         assert_eq!(
@@ -717,7 +757,9 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("tmpdir");
-        let vms = collect_local_vm_runtime(dir.to_str().expect("utf8")).await;
+        let vms =
+            collect_local_vm_runtime(dir.to_str().expect("utf8"), "/run/kcore/guest-heartbeat")
+                .await;
         assert!(vms.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }

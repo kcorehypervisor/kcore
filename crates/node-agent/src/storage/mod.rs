@@ -964,6 +964,149 @@ pub fn fence_targets(
     Ok(targets)
 }
 
+/// One fence of a lost host: its open clients, plus a range covering every
+/// address it might still write from. A range is added even when no watcher
+/// is listed, because an expired watch is not proof the old rbd-nbd stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FencePlan {
+    pub clients: Vec<String>,
+    pub ranges: Vec<String>,
+    pub host_state: String,
+}
+
+/// `host` as a Ceph blocklist range. Names that are not IP addresses are
+/// skipped: a range on a hostname would not match the OSD client.
+pub fn ip_range(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        Some(format!("{host}/32"))
+    } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        Some(format!("{host}/128"))
+    } else {
+        None
+    }
+}
+
+pub fn plan_fence(
+    backend_handle: &str,
+    watchers: &[String],
+    locks: &[RbdLock],
+    source_hosts: &[String],
+) -> Result<FencePlan, StorageError> {
+    let clients = fence_targets(backend_handle, watchers, locks, source_hosts)?;
+    let mut ranges = Vec::new();
+    for host in source_hosts {
+        if let Some(range) = ip_range(host) {
+            if !ranges.contains(&range) {
+                ranges.push(range);
+            }
+        }
+    }
+    if clients.is_empty() && ranges.is_empty() {
+        return Err(StorageError::new(
+            ErrorKind::FailedPrecondition,
+            "no Ceph clients and no IP ranges to blocklist; refusing to treat the volume as fenced",
+        ));
+    }
+    let host_state = if clients.is_empty() {
+        "dead".to_string()
+    } else {
+        "isolated".to_string()
+    };
+    Ok(FencePlan {
+        clients,
+        ranges,
+        host_state,
+    })
+}
+
+/// True when `token` is `ip/prefix` rather than an entity address
+/// (`ip:port/nonce`). Prefixes above 128 are nonces.
+pub fn is_blocklist_range(token: &str) -> bool {
+    canonical_blocklist_range(token).is_some() && !token.starts_with("cidr:")
+}
+
+/// `ip/prefix` form of a blocklist range.
+///
+/// `ceph osd blocklist range add` and `range rm` take `192.0.2.1/32`.
+/// Ceph Tentacle's `blocklist ls` prints that same range as
+/// `cidr:192.0.2.1:0/32`. Both name one range; removal always uses the
+/// command form.
+pub fn canonical_blocklist_range(token: &str) -> Option<String> {
+    let token = token.trim();
+    let (body, from_listing) = if let Some(rest) = token.strip_prefix("cidr:") {
+        (rest, true)
+    } else {
+        (token, false)
+    };
+    let (addr, bits) = body.rsplit_once('/')?;
+    let prefix: u8 = bits.parse().ok()?;
+    if prefix > 128 {
+        return None;
+    }
+    let ip = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if from_listing {
+        // `192.0.2.1:0/32` — the `:0` is the entity port, not part of the IP.
+        addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr)
+    } else {
+        addr
+    };
+    if ip.parse::<std::net::Ipv4Addr>().is_ok() || ip.parse::<std::net::Ipv6Addr>().is_ok() {
+        Some(format!("{ip}/{prefix}"))
+    } else {
+        None
+    }
+}
+
+/// Entity addresses and ranges in a `ceph osd blocklist ls` listing that
+/// belong to `hosts`.
+pub fn select_blocklist_removals(listing: &str, hosts: &[String]) -> Vec<String> {
+    let hosts: Vec<&str> = hosts
+        .iter()
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    for line in listing.lines() {
+        let Some(token) = line.split_whitespace().next() else {
+            continue;
+        };
+        if token == "listed" || token.starts_with('#') {
+            continue;
+        }
+        let stored = if let Some(range) = canonical_blocklist_range(token) {
+            let owned = hosts
+                .iter()
+                .any(|host| range.starts_with(&format!("{host}/")));
+            if !owned {
+                continue;
+            }
+            range
+        } else {
+            let host = entity_addr_host(token);
+            if !hosts.contains(&host) {
+                continue;
+            }
+            token.to_string()
+        };
+        if !out.iter().any(|have| have == &stored) {
+            out.push(stored);
+        }
+    }
+    out
+}
+
+/// `ceph osd blocklist add` on an address that is already listed exits
+/// non-zero. A second fence of the same lost host must still succeed.
+fn blocklist_add(args: &[&str]) -> Result<(), StorageError> {
+    match run_cmd_capture("ceph", args, ErrorKind::Internal) {
+        Ok(_) => Ok(()),
+        Err(e) if e.message().to_ascii_lowercase().contains("already") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn run_cmd_capture(
     program: &str,
     args: &[&str],
@@ -990,20 +1133,32 @@ fn run_cmd_capture(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Result of fencing one image. `blocklisted` lists entity addresses and
+/// `range:<ip>/prefix` entries. `host_state` is `isolated` when the lost
+/// host still had the image open, and `dead` when it did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenceOutcome {
+    pub blocklisted: Vec<String>,
+    pub host_state: String,
+}
+
 /// Blocklist every Ceph client that has `backend_handle` open from one of
-/// `source_hosts` and drop any RBD lock it held. Returns the blocklisted
-/// entity addresses.
+/// `source_hosts`, plus a range covering each of those addresses, and drop
+/// any RBD lock the clients held.
 ///
 /// Images are created with `layering` only, so there is no exclusive lock
 /// to arbitrate writers: once the controller restarts a guest elsewhere the
 /// old rbd-nbd on the lost node would keep writing. The OSD blocklist is the
 /// only thing that stops it, which is why this must run before the guest is
 /// reassigned. Clients are listed by `rbd status` (watchers), with `rbd lock
-/// ls` as a second source for images that do carry locks.
+/// ls` as a second source for images that do carry locks. The range is added
+/// even when that list is empty: a missing watcher is not proof the writer
+/// stopped. With neither clients nor a usable IP range, the call fails
+/// rather than reporting the image fenced.
 pub fn ceph_fence_volume(
     backend_handle: &str,
     source_hosts: &[String],
-) -> Result<Vec<String>, StorageError> {
+) -> Result<FenceOutcome, StorageError> {
     let handle = validate_rbd_pool_image_handle(backend_handle)?;
     let handle = handle.as_str();
     let status = run_cmd_capture(
@@ -1023,19 +1178,22 @@ pub fn ceph_fence_volume(
             Vec::new()
         }
     };
-    let targets = fence_targets(handle, &watchers, &locks, source_hosts)?;
+    let plan = plan_fence(handle, &watchers, &locks, source_hosts)?;
     let expire = FENCE_BLOCKLIST_EXPIRE_SECS.to_string();
-    for addr in &targets {
-        run_cmd_capture(
-            "ceph",
-            &["osd", "blocklist", "add", addr, &expire],
-            ErrorKind::Internal,
-        )?;
+    let mut blocklisted = Vec::new();
+    for addr in &plan.clients {
+        blocklist_add(&["osd", "blocklist", "add", addr, &expire])?;
         tracing::info!(handle, addr = %addr, "blocklisted Ceph client");
+        blocklisted.push(addr.clone());
+    }
+    for range in &plan.ranges {
+        blocklist_add(&["osd", "blocklist", "range", "add", range, &expire])?;
+        tracing::info!(handle, range = %range, "blocklisted Ceph client range");
+        blocklisted.push(format!("range:{range}"));
     }
     for lock in locks
         .iter()
-        .filter(|lock| targets.iter().any(|t| t == &lock.address))
+        .filter(|lock| plan.clients.iter().any(|t| t == &lock.address))
     {
         if let Err(e) = run_cmd_capture(
             "rbd",
@@ -1045,7 +1203,57 @@ pub fn ceph_fence_volume(
             tracing::warn!(handle, lock = %lock.id, error = %e, "removing fenced client's RBD lock failed");
         }
     }
-    Ok(targets)
+    Ok(FenceOutcome {
+        blocklisted,
+        host_state: plan.host_state,
+    })
+}
+
+/// Remove OSD blocklist entries and ranges that belong to `source_hosts`.
+/// Called when a node heartbeats again, so its new clients can map images
+/// the failover had fenced.
+pub fn ceph_unfence_hosts(source_hosts: &[String]) -> Result<Vec<String>, StorageError> {
+    if source_hosts.iter().all(|h| h.trim().is_empty()) {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "source_hosts is required",
+        ));
+    }
+    let listing = run_cmd_capture("ceph", &["osd", "blocklist", "ls"], ErrorKind::Internal)?;
+    let range_listing = run_cmd_capture(
+        "ceph",
+        &["osd", "blocklist", "range", "ls"],
+        ErrorKind::Internal,
+    )
+    .unwrap_or_default();
+    let mut remove = select_blocklist_removals(&listing, source_hosts);
+    for token in select_blocklist_removals(&range_listing, source_hosts) {
+        if !remove.iter().any(|have| have == &token) {
+            remove.push(token);
+        }
+    }
+    for range in source_hosts.iter().filter_map(|host| ip_range(host)) {
+        if range_listing.contains(&range) && !remove.iter().any(|have| have == &range) {
+            remove.push(range);
+        }
+    }
+    for token in &remove {
+        if is_blocklist_range(token) {
+            run_cmd_capture(
+                "ceph",
+                &["osd", "blocklist", "range", "rm", token],
+                ErrorKind::Internal,
+            )?;
+        } else {
+            run_cmd_capture(
+                "ceph",
+                &["osd", "blocklist", "rm", token],
+                ErrorKind::Internal,
+            )?;
+        }
+        tracing::info!(addr = %token, "removed failover blocklist entry");
+    }
+    Ok(remove)
 }
 
 fn from_lvm(err: crate::lvm_ops::LvmOpError) -> StorageError {
@@ -1723,6 +1931,84 @@ mod tests {
             .is_empty());
         let err = fence_targets("kcore-vms/img", &[], &[], &[]).unwrap_err();
         assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+    }
+
+    #[test]
+    fn plan_fence_adds_a_range_when_nobody_is_watching() {
+        let hosts = vec!["192.168.40.145".to_string(), "kcore-node".to_string()];
+        let plan = plan_fence("kcore-vms/img", &[], &[], &hosts).unwrap();
+        assert_eq!(plan.clients, Vec::<String>::new());
+        assert_eq!(plan.ranges, vec!["192.168.40.145/32".to_string()]);
+        assert_eq!(plan.host_state, "dead");
+    }
+
+    #[test]
+    fn plan_fence_marks_an_open_image_isolated_and_covers_ipv6() {
+        let watchers = vec!["192.168.40.145:0/11".to_string()];
+        let hosts = vec!["192.168.40.145".to_string(), "2001:db8::7".to_string()];
+        let plan = plan_fence("kcore-vms/img", &watchers, &[], &hosts).unwrap();
+        assert_eq!(plan.clients, vec!["192.168.40.145:0/11".to_string()]);
+        assert_eq!(
+            plan.ranges,
+            vec![
+                "192.168.40.145/32".to_string(),
+                "2001:db8::7/128".to_string()
+            ]
+        );
+        assert_eq!(plan.host_state, "isolated");
+    }
+
+    #[test]
+    fn plan_fence_refuses_when_nothing_can_be_blocklisted() {
+        let err = plan_fence("kcore-vms/img", &[], &[], &["lost-node".into()]).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::FailedPrecondition));
+    }
+
+    #[test]
+    fn blocklist_removal_selects_entities_and_ranges() {
+        let listing = "\
+listed 2 entries
+192.168.40.145:0/11 2027-01-01 00:00:00.000000
+10.1.1.9:6801/4 2027-01-01 00:00:00.000000
+192.168.40.145/32
+";
+        let hosts = vec!["192.168.40.145".to_string()];
+        assert_eq!(
+            select_blocklist_removals(listing, &hosts),
+            vec![
+                "192.168.40.145:0/11".to_string(),
+                "192.168.40.145/32".to_string()
+            ]
+        );
+        assert!(is_blocklist_range("192.168.40.145/32"));
+        assert!(is_blocklist_range("2001:db8::7/128"));
+        assert!(!is_blocklist_range("192.168.40.145:0/11"));
+        assert!(!is_blocklist_range("cidr:192.168.40.145:0/32"));
+        assert_eq!(
+            canonical_blocklist_range("cidr:192.168.40.145:0/32").as_deref(),
+            Some("192.168.40.145/32")
+        );
+    }
+
+    #[test]
+    fn blocklist_removal_accepts_tentacle_cidr_ranges() {
+        // Ceph 20 prints a range added as `192.168.40.145/32` like this.
+        // `range rm` still wants the command form, not the listing token.
+        let listing = "\
+listed 4 entries
+cidr:192.168.40.145:0/32 2026-10-27T15:47:52.961960+0000
+cidr:192.168.47.4:0/32 2026-10-27T15:47:53.253734+0000
+192.168.40.143:0/303618515 2026-10-21T12:57:27.149030+0000
+192.168.40.145/32
+";
+        let hosts = vec!["192.168.40.145".to_string(), "192.168.47.4".to_string()];
+        assert_eq!(
+            select_blocklist_removals(listing, &hosts),
+            vec![
+                "192.168.40.145/32".to_string(),
+                "192.168.47.4/32".to_string()
+            ]
+        );
     }
 
     #[test]

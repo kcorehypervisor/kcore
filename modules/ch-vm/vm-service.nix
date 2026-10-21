@@ -59,9 +59,16 @@ let
       # format is sniffed in the start script (see srcFormatFn).
       actualFormat = if isBlockBackend then "raw" else "$ROOT_FMT";
 
+      # LVM and ZFS guests open a stable device-mapper name so a live migration
+      # can reload the table (linear → mirror) without Cloud Hypervisor seeing
+      # a path that only exists on one node. `direct=on` keeps guest writes
+      # synchronous, which is what makes the mirror a complete copy.
       vmDiskArg =
-        "path=${actualDisk},image_type=${actualFormat}"
-        + lib.optionalString isCeph ",direct=on,serial=root-${vmName}";
+        if isLvm || isZfs then
+          "path=/dev/mapper/kcore-vm-${vmName},image_type=raw,direct=on,serial=root-${vmName}"
+        else
+          "path=${actualDisk},image_type=${actualFormat}"
+          + lib.optionalString isCeph ",direct=on,serial=root-${vmName}";
       seedDiskArg = "path=${seedIso},readonly=on,image_type=raw";
       dataDiskArgs = lib.concatMapStringsSep " " (
         disk:
@@ -163,6 +170,17 @@ let
             exit 1
           fi
           rm -f "$SEED_MARKER"
+        fi
+        REPLICA_MARKER="/var/lib/kcore/replica-ready/${vmName}"
+        if [ -f "$REPLICA_MARKER" ]; then
+          SNAP="$(${pkgs.coreutils}/bin/tr -d '[:space:]' < "$REPLICA_MARKER")"
+          if [ -n "$SNAP" ] && ${pkgs.zfs}/bin/zfs list -H -t snapshot "$ZVOL_DATASET@$SNAP" >/dev/null 2>&1; then
+            echo "Rolling $ZVOL_DATASET back to replica snapshot $SNAP"
+            ${pkgs.zfs}/bin/zfs rollback -r "$ZVOL_DATASET@$SNAP"
+          fi
+          mkdir -p "$(dirname "$SEED_MARKER")"
+          touch "$SEED_MARKER"
+          rm -f "$REPLICA_MARKER"
         fi
         if [ ! -f "$SEED_MARKER" ]; then
           verify_source ${toString vmCfg.image}
@@ -297,9 +315,11 @@ let
       vgpuDevices = builtins.filter (dev: dev.vgpuProfile != null) normalizedPci;
       sysfs = config.ch-vm.vms.sysfsRoot;
 
-      # Live migration requires MAP_SHARED guest RAM (`shared=on`).
+      # Live migration requires MAP_SHARED guest RAM (`shared=on`). Every
+      # block backend can move: Ceph because the disk is shared, LVM and ZFS
+      # because the disk is mirrored onto the destination first.
       memoryArg =
-        if isCeph then
+        if isBlockBackend then
           "--memory size=${toString vmCfg.memorySize}M,shared=on"
         else
           "--memory size=${toString vmCfg.memorySize}M";
@@ -482,6 +502,40 @@ let
 
       # After a live receive, CH is already running outside systemd. Skip
       # destructive socket cleanup so the handoff ExecStart can adopt it.
+      # `/dev/mapper/kcore-vm-<name>` is the path Cloud Hypervisor records. It is
+      # a linear map over the LV or zvol until a migration reloads it. Creating
+      # it is idempotent: a live-migrated guest, or one already running, is
+      # left alone.
+      localMapperScript = pkgs.writeShellScript "local-mapper-${vmName}" ''
+        set -euo pipefail
+        if [ -f "${liveMigratedMarker}" ]; then
+          exit 0
+        fi
+        name="kcore-vm-${vmName}"
+        mapper="/dev/mapper/$name"
+        backing="${if isLvm then lvDevice else zvolDevice}"
+        if [ -b "$mapper" ]; then
+          exit 0
+        fi
+        ${pkgs.kmod}/bin/modprobe dm-mod || true
+        sectors="$(${pkgs.util-linux}/bin/blockdev --getsz "$backing")"
+        printf '0 %s linear %s 0\n' "$sectors" "$backing" | ${pkgs.lvm2.bin}/bin/dmsetup create "$name"
+        test -b "$mapper"
+      '';
+
+      localMapperRemoveScript = pkgs.writeShellScript "local-mapper-remove-${vmName}" ''
+        name="kcore-vm-${vmName}"
+        mapper="/dev/mapper/$name"
+        if [ ! -b "$mapper" ]; then
+          exit 0
+        fi
+        open="$(${pkgs.lvm2.bin}/bin/dmsetup info -c --noheadings -o open "$name" 2>/dev/null || echo 0)"
+        if [ "$open" != "0" ]; then
+          exit 0
+        fi
+        ${pkgs.lvm2.bin}/bin/dmsetup remove "$name" || true
+      '';
+
       startPreScript = pkgs.writeShellScript "kcore-vm-${vmName}-pre" ''
         set -e
         if [ -f "${liveMigratedMarker}" ]; then
@@ -519,6 +573,15 @@ let
         ${vmmFunctions}
         adopt() {
           echo "$2 cloud-hypervisor pid $1"
+          # The node-agent spawns this hypervisor, so the process is still in
+          # the agent's cgroup. Restarting that unit kills every process there,
+          # the tail below exits, and systemd cold-boots the guest. Move the
+          # hypervisor into this unit's cgroup before waiting on it.
+          cg="$(${pkgs.gnused}/bin/sed -n 's/^0:://p' /proc/self/cgroup | ${pkgs.coreutils}/bin/head -n1)"
+          if [ -n "$cg" ]; then
+            echo "$1" > "/sys/fs/cgroup$cg/cgroup.procs" \
+              || echo "warning: could not move cloud-hypervisor pid $1 into $cg"
+          fi
           exec ${pkgs.coreutils}/bin/tail --pid="$1" -f /dev/null
         }
         if [ -f "${liveMigratedMarker}" ]; then
@@ -547,10 +610,10 @@ let
         exec ${chBin} ${chArgs}
       '';
 
-      # Press the ACPI power button, then wait for the VMM to exit. systemd
-      # only waits for (and finally kills) processes inside the unit's cgroup,
-      # and an adopted VMM is not in it: without this wait the unit would be
-      # "stopped" while the guest runs on, and the next start would adopt it
+      # Press the ACPI power button, then wait for the VMM to exit. Adoption
+      # moves the hypervisor into this unit's cgroup; if that move failed it is
+      # still outside, and systemd would report the unit stopped while the
+      # guest kept running. Wait here so a restart does not adopt the old VMM
       # again instead of applying whatever the restart was meant to apply.
       stopGraceSec = 25;
       stopScript = pkgs.writeShellScript "kcore-vm-${vmName}-stop" ''
@@ -575,10 +638,12 @@ let
       description = "kcore VM ${vmName}";
       requires =
         map (iface: "${iface.unit}.service") ifaces
-        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service";
+        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service"
+        ++ [ "kcore-placement-confirmed.target" ];
       after =
         map (iface: "${iface.unit}.service") ifaces
-        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service";
+        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service"
+        ++ [ "kcore-placement-confirmed.target" ];
       wantedBy = lib.optionals (vmCfg.autoStart && !vmCfg.incomingMigration) [ "multi-user.target" ];
       # stopIfChanged/restartIfChanged keep their NixOS defaults so VM spec
       # updates (cpu/memory/extraArgs) take effect for Ceph-backed VMs too. The
@@ -594,12 +659,14 @@ let
         ExecStartPre =
           lib.optionals (vfioDevices != [ ]) [ "${vfioBindScript}" ]
           ++ lib.optionals (vgpuDevices != [ ]) [ "${vgpuBindScript}" ]
-          ++ [ "${startPreScript}" ];
+          ++ [ "${startPreScript}" ]
+          ++ lib.optionals (isLvm || isZfs) [ "${localMapperScript}" ];
         ExecStart = "${startScript}";
         ExecStop = "${stopScript}";
         ExecStopPost =
           lib.optional (vgpuDevices != [ ]) "-${vgpuClearScript}"
-          ++ lib.optional isCeph "-${cephUnmapScript}";
+          ++ lib.optional isCeph "-${cephUnmapScript}"
+          ++ lib.optional (isLvm || isZfs) "-${localMapperRemoveScript}";
         TimeoutStopSec = 30;
         # ExecStartPre copies the image onto the volume. The 90s default is
         # shorter than a Windows qcow2 convert, which then fails the unit.
@@ -649,6 +716,12 @@ in
     # unit later adopts a process it could not have started.
     environment.etc."kcore/cloud-hypervisor".text = chBin + "\n";
     environment.etc."kcore/vm-socket-dir".text = cfg.socketDir + "\n";
+    # name<space>backend, one VM per line. The node agent masks every Ceph
+    # unit the controller no longer places here before it starts
+    # kcore-placement-confirmed.target, which these units require.
+    environment.etc."kcore/vm-placement".text = lib.concatStrings (
+      lib.mapAttrsToList (name: vm: "${name} ${vm.storageBackend}\n") cfg.virtualMachines
+    );
     # Options the controller may only emit once this module version is
     # installed on the node (an unknown option fails the whole evaluation).
     # Append here when adding a per-VM option the controller renders.
@@ -656,10 +729,29 @@ in
       imageSha256
       cloudHypervisorPatches
       vgpuProfile
+      localLiveMigrate
+      cloudInitGuestOpsKeys
     '';
+
+    # qemu-nbd and nbd-client replicate an LV/zvol during migration. dmsetup
+    # and lvcreate come from lvm2; zfs is already on the system when a guest
+    # uses it. The node agent finds them on PATH.
+    environment.systemPackages = [
+      pkgs.qemu-utils
+      pkgs.nbd
+      pkgs.lvm2
+    ]
+    ++ lib.optional anyVmUsesZfs pkgs.zfs;
 
     systemd.services = lib.mapAttrs' (
       vmName: vmCfg: lib.nameValuePair "kcore-vm-${vmName}" (mkVmService vmName vmCfg)
     ) cfg.virtualMachines;
+
+    # Not wanted by multi-user. The node agent starts it after the controller
+    # lists the VMs that still belong here, so a host that reboots cannot
+    # start a Ceph guest the cluster has already moved.
+    systemd.targets.kcore-placement-confirmed = {
+      description = "Controller confirmed which VMs belong on this host";
+    };
   };
 }

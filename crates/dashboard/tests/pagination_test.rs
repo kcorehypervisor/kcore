@@ -121,6 +121,7 @@ impl Controller for ManyVmsController {
                 storage_backend: String::new(),
                 storage_size_bytes: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             })
             .collect();
         Ok(Response::new(ListVmsResponse { vms }))
@@ -1028,6 +1029,20 @@ impl Controller for ManyVmsController {
         &self,
         _: TRequest<GetKubernetesClusterHealthRequest>,
     ) -> Result<Response<GetKubernetesClusterHealthResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn get_ha_status(
+        &self,
+        _: TRequest<GetHaStatusRequest>,
+    ) -> Result<Response<GetHaStatusResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+
+    async fn list_ha_events(
+        &self,
+        _: TRequest<ListHaEventsRequest>,
+    ) -> Result<Response<ListHaEventsResponse>, Status> {
         Err(Status::unimplemented(""))
     }
 }

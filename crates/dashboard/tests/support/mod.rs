@@ -119,6 +119,7 @@ impl Controller for MockController {
             node_id: "node-mock-a".into(),
             assigned_ip: "10.0.0.50".into(),
             guest_reachable: false,
+            ..Default::default()
         }))
     }
 
@@ -208,6 +209,7 @@ impl Controller for MockController {
                 storage_backend: "lvm".into(),
                 storage_size_bytes: 0,
                 labels: std::collections::HashMap::new(),
+                ..Default::default()
             }],
         }))
     }
@@ -1665,6 +1667,29 @@ impl Controller for MockController {
                 "kubernetes cluster '{name}' not found"
             ))),
         }
+    }
+
+    async fn get_ha_status(
+        &self,
+        _: Request<GetHaStatusRequest>,
+    ) -> Result<Response<GetHaStatusResponse>, Status> {
+        Ok(Response::new(GetHaStatusResponse {
+            enabled: true,
+            acting: true,
+            failover_capacity: "protected".into(),
+            host_failures_to_tolerate: 1,
+            node_timeout_secs: 30,
+            detect_interval_secs: 5,
+            isolation_response: "powerOff".into(),
+            ..Default::default()
+        }))
+    }
+
+    async fn list_ha_events(
+        &self,
+        _: Request<ListHaEventsRequest>,
+    ) -> Result<Response<ListHaEventsResponse>, Status> {
+        Ok(Response::new(ListHaEventsResponse { events: vec![] }))
     }
 }
 

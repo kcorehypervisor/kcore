@@ -20,12 +20,14 @@ mod db;
 mod disk_reconciler;
 mod grpc;
 mod guest_ops;
+mod ha;
 mod host_volume;
 mod kubernetes_admin;
 mod kubernetes_lifecycle;
 mod kubernetes_local;
 mod kubernetes_orchestrator;
 mod kubernetes_pki;
+mod local_migrate;
 mod metrics_targets;
 mod net_policy;
 mod nixgen;
@@ -286,18 +288,25 @@ async fn main() -> anyhow::Result<()> {
 
     let staleness_db = database.clone();
     let staleness_webhooks = webhooks.clone();
+    let heartbeat_timeout_secs = cfg.failover.node_timeout_secs;
+    let detect_interval_secs = cfg.failover.detect_interval_secs;
     tokio::spawn(async move {
-        const HEARTBEAT_TIMEOUT_SECS: i64 = 90;
-        const CHECK_INTERVAL_SECS: u64 = 30;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
-            match staleness_db.get_stale_nodes(HEARTBEAT_TIMEOUT_SECS) {
+            tokio::time::sleep(std::time::Duration::from_secs(detect_interval_secs)).await;
+            match staleness_db.get_heartbeat_expired(heartbeat_timeout_secs) {
                 Ok(stale) => {
                     for node in &stale {
-                        if staleness_db
-                            .update_node_status(&node.id, "not-ready")
-                            .unwrap_or(false)
-                        {
+                        let became_lost = if node.status == "ready" {
+                            staleness_db
+                                .update_node_status(&node.id, "not-ready")
+                                .unwrap_or(false)
+                        } else {
+                            true
+                        };
+                        if let Err(e) = staleness_db.mark_node_lost(&node.id) {
+                            warn!(node_id = %node.id, error = %e, "failed to record lost node");
+                        }
+                        if became_lost && node.status == "ready" {
                             warn!(
                                 node_id = %node.id,
                                 last_heartbeat = %node.last_heartbeat,
@@ -311,7 +320,15 @@ async fn main() -> anyhow::Result<()> {
                                     "hostname": node.hostname,
                                     "address": node.address,
                                     "lastHeartbeat": node.last_heartbeat,
-                                    "timeoutSeconds": HEARTBEAT_TIMEOUT_SECS,
+                                    "timeoutSeconds": heartbeat_timeout_secs,
+                                }),
+                            );
+                            staleness_webhooks.emit(
+                                webhooks::EVENT_NODE_LOST,
+                                format!("node/{}", node.id),
+                                serde_json::json!({
+                                    "nodeId": node.id,
+                                    "hostname": node.hostname,
                                 }),
                             );
                         }
@@ -358,13 +375,15 @@ async fn main() -> anyhow::Result<()> {
         );
         svc = svc.with_webhooks(webhooks.clone());
         svc = svc.with_scheduler(&cfg.scheduler);
+        svc = svc.with_failover(cfg.failover.clone());
         if cfg.failover.enabled {
             let failover_svc = svc.clone();
+            let interval = cfg.failover.detect_interval_secs;
             failover_task = Some(tokio::spawn(async move {
                 let mut announced = std::collections::HashSet::new();
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    failover_svc.failover_not_ready_nodes(&mut announced).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    failover_svc.ha_pass(&mut announced).await;
                 }
             }));
         }

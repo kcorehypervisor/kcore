@@ -13,6 +13,7 @@ mod discovery;
 mod disk;
 mod grpc;
 mod guest_ops;
+mod ha;
 mod host_cpu;
 mod instant;
 mod issue_screen;
@@ -29,7 +30,9 @@ mod storage;
 mod system_update;
 mod vmm;
 mod volume_crypto;
+mod volume_mirror;
 mod zfs_ops;
+mod zfs_replica;
 
 use clap::{Args, Parser, Subcommand};
 use tokio::signal;
@@ -217,6 +220,9 @@ async fn main() -> anyhow::Result<()> {
         }
         if let Some(pool) = zfs_pool {
             storage_service = storage_service.with_zfs_pool(pool);
+            if let Some(zfs) = cfg.storage.zfs.as_ref() {
+                storage_service = storage_service.with_zfs_prefix(zfs.dataset_prefix.clone());
+            }
         }
         let storage_svc = InterceptedService::new(
             proto::node_storage_server::NodeStorageServer::with_interceptor(

@@ -71,6 +71,12 @@ service NodeStorage {
   // a node the controller can no longer reach. It fails when the image is
   // open from any other host; the caller must not move the guest then.
   rpc FenceVolume(FenceVolumeRequest) returns (FenceVolumeResponse);
+  // Lift the address-range blocklist added for a host that has come back.
+  rpc UnfenceHost(UnfenceHostRequest) returns (UnfenceHostResponse);
+  // Full or incremental `zfs send` of one VM volume.
+  rpc PullZfsSend(PullZfsSendRequest) returns (stream ZfsSendChunk);
+  // Receive that stream onto the replica dataset and mark it bootable.
+  rpc RecvZfsSend(stream ZfsSendChunk) returns (RecvZfsSendResponse);
 
   // Host-side LUKS over a mapped RBD device (E2 per-volume encryption).
   rpc FormatEncryptedVolume(FormatEncryptedVolumeRequest)
@@ -217,6 +223,24 @@ service NodeAdmin {
       returns (FinalizeLiveMigrateSourceResponse);
   rpc FinalizeLiveMigrateDest(FinalizeLiveMigrateDestRequest)
       returns (FinalizeLiveMigrateDestResponse);
+
+  // Local-disk (LVM/ZFS) migration. The destination exports a new LV/zvol over
+  // NBD; the source mirrors the guest disk onto it with dm-mirror, then the
+  // existing Cloud Hypervisor send/receive moves memory. A stopped guest is
+  // copied with qemu-img instead of a mirror. See docs/vm-migration.md.
+  rpc InspectLocalVmDisk(InspectLocalVmDiskRequest) returns (InspectLocalVmDiskResponse);
+  rpc PrepareVolumeMirrorTarget(PrepareVolumeMirrorTargetRequest)
+      returns (PrepareVolumeMirrorTargetResponse);
+  rpc StartVolumeMirror(StartVolumeMirrorRequest) returns (StartVolumeMirrorResponse);
+  rpc GetVolumeMirrorStatus(GetVolumeMirrorStatusRequest)
+      returns (GetVolumeMirrorStatusResponse);
+  rpc CopyLocalVolume(CopyLocalVolumeRequest) returns (CopyLocalVolumeResponse);
+  rpc CommitVolumeMirrorTarget(CommitVolumeMirrorTargetRequest)
+      returns (CommitVolumeMirrorTargetResponse);
+  rpc AbortVolumeMirror(AbortVolumeMirrorRequest) returns (AbortVolumeMirrorResponse);
+  rpc ReleaseVolumeMirror(ReleaseVolumeMirrorRequest) returns (ReleaseVolumeMirrorResponse);
+  // Stop the guest and hold systemd restart, or undo that, for a cold copy.
+  rpc SetLocalVmQuiesced(SetLocalVmQuiescedRequest) returns (SetLocalVmQuiescedResponse);
 
   // Hotplug a mapped block device into a running Cloud Hypervisor guest.
   rpc HotAddDisk(HotAddDiskRequest) returns (HotAddDiskResponse);
@@ -725,9 +749,45 @@ message FenceVolumeRequest {
 }
 
 message FenceVolumeResponse {
-  // Entity addresses (`ip:port/nonce`) that were added to the OSD blocklist.
-  // Empty when nobody had the image open.
+  // Entity addresses (`ip:port/nonce`) that were added to the OSD blocklist,
+  // plus `range:<ip>/32` entries for the lost host. Empty when nobody had
+  // the image open and no range was added.
   repeated string blocklisted = 1;
+  // dead: the lost host has no Ceph clients. isolated: it still has the
+  // image open. unknown: the member could not tell.
+  string host_state = 2;
+}
+
+message UnfenceHostRequest {
+  repeated string source_hosts = 1;
+}
+
+message UnfenceHostResponse {
+  bool success = 1;
+  repeated string removed = 2;
+}
+
+message PullZfsSendRequest {
+  string vm_name = 1;
+  // Snapshot name (not the full dataset@snap) already on the replica.
+  // Empty sends the whole volume.
+  string incremental_from = 2;
+  string pool = 3;
+  string dataset_prefix = 4;
+}
+
+message ZfsSendChunk {
+  string vm_name = 1;
+  string snapshot = 2;
+  string dataset = 3;
+  bytes data = 4;
+  bool last = 5;
+}
+
+message RecvZfsSendResponse {
+  bool success = 1;
+  string snapshot = 2;
+  string message = 3;
 }
 
 message FormatEncryptedVolumeRequest {
@@ -1413,6 +1473,10 @@ message PrepareLiveMigrateReceiveRequest {
   // CPU facts of the node the guest is leaving. Unset when the source agent
   // predates GetHostCpuInfo; the destination then skips the comparison.
   HostCpuInfo source_cpu = 7;
+  // The disk is a local device-mapper target already present on this node
+  // (`/dev/mapper/kcore-vm-<name>`). Skip the RBD map; the volume mirror
+  // created the device.
+  bool local_disk = 8;
 }
 
 message PrepareLiveMigrateReceiveResponse {
@@ -1692,6 +1756,133 @@ message KubernetesAdminResponse {
   int32 status_code = 1;
   string body = 2;
   string message = 3;
+}
+
+message InspectLocalVmDiskRequest {
+  string vm_name = 1;
+  string storage_backend = 2;
+  string vg_name = 3;
+  string pool_name = 4;
+}
+
+message InspectLocalVmDiskResponse {
+  bool success = 1;
+  string message = 2;
+  string mapper_path = 3;
+  string backing_path = 4;
+  int64 size_bytes = 5;
+  bool mapper_present = 6;
+  bool guest_uses_mapper = 7;
+  bool memory_shared = 8;
+  bool running = 9;
+  string state = 10;
+}
+
+message PrepareVolumeMirrorTargetRequest {
+  string vm_name = 1;
+  string storage_backend = 2;
+  int64 size_bytes = 3;
+  string bind_addr = 4;
+  string vg_name = 5;
+  string pool_name = 6;
+}
+
+message PrepareVolumeMirrorTargetResponse {
+  bool success = 1;
+  string message = 2;
+  int32 listen_port = 3;
+  string export_name = 4;
+  string listen_addr = 5;
+  int64 device_bytes = 6;
+  string mapper_path = 7;
+}
+
+message StartVolumeMirrorRequest {
+  string vm_name = 1;
+  string target_host = 2;
+  int32 target_port = 3;
+  string export_name = 4;
+  string storage_backend = 5;
+  string vg_name = 6;
+  string pool_name = 7;
+}
+
+message StartVolumeMirrorResponse {
+  bool success = 1;
+  string message = 2;
+  string nbd_device = 3;
+}
+
+message GetVolumeMirrorStatusRequest { string vm_name = 1; }
+
+message GetVolumeMirrorStatusResponse {
+  bool success = 1;
+  string message = 2;
+  bool in_sync = 3;
+  int64 bytes_synced = 4;
+  int64 bytes_total = 5;
+  bool degraded = 6;
+}
+
+message CopyLocalVolumeRequest {
+  string vm_name = 1;
+  string storage_backend = 2;
+  string vg_name = 3;
+  string pool_name = 4;
+  string target_host = 5;
+  int32 target_port = 6;
+  string export_name = 7;
+}
+
+message CopyLocalVolumeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CommitVolumeMirrorTargetRequest { string vm_name = 1; }
+
+message CommitVolumeMirrorTargetResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message AbortVolumeMirrorRequest {
+  string vm_name = 1;
+  // Delete the destination copy. Ignored on the source, which only reloads
+  // the mapping back to linear so the guest keeps its disk.
+  bool destroy_volume = 2;
+}
+
+message AbortVolumeMirrorResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ReleaseVolumeMirrorRequest {
+  string vm_name = 1;
+  // "target" stops the NBD export and keeps the volume.
+  // "source" deletes the local copy after a successful move.
+  string role = 2;
+}
+
+message ReleaseVolumeMirrorResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SetLocalVmQuiescedRequest {
+  string vm_name = 1;
+  bool quiesced = 2;
+  // With quiesced = false: start the unit again. False only lifts the
+  // Restart=no drop-in, which is what a successful cold move wants — the
+  // unit is about to disappear from the source configuration.
+  bool start = 3;
+}
+
+message SetLocalVmQuiescedResponse {
+  bool success = 1;
+  string message = 2;
+  bool vmm_stopped = 3;
 }
 
 message PrepareInstantDiskRequest {

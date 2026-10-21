@@ -675,6 +675,7 @@ fn vms_table(data: VmsPageDto) -> impl IntoView {
                         <th>"State"</th>
                         <th>"Node"</th>
                         <th>"Storage"</th>
+                        <th>"HA"</th>
                         <th>"vCPU"</th>
                         <th>"Memory"</th>
                         <th></th>
@@ -718,6 +719,7 @@ fn vm_row(vm: VmRowDto) -> impl IntoView {
             <td><span class={badge_class}>{vm.state.clone()}</span></td>
             <td><code class="inline">{vm.node_id.clone()}</code></td>
             <td>{vm.storage_backend.clone()}</td>
+            <td>{vm.ha.clone()}</td>
             <td>{vm.cpu}</td>
             <td>{vm.memory.clone()}</td>
             <td><a href=console_href>"Console"</a></td>

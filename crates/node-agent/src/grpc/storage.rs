@@ -2,6 +2,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -15,6 +16,7 @@ pub struct StorageService {
     storage: Arc<dyn StorageAdapter>,
     lvm_vg: Option<String>,
     zfs_pool: Option<String>,
+    zfs_prefix: String,
 }
 
 impl StorageService {
@@ -23,6 +25,7 @@ impl StorageService {
             storage: storage::default_adapter(),
             lvm_vg: None,
             zfs_pool: None,
+            zfs_prefix: "kcore-".to_string(),
         }
     }
 
@@ -31,6 +34,7 @@ impl StorageService {
             storage,
             lvm_vg: None,
             zfs_pool: None,
+            zfs_prefix: "kcore-".to_string(),
         }
     }
 
@@ -41,6 +45,14 @@ impl StorageService {
 
     pub fn with_zfs_pool(mut self, pool: impl Into<String>) -> Self {
         self.zfs_pool = Some(pool.into());
+        self
+    }
+
+    pub fn with_zfs_prefix(mut self, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        if !prefix.is_empty() {
+            self.zfs_prefix = prefix;
+        }
         self
     }
 
@@ -196,12 +208,223 @@ impl proto::node_storage_server::NodeStorage for StorageService {
     ) -> Result<Response<proto::FenceVolumeResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
         let req = request.into_inner();
-        let blocklisted = tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             storage::ceph_fence_volume(&req.backend_handle, &req.source_hosts)
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))??;
-        Ok(Response::new(proto::FenceVolumeResponse { blocklisted }))
+        Ok(Response::new(proto::FenceVolumeResponse {
+            blocklisted: outcome.blocklisted,
+            host_state: outcome.host_state,
+        }))
+    }
+
+    async fn unfence_host(
+        &self,
+        request: Request<proto::UnfenceHostRequest>,
+    ) -> Result<Response<proto::UnfenceHostResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let removed =
+            tokio::task::spawn_blocking(move || storage::ceph_unfence_hosts(&req.source_hosts))
+                .await
+                .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::UnfenceHostResponse {
+            success: true,
+            removed,
+        }))
+    }
+
+    type PullZfsSendStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::ZfsSendChunk, Status>> + Send>>;
+
+    async fn pull_zfs_send(
+        &self,
+        request: Request<proto::PullZfsSendRequest>,
+    ) -> Result<Response<Self::PullZfsSendStream>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let pool = if req.pool.is_empty() {
+            self.zfs_pool.clone().unwrap_or_else(|| "tank0".to_string())
+        } else {
+            req.pool
+        };
+        let prefix = if req.dataset_prefix.is_empty() {
+            self.zfs_prefix.clone()
+        } else {
+            req.dataset_prefix
+        };
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
+            .unwrap_or(0);
+        let plan = crate::zfs_replica::plan_send(
+            &pool,
+            &prefix,
+            &req.vm_name,
+            &req.incremental_from,
+            unix,
+        )
+        .map_err(Status::invalid_argument)?;
+        let mut child = tokio::process::Command::new("zfs")
+            .args(&plan.send_args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| Status::internal(format!("starting zfs send: {e}")))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Status::internal("zfs send has no stdout"))?;
+        let stderr = child.stderr.take();
+        let vm_name = req.vm_name;
+        let snapshot = plan.snapshot;
+        let dataset = plan.dataset;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = proto::ZfsSendChunk {
+                            vm_name: vm_name.clone(),
+                            snapshot: snapshot.clone(),
+                            dataset: dataset.clone(),
+                            data: buf[..n].to_vec(),
+                            last: false,
+                        };
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            let _ = child.kill().await;
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("reading zfs send: {e}"))))
+                            .await;
+                        let _ = child.kill().await;
+                        return;
+                    }
+                }
+            }
+            let status = child.wait().await;
+            match status {
+                Ok(code) if code.success() => {
+                    let _ = tx
+                        .send(Ok(proto::ZfsSendChunk {
+                            vm_name,
+                            snapshot,
+                            dataset,
+                            data: Vec::new(),
+                            last: true,
+                        }))
+                        .await;
+                }
+                Ok(code) => {
+                    let mut err = String::new();
+                    if let Some(mut stderr) = stderr {
+                        let _ = stderr.read_to_string(&mut err).await;
+                    }
+                    let _ = tx
+                        .send(Err(Status::internal(format!(
+                            "zfs send exited {code}: {}",
+                            err.trim()
+                        ))))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("waiting for zfs send: {e}"))))
+                        .await;
+                }
+            }
+        });
+        let stream: Self::PullZfsSendStream = Box::pin(ReceiverStream::new(rx));
+        Ok(Response::new(stream))
+    }
+
+    async fn recv_zfs_send(
+        &self,
+        request: Request<tonic::Streaming<proto::ZfsSendChunk>>,
+    ) -> Result<Response<proto::RecvZfsSendResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let mut stream = request.into_inner();
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("zfs recv stream is empty"))?;
+        let vm_name = first.vm_name.clone();
+        let snapshot = first.snapshot.clone();
+        let dataset = if first.dataset.is_empty() {
+            let pool = self.zfs_pool.clone().unwrap_or_else(|| "tank0".to_string());
+            crate::zfs_replica::dataset_name(&pool, &self.zfs_prefix, &vm_name)
+                .map_err(Status::invalid_argument)?
+        } else {
+            first.dataset.clone()
+        };
+        if dataset.contains([' ', ';']) || snapshot.contains([' ', ';']) {
+            return Err(Status::invalid_argument("dataset or snapshot is not safe"));
+        }
+        let mut child = tokio::process::Command::new("zfs")
+            .args(["recv", "-F", "-u", &dataset])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| Status::internal(format!("starting zfs recv: {e}")))?;
+        let mut stderr = child.stderr.take();
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Status::internal("zfs recv has no stdin"))?;
+        stdin
+            .write_all(&first.data)
+            .await
+            .map_err(|e| Status::internal(format!("writing zfs recv: {e}")))?;
+        let mut failed: Option<Status> = None;
+        if !first.last {
+            while let Some(chunk) = stream.message().await? {
+                if stdin.write_all(&chunk.data).await.is_err() {
+                    failed = Some(Status::internal("zfs recv stopped reading"));
+                    break;
+                }
+                if chunk.last {
+                    break;
+                }
+            }
+        }
+        drop(stdin);
+        if let Some(err) = failed {
+            let _ = child.kill().await;
+            return Err(err);
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| Status::internal(format!("waiting for zfs recv: {e}")))?;
+        if !status.success() {
+            let mut err = String::new();
+            if let Some(mut stderr) = stderr.take() {
+                let _ = stderr.read_to_string(&mut err).await;
+            }
+            return Ok(Response::new(proto::RecvZfsSendResponse {
+                success: false,
+                snapshot,
+                message: format!("zfs recv exited {status}: {}", err.trim()),
+            }));
+        }
+        if let Err(e) = crate::zfs_replica::write_replica_markers(&vm_name, &snapshot) {
+            return Ok(Response::new(proto::RecvZfsSendResponse {
+                success: false,
+                snapshot,
+                message: e,
+            }));
+        }
+        Ok(Response::new(proto::RecvZfsSendResponse {
+            success: true,
+            snapshot,
+            message: String::new(),
+        }))
     }
 
     async fn rollback_volume(

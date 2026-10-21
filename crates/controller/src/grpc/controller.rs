@@ -201,6 +201,13 @@ fn gpu_info_from_row(
     }
 }
 
+/// A fence counts only when it covers the lost host's address, not merely
+/// a watcher that happened to still be listed. The node agent prefixes
+/// those entries with `range:`.
+fn fence_covers_lost_host(entries: &[String]) -> bool {
+    entries.iter().any(|entry| entry.starts_with("range:"))
+}
+
 fn accepts_migrated_vms(node: &NodeRow) -> Result<(), Status> {
     if node.approval_status != "approved" {
         return Err(Status::failed_precondition(format!(
@@ -490,6 +497,7 @@ pub struct ControllerService {
     revocation_fail_mode: String,
     webhooks: crate::webhooks::Dispatcher,
     overcommit: crate::scheduler::Overcommit,
+    failover: crate::config::FailoverConfig,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
     #[cfg(test)]
@@ -547,6 +555,78 @@ fn explicit_net_policy(
         gateway.to_string(),
         req.east_west_firewall,
     )))
+}
+
+/// Restores a live disk mirror if the migrate RPC is cancelled while the
+/// resync is still running. A client timeout drops this future at the next
+/// `.await`, and `Drop` does not await, so the cleanup is spawned.
+struct LiveMirrorGuard {
+    armed: bool,
+    service: ControllerService,
+    source: NodeRow,
+    target: NodeRow,
+    runtime_name: String,
+    op_id: String,
+}
+
+impl LiveMirrorGuard {
+    fn arm(
+        service: ControllerService,
+        source: NodeRow,
+        target: NodeRow,
+        runtime_name: String,
+        op_id: String,
+    ) -> Self {
+        Self {
+            armed: true,
+            service,
+            source,
+            target,
+            runtime_name,
+            op_id,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LiveMirrorGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let service = self.service.clone();
+        let source = self.source.clone();
+        let target = self.target.clone();
+        let runtime_name = self.runtime_name.clone();
+        let op_id = self.op_id.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            warn!(
+                op = %op_id,
+                vm = %runtime_name,
+                "live mirror RPC dropped; restoring the source disk"
+            );
+            match service.abort_volume_on(&source, &runtime_name, false).await {
+                Ok(()) => {
+                    let _ = service.abort_volume_on(&target, &runtime_name, true).await;
+                    service.close_local_op(&op_id, VmOperationRow::PHASE_CANCELLED);
+                }
+                Err(status) => {
+                    warn!(
+                        op = %op_id,
+                        error = %status,
+                        "dropped mirror could not restore the source; destination copy kept"
+                    );
+                }
+            }
+        });
+    }
 }
 
 fn extra_nics_by_vm(
@@ -737,6 +817,7 @@ impl ControllerService {
             revocation_fail_mode: crate::config::RevocationConfig::default().fail_mode,
             webhooks: crate::webhooks::Dispatcher::noop(),
             overcommit: crate::scheduler::Overcommit::default(),
+            failover: crate::config::FailoverConfig::default(),
             #[cfg(test)]
             test_push_hook: None,
             #[cfg(test)]
@@ -776,6 +857,11 @@ impl ControllerService {
             cpu: scheduler.cpu_overcommit,
             memory: scheduler.memory_overcommit,
         };
+        self
+    }
+
+    pub fn with_failover(mut self, failover: crate::config::FailoverConfig) -> Self {
+        self.failover = failover;
         self
     }
 
@@ -916,6 +1002,7 @@ impl ControllerService {
             revocation_fail_mode: crate::config::RevocationConfig::default().fail_mode,
             webhooks: crate::webhooks::Dispatcher::noop(),
             overcommit: crate::scheduler::Overcommit::default(),
+            failover: crate::config::FailoverConfig::default(),
             test_push_hook: Some(hook),
             test_fence_hook: None,
         }
@@ -1567,9 +1654,17 @@ impl ControllerService {
     }
 
     pub(crate) fn ceph_member_ids(&self) -> HashSet<String> {
-        self.db
-            .list_ceph_clusters()
-            .unwrap_or_default()
+        let clusters = match self.db.list_ceph_clusters() {
+            Ok(clusters) => clusters,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "could not list Ceph clusters; no host will be treated as a Ceph member"
+                );
+                return HashSet::new();
+            }
+        };
+        clusters
             .into_iter()
             .filter_map(|c| ceph_cluster_spec::spec_from_json(&c.spec_json).ok())
             .flat_map(|s| s.nodes.into_iter().map(|n| n.node_id))
@@ -2304,31 +2399,36 @@ impl ControllerService {
         }
     }
 
-    async fn live_migrate_vm(
+    fn local_fail(operation_id: impl Into<String>, status: Status) -> LiveMigrateFailure {
+        LiveMigrateFailure {
+            send_succeeded: false,
+            status,
+            operation_id: operation_id.into(),
+        }
+    }
+
+    fn begin_local_op(
         &self,
         vm: &VmRow,
         source: &NodeRow,
         target: &NodeRow,
-        volume: &VolumeRow,
-        runtime_name: &str,
-        dest_host: &str,
-    ) -> Result<LiveMigrateOutcome, LiveMigrateFailure> {
+        phase: &str,
+    ) -> Result<String, LiveMigrateFailure> {
         if let Ok(Some(open)) = self.db.get_open_vm_operation(&vm.id) {
-            return Err(LiveMigrateFailure {
-                send_succeeded: false,
-                status: Status::failed_precondition(format!(
+            return Err(Self::local_fail(
+                open.id.clone(),
+                Status::failed_precondition(format!(
                     "VM '{}' already has open operation {} in phase {}",
                     vm.name, open.id, open.phase
                 )),
-                operation_id: open.id,
-            });
+            ));
         }
         let op_id = Uuid::new_v4().to_string();
         if let Err(e) = self.db.insert_vm_operation(&VmOperationRow {
             id: op_id.clone(),
             vm_id: vm.id.clone(),
             kind: VmOperationRow::KIND_LIVE_MIGRATE.into(),
-            phase: VmOperationRow::PHASE_PREPARING.into(),
+            phase: phase.to_string(),
             source_node: source.id.clone(),
             target_node: target.id.clone(),
             cancel_requested: false,
@@ -2338,53 +2438,886 @@ impl ControllerService {
             updated_at: String::new(),
             finished_at: String::new(),
         }) {
-            return Err(LiveMigrateFailure {
-                send_succeeded: false,
-                status: Status::internal(format!("recording migrate operation: {e}")),
-                operation_id: op_id,
-            });
+            return Err(Self::local_fail(
+                op_id,
+                Status::internal(format!("recording migrate operation: {e}")),
+            ));
         }
-        let attached =
-            self.db
-                .list_attached_volumes_for_vm(&vm.id)
-                .map_err(|e| LiveMigrateFailure {
+        Ok(op_id)
+    }
+
+    fn close_local_op(&self, op_id: &str, phase: &str) {
+        let _ = self
+            .db
+            .update_vm_operation_phase(op_id, phase, Some(false), None, true);
+    }
+
+    async fn node_has_local_migrate(&self, node: &NodeRow) -> Result<bool, Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        match admin
+            .get_ch_vm_module_features(node_proto::GetChVmModuleFeaturesRequest {})
+            .await
+        {
+            Ok(resp) => Ok(resp
+                .into_inner()
+                .features
+                .iter()
+                .any(|feature| feature == crate::local_migrate::FEATURE)),
+            Err(e) if e.code() == tonic::Code::Unimplemented => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Refuse an LVM destination that has already reported too little free
+    /// space. A node that does not implement `GetLvmInfo` is left to `lvcreate`.
+    async fn ensure_lvm_room(&self, node: &NodeRow, need_bytes: i64) -> Result<(), Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let info = match admin.get_lvm_info(node_proto::GetLvmInfoRequest {}).await {
+            Ok(resp) => resp.into_inner(),
+            Err(e) if e.code() == tonic::Code::Unimplemented => return Ok(()),
+            Err(e) => {
+                warn!(node = %node.id, error = %e, "GetLvmInfo failed; lvcreate will report space");
+                return Ok(());
+            }
+        };
+        if !info.available {
+            return Ok(());
+        }
+        let Some(group) = info
+            .volume_groups
+            .iter()
+            .find(|group| group.name == crate::local_migrate::LVM_VG)
+        else {
+            return Ok(());
+        };
+        if group.free_bytes < need_bytes {
+            return Err(Status::failed_precondition(format!(
+                "volume group {} on {} has {} bytes free, need {need_bytes}",
+                crate::local_migrate::LVM_VG,
+                node.id,
+                group.free_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    async fn abort_volume_on(
+        &self,
+        node: &NodeRow,
+        vm_name: &str,
+        destroy_volume: bool,
+    ) -> Result<(), Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let resp = admin
+            .abort_volume_mirror(node_proto::AbortVolumeMirrorRequest {
+                vm_name: vm_name.to_string(),
+                destroy_volume,
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!("aborting volume mirror for {vm_name} on {}", node.id),
+                )
+            })?
+            .into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(Status::internal(format!(
+                "abort volume mirror on {}: {}",
+                node.id, resp.message
+            )))
+        }
+    }
+
+    async fn release_volume_on(
+        &self,
+        node: &NodeRow,
+        vm_name: &str,
+        role: &str,
+    ) -> Result<(), Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let resp = admin
+            .release_volume_mirror(node_proto::ReleaseVolumeMirrorRequest {
+                vm_name: vm_name.to_string(),
+                role: role.to_string(),
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!(
+                        "releasing volume mirror ({role}) for {vm_name} on {}",
+                        node.id
+                    ),
+                )
+            })?
+            .into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(Status::internal(format!(
+                "release volume mirror on {}: {}",
+                node.id, resp.message
+            )))
+        }
+    }
+
+    async fn set_local_quiesced(
+        &self,
+        node: &NodeRow,
+        vm_name: &str,
+        quiesced: bool,
+        start: bool,
+    ) -> Result<(), Status> {
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let resp = admin
+            .set_local_vm_quiesced(node_proto::SetLocalVmQuiescedRequest {
+                vm_name: vm_name.to_string(),
+                quiesced,
+                start,
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!("changing quiesce for {vm_name} on {}", node.id),
+                )
+            })?
+            .into_inner();
+        if resp.success {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(resp.message))
+        }
+    }
+
+    /// Move an LVM or ZFS VM by copying its block device, then either live
+    /// migrating memory or reassigning the stopped guest.
+    ///
+    /// The destination copy is destroyed only when this attempt still owns it
+    /// and the guest has not been sent. After a successful send both copies
+    /// are kept until the source copy is explicitly released.
+    async fn migrate_local_disk(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        allow_cold: bool,
+    ) -> Result<(LiveMigrateOutcome, &'static str), LiveMigrateFailure> {
+        if !self.node_supports_backend(source, &vm.storage_backend) {
+            return Err(Self::local_fail(
+                "",
+                Status::failed_precondition(format!(
+                    "source node {} uses storage backend {}, which cannot host this {} VM",
+                    source.id, source.storage_backend, vm.storage_backend
+                )),
+            ));
+        }
+        if !self.node_supports_backend(target, &vm.storage_backend) {
+            return Err(Self::local_fail(
+                "",
+                Status::failed_precondition(format!(
+                    "target node {} uses storage backend {}, which cannot host this {} VM",
+                    target.id, target.storage_backend, vm.storage_backend
+                )),
+            ));
+        }
+        for node in [source, target] {
+            match self.node_has_local_migrate(node).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Self::local_fail(
+                        "",
+                        Status::failed_precondition(format!(
+                            "node {} does not advertise local disk migration ({}); upgrade it and apply its configuration",
+                            node.id,
+                            crate::local_migrate::FEATURE
+                        )),
+                    ));
+                }
+                Err(status) => return Err(Self::local_fail("", status)),
+            }
+        }
+
+        let runtime_name = sanitize_nix_attr_key(&vm.name);
+        let mut source_admin = self
+            .ensure_admin_client_for_node(source)
+            .await
+            .map_err(|status| Self::local_fail("", status))?;
+        let inspected = source_admin
+            .inspect_local_vm_disk(node_proto::InspectLocalVmDiskRequest {
+                vm_name: runtime_name.clone(),
+                storage_backend: vm.storage_backend.clone(),
+                vg_name: crate::local_migrate::LVM_VG.into(),
+                pool_name: crate::local_migrate::ZFS_POOL.into(),
+            })
+            .await
+            .map_err(|e| {
+                Self::local_fail(
+                    "",
+                    status_with_context(&e, &format!("inspecting disk of VM '{}'", vm.name)),
+                )
+            })?
+            .into_inner();
+        if !inspected.success || inspected.size_bytes <= 0 {
+            return Err(Self::local_fail(
+                "",
+                Status::failed_precondition(format!(
+                    "VM '{}' has no local disk on {}: {}",
+                    vm.name, source.id, inspected.message
+                )),
+            ));
+        }
+        let plan = crate::local_migrate::plan_local_move(
+            inspected.running,
+            inspected.guest_uses_mapper,
+            inspected.memory_shared,
+            allow_cold,
+        )
+        .map_err(|message| Self::local_fail("", Status::failed_precondition(message)))?;
+        if vm.storage_backend == "lvm" {
+            self.ensure_lvm_room(target, inspected.size_bytes)
+                .await
+                .map_err(|status| Self::local_fail("", status))?;
+        }
+
+        match plan {
+            crate::local_migrate::LocalMove::Live => {
+                self.live_mirror_local_disk(vm, source, target, &runtime_name, inspected.size_bytes)
+                    .await
+            }
+            crate::local_migrate::LocalMove::ColdCopy => {
+                self.cold_copy_local_disk(vm, source, target, &runtime_name, inspected.size_bytes)
+                    .await
+            }
+        }
+    }
+
+    async fn prepare_mirror_target(
+        &self,
+        target: &NodeRow,
+        vm: &VmRow,
+        runtime_name: &str,
+        size_bytes: i64,
+    ) -> Result<node_proto::PrepareVolumeMirrorTargetResponse, Status> {
+        let mut dest_admin = self.ensure_admin_client_for_node(target).await?;
+        let prepared = dest_admin
+            .prepare_volume_mirror_target(node_proto::PrepareVolumeMirrorTargetRequest {
+                vm_name: runtime_name.to_string(),
+                storage_backend: vm.storage_backend.clone(),
+                size_bytes,
+                bind_addr: grpc_address_host(&target.address),
+                vg_name: crate::local_migrate::LVM_VG.into(),
+                pool_name: crate::local_migrate::ZFS_POOL.into(),
+            })
+            .await
+            .map_err(|e| {
+                status_with_context(
+                    &e,
+                    &format!("preparing mirror target for '{}' on {}", vm.name, target.id),
+                )
+            })?
+            .into_inner();
+        if !prepared.success || prepared.listen_port <= 0 {
+            return Err(Status::internal(format!(
+                "prepare mirror target failed: {}",
+                prepared.message
+            )));
+        }
+        Ok(prepared)
+    }
+
+    async fn live_mirror_local_disk(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        runtime_name: &str,
+        size_bytes: i64,
+    ) -> Result<(LiveMigrateOutcome, &'static str), LiveMigrateFailure> {
+        let op_id =
+            self.begin_local_op(vm, source, target, VmOperationRow::PHASE_MIRROR_SYNCING)?;
+        let prepared = match self
+            .prepare_mirror_target(target, vm, runtime_name, size_bytes)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                if let Err(abort) = self.abort_volume_on(target, runtime_name, true).await {
+                    warn!(vm = %vm.name, error = %abort, "mirror target cleanup after prepare failure");
+                }
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        let mut source_admin = match self.ensure_admin_client_for_node(source).await {
+            Ok(admin) => admin,
+            Err(status) => {
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        if let Err(e) = source_admin
+            .start_volume_mirror(node_proto::StartVolumeMirrorRequest {
+                vm_name: runtime_name.to_string(),
+                target_host: prepared.listen_addr.clone(),
+                target_port: prepared.listen_port,
+                export_name: prepared.export_name.clone(),
+                storage_backend: vm.storage_backend.clone(),
+                vg_name: crate::local_migrate::LVM_VG.into(),
+                pool_name: crate::local_migrate::ZFS_POOL.into(),
+            })
+            .await
+        {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(
+                op_id,
+                status_with_context(&e, &format!("starting disk mirror for '{}'", vm.name)),
+            ));
+        }
+
+        let mut mirror_guard = LiveMirrorGuard::arm(
+            self.clone(),
+            source.clone(),
+            target.clone(),
+            runtime_name.to_string(),
+            op_id.clone(),
+        );
+        let started = std::time::Instant::now();
+        let limit = Duration::from_secs(6 * 60 * 60);
+        let mut status_errors = 0u32;
+        loop {
+            if started.elapsed() > limit {
+                mirror_guard.disarm();
+                let _ = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(
+                    op_id,
+                    Status::deadline_exceeded(format!(
+                        "disk mirror of '{}' did not reach sync within 6h",
+                        vm.name
+                    )),
+                ));
+            }
+            let cancel = self
+                .db
+                .get_vm_operation(&op_id)
+                .ok()
+                .flatten()
+                .is_some_and(|op| op.cancel_requested);
+            if cancel {
+                mirror_guard.disarm();
+                let restored = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                if let Err(status) = restored {
+                    return Err(Self::local_fail(
+                        op_id,
+                        status_with_context(
+                            &status,
+                            "cancelled, but the source mirror could not be restored",
+                        ),
+                    ));
+                }
+                self.close_local_op(&op_id, VmOperationRow::PHASE_CANCELLED);
+                return Err(Self::local_fail(
+                    op_id,
+                    Status::cancelled(format!("disk mirror of '{}' cancelled", vm.name)),
+                ));
+            }
+            match source_admin
+                .get_volume_mirror_status(node_proto::GetVolumeMirrorStatusRequest {
+                    vm_name: runtime_name.to_string(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    status_errors = 0;
+                    let status = resp.into_inner();
+                    let detail = crate::local_migrate::mirror_detail(
+                        status.bytes_synced,
+                        status.bytes_total,
+                        status.in_sync,
+                    );
+                    let _ = self.db.update_vm_operation_phase(
+                        &op_id,
+                        VmOperationRow::PHASE_MIRROR_SYNCING,
+                        None,
+                        Some(&detail),
+                        false,
+                    );
+                    if !status.success || status.degraded {
+                        mirror_guard.disarm();
+                        let _ = self.abort_volume_on(source, runtime_name, false).await;
+                        let _ = self.abort_volume_on(target, runtime_name, true).await;
+                        self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                        return Err(Self::local_fail(
+                            op_id,
+                            Status::failed_precondition(format!(
+                                "disk mirror of '{}' became unusable ({})",
+                                vm.name, status.message
+                            )),
+                        ));
+                    }
+                    if status.in_sync {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    status_errors += 1;
+                    warn!(vm = %vm.name, error = %e, "volume mirror status");
+                    if status_errors >= 3 {
+                        mirror_guard.disarm();
+                        let _ = self.abort_volume_on(source, runtime_name, false).await;
+                        let _ = self.abort_volume_on(target, runtime_name, true).await;
+                        self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                        return Err(Self::local_fail(
+                            op_id,
+                            status_with_context(&e, "reading disk mirror status"),
+                        ));
+                    }
+                    if let Ok(fresh) = self.ensure_admin_client_for_node(source).await {
+                        source_admin = fresh;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        let mut dest_admin = match self.ensure_admin_client_for_node(target).await {
+            Ok(admin) => admin,
+            Err(status) => {
+                mirror_guard.disarm();
+                let _ = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        if let Err(e) = dest_admin
+            .commit_volume_mirror_target(node_proto::CommitVolumeMirrorTargetRequest {
+                vm_name: runtime_name.to_string(),
+            })
+            .await
+        {
+            mirror_guard.disarm();
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(
+                op_id,
+                status_with_context(&e, "writing the destination seed marker"),
+            ));
+        }
+
+        // Memory send has its own cleanup. A drop from here on must not tear
+        // the mirror down out from under Cloud Hypervisor.
+        mirror_guard.disarm();
+        let dest_host = grpc_address_host(&target.address);
+        match self
+            .live_migrate_vm(vm, source, target, None, runtime_name, &dest_host)
+            .await
+        {
+            Ok(mut outcome) => {
+                if let Err(e) = self.release_volume_on(target, runtime_name, "target").await {
+                    warn!(vm = %vm.name, error = %e, "destination NBD export still running");
+                    outcome.warnings.push(format!(
+                        "destination NBD export for '{}' was not stopped: {e}",
+                        vm.name
+                    ));
+                }
+                if let Err(e) = self.release_volume_on(source, runtime_name, "source").await {
+                    warn!(vm = %vm.name, error = %e, "source disk was not deleted");
+                    outcome
+                        .warnings
+                        .push(format!("source disk of '{}' was not deleted: {e}", vm.name));
+                }
+                Ok((outcome, "live"))
+            }
+            Err(err) if err.send_succeeded => {
+                if let Err(e) = self.release_volume_on(target, runtime_name, "target").await {
+                    warn!(vm = %vm.name, error = %e, "stop destination NBD after send");
+                }
+                if let Err(e) = self.abort_volume_on(source, runtime_name, false).await {
+                    warn!(vm = %vm.name, error = %e, "restore source linear after send");
+                }
+                Err(err)
+            }
+            Err(err) => {
+                match self.abort_volume_on(source, runtime_name, false).await {
+                    Ok(()) => {
+                        let _ = self.abort_volume_on(target, runtime_name, true).await;
+                    }
+                    Err(status) => {
+                        warn!(
+                            vm = %vm.name,
+                            error = %status,
+                            "source mirror still active after a failed send; destination copy kept"
+                        );
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn cold_copy_local_disk(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        runtime_name: &str,
+        size_bytes: i64,
+    ) -> Result<(LiveMigrateOutcome, &'static str), LiveMigrateFailure> {
+        let op_id = self.begin_local_op(vm, source, target, VmOperationRow::PHASE_COPYING)?;
+        if let Err(status) = self
+            .set_local_quiesced(source, runtime_name, true, false)
+            .await
+        {
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(op_id, status));
+        }
+        let prepared = match self
+            .prepare_mirror_target(target, vm, runtime_name, size_bytes)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(status) => {
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                let _ = self
+                    .set_local_quiesced(source, runtime_name, false, true)
+                    .await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+
+        let stop_heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat_stop = std::sync::Arc::clone(&stop_heartbeat);
+        let heartbeat_db = self.db.clone();
+        let heartbeat_op = op_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if heartbeat_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let _ = heartbeat_db.update_vm_operation_phase(
+                    &heartbeat_op,
+                    VmOperationRow::PHASE_COPYING,
+                    None,
+                    None,
+                    false,
+                );
+            }
+        });
+        let mut source_admin = match self.ensure_admin_client_for_node(source).await {
+            Ok(admin) => admin,
+            Err(status) => {
+                stop_heartbeat.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                let _ = self
+                    .set_local_quiesced(source, runtime_name, false, true)
+                    .await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        let copied = source_admin
+            .copy_local_volume(node_proto::CopyLocalVolumeRequest {
+                vm_name: runtime_name.to_string(),
+                storage_backend: vm.storage_backend.clone(),
+                vg_name: crate::local_migrate::LVM_VG.into(),
+                pool_name: crate::local_migrate::ZFS_POOL.into(),
+                target_host: prepared.listen_addr,
+                target_port: prepared.listen_port,
+                export_name: prepared.export_name,
+            })
+            .await;
+        stop_heartbeat.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = copied {
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(
+                op_id,
+                status_with_context(&e, &format!("copying disk of '{}'", vm.name)),
+            ));
+        }
+        let cancel = self
+            .db
+            .get_vm_operation(&op_id)
+            .ok()
+            .flatten()
+            .is_some_and(|op| op.cancel_requested);
+        if cancel {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_CANCELLED);
+            return Err(Self::local_fail(
+                op_id,
+                Status::cancelled(format!("disk copy of '{}' cancelled", vm.name)),
+            ));
+        }
+
+        let mut dest_admin = match self.ensure_admin_client_for_node(target).await {
+            Ok(admin) => admin,
+            Err(status) => {
+                let _ = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                let _ = self
+                    .set_local_quiesced(source, runtime_name, false, true)
+                    .await;
+                self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+                return Err(Self::local_fail(op_id, status));
+            }
+        };
+        if let Err(e) = dest_admin
+            .commit_volume_mirror_target(node_proto::CommitVolumeMirrorTargetRequest {
+                vm_name: runtime_name.to_string(),
+            })
+            .await
+        {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(
+                op_id,
+                status_with_context(&e, "writing the destination seed marker"),
+            ));
+        }
+        if let Err(status) = self.release_volume_on(target, runtime_name, "target").await {
+            let _ = self.abort_volume_on(source, runtime_name, false).await;
+            let _ = self.abort_volume_on(target, runtime_name, true).await;
+            let _ = self
+                .set_local_quiesced(source, runtime_name, false, true)
+                .await;
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(op_id, status));
+        }
+
+        if let Err(status) = self.cold_reassign_vm(vm, source, target).await {
+            let moved = self
+                .db
+                .get_vm(&vm.id)
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.node_id == target.id);
+            if !moved {
+                let _ = self.abort_volume_on(source, runtime_name, false).await;
+                let _ = self.abort_volume_on(target, runtime_name, true).await;
+                let _ = self
+                    .set_local_quiesced(source, runtime_name, false, true)
+                    .await;
+            }
+            self.close_local_op(&op_id, VmOperationRow::PHASE_FAILED);
+            return Err(Self::local_fail(op_id, status));
+        }
+        if let Err(e) = self.release_volume_on(source, runtime_name, "source").await {
+            warn!(vm = %vm.name, error = %e, "source disk was not deleted after cold copy");
+        }
+        let _ = self
+            .set_local_quiesced(source, runtime_name, false, false)
+            .await;
+        self.close_local_op(&op_id, VmOperationRow::PHASE_DONE);
+        Ok((
+            LiveMigrateOutcome {
+                operation_id: op_id,
+                warnings: Vec::new(),
+            },
+            "cold",
+        ))
+    }
+
+    async fn respond_local_migrate(
+        &self,
+        actor: &str,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        allow_cold: bool,
+    ) -> Result<Response<controller_proto::MigrateVmResponse>, Status> {
+        match self
+            .migrate_local_disk(vm, source, target, allow_cold)
+            .await
+        {
+            Ok((outcome, mode)) => {
+                self.webhooks.emit(
+                    crate::webhooks::EVENT_VM_MIGRATED,
+                    format!("vm/{}", vm.id),
+                    serde_json::json!({
+                        "vmId": vm.id,
+                        "vmName": vm.name,
+                        "sourceNode": source.id,
+                        "targetNode": target.id,
+                        "mode": mode,
+                    }),
+                );
+                self.log_replication_event_required(
+                    actor,
+                    Some("MigrateVm"),
+                    EVT_VM_MIGRATE,
+                    &format!("vm/{}", vm.id),
+                    serde_json::json!({
+                        "vmId": vm.id,
+                        "vmName": vm.name,
+                        "sourceNode": source.id,
+                        "targetNode": target.id,
+                        "mode": mode,
+                        "operationId": outcome.operation_id,
+                        "hostWarnings": outcome.warnings,
+                    }),
+                )?;
+                let mut message = format!(
+                    "{mode}-migrated '{}' from {} to {}",
+                    vm.name, source.id, target.id
+                );
+                for line in &outcome.warnings {
+                    message.push_str("\nwarning: ");
+                    message.push_str(line);
+                }
+                Ok(Response::new(controller_proto::MigrateVmResponse {
+                    success: true,
+                    message,
+                    mode: mode.into(),
+                    source_node: source.id.clone(),
+                    target_node: target.id.clone(),
+                    operation_id: outcome.operation_id,
+                }))
+            }
+            Err(err) => {
+                warn!(
+                    vm = %vm.name,
+                    send_succeeded = err.send_succeeded,
+                    operation_id = %err.operation_id,
+                    error = %err.status,
+                    "local disk migrate failed"
+                );
+                Err(err.status)
+            }
+        }
+    }
+
+    async fn live_migrate_vm(
+        &self,
+        vm: &VmRow,
+        source: &NodeRow,
+        target: &NodeRow,
+        volume: Option<&VolumeRow>,
+        runtime_name: &str,
+        dest_host: &str,
+    ) -> Result<LiveMigrateOutcome, LiveMigrateFailure> {
+        // A local-disk move records MirrorSyncing/Copying before calling in.
+        // That row is this attempt, not a conflict.
+        let local_disk = volume.is_none();
+        let op_id = if let Ok(Some(open)) = self.db.get_open_vm_operation(&vm.id) {
+            if local_disk && crate::local_migrate::local_phase_is_open(&open.phase) {
+                open.id
+            } else {
+                return Err(LiveMigrateFailure {
                     send_succeeded: false,
-                    status: Status::internal(e.to_string()),
+                    status: Status::failed_precondition(format!(
+                        "VM '{}' already has open operation {} in phase {}",
+                        vm.name, open.id, open.phase
+                    )),
+                    operation_id: open.id,
+                });
+            }
+        } else {
+            let op_id = Uuid::new_v4().to_string();
+            if let Err(e) = self.db.insert_vm_operation(&VmOperationRow {
+                id: op_id.clone(),
+                vm_id: vm.id.clone(),
+                kind: VmOperationRow::KIND_LIVE_MIGRATE.into(),
+                phase: VmOperationRow::PHASE_PREPARING.into(),
+                source_node: source.id.clone(),
+                target_node: target.id.clone(),
+                cancel_requested: false,
+                send_succeeded: false,
+                detail_json: "{}".into(),
+                started_at: String::new(),
+                updated_at: String::new(),
+                finished_at: String::new(),
+            }) {
+                return Err(LiveMigrateFailure {
+                    send_succeeded: false,
+                    status: Status::internal(format!("recording migrate operation: {e}")),
+                    operation_id: op_id,
+                });
+            }
+            op_id
+        };
+        if local_disk {
+            let _ = self.db.update_vm_operation_phase(
+                &op_id,
+                VmOperationRow::PHASE_PREPARING,
+                Some(false),
+                None,
+                false,
+            );
+        }
+        let (rbd_volumes, encrypted_volumes, root_pool, root_image) = if let Some(volume) = volume {
+            let attached =
+                self.db
+                    .list_attached_volumes_for_vm(&vm.id)
+                    .map_err(|e| LiveMigrateFailure {
+                        send_succeeded: false,
+                        status: Status::internal(e.to_string()),
+                        operation_id: op_id.clone(),
+                    })?;
+            let rbd_volumes: Vec<node_proto::RbdImageRef> = if attached.is_empty() {
+                vec![node_proto::RbdImageRef {
+                    pool: volume.pool.clone(),
+                    image: volume.image.clone(),
+                }]
+            } else {
+                attached
+                    .iter()
+                    .map(|v| node_proto::RbdImageRef {
+                        pool: v.pool.clone(),
+                        image: v.image.clone(),
+                    })
+                    .collect()
+            };
+            let encrypted_volumes = self
+                .encrypted_volume_keys_for_vols(if attached.is_empty() {
+                    std::slice::from_ref(volume)
+                } else {
+                    attached.as_slice()
+                })
+                .map_err(|status| LiveMigrateFailure {
+                    send_succeeded: false,
+                    status,
                     operation_id: op_id.clone(),
                 })?;
-        let rbd_volumes: Vec<node_proto::RbdImageRef> = if attached.is_empty() {
-            vec![node_proto::RbdImageRef {
-                pool: volume.pool.clone(),
-                image: volume.image.clone(),
-            }]
+            let root_pool = rbd_volumes
+                .first()
+                .map(|v| v.pool.clone())
+                .unwrap_or_else(|| volume.pool.clone());
+            let root_image = rbd_volumes
+                .first()
+                .map(|v| v.image.clone())
+                .unwrap_or_else(|| volume.image.clone());
+            (rbd_volumes, encrypted_volumes, root_pool, root_image)
         } else {
-            attached
-                .iter()
-                .map(|v| node_proto::RbdImageRef {
-                    pool: v.pool.clone(),
-                    image: v.image.clone(),
-                })
-                .collect()
+            (Vec::new(), Vec::new(), String::new(), String::new())
         };
-        let encrypted_volumes = self
-            .encrypted_volume_keys_for_vols(if attached.is_empty() {
-                std::slice::from_ref(volume)
-            } else {
-                attached.as_slice()
-            })
-            .map_err(|status| LiveMigrateFailure {
-                send_succeeded: false,
-                status,
-                operation_id: op_id.clone(),
-            })?;
-        let root_pool = rbd_volumes
-            .first()
-            .map(|v| v.pool.clone())
-            .unwrap_or_else(|| volume.pool.clone());
-        let root_image = rbd_volumes
-            .first()
-            .map(|v| v.image.clone())
-            .unwrap_or_else(|| volume.image.clone());
         let mut dest_admin = self
             .ensure_admin_client_for_node(target)
             .await
@@ -2474,6 +3407,7 @@ impl ControllerService {
                 rbd_volumes: rbd_volumes.clone(),
                 encrypted_volumes: encrypted_volumes.clone(),
                 source_cpu,
+                local_disk,
             })
             .await
         {
@@ -3233,6 +4167,7 @@ impl ControllerService {
         target_node: &str,
         gpus: &[String],
         vgpus: &[String],
+        ignore_admission: bool,
     ) -> Result<Response<controller_proto::MigrateVmResponse>, Status> {
         let source_node = self
             .db
@@ -3254,6 +4189,7 @@ impl ControllerService {
             ));
         }
         accepts_migrated_vms(&target)?;
+        self.admit_move(actor, &vm, &target.id, ignore_admission)?;
         if !self.node_supports_backend(&target, &vm.storage_backend) {
             return Err(Status::failed_precondition(format!(
                 "target node does not support storage backend '{}'",
@@ -3323,6 +4259,140 @@ impl ControllerService {
             target_node: target.id,
             operation_id: String::new(),
         }))
+    }
+
+    fn admission_report(
+        &self,
+        place: Option<(&VmRow, &str)>,
+        extra: Option<(&str, i32, i64, &str, &str)>,
+    ) -> Result<crate::ha::AdmissionReport, Status> {
+        let nodes = self
+            .db
+            .list_nodes()
+            .map_err(|e| Status::internal(format!("listing nodes: {e}")))?;
+        let vms = self
+            .db
+            .list_vms()
+            .map_err(|e| Status::internal(format!("listing vms: {e}")))?;
+        let policies = self.db.list_vm_ha().unwrap_or_default();
+        let mut hosts = Vec::new();
+        let mut index = std::collections::HashMap::new();
+        for node in &nodes {
+            let (survivor, can_fail) = crate::ha::host_role(node);
+            index.insert(node.id.clone(), hosts.len());
+            hosts.push(crate::ha::AdmissionHost {
+                cpu: crate::scheduler::schedulable_cpu(node.cpu_cores, self.overcommit.cpu),
+                memory: crate::scheduler::schedulable_memory(
+                    node.memory_bytes,
+                    self.overcommit.memory,
+                ),
+                survivor,
+                can_fail,
+            });
+        }
+        let mut admission_vms = Vec::new();
+        for vm in &vms {
+            let node_id = match place {
+                Some((moving, target)) if moving.id == vm.id => target,
+                _ => vm.node_id.as_str(),
+            };
+            let Some(&host_index) = index.get(node_id) else {
+                continue;
+            };
+            let replica = policies
+                .iter()
+                .find(|row| row.vm_id == vm.id)
+                .map(|row| row.replica_node.as_str())
+                .unwrap_or("");
+            admission_vms.push(crate::ha::AdmissionVm {
+                host_index,
+                cpu: i64::from(vm.cpu),
+                memory: vm.memory_bytes,
+                protected: crate::ha::is_protected(&vm.storage_backend, replica),
+            });
+        }
+        if let Some((node_id, cpu, memory, backend, replica)) = extra {
+            if let Some(&host_index) = index.get(node_id) {
+                admission_vms.push(crate::ha::AdmissionVm {
+                    host_index,
+                    cpu: i64::from(cpu),
+                    memory,
+                    protected: crate::ha::is_protected(backend, replica),
+                });
+            }
+        }
+        Ok(crate::ha::admission(
+            &hosts,
+            &admission_vms,
+            self.failover.admission_control.host_failures_to_tolerate,
+        ))
+    }
+
+    fn enforce_admission(
+        &self,
+        report: &crate::ha::AdmissionReport,
+        ignore: bool,
+        actor: &str,
+        resource: &str,
+    ) -> Result<(), Status> {
+        if report.capacity != crate::ha::CAPACITY_INSUFFICIENT {
+            return Ok(());
+        }
+        if ignore {
+            self.record_audit(
+                actor,
+                "IgnoreAdmissionControl",
+                resource,
+                report.message.clone(),
+            );
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "admission control: {}",
+            report.message
+        )))
+    }
+
+    fn ha_view(&self, vm: &VmRow) -> (String, String, String, i32, String) {
+        let row = self.db.get_vm_ha(&vm.id).ok().flatten();
+        let replica = row
+            .as_ref()
+            .map(|row| row.replica_node.clone())
+            .unwrap_or_default();
+        (
+            crate::ha::protection(&vm.storage_backend, &replica).to_string(),
+            row.as_ref()
+                .map(|row| row.restart_priority.clone())
+                .unwrap_or_else(|| crate::ha::PRIORITY_MEDIUM.to_string()),
+            replica,
+            row.as_ref()
+                .map(|row| i32::try_from(row.replica_interval_secs).unwrap_or(0))
+                .unwrap_or(0),
+            row.as_ref()
+                .map(|row| row.vm_monitoring.clone())
+                .unwrap_or_else(|| "off".to_string()),
+        )
+    }
+
+    fn admit_move(
+        &self,
+        actor: &str,
+        vm: &VmRow,
+        target_node_id: &str,
+        ignore: bool,
+    ) -> Result<(), Status> {
+        let replica = self
+            .db
+            .get_vm_ha(&vm.id)
+            .ok()
+            .flatten()
+            .map(|row| row.replica_node)
+            .unwrap_or_default();
+        if !crate::ha::is_protected(&vm.storage_backend, &replica) {
+            return Ok(());
+        }
+        let report = self.admission_report(Some((vm, target_node_id)), None)?;
+        self.enforce_admission(&report, ignore, actor, &format!("vm/{}", vm.id))
     }
 
     fn reassign_vm_node(&self, vm: &VmRow, target_node_id: &str) -> Result<(), Status> {
@@ -4764,6 +5834,13 @@ impl ControllerService {
                     .ok()
                     .is_some_and(|names| !names.is_empty())
             {
+                if crate::local_migrate::is_local_block(&vm.storage_backend) {
+                    errors.push(format!(
+                        "VM '{}' uses a GPU or PCI device with {} storage and stays on {}",
+                        vm.name, vm.storage_backend, source_node.id
+                    ));
+                    continue;
+                }
                 let mut gpu_targets: Vec<NodeRow> = eligible_nodes
                     .iter()
                     .filter(|n| {
@@ -4878,7 +5955,7 @@ impl ControllerService {
                             vm,
                             &source_node,
                             &target,
-                            &volume,
+                            Some(&volume),
                             &runtime_name,
                             &dest_host,
                         )
@@ -4904,6 +5981,34 @@ impl ControllerService {
                                 "live migrate during drain failed before send; falling back to cold"
                             );
                         }
+                    }
+                }
+            }
+
+            if crate::local_migrate::is_local_block(&vm.storage_backend) {
+                match self
+                    .migrate_local_disk(vm, &source_node, &target, true)
+                    .await
+                {
+                    Ok(_) => {
+                        migrated += 1;
+                        destination_node_ids.insert(target.id.clone());
+                        continue;
+                    }
+                    Err(err) if err.send_succeeded => {
+                        errors.push(format!(
+                            "VM '{}' left mid-migration from {} to {}: {}",
+                            vm.name, source_node.id, target.id, err.status
+                        ));
+                        destination_node_ids.insert(target.id.clone());
+                        continue;
+                    }
+                    Err(err) => {
+                        errors.push(format!(
+                            "VM '{}' left on {}: {}",
+                            vm.name, source_node.id, err.status
+                        ));
+                        continue;
                     }
                 }
             }
@@ -4961,8 +6066,8 @@ impl ControllerService {
     }
 
     /// Addresses under which `node` can appear as a Ceph client: its Ceph
-    /// public (mon) address from every CephCluster it belongs to, plus the
-    /// host part of its gRPC address.
+    /// public (mon) address and its cluster-network address from every
+    /// CephCluster it belongs to, plus the host part of its gRPC address.
     fn ceph_client_hosts_for_node(&self, node: &NodeRow) -> Result<Vec<String>, Status> {
         let mut hosts = vec![grpc_address_host(&node.address)];
         for cluster in self
@@ -4977,6 +6082,10 @@ impl ControllerService {
                 let addr = member.mon_addr.trim();
                 if !addr.is_empty() {
                     hosts.push(grpc_address_host(addr));
+                }
+                let cluster = grpc_address_host(member.cluster_addr.trim());
+                if !cluster.is_empty() {
+                    hosts.push(cluster);
                 }
             }
         }
@@ -4994,8 +6103,9 @@ impl ControllerService {
     /// unreachable node keeps writing after the guest restarts elsewhere and
     /// the filesystem is torn apart by two kernels. Any failure here aborts
     /// the failover of this VM: a guest that stays down is recoverable, a
-    /// corrupted disk is not. A member that cannot be reached is skipped; a
-    /// member that answers with an error ends the attempt, because that
+    /// corrupted disk is not. A member that cannot be reached, does not
+    /// implement FenceVolume, or reports success without an IP range for the
+    /// lost host is skipped. Any other error ends the attempt, because that
     /// answer (image open from the wrong host, blocklist refused) is the
     /// cluster's verdict and not a transport problem.
     async fn fence_vm_volumes(
@@ -5020,7 +6130,13 @@ impl ControllerService {
             let handle = format!("{}/{}", vol.pool, vol.image);
             #[cfg(test)]
             if let Some(hook) = &self.test_fence_hook {
-                blocklisted.extend(hook(&handle, &hosts)?);
+                let added = hook(&handle, &hosts)?;
+                if !fence_covers_lost_host(&added) {
+                    return Err(Status::failed_precondition(format!(
+                        "fence of {handle} did not blocklist an IP range for the lost host"
+                    )));
+                }
+                blocklisted.extend(added);
                 continue;
             }
             let mut last_err = Status::unavailable(format!(
@@ -5048,16 +6164,32 @@ impl ControllerService {
                     .await
                 {
                     Ok(resp) => {
-                        blocklisted.extend(resp.into_inner().blocklisted);
-                        fenced = true;
-                        break;
-                    }
-                    Err(e) if e.code() == tonic::Code::Unavailable => {
-                        last_err = Status::unavailable(format!(
-                            "{} did not answer FenceVolume for {handle}: {}",
-                            member.id,
-                            e.message()
+                        let added = resp.into_inner().blocklisted;
+                        if fence_covers_lost_host(&added) {
+                            blocklisted.extend(added);
+                            fenced = true;
+                            break;
+                        }
+                        // An older agent answers success with an empty list
+                        // after the watchers have already dropped. That is
+                        // not a fence: the lost host can still map the image.
+                        last_err = Status::failed_precondition(format!(
+                            "{} reported {handle} fenced without a blocklist range for the lost host",
+                            member.id
                         ));
+                    }
+                    Err(e)
+                        if e.code() == tonic::Code::Unavailable
+                            || e.code() == tonic::Code::Unimplemented =>
+                    {
+                        last_err = Status::new(
+                            e.code(),
+                            format!(
+                                "{} did not answer FenceVolume for {handle}: {}",
+                                member.id,
+                                e.message()
+                            ),
+                        );
                     }
                     Err(e) => {
                         return Err(Status::new(
@@ -5072,6 +6204,208 @@ impl ControllerService {
             }
         }
         Ok(blocklisted)
+    }
+
+    /// A controller with no replication peers is the only actor. With peers,
+    /// only the failover lease holder moves VMs.
+    fn failover_may_act(&self) -> bool {
+        let Some(replication) = &self.replication else {
+            return true;
+        };
+        let Ok(Some(lease)) = self.db.get_cluster_lease("failover") else {
+            return false;
+        };
+        lease.holder == replication.controller_id && lease.expires_at_ms > crate::ha::now_unix_ms()
+    }
+
+    pub fn maintain_failover_lease(&self) {
+        let Some(replication) = &self.replication else {
+            return;
+        };
+        let fresh = self
+            .db
+            .has_fresh_direct_heartbeat(self.failover.node_timeout_secs)
+            .unwrap_or(false);
+        let current = self.db.get_cluster_lease("failover").ok().flatten();
+        let view = current.as_ref().map(|row| crate::ha::LeaseView {
+            holder: row.holder.clone(),
+            expires_at_ms: row.expires_at_ms,
+            term: row.term,
+        });
+        if let crate::ha::LeaseDecision::Act {
+            term,
+            expires_at_ms,
+        } = crate::ha::decide_lease(
+            crate::ha::now_unix_ms(),
+            &replication.controller_id,
+            true,
+            fresh,
+            0,
+            self.failover.node_timeout_secs.saturating_mul(500),
+            self.failover.lease_renew_secs.saturating_mul(1000),
+            view.as_ref(),
+        ) {
+            let _ = self.db.upsert_cluster_lease(&crate::db::ClusterLeaseRow {
+                name: "failover".into(),
+                holder: replication.controller_id.clone(),
+                expires_at_ms,
+                term,
+            });
+        }
+    }
+
+    pub async fn ha_pass(&self, announced: &mut std::collections::HashSet<String>) {
+        self.maintain_failover_lease();
+        if self.failover.enabled && self.failover_may_act() {
+            self.failover_not_ready_nodes(announced).await;
+            self.replicate_due_zfs().await;
+        }
+    }
+
+    async fn unfence_returned_node(&self, node_id: &str) -> bool {
+        let Ok(Some(node)) = self.db.get_node(node_id) else {
+            return false;
+        };
+        let Ok(hosts) = self.ceph_client_hosts_for_node(&node) else {
+            return false;
+        };
+        if hosts.is_empty() {
+            return true;
+        }
+        let Ok(members) = self.db.list_nodes() else {
+            return false;
+        };
+        for member in members
+            .iter()
+            .filter(|member| member.id != node_id && member.status == "ready")
+        {
+            if !self.node_supports_backend(member, "ceph") {
+                continue;
+            }
+            if self.clients.get_storage(&member.address).is_none()
+                && self.clients.connect(&member.address).await.is_err()
+            {
+                continue;
+            }
+            let Some(mut storage) = self.clients.get_storage(&member.address) else {
+                continue;
+            };
+            if storage
+                .unfence_host(node_proto::UnfenceHostRequest {
+                    source_hosts: hosts.clone(),
+                })
+                .await
+                .is_ok()
+            {
+                info!(node_id, "lifted failover blocklist after the node returned");
+                return true;
+            }
+        }
+        warn!(
+            node_id,
+            "could not lift the failover blocklist; the fence hold stays until a Ceph member accepts the removal"
+        );
+        false
+    }
+
+    async fn replicate_due_zfs(&self) {
+        let Ok(policies) = self.db.list_vm_ha() else {
+            return;
+        };
+        let now = crate::ha::now_unix_secs();
+        for policy in policies {
+            if !crate::ha::replica_due(policy.last_replica_at, policy.replica_interval_secs, now) {
+                continue;
+            }
+            let Ok(Some(vm)) = self.db.get_vm(&policy.vm_id) else {
+                continue;
+            };
+            if vm.storage_backend != "zfs" {
+                continue;
+            }
+            let Ok(Some(source)) = self.db.get_node(&vm.node_id) else {
+                continue;
+            };
+            let Ok(Some(dest)) = self.db.get_node(&policy.replica_node) else {
+                continue;
+            };
+            if source.status != "ready" || dest.status != "ready" {
+                continue;
+            }
+            match self
+                .stream_zfs_replica(&vm.name, &policy.last_replica_snapshot, &source, &dest)
+                .await
+            {
+                Ok(snapshot) => {
+                    let _ = self.db.set_vm_replica_progress(&vm.id, now, &snapshot);
+                    let _ = self.db.insert_ha_event(
+                        &source.id,
+                        &vm.id,
+                        "replicated",
+                        &format!("snapshot={snapshot} replica={}", dest.id),
+                    );
+                }
+                Err(e) => {
+                    warn!(vm = %vm.name, error = %e, "zfs replica send failed");
+                }
+            }
+        }
+    }
+
+    async fn stream_zfs_replica(
+        &self,
+        vm_name: &str,
+        incremental_from: &str,
+        source: &NodeRow,
+        dest: &NodeRow,
+    ) -> Result<String, Status> {
+        if self.clients.get_storage(&source.address).is_none() {
+            self.clients
+                .connect(&source.address)
+                .await
+                .map_err(|e| Status::unavailable(format!("connecting to source: {e}")))?;
+        }
+        if self.clients.get_storage(&dest.address).is_none() {
+            self.clients
+                .connect(&dest.address)
+                .await
+                .map_err(|e| Status::unavailable(format!("connecting to replica: {e}")))?;
+        }
+        let mut pull = self
+            .clients
+            .get_storage(&source.address)
+            .ok_or_else(|| Status::unavailable("source storage client missing"))?;
+        let mut recv = self
+            .clients
+            .get_storage(&dest.address)
+            .ok_or_else(|| Status::unavailable("replica storage client missing"))?;
+        let response = pull
+            .pull_zfs_send(node_proto::PullZfsSendRequest {
+                vm_name: vm_name.to_string(),
+                incremental_from: incremental_from.to_string(),
+                pool: String::new(),
+                dataset_prefix: String::new(),
+            })
+            .await
+            .map_err(|e| Status::unavailable(format!("zfs send: {e}")))?;
+        let mut inbound = response.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Ok(Some(chunk)) = inbound.message().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let received = recv
+            .recv_zfs_send(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .map_err(|e| Status::unavailable(format!("zfs recv: {e}")))?
+            .into_inner();
+        if !received.success {
+            return Err(Status::internal(received.message));
+        }
+        Ok(received.snapshot)
     }
 
     /// Move Ceph VMs off a node that has already been marked `not-ready`.
@@ -5092,17 +6426,45 @@ impl ControllerService {
             .get_node(node_id)
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(format!("node '{node_id}' not found")))?;
-        if source.status != "not-ready" {
+        let lost = self.db.node_lost_at(node_id).unwrap_or_default();
+        if source.status != "not-ready" && lost.is_empty() {
+            return Ok(NodeDrainOutcome {
+                migrated: 0,
+                errors: Vec::new(),
+            });
+        }
+        // A fence hold keeps `lost_at` after the host heartbeats again, so the
+        // next beat can still find the placement reports. That timestamp must
+        // not move the guests a second time.
+        let recently_seen = self
+            .db
+            .node_recently_seen(node_id, self.failover.node_timeout_secs)
+            .unwrap_or(false);
+        if recently_seen && source.status != "not-ready" {
+            return Ok(NodeDrainOutcome {
+                migrated: 0,
+                errors: Vec::new(),
+            });
+        }
+        if !self.failover_may_act() {
             return Ok(NodeDrainOutcome {
                 migrated: 0,
                 errors: Vec::new(),
             });
         }
 
-        let vms = self
+        let mut vms = self
             .db
             .list_vms_for_node(node_id)
             .map_err(|e| Status::internal(format!("listing vms: {e}")))?;
+        let policies = self.db.list_vm_ha().unwrap_or_default();
+        crate::ha::sort_for_restart(&mut vms, |vm| {
+            policies
+                .iter()
+                .find(|row| row.vm_id == vm.id)
+                .map(|row| row.restart_priority.clone())
+                .unwrap_or_else(|| crate::ha::PRIORITY_MEDIUM.to_string())
+        });
         let all_nodes = self
             .db
             .list_nodes()
@@ -5116,65 +6478,115 @@ impl ControllerService {
         let mut migrated = 0i32;
         let mut errors = Vec::new();
         for vm in &vms {
-            if vm.storage_backend != "ceph" {
+            let policy = policies.iter().find(|row| row.vm_id == vm.id);
+            let replica_node = policy.map(|row| row.replica_node.as_str()).unwrap_or("");
+            let has_replica = vm.storage_backend == "zfs"
+                && !replica_node.is_empty()
+                && policy.map(|row| row.last_replica_at).unwrap_or(0) > 0;
+            if vm.storage_backend != "ceph" && !has_replica {
                 errors.push(format!(
                     "VM '{}' uses {} storage on failed node {node_id}; it stays until the node returns",
                     vm.name, vm.storage_backend
                 ));
+                let _ = self.db.insert_ha_event(
+                    node_id,
+                    &vm.id,
+                    "skipped",
+                    &format!("unprotected {}", vm.storage_backend),
+                );
                 continue;
             }
-            let mut candidates: Vec<NodeRow> = eligible
-                .iter()
-                .filter(|n| self.node_supports_backend(n, "ceph"))
-                .filter(|n| accepts_migrated_vms(n).is_ok())
-                .cloned()
-                .collect();
-            match self.healthy_ceph_members(&candidates) {
-                Ok(healthy) => candidates = healthy,
-                Err(e) => {
-                    errors.push(format!("VM '{}': {e}", vm.name));
-                    continue;
-                }
-            }
-            let target = match self.select_scheduled_node(
-                &candidates,
-                vm.cpu,
-                vm.memory_bytes,
-                "",
-                &[],
-                &self.db.get_vm_anti_affinity(&vm.id).unwrap_or_default(),
-            ) {
-                Ok(Some(node)) => node,
-                Ok(None) => {
+            let (target, blocklisted) = if has_replica {
+                let Some(node) = eligible.iter().find(|n| n.id == replica_node).cloned() else {
                     errors.push(format!(
-                        "no healthy Ceph node can take VM '{}' from failed node {node_id}",
+                        "VM '{}' replica node {replica_node} is not available",
                         vm.name
                     ));
                     continue;
-                }
-                Err(err) => {
-                    errors.push(format!("VM '{}': {err}", vm.name));
+                };
+                if let Err(e) = accepts_migrated_vms(&node) {
+                    errors.push(format!("VM '{}': {e}", vm.name));
                     continue;
                 }
-            };
-
-            let blocklisted = match self.fence_vm_volumes(vm, &source, &candidates).await {
-                Ok(addrs) => addrs,
-                Err(e) => {
-                    errors.push(format!(
-                        "VM '{}' stays on {node_id}: its RBD images could not be fenced ({})",
-                        vm.name,
-                        e.message()
-                    ));
-                    continue;
+                (node, Vec::new())
+            } else {
+                let mut candidates: Vec<NodeRow> = eligible
+                    .iter()
+                    .filter(|n| self.node_supports_backend(n, "ceph"))
+                    .filter(|n| accepts_migrated_vms(n).is_ok())
+                    .cloned()
+                    .collect();
+                match self.healthy_ceph_members(&candidates) {
+                    Ok(healthy) => candidates = healthy,
+                    Err(e) => {
+                        errors.push(format!("VM '{}': {e}", vm.name));
+                        continue;
+                    }
                 }
+                let target = match self.select_scheduled_node(
+                    &candidates,
+                    vm.cpu,
+                    vm.memory_bytes,
+                    "",
+                    &[],
+                    &self.db.get_vm_anti_affinity(&vm.id).unwrap_or_default(),
+                ) {
+                    Ok(Some(node)) => node,
+                    Ok(None) => {
+                        errors.push(format!(
+                            "no healthy Ceph node can take VM '{}' from failed node {node_id}",
+                            vm.name
+                        ));
+                        continue;
+                    }
+                    Err(err) => {
+                        errors.push(format!("VM '{}': {err}", vm.name));
+                        continue;
+                    }
+                };
+                let blocklisted = match self.fence_vm_volumes(vm, &source, &candidates).await {
+                    Ok(addrs) => addrs,
+                    Err(e) => {
+                        errors.push(format!(
+                            "VM '{}' stays on {node_id}: its RBD images could not be fenced ({})",
+                            vm.name,
+                            e.message()
+                        ));
+                        let _ = self
+                            .db
+                            .insert_ha_event(node_id, &vm.id, "failed", e.message());
+                        self.webhooks.emit(
+                            crate::webhooks::EVENT_VM_FAILOVER_FAILED,
+                            format!("vm/{}", vm.id),
+                            serde_json::json!({
+                                "vmId": vm.id,
+                                "sourceNode": node_id,
+                                "error": e.message(),
+                            }),
+                        );
+                        continue;
+                    }
+                };
+                info!(
+                    vm = %vm.name,
+                    source = %node_id,
+                    blocklisted = ?blocklisted,
+                    "fenced Ceph clients of unreachable node"
+                );
+                if let Err(e) = self.db.add_fenced_vm(node_id, &vm.name) {
+                    warn!(
+                        node_id,
+                        vm = %vm.name,
+                        error = %e,
+                        "fenced the guest but could not record the hold"
+                    );
+                }
+                (target, blocklisted)
             };
-            info!(
-                vm = %vm.name,
-                source = %node_id,
-                blocklisted = ?blocklisted,
-                "fenced Ceph clients of unreachable node"
-            );
+            let restart = crate::ha::should_restart(&vm.runtime_state, vm.auto_start);
+            if restart != vm.auto_start {
+                let _ = self.db.set_vm_auto_start(&vm.id, restart);
+            }
 
             if let Err(e) = self.reassign_vm_node(vm, &target.id) {
                 errors.push(format!("VM '{}': {e}", vm.name));
@@ -5192,7 +6604,23 @@ impl ControllerService {
                     "vmName": vm.name,
                     "sourceNode": node_id,
                     "targetNode": target.id,
-                    "mode": "failover",
+                    "mode": if has_replica { "replica" } else { "failover" },
+                }),
+            );
+            let _ = self.db.insert_ha_event(
+                node_id,
+                &vm.id,
+                "reassigned",
+                &format!("target={} restart={restart}", target.id),
+            );
+            self.webhooks.emit(
+                crate::webhooks::EVENT_VM_FAILOVER_COMPLETED,
+                format!("vm/{}", vm.id),
+                serde_json::json!({
+                    "vmId": vm.id,
+                    "sourceNode": node_id,
+                    "targetNode": target.id,
+                    "restart": restart,
                 }),
             );
             let _ = self.log_replication_event_required(
@@ -5242,9 +6670,10 @@ impl ControllerService {
                 return;
             }
         };
+        let lost_ids = self.db.list_lost_node_ids().unwrap_or_default();
         let not_ready: std::collections::HashSet<String> = nodes
             .iter()
-            .filter(|node| node.status == "not-ready")
+            .filter(|node| node.status == "not-ready" || lost_ids.iter().any(|id| id == &node.id))
             .map(|node| node.id.clone())
             .collect();
         announced.retain(|key| {
@@ -5822,6 +7251,70 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 req.node_id
             )));
         }
+        let _ = self.db.mark_direct_seen(&req.node_id);
+        let _ = self.db.clear_node_lost(&req.node_id);
+        for action in &req.ha_actions {
+            let (phase, vm_id) = action
+                .split_once(':')
+                .unwrap_or(("action", action.as_str()));
+            let _ = self.db.insert_ha_event(&req.node_id, vm_id, phase, action);
+        }
+        // Coming back is not enough. The blocklist stays until this host
+        // reports that placement settled and every fenced guest is masked
+        // or still assigned here.
+        let assigned_names: Vec<String> = self
+            .db
+            .list_vms_for_node(&req.node_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|vm| vm.name)
+            .collect();
+        match self.db.get_node_fence_hold(&req.node_id) {
+            Ok(hold) => {
+                let mut actions = req.ha_actions.clone();
+                if hold.pending {
+                    match self
+                        .db
+                        .placement_release_reports(&req.node_id, &hold.lost_at)
+                    {
+                        Ok(prior) => {
+                            actions = crate::ha::merge_placement_reports(&actions, &prior);
+                        }
+                        Err(e) => {
+                            warn!(node_id = %req.node_id, error = %e, "could not read earlier placement reports");
+                        }
+                    }
+                }
+                match crate::ha::fence_release(hold.pending, &hold.vms, &assigned_names, &actions) {
+                    crate::ha::FenceRelease::Keep => {}
+                    crate::ha::FenceRelease::Hold { vms } => {
+                        if vms != hold.vms {
+                            if let Err(e) = self.db.set_node_fence_hold(&req.node_id, true, &vms) {
+                                warn!(node_id = %req.node_id, error = %e, "could not update the fence hold");
+                            }
+                        }
+                    }
+                    crate::ha::FenceRelease::Unfence => {
+                        // The blocklist stays until a Ceph member accepts the
+                        // removal. Clearing the hold first dropped it on the
+                        // floor when that call failed, and the next heartbeat
+                        // had nothing left to retry.
+                        let node_id = req.node_id.clone();
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            if this.unfence_returned_node(&node_id).await {
+                                if let Err(e) = this.db.set_node_fence_hold(&node_id, false, &[]) {
+                                    warn!(node_id, error = %e, "could not clear the fence hold");
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(node_id = %req.node_id, error = %e, "could not read the fence hold; leaving the blocklist in place");
+            }
+        }
 
         let capabilities = req.update_capabilities.join(",");
         if let Err(e) = self.db.upsert_node_host_status(
@@ -5930,8 +7423,26 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )?;
         }
 
+        let assigned = self.db.list_vms_for_node(&req.node_id).unwrap_or_default();
+        let policies = self.db.list_vm_ha().unwrap_or_default();
+        let vm_monitors = assigned
+            .iter()
+            .filter_map(|vm| {
+                let row = policies.iter().find(|row| row.vm_id == vm.id)?;
+                if row.vm_monitoring != "restart" {
+                    return None;
+                }
+                Some(controller_proto::VmMonitor {
+                    vm_name: vm.name.clone(),
+                    restart_after_secs: i32::try_from(row.vm_monitoring_secs).unwrap_or(0),
+                })
+            })
+            .collect();
         Ok(Response::new(controller_proto::HeartbeatResponse {
             success: true,
+            assigned_vm_ids: assigned.into_iter().map(|vm| vm.name).collect(),
+            assignment_confirmed: true,
+            vm_monitors,
         }))
     }
 
@@ -5955,6 +7466,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 Ok(controller_proto::VmState::Error) => "error",
                 _ => "unknown",
             };
+            if vm.guest_heartbeat_unix > 0 {
+                let _ = self.db.set_guest_heartbeat_for_name(
+                    &req.node_id,
+                    &vm.name,
+                    vm.guest_heartbeat_unix,
+                );
+            }
             match self
                 .db
                 .apply_vm_runtime_state(&req.node_id, &vm.name, state_str)
@@ -6193,6 +7711,41 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )));
         }
         self.preflight_vm_create_on_node(&node, &spec, &requested_storage_backend)?;
+        let ha_policy = crate::ha::VmPolicy {
+            restart_priority: req.restart_priority.clone(),
+            vm_monitoring: req.vm_monitoring.clone(),
+            vm_monitoring_secs: i64::from(req.vm_monitoring_secs),
+            replica_node: req.replica_node.clone(),
+            replica_interval_secs: i64::from(req.replica_interval_secs),
+        }
+        .normalized()
+        .map_err(Status::invalid_argument)?;
+        if !ha_policy.replica_node.is_empty() && requested_storage_backend != "zfs" {
+            return Err(Status::invalid_argument(
+                "a replica node is only supported for zfs VMs",
+            ));
+        }
+        if !ha_policy.replica_node.is_empty() && ha_policy.replica_node == node.id {
+            return Err(Status::invalid_argument(
+                "replica node must be a different host",
+            ));
+        }
+        let create_report = self.admission_report(
+            None,
+            Some((
+                node.id.as_str(),
+                spec.cpu,
+                spec.memory_bytes,
+                requested_storage_backend.as_str(),
+                ha_policy.replica_node.as_str(),
+            )),
+        )?;
+        self.enforce_admission(
+            &create_report,
+            req.ignore_admission_control,
+            &actor,
+            &format!("vm/{}", spec.name),
+        )?;
 
         let mut assigned_gpus = String::new();
         if wants_gpu {
@@ -6413,6 +7966,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
             return Err(Status::internal(format!("storing vm: {e}")));
         }
+        let _ = self.db.upsert_vm_ha(&crate::db::VmHaRow {
+            vm_id: vm.id.clone(),
+            restart_priority: ha_policy.restart_priority,
+            vm_monitoring: ha_policy.vm_monitoring,
+            vm_monitoring_secs: ha_policy.vm_monitoring_secs,
+            replica_node: ha_policy.replica_node,
+            replica_interval_secs: ha_policy.replica_interval_secs,
+            last_replica_at: 0,
+            last_replica_snapshot: String::new(),
+            last_guest_heartbeat: 0,
+        });
         if !assigned_gpus.is_empty() {
             if let Err(e) = self.db.set_vm_gpu(&vm.id, &assigned_gpus) {
                 self.rollback_created_vm(&node, &vm).await;
@@ -6907,12 +8471,24 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     updated_at: None,
                 });
                 let guest_reachable = self.guest_reachable_for(&db_vm).await;
+                let (
+                    ha_protection,
+                    restart_priority,
+                    replica_node,
+                    replica_interval_secs,
+                    vm_monitoring,
+                ) = self.ha_view(&db_vm);
                 return Ok(Response::new(controller_proto::GetVmResponse {
                     spec,
                     status,
                     node_id: node.id,
                     assigned_ip: db_vm.vm_ip.clone(),
                     guest_reachable,
+                    ha_protection,
+                    restart_priority,
+                    replica_node,
+                    replica_interval_secs,
+                    vm_monitoring,
                 }));
             }
         };
@@ -7045,12 +8621,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
         });
 
         let guest_reachable = self.guest_reachable_for(&db_vm).await;
+        let (ha_protection, restart_priority, replica_node, replica_interval_secs, vm_monitoring) =
+            self.ha_view(&db_vm);
         Ok(Response::new(controller_proto::GetVmResponse {
             spec,
             status,
             node_id: node.id,
             assigned_ip: db_vm.vm_ip,
             guest_reachable,
+            ha_protection,
+            restart_priority,
+            replica_node,
+            replica_interval_secs,
+            vm_monitoring,
         }))
     }
 
@@ -7260,11 +8843,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
         }
 
+        let ha_rows = self.db.list_vm_ha().unwrap_or_default();
         let infos: Vec<_> = rows
             .into_iter()
             .enumerate()
             .map(|(i, vm)| {
                 let state = live_states[i].unwrap_or(fallback_states[i]);
+                let policy = ha_rows.iter().find(|row| row.vm_id == vm.id);
+                let replica = policy.map(|row| row.replica_node.as_str()).unwrap_or("");
                 controller_proto::VmInfo {
                     id: vm.id,
                     name: vm.name,
@@ -7273,9 +8859,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     memory_bytes: vm.memory_bytes,
                     node_id: vm.node_id,
                     created_at: None,
-                    storage_backend: vm.storage_backend,
+                    storage_backend: vm.storage_backend.clone(),
                     storage_size_bytes: vm.storage_size_bytes,
                     labels: vm_labels(&vm.labels),
+                    ha_protection: crate::ha::protection(&vm.storage_backend, replica).to_string(),
+                    restart_priority: policy
+                        .map(|row| row.restart_priority.clone())
+                        .unwrap_or_else(|| crate::ha::PRIORITY_MEDIUM.to_string()),
+                    replica_node: replica.to_string(),
+                    replica_interval_secs: policy
+                        .map(|row| i32::try_from(row.replica_interval_secs).unwrap_or(0))
+                        .unwrap_or(0),
+                    guest_heartbeat_unix: policy.map(|row| row.last_guest_heartbeat).unwrap_or(0),
                 }
             })
             .collect();
@@ -7315,6 +8910,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         target_dc: String::new(),
                         node_labels: Vec::new(),
                         anti_affinity: String::new(),
+                        ..Default::default()
                     }))
                     .await?
                     .into_inner();
@@ -9500,14 +11096,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         if !vm.pci_devices.is_empty() || !self.vm_gpu_names(&vm.id)?.is_empty() {
             return self
-                .migrate_gpu_vm(&actor, vm, &req.target_node, &req.gpus, &req.vgpus)
+                .migrate_gpu_vm(
+                    &actor,
+                    vm,
+                    &req.target_node,
+                    &req.gpus,
+                    &req.vgpus,
+                    req.ignore_admission_control,
+                )
                 .await;
-        }
-
-        if vm.storage_backend != "ceph" {
-            return Err(Status::failed_precondition(
-                "live migrate requires storage_backend=ceph (shared RBD)",
-            ));
         }
 
         let source_node = self
@@ -9532,6 +11129,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
             ));
         }
         accepts_migrated_vms(target)?;
+        self.admit_move(&actor, &vm, &target.id, req.ignore_admission_control)?;
+
+        if crate::local_migrate::is_local_block(&vm.storage_backend) {
+            return self
+                .respond_local_migrate(&actor, &vm, &source_node, target, req.allow_cold_fallback)
+                .await;
+        }
+
+        if vm.storage_backend != "ceph" {
+            return Err(Status::failed_precondition(
+                "live migrate supports ceph (shared RBD) and lvm/zfs (disk mirror); filesystem disks stay on the node",
+            ));
+        }
         if !self.node_supports_backend(target, "ceph") {
             return Err(Status::failed_precondition(
                 "target node is not a CephCluster member",
@@ -9562,7 +11172,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 &vm,
                 &source_node,
                 target,
-                &volume,
+                Some(&volume),
                 &runtime_name,
                 &dest_host,
             )
@@ -9852,6 +11462,28 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "cleared a live-migrate receive session that still looked active"
             );
         }
+        let mut mirror_note = String::new();
+        if crate::local_migrate::is_local_block(&vm.storage_backend) {
+            // This node does not own the VM, so its copy is a stranded target.
+            // The owner keeps its disk; only the mirror leg is removed.
+            if let Err(e) = self.abort_volume_on(&node, &runtime_name, true).await {
+                warn!(vm = %vm.name, node = %node.id, error = %e, "destination mirror cleanup");
+                mirror_note = format!(" destination mirror cleanup failed: {e}");
+            }
+            if let Ok(Some(owner)) = self.db.get_node(&vm.node_id) {
+                self.abort_volume_on(&owner, &runtime_name, false)
+                    .await
+                    .map_err(|e| {
+                        status_with_context(
+                            &e,
+                            &format!(
+                                "receive session on {} was cleared, but {} is still mirroring",
+                                node.id, owner.id
+                            ),
+                        )
+                    })?;
+            }
+        }
         self.record_audit(
             &actor,
             "ResetLiveMigrateReceive",
@@ -9867,7 +11499,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 success: true,
                 cleared: true,
                 message: format!(
-                    "cleared live-migrate receive session for '{}' on node {}{} ({})",
+                    "cleared live-migrate receive session for '{}' on node {}{} ({}){mirror_note}",
                     vm.name,
                     node.id,
                     if killed_live_receive {
@@ -10173,7 +11805,44 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .count_certificates(&now, &warn)
             .map(|counts| counts.4)
             .unwrap_or(0);
-        let health = crate::cluster_health::assess(&nodes, &vms, conflicts, inventory_expiring);
+        let mut health = crate::cluster_health::assess(&nodes, &vms, conflicts, inventory_expiring);
+        let report =
+            self.admission_report(None, None)
+                .unwrap_or_else(|_| crate::ha::AdmissionReport {
+                    capacity: crate::ha::CAPACITY_NOT_APPLICABLE.to_string(),
+                    host_failures_tolerated: 0,
+                    memory_headroom_bytes: 0,
+                    cpu_headroom: 0,
+                    message: "admission control could not be computed".into(),
+                });
+        let lost = self.db.list_lost_node_ids().unwrap_or_default();
+        let policies = self.db.list_vm_ha().unwrap_or_default();
+        let unprotected_vms_on_lost_nodes = vms
+            .iter()
+            .filter(|vm| lost.iter().any(|id| id == &vm.node_id))
+            .filter(|vm| {
+                let replica = policies
+                    .iter()
+                    .find(|row| row.vm_id == vm.id)
+                    .map(|row| row.replica_node.as_str())
+                    .unwrap_or("");
+                !crate::ha::is_protected(&vm.storage_backend, replica)
+            })
+            .count() as i32;
+        if unprotected_vms_on_lost_nodes > 0 {
+            health.conditions.push(format!(
+                "{unprotected_vms_on_lost_nodes} unprotected VM(s) are on a lost node"
+            ));
+            if health.status == crate::cluster_health::STATUS_HEALTHY {
+                health.status = crate::cluster_health::STATUS_DEGRADED.to_string();
+            }
+        }
+        let lease = self.db.get_cluster_lease("failover").ok().flatten();
+        let ha_lease_holder = lease
+            .as_ref()
+            .map(|row| row.holder.clone())
+            .unwrap_or_default();
+        let ha_lease_term = lease.as_ref().map(|row| row.term).unwrap_or(0);
         Ok(Response::new(controller_proto::GetClusterHealthResponse {
             status: health.status,
             ready_nodes: health.ready_nodes,
@@ -10185,6 +11854,82 @@ impl controller_proto::controller_server::Controller for ControllerService {
             replication_conflicts: health.replication_conflicts,
             certificates_expiring_soon: health.certificates_expiring_soon,
             conditions: health.conditions,
+            host_failures_tolerated: report.host_failures_tolerated,
+            failover_capacity: report.capacity,
+            failover_memory_headroom_bytes: report.memory_headroom_bytes,
+            ha_lease_holder,
+            ha_lease_term,
+            unprotected_vms_on_lost_nodes,
+        }))
+    }
+
+    async fn get_ha_status(
+        &self,
+        request: Request<controller_proto::GetHaStatusRequest>,
+    ) -> Result<Response<controller_proto::GetHaStatusResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let _ = request;
+        let report =
+            self.admission_report(None, None)
+                .unwrap_or_else(|_| crate::ha::AdmissionReport {
+                    capacity: crate::ha::CAPACITY_NOT_APPLICABLE.to_string(),
+                    host_failures_tolerated: 0,
+                    memory_headroom_bytes: 0,
+                    cpu_headroom: 0,
+                    message: String::new(),
+                });
+        let lease = self.db.get_cluster_lease("failover").ok().flatten();
+        let controller_id = self
+            .replication
+            .as_ref()
+            .map(|rep| rep.controller_id.clone())
+            .unwrap_or_else(|| "local".to_string());
+        Ok(Response::new(controller_proto::GetHaStatusResponse {
+            enabled: self.failover.enabled,
+            acting: self.failover_may_act(),
+            lease_holder: lease
+                .as_ref()
+                .map(|row| row.holder.clone())
+                .unwrap_or_default(),
+            lease_term: lease.as_ref().map(|row| row.term).unwrap_or(0),
+            lease_expires_at_ms: lease.as_ref().map(|row| row.expires_at_ms).unwrap_or(0),
+            node_timeout_secs: i32::try_from(self.failover.node_timeout_secs).unwrap_or(30),
+            detect_interval_secs: i32::try_from(self.failover.detect_interval_secs).unwrap_or(5),
+            isolation_response: self.failover.isolation_response.clone(),
+            host_failures_to_tolerate: self.failover.admission_control.host_failures_to_tolerate,
+            failover_capacity: report.capacity,
+            memory_headroom_bytes: report.memory_headroom_bytes,
+            controller_id,
+        }))
+    }
+
+    async fn list_ha_events(
+        &self,
+        request: Request<controller_proto::ListHaEventsRequest>,
+    ) -> Result<Response<controller_proto::ListHaEventsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        let limit = if req.limit <= 0 {
+            50
+        } else {
+            i64::from(req.limit)
+        };
+        let rows = self
+            .db
+            .list_ha_events(&req.node_id, &req.vm_id, limit)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(controller_proto::ListHaEventsResponse {
+            events: rows
+                .into_iter()
+                .map(|row| controller_proto::HaEvent {
+                    id: row.id,
+                    node_id: row.node_id,
+                    vm_id: row.vm_id,
+                    phase: row.phase,
+                    detail: row.detail,
+                    created_at: row.created_at,
+                })
+                .collect(),
         }))
     }
 
@@ -11670,7 +13415,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
         if !crate::vm_operation_policy::cancel_allowed(&op.phase, op.send_succeeded) {
             return Err(Status::failed_precondition(format!(
-                "cancel refused in phase {} (send_succeeded={}; only Preparing before send is cancellable; after send the guest may already be on the destination)",
+                "cancel refused in phase {} (send_succeeded={}; only Preparing, MirrorSyncing, or Copying before send is cancellable; after send the guest may already be on the destination)",
                 op.phase, op.send_succeeded
             )));
         }
@@ -16679,6 +18424,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let err =
@@ -16738,6 +18484,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let err =
@@ -16801,6 +18548,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let err =
@@ -16859,6 +18607,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let err =
@@ -16924,6 +18673,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let resp =
@@ -16983,6 +18733,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let err =
@@ -17048,6 +18799,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let resp =
@@ -17106,6 +18858,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let err =
@@ -17234,11 +18987,62 @@ mod tests {
                     allow_cold_fallback: false,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
             .expect_err("non-ceph should fail");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("filesystem"),
+            "filesystem refusal should name the backend: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_vm_rejects_lvm_on_a_filesystem_node_without_dialing() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node_a = test_node();
+        node_a.id = "node-a".into();
+        db.upsert_node(&node_a).unwrap();
+        let mut node_b = test_node();
+        node_b.id = "node-b".into();
+        node_b.address = "127.0.0.2:9091".into();
+        node_b.storage_backend = "lvm".into();
+        db.upsert_node(&node_b).unwrap();
+        let mut vm = test_vm("node-a");
+        vm.storage_backend = "lvm".into();
+        db.insert_vm(&vm).unwrap();
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db,
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let err =
+            <ControllerService as controller_proto::controller_server::Controller>::migrate_vm(
+                &svc,
+                Request::new(controller_proto::MigrateVmRequest {
+                    vm_id: vm.id,
+                    target_node: "node-b".into(),
+                    allow_cold_fallback: true,
+                    gpus: vec![],
+                    vgpus: vec![],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("lvm VM on a filesystem node should fail before any RPC");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("node-a"),
+            "refusal should name the source: {}",
+            err.message()
+        );
     }
 
     #[tokio::test]
@@ -17272,6 +19076,7 @@ mod tests {
                     allow_cold_fallback: true,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -17340,6 +19145,7 @@ mod tests {
                     allow_cold_fallback: false,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -17446,6 +19252,7 @@ mod tests {
                     allow_cold_fallback: false,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -17638,6 +19445,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
         let err =
             <ControllerService as controller_proto::controller_server::Controller>::create_vm(
@@ -17757,6 +19565,7 @@ mod tests {
                     allow_cold_fallback: true,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -17788,6 +19597,7 @@ mod tests {
                     allow_cold_fallback: true,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -17889,6 +19699,7 @@ mod tests {
                     allow_cold_fallback: true,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -17959,6 +19770,7 @@ mod tests {
                     allow_cold_fallback: true,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -18209,6 +20021,7 @@ mod tests {
                     allow_cold_fallback: true,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -18489,6 +20302,7 @@ mod tests {
                     allow_cold_fallback: true,
                     gpus: vec![],
                     vgpus: vec![],
+                    ..Default::default()
                 }),
             )
             .await
@@ -18793,6 +20607,7 @@ mod tests {
                     target_dc: String::new(),
                     node_labels: Vec::new(),
                     anti_affinity: String::new(),
+                    ..Default::default()
                 }),
             )
             .await
@@ -19340,7 +21155,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((handle.to_string(), hosts.to_vec()));
-            Ok(vec!["127.0.0.1:0/4242".to_string()])
+            Ok(vec![
+                "127.0.0.1:0/4242".to_string(),
+                "range:10.10.0.11/32".to_string(),
+            ])
         });
         let svc = svc_for(&db).with_test_fence_hook(hook);
 
@@ -19371,8 +21189,15 @@ mod tests {
         assert_eq!(fenced[0].0, format!("kcore-vms/kcore-{}", vm.id));
         assert_eq!(
             fenced[0].1,
-            vec!["10.10.0.11".to_string(), "127.0.0.1".to_string()]
+            vec![
+                "10.10.0.11".to_string(),
+                "10.20.0.11".to_string(),
+                "127.0.0.1".to_string()
+            ]
         );
+        let hold = db.get_node_fence_hold("node-a").expect("hold");
+        assert!(hold.pending);
+        assert_eq!(hold.vms, vec!["ceph-1".to_string()]);
     }
 
     #[tokio::test]
@@ -19405,6 +21230,35 @@ mod tests {
             "node-a"
         );
         assert!(!db.node_needs_config_push("node-a").expect("flag"));
+        let hold = db.get_node_fence_hold("node-a").expect("hold");
+        assert!(!hold.pending, "{hold:?}");
+    }
+
+    #[tokio::test]
+    async fn failover_leaves_the_vm_in_place_when_the_fence_has_no_range() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-a", "not-ready").expect("mark");
+        let hook: FenceHook = Arc::new(|_handle: &str, _hosts: &[String]| Ok(Vec::new()));
+        let svc = svc_for(&db).with_test_fence_hook(hook);
+
+        let outcome = svc
+            .failover_unreachable_node("node-a")
+            .await
+            .expect("failover pass");
+        assert_eq!(outcome.migrated, 0);
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("could not be fenced") && e.contains("IP range")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("ceph").node_id,
+            "node-a"
+        );
     }
 
     #[tokio::test]
@@ -19941,6 +21795,7 @@ mod tests {
             target_dc: String::new(),
             node_labels: Vec::new(),
             anti_affinity: String::new(),
+            ..Default::default()
         };
 
         let first =

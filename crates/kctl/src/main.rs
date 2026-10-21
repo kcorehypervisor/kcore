@@ -614,6 +614,24 @@ enum CreateResource {
         /// Keep this VM off nodes that already host the same anti-affinity group
         #[arg(long = "anti-affinity")]
         anti_affinity: Option<String>,
+        /// Restart order after a host failure: high, medium, or low
+        #[arg(long = "restart-priority")]
+        restart_priority: Option<String>,
+        /// Node that keeps an asynchronous ZFS replica of this VM
+        #[arg(long = "replica-node")]
+        replica_node: Option<String>,
+        /// Seconds between ZFS replica sends
+        #[arg(long = "replica-interval")]
+        replica_interval_secs: Option<i32>,
+        /// Guest heartbeat policy: off or restart
+        #[arg(long = "vm-monitoring")]
+        vm_monitoring: Option<String>,
+        /// Seconds a guest heartbeat may be stale before a restart
+        #[arg(long = "vm-monitoring-secs")]
+        vm_monitoring_secs: Option<i32>,
+        /// Create even when the cluster cannot tolerate another host failure
+        #[arg(long = "ignore-admission-control", default_value_t = false)]
+        ignore_admission_control: bool,
     },
     /// Create a container on a node
     Container {
@@ -1192,6 +1210,15 @@ enum GetResource {
     /// Node readiness, VM placement, certificate expiry, and replication conflicts
     #[command(name = "cluster-health")]
     ClusterHealth,
+    /// High-availability lease, admission, and failover capacity
+    Ha,
+    /// Recent failover, fence, and replica events
+    #[command(name = "ha-events")]
+    HaEvents {
+        /// How many events to print
+        #[arg(long, default_value_t = 50)]
+        limit: i32,
+    },
     /// Show the controller cryptographic configuration
     #[command(name = "crypto-config", alias = "crypto")]
     CryptoConfig,
@@ -1946,6 +1973,12 @@ async fn main() {
                     node_labels,
                     vm_label,
                     anti_affinity,
+                    restart_priority,
+                    replica_node,
+                    replica_interval_secs,
+                    vm_monitoring,
+                    vm_monitoring_secs,
+                    ignore_admission_control,
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -1990,6 +2023,12 @@ async fn main() {
                     node_labels: node_labels.clone(),
                     labels: vm_label.clone(),
                     anti_affinity: anti_affinity.clone(),
+                    restart_priority: restart_priority.clone(),
+                    replica_node: replica_node.clone(),
+                    replica_interval_secs: *replica_interval_secs,
+                    vm_monitoring: vm_monitoring.clone(),
+                    vm_monitoring_secs: *vm_monitoring_secs,
+                    ignore_admission_control: *ignore_admission_control,
                 },
             )
             .await
@@ -2605,6 +2644,18 @@ async fn main() {
             commands::cluster_ops::health(&info).await
         }
         Command::Get {
+            resource: GetResource::Ha,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::cluster_ops::ha_status(&info).await
+        }
+        Command::Get {
+            resource: GetResource::HaEvents { limit },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::cluster_ops::ha_events(&info, *limit).await
+        }
+        Command::Get {
             resource: GetResource::CryptoConfig,
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -3177,21 +3228,26 @@ async fn main() {
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            let mut client = client::controller_client(&info)
-                .await
-                .unwrap_or_else(|e| fatal(&format!("{e}")));
+            let mut client =
+                client::controller_client_with_timeout(&info, client::LOCAL_DISK_MOVE_TIMEOUT)
+                    .await
+                    .unwrap_or_else(|e| fatal(&format!("{e}")));
             let mut devices = gpu.clone();
             devices.extend(nic.clone());
             devices.extend(nvme.clone());
-            let resp = client
-                .migrate_vm(client::controller_proto::MigrateVmRequest {
-                    vm_id: vm_id.to_string(),
-                    target_node: target_node.to_string(),
-                    allow_cold_fallback: *allow_cold_fallback,
-                    gpus: devices,
-                    vgpus: vgpu.clone(),
-                })
-                .await;
+            let mut request = tonic::Request::new(client::controller_proto::MigrateVmRequest {
+                vm_id: vm_id.to_string(),
+                target_node: target_node.to_string(),
+                allow_cold_fallback: *allow_cold_fallback,
+                gpus: devices,
+                vgpus: vgpu.clone(),
+                ignore_admission_control: false,
+            });
+            // The channel timeout is the shorter of this header and the
+            // endpoint timeout. Both are six hours so a local-disk resync
+            // is not abandoned while the controller is still copying.
+            request.set_timeout(client::LOCAL_DISK_MOVE_TIMEOUT);
+            let resp = client.migrate_vm(request).await;
             match resp {
                 Ok(r) => {
                     let r = r.into_inner();
