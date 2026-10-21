@@ -244,20 +244,144 @@ fn apply_mask(name: &str) -> bool {
 fn apply_unmask(name: &str) -> bool {
     let unit = vm_unit(name);
     let path = format!("/run/systemd/system/{unit}.d/placement-mask.conf");
+    let masked_at_unix = std::fs::metadata(&path).ok().and_then(file_mtime_unix);
+    // Read the unit before the drop-in is gone. `true` has usually already
+    // exited, and the timestamps are the only record that this start ran
+    // the mask instead of the guest.
+    let snapshot = masked_at_unix.map(|_| unit_runtime_snapshot(&unit));
     let was_masked = std::fs::remove_file(&path).is_ok();
     let _ = systemctl_ok(&["daemon-reload"]);
     let _ = systemctl_ok(&["unmask", "--runtime", &unit]);
-    // The mask can win the race with the unit's first start. A failed or
-    // dummy start has to be replaced with the real program once this guest
-    // belongs here again.
-    if was_masked {
-        let failed = systemctl_ok(&["is-failed", "--quiet", &unit]);
-        let active = systemctl_ok(&["is-active", "--quiet", &unit]);
-        if failed || active {
-            let _ = systemctl_ok(&["restart", &unit]);
-        }
+    let restart = was_masked
+        && snapshot.as_ref().is_some_and(|snapshot| {
+            masked_at_unix.is_some_and(|masked_at_unix| {
+                masked_unit_needs_restart(
+                    snapshot.active,
+                    snapshot.failed,
+                    snapshot.main_is_dummy,
+                    snapshot.exec_start_unix,
+                    snapshot.exec_exit_unix,
+                    masked_at_unix,
+                )
+            })
+        });
+    if restart {
+        let _ = systemctl_ok(&["restart", &unit]);
     }
     true
+}
+
+struct UnitRuntime {
+    active: bool,
+    failed: bool,
+    main_is_dummy: bool,
+    exec_start_unix: Option<u64>,
+    exec_exit_unix: Option<u64>,
+}
+
+fn file_mtime_unix(meta: std::fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs())
+}
+
+fn unit_runtime_snapshot(unit: &str) -> UnitRuntime {
+    let props = systemctl_show(unit);
+    let state = props.get("ActiveState").map(String::as_str).unwrap_or("");
+    let pid = props
+        .get("MainPID")
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(0);
+    UnitRuntime {
+        active: state == "active" || state == "activating" || state == "reloading",
+        failed: state == "failed",
+        main_is_dummy: pid > 0 && process_is_dummy_true(pid),
+        exec_start_unix: props
+            .get("ExecMainStartTimestamp")
+            .and_then(|raw| parse_systemd_unix_timestamp(raw)),
+        exec_exit_unix: props
+            .get("ExecMainExitTimestamp")
+            .and_then(|raw| parse_systemd_unix_timestamp(raw)),
+    }
+}
+
+fn systemctl_show(unit: &str) -> std::collections::HashMap<String, String> {
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "show",
+            "--timestamp=unix",
+            "--no-pager",
+            "-p",
+            "ActiveState",
+            "-p",
+            "MainPID",
+            "-p",
+            "ExecMainStartTimestamp",
+            "-p",
+            "ExecMainExitTimestamp",
+            unit,
+        ])
+        .output();
+    let mut map = std::collections::HashMap::new();
+    let Ok(output) = output else {
+        return map;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+    map
+}
+
+fn process_is_dummy_true(pid: u32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let first = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    let Ok(name) = std::str::from_utf8(first) else {
+        return false;
+    };
+    name == "true" || name.ends_with("/true")
+}
+
+/// A start or stop that happened while the placement mask was installed has
+/// to be redone with the real unit. `true` exits 0, so that start leaves the
+/// unit inactive rather than failed. A guest the operator stopped before
+/// this mask was written stays stopped.
+pub fn masked_unit_needs_restart(
+    active: bool,
+    failed: bool,
+    main_is_dummy: bool,
+    exec_start_unix: Option<u64>,
+    exec_exit_unix: Option<u64>,
+    masked_at_unix: u64,
+) -> bool {
+    if failed || (active && main_is_dummy) {
+        return true;
+    }
+    if active {
+        return false;
+    }
+    let under_mask = |stamp: Option<u64>| stamp.is_some_and(|t| t >= masked_at_unix);
+    under_mask(exec_start_unix) || under_mask(exec_exit_unix)
+}
+
+/// systemd `--timestamp=unix` prints `@<seconds>`, sometimes with a fraction.
+pub fn parse_systemd_unix_timestamp(raw: &str) -> Option<u64> {
+    let text = raw.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("n/a") {
+        return None;
+    }
+    let text = text.strip_prefix('@').unwrap_or(text);
+    let text = text.split('.').next().unwrap_or(text);
+    let secs: u64 = text.parse().ok()?;
+    if secs == 0 {
+        None
+    } else {
+        Some(secs)
+    }
 }
 
 fn systemctl_args(action: &HostAction) -> Option<Vec<String>> {
@@ -524,6 +648,76 @@ mod tests {
         assert!(timed.contains(&HostAction::Mask("web".into())));
         assert!(timed.contains(&HostAction::Unmask("db".into())));
         assert!(timed.contains(&HostAction::StartTarget));
+    }
+
+    #[test]
+    fn systemd_unix_timestamp_accepts_the_at_prefix() {
+        assert_eq!(
+            parse_systemd_unix_timestamp("@1792599110"),
+            Some(1_792_599_110)
+        );
+        assert_eq!(
+            parse_systemd_unix_timestamp("1792599110"),
+            Some(1_792_599_110)
+        );
+        assert_eq!(
+            parse_systemd_unix_timestamp("@1792599110.5"),
+            Some(1_792_599_110)
+        );
+        assert_eq!(parse_systemd_unix_timestamp(""), None);
+        assert_eq!(parse_systemd_unix_timestamp("n/a"), None);
+        assert_eq!(parse_systemd_unix_timestamp("@0"), None);
+    }
+
+    #[test]
+    fn a_dummy_start_under_the_mask_is_replaced_and_a_stopped_guest_is_not() {
+        let masked_at = 1_000;
+        assert!(masked_unit_needs_restart(
+            false,
+            false,
+            false,
+            Some(1_005),
+            Some(1_005),
+            masked_at
+        ));
+        assert!(masked_unit_needs_restart(
+            false, true, false, None, None, masked_at
+        ));
+        assert!(masked_unit_needs_restart(
+            true,
+            false,
+            true,
+            Some(1_005),
+            None,
+            masked_at
+        ));
+        assert!(!masked_unit_needs_restart(
+            true,
+            false,
+            false,
+            Some(900),
+            None,
+            masked_at
+        ));
+        assert!(!masked_unit_needs_restart(
+            false,
+            false,
+            false,
+            Some(800),
+            Some(900),
+            masked_at
+        ));
+        assert!(!masked_unit_needs_restart(
+            false, false, false, None, None, masked_at
+        ));
+        assert!(masked_unit_needs_restart(
+            false,
+            false,
+            false,
+            Some(900),
+            Some(1_010),
+            masked_at
+        ));
     }
 
     #[test]
