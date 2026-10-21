@@ -502,6 +502,8 @@ pub struct ControllerService {
     test_push_hook: Option<PushHook>,
     #[cfg(test)]
     test_fence_hook: Option<FenceHook>,
+    #[cfg(test)]
+    test_storage_verdict: Option<crate::ha::StorageVerdict>,
 }
 
 fn network_policies_by_name(
@@ -822,6 +824,8 @@ impl ControllerService {
             test_push_hook: None,
             #[cfg(test)]
             test_fence_hook: None,
+            #[cfg(test)]
+            test_storage_verdict: None,
         }
     }
 
@@ -1005,12 +1009,19 @@ impl ControllerService {
             failover: crate::config::FailoverConfig::default(),
             test_push_hook: Some(hook),
             test_fence_hook: None,
+            test_storage_verdict: None,
         }
     }
 
     #[cfg(test)]
     pub fn with_test_fence_hook(mut self, hook: FenceHook) -> Self {
         self.test_fence_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_test_storage_verdict(mut self, verdict: crate::ha::StorageVerdict) -> Self {
+        self.test_storage_verdict = Some(verdict);
         self
     }
 
@@ -4288,6 +4299,9 @@ impl ControllerService {
                 ),
                 survivor,
                 can_fail,
+                domain: crate::ha::failure_domain_label(
+                    &self.db.get_node_labels(&node.id).unwrap_or_default(),
+                ),
             });
         }
         let mut admission_vms = Vec::new();
@@ -6408,6 +6422,97 @@ impl ControllerService {
         Ok(received.snapshot)
     }
 
+    async fn storage_verdict_for_failover(
+        &self,
+        source: &NodeRow,
+        images: &[String],
+    ) -> crate::ha::StorageVerdict {
+        #[cfg(test)]
+        {
+            let _ = (source, images);
+            self.test_storage_verdict
+                .unwrap_or(crate::ha::StorageVerdict::Dead)
+        }
+        #[cfg(not(test))]
+        {
+            self.probe_peer_storage(source, images).await
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn probe_peer_storage(
+        &self,
+        source: &NodeRow,
+        images: &[String],
+    ) -> crate::ha::StorageVerdict {
+        let Ok(hosts) = self.ceph_client_hosts_for_node(source) else {
+            return crate::ha::StorageVerdict::Unknown;
+        };
+        let Ok(members) = self.db.list_nodes() else {
+            return crate::ha::StorageVerdict::Unknown;
+        };
+        let host_name = if source.hostname.is_empty() {
+            source.id.clone()
+        } else {
+            source.hostname.clone()
+        };
+        for member in members
+            .iter()
+            .filter(|member| member.id != source.id && member.status == "ready")
+        {
+            if !self.node_supports_backend(member, "ceph") {
+                continue;
+            }
+            if self.clients.get_storage(&member.address).is_none()
+                && self.clients.connect(&member.address).await.is_err()
+            {
+                continue;
+            }
+            let Some(mut storage) = self.clients.get_storage(&member.address) else {
+                continue;
+            };
+            match storage
+                .probe_host_storage(node_proto::ProbeHostStorageRequest {
+                    host_name: host_name.clone(),
+                    source_hosts: hosts.clone(),
+                    images: images.to_vec(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let probe = resp.into_inner();
+                    if !probe.queried {
+                        continue;
+                    }
+                    let watcher = if images.is_empty() {
+                        None
+                    } else {
+                        Some(probe.watcher_from_host)
+                    };
+                    return crate::ha::storage_verdict(
+                        crate::ha::parse_osd_report(&probe.osd_state),
+                        watcher,
+                    );
+                }
+                Err(err)
+                    if err.code() == tonic::Code::Unimplemented
+                        || err.code() == tonic::Code::Unavailable =>
+                {
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                        node_id = %source.id,
+                        member = %member.id,
+                        error = %err,
+                        "storage heartbeat failed"
+                    );
+                }
+            }
+        }
+        crate::ha::StorageVerdict::Unknown
+    }
+
     /// Move Ceph VMs off a node that has already been marked `not-ready`.
     ///
     /// Local-disk VMs stay, because their disks are on the failed host. The
@@ -6465,6 +6570,40 @@ impl ControllerService {
                 .map(|row| row.restart_priority.clone())
                 .unwrap_or_else(|| crate::ha::PRIORITY_MEDIUM.to_string())
         });
+        if vms.iter().any(|vm| vm.storage_backend == "ceph") {
+            let mut images = Vec::new();
+            for vm in vms.iter().filter(|vm| vm.storage_backend == "ceph") {
+                let Ok(volumes) = self.db.list_attached_volumes_for_vm(&vm.id) else {
+                    continue;
+                };
+                for vol in volumes {
+                    images.push(format!("{}/{}", vol.pool, vol.image));
+                }
+            }
+            match self.storage_verdict_for_failover(&source, &images).await {
+                crate::ha::StorageVerdict::Alive => {
+                    let _ = self.db.insert_ha_event(
+                        node_id,
+                        "",
+                        "agent-down",
+                        "storage heartbeat still sees this host",
+                    );
+                    return Ok(NodeDrainOutcome {
+                        migrated: 0,
+                        errors: Vec::new(),
+                    });
+                }
+                crate::ha::StorageVerdict::Unknown => {
+                    return Ok(NodeDrainOutcome {
+                        migrated: 0,
+                        errors: vec![format!(
+                            "storage heartbeat for {node_id} did not answer; guests stay"
+                        )],
+                    });
+                }
+                crate::ha::StorageVerdict::Dead => {}
+            }
+        }
         let all_nodes = self
             .db
             .list_nodes()
@@ -7253,6 +7392,22 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }
         let _ = self.db.mark_direct_seen(&req.node_id);
         let _ = self.db.clear_node_lost(&req.node_id);
+        if req.host_health == "degraded" {
+            let _ = self.db.set_node_host_health(&req.node_id, "degraded");
+            if let Ok(Some(node)) = self.db.get_node(&req.node_id) {
+                if crate::ha::proactive_should_cordon(&req.host_health, &node.status) {
+                    let _ = self.db.update_node_status(&req.node_id, "cordoned");
+                    let _ = self.db.insert_ha_event(
+                        &req.node_id,
+                        "",
+                        "proactive",
+                        &req.host_health_reason,
+                    );
+                }
+            }
+        } else if !req.host_health.is_empty() {
+            let _ = self.db.set_node_host_health(&req.node_id, "ok");
+        }
         for action in &req.ha_actions {
             let (phase, vm_id) = action
                 .split_once(':')
@@ -21198,6 +21353,35 @@ mod tests {
         let hold = db.get_node_fence_hold("node-a").expect("hold");
         assert!(hold.pending);
         assert_eq!(hold.vms, vec!["ceph-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn failover_does_not_move_a_host_storage_still_sees() {
+        let (db, vm) = ceph_two_node_fixture();
+        mark_ceph_cluster_healthy(&db, "lab");
+        db.update_node_status("node-a", "not-ready").expect("mark");
+        let hook: FenceHook = Arc::new(|_handle: &str, _hosts: &[String]| {
+            panic!("a live storage heartbeat must not fence");
+        });
+        let svc = svc_for(&db)
+            .with_test_fence_hook(hook)
+            .with_test_storage_verdict(crate::ha::StorageVerdict::Alive);
+
+        let outcome = svc
+            .failover_unreachable_node("node-a")
+            .await
+            .expect("failover pass");
+        assert_eq!(outcome.migrated, 0);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(
+            db.get_vm(&vm.id).expect("get").expect("ceph").node_id,
+            "node-a"
+        );
+        let events = db.list_ha_events("", "", 20).expect("events");
+        assert!(
+            events.iter().any(|event| event.phase == "agent-down"),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]

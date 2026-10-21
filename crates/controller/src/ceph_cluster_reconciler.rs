@@ -137,6 +137,7 @@ async fn reconcile_row(
                     .unwrap_or(&node.mon_addr)
                     .to_string(),
                 cluster_addr: node.cluster_addr.clone(),
+                allow_found: bootstrap.is_empty() && index == 0,
             }))
             .await
             .map_err(|e| e.to_string())?
@@ -173,6 +174,7 @@ async fn reconcile_row(
                         .unwrap_or(&node.mon_addr)
                         .to_string(),
                     cluster_addr: node.cluster_addr.clone(),
+                    allow_found: false,
                 }))
                 .await
                 .map_err(|e| e.to_string())?

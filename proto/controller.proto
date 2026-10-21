@@ -294,6 +294,9 @@ message HeartbeatRequest {
   // a guest heartbeat went stale. "isolation-poweroff:<vm>" and
   // "monitor-restart:<vm>".
   repeated string ha_actions = 13;
+  // ok, or degraded when this host's own OSDs are down while the agent is up.
+  string host_health = 14;
+  string host_health_reason = 15;
 }
 
 message GpuInfo {

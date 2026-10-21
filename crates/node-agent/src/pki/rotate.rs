@@ -244,6 +244,56 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// `ip route get` prints `src <address>` for the chosen source.
+pub fn route_src(text: &str) -> Option<String> {
+    let mut words = text.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "src" {
+            let ip = words.next()?.trim();
+            if ip.is_empty() || ip.starts_with("127.") {
+                return None;
+            }
+            return Some(ip.to_string());
+        }
+    }
+    None
+}
+
+/// The address this host uses toward the controller, when the current
+/// certificate does not name it. The controller issues that address and
+/// rejects any other SAN.
+pub fn cert_host_for_renewal(current_sans: &[String], primary_ip: &str) -> Option<String> {
+    let ip = primary_ip.trim();
+    if ip.is_empty() || current_sans.iter().any(|san| san == ip) {
+        None
+    } else {
+        Some(ip.to_string())
+    }
+}
+
+fn primary_ip_toward(cfg: &Config) -> Option<String> {
+    let target = cfg
+        .controller_addr
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let target = if target.is_empty() {
+        "192.0.2.1".to_string()
+    } else {
+        target
+    };
+    let out = std::process::Command::new("ip")
+        .args(["-4", "route", "get", &target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    route_src(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Run one rotation attempt for this node.
 ///
 /// Returns `Ok(outcome)` when the node is in a good state afterwards —
@@ -270,7 +320,9 @@ pub async fn rotate_once(
 
     let now = OffsetDateTime::now_utc();
     let days_until_expiry = current.days_remaining(now) as i32;
-    if !force
+    let san_fix = primary_ip_toward(cfg).and_then(|ip| cert_host_for_renewal(&current.sans, &ip));
+    if san_fix.is_none()
+        && !force
         && !is_due_for_renewal(
             current.not_before,
             current.not_after,
@@ -290,7 +342,11 @@ pub async fn rotate_once(
         });
     }
 
-    let (csr_pem, key) = build_csr(&current.subject_cn, &current.sans)?;
+    let (cn, sans) = match &san_fix {
+        Some(ip) => (format!("kcore-node-{ip}"), vec![ip.clone()]),
+        None => (current.subject_cn.clone(), current.sans.clone()),
+    };
+    let (csr_pem, key) = build_csr(&cn, &sans)?;
 
     let mut signed: Option<controller_proto::SignNodeCsrResponse> = None;
     let mut last_err = String::new();
@@ -403,6 +459,22 @@ mod tests {
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::now_utc()
+    }
+
+    #[test]
+    fn a_moved_address_is_the_san_the_next_certificate_requests() {
+        assert_eq!(
+            route_src("192.168.40.107 dev br0 src 192.168.40.103 uid 0"),
+            Some("192.168.40.103".into())
+        );
+        assert_eq!(
+            cert_host_for_renewal(&["192.168.40.141".into()], "192.168.40.103").as_deref(),
+            Some("192.168.40.103")
+        );
+        assert_eq!(
+            cert_host_for_renewal(&["192.168.40.103".into()], "192.168.40.103"),
+            None
+        );
     }
 
     #[test]

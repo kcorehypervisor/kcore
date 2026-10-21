@@ -235,6 +235,25 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         }))
     }
 
+    async fn probe_host_storage(
+        &self,
+        request: Request<proto::ProbeHostStorageRequest>,
+    ) -> Result<Response<proto::ProbeHostStorageResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let probe = tokio::task::spawn_blocking(move || {
+            storage::probe_host_storage(&req.host_name, &req.source_hosts, &req.images)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?;
+        Ok(Response::new(proto::ProbeHostStorageResponse {
+            queried: probe.queried,
+            osd_state: probe.osd_state,
+            watcher_from_host: probe.watcher_from_host,
+            detail: probe.detail,
+        }))
+    }
+
     type PullZfsSendStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::ZfsSendChunk, Status>> + Send>>;
 

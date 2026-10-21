@@ -1155,6 +1155,85 @@ pub struct FenceOutcome {
 /// even when that list is empty: a missing watcher is not proof the writer
 /// stopped. With neither clients nor a usable IP range, the call fails
 /// rather than reporting the image fenced.
+pub struct HostStorageProbe {
+    pub queried: bool,
+    pub osd_state: String,
+    pub watcher_from_host: bool,
+    pub detail: String,
+}
+
+/// Ask Ceph whether `host` still owns its OSDs or still watches `images`.
+/// A command failure leaves `queried` false so the controller does not fence.
+pub fn probe_host_storage(
+    host: &str,
+    source_hosts: &[String],
+    images: &[String],
+) -> HostStorageProbe {
+    let tree = match run_cmd_capture(
+        "ceph",
+        &["osd", "tree", "--format", "json"],
+        ErrorKind::Internal,
+    ) {
+        Ok(json) => json,
+        Err(err) => {
+            return HostStorageProbe {
+                queried: false,
+                osd_state: "unknown".into(),
+                watcher_from_host: false,
+                detail: err.to_string(),
+            };
+        }
+    };
+    let osd_state = crate::ceph_bootstrap::host_osd_state(&tree, host)
+        .unwrap_or("unknown")
+        .to_string();
+    for image in images {
+        let status = match run_cmd_capture(
+            "rbd",
+            &["status", image, "--format", "json"],
+            ErrorKind::Internal,
+        ) {
+            Ok(json) => json,
+            Err(err) => {
+                return HostStorageProbe {
+                    queried: false,
+                    osd_state,
+                    watcher_from_host: false,
+                    detail: err.to_string(),
+                };
+            }
+        };
+        let watchers = match parse_rbd_status_watchers(&status) {
+            Ok(list) => list,
+            Err(err) => {
+                return HostStorageProbe {
+                    queried: false,
+                    osd_state,
+                    watcher_from_host: false,
+                    detail: err.to_string(),
+                };
+            }
+        };
+        if watchers
+            .iter()
+            .any(|addr| crate::ceph_bootstrap::watcher_matches_host(addr, source_hosts))
+        {
+            return HostStorageProbe {
+                queried: true,
+                osd_state,
+                watcher_from_host: true,
+                detail: String::new(),
+            };
+        }
+    }
+    HostStorageProbe {
+        queried: true,
+        osd_state,
+        watcher_from_host: false,
+        detail: String::new(),
+    }
+}
+
 pub fn ceph_fence_volume(
     backend_handle: &str,
     source_hosts: &[String],

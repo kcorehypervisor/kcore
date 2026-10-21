@@ -2306,7 +2306,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if req.mon {
             let mons = crate::ceph_bootstrap::parse_mon_map(&req.mon_map)
                 .map_err(Status::invalid_argument)?;
-            crate::ceph_bootstrap::mkfs_mon(&pkg, &req.daemon_id, &mons)
+            crate::ceph_bootstrap::mkfs_mon(&pkg, &req.daemon_id, &mons, req.allow_found)
                 .map_err(Status::internal)?;
             require_unit_started(&format!("ceph-mon-{}", req.daemon_id)).await?;
         }

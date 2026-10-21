@@ -143,6 +143,13 @@ in
         "nix-command"
         "flakes"
       ];
+      # A fresh install must be able to nixos-rebuild without a channel and
+      # without a hand-written NIX_PATH. The nixpkgs source stays in the
+      # system closure because this path is part of the generation.
+      nix.nixPath = [
+        "nixos-config=/etc/nixos/configuration.nix"
+        "nixpkgs=${pkgs.path}"
+      ];
       # A later nixpkgs default of broker makes nixos-rebuild refuse to switch
       # a running node. Callers do not set this.
       services.dbus.implementation = lib.mkDefault "dbus";

@@ -345,6 +345,14 @@ async fn send_heartbeat_once(
             }
         };
         let host = crate::system_update::read_host_report();
+        // Crush names the host by hostname. A node id that is not that name
+        // is absent from the tree, and absence must stay "ok".
+        let crush_host = hostname::get()
+            .ok()
+            .and_then(|name| name.into_string().ok())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| cfg.node_id.clone());
+        let host_health = crate::ceph_bootstrap::local_osd_health(&crush_host);
         match client
             .heartbeat(controller_proto::HeartbeatRequest {
                 node_id: cfg.node_id.clone(),
@@ -363,6 +371,12 @@ async fn send_heartbeat_once(
                 schema_version: host.schema_version,
                 nixpkgs_rev: host.nixpkgs_rev,
                 ha_actions: ha_actions.clone(),
+                host_health: host_health.to_string(),
+                host_health_reason: if host_health == "degraded" {
+                    "local OSD down".into()
+                } else {
+                    String::new()
+                },
             })
             .await
         {
