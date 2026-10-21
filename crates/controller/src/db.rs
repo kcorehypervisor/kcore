@@ -826,6 +826,7 @@ pub const SCHEMA_VERSION: i32 = 64;
 /// database already stamped 58 still receives that table. Version 60 adds
 /// membership columns with defaults. Version 61 adds `vms.labels` with a
 /// default. Version 62 adds vGPU parent and profile columns on `node_gpus`.
+/// Version 63 adds the HA tables. Version 64 adds the fence hold on `node_ha`.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2081,6 +2082,24 @@ impl Database {
             }
         }
 
+        if version < 62 {
+            for column in [
+                "parent TEXT NOT NULL DEFAULT ''",
+                "profile TEXT NOT NULL DEFAULT ''",
+                "profiles TEXT NOT NULL DEFAULT ''",
+            ] {
+                let name = column.split_whitespace().next().unwrap_or(column);
+                let has: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('node_gpus') WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if has == 0 {
+                    conn.execute(&format!("ALTER TABLE node_gpus ADD COLUMN {column}"), [])?;
+                }
+            }
+        }
+
         if version < 63 {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS vm_ha (
@@ -2130,24 +2149,6 @@ impl Database {
                 )?;
                 if has == 0 {
                     conn.execute(&format!("ALTER TABLE node_ha ADD COLUMN {column}"), [])?;
-                }
-            }
-        }
-
-        if version < 62 {
-            for column in [
-                "parent TEXT NOT NULL DEFAULT ''",
-                "profile TEXT NOT NULL DEFAULT ''",
-                "profiles TEXT NOT NULL DEFAULT ''",
-            ] {
-                let name = column.split_whitespace().next().unwrap_or(column);
-                let has: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('node_gpus') WHERE name = ?1",
-                    params![name],
-                    |row| row.get(0),
-                )?;
-                if has == 0 {
-                    conn.execute(&format!("ALTER TABLE node_gpus ADD COLUMN {column}"), [])?;
                 }
             }
         }

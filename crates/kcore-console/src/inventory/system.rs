@@ -35,7 +35,7 @@ pub struct Meta {
 impl Default for Meta {
     fn default() -> Self {
         Self {
-            product: "kcore hypervisor".to_string(),
+            product: super::product_label(),
             version: PKG_VERSION.to_string(),
             build_id: if GIT_SHORT.is_empty() {
                 "—".to_string()
@@ -204,7 +204,7 @@ pub fn load_meta(api: &ApiStatus) -> Meta {
 
     let local_time = Local::now().format("%Y-%m-%d %H:%M:%S (local)").to_string();
 
-    let product = "kcore hypervisor".to_string();
+    let product = super::product_label();
     let remote = if management_url == "—" {
         "kcorectl login https://<node-ip>:8443".to_string()
     } else {

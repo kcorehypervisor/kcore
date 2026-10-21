@@ -350,6 +350,17 @@ pub async fn node_admin_client(
         .max_decoding_message_size(1024 * 1024 * 1024))
 }
 
+pub mod vault_install_proto {
+    tonic::include_proto!("kcore.vault.install");
+}
+
+pub async fn vault_install_client(
+    info: &ConnectionInfo,
+) -> Result<vault_install_proto::vault_install_client::VaultInstallClient<Channel>> {
+    let channel = connect(info).await?;
+    Ok(vault_install_proto::vault_install_client::VaultInstallClient::new(channel))
+}
+
 pub async fn node_storage_client(
     info: &ConnectionInfo,
 ) -> Result<node_proto::node_storage_client::NodeStorageClient<Channel>> {

@@ -856,6 +856,83 @@ impl proto::node_storage_server::NodeStorage for StorageService {
             message: "closed".into(),
         }))
     }
+
+    async fn prepare_instant_disk(
+        &self,
+        request: Request<proto::PrepareInstantDiskRequest>,
+    ) -> Result<Response<proto::PrepareInstantDiskResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let vm_name = sanitize_instant_name(&req.vm_name);
+        let dir = std::path::PathBuf::from(format!("/var/lib/kcore/instant/{vm_name}"));
+        let overlay =
+            crate::instant::prepare_overlay(&req.nbd_url, &dir).map_err(Status::internal)?;
+        let memory = req.memory_bytes.max(0) as u64;
+        let vcpus = req.vcpus.max(0) as u32;
+        match crate::instant::boot_overlay(&vm_name, &overlay, memory, vcpus).await {
+            Ok(pid) => Ok(Response::new(proto::PrepareInstantDiskResponse {
+                success: true,
+                message: format!("pid {pid}"),
+                disk_path: overlay.display().to_string(),
+            })),
+            Err(e) => Ok(Response::new(proto::PrepareInstantDiskResponse {
+                success: false,
+                message: e,
+                disk_path: overlay.display().to_string(),
+            })),
+        }
+    }
+
+    async fn finalize_instant_disk(
+        &self,
+        request: Request<proto::FinalizeInstantDiskRequest>,
+    ) -> Result<Response<proto::FinalizeInstantDiskResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let device = resolve_write_device(&req.backend_handle, &req.storage_class)?;
+        let overlay = std::path::PathBuf::from(&req.overlay_path);
+        let device_path = std::path::PathBuf::from(&device);
+        let bytes = tokio::task::spawn_blocking(move || {
+            crate::instant::copy_overlay(&overlay, &device_path)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(Status::internal)?;
+        let vm_name = req.vm_name.trim().to_string();
+        let swap = if vm_name.is_empty() {
+            Ok(())
+        } else {
+            crate::instant::swap_disk(&vm_name, &device).await
+        };
+        let message = match swap {
+            Ok(()) => "volume kept".to_string(),
+            Err(e) => format!("volume written; disk swap: {e}"),
+        };
+        Ok(Response::new(proto::FinalizeInstantDiskResponse {
+            success: true,
+            message,
+            bytes_written: bytes,
+            volume_path: device,
+        }))
+    }
+}
+
+fn sanitize_instant_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "vault-instant".into()
+    } else {
+        cleaned
+    }
 }
 
 fn lvm_to_storage(err: lvm_ops::LvmOpError) -> storage::StorageError {

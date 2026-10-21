@@ -29,6 +29,12 @@ test("the server lists tools and refuses to apply a VM that still has open quest
   assert.match(applyText, /applied\\": false/);
   assert.doesNotMatch(applyText, /kctl was not found/);
 
+  const vault = await client.callTool({
+    name: "kcore_vault_apply",
+    arguments: { kind: "BackupPolicy", spec: { name: "nightly" }, confirm: false },
+  });
+  assert.match(JSON.stringify(vault), /confirm must be true/);
+
   await client.close();
   await server.close();
 });

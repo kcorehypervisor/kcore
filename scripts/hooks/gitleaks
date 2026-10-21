@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Scan staged changes for secrets. Installed by `make install-hooks`.
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks is not installed."
+    echo "  Install gitleaks (https://github.com/gitleaks/gitleaks) and commit again."
+    exit 1
+fi
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+gitleaks protect --staged --redact --config "$root/.gitleaks.toml"

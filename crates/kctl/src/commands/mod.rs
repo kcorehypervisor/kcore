@@ -25,6 +25,7 @@ pub mod security_group;
 pub mod shared_filesystem;
 pub mod ssh_key;
 pub mod storage_class;
+pub mod vault;
 pub mod vm;
 pub mod volume;
 pub mod workload;

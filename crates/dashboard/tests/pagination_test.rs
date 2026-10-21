@@ -403,6 +403,18 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<BackupClusterResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+    async fn prepare_instant_recovery(
+        &self,
+        _: TRequest<PrepareInstantRecoveryRequest>,
+    ) -> Result<Response<PrepareInstantRecoveryResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn finalize_instant_recovery(
+        &self,
+        _: TRequest<FinalizeInstantRecoveryRequest>,
+    ) -> Result<Response<FinalizeInstantRecoveryResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
     async fn restore_cluster(
         &self,
         _: TRequest<RestoreClusterRequest>,

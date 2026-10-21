@@ -12,7 +12,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(false)
         .build_client(true)
-        .compile_protos(&[node_proto], &[proto_dir])?;
+        .compile_protos(&[node_proto], std::slice::from_ref(&proto_dir))?;
+
+    let vault_install_proto = proto_dir.join("vault_install.proto");
+    tonic_build::configure()
+        .build_server(false)
+        .build_client(true)
+        .compile_protos(&[vault_install_proto], std::slice::from_ref(&proto_dir))?;
 
     Ok(())
 }
