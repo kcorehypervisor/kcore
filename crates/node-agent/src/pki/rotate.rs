@@ -279,11 +279,11 @@ fn primary_ip_toward(cfg: &Config) -> Option<String> {
         .unwrap_or("")
         .trim()
         .to_string();
-    let target = if target.is_empty() {
-        "192.0.2.1".to_string()
-    } else {
-        target
-    };
+    // No controller address means we do not know which source the controller
+    // will accept. Inventing a route target would renew a healthy certificate.
+    if target.is_empty() {
+        return None;
+    }
     let out = std::process::Command::new("ip")
         .args(["-4", "route", "get", &target])
         .output()
