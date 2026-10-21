@@ -826,6 +826,7 @@ pub const SCHEMA_VERSION: i32 = 65;
 /// database already stamped 58 still receives that table. Version 60 adds
 /// membership columns with defaults. Version 61 adds `vms.labels` with a
 /// default. Version 62 adds vGPU parent and profile columns on `node_gpus`.
+/// Version 63 adds the HA tables. Version 64 adds the fence hold on `node_ha`.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2083,6 +2084,24 @@ impl Database {
             }
         }
 
+        if version < 62 {
+            for column in [
+                "parent TEXT NOT NULL DEFAULT ''",
+                "profile TEXT NOT NULL DEFAULT ''",
+                "profiles TEXT NOT NULL DEFAULT ''",
+            ] {
+                let name = column.split_whitespace().next().unwrap_or(column);
+                let has: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('node_gpus') WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if has == 0 {
+                    conn.execute(&format!("ALTER TABLE node_gpus ADD COLUMN {column}"), [])?;
+                }
+            }
+        }
+
         if version < 63 {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS vm_ha (
@@ -2138,24 +2157,6 @@ impl Database {
 
         if version < 65 {
             conn.execute_batch(crate::clickhouse_db::SCHEMA)?;
-        }
-
-        if version < 62 {
-            for column in [
-                "parent TEXT NOT NULL DEFAULT ''",
-                "profile TEXT NOT NULL DEFAULT ''",
-                "profiles TEXT NOT NULL DEFAULT ''",
-            ] {
-                let name = column.split_whitespace().next().unwrap_or(column);
-                let has: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('node_gpus') WHERE name = ?1",
-                    params![name],
-                    |row| row.get(0),
-                )?;
-                if has == 0 {
-                    conn.execute(&format!("ALTER TABLE node_gpus ADD COLUMN {column}"), [])?;
-                }
-            }
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -9586,6 +9587,32 @@ mod tests {
             .expect("release");
         assert!(db.node_lost_at(&node.id).expect("cleared").is_empty());
         assert!(!db.clear_node_lost(&node.id).expect("clear after release"));
+    }
+
+    #[test]
+    fn a_fresh_heartbeat_is_recent_and_an_old_one_is_not() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        assert!(!db.node_recently_seen(&node.id, 30).expect("empty"));
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE nodes SET last_heartbeat = datetime('now') WHERE id = ?1",
+                params![node.id],
+            )
+            .expect("stamp now");
+        }
+        assert!(db.node_recently_seen(&node.id, 30).expect("fresh"));
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE nodes SET last_heartbeat = datetime('now', '-2 minutes') WHERE id = ?1",
+                params![node.id],
+            )
+            .expect("stamp old");
+        }
+        assert!(!db.node_recently_seen(&node.id, 30).expect("stale"));
     }
 
     #[test]

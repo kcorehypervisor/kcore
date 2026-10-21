@@ -12,3 +12,12 @@ crates/dashboard/web/dist
 /RELEASE_NOTES.md
 *.iso
 .env
+
+# Generated cluster material. Never commit keys, CSRs, or kubeconfigs.
+/k8s-pki/
+k8s-config-node-*.nix
+*.key
+*.pem
+*.kubeconfig
+*.csr
+*.srl

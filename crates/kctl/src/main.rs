@@ -195,6 +195,16 @@ enum Command {
         #[command(subcommand)]
         action: NodeAction,
     },
+    /// Install a booted kcore Vault image.
+    ///
+    /// The live image listens on port 9091 without TLS, like the hypervisor
+    /// installer. Pass `-k` and `--node`.
+    ///
+    /// Example: kctl --node 192.168.40.120 -k vault install --os-disk /dev/nvme0n1 --data-disk /dev/sda
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
+    },
     /// Kubernetes cluster management
     Kubernetes {
         #[command(subcommand)]
@@ -1660,6 +1670,27 @@ enum PciAction {
 }
 
 #[derive(Subcommand)]
+enum VaultAction {
+    /// List disks on the booted Vault image
+    Disks,
+    /// Install the booted Vault image onto disk
+    Install {
+        /// OS disk. The installer erases it.
+        #[arg(long)]
+        os_disk: String,
+        /// Repository disk, formatted as ZFS pool "vault"
+        #[arg(long)]
+        data_disk: Option<String>,
+        /// Installed hostname (default: kcore-vault)
+        #[arg(long)]
+        hostname: Option<String>,
+        /// Leave the machine on the installer after install-vault finishes
+        #[arg(long)]
+        no_reboot: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum DrainResource {
     /// Drain a node
     Node {
@@ -3011,6 +3042,28 @@ async fn main() {
         Command::Clickhouse { action } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::clickhouse::run(&info, action).await
+        }
+
+        Command::Vault { action } => {
+            let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
+            match action {
+                VaultAction::Disks => commands::vault::disks(&info).await,
+                VaultAction::Install {
+                    os_disk,
+                    data_disk,
+                    hostname,
+                    no_reboot,
+                } => {
+                    commands::vault::install(
+                        &info,
+                        os_disk,
+                        data_disk.as_deref(),
+                        hostname.as_deref(),
+                        !no_reboot,
+                    )
+                    .await
+                }
+            }
         }
 
         Command::Kubernetes {

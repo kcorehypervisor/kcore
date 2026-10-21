@@ -11,6 +11,7 @@ import { createClusterContext } from "./pki.js";
 import { bootstrapCertRequest, buildApply, buildDelete, buildOperation, buildPlanCall, buildRead, type RpcCall } from "./requests.js";
 import { diffSpec } from "./plan.js";
 import type { ConnectionOptions } from "./connection.js";
+import { applyVault, documents, operateVault, readVault, unconfirmed, vaultAddress } from "./vault.js";
 
 const INSTRUCTIONS = `kcore MCP dials the kcore controller gRPC API. Apply is a declarative upsert: it creates a missing resource, updates mutable fields, and rejects immutable changes.
 
@@ -620,6 +621,84 @@ export function createServer(): McpServer {
         },
       ],
     }),
+  );
+
+  const vaultAddressSchema = z.string().optional().describe("Vault coordinator host:port. Defaults to KCORE_VAULT_ENDPOINT or 127.0.0.1:9191.");
+
+  server.registerTool(
+    "kcore_vault_read",
+    {
+      title: "Read the vault",
+      description: "Read vault inventory, backup jobs, or the backup catalog. Does not change the coordinator.",
+      inputSchema: {
+        view: z.enum(["inventory", "jobs", "catalog"]).describe("What to list."),
+        vault: vaultAddressSchema,
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ view, vault }) => {
+      try {
+        return text(await readVault(vaultAddress(vault), view));
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "kcore_vault_apply",
+    {
+      title: "Apply a vault document",
+      description: "Apply BackupPolicy, BackupTarget, or Replication YAML to the vault coordinator. Requires confirm true. These kinds are not cluster resources.",
+      inputSchema: {
+        manifest: z.string().optional().describe("YAML documents. Each document has kind BackupPolicy, BackupTarget, or Replication."),
+        kind: z.enum(["BackupPolicy", "BackupTarget", "Replication"]).optional(),
+        spec: specSchema,
+        confirm: z.boolean().optional().describe("Must be true. The operator has to agree before this runs."),
+        vault: vaultAddressSchema,
+      },
+      annotations: { destructiveHint: true, openWorldHint: false },
+    },
+    async ({ manifest, kind, spec, confirm, vault }) => {
+      const refused = unconfirmed(confirm);
+      if (refused) return text({ ok: false, error: refused });
+      try {
+        const docs = manifest
+          ? documents(manifest)
+          : [{ kind, ...(spec ?? {}) }];
+        const applied = [];
+        for (const doc of docs) {
+          applied.push(await applyVault(vaultAddress(vault), doc));
+        }
+        return text({ ok: true, applied });
+      } catch (error) {
+        return failure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "kcore_vault_operate",
+    {
+      title: "Operate the vault",
+      description: "Start a backup, restore, verify, or replication job. Requires confirm true.",
+      inputSchema: {
+        action: z.enum(["backup", "restore", "verify", "replicate"]),
+        spec: specSchema,
+        confirm: z.boolean().optional().describe("Must be true. The operator has to agree before this runs."),
+        vault: vaultAddressSchema,
+      },
+      annotations: { destructiveHint: true, openWorldHint: false },
+    },
+    async ({ action, spec, confirm, vault }) => {
+      const refused = unconfirmed(confirm);
+      if (refused) return text({ ok: false, error: refused });
+      try {
+        return text(await operateVault(vaultAddress(vault), { action, ...(spec ?? {}) }));
+      } catch (error) {
+        return failure(error);
+      }
+    },
   );
 
   return server;

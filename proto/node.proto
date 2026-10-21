@@ -55,6 +55,9 @@ service NodeStorage {
   rpc ListChangedExtents(ListChangedExtentsRequest) returns (ListChangedExtentsResponse);
   rpc ReadVolumeExtents(ReadVolumeExtentsRequest) returns (stream VolumeBlock);
   rpc WriteVolumeExtents(stream WriteVolumeExtentsRequest) returns (WriteVolumeExtentsResponse);
+  // Instant recovery. The overlay is a qcow2 whose backing file is the vault NBD export.
+  rpc PrepareInstantDisk(PrepareInstantDiskRequest) returns (PrepareInstantDiskResponse);
+  rpc FinalizeInstantDisk(FinalizeInstantDiskRequest) returns (FinalizeInstantDiskResponse);
 
   // Format, mount, and unmount a logical volume in this node's volume group.
   // Mount points must be under /var/lib/kcore or /mnt/kcore.
@@ -2245,4 +2248,28 @@ message RunClickhouseAdminResponse {
   string message = 2;
   // Backup: the system.backups id. LocalPartsCount: the count as text.
   string result = 3;
+}
+
+message PrepareInstantDiskRequest {
+  string nbd_url = 1;
+  string vm_name = 2;
+  int64 memory_bytes = 3;
+  int32 vcpus = 4;
+}
+message PrepareInstantDiskResponse {
+  bool success = 1;
+  string message = 2;
+  string disk_path = 3;
+}
+message FinalizeInstantDiskRequest {
+  string overlay_path = 1;
+  string backend_handle = 2;
+  string storage_class = 3;
+  string vm_name = 4;
+}
+message FinalizeInstantDiskResponse {
+  bool success = 1;
+  string message = 2;
+  int64 bytes_written = 3;
+  string volume_path = 4;
 }

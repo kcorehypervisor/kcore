@@ -127,7 +127,8 @@ use super::validation::{
     storage_backend_to_proto, validate_image_path, validate_image_sha256, validate_image_url,
     validate_ipv4, validate_netmask, validate_network_name, validate_network_type,
     validate_postgresql_database, validate_postgresql_name, validate_postgresql_package,
-    validate_postgresql_port, validate_storage_size_bytes,
+    validate_postgresql_port, validate_storage_size_bytes, vault_boot_volume_name,
+    VAULT_BOOT_IMAGE,
 };
 
 #[cfg(test)]
@@ -1911,6 +1912,23 @@ impl ControllerService {
                 ))
             })?;
         Ok(())
+    }
+
+    fn node_for_instant(&self, name: &str) -> Result<crate::db::NodeRow, Status> {
+        let nodes = self
+            .db
+            .list_nodes()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if name.is_empty() {
+            return nodes
+                .into_iter()
+                .next()
+                .ok_or_else(|| Status::failed_precondition("no nodes"));
+        }
+        nodes
+            .into_iter()
+            .find(|n| n.id == name || n.hostname == name)
+            .ok_or_else(|| Status::not_found(format!("node {name} not found")))
     }
 
     /// Close the LUKS mapper (and release its nbd) on `node` for each encrypted
@@ -7800,18 +7818,38 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         let image_url_input = req.image_url.trim();
         let image_path_input = req.image_path.trim();
-        if image_url_input.is_empty() && image_path_input.is_empty() {
+        let boot_volume = match vault_boot_volume_name(&spec) {
+            Some(name) => Some(
+                self.resolve_volume_row(&name)?
+                    .ok_or_else(|| Status::not_found(format!("boot volume '{name}' not found")))?,
+            ),
+            None => None,
+        };
+        if boot_volume.is_none() && image_url_input.is_empty() && image_path_input.is_empty() {
             return Err(Status::invalid_argument(
                 "either image_url or image_path is required",
             ));
         }
-        if !image_url_input.is_empty() && !image_path_input.is_empty() {
+        if boot_volume.is_none() && !image_url_input.is_empty() && !image_path_input.is_empty() {
             return Err(Status::invalid_argument(
                 "image_url and image_path are mutually exclusive",
             ));
         }
 
-        let (image_url, image_sha256, image_path, image_format) = if !image_url_input.is_empty() {
+        let (image_url, image_sha256, image_path, image_format) = if let Some(ref vol) = boot_volume
+        {
+            if vol.storage_class != "ceph" || vol.pool.is_empty() || vol.image.is_empty() {
+                return Err(Status::failed_precondition(
+                    "boot test volume must be a Ceph volume with a pool and image",
+                ));
+            }
+            (
+                String::new(),
+                String::new(),
+                VAULT_BOOT_IMAGE.to_string(),
+                "raw".to_string(),
+            )
+        } else if !image_url_input.is_empty() {
             let image_url = validate_image_url(image_url_input)?;
             let image_sha256 = validate_image_sha256(&req.image_sha256)?;
             let image_path = derive_local_image_path(&image_url, &image_sha256);
@@ -7908,26 +7946,29 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     "storage_backend ceph requires a healthy CephCluster that includes the target node",
                 ));
             }
-            if self.clients.get_storage(&node.address).is_none() {
-                self.clients
-                    .connect(&node.address)
+            // A boot test already wrote the guest into this RBD. Creating
+            // another image would boot an empty disk.
+            if boot_volume.is_none() {
+                if self.clients.get_storage(&node.address).is_none() {
+                    self.clients.connect(&node.address).await.map_err(|e| {
+                        Status::unavailable(format!("connecting to Ceph node: {e}"))
+                    })?;
+                }
+                let mut storage = self
+                    .clients
+                    .get_storage(&node.address)
+                    .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
+                storage
+                    .create_volume(node_proto::CreateVolumeRequest {
+                        volume_id: format!("kcore-{}", vm.id),
+                        storage_class: "ceph".into(),
+                        size_bytes: vm.storage_size_bytes,
+                        parameters: HashMap::new(),
+                        lv_name: String::new(),
+                    })
                     .await
-                    .map_err(|e| Status::unavailable(format!("connecting to Ceph node: {e}")))?;
+                    .map_err(|e| Status::internal(format!("creating RBD volume: {e}")))?;
             }
-            let mut storage = self
-                .clients
-                .get_storage(&node.address)
-                .ok_or_else(|| Status::unavailable("Ceph storage client unavailable"))?;
-            storage
-                .create_volume(node_proto::CreateVolumeRequest {
-                    volume_id: format!("kcore-{}", vm.id),
-                    storage_class: "ceph".into(),
-                    size_bytes: vm.storage_size_bytes,
-                    parameters: HashMap::new(),
-                    lv_name: String::new(),
-                })
-                .await
-                .map_err(|e| Status::internal(format!("creating RBD volume: {e}")))?;
         }
 
         if let Err(e) = self.db.insert_vm(&vm) {
@@ -7990,11 +8031,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
         }
         if vm.storage_backend == "ceph" {
-            if let Err(e) = self.db.upsert_volume(&VolumeRow::new_root(
-                &vm.id,
-                &vm.name,
-                vm.storage_size_bytes,
-            )) {
+            let mut root = VolumeRow::new_root(&vm.id, &vm.name, vm.storage_size_bytes);
+            if let Some(ref vol) = boot_volume {
+                root.pool.clone_from(&vol.pool);
+                root.image.clone_from(&vol.image);
+                root.size_bytes = vol.size_bytes;
+            }
+            if let Err(e) = self.db.upsert_volume(&root) {
                 self.rollback_created_vm(&node, &vm).await;
                 return Err(Status::internal(format!("storing Ceph volume: {e}")));
             }
@@ -14114,6 +14157,80 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 } else {
                     "thawed".into()
                 },
+            },
+        ))
+    }
+
+    async fn prepare_instant_recovery(
+        &self,
+        request: Request<controller_proto::PrepareInstantRecoveryRequest>,
+    ) -> Result<Response<controller_proto::PrepareInstantRecoveryResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let req = request.into_inner();
+        if req.nbd_url.trim().is_empty() {
+            return Err(Status::invalid_argument("nbd_url is required"));
+        }
+        let node = self.node_for_instant(req.node.trim())?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self.clients.get_storage(&node.address).ok_or_else(|| {
+            Status::failed_precondition(format!("storage client for {} unavailable", node.id))
+        })?;
+        let prepared = storage
+            .prepare_instant_disk(node_proto::PrepareInstantDiskRequest {
+                nbd_url: req.nbd_url,
+                vm_name: req.vm_name,
+                memory_bytes: req.memory_bytes,
+                vcpus: req.vcpus,
+            })
+            .await?
+            .into_inner();
+        Ok(Response::new(
+            controller_proto::PrepareInstantRecoveryResponse {
+                success: prepared.success,
+                message: prepared.message,
+                disk_path: prepared.disk_path,
+            },
+        ))
+    }
+
+    async fn finalize_instant_recovery(
+        &self,
+        request: Request<controller_proto::FinalizeInstantRecoveryRequest>,
+    ) -> Result<Response<controller_proto::FinalizeInstantRecoveryResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let req = request.into_inner();
+        let vol = self
+            .resolve_volume_row(req.volume_name.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume_name)))?;
+        let node = self.node_for_instant(req.node.trim())?;
+        if self.clients.get_storage(&node.address).is_none() {
+            let _ = self.clients.connect(&node.address).await;
+        }
+        let mut storage = self.clients.get_storage(&node.address).ok_or_else(|| {
+            Status::failed_precondition(format!("storage client for {} unavailable", node.id))
+        })?;
+        let backend = if vol.pool.is_empty() {
+            vol.image.clone()
+        } else {
+            format!("{}/{}", vol.pool, vol.image)
+        };
+        let finished = storage
+            .finalize_instant_disk(node_proto::FinalizeInstantDiskRequest {
+                overlay_path: req.overlay_path,
+                backend_handle: backend,
+                storage_class: vol.storage_class.clone(),
+                vm_name: req.vm_name,
+            })
+            .await?
+            .into_inner();
+        Ok(Response::new(
+            controller_proto::FinalizeInstantRecoveryResponse {
+                success: finished.success,
+                message: finished.message,
+                bytes_written: finished.bytes_written,
+                volume_path: finished.volume_path,
             },
         ))
     }

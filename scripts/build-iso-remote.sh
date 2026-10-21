@@ -3,9 +3,11 @@
 
 set -euo pipefail
 
-SSH_HOST="rtacconi@192.168.40.10"
-SSH_KEY="$HOME/.ssh/id_ed25519_gmail"
-REMOTE_DIR="/mnt/md126/kcore-rust"
+# Required: KCORE_ISO_SSH_HOST (user@host). Optional: KCORE_ISO_SSH_KEY, KCORE_ISO_REMOTE_DIR.
+: "${KCORE_ISO_SSH_HOST:?Set KCORE_ISO_SSH_HOST to user@host}"
+SSH_HOST="$KCORE_ISO_SSH_HOST"
+SSH_KEY="${KCORE_ISO_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+REMOTE_DIR="${KCORE_ISO_REMOTE_DIR:-/var/tmp/kcore-iso-build}"
 LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "======================================================"
@@ -52,6 +54,11 @@ rsync -avz --progress \
     --exclude 'target/' \
     --exclude '*.db' \
     --exclude '*.log' \
+    --exclude 'k8s-pki/' \
+    --exclude '.env' \
+    --exclude '*.key' \
+    --exclude '*.pem' \
+    --exclude '*.kubeconfig' \
     "$LOCAL_DIR/" "$SSH_HOST:$REMOTE_DIR/"
 
 echo ""
