@@ -387,6 +387,7 @@ async fn send_heartbeat_once(
                     guard.last_ok = Some(std::time::Instant::now());
                     if resp.assignment_confirmed {
                         guard.assigned = resp.assigned_vm_ids;
+                        guard.fence_vms = resp.fence_vm_ids;
                         guard.confirmed = true;
                     }
                     guard.monitors = resp

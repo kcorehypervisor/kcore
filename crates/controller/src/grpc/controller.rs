@@ -7593,11 +7593,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 })
             })
             .collect();
+        // Names still on the hold, after this heartbeat's release decision.
+        // The agent masks them even when its placement file no longer lists
+        // the guest. An empty list is a host with no fence.
+        let fence_vm_ids = match self.db.get_node_fence_hold(&req.node_id) {
+            Ok(hold) if hold.pending => hold.vms,
+            _ => Vec::new(),
+        };
         Ok(Response::new(controller_proto::HeartbeatResponse {
             success: true,
             assigned_vm_ids: assigned.into_iter().map(|vm| vm.name).collect(),
             assignment_confirmed: true,
             vm_monitors,
+            fence_vm_ids,
         }))
     }
 

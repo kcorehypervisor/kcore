@@ -341,6 +341,11 @@ message HeartbeatResponse {
   // Guest-heartbeat restarts the node should perform. restart_after_secs
   // of 0 means monitoring is off for that VM.
   repeated VmMonitor vm_monitors = 4;
+  // Guests this host must mask before the controller lifts its fence.
+  // A reinstall no longer lists them in vm-placement, so the agent cannot
+  // discover the names locally. Empty when no fence is held. An older
+  // agent ignores the field and its fence stays until it reports the masks.
+  repeated string fence_vm_ids = 5;
 }
 
 message VmMonitor {

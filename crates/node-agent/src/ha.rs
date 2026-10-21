@@ -26,17 +26,23 @@ pub enum HostAction {
 }
 
 /// Placement runs on the first pass, when the controller's assignment
-/// changes, and when `vm-placement` itself changes. A moved guest's line
-/// often appears only after `nixos-rebuild` writes the file, which is
-/// later than the assignment heartbeat.
+/// changes, when the fence list changes, and when `vm-placement` itself
+/// changes. A moved guest's line often appears only after `nixos-rebuild`
+/// writes the file, which is later than the assignment heartbeat. A
+/// reinstall never writes that line, so the fence list is the other signal.
 pub fn placement_cycle_due(
     done: bool,
     assigned: &[String],
     last_assigned: &[String],
+    fence_vms: &[String],
+    last_fence: &[String],
     placement_text: &str,
     last_placement: &str,
 ) -> bool {
-    !done || assigned != last_assigned || placement_text != last_placement
+    !done
+        || assigned != last_assigned
+        || fence_vms != last_fence
+        || placement_text != last_placement
 }
 
 pub fn parse_placement_file(text: &str) -> Vec<LocalVm> {
@@ -59,9 +65,15 @@ pub fn parse_placement_file(text: &str) -> Vec<LocalVm> {
 /// `confirmed` false means the controller is too old to say, so every unit
 /// may start. After `timed_out`, Ceph units that were never confirmed are
 /// masked and the target is started so local disks boot.
+///
+/// `fence_vms` are guests the controller moved away and still blocklists
+/// this host for. They are masked even when `vm-placement` no longer names
+/// them. A unit that is not installed counts as masked. A guest the
+/// controller still assigns here is left alone.
 pub fn placement_actions(
     local: &[LocalVm],
     assigned: &[String],
+    fence_vms: &[String],
     confirmed: bool,
     timed_out: bool,
 ) -> Vec<HostAction> {
@@ -83,6 +95,21 @@ pub fn placement_actions(
             actions.push(HostAction::Mask(vm.name.clone()));
         } else {
             actions.push(HostAction::Unmask(vm.name.clone()));
+        }
+    }
+    if confirmed {
+        for name in fence_vms {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let already = actions.iter().any(|action| {
+                matches!(action, HostAction::Mask(have) | HostAction::Unmask(have) if have == name)
+            });
+            let owned = assigned.iter().any(|id| id == name);
+            if !already && !owned {
+                actions.push(HostAction::Mask(name.to_string()));
+            }
         }
     }
     actions.push(HostAction::StartTarget);
@@ -451,6 +478,9 @@ pub fn apply_host_actions(actions: &[HostAction]) -> Vec<String> {
 pub struct HaShared {
     pub pending_reports: Vec<String>,
     pub assigned: Vec<String>,
+    /// Guests the controller still fences this host for. Masked even when
+    /// they are absent from the local placement file.
+    pub fence_vms: Vec<String>,
     pub confirmed: bool,
     pub monitors: Vec<(String, i64)>,
     pub last_ok: Option<Instant>,
@@ -465,13 +495,15 @@ pub fn spawn_ha_supervisor(
         let started = Instant::now();
         let mut placement_done = false;
         let mut last_assigned: Vec<String> = Vec::new();
+        let mut last_fence: Vec<String> = Vec::new();
         let mut last_placement = String::new();
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let (assigned, confirmed, monitors, last_ok, mut last_restart) = {
+            let (assigned, fence_vms, confirmed, monitors, last_ok, mut last_restart) = {
                 let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                 (
                     guard.assigned.clone(),
+                    guard.fence_vms.clone(),
                     guard.confirmed,
                     guard.monitors.clone(),
                     guard.last_ok,
@@ -485,6 +517,8 @@ pub fn spawn_ha_supervisor(
                 placement_done,
                 &assigned,
                 &last_assigned,
+                &fence_vms,
+                &last_fence,
                 &placement_text,
                 &last_placement,
             );
@@ -511,6 +545,7 @@ pub fn spawn_ha_supervisor(
             let actions = supervisor_actions(
                 &local,
                 &assigned,
+                &fence_vms,
                 confirmed,
                 started,
                 now,
@@ -525,15 +560,28 @@ pub fn spawn_ha_supervisor(
                 &last_restart,
                 now_unix,
             );
+            let reports = apply_host_actions(&actions);
+            // A mask that did not land has to be tried again. Marking the
+            // cycle done first left a moved guest unmasked, and the fence
+            // hold never cleared.
+            let mask_failed = actions.iter().any(|action| {
+                let HostAction::Mask(name) = action else {
+                    return false;
+                };
+                !reports
+                    .iter()
+                    .any(|report| report == &format!("placement-mask:{name}"))
+            });
             if actions
                 .iter()
                 .any(|action| matches!(action, HostAction::StartTarget))
+                && !mask_failed
             {
                 placement_done = true;
                 last_assigned = assigned;
+                last_fence = fence_vms;
                 last_placement = placement_text;
             }
-            let reports = apply_host_actions(&actions);
             if Path::new("/run/systemd/system").exists() {
                 for action in &actions {
                     if let HostAction::Restart(name) = action {
@@ -556,6 +604,7 @@ pub fn spawn_ha_supervisor(
 pub fn supervisor_actions(
     local: &[LocalVm],
     assigned: &[String],
+    fence_vms: &[String],
     confirmed: bool,
     started: Instant,
     now: Instant,
@@ -573,7 +622,9 @@ pub fn supervisor_actions(
     let mut actions = Vec::new();
     if placement_due {
         let timed_out = now.saturating_duration_since(started) >= placement_timeout;
-        actions.extend(placement_actions(local, assigned, confirmed, timed_out));
+        actions.extend(placement_actions(
+            local, assigned, fence_vms, confirmed, timed_out,
+        ));
     }
     if isolation_due(last_ok, now, isolation_timeout) {
         actions.extend(isolation_actions(local, storage, isolation));
@@ -650,13 +701,45 @@ mod tests {
     fn placement_runs_again_when_the_file_or_the_assignment_changes() {
         let assigned = vec!["labtest-9".to_string()];
         let text = "labtest-9 ceph\n";
-        assert!(placement_cycle_due(false, &assigned, &[], text, ""));
-        assert!(!placement_cycle_due(true, &assigned, &assigned, text, text));
+        assert!(placement_cycle_due(
+            false,
+            &assigned,
+            &[],
+            &[],
+            &[],
+            text,
+            ""
+        ));
+        assert!(!placement_cycle_due(
+            true,
+            &assigned,
+            &assigned,
+            &[],
+            &[],
+            text,
+            text
+        ));
         assert!(
-            placement_cycle_due(true, &assigned, &assigned, text, ""),
+            placement_cycle_due(true, &assigned, &assigned, &[], &[], text, ""),
             "a placement file written after the first pass still has to be applied"
         );
-        assert!(placement_cycle_due(true, &assigned, &[], text, text));
+        assert!(placement_cycle_due(
+            true,
+            &assigned,
+            &[],
+            &[],
+            &[],
+            text,
+            text
+        ));
+        let fence = vec!["labtest-9".to_string()];
+        assert!(
+            placement_cycle_due(true, &assigned, &assigned, &fence, &[], text, text),
+            "a fence list that arrives after the first pass still has to be applied"
+        );
+        assert!(!placement_cycle_due(
+            true, &assigned, &assigned, &fence, &fence, text, text
+        ));
     }
 
     fn placement_file_parses_name_and_backend() {
@@ -674,8 +757,8 @@ mod tests {
     #[test]
     fn an_unconfirmed_controller_holds_units_until_timeout() {
         let local = vec![vm("web", "ceph"), vm("db", "zfs")];
-        assert!(placement_actions(&local, &[], false, false).is_empty());
-        let timed = placement_actions(&local, &[], false, true);
+        assert!(placement_actions(&local, &[], &[], false, false).is_empty());
+        let timed = placement_actions(&local, &[], &[], false, true);
         assert!(timed.contains(&HostAction::Mask("web".into())));
         assert!(timed.contains(&HostAction::Unmask("db".into())));
         assert!(timed.contains(&HostAction::StartTarget));
@@ -781,7 +864,7 @@ mod tests {
     #[test]
     fn a_moved_ceph_vm_is_masked_and_a_local_vm_starts() {
         let local = vec![vm("web", "ceph"), vm("db", "lvm")];
-        let actions = placement_actions(&local, &["db".into()], true, false);
+        let actions = placement_actions(&local, &["db".into()], &[], true, false);
         assert_eq!(
             actions,
             vec![
@@ -790,6 +873,44 @@ mod tests {
                 HostAction::StartTarget,
             ]
         );
+    }
+
+    #[test]
+    fn a_fenced_vm_missing_from_the_placement_file_is_still_masked() {
+        let local = vec![vm("db", "lvm")];
+        let actions = placement_actions(
+            &local,
+            &["db".into()],
+            &["labtest-9".into(), " ".into()],
+            true,
+            false,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                HostAction::Unmask("db".into()),
+                HostAction::Mask("labtest-9".into()),
+                HostAction::StartTarget,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fenced_vm_that_still_belongs_here_is_not_masked() {
+        let actions = placement_actions(
+            &[],
+            &["labtest-9".into()],
+            &["labtest-9".into()],
+            true,
+            false,
+        );
+        assert_eq!(actions, vec![HostAction::StartTarget]);
+    }
+
+    #[test]
+    fn an_unconfirmed_controller_does_not_apply_a_stale_fence_list() {
+        let actions = placement_actions(&[], &[], &["labtest-9".into()], false, true);
+        assert_eq!(actions, vec![HostAction::StartTarget]);
     }
 
     #[test]
@@ -845,6 +966,7 @@ mod tests {
         let waiting = supervisor_actions(
             &local,
             &[],
+            &[],
             false,
             start,
             start,
@@ -863,6 +985,7 @@ mod tests {
         let timed = supervisor_actions(
             &local,
             &[],
+            &["labtest-9".into()],
             false,
             start,
             start + Duration::from_secs(300),
@@ -878,6 +1001,7 @@ mod tests {
             0,
         );
         assert!(timed.contains(&HostAction::Mask("web".into())));
+        assert!(!timed.contains(&HostAction::Mask("labtest-9".into())));
         assert!(timed.contains(&HostAction::Stop("web".into())));
         assert!(!timed
             .iter()
