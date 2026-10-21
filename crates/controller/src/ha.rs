@@ -27,6 +27,52 @@ pub const CAPACITY_NOT_APPLICABLE: &str = "not-applicable";
 /// missed beats so one delayed heartbeat is not a host failure.
 pub const NODE_HEARTBEAT_INTERVAL_SECS: i64 = 15;
 
+/// Agent report once placement has masked moved Ceph guests and started the
+/// confirmation target. Older agents never send it, so their fence stays.
+pub const PLACEMENT_SETTLED: &str = "placement-settled";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceRelease {
+    /// No fence is held. A heartbeat by itself does not lift a blocklist.
+    Keep,
+    /// The fence stays. `vms` are the guests still waiting to be masked.
+    Hold { vms: Vec<String> },
+    /// Every held guest is masked or still assigned here, and placement settled.
+    Unfence,
+}
+
+/// A returning host stays blocklisted until the agent reports
+/// [`PLACEMENT_SETTLED`] and every held VM is either still assigned on that
+/// host or named in a `placement-mask:` report. The first heartbeat after
+/// boot arrives before the moved guest is masked.
+pub fn fence_release(
+    pending: bool,
+    held: &[String],
+    assigned: &[String],
+    actions: &[String],
+) -> FenceRelease {
+    if !pending {
+        return FenceRelease::Keep;
+    }
+    let settled = actions.iter().any(|action| action == PLACEMENT_SETTLED);
+    let remaining: Vec<String> = held
+        .iter()
+        .filter(|vm| {
+            let still_here = assigned.iter().any(|name| name == *vm);
+            let masked = actions
+                .iter()
+                .any(|action| action == &format!("placement-mask:{vm}"));
+            !still_here && !masked
+        })
+        .cloned()
+        .collect();
+    if remaining.is_empty() && settled {
+        FenceRelease::Unfence
+    } else {
+        FenceRelease::Hold { vms: remaining }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmPolicy {
     pub restart_priority: String,
@@ -506,6 +552,68 @@ mod tests {
             decide_lease(1, "solo", false, false, 9_000, 1, 1_000, None),
             LeaseDecision::Act { .. }
         ));
+    }
+
+    #[test]
+    fn a_returning_host_stays_fenced_until_the_moved_vm_is_masked() {
+        let held = vec!["labtest-9".to_string()];
+        assert_eq!(
+            fence_release(false, &held, &[], &["placement-settled".into()]),
+            FenceRelease::Keep
+        );
+        assert_eq!(
+            fence_release(true, &held, &[], &[]),
+            FenceRelease::Hold {
+                vms: vec!["labtest-9".into()]
+            }
+        );
+        assert_eq!(
+            fence_release(true, &held, &[], &["placement-settled".into()]),
+            FenceRelease::Hold {
+                vms: vec!["labtest-9".into()]
+            }
+        );
+        assert_eq!(
+            fence_release(
+                true,
+                &held,
+                &[],
+                &[
+                    "placement-mask:labtest-9".into(),
+                    "placement-settled".into()
+                ]
+            ),
+            FenceRelease::Unfence
+        );
+        // The move failed, so the guest still belongs here. Unfence waits
+        // until placement has settled and the unit is gated.
+        assert_eq!(
+            fence_release(true, &held, &["labtest-9".into()], &[]),
+            FenceRelease::Hold { vms: vec![] }
+        );
+        assert_eq!(
+            fence_release(
+                true,
+                &held,
+                &["labtest-9".into()],
+                &["placement-settled".into()]
+            ),
+            FenceRelease::Unfence
+        );
+        assert_eq!(
+            fence_release(
+                true,
+                &["labtest-9".into(), "other".into()],
+                &[],
+                &[
+                    "placement-mask:labtest-9".into(),
+                    "placement-settled".into()
+                ]
+            ),
+            FenceRelease::Hold {
+                vms: vec!["other".into()]
+            }
+        );
     }
 
     #[test]

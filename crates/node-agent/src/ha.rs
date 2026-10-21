@@ -179,6 +179,33 @@ pub fn read_guest_heartbeat(dir: &Path, vm: &str) -> i64 {
     text.trim().parse().unwrap_or(0)
 }
 
+/// What the next heartbeat should tell the controller about this action.
+pub fn action_report(action: &HostAction) -> Option<String> {
+    match action {
+        HostAction::Mask(name) => Some(format!("placement-mask:{name}")),
+        HostAction::Unmask(_) => None,
+        HostAction::StartTarget => Some("placement-settled".into()),
+        HostAction::Stop(name) => Some(format!("isolation-poweroff:{name}")),
+        HostAction::Restart(name) => Some(format!("monitor-restart:{name}")),
+    }
+}
+
+fn systemctl_args(action: &HostAction) -> Vec<String> {
+    match action {
+        HostAction::Mask(name) => vec![
+            "mask".into(),
+            "--now".into(),
+            format!("kcore-vm-{name}.service"),
+        ],
+        HostAction::Unmask(name) => vec!["unmask".into(), format!("kcore-vm-{name}.service")],
+        HostAction::StartTarget => {
+            vec!["start".into(), "kcore-placement-confirmed.target".into()]
+        }
+        HostAction::Stop(name) => vec!["stop".into(), format!("kcore-vm-{name}.service")],
+        HostAction::Restart(name) => vec!["restart".into(), format!("kcore-vm-{name}.service")],
+    }
+}
+
 /// Apply host actions when systemd is running. Returns the actions it
 /// attempted so the next heartbeat can report them. Missing systemd is a
 /// no-op, which is what unit tests and a developer laptop need.
@@ -188,36 +215,10 @@ pub fn apply_host_actions(actions: &[HostAction]) -> Vec<String> {
     }
     let mut reported = Vec::new();
     for action in actions {
-        let (program_args, report): (Vec<String>, String) = match action {
-            HostAction::Mask(name) => (
-                vec![
-                    "mask".into(),
-                    "--now".into(),
-                    format!("kcore-vm-{name}.service"),
-                ],
-                format!("placement-mask:{name}"),
-            ),
-            HostAction::Unmask(name) => (
-                vec!["unmask".into(), format!("kcore-vm-{name}.service")],
-                String::new(),
-            ),
-            HostAction::StartTarget => (
-                vec!["start".into(), "kcore-placement-confirmed.target".into()],
-                String::new(),
-            ),
-            HostAction::Stop(name) => (
-                vec!["stop".into(), format!("kcore-vm-{name}.service")],
-                format!("isolation-poweroff:{name}"),
-            ),
-            HostAction::Restart(name) => (
-                vec!["restart".into(), format!("kcore-vm-{name}.service")],
-                format!("monitor-restart:{name}"),
-            ),
-        };
         let _ = std::process::Command::new("systemctl")
-            .args(&program_args)
+            .args(systemctl_args(action))
             .status();
-        if !report.is_empty() {
+        if let Some(report) = action_report(action) {
             reported.push(report);
         }
     }
@@ -439,6 +440,23 @@ mod tests {
         assert!(timed.contains(&HostAction::Mask("web".into())));
         assert!(timed.contains(&HostAction::Unmask("db".into())));
         assert!(timed.contains(&HostAction::StartTarget));
+    }
+
+    #[test]
+    fn placement_reports_the_mask_and_that_placement_settled() {
+        let actions = [
+            HostAction::Mask("web".into()),
+            HostAction::Unmask("db".into()),
+            HostAction::StartTarget,
+        ];
+        let reports: Vec<String> = actions.iter().filter_map(action_report).collect();
+        assert_eq!(
+            reports,
+            vec![
+                "placement-mask:web".to_string(),
+                "placement-settled".to_string()
+            ]
+        );
     }
 
     #[test]

@@ -160,6 +160,17 @@ pub struct ClusterLeaseRow {
     pub term: i64,
 }
 
+/// Ceph blocklist held on a host until its agent masks the moved guests.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeFenceHold {
+    pub pending: bool,
+    pub vms: Vec<String>,
+}
+
+fn split_fence_vms(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_string).collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeGpuRow {
     pub node_id: String,
@@ -805,7 +816,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 63;
+pub const SCHEMA_VERSION: i32 = 64;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -2101,6 +2112,23 @@ impl Database {
                     term INTEGER NOT NULL
                 );",
             )?;
+        }
+
+        if version < 64 {
+            for column in [
+                "fence_pending INTEGER NOT NULL DEFAULT 0",
+                "fence_vms TEXT NOT NULL DEFAULT ''",
+            ] {
+                let name = column.split_whitespace().next().unwrap_or(column);
+                let has: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('node_ha') WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if has == 0 {
+                    conn.execute(&format!("ALTER TABLE node_ha ADD COLUMN {column}"), [])?;
+                }
+            }
         }
 
         if version < 62 {
@@ -6577,6 +6605,56 @@ impl Database {
             )
             .ok();
         Ok(value.unwrap_or_default())
+    }
+
+    /// Names still blocklisted on a lost host, and whether that fence is held.
+    pub fn get_node_fence_hold(&self, node_id: &str) -> Result<NodeFenceHold, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        match conn.query_row(
+            "SELECT fence_pending, fence_vms FROM node_ha WHERE node_id = ?1",
+            params![node_id],
+            |row| {
+                let pending: i64 = row.get(0)?;
+                let vms: String = row.get(1)?;
+                Ok((pending, vms))
+            },
+        ) {
+            Ok((pending, vms)) => Ok(NodeFenceHold {
+                pending: pending != 0,
+                vms: split_fence_vms(&vms),
+            }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(NodeFenceHold::default()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Replace the fence hold. An empty `vms` with `pending` still set means
+    /// every guest is accounted for and the agent has not settled placement.
+    pub fn set_node_fence_hold(
+        &self,
+        node_id: &str,
+        pending: bool,
+        vms: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO node_ha (node_id, fence_pending, fence_vms) VALUES (?1, ?2, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET
+               fence_pending = excluded.fence_pending,
+               fence_vms = excluded.fence_vms",
+            params![node_id, i32::from(pending), vms.join(" ")],
+        )?;
+        Ok(())
+    }
+
+    /// Remember that `vm_name` was fenced on `node_id` and must stay fenced
+    /// until that host reports the guest masked.
+    pub fn add_fenced_vm(&self, node_id: &str, vm_name: &str) -> Result<(), rusqlite::Error> {
+        let mut hold = self.get_node_fence_hold(node_id)?;
+        if !hold.vms.iter().any(|name| name == vm_name) {
+            hold.vms.push(vm_name.to_string());
+        }
+        self.set_node_fence_hold(node_id, true, &hold.vms)
     }
 
     /// Clear the lost mark. Returns true when the node had been marked lost.

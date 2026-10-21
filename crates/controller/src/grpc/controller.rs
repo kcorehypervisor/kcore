@@ -6529,6 +6529,14 @@ impl ControllerService {
                     blocklisted = ?blocklisted,
                     "fenced Ceph clients of unreachable node"
                 );
+                if let Err(e) = self.db.add_fenced_vm(node_id, &vm.name) {
+                    warn!(
+                        node_id,
+                        vm = %vm.name,
+                        error = %e,
+                        "fenced the guest but could not record the hold"
+                    );
+                }
                 (target, blocklisted)
             };
             let restart = crate::ha::should_restart(&vm.runtime_state, vm.auto_start);
@@ -7200,19 +7208,54 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )));
         }
         let _ = self.db.mark_direct_seen(&req.node_id);
-        let returned = self.db.clear_node_lost(&req.node_id).unwrap_or(false);
+        let _ = self.db.clear_node_lost(&req.node_id);
         for action in &req.ha_actions {
             let (phase, vm_id) = action
                 .split_once(':')
                 .unwrap_or(("action", action.as_str()));
             let _ = self.db.insert_ha_event(&req.node_id, vm_id, phase, action);
         }
-        if returned {
-            let node_id = req.node_id.clone();
-            let this = self.clone();
-            tokio::spawn(async move {
-                this.unfence_returned_node(&node_id).await;
-            });
+        // Coming back is not enough. The blocklist stays until this host
+        // reports that placement settled and every fenced guest is masked
+        // or still assigned here.
+        let assigned_names: Vec<String> = self
+            .db
+            .list_vms_for_node(&req.node_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|vm| vm.name)
+            .collect();
+        match self.db.get_node_fence_hold(&req.node_id) {
+            Ok(hold) => {
+                match crate::ha::fence_release(
+                    hold.pending,
+                    &hold.vms,
+                    &assigned_names,
+                    &req.ha_actions,
+                ) {
+                    crate::ha::FenceRelease::Keep => {}
+                    crate::ha::FenceRelease::Hold { vms } => {
+                        if vms != hold.vms {
+                            if let Err(e) = self.db.set_node_fence_hold(&req.node_id, true, &vms) {
+                                warn!(node_id = %req.node_id, error = %e, "could not update the fence hold");
+                            }
+                        }
+                    }
+                    crate::ha::FenceRelease::Unfence => {
+                        if let Err(e) = self.db.set_node_fence_hold(&req.node_id, false, &[]) {
+                            warn!(node_id = %req.node_id, error = %e, "could not clear the fence hold");
+                        }
+                        let node_id = req.node_id.clone();
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            this.unfence_returned_node(&node_id).await;
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(node_id = %req.node_id, error = %e, "could not read the fence hold; leaving the blocklist in place");
+            }
         }
 
         let capabilities = req.update_capabilities.join(",");
@@ -20995,6 +21038,9 @@ mod tests {
                 "127.0.0.1".to_string()
             ]
         );
+        let hold = db.get_node_fence_hold("node-a").expect("hold");
+        assert!(hold.pending);
+        assert_eq!(hold.vms, vec!["ceph-1".to_string()]);
     }
 
     #[tokio::test]
@@ -21027,6 +21073,8 @@ mod tests {
             "node-a"
         );
         assert!(!db.node_needs_config_push("node-a").expect("flag"));
+        let hold = db.get_node_fence_hold("node-a").expect("hold");
+        assert!(!hold.pending, "{hold:?}");
     }
 
     #[tokio::test]
