@@ -1872,6 +1872,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcore-clickhouse"
+version = "0.5.0"
+dependencies = [
+ "kcore-sanitize",
+ "proptest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "kcore-console"
 version = "0.5.0"
 dependencies = [
@@ -1897,6 +1908,7 @@ dependencies = [
  "clap",
  "const-oid 0.9.6",
  "der",
+ "kcore-clickhouse",
  "kcore-disko-types",
  "kcore-gpu",
  "kcore-sanitize",
@@ -2012,6 +2024,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "hyperlocal",
+ "kcore-clickhouse",
  "kcore-disko-types",
  "kcore-gpu",
  "kcore-sanitize",
@@ -2075,6 +2088,7 @@ dependencies = [
  "base64",
  "clap",
  "dirs",
+ "kcore-clickhouse",
  "kcore-disk-layout-yaml",
  "kcore-gpu",
  "kcore-sanitize",

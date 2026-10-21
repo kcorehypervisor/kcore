@@ -50,6 +50,8 @@ export function buildApply(kind: ResourceKind, spec: Record<string, unknown>): R
       return securityGroupCalls(spec);
     case "disk-layout":
       return [{ target: "controller", method: "createDiskLayout", request: { diskLayout: diskLayoutMessage(spec) } }];
+    case "clickhouse-cluster":
+      return [{ target: "controller", method: "createClickhouseCluster", request: clickhouseCreate(spec) }];
     case "ceph-cluster":
       return [{ target: "controller", method: "createCephCluster", request: { cephCluster: cephMessage(spec) } }];
     case "shared-filesystem":
@@ -104,6 +106,10 @@ export function buildRead(kind: ResourceKind, name?: string): RpcCall {
       return named
         ? { target: "controller", method: "getDiskLayout", request: { name: named } }
         : { target: "controller", method: "listDiskLayouts", request: {} };
+    case "clickhouse-cluster":
+      return named
+        ? { target: "controller", method: "getClickhouseCluster", request: { name: named } }
+        : { target: "controller", method: "listClickhouseClusters", request: {} };
     case "ceph-cluster":
       return named
         ? { target: "controller", method: "getCephCluster", request: { name: named } }
@@ -152,6 +158,8 @@ export function buildDelete(kind: ResourceKind, name: string): RpcCall {
       return { target: "controller", method: "deleteSecurityGroup", request: { name: id } };
     case "disk-layout":
       return { target: "controller", method: "deleteDiskLayout", request: { name: id } };
+    case "clickhouse-cluster":
+      return { target: "controller", method: "deleteClickhouseCluster", request: { name: id, confirm: true } };
     case "ceph-cluster":
       return { target: "controller", method: "deleteCephCluster", request: { name: id } };
     case "shared-filesystem":
@@ -166,6 +174,9 @@ export function buildDelete(kind: ResourceKind, name: string): RpcCall {
 }
 
 export function buildPlanCall(kind: ResourceKind, spec: Record<string, unknown>, name?: string): RpcCall {
+  if (kind.id === "clickhouse-cluster") {
+    return { target: "controller", method: "planClickhouseCluster", request: clickhousePlan(spec) };
+  }
   if (kind.id === "disk-layout") {
     return { target: "controller", method: "classifyDiskLayout", request: { diskLayout: diskLayoutMessage(spec) } };
   }
@@ -483,6 +494,17 @@ function diskLayoutMessage(spec: Record<string, unknown>): Record<string, unknow
 function readLayoutFile(path: string | undefined): string {
   if (!path) return "";
   return readFileSync(assertArg(path, "layout file"), "utf8");
+}
+
+function clickhousePlan(spec: Record<string, unknown>): Record<string, unknown> {
+  const name = assertName(required(spec, "name", "name"), "name");
+  const body = { ...spec };
+  delete body.name;
+  return { name, spec: body };
+}
+
+function clickhouseCreate(spec: Record<string, unknown>): Record<string, unknown> {
+  return { ...clickhousePlan(spec), confirm: true };
 }
 
 function cephMessage(spec: Record<string, unknown>): Record<string, unknown> {

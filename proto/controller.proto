@@ -244,6 +244,43 @@ service Controller {
   rpc DeleteKubernetesCluster(DeleteKubernetesClusterRequest) returns (DeleteKubernetesClusterResponse);
   rpc ScaleKubernetesCluster(ScaleKubernetesClusterRequest) returns (ScaleKubernetesClusterResponse);
   rpc GetKubernetesClusterHealth(GetKubernetesClusterHealthRequest) returns (GetKubernetesClusterHealthResponse);
+
+  // ClickHouse cluster lifecycle
+  // Preflight every member and print what would change. Never mutates.
+  rpc PlanClickhouseCluster(PlanClickhouseClusterRequest) returns (PlanClickhouseClusterResponse);
+  // Persist the spec and start the bootstrap operation. Refused when the
+  // plan has blocking issues or when confirm is false.
+  rpc CreateClickhouseCluster(CreateClickhouseClusterRequest) returns (CreateClickhouseClusterResponse);
+  // Persist a new generation and start a rolling update operation. Immutable
+  // fields return INVALID_ARGUMENT with the field path in the message.
+  rpc UpdateClickhouseCluster(UpdateClickhouseClusterRequest) returns (UpdateClickhouseClusterResponse);
+  rpc GetClickhouseCluster(GetClickhouseClusterRequest) returns (GetClickhouseClusterResponse);
+  rpc ListClickhouseClusters(ListClickhouseClustersRequest) returns (ListClickhouseClustersResponse);
+  // Stop units, optionally release data volumes, drop the rows.
+  rpc DeleteClickhouseCluster(DeleteClickhouseClusterRequest) returns (DeleteClickhouseClusterResponse);
+  // Add or remove replicas and shards. Keeper membership is immutable in v1.
+  rpc ScaleClickhouseCluster(ScaleClickhouseClusterRequest) returns (ScaleClickhouseClusterResponse);
+  // Replace one failed replica with a new node under the same shard.
+  rpc ReplaceClickhouseReplica(ReplaceClickhouseReplicaRequest) returns (ReplaceClickhouseReplicaResponse);
+  // Rebuild Keeper metadata for one replica from the surviving replicas.
+  // This is SYSTEM RESTORE REPLICA, not a backup RESTORE.
+  rpc RestoreClickhouseReplica(RestoreClickhouseReplicaRequest) returns (RestoreClickhouseReplicaResponse);
+  // Change the package pin. Keeper members roll first, then one replica per
+  // shard at a time.
+  rpc UpgradeClickhouseCluster(UpgradeClickhouseClusterRequest) returns (UpgradeClickhouseClusterResponse);
+  // Live health: units, Keeper quorum, replica lag, read-only replicas.
+  rpc GetClickhouseClusterHealth(GetClickhouseClusterHealthRequest) returns (GetClickhouseClusterHealthResponse);
+  // Long-running operations started by Create/Update/Scale/Upgrade/Delete.
+  rpc GetClickhouseOperation(GetClickhouseOperationRequest) returns (GetClickhouseOperationResponse);
+  rpc ListClickhouseOperations(ListClickhouseOperationsRequest) returns (ListClickhouseOperationsResponse);
+  rpc CancelClickhouseOperation(CancelClickhouseOperationRequest) returns (CancelClickhouseOperationResponse);
+  // Generated secrets (default user password, interserver credential). Audit
+  // logged. Operator role only.
+  rpc GetClickhouseClusterCredentials(GetClickhouseClusterCredentialsRequest) returns (GetClickhouseClusterCredentialsResponse);
+  // Native BACKUP / RESTORE driven through one replica per shard.
+  rpc BackupClickhouseCluster(BackupClickhouseClusterRequest) returns (BackupClickhouseClusterResponse);
+  rpc RestoreClickhouseCluster(RestoreClickhouseClusterRequest) returns (RestoreClickhouseClusterResponse);
+  rpc ListClickhouseBackups(ListClickhouseBackupsRequest) returns (ListClickhouseBackupsResponse);
 }
 
 message RegisterNodeRequest {
@@ -2965,4 +3002,499 @@ message GetKubernetesClusterHealthResponse {
   int32 etcd_member_count = 7;
   bool api_server_reachable = 8;
   repeated NodeHealth node_health = 9;
+}
+
+// ClickHouse cluster lifecycle
+message ClickhouseReplicaSpec {
+  string node_id = 1;
+  // Value of the {replica} macro. Defaults to node_id. Immutable once the
+  // replica has joined: ReplicatedMergeTree paths embed it.
+  string replica_name = 2;
+  // Static address other members dial. Must be present on `iface` and not
+  // DHCP-managed (same rule as Ceph mon addresses).
+  string advertise_address = 3;
+  // NIC that carries client, interserver and Keeper traffic. Firewall holes
+  // are opened on this interface only.
+  string iface = 4;
+  // Data directory volume. Empty uses the OS disk under
+  // /var/lib/kcore-clickhouse/<cluster>/data.
+  ClickhouseHostVolume data_volume = 5;
+  // Placement label. If any replica or keeper sets it, every member must.
+  // Controller-only: it is not a ClickHouse macro, so changing it does not
+  // rewrite a table path.
+  string datacenter = 6;
+  // Unset is false. true lists this replica at priority 100 with
+  // load_balancing first_or_random, so Distributed inserts land on a
+  // writable replica. ReplicatedMergeTree still fetches parts here.
+  // A shard with no writable replica is a plan error. A read replica does
+  // not satisfy the rolling gate for a writable replica.
+  bool read_only = 7;
+}
+message ClickhouseShardSpec {
+  // Value of the {shard} macro. Defaults to the 1-based position. Immutable.
+  string shard_name = 1;
+  repeated ClickhouseReplicaSpec replicas = 2;
+  // Relative weight used in remote_servers. 0 means 1.
+  int32 weight = 3;
+}
+message ClickhouseKeeperSpec {
+  string node_id = 1;
+  // Raft server_id. Defaults to the 1-based position. Immutable.
+  int32 server_id = 2;
+  string advertise_address = 3;
+  string iface = 4;
+  // Log and snapshot volume. Keeper fsyncs every Raft append; a separate
+  // device keeps server merges from adding latency. Empty uses the OS disk.
+  ClickhouseHostVolume data_volume = 5;
+  // Same rule as ClickhouseReplicaSpec.datacenter.
+  string datacenter = 6;
+  // Unset is false: the member votes and may become leader. true sets
+  // raft can_become_leader to false (a NuRaft learner). Learners do not
+  // vote and do not count toward the 1/3/5 voting-member rule. Changing
+  // this on an existing server_id is replace; Keeper cannot flip the role
+  // of an existing id.
+  bool learner = 7;
+}
+message ClickhouseHostVolume {
+  string name = 1;            // LV or zvol name on the node
+  string storage_class = 2;   // "lvm" or "zfs"
+  string volume_group = 3;    // VG (lvm) or pool (zfs)
+  int64 size_bytes = 4;
+  string fs_type = 5;         // "ext4" or "xfs"; empty means xfs
+}
+message ClickhouseUserSpec {
+  string name = 1;
+  string password_sha256_hex = 2;
+  // IP or CIDR entries for <networks><ip>. Empty means client_networks,
+  // or 127.0.0.1 when client_networks is also empty. It does not mean ::/0.
+  repeated string networks = 3;
+  string profile = 4;         // settings profile name, empty means "default"
+  string quota = 5;           // quota name, empty means "default"
+  // Grant management is left to SQL. true grants access_management=1.
+  bool access_management = 6;
+}
+message ClickhouseSettingsProfile {
+  string name = 1;
+  // Server-side settings such as max_memory_usage. Keys are validated as
+  // [a-z_][a-z0-9_]* and values are strings as ClickHouse accepts them.
+  // User, database, profile and cluster names use [A-Za-z_][A-Za-z0-9_]*.
+  // Shard and replica names use [A-Za-z0-9][A-Za-z0-9._-]{0,63} so the
+  // defaults "1" and "node-105" are valid.
+  map<string, string> settings = 2;
+}
+message ClickhouseDatabaseSpec {
+  string name = 1;
+}
+message ClickhouseQuotaInterval {
+  int32 duration_seconds = 1;
+  int64 queries = 2;
+  int64 errors = 3;
+  int64 result_rows = 4;
+  int64 read_rows = 5;
+  int64 execution_time_seconds = 6;
+}
+message ClickhouseQuotaSpec {
+  string name = 1;
+  repeated ClickhouseQuotaInterval intervals = 2;
+}
+message ClickhouseDictionaryAttribute {
+  string name = 1;
+  // ClickHouse type name: [A-Za-z_][A-Za-z0-9_]* with an optional (n) or
+  // (n, n) suffix. Nested and experimental types are refused.
+  string type = 2;
+  bool nullable = 3;
+}
+message ClickhouseDictionarySpec {
+  string name = 1;
+  // "clickhouse" or "https"
+  string source = 2;
+  string query = 3;
+  string url = 4;
+  string primary_key = 5;
+  // "flat", "hashed", or "cache"
+  string layout = 6;
+  int32 lifetime_seconds = 7;
+  repeated ClickhouseDictionaryAttribute attributes = 8;
+  string database = 9;
+}
+message ClickhouseNamedCollectionSpec {
+  string name = 1;
+  map<string, string> keys = 2;
+  map<string, string> secret_refs = 3;
+}
+message ClickhouseFunctionSpec {
+  string name = 1;
+  string parameters = 2;
+  string expression = 3;
+}
+message ClickhouseSystemLogs {
+  int32 query_log_days = 1;
+  int32 part_log_days = 2;
+  int32 trace_log_days = 3;
+  int32 text_log_days = 4;
+}
+message ClickhouseTlsConfig {
+  // Unset is false. false means TLS is on: kcore issues per-node certificates
+  // from the cluster PKI and enables tcp_port_secure / https_port /
+  // interserver_https_port / Keeper tcp_port_secure. The packaged plaintext
+  // listeners (tcp 9000, http 8123, interserver 9009, Keeper 2181) are removed,
+  // not bound to localhost. true turns TLS off and renders the plaintext ports.
+  bool disabled = 1;
+  // Days before not_after at which the cert rotation reconciler reissues.
+  int32 rotate_before_days = 2;
+}
+message ClickhouseClusterSpec {
+  // Which nixpkgs ClickHouse attribute the module uses: "clickhouse" (default)
+  // or "clickhouse-lts". Changing it is an upgrade, not an update.
+  string package = 1;
+  repeated ClickhouseShardSpec shards = 2;
+  // 1, 3 or 5 voting members, plus any number of learners. Membership is
+  // immutable in v1 (plan returns "replace").
+  repeated ClickhouseKeeperSpec keepers = 3;
+  repeated ClickhouseUserSpec users = 4;
+  repeated ClickhouseSettingsProfile profiles = 5;
+  repeated ClickhouseDatabaseSpec databases = 6;
+  // Server config keys rendered into config.d. Same validation as profile
+  // settings. Keys kcore owns (listen_host, ports, macros, remote_servers,
+  // zookeeper, path, openSSL, interserver_*) are refused.
+  map<string, string> server_settings = 7;
+  ClickhouseTlsConfig tls = 8;
+  // CIDRs allowed to reach the client ports. Member addresses are always
+  // allowed for interserver and Keeper traffic. Empty means members only.
+  repeated string client_networks = 9;
+  // Rolling restart gate: a replica is "caught up" when
+  // max(system.replicas.absolute_delay) is below this. 0 means 30.
+  int32 max_replica_delay_seconds = 10;
+  // Rolling restart gate: how long a step waits for the gate. 0 means 600.
+  int32 step_timeout_seconds = 11;
+  ClickhousePorts ports = 12;
+  // max_server_memory_usage_to_ram_ratio. 0 means 0.5: the host still runs
+  // guests and the agent. Upstream's 0.9 is refused by validation.
+  double max_server_memory_ratio = 13;
+  repeated ClickhouseQuotaSpec quotas = 14;
+  repeated ClickhouseDictionarySpec dictionaries = 15;
+  repeated ClickhouseNamedCollectionSpec named_collections = 16;
+  repeated ClickhouseFunctionSpec functions = 17;
+  ClickhouseSystemLogs system_logs = 18;
+  // Unset is false. The native Prometheus port stays on 127.0.0.1 and
+  // /clickhouse/metrics is served on HTTPS as the kcore-metrics user.
+  // true opens 9363 on iface to clientNetworks. Plan warns: that port
+  // has no authentication (ClickHouse issue 73774, still true in 26.9).
+  bool metrics_public = 19;
+}
+message ClickhousePorts {
+  int32 tcp = 1;              // 9000, only rendered when TLS is disabled
+  int32 tcp_secure = 2;       // 9440
+  int32 http = 3;             // 8123, only rendered when TLS is disabled
+  int32 https = 4;            // 8443
+  int32 interserver = 5;      // 9009 (http) or 9010 (https)
+  int32 keeper = 6;           // 9281 secure by default; 9181 only when TLS is off.
+                              // The compiled Keeper default if unset is 2181.
+  int32 keeper_raft = 7;      // 9234, TLS when raft_configuration.secure is set
+  int32 prometheus = 8;       // 9363 on 127.0.0.1. 0 disables. Public bind is metrics_public.
+}
+message ClickhouseClusterStatus {
+  // pending, bootstrapping, ready, degraded, updating, upgrading, scaling,
+  // deleting, failed
+  string phase = 1;
+  string message = 2;
+  int64 observed_generation = 3;
+  int32 ready_replicas = 4;
+  int32 total_replicas = 5;
+  int32 ready_keepers = 6;
+  int32 total_keepers = 7;
+  // Package version reported by the members, e.g. "26.2.4.23". Mixed
+  // versions during an upgrade are reported as "a,b".
+  string running_version = 8;
+  google.protobuf.Timestamp last_updated = 9;
+  // Operation currently driving the cluster, empty when idle.
+  string active_operation_id = 10;
+}
+message ClickhouseCluster {
+  string name = 1;
+  int64 generation = 2;
+  ClickhouseClusterSpec spec = 3;
+  ClickhouseClusterStatus status = 4;
+}
+message PlanClickhouseClusterRequest {
+  string name = 1;
+  ClickhouseClusterSpec spec = 2;
+}
+message ClickhouseNodePlan {
+  string node_id = 1;
+  // "server", "keeper" or "server+keeper"
+  string roles = 2;
+  bool preflight_passed = 3;
+  repeated string issues = 4;
+  // "build", "rebuild", "restart", "no-change"
+  string nix_action = 5;
+}
+message PlanClickhouseClusterResponse {
+  // "create", "update", "upgrade", "scale", "replace", "unchanged"
+  string action = 1;
+  repeated string blocking_issues = 2;
+  repeated string warnings = 3;
+  repeated string changed_fields = 4;
+  repeated ClickhouseNodePlan node_plans = 5;
+  // Ordered steps the reconciler would run, one line each.
+  repeated string rollout_steps = 6;
+  string rendered_nix_preview = 7;
+}
+message CreateClickhouseClusterRequest {
+  string name = 1;
+  ClickhouseClusterSpec spec = 2;
+  bool confirm = 3;
+}
+message CreateClickhouseClusterResponse {
+  ClickhouseCluster cluster = 1;
+  string operation_id = 2;
+}
+message UpdateClickhouseClusterRequest {
+  string name = 1;
+  ClickhouseClusterSpec spec = 2;
+  bool confirm = 3;
+}
+message UpdateClickhouseClusterResponse {
+  ClickhouseCluster cluster = 1;
+  string operation_id = 2;
+}
+message GetClickhouseClusterRequest { string name = 1; }
+message GetClickhouseClusterResponse { ClickhouseCluster cluster = 1; }
+message ListClickhouseClustersRequest {}
+message ListClickhouseClustersResponse { repeated ClickhouseCluster clusters = 1; }
+message DeleteClickhouseClusterRequest {
+  string name = 1;
+  bool confirm = 2;
+  // Drop the rows even when members cannot be reached. Units on unreachable
+  // nodes are removed by the next successful apply of an empty fragment.
+  bool force = 3;
+  // Keep data and Keeper volumes mounted and unformatted after the units
+  // stop. Default false unmounts and deletes them.
+  bool retain_data = 4;
+}
+message DeleteClickhouseClusterResponse {
+  string message = 1;
+  string operation_id = 2;
+}
+message ScaleClickhouseClusterRequest {
+  string name = 1;
+  // Replicas to add. shard_name must exist, or be a new shard when the whole
+  // shard is given in add_shards.
+  repeated ClickhouseScaleReplica add_replicas = 2;
+  repeated ClickhouseShardSpec add_shards = 3;
+  // Replicas to remove, as "<shard>/<replica>". The last replica of a shard
+  // needs force.
+  repeated string remove_replicas = 4;
+  // Whole shards to remove. kcore does not move data; the operator drains
+  // tables first. Refused unless the shard holds no local parts or force.
+  repeated string remove_shards = 5;
+  bool confirm = 6;
+  bool force = 7;
+}
+message ClickhouseScaleReplica {
+  string shard_name = 1;
+  ClickhouseReplicaSpec replica = 2;
+}
+message ScaleClickhouseClusterResponse {
+  ClickhouseCluster cluster = 1;
+  string operation_id = 2;
+}
+message ReplaceClickhouseReplicaRequest {
+  string name = 1;
+  string shard_name = 2;
+  // Replica being replaced. SYSTEM DROP REPLICA runs on a surviving replica
+  // of the shard after the old node is confirmed stopped or unreachable.
+  string old_replica_name = 3;
+  ClickhouseReplicaSpec new_replica = 4;
+  bool confirm = 5;
+  // Skip the stop when the old node is unreachable. drop-replica still runs
+  // on a survivor before the new replica is created.
+  bool force = 6;
+}
+message ReplaceClickhouseReplicaResponse {
+  ClickhouseCluster cluster = 1;
+  string operation_id = 2;
+}
+message UpgradeClickhouseClusterRequest {
+  string name = 1;
+  // "clickhouse" or "clickhouse-lts". The resolved version is whatever the
+  // node's nixpkgs pin provides; plan prints it per node.
+  string package = 2;
+  // Any lower version is refused without force. ClickHouse on-disk metadata
+  // does not downgrade across any component. A roll that crosses 26.7 keeps
+  // interserver_tables_status_require_auth false on the new servers until
+  // every server is past that line.
+  bool force = 3;
+  bool confirm = 4;
+  // Set when the jump from the running version to `package` crosses a
+  // Keeper on-disk feature-flag boundary. The resolved version must sit
+  // inside the window (at least the boundary's minimum step, and below
+  // the version that introduced the flag). Empty when the jump crosses
+  // no boundary. 26.2 to 26.9 does not cross the 25.7 boundary.
+  string intermediate_package = 5;
+}
+message UpgradeClickhouseClusterResponse {
+  ClickhouseCluster cluster = 1;
+  string operation_id = 2;
+}
+message RestoreClickhouseReplicaRequest {
+  string name = 1;
+  string shard_name = 2;
+  string replica_name = 3;
+  // Empty means every database in spec.databases.
+  string database = 4;
+  bool confirm = 5;
+  // Run even when the replica's Keeper session looks healthy. Without
+  // force the replica must have readonly replicated tables or a failed
+  // Keeper session.
+  bool force = 6;
+}
+message RestoreClickhouseReplicaResponse {
+  ClickhouseCluster cluster = 1;
+  string operation_id = 2;
+}
+message GetClickhouseClusterHealthRequest { string name = 1; }
+message ClickhouseReplicaHealth {
+  string node_id = 1;
+  string shard_name = 2;
+  string replica_name = 3;
+  bool unit_active = 4;
+  string version = 5;
+  // From system.replicas aggregated over all replicated tables.
+  int32 readonly_tables = 6;
+  int32 max_absolute_delay_seconds = 7;
+  int64 queue_size = 8;
+  bool keeper_session_ok = 9;
+  // Free bytes on the data volume.
+  int64 data_free_bytes = 10;
+  string message = 11;
+}
+message ClickhouseKeeperHealth {
+  string node_id = 1;
+  int32 server_id = 2;
+  bool unit_active = 3;
+  // From `mntr` written through a TLS handshake to the Keeper client port:
+  // leader, follower, observer, or unknown when the handshake or the port
+  // did not answer. A plaintext four-letter write does not work on 9281.
+  string role = 4;
+  int64 znode_count = 5;
+  int64 outstanding_requests = 6;
+  string version = 7;
+}
+message GetClickhouseClusterHealthResponse {
+  // "healthy", "degraded", "critical"
+  string overall_health = 1;
+  bool keeper_quorum = 2;
+  int32 keeper_members_up = 3;
+  int32 keeper_members_total = 4;
+  // Shards with no replica answering queries.
+  repeated string shards_without_replica = 5;
+  repeated ClickhouseReplicaHealth replicas = 6;
+  repeated ClickhouseKeeperHealth keepers = 7;
+}
+message ClickhouseOperationStep {
+  int32 index = 1;
+  // apply-nix, wait-nix, wait-keeper-quorum, wait-replica-caught-up,
+  // create-databases, drop-replica, stop-unit, start-unit, backup, restore,
+  // release-volume
+  string kind = 2;
+  string node_id = 3;
+  // pending, running, succeeded, failed, skipped
+  string state = 4;
+  string message = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp finished_at = 7;
+}
+message ClickhouseOperation {
+  string id = 1;
+  string cluster_name = 2;
+  // create, update, upgrade, scale, replace, delete, backup, restore
+  string kind = 3;
+  // running, succeeded, failed, cancelled
+  string state = 4;
+  int64 target_generation = 5;
+  repeated ClickhouseOperationStep steps = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+message GetClickhouseOperationRequest { string id = 1; }
+message GetClickhouseOperationResponse { ClickhouseOperation operation = 1; }
+message ListClickhouseOperationsRequest { string cluster_name = 1; }
+message ListClickhouseOperationsResponse { repeated ClickhouseOperation operations = 1; }
+message CancelClickhouseOperationRequest { string id = 1; }
+message CancelClickhouseOperationResponse { ClickhouseOperation operation = 1; }
+message GetClickhouseClusterCredentialsRequest { string name = 1; }
+message GetClickhouseClusterCredentialsResponse {
+  string default_user = 1;
+  string default_password = 2;
+  // One connection string per replica, e.g.
+  // "clickhouse://default@192.168.40.105:9440?secure=1".
+  repeated string endpoints = 3;
+  // PEM of the CA that signed the member certificates.
+  string ca_pem = 4;
+  // HTTPS scrape of /clickhouse/metrics. The native 9363 port is localhost
+  // and is not in this list.
+  string metrics_user = 5;
+  string metrics_password = 6;
+  repeated string metrics_urls = 7;
+}
+message ClickhouseBackupTarget {
+  // "disk" or "s3"
+  string kind = 1;
+  // disk: mount path on every replica. s3: endpoint URL.
+  string location = 2;
+  string s3_bucket = 3;
+  // Name of a credential already stored by the controller. The access key
+  // never travels in this message.
+  string s3_credential_ref = 4;
+}
+message BackupClickhouseClusterRequest {
+  string name = 1;
+  ClickhouseBackupTarget target = 2;
+  // Databases to include. Empty means every database in spec.databases.
+  repeated string databases = 3;
+  // Backup name within the target. Empty means <cluster>-<generation>-<ts>.
+  string backup_name = 4;
+  // BACKUP ... SETTINGS base_backup for incremental backups.
+  string base_backup_name = 5;
+  bool confirm = 6;
+  // Skip SQL access entities. Default false backs them up from the
+  // replicated access storage. users.xml stays allow_backup false.
+  bool skip_access = 7;
+}
+message BackupClickhouseClusterResponse {
+  string operation_id = 1;
+  string backup_name = 2;
+}
+message RestoreClickhouseClusterRequest {
+  string name = 1;
+  ClickhouseBackupTarget target = 2;
+  string backup_name = 3;
+  repeated string databases = 4;
+  // RESTORE ... SETTINGS allow_non_empty_tables. Default false.
+  bool allow_non_empty_tables = 5;
+  bool confirm = 6;
+  // Skip restoring SQL access entities. Default false restores them on
+  // one writable replica; Keeper replicates them to the others.
+  bool skip_access = 7;
+}
+message RestoreClickhouseClusterResponse {
+  string operation_id = 1;
+}
+message ListClickhouseBackupsRequest {
+  string name = 1;
+  ClickhouseBackupTarget target = 2;
+}
+message ClickhouseBackupInfo {
+  string backup_name = 1;
+  // From system.backups on the replica that ran it.
+  string status = 2;
+  int64 total_size_bytes = 3;
+  int64 num_files = 4;
+  google.protobuf.Timestamp start_time = 5;
+  google.protobuf.Timestamp end_time = 6;
+  string error = 7;
+}
+message ListClickhouseBackupsResponse {
+  repeated ClickhouseBackupInfo backups = 1;
 }

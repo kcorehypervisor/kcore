@@ -61,6 +61,7 @@ in
     ./ch-vm
     ./kcore-branding.nix
     ./kcore-ceph.nix
+    ./kcore-clickhouse.nix
     ./kcore-metrics.nix
     ./kcore-dashboard.nix
   ];

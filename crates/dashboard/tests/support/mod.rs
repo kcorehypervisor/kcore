@@ -1677,6 +1677,121 @@ impl Controller for MockController {
     ) -> Result<Response<ListHaEventsResponse>, Status> {
         Ok(Response::new(ListHaEventsResponse { events: vec![] }))
     }
+
+    async fn plan_clickhouse_cluster(
+        &self,
+        _: Request<PlanClickhouseClusterRequest>,
+    ) -> Result<Response<PlanClickhouseClusterResponse>, Status> {
+        Err(unimp("plan_clickhouse_cluster"))
+    }
+    async fn create_clickhouse_cluster(
+        &self,
+        _: Request<CreateClickhouseClusterRequest>,
+    ) -> Result<Response<CreateClickhouseClusterResponse>, Status> {
+        Err(unimp("create_clickhouse_cluster"))
+    }
+    async fn update_clickhouse_cluster(
+        &self,
+        _: Request<UpdateClickhouseClusterRequest>,
+    ) -> Result<Response<UpdateClickhouseClusterResponse>, Status> {
+        Err(unimp("update_clickhouse_cluster"))
+    }
+    async fn get_clickhouse_cluster(
+        &self,
+        _: Request<GetClickhouseClusterRequest>,
+    ) -> Result<Response<GetClickhouseClusterResponse>, Status> {
+        Err(Status::not_found("clickhouse cluster"))
+    }
+    async fn list_clickhouse_clusters(
+        &self,
+        _: Request<ListClickhouseClustersRequest>,
+    ) -> Result<Response<ListClickhouseClustersResponse>, Status> {
+        Ok(Response::new(ListClickhouseClustersResponse {
+            clusters: vec![],
+        }))
+    }
+    async fn delete_clickhouse_cluster(
+        &self,
+        _: Request<DeleteClickhouseClusterRequest>,
+    ) -> Result<Response<DeleteClickhouseClusterResponse>, Status> {
+        Err(unimp("delete_clickhouse_cluster"))
+    }
+    async fn scale_clickhouse_cluster(
+        &self,
+        _: Request<ScaleClickhouseClusterRequest>,
+    ) -> Result<Response<ScaleClickhouseClusterResponse>, Status> {
+        Err(unimp("scale_clickhouse_cluster"))
+    }
+    async fn replace_clickhouse_replica(
+        &self,
+        _: Request<ReplaceClickhouseReplicaRequest>,
+    ) -> Result<Response<ReplaceClickhouseReplicaResponse>, Status> {
+        Err(unimp("replace_clickhouse_replica"))
+    }
+    async fn restore_clickhouse_replica(
+        &self,
+        _: Request<RestoreClickhouseReplicaRequest>,
+    ) -> Result<Response<RestoreClickhouseReplicaResponse>, Status> {
+        Err(unimp("restore_clickhouse_replica"))
+    }
+    async fn upgrade_clickhouse_cluster(
+        &self,
+        _: Request<UpgradeClickhouseClusterRequest>,
+    ) -> Result<Response<UpgradeClickhouseClusterResponse>, Status> {
+        Err(unimp("upgrade_clickhouse_cluster"))
+    }
+    async fn get_clickhouse_cluster_health(
+        &self,
+        _: Request<GetClickhouseClusterHealthRequest>,
+    ) -> Result<Response<GetClickhouseClusterHealthResponse>, Status> {
+        Err(unimp("get_clickhouse_cluster_health"))
+    }
+    async fn get_clickhouse_operation(
+        &self,
+        _: Request<GetClickhouseOperationRequest>,
+    ) -> Result<Response<GetClickhouseOperationResponse>, Status> {
+        Err(unimp("get_clickhouse_operation"))
+    }
+    async fn list_clickhouse_operations(
+        &self,
+        _: Request<ListClickhouseOperationsRequest>,
+    ) -> Result<Response<ListClickhouseOperationsResponse>, Status> {
+        Ok(Response::new(ListClickhouseOperationsResponse {
+            operations: vec![],
+        }))
+    }
+    async fn cancel_clickhouse_operation(
+        &self,
+        _: Request<CancelClickhouseOperationRequest>,
+    ) -> Result<Response<CancelClickhouseOperationResponse>, Status> {
+        Err(unimp("cancel_clickhouse_operation"))
+    }
+    async fn get_clickhouse_cluster_credentials(
+        &self,
+        _: Request<GetClickhouseClusterCredentialsRequest>,
+    ) -> Result<Response<GetClickhouseClusterCredentialsResponse>, Status> {
+        Err(unimp("get_clickhouse_cluster_credentials"))
+    }
+    async fn backup_clickhouse_cluster(
+        &self,
+        _: Request<BackupClickhouseClusterRequest>,
+    ) -> Result<Response<BackupClickhouseClusterResponse>, Status> {
+        Err(unimp("backup_clickhouse_cluster"))
+    }
+    async fn restore_clickhouse_cluster(
+        &self,
+        _: Request<RestoreClickhouseClusterRequest>,
+    ) -> Result<Response<RestoreClickhouseClusterResponse>, Status> {
+        Err(unimp("restore_clickhouse_cluster"))
+    }
+    async fn list_clickhouse_backups(
+        &self,
+        _: Request<ListClickhouseBackupsRequest>,
+    ) -> Result<Response<ListClickhouseBackupsResponse>, Status> {
+        Ok(Response::new(ListClickhouseBackupsResponse {
+            backups: vec![],
+        }))
+    }
 }
 
 #[tonic::async_trait]

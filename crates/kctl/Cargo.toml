@@ -7,6 +7,7 @@ edition = "2021"
 clap = { version = "4", features = ["derive"] }
 kcore-gpu = { path = "../kcore-gpu" }
 kcore-sanitize = { path = "../kcore-sanitize" }
+kcore-clickhouse = { path = "../kcore-clickhouse" }
 kcore-disk-layout-yaml = { path = "../kcore-disk-layout-yaml" }
 dirs = "6"
 prost = "0.13"

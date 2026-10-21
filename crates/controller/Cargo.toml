@@ -10,6 +10,7 @@ autoexamples = false
 anyhow = "1.0.102"
 kcore-gpu = { path = "../kcore-gpu" }
 kcore-sanitize = { path = "../kcore-sanitize" }
+kcore-clickhouse = { path = "../kcore-clickhouse" }
 kcore-disko-types = { path = "../kcore-disko-types" }
 aws-lc-rs = "1.16.2"
 axum = "0.8"

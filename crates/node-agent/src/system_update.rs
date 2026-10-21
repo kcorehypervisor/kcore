@@ -53,6 +53,7 @@ pub fn strip_legacy_imports(src: &str) -> String {
                 || t.contains("./modules/kcore-metrics.nix")
                 || t.contains("./kcore-vms.nix")
                 || t.contains("./kcore-ceph.nix")
+                || t.contains("./kcore-clickhouse.nix")
                 || t.contains("./hardware-configuration.nix"))
         })
         .collect::<Vec<_>>()
@@ -441,6 +442,7 @@ fn write_migration_flake(
         ./hardware-configuration.nix
         ./kcore-vms.nix
         ./kcore-ceph.nix
+        ./kcore-clickhouse.nix
         ./legacy-configuration.nix
       ];
     }};
@@ -452,6 +454,11 @@ fn write_migration_flake(
 "#
     );
     fs::write(HOST_FLAKE, flake).map_err(|e| format!("write flake: {e}"))?;
+    let values = Path::new("/etc/nixos/kcore-clickhouse.nix");
+    if !values.exists() {
+        fs::write(values, "{ ... }:\n{\n}\n")
+            .map_err(|e| format!("write clickhouse values: {e}"))?;
+    }
     Ok(())
 }
 

@@ -238,7 +238,18 @@ async fn reconcile_update(
                         }
                         return Ok(());
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if let Err(err) =
+                            crate::clickhouse_db::take_down_block(db, &node_row.node_id)
+                        {
+                            db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                                last_error: err,
+                                ..node_row.clone()
+                            })
+                            .map_err(|e| format!("mark clickhouse gate: {e}"))?;
+                            return Ok(());
+                        }
+                    }
                     Err(err) => return Err(err),
                 }
                 let closure = node_row.prepared_closure.clone();

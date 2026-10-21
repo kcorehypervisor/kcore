@@ -90,6 +90,9 @@ jobs:
       - name: Ceph module eval (kcore.ceph.enable + firewall)
         run: nix build --no-link .#checks.x86_64-linux.ceph-module-eval
 
+      - name: ClickHouse module eval
+        run: nix build --no-link .#checks.x86_64-linux.clickhouse-module-eval
+
       - name: Local disk migration rehearsal
         run: nix build --no-link .#checks.x86_64-linux.local-disk-migrate
 

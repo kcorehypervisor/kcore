@@ -112,6 +112,14 @@ export const KINDS: ResourceKind[] = [
     immutable: ["nodeId"],
   },
   {
+    id: "clickhouse-cluster",
+    yamlKind: "ClickhouseCluster",
+    title: "ClickHouse cluster",
+    summary: "Shards, replicas, and ClickHouse Keeper on kcoreOS nodes. Apply confirms the rollout. Keeper membership, ports, and TLS mode stay fixed after create.",
+    mutable: ["users", "profiles", "serverSettings", "quotas", "systemLogs", "package"],
+    immutable: ["name", "keepers", "tls", "ports"],
+  },
+  {
     id: "ceph-cluster",
     yamlKind: "CephCluster",
     title: "Ceph cluster",

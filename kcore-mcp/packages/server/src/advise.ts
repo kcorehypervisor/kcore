@@ -39,6 +39,7 @@ const INTENT: Array<[RegExp, string]> = [
   [/\bsnapshots?\b/i, "volume-snapshot"],
   [/\bsecurity groups?\b|\bfirewall\b/i, "security-group"],
   [/\bdisk layouts?\b|\bdisko\b/i, "disk-layout"],
+  [/\bclickhouse\b/i, "clickhouse-cluster"],
   [/\bceph\b/i, "ceph-cluster"],
   [/\bcephfs\b|\bshared filesystems?\b/i, "shared-filesystem"],
   [/\bobject stores?\b|\brgw\b|\bs3\b/i, "object-store"],
@@ -52,6 +53,7 @@ export function inferKind(intent: string | undefined): string | undefined {
   for (const [pattern, id] of INTENT) {
     if (pattern.test(intent)) hits.add(id);
   }
+  if (hits.has("clickhouse-cluster")) return "clickhouse-cluster";
   if (hits.size !== 1) return undefined;
   return [...hits][0];
 }
@@ -283,6 +285,30 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           "Paste the layout: layoutNix, layoutNixFile, or diskLayout.",
           "Exactly one of those three. Run plan first so the classifier can refuse a disk that still backs a VM.",
           missing(spec, "layoutNix") && missing(spec, "layoutNixFile") && missing(spec, "diskLayout"),
+        ),
+      ].filter((item) => item.required);
+    case "clickhouse-cluster":
+      return [
+        question("name", "What should the ClickHouse cluster be called?", "kctl and the dashboard use this name.", missing(spec, "name")),
+        question(
+          "shards",
+          "Which shards and replicas, including read replicas?",
+          "Each replica needs a node id, advertise address, and interface. Read replicas use priority 100 and do not count as a writable copy.",
+          !Array.isArray(spec.shards) || spec.shards.length === 0,
+          { example: "shard 1 on node-105 and node-106" },
+        ),
+        question(
+          "keepers",
+          "Which nodes run ClickHouse Keeper, and which are learners?",
+          "Voting members must be 1, 3, or 5. Learners do not vote and cannot be promoted in v1. One datacenter must not hold a majority.",
+          !Array.isArray(spec.keepers) || spec.keepers.length === 0,
+        ),
+        question(
+          "clientNetworks",
+          "Which client networks may connect?",
+          "Empty means localhost only. Volumes, quotas, and log retention can stay at the defaults.",
+          false,
+          { example: "192.168.40.0/24" },
         ),
       ].filter((item) => item.required);
     case "ceph-cluster":
