@@ -261,6 +261,23 @@ service NodeAdmin {
   // Read /etc/kubernetes/admin.conf on this node and call the Kubernetes API.
   // The controller uses this instead of running kubectl.
   rpc KubernetesAdmin(KubernetesAdminRequest) returns (KubernetesAdminResponse);
+
+  // ClickHouse cluster lifecycle
+  // Dry-build the fragment and check ports, interface, address, volumes,
+  // clock sync and the package pin. Never mutates.
+  rpc CheckClickhousePreflight(CheckClickhousePreflightRequest) returns (CheckClickhousePreflightResponse);
+  // Write secrets outside the Nix store, render /etc/nixos/kcore-clickhouse.nix
+  // from the typed request, then nixos-rebuild test+switch under the node
+  // apply lock. Poll GetNixApplyStatus with the returned apply_id.
+  rpc ApplyClickhouseConfig(ApplyClickhouseConfigRequest) returns (ApplyClickhouseConfigResponse);
+  // Units, Keeper `mntr` over TLS to 127.0.0.1, and system.replicas aggregates.
+  rpc GetClickhouseStatus(GetClickhouseStatusRequest) returns (GetClickhouseStatusResponse);
+  // Start or stop the server or Keeper unit. Stop is graceful: the unit's
+  // ExecStop waits for shutdown_wait_unfinished_queries.
+  rpc SetClickhouseUnitState(SetClickhouseUnitStateRequest) returns (SetClickhouseUnitStateResponse);
+  // A closed set of administrative statements built by the agent with quoted
+  // identifiers. No free-form SQL crosses this boundary.
+  rpc RunClickhouseAdmin(RunClickhouseAdminRequest) returns (RunClickhouseAdminResponse);
 }
 
 // VM specification
@@ -1883,6 +1900,354 @@ message SetLocalVmQuiescedResponse {
   bool success = 1;
   string message = 2;
   bool vmm_stopped = 3;
+}
+
+// ClickHouse cluster lifecycle
+message ClickhouseHostVolume {
+  string name = 1;            // LV or zvol name on the node
+  string storage_class = 2;   // "lvm" or "zfs"
+  string volume_group = 3;    // VG (lvm) or pool (zfs)
+  int64 size_bytes = 4;
+  string fs_type = 5;         // "ext4" or "xfs"; empty means xfs
+}
+message ClickhouseUserSpec {
+  string name = 1;
+  string password_sha256_hex = 2;
+  // IP or CIDR entries for <networks><ip>. Empty means client_networks,
+  // or 127.0.0.1 when client_networks is also empty. It does not mean ::/0.
+  repeated string networks = 3;
+  string profile = 4;         // settings profile name, empty means "default"
+  string quota = 5;           // quota name, empty means "default"
+  // Grant management is left to SQL. true grants access_management=1.
+  bool access_management = 6;
+}
+message ClickhouseSettingsProfile {
+  string name = 1;
+  // Server-side settings such as max_memory_usage. Keys are validated as
+  // [a-z_][a-z0-9_]* and values are strings as ClickHouse accepts them.
+  // User, database, profile and cluster names use [A-Za-z_][A-Za-z0-9_]*.
+  // Shard and replica names use [A-Za-z0-9][A-Za-z0-9._-]{0,63} so the
+  // defaults "1" and "node-105" are valid.
+  map<string, string> settings = 2;
+}
+message ClickhouseDatabaseSpec {
+  string name = 1;
+}
+message ClickhouseQuotaInterval {
+  int32 duration_seconds = 1;
+  int64 queries = 2;
+  int64 errors = 3;
+  int64 result_rows = 4;
+  int64 read_rows = 5;
+  int64 execution_time_seconds = 6;
+}
+message ClickhouseQuotaSpec {
+  string name = 1;
+  repeated ClickhouseQuotaInterval intervals = 2;
+}
+message ClickhouseDictionaryAttribute {
+  string name = 1;
+  // ClickHouse type name: [A-Za-z_][A-Za-z0-9_]* with an optional (n) or
+  // (n, n) suffix. Nested and experimental types are refused.
+  string type = 2;
+  bool nullable = 3;
+}
+message ClickhouseDictionarySpec {
+  string name = 1;
+  // "clickhouse" or "https"
+  string source = 2;
+  string query = 3;
+  string url = 4;
+  string primary_key = 5;
+  // "flat", "hashed", or "cache"
+  string layout = 6;
+  int32 lifetime_seconds = 7;
+  repeated ClickhouseDictionaryAttribute attributes = 8;
+  string database = 9;
+}
+message ClickhouseNamedCollectionSpec {
+  string name = 1;
+  map<string, string> keys = 2;
+  map<string, string> secret_refs = 3;
+}
+message ClickhouseFunctionSpec {
+  string name = 1;
+  string parameters = 2;
+  string expression = 3;
+}
+message ClickhouseSystemLogs {
+  int32 query_log_days = 1;
+  int32 part_log_days = 2;
+  int32 trace_log_days = 3;
+  int32 text_log_days = 4;
+}
+message ClickhousePorts {
+  int32 tcp = 1;              // 9000, only rendered when TLS is disabled
+  int32 tcp_secure = 2;       // 9440
+  int32 http = 3;             // 8123, only rendered when TLS is disabled
+  int32 https = 4;            // 8443
+  int32 interserver = 5;      // 9009 (http) or 9010 (https)
+  int32 keeper = 6;           // 9281 secure by default; 9181 only when TLS is off.
+                              // The compiled Keeper default if unset is 2181.
+  int32 keeper_raft = 7;      // 9234, TLS when raft_configuration.secure is set
+  int32 prometheus = 8;       // 9363 on 127.0.0.1. 0 disables. Public bind is metrics_public.
+}
+message ClickhouseBackupTarget {
+  // "disk" or "s3"
+  string kind = 1;
+  // disk: mount path on every replica. s3: endpoint URL.
+  string location = 2;
+  string s3_bucket = 3;
+  // Name of a credential already stored by the controller. The access key
+  // never travels in this message.
+  string s3_credential_ref = 4;
+}
+message ClickhouseNodeServerConfig {
+  string shard_name = 1;
+  string replica_name = 2;
+  // Mount path of the data volume, or empty for the OS disk default.
+  string data_path = 3;
+  // Every shard/replica with advertise address and port; identical on all
+  // members so remote_servers is identical.
+  repeated ClickhouseRemoteShard remote_shards = 4;
+  repeated ClickhouseUserSpec users = 5;
+  repeated ClickhouseSettingsProfile profiles = 6;
+  repeated ClickhouseDatabaseSpec databases = 7;
+  map<string, string> server_settings = 8;
+  repeated string client_networks = 9;
+  double max_server_memory_ratio = 10;
+  repeated ClickhouseQuotaSpec quotas = 11;
+  repeated ClickhouseDictionarySpec dictionaries = 12;
+  repeated ClickhouseNamedCollectionSpec named_collections = 13;
+  repeated ClickhouseFunctionSpec functions = 14;
+  ClickhouseSystemLogs system_logs = 15;
+  bool metrics_public = 16;
+  // This replica is a read replica. The remote_shards list still carries
+  // every member; priority on each remote replica encodes read_only.
+  bool read_only = 17;
+}
+message ClickhouseRemoteShard {
+  string shard_name = 1;
+  int32 weight = 2;
+  repeated ClickhouseRemoteReplica replicas = 3;
+}
+message ClickhouseRemoteReplica {
+  string replica_name = 1;
+  string host = 2;
+  int32 port = 3;
+  bool secure = 4;
+  // 1 for a writable replica, 100 for a read replica. 0 means 1.
+  int32 priority = 5;
+}
+message ClickhouseNodeKeeperConfig {
+  int32 server_id = 1;
+  string data_path = 2;
+  repeated ClickhouseRaftPeer raft_peers = 3;
+}
+message ClickhouseRaftPeer {
+  int32 server_id = 1;
+  string host = 2;
+  int32 port = 3;
+  // true renders can_become_leader: false.
+  bool learner = 4;
+}
+message ClickhouseNodeSecrets {
+  string default_password_sha256_hex = 1;
+  string interserver_user = 2;
+  string interserver_password = 3;
+  bytes tls_cert_pem = 4;
+  bytes tls_key_pem = 5;
+  bytes tls_ca_pem = 6;
+  // Keeper connection secret shared by servers and Keeper members.
+  // Plaintext "kcore:<password>", not a precomputed digest.
+  string keeper_secret = 7;
+  // remote_servers.<cluster>.secret. Distributed queries and, from 26.7,
+  // interserver TablesStatus authentication.
+  string cluster_secret = 8;
+  // Password of the kcore-metrics user, as a SHA-256 hex digest.
+  string metrics_password_sha256_hex = 9;
+  // Named-collection secret values keyed by "<collection>.<key>".
+  map<string, string> named_collection_secrets = 10;
+  // Plaintext default user password. The env file stores only the SHA-256
+  // hex. The agent uses this for clickhouse-client and does not put it in Nix.
+  string default_password = 11;
+}
+message CheckClickhousePreflightRequest {
+  string cluster_name = 1;
+  ClickhouseNodeServerConfig server = 2;  // unset when the node is Keeper-only
+  ClickhouseNodeKeeperConfig keeper = 3;  // unset when the node has no Keeper
+  string advertise_address = 4;
+  string iface = 5;
+  string package = 6;
+  ClickhousePorts ports = 7;
+  bool tls_enabled = 8;
+  ClickhouseHostVolume data_volume = 9;
+  ClickhouseHostVolume keeper_volume = 10;
+}
+message ClickhousePreflightIssue {
+  // "error" blocks, "warning" is printed.
+  string severity = 1;
+  // iface, address, port, volume, clock, package, dry-build, memory
+  string check = 2;
+  string message = 3;
+}
+message CheckClickhousePreflightResponse {
+  bool ok = 1;
+  repeated ClickhousePreflightIssue issues = 2;
+  // Version the pin resolves to for `package`, e.g. "26.2.4.23".
+  string resolved_version = 3;
+  // "build", "rebuild", "restart", "no-change"
+  string nix_action = 4;
+}
+message ApplyClickhouseConfigRequest {
+  string cluster_name = 1;
+  int64 generation = 2;
+  // false renders `kcore.clickhouse.enable = false` and removes secrets
+  // after the units stop.
+  bool enable = 3;
+  ClickhouseNodeServerConfig server = 4;
+  ClickhouseNodeKeeperConfig keeper = 5;
+  string advertise_address = 6;
+  string iface = 7;
+  string package = 8;
+  ClickhousePorts ports = 9;
+  bool tls_enabled = 10;
+  ClickhouseNodeSecrets secrets = 11;
+  // Format and mount before the rebuild when set and not yet mounted.
+  ClickhouseHostVolume data_volume = 12;
+  ClickhouseHostVolume keeper_volume = 13;
+}
+message ApplyClickhouseConfigResponse {
+  string apply_id = 1;
+  // "started", "no-change", "failed"
+  string status = 2;
+  string message = 3;
+}
+message GetClickhouseStatusRequest { string cluster_name = 1; }
+message GetClickhouseStatusResponse {
+  bool server_enabled = 1;
+  bool server_active = 2;
+  bool keeper_enabled = 3;
+  bool keeper_active = 4;
+  string version = 5;
+  int64 generation = 6;
+  // Server aggregates from system.replicas; zero when no server here.
+  int32 readonly_tables = 7;
+  int32 max_absolute_delay_seconds = 8;
+  int64 queue_size = 9;
+  bool keeper_session_ok = 10;
+  int64 data_free_bytes = 11;
+  // Keeper `mntr` fields from the TLS client port; empty role when no Keeper.
+  string keeper_role = 12;
+  int64 keeper_znode_count = 13;
+  int64 keeper_outstanding_requests = 14;
+  string message = 15;
+}
+message SetClickhouseUnitStateRequest {
+  string cluster_name = 1;
+  // "server" or "keeper"
+  string unit = 2;
+  // "start", "stop", "restart"
+  string action = 3;
+  int32 timeout_seconds = 4;
+}
+message SetClickhouseUnitStateResponse {
+  bool active = 1;
+  string message = 2;
+}
+message RunClickhouseAdminRequest {
+  string cluster_name = 1;
+  oneof command {
+    // SYSTEM SYNC REPLICA for every replicated table in the database, or
+    // all databases when empty.
+    SyncReplica sync_replica = 2;
+    // SYSTEM DROP REPLICA '<replica>' FROM DATABASE <db> for each database.
+    // shard_name selects the surviving replica; it is not part of the SQL.
+    DropReplica drop_replica = 3;
+    // CREATE DATABASE IF NOT EXISTS ... ENGINE = Replicated(...)
+    EnsureReplicatedDatabase ensure_database = 4;
+    // SYSTEM RESTORE REPLICA on a replica whose Keeper metadata was lost.
+    RestoreReplica restore_replica = 5;
+    // BACKUP / RESTORE with the target and names given; polled through
+    // system.backups by backup id.
+    Backup backup = 6;
+    Restore restore = 7;
+    BackupStatus backup_status = 8;
+    // SELECT count() FROM system.parts WHERE active, for remove_shards.
+    LocalPartsCount local_parts_count = 9;
+    // SYSTEM RELOAD CONFIG after the agent rewrote certificates or secrets.
+    ReloadConfig reload_config = 10;
+    // ALTER TABLE system.<log> MODIFY TTL. Config changes do not alter an
+    // existing system log table.
+    SetSystemLogTtl set_system_log_ttl = 11;
+    // BACKUP of replicated access entities. One replica only.
+    BackupAccess backup_access = 12;
+    RestoreAccess restore_access = 13;
+    // CREATE FUNCTION IF NOT EXISTS. The expression is one statement body.
+    CreateFunction create_function = 14;
+    // Dictionaries are config. The agent reloads after the name is present.
+    CreateDictionary create_dictionary = 15;
+    // SELECT from system.clusters. Empty output fails the step.
+    VerifyClusters verify_clusters = 16;
+  }
+
+  message SyncReplica { string database = 1; int32 timeout_seconds = 2; }
+  message DropReplica {
+    string replica_name = 1;
+    string shard_name = 2;
+    // Empty means every database in the cluster spec.
+    repeated string databases = 3;
+  }
+  message EnsureReplicatedDatabase { string database = 1; string shard_name = 2; string replica_name = 3; }
+  message RestoreReplica {
+    // Empty means every database in the cluster spec. The agent lists
+    // system.replicas and runs SYSTEM RESTORE REPLICA for each readonly
+    // table. The per-table statement is the stable one.
+    string database = 1;
+  }
+  message SetSystemLogTtl {
+    // query_log, part_log, trace_log, or text_log
+    string table = 1;
+    int32 days = 2;
+  }
+  message BackupAccess {
+    ClickhouseBackupTarget target = 1;
+    string backup_name = 2;
+  }
+  message RestoreAccess {
+    ClickhouseBackupTarget target = 1;
+    string backup_name = 2;
+  }
+  message Backup {
+    ClickhouseBackupTarget target = 1;
+    repeated string databases = 2;
+    string backup_name = 3;
+    string base_backup_name = 4;
+    string shard_name = 5;
+  }
+  message Restore {
+    ClickhouseBackupTarget target = 1;
+    repeated string databases = 2;
+    string backup_name = 3;
+    bool allow_non_empty_tables = 4;
+    string shard_name = 5;
+  }
+  message BackupStatus { string backup_id = 1; }
+  message LocalPartsCount {}
+  message ReloadConfig {}
+  message CreateFunction {
+    string name = 1;
+    string parameters = 2;
+    string expression = 3;
+  }
+  message CreateDictionary { string name = 1; }
+  message VerifyClusters {}
+}
+message RunClickhouseAdminResponse {
+  bool ok = 1;
+  string message = 2;
+  // Backup: the system.backups id. LocalPartsCount: the count as text.
+  string result = 3;
 }
 
 message PrepareInstantDiskRequest {

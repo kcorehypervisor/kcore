@@ -532,6 +532,237 @@ mod tests {
 }
 
 // =============================================================
+// ClickHouse identifier and literal quoting
+// =============================================================
+
+/// ClickHouse name classes. Identifiers and setting keys become unquoted
+/// SQL or Nix attribute names. Shard and replica names are macro values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClickhouseNameClass {
+    /// `[A-Za-z_][A-Za-z0-9_]*`
+    Identifier,
+    /// `[a-z_][a-z0-9_]*`
+    SettingKey,
+    /// `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`
+    Macro,
+}
+
+/// True when `name` matches `class`.
+pub fn validate_clickhouse_name(name: &str, class: ClickhouseNameClass) -> bool {
+    let b = name.as_bytes();
+    if b.is_empty() || b.len() > 64 {
+        return false;
+    }
+    match class {
+        ClickhouseNameClass::Identifier => ident_bytes(b, true),
+        ClickhouseNameClass::SettingKey => ident_bytes(b, false),
+        ClickhouseNameClass::Macro => macro_bytes(b),
+    }
+}
+
+// Kani does not model `u8::is_ascii_*`. These matches stay explicit.
+#[allow(clippy::manual_is_ascii_check)]
+fn is_lower(c: u8) -> bool {
+    matches!(c, b'a'..=b'z')
+}
+
+#[allow(clippy::manual_is_ascii_check)]
+fn is_upper(c: u8) -> bool {
+    matches!(c, b'A'..=b'Z')
+}
+
+#[allow(clippy::manual_is_ascii_check)]
+fn is_digit(c: u8) -> bool {
+    matches!(c, b'0'..=b'9')
+}
+
+fn ident_bytes(b: &[u8], allow_upper: bool) -> bool {
+    let first = b[0];
+    let first_ok = first == b'_' || is_lower(first) || (allow_upper && is_upper(first));
+    if !first_ok {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() {
+        let c = b[i];
+        let ok = c == b'_' || is_digit(c) || is_lower(c) || (allow_upper && is_upper(c));
+        if !ok {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn macro_bytes(b: &[u8]) -> bool {
+    if b.len() > 64 {
+        return false;
+    }
+    let first = b[0];
+    if !(is_lower(first) || is_upper(first) || is_digit(first)) {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() {
+        let c = b[i];
+        if !(is_lower(c) || is_upper(c) || is_digit(c) || c == b'.' || c == b'_' || c == b'-') {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Wrap a ClickHouse identifier in backticks, doubling any backtick inside.
+pub fn quote_identifier(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('`');
+    push_quoted(name, b'`', &mut out);
+    out.push('`');
+    out
+}
+
+/// Wrap a ClickHouse string literal in single quotes.
+///
+/// `'` and `\` are escaped with a backslash so the literal cannot close early.
+pub fn quote_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    let b = value.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' || b[i] == b'\\' {
+            out.push('\\');
+            out.push(char::from(b[i]));
+            i += 1;
+        } else {
+            #[cfg(kani)]
+            {
+                out.push(char::from(b[i]));
+                i += 1;
+            }
+            #[cfg(not(kani))]
+            {
+                if b[i] < 128 {
+                    out.push(char::from(b[i]));
+                    i += 1;
+                } else {
+                    let ch = value[i..].chars().next().unwrap();
+                    i += ch.len_utf8();
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn push_quoted(value: &str, quote: u8, out: &mut String) {
+    let b = value.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == quote {
+            out.push(char::from(quote));
+            out.push(char::from(quote));
+            i += 1;
+        } else {
+            #[cfg(kani)]
+            {
+                out.push(char::from(b[i]));
+                i += 1;
+            }
+            #[cfg(not(kani))]
+            {
+                if b[i] < 128 {
+                    out.push(char::from(b[i]));
+                    i += 1;
+                } else {
+                    let ch = value[i..].chars().next().unwrap();
+                    i += ch.len_utf8();
+                    out.push(ch);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod clickhouse_quoting_tests {
+    use super::*;
+
+    #[test]
+    fn names_follow_the_two_grammars() {
+        assert!(validate_clickhouse_name(
+            "events",
+            ClickhouseNameClass::Identifier
+        ));
+        assert!(validate_clickhouse_name(
+            "_x1",
+            ClickhouseNameClass::Identifier
+        ));
+        assert!(!validate_clickhouse_name(
+            "node-105",
+            ClickhouseNameClass::Identifier
+        ));
+        assert!(!validate_clickhouse_name(
+            "1",
+            ClickhouseNameClass::Identifier
+        ));
+        assert!(validate_clickhouse_name(
+            "max_memory_usage",
+            ClickhouseNameClass::SettingKey
+        ));
+        assert!(!validate_clickhouse_name(
+            "Max",
+            ClickhouseNameClass::SettingKey
+        ));
+        assert!(validate_clickhouse_name("1", ClickhouseNameClass::Macro));
+        assert!(validate_clickhouse_name(
+            "node-105",
+            ClickhouseNameClass::Macro
+        ));
+        assert!(!validate_clickhouse_name(
+            "bad name",
+            ClickhouseNameClass::Macro
+        ));
+        assert!(!validate_clickhouse_name("", ClickhouseNameClass::Macro));
+    }
+
+    #[test]
+    fn quotes_do_not_close_early() {
+        let ident = quote_identifier("a`b`; DROP");
+        assert_eq!(ident, "`a``b``; DROP`");
+        assert!(ident.starts_with('`') && ident.ends_with('`'));
+        let lit = quote_literal("a'b\\c; --");
+        assert_eq!(lit, "'a\\'b\\\\c; --'");
+        assert!(literal_quotes_are_escaped(&lit));
+    }
+
+    fn literal_quotes_are_escaped(lit: &str) -> bool {
+        let b = lit.as_bytes();
+        if b.len() < 2 || b[0] != b'\'' || b[b.len() - 1] != b'\'' {
+            return false;
+        }
+        let mut i = 1;
+        while i < b.len() - 1 {
+            if b[i] == b'\\' {
+                if i + 1 >= b.len() - 1 {
+                    return false;
+                }
+                i += 2;
+                continue;
+            }
+            if b[i] == b'\'' {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+// =============================================================
 // Bounded model-checking proofs (Phase 2 — Kani)
 // =============================================================
 
@@ -702,5 +933,79 @@ mod kani_proofs {
             assert!(!out.starts_with('-'));
             assert!(out.len() <= MAX_SAFE_SEGMENT_LEN);
         }
+    }
+
+    fn identifier_quote_closes_only_at_end(quoted: &str) -> bool {
+        let b = quoted.as_bytes();
+        if b.len() < 2 || b[0] != b'`' || b[b.len() - 1] != b'`' {
+            return false;
+        }
+        let mut i = 1;
+        while i < b.len() - 1 {
+            if b[i] == b'`' {
+                if i + 1 >= b.len() - 1 || b[i + 1] != b'`' {
+                    return false;
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        true
+    }
+
+    fn literal_quote_closes_only_at_end(quoted: &str) -> bool {
+        let b = quoted.as_bytes();
+        if b.len() < 2 || b[0] != b'\'' || b[b.len() - 1] != b'\'' {
+            return false;
+        }
+        let mut i = 1;
+        while i < b.len() - 1 {
+            if b[i] == b'\\' {
+                if i + 1 >= b.len() - 1 {
+                    return false;
+                }
+                i += 2;
+            } else if b[i] == b'\'' {
+                return false;
+            } else {
+                i += 1;
+            }
+        }
+        true
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn quote_identifier_does_not_close_early() {
+        let mut buf = [0u8; MAX_INPUT_LEN];
+        let s = any_ascii_str(&mut buf);
+        kani::assume(s.len() <= 1);
+        assert!(identifier_quote_closes_only_at_end(&quote_identifier(s)));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn quote_literal_does_not_close_early() {
+        let mut buf = [0u8; MAX_INPUT_LEN];
+        let s = any_ascii_str(&mut buf);
+        kani::assume(s.len() <= 1);
+        assert!(literal_quote_closes_only_at_end(&quote_literal(s)));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn clickhouse_name_matches_grammar() {
+        let mut buf = [0u8; MAX_INPUT_LEN];
+        let s = any_ascii_str(&mut buf);
+        kani::assume(s.len() <= 2);
+        let ident = validate_clickhouse_name(s, ClickhouseNameClass::Identifier);
+        let bytes = s.as_bytes();
+        let spec = !bytes.is_empty()
+            && (bytes[0] == b'_' || matches!(bytes[0], b'A'..=b'Z' | b'a'..=b'z'))
+            && bytes[1..]
+                .iter()
+                .all(|c| *c == b'_' || matches!(*c, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'));
+        assert_eq!(ident, spec);
     }
 }

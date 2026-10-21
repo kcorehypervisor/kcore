@@ -1,6 +1,6 @@
 # Bare-metal ClickHouse on kcoreOS
 
-Status: **design**. No module, API, or lab apply yet.
+Status: **implemented in tree**. The NixOS module, controller API, node agent, kctl, MCP kind, and dashboard card are in this revision. Lab apply is still blocked.
 
 Reviewed against ClickHouse commit [`ae3bcc01`](https://github.com/ClickHouse/ClickHouse/commit/ae3bcc01c681d35f0d778b310c0022407b65efd6) (2026-10-16, `v26.9.20.23-stable`) and against nixpkgs `b40629efe5d6`, whose `pkgs.clickhouse` is still `26.2.4.23-stable` (ClickHouse `94012846`). The module targets the pin. The upgrade section below is what changes when the pin moves to 26.7 or later. Latest LTS on that date is `v26.8.28.14-lts`.
 

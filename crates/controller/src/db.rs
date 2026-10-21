@@ -819,7 +819,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 64;
+pub const SCHEMA_VERSION: i32 = 65;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -920,7 +920,9 @@ impl Database {
         Ok(db)
     }
 
-    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, rusqlite::Error> {
+    pub(crate) fn lock_conn(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, rusqlite::Error> {
         self.conn.lock().map_err(|_| {
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(1),
@@ -2151,6 +2153,10 @@ impl Database {
                     conn.execute(&format!("ALTER TABLE node_ha ADD COLUMN {column}"), [])?;
                 }
             }
+        }
+
+        if version < 65 {
+            conn.execute_batch(crate::clickhouse_db::SCHEMA)?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;

@@ -1,18 +1,20 @@
 use crate::api::{
-    get_ceph_cluster_detail_dto, get_compliance_dto, get_dbms_dto, get_kubernetes_cluster_dto,
-    get_network_overview_dto, get_replication_status_dto, get_storage_overview_dto,
-    list_audit_events_dto, list_ceph_clusters_dto, list_dbms_dto, list_kubernetes_clusters_dto,
-    list_networks_dto, list_object_stores_dto, list_operations_dto, list_replication_conflicts_dto,
+    get_ceph_cluster_detail_dto, get_clickhouse_cluster_dto, get_compliance_dto, get_dbms_dto,
+    get_kubernetes_cluster_dto, get_network_overview_dto, get_replication_status_dto,
+    get_storage_overview_dto, list_audit_events_dto, list_ceph_clusters_dto,
+    list_clickhouse_clusters_dto, list_dbms_dto, list_kubernetes_clusters_dto, list_networks_dto,
+    list_object_stores_dto, list_operations_dto, list_replication_conflicts_dto,
     list_shared_filesystems_dto, list_vms_page, list_volumes_dto,
 };
 use crate::dto::{
-    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ComplianceDto, DbmsDetailDto,
-    DbmsRowDto, HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto,
-    KubernetesHostVolumeDto, KubernetesNodeDto, KubernetesNodeHealthDto, LvmLogicalVolumeDto,
-    LvmPhysicalVolumeDto, LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto,
-    NodeStorageDto, NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto,
-    ReplicationStatusDto, SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto,
-    VmOperationRowDto, VmRowDto, VmsPageDto, VolumeRowDto,
+    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, ClickhouseClusterDetailDto,
+    ClickhouseClusterRowDto, ClickhouseMemberDto, ComplianceDto, DbmsDetailDto, DbmsRowDto,
+    HostInterfaceDto, KubernetesClusterDetailDto, KubernetesClusterRowDto, KubernetesHostVolumeDto,
+    KubernetesNodeDto, KubernetesNodeHealthDto, LvmLogicalVolumeDto, LvmPhysicalVolumeDto,
+    LvmVolumeGroupDto, NetworkOverviewDto, NetworkRowDto, NodeNetworkDto, NodeStorageDto,
+    NodeSummaryDto, ObjectStoreRowDto, ReplicationConflictDto, ReplicationStatusDto,
+    SharedFilesystemRowDto, StorageDiskRowDto, StorageOverviewDto, VmOperationRowDto, VmRowDto,
+    VmsPageDto, VolumeRowDto,
 };
 use crate::format::{paginate_by_name, paginate_preserve_order};
 use crate::pages::{
@@ -88,6 +90,7 @@ pub fn App() -> impl IntoView {
                     <a href="/ceph">"Ceph"</a>
                     <a href="/kds">"KDS"</a>
                     <a href="/k8s">"Kubernetes"</a>
+                    <a href="/clickhouse">"ClickHouse"</a>
                     <a href="/networks">"Networks"</a>
                     <a href="/storage">"Storage"</a>
                     <a href="/operations">"Operations"</a>
@@ -120,6 +123,8 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/ceph/:name") view=CephClusterDetailPage/>
                         <Route path=path!("/kds") view=KdsPage/>
                         <Route path=path!("/kds/:name") view=KdsDetailPage/>
+                        <Route path=path!("/clickhouse") view=ClickhousePage/>
+                        <Route path=path!("/clickhouse/:name") view=ClickhouseDetailPage/>
                         <Route path=path!("/k8s") view=KubernetesPage/>
                         <Route path=path!("/k8s/:name") view=KubernetesDetailPage/>
                         <Route path=path!("/operations") view=OperationsPage/>
@@ -190,6 +195,10 @@ fn HomePage() -> impl IntoView {
             <a href="/k8s" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Kubernetes"</h2>
                 <p class="muted">"Kubernetes clusters, nodes, and health."</p>
+            </a>
+            <a href="/clickhouse" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"ClickHouse"</h2>
+                <p class="muted">"Shards, replicas, and ClickHouse Keeper."</p>
             </a>
             <a href="/operations" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Operations"</h2>
@@ -2380,6 +2389,154 @@ fn dbms_detail_view(detail: DbmsDetailDto) -> impl IntoView {
             </dl>
         </div>
     }
+}
+
+#[component]
+fn ClickhousePage() -> impl IntoView {
+    let res = Resource::new(|| (), |_| list_clickhouse_clusters_dto());
+    view! {
+        <section class="hero">
+            <h1>"ClickHouse"</h1>
+            <p class="muted">"ClickHouse clusters on kcoreOS. Open a cluster for replicas, Keeper, and health."</p>
+        </section>
+        <Suspense fallback=move || view! { <p class="muted">"Loading ClickHouse clusters…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(rows) => clickhouse_table(rows).into_any(),
+                    Err(e) => view! { <p class="err">{e.to_string()}</p> }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn clickhouse_table(rows: Vec<ClickhouseClusterRowDto>) -> impl IntoView {
+    if rows.is_empty() {
+        return view! {
+            <div class="empty-note">
+                "No ClickHouse clusters. Create one with "<code class="inline">"kctl clickhouse apply -f"</code>"."
+            </div>
+        }
+        .into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead>
+                    <tr>
+                        <th>"Name"</th>
+                        <th>"Phase"</th>
+                        <th>"Package"</th>
+                        <th>"Replicas"</th>
+                        <th>"Keepers"</th>
+                        <th>"Version"</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.into_iter().map(|row| {
+                        let href = format!("/clickhouse/{}", encode_path_segment(&row.name));
+                        view! {
+                            <tr>
+                                <td><a class="cell-link" href=href.clone()><strong>{row.name}</strong></a></td>
+                                <td><a class="cell-link" href=href.clone()>{row.phase}</a></td>
+                                <td><a class="cell-link" href=href.clone()>{row.package}</a></td>
+                                <td><a class="cell-link" href=href.clone()>{row.replicas}</a></td>
+                                <td><a class="cell-link" href=href.clone()>{row.keepers}</a></td>
+                                <td><a class="cell-link" href=href>{display_or_dash(&row.version)}</a></td>
+                            </tr>
+                        }
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn ClickhouseDetailPage() -> impl IntoView {
+    let params = use_params_map();
+    let name = Memo::new(move |_| {
+        params
+            .get()
+            .get("name")
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    });
+    let res = Resource::new(
+        move || name.get(),
+        |n| async move {
+            if n.trim().is_empty() {
+                return Err(ServerFnError::new("missing ClickHouse cluster name"));
+            }
+            get_clickhouse_cluster_dto(n).await
+        },
+    );
+    view! {
+        <Suspense fallback=move || view! { <p class="muted">"Loading ClickHouse cluster…"</p> }>
+            {move || Suspend::new(async move {
+                match res.await {
+                    Ok(detail) => clickhouse_detail_view(detail).into_any(),
+                    Err(e) => view! {
+                        <section class="hero">
+                            <p class="crumb"><a href="/clickhouse">"← ClickHouse"</a></p>
+                            <h1>"ClickHouse cluster"</h1>
+                        </section>
+                        <p class="err">{e.to_string()}</p>
+                    }.into_any(),
+                }
+            })}
+        </Suspense>
+    }
+}
+
+fn clickhouse_detail_view(detail: ClickhouseClusterDetailDto) -> impl IntoView {
+    let members = detail.members.clone();
+    let quorum = if detail.keeper_quorum { "yes" } else { "no" };
+    view! {
+        <section class="hero">
+            <p class="crumb"><a href="/clickhouse">"← ClickHouse"</a></p>
+            <h1>{detail.name.clone()}</h1>
+            <p class="muted">
+                {detail.phase.clone()}
+                " · generation "{detail.generation}
+                " · health "{detail.overall_health.clone()}
+                " · quorum "{quorum}
+            </p>
+            <p class="muted">{display_or_dash(&detail.message)}</p>
+        </section>
+        <div class="card">
+            <dl class="kv">
+                <dt>"Package"</dt><dd>{detail.package.clone()}</dd>
+                <dt>"Health error"</dt><dd>{display_or_dash(&detail.health_error)}</dd>
+            </dl>
+        </div>
+        <h2 class="section-title">"Members"</h2>
+        {clickhouse_members(members)}
+    }
+}
+
+fn clickhouse_members(members: Vec<ClickhouseMemberDto>) -> impl IntoView {
+    if members.is_empty() {
+        return view! { <p class="muted">"No member health yet."</p> }.into_any();
+    }
+    view! {
+        <div class="table-wrap">
+            <table class="data">
+                <thead><tr><th>"Node"</th><th>"Role"</th><th>"Detail"</th></tr></thead>
+                <tbody>
+                    {members.into_iter().map(|member| view! {
+                        <tr>
+                            <td>{member.node_id}</td>
+                            <td>{member.role}</td>
+                            <td>{member.detail}</td>
+                        </tr>
+                    }).collect_view()}
+                </tbody>
+            </table>
+        </div>
+    }
+    .into_any()
 }
 
 #[component]

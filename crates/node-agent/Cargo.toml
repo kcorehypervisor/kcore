@@ -8,6 +8,7 @@ clap = { version = "4", features = ["derive"] }
 kcore-gpu = { path = "../kcore-gpu" }
 kcore-volume-mirror = { path = "../kcore-volume-mirror" }
 kcore-sanitize = { path = "../kcore-sanitize" }
+kcore-clickhouse = { path = "../kcore-clickhouse" }
 kcore-disko-types = { path = "../kcore-disko-types" }
 hostname = "0.4"
 hyper = { version = "1", features = ["client", "http1"] }

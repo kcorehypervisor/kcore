@@ -3,6 +3,7 @@ pub mod audit;
 pub mod ceph_cluster;
 pub mod ceph_dashboard_credentials;
 pub mod certs;
+pub mod clickhouse;
 pub mod cluster;
 pub mod cluster_ops;
 pub mod cluster_update;

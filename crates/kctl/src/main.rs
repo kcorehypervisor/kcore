@@ -210,6 +210,11 @@ enum Command {
         #[command(subcommand)]
         action: KubernetesAction,
     },
+    /// ClickHouse cluster lifecycle
+    Clickhouse {
+        #[command(subcommand)]
+        action: commands::clickhouse::Action,
+    },
     /// Pull a resource
     Pull {
         #[command(subcommand)]
@@ -3032,6 +3037,11 @@ async fn main() {
         } => {
             let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
             commands::image::pull(&info, uri, sha256.as_deref()).await
+        }
+
+        Command::Clickhouse { action } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::clickhouse::run(&info, action).await
         }
 
         Command::Vault { action } => {

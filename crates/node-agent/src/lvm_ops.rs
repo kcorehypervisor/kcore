@@ -168,7 +168,11 @@ pub fn validate_mount_point(mount_point: &str) -> Result<String, LvmOpError> {
             "mount_point is required",
         ));
     }
-    let roots = [Path::new("/var/lib/kcore"), Path::new("/mnt/kcore")];
+    let roots = [
+        Path::new("/var/lib/kcore-clickhouse"),
+        Path::new("/var/lib/kcore"),
+        Path::new("/mnt/kcore"),
+    ];
     let mut last_err = String::new();
     for root in roots {
         match path_safety::validate_path_under_root(raw, root, "mount_point") {
@@ -945,6 +949,10 @@ mod tests {
         assert_eq!(
             validate_mount_point("/var/lib/kcore/k8s").unwrap(),
             "/var/lib/kcore/k8s"
+        );
+        assert_eq!(
+            validate_mount_point("/var/lib/kcore-clickhouse/analytics/data").unwrap(),
+            "/var/lib/kcore-clickhouse/analytics/data"
         );
         assert_eq!(
             validate_mount_point("/mnt/kcore/data").unwrap(),

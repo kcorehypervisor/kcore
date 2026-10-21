@@ -4588,6 +4588,283 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             Err(err) => Err(Status::internal(format!("{err:#}"))),
         }
     }
+
+    async fn check_clickhouse_preflight(
+        &self,
+        request: Request<proto::CheckClickhousePreflightRequest>,
+    ) -> Result<Response<proto::CheckClickhousePreflightResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let mut issues = crate::clickhouse_agent::preflight(&req);
+        if !clock_synchronized().await {
+            issues.push(proto::ClickhousePreflightIssue {
+                severity: "warning".into(),
+                check: "clock".into(),
+                message: "NTP is not synchronized".into(),
+            });
+        }
+        let ok = !issues.iter().any(|issue| issue.severity == "error");
+        Ok(Response::new(proto::CheckClickhousePreflightResponse {
+            ok,
+            issues,
+            resolved_version: String::new(),
+            nix_action: if std::path::Path::new(crate::clickhouse_agent::VALUES_FILE).exists() {
+                "rebuild".into()
+            } else {
+                "build".into()
+            },
+        }))
+    }
+
+    async fn apply_clickhouse_config(
+        &self,
+        request: Request<proto::ApplyClickhouseConfigRequest>,
+    ) -> Result<Response<proto::ApplyClickhouseConfigResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let prepared = crate::clickhouse_agent::prepare(&req).map_err(Status::invalid_argument)?;
+        crate::clickhouse_agent::install(std::path::Path::new("/"), &prepared)
+            .map_err(Status::internal)?;
+        let apply_id = format!("clickhouse-{}", uuid_like_suffix());
+        write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+        let apply_lock = Arc::clone(&self.apply_lock);
+        let spawned_id = apply_id.clone();
+        tokio::spawn(async move {
+            let _guard = apply_lock.lock().await;
+            run_test_then_switch(
+                PathBuf::from(crate::clickhouse_agent::VALUES_FILE),
+                Vec::new(),
+                spawned_id,
+            )
+            .await;
+        });
+        Ok(Response::new(proto::ApplyClickhouseConfigResponse {
+            apply_id,
+            status: "started".into(),
+            message: "clickhouse nix written; nixos-rebuild started".into(),
+        }))
+    }
+
+    async fn get_clickhouse_status(
+        &self,
+        request: Request<proto::GetClickhouseStatusRequest>,
+    ) -> Result<Response<proto::GetClickhouseStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let server_active = unit_is_active("clickhouse.service").await;
+        let keeper_active = unit_is_active("clickhouse-keeper.service").await;
+        let version = clickhouse_query(&req.cluster_name, kcore_clickhouse::ops::version_sql())
+            .await
+            .unwrap_or_default();
+        let replicas = clickhouse_query(
+            &req.cluster_name,
+            kcore_clickhouse::ops::replicas_aggregate_sql(),
+        )
+        .await
+        .unwrap_or_default();
+        let parsed = kcore_clickhouse::ops::parse_replicas_tsv(&replicas);
+        let session = clickhouse_query(
+            &req.cluster_name,
+            kcore_clickhouse::ops::keeper_session_sql(),
+        )
+        .await
+        .unwrap_or_default();
+        let mntr = keeper_mntr().await.unwrap_or_default();
+        let parsed_mntr = kcore_clickhouse::ops::parse_mntr(&mntr);
+        Ok(Response::new(proto::GetClickhouseStatusResponse {
+            server_enabled: server_unit_enabled().await,
+            server_active,
+            keeper_enabled: values_contain("keeper.enable = true").await,
+            keeper_active,
+            version: version.trim().to_string(),
+            readonly_tables: parsed.readonly_tables,
+            max_absolute_delay_seconds: parsed.max_delay_seconds,
+            queue_size: parsed.queue_size,
+            keeper_session_ok: session.trim() != "0" && !session.trim().is_empty(),
+            keeper_role: parsed_mntr.role,
+            keeper_znode_count: parsed_mntr.znode_count,
+            keeper_outstanding_requests: parsed_mntr.outstanding_requests,
+            message: String::new(),
+            ..Default::default()
+        }))
+    }
+
+    async fn set_clickhouse_unit_state(
+        &self,
+        request: Request<proto::SetClickhouseUnitStateRequest>,
+    ) -> Result<Response<proto::SetClickhouseUnitStateResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let unit =
+            crate::clickhouse_agent::unit_service(&req.unit).map_err(Status::invalid_argument)?;
+        if !matches!(req.action.as_str(), "start" | "stop" | "restart") {
+            return Err(Status::invalid_argument(
+                "action must be start, stop, or restart",
+            ));
+        }
+        let output = Command::new("systemctl")
+            .args([&req.action, unit])
+            .output()
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        if !output.status.success() {
+            return Err(Status::internal(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        Ok(Response::new(proto::SetClickhouseUnitStateResponse {
+            active: unit_is_active(unit).await,
+            message: format!("{unit} {}", req.action),
+        }))
+    }
+
+    async fn run_clickhouse_admin(
+        &self,
+        request: Request<proto::RunClickhouseAdminRequest>,
+    ) -> Result<Response<proto::RunClickhouseAdminResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let cluster = req.cluster_name.clone();
+        let plan = crate::clickhouse_agent::admin_plan(&req).map_err(Status::invalid_argument)?;
+        let result = match plan {
+            crate::clickhouse_agent::AdminPlan::Sql(statements) => {
+                let mut last = String::new();
+                for statement in statements {
+                    last = clickhouse_query(&cluster, &statement)
+                        .await
+                        .map_err(Status::internal)?;
+                }
+                last
+            }
+            crate::clickhouse_agent::AdminPlan::SyncReplicas { database } => {
+                run_for_tables(&cluster, &database, |db, table| {
+                    kcore_clickhouse::ops::sync_replica_sql(db, table)
+                })
+                .await?
+            }
+            crate::clickhouse_agent::AdminPlan::RestoreReadonly { database } => {
+                let query = kcore_clickhouse::ops::readonly_tables_sql(&database)
+                    .map_err(Status::invalid_argument)?;
+                let body = clickhouse_query(&cluster, &query)
+                    .await
+                    .map_err(Status::internal)?;
+                let mut last = String::new();
+                for line in body.lines() {
+                    let mut fields = line.split('\t');
+                    let db = fields.next().unwrap_or("");
+                    let table = fields.next().unwrap_or("");
+                    if table.is_empty() {
+                        continue;
+                    }
+                    let statement = kcore_clickhouse::ops::restore_replica_sql(db, table)
+                        .map_err(Status::invalid_argument)?;
+                    last = clickhouse_query(&cluster, &statement)
+                        .await
+                        .map_err(Status::internal)?;
+                }
+                last
+            }
+        };
+        Ok(Response::new(proto::RunClickhouseAdminResponse {
+            ok: true,
+            message: String::new(),
+            result,
+        }))
+    }
+}
+
+async fn clock_synchronized() -> bool {
+    let Ok(output) = Command::new("timedatectl")
+        .args(["show", "-p", "NTPSynchronized", "--value"])
+        .output()
+        .await
+    else {
+        return true;
+    };
+    String::from_utf8_lossy(&output.stdout).trim() != "no"
+}
+
+async fn unit_is_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
+}
+
+async fn server_unit_enabled() -> bool {
+    values_contain("server.enable = true").await
+}
+
+async fn values_contain(needle: &str) -> bool {
+    tokio::fs::read_to_string(crate::clickhouse_agent::VALUES_FILE)
+        .await
+        .is_ok_and(|text| text.contains(needle))
+}
+
+async fn clickhouse_query(cluster: &str, sql: &str) -> Result<String, String> {
+    let password_file = format!("/var/lib/kcore-clickhouse/{cluster}/secrets/client.password");
+    let password = tokio::fs::read_to_string(&password_file)
+        .await
+        .unwrap_or_default();
+    let output = Command::new("clickhouse-client")
+        .args([
+            "--secure",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9440",
+            "--user",
+            "default",
+            "--query",
+            sql,
+        ])
+        .env("CLICKHOUSE_PASSWORD", password.trim())
+        .output()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn keeper_mntr() -> Result<String, String> {
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "printf 'mntr\\n' | openssl s_client -connect 127.0.0.1:9281 -quiet",
+        ])
+        .output()
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn run_for_tables(
+    cluster: &str,
+    database: &str,
+    statement: impl Fn(&str, &str) -> Result<String, String>,
+) -> Result<String, Status> {
+    let list = kcore_clickhouse::ops::list_replicated_tables_sql(database)
+        .map_err(Status::invalid_argument)?;
+    let body = clickhouse_query(cluster, &list)
+        .await
+        .map_err(Status::internal)?;
+    let mut last = String::new();
+    for line in body.lines() {
+        let mut fields = line.split('\t');
+        let db = fields.next().unwrap_or("");
+        let table = fields.next().unwrap_or("");
+        if table.is_empty() {
+            continue;
+        }
+        let sql = statement(db, table).map_err(Status::invalid_argument)?;
+        last = clickhouse_query(cluster, &sql)
+            .await
+            .map_err(Status::internal)?;
+    }
+    Ok(last)
 }
 
 // Helper methods for Kubernetes operations

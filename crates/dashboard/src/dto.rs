@@ -853,3 +853,34 @@ pub struct CryptoConfigDto {
     pub revocation_mode: String,
     pub signing_scheme: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClickhouseClusterRowDto {
+    pub name: String,
+    pub phase: String,
+    pub message: String,
+    pub package: String,
+    pub replicas: String,
+    pub keepers: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClickhouseMemberDto {
+    pub node_id: String,
+    pub role: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClickhouseClusterDetailDto {
+    pub name: String,
+    pub generation: i64,
+    pub phase: String,
+    pub message: String,
+    pub package: String,
+    pub overall_health: String,
+    pub keeper_quorum: bool,
+    pub health_error: String,
+    pub members: Vec<ClickhouseMemberDto>,
+}

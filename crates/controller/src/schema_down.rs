@@ -397,6 +397,16 @@ DROP TABLE IF EXISTS vm_ha;",
 ALTER TABLE node_ha DROP COLUMN fence_pending;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 65,
+        sql: "DROP TABLE IF EXISTS clickhouse_backups;
+DROP TABLE IF EXISTS clickhouse_operations;
+DROP TABLE IF EXISTS clickhouse_member_certs;
+DROP TABLE IF EXISTS clickhouse_cluster_secrets;
+DROP TABLE IF EXISTS clickhouse_cluster_members;
+DROP TABLE IF EXISTS clickhouse_clusters;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

@@ -1,0 +1,17 @@
+[package]
+name = "kcore-clickhouse"
+version = "0.5.0"
+edition = "2021"
+description = "ClickHouse cluster spec, rollout planner, Nix fragment renderer, and admin SQL."
+
+[dependencies]
+kcore-sanitize = { path = "../kcore-sanitize" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+proptest = "1.11"
+
+[lints]
+workspace = true

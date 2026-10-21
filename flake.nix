@@ -193,6 +193,10 @@
             vm-module = import ./tests/vm-module.nix { inherit pkgs; };
             local-disk-migrate = import ./tests/local-disk-migrate.nix { inherit pkgs; };
             disko-module = import ./tests/disko-module.nix { inherit pkgs; };
+            clickhouse-module-eval = import ./tests/clickhouse-module-eval.nix {
+              inherit pkgs;
+              inherit (inputs.nixpkgs.lib) nixosSystem;
+            };
             ceph-module-eval = import ./tests/ceph-module-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;
@@ -275,6 +279,7 @@
           chVmModule = ./modules/ch-vm;
           dashboardModule = ./modules/kcore-dashboard.nix;
           cephModule = ./modules/kcore-ceph.nix;
+          clickhouseModule = ./modules/kcore-clickhouse.nix;
           metricsModule = ./modules/kcore-metrics.nix;
         in
         {
@@ -284,6 +289,7 @@
             kcore-disko = ./modules/kcore-disko.nix;
             kcore-dashboard = dashboardModule;
             kcore-ceph = cephModule;
+            kcore-clickhouse = clickhouseModule;
             kcore-metrics = metricsModule;
             kcore-host = ./modules/kcore-host.nix;
           };
@@ -973,6 +979,7 @@
 
                                                                 echo "kcore packages come from the host flake; not copying /opt/kcore/bin."
                                                                 printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-ceph.nix
+                                                                printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-clickhouse.nix
                                                                 # The format already happened. The saved graph must not point at
                                                                 # /tmp, which is gone after reboot.
                                                                 sed 's|passwordFile = "/tmp/luks/password"|passwordFile = "/etc/kcore/recovery/crypto_keyfile.bin"|' /tmp/disko-config.nix > /mnt/etc/nixos/disko-config.nix
@@ -1479,6 +1486,7 @@
                               ./node.nix
                               ./kcore-vms.nix
                               ./kcore-ceph.nix
+                              ./kcore-clickhouse.nix
                             ];
                           };
                         };

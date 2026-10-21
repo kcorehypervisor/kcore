@@ -149,6 +149,24 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_AFTER_RENEW: &[(&str, &str)] = &[
     // GetCrl also accepts node certificates so agents can fetch revocation
     // data over their existing channel; the operator floor is read-only.
     ("GetCrl", "read-only"),
+    ("PlanClickhouseCluster", "read-only"),
+    ("CreateClickhouseCluster", "cluster-admin"),
+    ("UpdateClickhouseCluster", "cluster-admin"),
+    ("GetClickhouseCluster", "read-only"),
+    ("ListClickhouseClusters", "read-only"),
+    ("DeleteClickhouseCluster", "cluster-admin"),
+    ("ScaleClickhouseCluster", "cluster-admin"),
+    ("ReplaceClickhouseReplica", "cluster-admin"),
+    ("RestoreClickhouseReplica", "cluster-admin"),
+    ("UpgradeClickhouseCluster", "cluster-admin"),
+    ("GetClickhouseClusterHealth", "read-only"),
+    ("GetClickhouseOperation", "read-only"),
+    ("ListClickhouseOperations", "read-only"),
+    ("CancelClickhouseOperation", "cluster-admin"),
+    ("GetClickhouseClusterCredentials", "cluster-admin"),
+    ("BackupClickhouseCluster", "backup-operator"),
+    ("RestoreClickhouseCluster", "cluster-admin"),
+    ("ListClickhouseBackups", "backup-operator"),
 ];
 
 /// `ControllerAdmin` service RPCs (separate tonic service; listed at end of compliance output).

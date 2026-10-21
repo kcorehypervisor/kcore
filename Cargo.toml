@@ -2,6 +2,7 @@
 members = [
     "crates/kcore-gpu",
     "crates/kcore-sanitize",
+    "crates/kcore-clickhouse",
     "crates/kcore-disko-types",
     "crates/kcore-verification",
     "crates/kcore-disk-layout-yaml",

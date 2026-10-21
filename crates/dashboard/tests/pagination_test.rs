@@ -1045,6 +1045,121 @@ impl Controller for ManyVmsController {
     ) -> Result<Response<ListHaEventsResponse>, Status> {
         Err(Status::unimplemented(""))
     }
+
+    async fn plan_clickhouse_cluster(
+        &self,
+        _: TRequest<PlanClickhouseClusterRequest>,
+    ) -> Result<Response<PlanClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn create_clickhouse_cluster(
+        &self,
+        _: TRequest<CreateClickhouseClusterRequest>,
+    ) -> Result<Response<CreateClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn update_clickhouse_cluster(
+        &self,
+        _: TRequest<UpdateClickhouseClusterRequest>,
+    ) -> Result<Response<UpdateClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_clickhouse_cluster(
+        &self,
+        _: TRequest<GetClickhouseClusterRequest>,
+    ) -> Result<Response<GetClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_clickhouse_clusters(
+        &self,
+        _: TRequest<ListClickhouseClustersRequest>,
+    ) -> Result<Response<ListClickhouseClustersResponse>, Status> {
+        Ok(Response::new(ListClickhouseClustersResponse {
+            clusters: vec![],
+        }))
+    }
+    async fn delete_clickhouse_cluster(
+        &self,
+        _: TRequest<DeleteClickhouseClusterRequest>,
+    ) -> Result<Response<DeleteClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn scale_clickhouse_cluster(
+        &self,
+        _: TRequest<ScaleClickhouseClusterRequest>,
+    ) -> Result<Response<ScaleClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn replace_clickhouse_replica(
+        &self,
+        _: TRequest<ReplaceClickhouseReplicaRequest>,
+    ) -> Result<Response<ReplaceClickhouseReplicaResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn restore_clickhouse_replica(
+        &self,
+        _: TRequest<RestoreClickhouseReplicaRequest>,
+    ) -> Result<Response<RestoreClickhouseReplicaResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn upgrade_clickhouse_cluster(
+        &self,
+        _: TRequest<UpgradeClickhouseClusterRequest>,
+    ) -> Result<Response<UpgradeClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_clickhouse_cluster_health(
+        &self,
+        _: TRequest<GetClickhouseClusterHealthRequest>,
+    ) -> Result<Response<GetClickhouseClusterHealthResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_clickhouse_operation(
+        &self,
+        _: TRequest<GetClickhouseOperationRequest>,
+    ) -> Result<Response<GetClickhouseOperationResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_clickhouse_operations(
+        &self,
+        _: TRequest<ListClickhouseOperationsRequest>,
+    ) -> Result<Response<ListClickhouseOperationsResponse>, Status> {
+        Ok(Response::new(ListClickhouseOperationsResponse {
+            operations: vec![],
+        }))
+    }
+    async fn cancel_clickhouse_operation(
+        &self,
+        _: TRequest<CancelClickhouseOperationRequest>,
+    ) -> Result<Response<CancelClickhouseOperationResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn get_clickhouse_cluster_credentials(
+        &self,
+        _: TRequest<GetClickhouseClusterCredentialsRequest>,
+    ) -> Result<Response<GetClickhouseClusterCredentialsResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn backup_clickhouse_cluster(
+        &self,
+        _: TRequest<BackupClickhouseClusterRequest>,
+    ) -> Result<Response<BackupClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn restore_clickhouse_cluster(
+        &self,
+        _: TRequest<RestoreClickhouseClusterRequest>,
+    ) -> Result<Response<RestoreClickhouseClusterResponse>, Status> {
+        Err(Status::unimplemented(""))
+    }
+    async fn list_clickhouse_backups(
+        &self,
+        _: TRequest<ListClickhouseBackupsRequest>,
+    ) -> Result<Response<ListClickhouseBackupsResponse>, Status> {
+        Ok(Response::new(ListClickhouseBackupsResponse {
+            backups: vec![],
+        }))
+    }
 }
 
 async fn spawn_many_vms_controller() -> SocketAddr {

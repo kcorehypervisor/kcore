@@ -263,6 +263,50 @@ pub async fn get_postgresql(
         .with_context(|| format!("postgresql '{name}' not found"))
 }
 
+pub async fn list_clickhouse_clusters(
+    cfg: &DashboardConfig,
+) -> Result<Vec<controller_proto::ClickhouseCluster>> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .list_clickhouse_clusters(controller_proto::ListClickhouseClustersRequest {})
+        .await
+        .context("ListClickhouseClusters RPC")?;
+    Ok(resp.into_inner().clusters)
+}
+
+pub async fn get_clickhouse_cluster(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::ClickhouseCluster> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .get_clickhouse_cluster(controller_proto::GetClickhouseClusterRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetClickhouseCluster RPC for '{name}'"))?;
+    resp.into_inner()
+        .cluster
+        .with_context(|| format!("clickhouse cluster '{name}' not found"))
+}
+
+pub async fn get_clickhouse_cluster_health(
+    cfg: &DashboardConfig,
+    name: &str,
+) -> Result<controller_proto::GetClickhouseClusterHealthResponse> {
+    let channel = connect_channel(cfg).await?;
+    let mut client = controller_proto::controller_client::ControllerClient::new(channel);
+    let resp = client
+        .get_clickhouse_cluster_health(controller_proto::GetClickhouseClusterHealthRequest {
+            name: name.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetClickhouseClusterHealth RPC for '{name}'"))?;
+    Ok(resp.into_inner())
+}
+
 pub async fn list_kubernetes_clusters(
     cfg: &DashboardConfig,
 ) -> Result<Vec<controller_proto::KubernetesCluster>> {

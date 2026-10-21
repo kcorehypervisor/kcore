@@ -4,30 +4,31 @@ use leptos::prelude::*;
 
 use crate::controller_client;
 use crate::dto::{
-    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, CertificateRowDto, ClusterHealthDto,
-    ComplianceDto, ContainerDetailDto, ContainerRowDto, CrlSummaryDto, CryptoConfigDto,
-    DbmsDetailDto, DbmsRowDto, DiskLayoutDetailDto, DiskLayoutRowDto, KubernetesClusterDetailDto,
-    KubernetesClusterRowDto, NetworkOverviewDto, NetworkRowDto, NodeDetailDto, NodeRowDto,
-    ObjectStoreDetailDto, ObjectStoreRowDto, OperationDetailDto, PkiStatusDto,
-    ReplicationConflictDto, ReplicationStatusDto, SbomSummaryDto, SharedFilesystemDetailDto,
-    SharedFilesystemRowDto, SnapshotPolicyDto, SnapshotRowDto, SshKeyDetailDto, SshKeyRowDto,
-    StorageClassDetailDto, StorageClassDto, StorageOverviewDto, VmDetailDto, VmOperationRowDto,
-    VmsPageDto, VolumeDetailDto, VolumeRowDto,
+    AuditEventDto, CephClusterDetailDto, CephClusterRowDto, CertificateRowDto,
+    ClickhouseClusterDetailDto, ClickhouseClusterRowDto, ClusterHealthDto, ComplianceDto,
+    ContainerDetailDto, ContainerRowDto, CrlSummaryDto, CryptoConfigDto, DbmsDetailDto, DbmsRowDto,
+    DiskLayoutDetailDto, DiskLayoutRowDto, KubernetesClusterDetailDto, KubernetesClusterRowDto,
+    NetworkOverviewDto, NetworkRowDto, NodeDetailDto, NodeRowDto, ObjectStoreDetailDto,
+    ObjectStoreRowDto, OperationDetailDto, PkiStatusDto, ReplicationConflictDto,
+    ReplicationStatusDto, SbomSummaryDto, SharedFilesystemDetailDto, SharedFilesystemRowDto,
+    SnapshotPolicyDto, SnapshotRowDto, SshKeyDetailDto, SshKeyRowDto, StorageClassDetailDto,
+    StorageClassDto, StorageOverviewDto, VmDetailDto, VmOperationRowDto, VmsPageDto,
+    VolumeDetailDto, VolumeRowDto,
 };
 use crate::mappers::{
     audit_events_from_proto, ceph_cluster_detail_from_proto, ceph_clusters_from_proto,
-    certificates_from_proto, cluster_health_from_proto, compliance_from_proto,
-    conflicts_from_proto, container_detail_from_proto, containers_from_proto,
-    crl_summary_from_proto, crypto_config_from_proto, dbms_detail_from_postgresql,
-    dbms_from_postgresqls, disk_layout_detail_from_proto, disk_layouts_from_proto,
-    filter_audit_events, filter_vm_operations, inventory_volume_detail,
-    kubernetes_clusters_from_proto, kubernetes_detail_from_proto, merge_ceph_capacity,
-    network_overview_from_proto, networks_from_proto, node_detail_from_proto, nodes_from_proto,
-    object_store_detail_from_proto, object_stores_from_proto, operation_detail_from_proto,
-    pki_status_from_proto, replication_status_from_proto, sbom_summary_from_proto,
-    shared_filesystem_detail_from_proto, shared_filesystems_from_proto,
-    snapshot_policies_from_proto, snapshot_policy_from_proto, snapshots_from_proto,
-    ssh_key_detail_from_proto, ssh_keys_from_proto, storage_class_detail,
+    certificates_from_proto, clickhouse_clusters_from_proto, clickhouse_detail_from_proto,
+    cluster_health_from_proto, compliance_from_proto, conflicts_from_proto,
+    container_detail_from_proto, containers_from_proto, crl_summary_from_proto,
+    crypto_config_from_proto, dbms_detail_from_postgresql, dbms_from_postgresqls,
+    disk_layout_detail_from_proto, disk_layouts_from_proto, filter_audit_events,
+    filter_vm_operations, inventory_volume_detail, kubernetes_clusters_from_proto,
+    kubernetes_detail_from_proto, merge_ceph_capacity, network_overview_from_proto,
+    networks_from_proto, node_detail_from_proto, nodes_from_proto, object_store_detail_from_proto,
+    object_stores_from_proto, operation_detail_from_proto, pki_status_from_proto,
+    replication_status_from_proto, sbom_summary_from_proto, shared_filesystem_detail_from_proto,
+    shared_filesystems_from_proto, snapshot_policies_from_proto, snapshot_policy_from_proto,
+    snapshots_from_proto, ssh_key_detail_from_proto, ssh_keys_from_proto, storage_class_detail,
     storage_classes_from_nodes, storage_overview_from_proto, vm_detail_from_proto,
     vm_operations_from_proto, vms_page_from_proto, volume_detail_from_info,
     volumes_with_host_inventory,
@@ -212,6 +213,33 @@ pub async fn get_dbms_dto(name: String) -> Result<DbmsDetailDto, ServerFnError> 
         .await
         .map_err(map_err)?;
     Ok(dbms_detail_from_postgresql(info))
+}
+
+#[server(ListClickhouseClusters, "/api")]
+pub async fn list_clickhouse_clusters_dto() -> Result<Vec<ClickhouseClusterRowDto>, ServerFnError> {
+    let cfg = dashboard_config();
+    let clusters = controller_client::list_clickhouse_clusters(cfg)
+        .await
+        .map_err(map_err)?;
+    Ok(clickhouse_clusters_from_proto(clusters))
+}
+
+#[server(GetClickhouseCluster, "/api")]
+pub async fn get_clickhouse_cluster_dto(
+    name: String,
+) -> Result<ClickhouseClusterDetailDto, ServerFnError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ServerFnError::new("missing ClickHouse cluster name"));
+    }
+    let cfg = dashboard_config();
+    let cluster = controller_client::get_clickhouse_cluster(cfg, name)
+        .await
+        .map_err(map_err)?;
+    let health = controller_client::get_clickhouse_cluster_health(cfg, name)
+        .await
+        .map_err(|err| format!("{err:#}"));
+    Ok(clickhouse_detail_from_proto(cluster, health))
 }
 
 #[server(ListKubernetesClusters, "/api")]

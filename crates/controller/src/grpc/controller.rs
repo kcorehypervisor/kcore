@@ -6949,6 +6949,17 @@ impl ControllerService {
     }
 }
 
+macro_rules! clickhouse_audit {
+    ($self:ident, $request:ident, $action:expr, $call:path) => {{
+        $self.require_operator(&$request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&$request);
+        let name = $request.get_ref().clickhouse_name();
+        let response = $call(&$self.db, $request).await?;
+        $self.record_audit(&actor, $action, &name, "");
+        Ok(response)
+    }};
+}
+
 #[tonic::async_trait]
 impl controller_proto::controller_server::Controller for ControllerService {
     async fn format_volume(
@@ -17268,6 +17279,244 @@ impl controller_proto::controller_server::Controller for ControllerService {
     ) -> Result<Response<controller_proto::ClassifyDiskLayoutResponse>, Status> {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
         self.classify_disk_layout_impl(request.into_inner()).await
+    }
+
+    async fn plan_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::PlanClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::PlanClickhouseClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        crate::clickhouse_api::plan(&self.db, request).await
+    }
+
+    async fn create_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::CreateClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::CreateClickhouseClusterResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "CreateClickhouseCluster",
+            crate::clickhouse_api::create
+        )
+    }
+
+    async fn update_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::UpdateClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::UpdateClickhouseClusterResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "UpdateClickhouseCluster",
+            crate::clickhouse_api::update
+        )
+    }
+
+    async fn get_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::GetClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::GetClickhouseClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        crate::clickhouse_api::get(&self.db, request).await
+    }
+
+    async fn list_clickhouse_clusters(
+        &self,
+        request: Request<controller_proto::ListClickhouseClustersRequest>,
+    ) -> Result<Response<controller_proto::ListClickhouseClustersResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        crate::clickhouse_api::list(&self.db, request).await
+    }
+
+    async fn delete_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::DeleteClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::DeleteClickhouseClusterResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "DeleteClickhouseCluster",
+            crate::clickhouse_api::delete
+        )
+    }
+
+    async fn scale_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::ScaleClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::ScaleClickhouseClusterResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "ScaleClickhouseCluster",
+            crate::clickhouse_api::scale
+        )
+    }
+
+    async fn replace_clickhouse_replica(
+        &self,
+        request: Request<controller_proto::ReplaceClickhouseReplicaRequest>,
+    ) -> Result<Response<controller_proto::ReplaceClickhouseReplicaResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "ReplaceClickhouseReplica",
+            crate::clickhouse_api::replace
+        )
+    }
+
+    async fn restore_clickhouse_replica(
+        &self,
+        request: Request<controller_proto::RestoreClickhouseReplicaRequest>,
+    ) -> Result<Response<controller_proto::RestoreClickhouseReplicaResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "RestoreClickhouseReplica",
+            crate::clickhouse_api::restore_replica
+        )
+    }
+
+    async fn upgrade_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::UpgradeClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::UpgradeClickhouseClusterResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "UpgradeClickhouseCluster",
+            crate::clickhouse_api::upgrade
+        )
+    }
+
+    async fn get_clickhouse_cluster_health(
+        &self,
+        request: Request<controller_proto::GetClickhouseClusterHealthRequest>,
+    ) -> Result<Response<controller_proto::GetClickhouseClusterHealthResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        crate::clickhouse_api::health(&self.db, request).await
+    }
+
+    async fn get_clickhouse_operation(
+        &self,
+        request: Request<controller_proto::GetClickhouseOperationRequest>,
+    ) -> Result<Response<controller_proto::GetClickhouseOperationResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        crate::clickhouse_api::get_operation(&self.db, request).await
+    }
+
+    async fn list_clickhouse_operations(
+        &self,
+        request: Request<controller_proto::ListClickhouseOperationsRequest>,
+    ) -> Result<Response<controller_proto::ListClickhouseOperationsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        crate::clickhouse_api::list_operations(&self.db, request).await
+    }
+
+    async fn cancel_clickhouse_operation(
+        &self,
+        request: Request<controller_proto::CancelClickhouseOperationRequest>,
+    ) -> Result<Response<controller_proto::CancelClickhouseOperationResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "CancelClickhouseOperation",
+            crate::clickhouse_api::cancel
+        )
+    }
+
+    async fn get_clickhouse_cluster_credentials(
+        &self,
+        request: Request<controller_proto::GetClickhouseClusterCredentialsRequest>,
+    ) -> Result<Response<controller_proto::GetClickhouseClusterCredentialsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let name = request.get_ref().name.clone();
+        let response = crate::clickhouse_api::credentials(&self.db, request).await?;
+        self.record_audit(&actor, "GetClickhouseClusterCredentials", &name, "");
+        Ok(response)
+    }
+
+    async fn backup_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::BackupClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::BackupClickhouseClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        let actor = Self::audit_actor(&request);
+        let name = request.get_ref().name.clone();
+        let response = crate::clickhouse_api::backup(&self.db, request).await?;
+        self.record_audit(&actor, "BackupClickhouseCluster", &name, "");
+        Ok(response)
+    }
+
+    async fn restore_clickhouse_cluster(
+        &self,
+        request: Request<controller_proto::RestoreClickhouseClusterRequest>,
+    ) -> Result<Response<controller_proto::RestoreClickhouseClusterResponse>, Status> {
+        clickhouse_audit!(
+            self,
+            request,
+            "RestoreClickhouseCluster",
+            crate::clickhouse_api::restore
+        )
+    }
+
+    async fn list_clickhouse_backups(
+        &self,
+        request: Request<controller_proto::ListClickhouseBackupsRequest>,
+    ) -> Result<Response<controller_proto::ListClickhouseBackupsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::BackupOperator)?;
+        crate::clickhouse_api::list_backups(&self.db, request).await
+    }
+}
+
+trait ClickhouseNamed {
+    fn clickhouse_name(&self) -> String;
+}
+
+impl ClickhouseNamed for controller_proto::CreateClickhouseClusterRequest {
+    fn clickhouse_name(&self) -> String {
+        self.name.clone()
+    }
+}
+impl ClickhouseNamed for controller_proto::UpdateClickhouseClusterRequest {
+    fn clickhouse_name(&self) -> String {
+        self.name.clone()
+    }
+}
+impl ClickhouseNamed for controller_proto::DeleteClickhouseClusterRequest {
+    fn clickhouse_name(&self) -> String {
+        self.name.clone()
+    }
+}
+impl ClickhouseNamed for controller_proto::ScaleClickhouseClusterRequest {
+    fn clickhouse_name(&self) -> String {
+        self.name.clone()
+    }
+}
+impl ClickhouseNamed for controller_proto::ReplaceClickhouseReplicaRequest {
+    fn clickhouse_name(&self) -> String {
+        self.name.clone()
+    }
+}
+impl ClickhouseNamed for controller_proto::RestoreClickhouseReplicaRequest {
+    fn clickhouse_name(&self) -> String {
+        self.name.clone()
+    }
+}
+impl ClickhouseNamed for controller_proto::UpgradeClickhouseClusterRequest {
+    fn clickhouse_name(&self) -> String {
+        self.name.clone()
+    }
+}
+impl ClickhouseNamed for controller_proto::RestoreClickhouseClusterRequest {
+    fn clickhouse_name(&self) -> String {
+        self.name.clone()
+    }
+}
+impl ClickhouseNamed for controller_proto::CancelClickhouseOperationRequest {
+    fn clickhouse_name(&self) -> String {
+        self.id.clone()
     }
 }
 

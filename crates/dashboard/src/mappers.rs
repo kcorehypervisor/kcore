@@ -1873,6 +1873,78 @@ pub fn crypto_config_from_proto(cfg: controller_proto::GetCryptoConfigResponse) 
     }
 }
 
+pub fn clickhouse_clusters_from_proto(
+    clusters: Vec<controller_proto::ClickhouseCluster>,
+) -> Vec<crate::dto::ClickhouseClusterRowDto> {
+    let mut rows: Vec<_> = clusters
+        .into_iter()
+        .map(|cluster| {
+            let spec = cluster.spec.unwrap_or_default();
+            let status = cluster.status.unwrap_or_default();
+            let replicas: usize = spec.shards.iter().map(|shard| shard.replicas.len()).sum();
+            crate::dto::ClickhouseClusterRowDto {
+                name: cluster.name,
+                phase: status.phase,
+                message: status.message,
+                package: spec.package,
+                replicas: format!("{}/{}", status.ready_replicas, replicas),
+                keepers: format!("{}/{}", status.ready_keepers, spec.keepers.len()),
+                version: status.running_version,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+pub fn clickhouse_detail_from_proto(
+    cluster: controller_proto::ClickhouseCluster,
+    health: Result<controller_proto::GetClickhouseClusterHealthResponse, String>,
+) -> crate::dto::ClickhouseClusterDetailDto {
+    let spec = cluster.spec.clone().unwrap_or_default();
+    let status = cluster.status.unwrap_or_default();
+    let (overall_health, health_error, members, keeper_quorum) = match health {
+        Ok(health) => {
+            let mut members = Vec::new();
+            for replica in health.replicas {
+                members.push(crate::dto::ClickhouseMemberDto {
+                    node_id: replica.node_id,
+                    role: format!("replica {}/{}", replica.shard_name, replica.replica_name),
+                    detail: format!(
+                        "active={} readonly={} version={}",
+                        replica.unit_active, replica.readonly_tables, replica.version
+                    ),
+                });
+            }
+            for keeper in health.keepers {
+                members.push(crate::dto::ClickhouseMemberDto {
+                    node_id: keeper.node_id,
+                    role: format!("keeper {}", keeper.server_id),
+                    detail: format!("role={} active={}", keeper.role, keeper.unit_active),
+                });
+            }
+            (
+                health.overall_health,
+                String::new(),
+                members,
+                health.keeper_quorum,
+            )
+        }
+        Err(err) => ("unknown".into(), err, Vec::new(), false),
+    };
+    crate::dto::ClickhouseClusterDetailDto {
+        name: cluster.name,
+        generation: cluster.generation,
+        phase: status.phase,
+        message: status.message,
+        package: spec.package,
+        overall_health,
+        keeper_quorum,
+        health_error,
+        members,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,6 +11,11 @@ mod ceph_cli;
 mod ceph_cluster_reconciler;
 mod ceph_cluster_spec;
 mod cert_rotation_reconciler;
+mod clickhouse_api;
+mod clickhouse_convert;
+mod clickhouse_db;
+mod clickhouse_engine;
+mod clickhouse_pki;
 mod cluster_health;
 mod cluster_update_reconciler;
 mod cluster_update_spec;
@@ -191,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
         },
     );
     ceph_cluster_reconciler::spawn_ceph_cluster_reconciler(database.clone(), clients.clone());
+    clickhouse_engine::spawn(database.clone(), clients.clone());
     shared_filesystem_reconciler::spawn_shared_filesystem_reconciler(database.clone());
     object_store_reconciler::spawn_object_store_reconciler(database.clone());
     cluster_update_reconciler::spawn_cluster_update_reconciler(database.clone(), clients.clone());
