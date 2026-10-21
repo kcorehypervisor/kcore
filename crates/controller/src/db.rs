@@ -165,6 +165,9 @@ pub struct ClusterLeaseRow {
 pub struct NodeFenceHold {
     pub pending: bool,
     pub vms: Vec<String>,
+    /// When this host was marked lost. Placement reports from before this
+    /// belong to an earlier outage and must not release the new fence.
+    pub lost_at: String,
 }
 
 fn split_fence_vms(text: &str) -> Vec<String> {
@@ -4393,8 +4396,8 @@ impl Database {
             Ok(CephClusterRow {
                 name: r.get(0)?,
                 generation: r.get(1)?,
-                spec_json: r.get(2)?,
-                bootstrap_json: r.get(3)?,
+                spec_json: row_text(r, 2)?,
+                bootstrap_json: row_text(r, 3)?,
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
             })
@@ -4412,8 +4415,8 @@ impl Database {
             Ok(CephClusterRow {
                 name: r.get(0)?,
                 generation: r.get(1)?,
-                spec_json: r.get(2)?,
-                bootstrap_json: r.get(3)?,
+                spec_json: row_text(r, 2)?,
+                bootstrap_json: row_text(r, 3)?,
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
             })
@@ -4584,8 +4587,8 @@ impl Database {
             Ok(CephClusterRow {
                 name: r.get(0)?,
                 generation: r.get(1)?,
-                spec_json: r.get(2)?,
-                bootstrap_json: r.get(3)?,
+                spec_json: row_text(r, 2)?,
+                bootstrap_json: row_text(r, 3)?,
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
             })
@@ -6611,17 +6614,19 @@ impl Database {
     pub fn get_node_fence_hold(&self, node_id: &str) -> Result<NodeFenceHold, rusqlite::Error> {
         let conn = self.lock_conn()?;
         match conn.query_row(
-            "SELECT fence_pending, fence_vms FROM node_ha WHERE node_id = ?1",
+            "SELECT fence_pending, fence_vms, COALESCE(lost_at, '') FROM node_ha WHERE node_id = ?1",
             params![node_id],
             |row| {
                 let pending: i64 = row.get(0)?;
                 let vms: String = row.get(1)?;
-                Ok((pending, vms))
+                let lost_at: String = row.get(2)?;
+                Ok((pending, vms, lost_at))
             },
         ) {
-            Ok((pending, vms)) => Ok(NodeFenceHold {
+            Ok((pending, vms, lost_at)) => Ok(NodeFenceHold {
                 pending: pending != 0,
                 vms: split_fence_vms(&vms),
+                lost_at,
             }),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(NodeFenceHold::default()),
             Err(e) => Err(e),
@@ -6641,7 +6646,8 @@ impl Database {
             "INSERT INTO node_ha (node_id, fence_pending, fence_vms) VALUES (?1, ?2, ?3)
              ON CONFLICT(node_id) DO UPDATE SET
                fence_pending = excluded.fence_pending,
-               fence_vms = excluded.fence_vms",
+               fence_vms = excluded.fence_vms,
+               lost_at = CASE WHEN excluded.fence_pending = 0 THEN '' ELSE node_ha.lost_at END",
             params![node_id, i32::from(pending), vms.join(" ")],
         )?;
         Ok(())
@@ -6658,8 +6664,16 @@ impl Database {
     }
 
     /// Clear the lost mark. Returns true when the node had been marked lost.
+    ///
+    /// A fence that is still pending keeps `lost_at`. Later heartbeats use it
+    /// to find `placement-mask` reports after the one that asked to unfence
+    /// failed. Releasing the hold clears the timestamp.
     pub fn clear_node_lost(&self, node_id: &str) -> Result<bool, rusqlite::Error> {
-        let was = !self.node_lost_at(node_id)?.is_empty();
+        let hold = self.get_node_fence_hold(node_id)?;
+        let was = !hold.lost_at.is_empty();
+        if hold.pending {
+            return Ok(was);
+        }
         let conn = self.lock_conn()?;
         conn.execute(
             "UPDATE node_ha SET lost_at = '' WHERE node_id = ?1",
@@ -6676,6 +6690,22 @@ impl Database {
             params![node_id],
         )?;
         Ok(())
+    }
+
+    /// True when `node_id` heartbeated inside `within_secs`.
+    pub fn node_recently_seen(
+        &self,
+        node_id: &str,
+        within_secs: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE id = ?1 AND last_heartbeat != ''
+             AND (julianday('now') - julianday(last_heartbeat)) * 86400 <= ?2",
+            params![node_id, within_secs],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// True when this controller heard from an approved node inside `within_secs`.
@@ -6786,6 +6816,29 @@ impl Database {
             params![vm_id, unix],
         )?;
         Ok(())
+    }
+
+    /// `placement-mask:` and `placement-settled` reports for this outage.
+    ///
+    /// `since` is the host's `lost_at`. An empty `since` returns nothing:
+    /// reports from an unknown outage must not release a new fence.
+    pub fn placement_release_reports(
+        &self,
+        node_id: &str,
+        since: &str,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        if since.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT detail FROM ha_events
+             WHERE node_id = ?1 AND created_at >= ?2
+               AND (detail = 'placement-settled' OR detail LIKE 'placement-mask:%')
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![node_id, since], |row| row.get(0))?;
+        rows.collect()
     }
 
     pub fn insert_ha_event(
@@ -7733,6 +7786,25 @@ fn row_to_vm_ha(row: &rusqlite::Row) -> Result<VmHaRow, rusqlite::Error> {
         last_replica_snapshot: row.get(7)?,
         last_guest_heartbeat: row.get(8)?,
     })
+}
+
+/// Read a column that should be text. A BLOB of UTF-8 is accepted: a spec
+/// written as bytes used to make `list_ceph_clusters` fail, and failover
+/// then treated every host as if it were not a Ceph member.
+fn row_text(row: &rusqlite::Row<'_>, idx: usize) -> Result<String, rusqlite::Error> {
+    use rusqlite::types::{Type, Value};
+    match row.get::<_, Value>(idx)? {
+        Value::Text(text) => Ok(text),
+        Value::Blob(bytes) => String::from_utf8(bytes).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(idx, Type::Blob, Box::new(err))
+        }),
+        Value::Null => Ok(String::new()),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            idx,
+            String::new(),
+            other.data_type(),
+        )),
+    }
 }
 
 fn row_to_node(row: &rusqlite::Row) -> Result<NodeRow, rusqlite::Error> {
@@ -9443,6 +9515,71 @@ mod tests {
             "status must cascade-delete with cluster"
         );
         assert!(!db.delete_ceph_cluster("lab").unwrap());
+    }
+
+    #[test]
+    fn ceph_cluster_spec_stored_as_a_blob_is_still_readable() {
+        let db = Database::open(":memory:").expect("open db");
+        let spec = r#"{"fsid":"f","publicNetwork":"192.168.40.0/24","clusterNetwork":"192.168.47.0/24","size":3,"minSize":2,"nodes":[{"nodeId":"node-103"}]}"#;
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "lab".into(),
+            generation: 1,
+            spec_json: spec.into(),
+            bootstrap_json: "{}".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        {
+            let conn = db.lock_conn().unwrap();
+            conn.execute(
+                "UPDATE ceph_clusters SET spec_json = ?1 WHERE name = 'lab'",
+                params![spec.as_bytes()],
+            )
+            .unwrap();
+        }
+        let got = db.get_ceph_cluster("lab").unwrap().unwrap();
+        assert!(got.spec_json.contains("node-103"));
+        assert_eq!(db.list_ceph_clusters().unwrap()[0].spec_json, spec);
+    }
+
+    #[test]
+    fn a_pending_fence_keeps_lost_at_until_the_hold_is_released() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        db.mark_node_lost(&node.id).expect("mark lost");
+        let lost = db.node_lost_at(&node.id).expect("lost_at");
+        assert!(!lost.is_empty());
+        db.set_node_fence_hold(&node.id, true, &["labtest-9".into()])
+            .expect("hold");
+        assert!(db.clear_node_lost(&node.id).expect("clear while pending"));
+        assert_eq!(db.node_lost_at(&node.id).expect("still lost"), lost);
+        db.insert_ha_event(
+            &node.id,
+            "labtest-9",
+            "placement-mask",
+            "placement-mask:labtest-9",
+        )
+        .expect("mask report");
+        db.insert_ha_event(
+            &node.id,
+            "labtest-9",
+            "placement-settled",
+            "placement-settled",
+        )
+        .expect("settled report");
+        let reports = db
+            .placement_release_reports(&node.id, &lost)
+            .expect("reports");
+        assert!(reports
+            .iter()
+            .any(|report| report == "placement-mask:labtest-9"));
+        assert!(reports.iter().any(|report| report == "placement-settled"));
+        db.set_node_fence_hold(&node.id, false, &[])
+            .expect("release");
+        assert!(db.node_lost_at(&node.id).expect("cleared").is_empty());
+        assert!(!db.clear_node_lost(&node.id).expect("clear after release"));
     }
 
     #[test]

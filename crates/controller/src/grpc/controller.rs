@@ -1653,9 +1653,17 @@ impl ControllerService {
     }
 
     pub(crate) fn ceph_member_ids(&self) -> HashSet<String> {
-        self.db
-            .list_ceph_clusters()
-            .unwrap_or_default()
+        let clusters = match self.db.list_ceph_clusters() {
+            Ok(clusters) => clusters,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "could not list Ceph clusters; no host will be treated as a Ceph member"
+                );
+                return HashSet::new();
+            }
+        };
+        clusters
             .into_iter()
             .filter_map(|c| ceph_cluster_spec::spec_from_json(&c.spec_json).ok())
             .flat_map(|s| s.nodes.into_iter().map(|n| n.node_id))
@@ -6236,18 +6244,18 @@ impl ControllerService {
         }
     }
 
-    async fn unfence_returned_node(&self, node_id: &str) {
+    async fn unfence_returned_node(&self, node_id: &str) -> bool {
         let Ok(Some(node)) = self.db.get_node(node_id) else {
-            return;
+            return false;
         };
         let Ok(hosts) = self.ceph_client_hosts_for_node(&node) else {
-            return;
+            return false;
         };
         if hosts.is_empty() {
-            return;
+            return true;
         }
         let Ok(members) = self.db.list_nodes() else {
-            return;
+            return false;
         };
         for member in members
             .iter()
@@ -6272,9 +6280,14 @@ impl ControllerService {
                 .is_ok()
             {
                 info!(node_id, "lifted failover blocklist after the node returned");
-                return;
+                return true;
             }
         }
+        warn!(
+            node_id,
+            "could not lift the failover blocklist; the fence hold stays until a Ceph member accepts the removal"
+        );
+        false
     }
 
     async fn replicate_due_zfs(&self) {
@@ -6397,6 +6410,19 @@ impl ControllerService {
             .ok_or_else(|| Status::not_found(format!("node '{node_id}' not found")))?;
         let lost = self.db.node_lost_at(node_id).unwrap_or_default();
         if source.status != "not-ready" && lost.is_empty() {
+            return Ok(NodeDrainOutcome {
+                migrated: 0,
+                errors: Vec::new(),
+            });
+        }
+        // A fence hold keeps `lost_at` after the host heartbeats again, so the
+        // next beat can still find the placement reports. That timestamp must
+        // not move the guests a second time.
+        let recently_seen = self
+            .db
+            .node_recently_seen(node_id, self.failover.node_timeout_secs)
+            .unwrap_or(false);
+        if recently_seen && source.status != "not-ready" {
             return Ok(NodeDrainOutcome {
                 migrated: 0,
                 errors: Vec::new(),
@@ -7227,12 +7253,21 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .collect();
         match self.db.get_node_fence_hold(&req.node_id) {
             Ok(hold) => {
-                match crate::ha::fence_release(
-                    hold.pending,
-                    &hold.vms,
-                    &assigned_names,
-                    &req.ha_actions,
-                ) {
+                let mut actions = req.ha_actions.clone();
+                if hold.pending {
+                    match self
+                        .db
+                        .placement_release_reports(&req.node_id, &hold.lost_at)
+                    {
+                        Ok(prior) => {
+                            actions = crate::ha::merge_placement_reports(&actions, &prior);
+                        }
+                        Err(e) => {
+                            warn!(node_id = %req.node_id, error = %e, "could not read earlier placement reports");
+                        }
+                    }
+                }
+                match crate::ha::fence_release(hold.pending, &hold.vms, &assigned_names, &actions) {
                     crate::ha::FenceRelease::Keep => {}
                     crate::ha::FenceRelease::Hold { vms } => {
                         if vms != hold.vms {
@@ -7242,13 +7277,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         }
                     }
                     crate::ha::FenceRelease::Unfence => {
-                        if let Err(e) = self.db.set_node_fence_hold(&req.node_id, false, &[]) {
-                            warn!(node_id = %req.node_id, error = %e, "could not clear the fence hold");
-                        }
+                        // The blocklist stays until a Ceph member accepts the
+                        // removal. Clearing the hold first dropped it on the
+                        // floor when that call failed, and the next heartbeat
+                        // had nothing left to retry.
                         let node_id = req.node_id.clone();
                         let this = self.clone();
                         tokio::spawn(async move {
-                            this.unfence_returned_node(&node_id).await;
+                            if this.unfence_returned_node(&node_id).await {
+                                if let Err(e) = this.db.set_node_fence_hold(&node_id, false, &[]) {
+                                    warn!(node_id, error = %e, "could not clear the fence hold");
+                                }
+                            }
                         });
                     }
                 }

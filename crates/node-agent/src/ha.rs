@@ -190,36 +190,108 @@ pub fn action_report(action: &HostAction) -> Option<String> {
     }
 }
 
-fn systemctl_args(action: &HostAction) -> Vec<String> {
+/// Runtime drop-in that stops a NixOS VM unit from mapping its disk.
+///
+/// `systemctl mask` refuses to replace the store symlink NixOS puts in
+/// `/etc/systemd/system`, and a `/run` mask loses to that `/etc` unit.
+/// Clearing `ExecStartPre` matters: that hook maps the RBD, so a unit that
+/// only loses `ExecStart` can still open the image the guest now runs elsewhere.
+pub fn placement_mask_dropin() -> &'static str {
+    "[Service]\n\
+     Restart=no\n\
+     ExecStartPre=\n\
+     ExecStart=\n\
+     ExecStop=\n\
+     ExecStopPost=\n\
+     ExecStart=/bin/true\n"
+}
+
+fn vm_unit(name: &str) -> String {
+    format!("kcore-vm-{name}.service")
+}
+
+fn systemctl_ok(args: &[&str]) -> bool {
+    std::process::Command::new("systemctl")
+        .args(args)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// `systemctl is-active` exits 0 while the unit is active or activating.
+fn unit_is_inactive(unit: &str) -> bool {
+    !systemctl_ok(&["is-active", "--quiet", unit])
+}
+
+/// Install the runtime mask and stop the unit. Reports success only when
+/// the unit is not running afterwards.
+fn apply_mask(name: &str) -> bool {
+    let unit = vm_unit(name);
+    let dir = format!("/run/systemd/system/{unit}.d");
+    let path = format!("{dir}/placement-mask.conf");
+    if std::fs::create_dir_all(&dir).is_err()
+        || std::fs::write(&path, placement_mask_dropin()).is_err()
+    {
+        return false;
+    }
+    if !systemctl_ok(&["daemon-reload"]) {
+        return false;
+    }
+    let _ = systemctl_ok(&["stop", &unit]);
+    unit_is_inactive(&unit)
+}
+
+fn apply_unmask(name: &str) -> bool {
+    let unit = vm_unit(name);
+    let path = format!("/run/systemd/system/{unit}.d/placement-mask.conf");
+    let _ = std::fs::remove_file(&path);
+    let _ = systemctl_ok(&["daemon-reload"]);
+    let _ = systemctl_ok(&["unmask", "--runtime", &unit]);
+    true
+}
+
+fn systemctl_args(action: &HostAction) -> Option<Vec<String>> {
     match action {
-        HostAction::Mask(name) => vec![
-            "mask".into(),
-            "--now".into(),
-            format!("kcore-vm-{name}.service"),
-        ],
-        HostAction::Unmask(name) => vec!["unmask".into(), format!("kcore-vm-{name}.service")],
-        HostAction::StartTarget => {
-            vec!["start".into(), "kcore-placement-confirmed.target".into()]
-        }
-        HostAction::Stop(name) => vec!["stop".into(), format!("kcore-vm-{name}.service")],
-        HostAction::Restart(name) => vec!["restart".into(), format!("kcore-vm-{name}.service")],
+        HostAction::Mask(_) | HostAction::Unmask(_) => None,
+        HostAction::StartTarget => Some(vec![
+            "start".into(),
+            "kcore-placement-confirmed.target".into(),
+        ]),
+        HostAction::Stop(name) => Some(vec!["stop".into(), vm_unit(name)]),
+        HostAction::Restart(name) => Some(vec!["restart".into(), vm_unit(name)]),
     }
 }
 
-/// Apply host actions when systemd is running. Returns the actions it
-/// attempted so the next heartbeat can report them. Missing systemd is a
-/// no-op, which is what unit tests and a developer laptop need.
+/// Apply host actions when systemd is running. A mask is reported only after
+/// the unit is inactive: telling the controller the guest is masked while it
+/// is still running releases the blocklist under a second writer.
+///
+/// `kcore-placement-confirmed.target` is reported even when the unit is
+/// absent. An older module has no such target, and the fence hold still has
+/// to release once the masks themselves succeeded.
 pub fn apply_host_actions(actions: &[HostAction]) -> Vec<String> {
     if !Path::new("/run/systemd/system").exists() {
         return Vec::new();
     }
     let mut reported = Vec::new();
     for action in actions {
-        let _ = std::process::Command::new("systemctl")
-            .args(systemctl_args(action))
-            .status();
-        if let Some(report) = action_report(action) {
-            reported.push(report);
+        let ok = match action {
+            HostAction::Mask(name) => apply_mask(name),
+            HostAction::Unmask(name) => apply_unmask(name),
+            HostAction::StartTarget => {
+                if let Some(args) = systemctl_args(action) {
+                    let _ = systemctl_ok(&args.iter().map(String::as_str).collect::<Vec<_>>());
+                }
+                true
+            }
+            other => systemctl_args(other)
+                .map(|args| systemctl_ok(&args.iter().map(String::as_str).collect::<Vec<_>>()))
+                .unwrap_or(false),
+        };
+        if ok {
+            if let Some(report) = action_report(action) {
+                reported.push(report);
+            }
         }
     }
     reported
@@ -440,6 +512,16 @@ mod tests {
         assert!(timed.contains(&HostAction::Mask("web".into())));
         assert!(timed.contains(&HostAction::Unmask("db".into())));
         assert!(timed.contains(&HostAction::StartTarget));
+    }
+
+    #[test]
+    fn placement_mask_dropin_clears_the_rbd_map_hook() {
+        let dropin = placement_mask_dropin();
+        assert!(dropin.contains("Restart=no\n"));
+        assert!(dropin.contains("ExecStartPre=\n"));
+        assert!(dropin.contains("ExecStart=\n"));
+        assert!(dropin.contains("ExecStopPost=\n"));
+        assert!(dropin.contains("ExecStart=/bin/true\n"));
     }
 
     #[test]

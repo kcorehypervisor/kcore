@@ -725,6 +725,7 @@ in
       cloudHypervisorPatches
       vgpuProfile
       localLiveMigrate
+      cloudInitGuestOpsKeys
     '';
 
     # qemu-nbd and nbd-client replicate an LV/zvol during migration. dmsetup

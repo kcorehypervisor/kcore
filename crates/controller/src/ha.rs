@@ -45,6 +45,20 @@ pub enum FenceRelease {
 /// [`PLACEMENT_SETTLED`] and every held VM is either still assigned on that
 /// host or named in a `placement-mask:` report. The first heartbeat after
 /// boot arrives before the moved guest is masked.
+/// Heartbeats after the one that carried `placement-mask` and
+/// `placement-settled` still have to retry unfence. The agent sends each
+/// report once; the controller keeps the earlier ones until the blocklist
+/// is actually removed.
+pub fn merge_placement_reports(current: &[String], prior: &[String]) -> Vec<String> {
+    let mut out = current.to_vec();
+    for report in prior {
+        if !out.iter().any(|have| have == report) {
+            out.push(report.clone());
+        }
+    }
+    out
+}
+
 pub fn fence_release(
     pending: bool,
     held: &[String],
@@ -560,6 +574,18 @@ mod tests {
         assert_eq!(
             fence_release(false, &held, &[], &["placement-settled".into()]),
             FenceRelease::Keep
+        );
+        let remembered = merge_placement_reports(
+            &[],
+            &[
+                "placement-mask:labtest-9".into(),
+                "placement-settled".into(),
+            ],
+        );
+        assert_eq!(
+            fence_release(true, &held, &[], &remembered),
+            FenceRelease::Unfence,
+            "a later heartbeat must still release from the reports the agent already sent"
         );
         assert_eq!(
             fence_release(true, &held, &[], &[]),

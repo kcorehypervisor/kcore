@@ -72,6 +72,7 @@ assert chBin != unpatched;
 assert lib.hasInfix "cloud-hypervisor-51.1" chBin;
 assert cfg.environment.etc."kcore/vm-socket-dir".text == "/run/kcore\n";
 assert lib.hasInfix "localLiveMigrate" cfg.environment.etc."kcore/ch-vm-features".text;
+assert lib.hasInfix "cloudInitGuestOpsKeys" cfg.environment.etc."kcore/ch-vm-features".text;
 assert lib.hasInfix "ceph-guest ceph" cfg.environment.etc."kcore/vm-placement".text;
 assert lib.hasInfix "lvm-guest lvm" cfg.environment.etc."kcore/vm-placement".text;
 assert cfg.systemd.targets ? "kcore-placement-confirmed";

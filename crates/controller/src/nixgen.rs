@@ -38,17 +38,20 @@ use kcore_sanitize::{nix_escape, sanitize_nix_attr_key};
 pub struct ModuleFeatures {
     pub image_sha256: bool,
     pub vgpu_profile: bool,
+    pub cloud_init_guest_ops_keys: bool,
 }
 
 impl ModuleFeatures {
     pub const IMAGE_SHA256: &'static str = "imageSha256";
     pub const VGPU_PROFILE: &'static str = "vgpuProfile";
+    pub const CLOUD_INIT_GUEST_OPS_KEYS: &'static str = "cloudInitGuestOpsKeys";
 
     /// Everything on: what a node installed from this tree supports.
     pub fn all() -> Self {
         Self {
             image_sha256: true,
             vgpu_profile: true,
+            cloud_init_guest_ops_keys: true,
         }
     }
 
@@ -59,6 +62,7 @@ impl ModuleFeatures {
         Self {
             image_sha256: has(Self::IMAGE_SHA256),
             vgpu_profile: has(Self::VGPU_PROFILE),
+            cloud_init_guest_ops_keys: has(Self::CLOUD_INIT_GUEST_OPS_KEYS),
         }
     }
 }
@@ -457,7 +461,7 @@ pub fn generate_node_config_inner(
                 "      cloudInitUserConfigFile = pkgs.writeText \"{nix_name}-cloud-init.yaml\" \"{escaped}\";\n"
             ));
             let ops_keys: Vec<&String> = guest_ops_keys.iter().filter(|k| !k.is_empty()).collect();
-            if !ops_keys.is_empty() {
+            if !ops_keys.is_empty() && features.cloud_init_guest_ops_keys {
                 out.push_str("      cloudInitGuestOpsKeys = [\n");
                 for pk in ops_keys {
                     out.push_str(&format!("        \"{}\"\n", nix_escape(pk)));
@@ -1031,7 +1035,7 @@ mod tests {
         let ops = vec!["ssh-ed25519 AAAAops kcore-guest-ops".to_string()];
         let none = std::collections::HashMap::new();
         let config = generate_node_config_inner(
-            &[v],
+            &[v.clone()],
             "eno1",
             &default_net(),
             &[],
@@ -1050,6 +1054,28 @@ mod tests {
         assert!(config.contains("cloudInitUserConfigFile"));
         assert!(config.contains("cloudInitGuestOpsKeys"));
         assert!(config.contains("ssh-ed25519 AAAAops kcore-guest-ops"));
+
+        let baseline = generate_node_config_inner(
+            &[v],
+            "eno1",
+            &default_net(),
+            &[],
+            &none,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &[],
+            &ops,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &ModuleFeatures::default(),
+            &[],
+        );
+        assert!(
+            !baseline.contains("cloudInitGuestOpsKeys"),
+            "an older module has no cloudInitGuestOpsKeys option; emitting it fails the whole evaluation"
+        );
     }
 
     #[test]
