@@ -239,6 +239,12 @@ in
     })
     (lib.mkIf cfg.console.enable {
       environment.systemPackages = [ cfg.console.package ];
+      # The branding unit otherwise stays off, or falls back to /opt/kcore
+      # and fails the switch when that path is not there.
+      services.kcore-console = {
+        enable = true;
+        package = cfg.console.package;
+      };
     })
     {
       environment.systemPackages = lib.mkIf (cfg.kctl.package != null) [ cfg.kctl.package ];

@@ -4517,6 +4517,21 @@ impl ControllerService {
             }
             return Err(e);
         }
+        // The switch has applied autoStart. A stopped guest has no VMM
+        // socket, so the next heartbeat cannot report it, and a stale
+        // "running" value would start it on another host after a failure.
+        let observed = if auto_start { "running" } else { "stopped" };
+        if let Err(e) = self
+            .db
+            .update_vm_runtime_state(&node.id, &vm_name, observed)
+        {
+            warn!(
+                node_id = %node.id,
+                vm_id = %vm_id,
+                error = %e,
+                "applied desired state but could not record runtime state"
+            );
+        }
         let desired_state = if auto_start {
             node_proto::VmDesiredState::Running as i32
         } else {
