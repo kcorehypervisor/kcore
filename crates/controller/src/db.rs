@@ -9584,6 +9584,32 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_heartbeat_is_recent_and_an_old_one_is_not() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).expect("insert node");
+        assert!(!db.node_recently_seen(&node.id, 30).expect("empty"));
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE nodes SET last_heartbeat = datetime('now') WHERE id = ?1",
+                params![node.id],
+            )
+            .expect("stamp now");
+        }
+        assert!(db.node_recently_seen(&node.id, 30).expect("fresh"));
+        {
+            let conn = db.lock_conn().expect("lock");
+            conn.execute(
+                "UPDATE nodes SET last_heartbeat = datetime('now', '-2 minutes') WHERE id = ?1",
+                params![node.id],
+            )
+            .expect("stamp old");
+        }
+        assert!(!db.node_recently_seen(&node.id, 30).expect("stale"));
+    }
+
+    #[test]
     fn ceph_cluster_reconcile_queue_tracks_observed_generation() {
         let db = Database::open(":memory:").expect("open db");
         db.upsert_ceph_cluster(&CephClusterRow {

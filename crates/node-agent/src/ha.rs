@@ -25,6 +25,20 @@ pub enum HostAction {
     Restart(String),
 }
 
+/// Placement runs on the first pass, when the controller's assignment
+/// changes, and when `vm-placement` itself changes. A moved guest's line
+/// often appears only after `nixos-rebuild` writes the file, which is
+/// later than the assignment heartbeat.
+pub fn placement_cycle_due(
+    done: bool,
+    assigned: &[String],
+    last_assigned: &[String],
+    placement_text: &str,
+    last_placement: &str,
+) -> bool {
+    !done || assigned != last_assigned || placement_text != last_placement
+}
+
 pub fn parse_placement_file(text: &str) -> Vec<LocalVm> {
     text.lines()
         .filter_map(|line| {
@@ -467,8 +481,13 @@ pub fn spawn_ha_supervisor(
             let placement_text = std::fs::read_to_string(&ha.placement_file).unwrap_or_default();
             let local = parse_placement_file(&placement_text);
             let now = Instant::now();
-            let placement_due =
-                !placement_done || assigned != last_assigned || placement_text != last_placement;
+            let placement_due = placement_cycle_due(
+                placement_done,
+                &assigned,
+                &last_assigned,
+                &placement_text,
+                &last_placement,
+            );
             let isolate =
                 isolation_due(last_ok, now, Duration::from_secs(ha.isolation_timeout_secs));
             let storage = if isolate && local.iter().any(|vm| vm.backend == "ceph") {
@@ -628,6 +647,18 @@ mod tests {
     }
 
     #[test]
+    fn placement_runs_again_when_the_file_or_the_assignment_changes() {
+        let assigned = vec!["labtest-9".to_string()];
+        let text = "labtest-9 ceph\n";
+        assert!(placement_cycle_due(false, &assigned, &[], text, ""));
+        assert!(!placement_cycle_due(true, &assigned, &assigned, text, text));
+        assert!(
+            placement_cycle_due(true, &assigned, &assigned, text, ""),
+            "a placement file written after the first pass still has to be applied"
+        );
+        assert!(placement_cycle_due(true, &assigned, &[], text, text));
+    }
+
     fn placement_file_parses_name_and_backend() {
         let vms = parse_placement_file("web ceph\n# comment\n\ndb zfs\nlegacy\n");
         assert_eq!(
