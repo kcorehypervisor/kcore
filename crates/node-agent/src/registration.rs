@@ -399,7 +399,11 @@ async fn send_heartbeat_once(
                 }
                 let vms = match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    collect_local_vm_runtime(&cfg.vm_socket_dir, &cfg.ha.guest_heartbeat_dir),
+                    collect_local_vm_runtime(
+                        &cfg.vm_socket_dir,
+                        &cfg.ha.guest_heartbeat_dir,
+                        &cfg.ha.placement_file,
+                    ),
                 )
                 .await
                 {
@@ -453,13 +457,19 @@ fn ch_state_to_controller(state: &str) -> i32 {
 
 /// Read Cloud Hypervisor `vm.info` for every API socket and report it to the
 /// controller. Socket names are the VM names the controller stored.
+///
+/// A guest that exited has no socket, so the placement file is the other
+/// list. Its unit has to be inactive, failed, or deactivating before it is
+/// reported stopped. A unit that is still activating keeps the previous
+/// runtime state, and a `systemctl` that cannot be run adds nothing.
 async fn collect_local_vm_runtime(
     socket_dir: &str,
     heartbeat_dir: &str,
+    placement_file: &str,
 ) -> Vec<controller_proto::VmInfo> {
     let client = crate::vmm::Client::new(socket_dir);
     let heartbeat_dir = heartbeat_dir.to_string();
-    client
+    let mut vms: Vec<controller_proto::VmInfo> = client
         .list_vms()
         .await
         .into_iter()
@@ -474,7 +484,72 @@ async fn collect_local_vm_runtime(
                 ..Default::default()
             }
         })
-        .collect()
+        .collect();
+    append_stopped_placement_guests(&mut vms, placement_file);
+    vms
+}
+
+fn append_stopped_placement_guests(vms: &mut Vec<controller_proto::VmInfo>, placement_file: &str) {
+    let text = std::fs::read_to_string(placement_file).unwrap_or_default();
+    let placement = crate::ha::parse_placement_file(&text);
+    if placement.is_empty() {
+        return;
+    }
+    let socket_names: Vec<String> = vms.iter().map(|vm| vm.name.clone()).collect();
+    let names: Vec<String> = placement.iter().map(|vm| vm.name.clone()).collect();
+    let Some(states) = systemd_unit_states(&names) else {
+        return;
+    };
+    for name in crate::ha::stopped_guests_without_socket(&placement, &socket_names, Some(&states)) {
+        vms.push(controller_proto::VmInfo {
+            id: name.clone(),
+            name,
+            state: controller_proto::VmState::Stopped as i32,
+            ..Default::default()
+        });
+    }
+}
+
+/// One `systemctl is-active` for every placement guest. `None` means the
+/// command could not be executed or did not answer in time, so the caller
+/// must not invent a stopped state.
+fn systemd_unit_states(names: &[String]) -> Option<std::collections::HashMap<String, String>> {
+    if names.is_empty() {
+        return Some(std::collections::HashMap::new());
+    }
+    let units: Vec<String> = names.iter().map(|name| crate::ha::vm_unit(name)).collect();
+    let mut child = std::process::Command::new("systemctl")
+        .arg("is-active")
+        .args(&units)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < std::time::Duration::from_secs(2) => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        if pipe.read_to_string(&mut stdout).is_err() {
+            return None;
+        }
+    }
+    if stdout.trim().is_empty() {
+        return None;
+    }
+    Some(crate::ha::zip_unit_states(names, &stdout))
 }
 
 fn collect_local_workload_runtime() -> Vec<controller_proto::WorkloadRuntimeInfo> {
@@ -788,9 +863,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("tmpdir");
-        let vms =
-            collect_local_vm_runtime(dir.to_str().expect("utf8"), "/run/kcore/guest-heartbeat")
-                .await;
+        let vms = collect_local_vm_runtime(
+            dir.to_str().expect("utf8"),
+            "/run/kcore/guest-heartbeat",
+            "/no/such/kcore-vm-placement",
+        )
+        .await;
         assert!(vms.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }

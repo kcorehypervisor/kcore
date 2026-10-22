@@ -60,6 +60,62 @@ pub fn parse_placement_file(text: &str) -> Vec<LocalVm> {
         .collect()
 }
 
+/// `systemctl is-active` prints one of these when the unit is not running
+/// and is not on its way up. Anything else (including an error line) is not
+/// a stopped guest.
+pub fn unit_state_is_down(state: &str) -> bool {
+    matches!(state.trim(), "inactive" | "failed" | "deactivating")
+}
+
+/// Pair each guest with the matching `systemctl is-active` line.
+pub fn zip_unit_states(
+    names: &[String],
+    stdout: &str,
+) -> std::collections::HashMap<String, String> {
+    names
+        .iter()
+        .zip(stdout.lines())
+        .filter_map(|(name, line)| {
+            let state = line.trim();
+            if state.is_empty() {
+                None
+            } else {
+                Some((name.clone(), state.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// Placement-file guests that have no VMM socket and whose unit is down.
+///
+/// `unit_states` is `None` when `systemctl` could not be executed. Nothing
+/// is returned then: a missing `systemctl` must not mark every guest stopped.
+/// A name with no state, or a state that is `active`, `activating`, or
+/// `reloading`, is left to the socket list. A guest that still has a socket
+/// is already reported from that socket, even when systemd says inactive.
+pub fn stopped_guests_without_socket(
+    placement: &[LocalVm],
+    socket_names: &[String],
+    unit_states: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    let Some(states) = unit_states else {
+        return Vec::new();
+    };
+    let mut stopped = Vec::new();
+    for vm in placement {
+        if socket_names.iter().any(|name| name == &vm.name) || stopped.contains(&vm.name) {
+            continue;
+        }
+        let Some(state) = states.get(&vm.name) else {
+            continue;
+        };
+        if unit_state_is_down(state) {
+            stopped.push(vm.name.clone());
+        }
+    }
+    stopped
+}
+
 /// What to do with the units in the booted configuration.
 ///
 /// `confirmed` false means the controller is too old to say, so every unit
@@ -264,7 +320,7 @@ pub fn placement_mask_dropin() -> &'static str {
      ExecStart=/run/current-system/sw/bin/true\n"
 }
 
-fn vm_unit(name: &str) -> String {
+pub(crate) fn vm_unit(name: &str) -> String {
     format!("kcore-vm-{name}.service")
 }
 
@@ -774,6 +830,46 @@ mod tests {
                 vm("legacy", "filesystem")
             ]
         );
+    }
+
+    #[test]
+    fn a_down_unit_with_no_socket_is_reported_stopped() {
+        let placement = vec![
+            vm("win10-01", "lvm"),
+            vm("ha-live", "ceph"),
+            vm("starting", "lvm"),
+            vm("reloading", "filesystem"),
+            vm("win10-01", "lvm"),
+            vm("leaving", "ceph"),
+            vm("broken", "lvm"),
+            vm("mystery", "lvm"),
+        ];
+        let sockets = vec!["ha-live".to_string()];
+        let mut states = zip_unit_states(
+            &[
+                "win10-01".into(),
+                "ha-live".into(),
+                "starting".into(),
+                "reloading".into(),
+                "leaving".into(),
+            ],
+            "inactive\nactive\nactivating\nreloading\ndeactivating\n",
+        );
+        states.insert("broken".into(), "failed".into());
+        states.insert("mystery".into(), "Failed to connect to bus".into());
+
+        assert_eq!(
+            stopped_guests_without_socket(&placement, &sockets, Some(&states)),
+            vec![
+                "win10-01".to_string(),
+                "leaving".to_string(),
+                "broken".to_string()
+            ]
+        );
+        assert!(stopped_guests_without_socket(&placement, &sockets, None).is_empty());
+        assert!(unit_state_is_down("inactive"));
+        assert!(!unit_state_is_down("activating"));
+        assert_eq!(vm_unit("win10-01"), "kcore-vm-win10-01.service");
     }
 
     #[test]
