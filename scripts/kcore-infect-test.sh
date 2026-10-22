@@ -28,10 +28,19 @@ base=(
   --flake github:kcorehypervisor/kcore
 )
 
+url='https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect'
+
 bash "$INFECT" --help >"$tmp/help"
 grep -q -- '--dry-run' "$tmp/help"
 grep -q -- '--cert-dir' "$tmp/help"
 grep -q -- '--run-controller' "$tmp/help"
+grep -F -q -- "$url" "$tmp/help"
+
+# The server runs `curl … | bash -s --`. Stdin is the script, and $0 is bash.
+bash -s -- --help <"$INFECT" >"$tmp/help-stdin"
+grep -F -q -- "$url" "$tmp/help-stdin"
+bash -s -- "${base[@]}" --out "$tmp/stdin" <"$INFECT" >"$tmp/stdin.out"
+grep -q 'inputs.kcore.url = "github:kcorehypervisor/kcore"' "$tmp/stdin/flake.nix"
 
 bash "$INFECT" "${base[@]}" --out "$tmp/controller" >"$tmp/controller.out"
 grep -q 'inputs.kcore.url = "github:kcorehypervisor/kcore"' "$tmp/controller/flake.nix"

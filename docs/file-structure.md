@@ -268,7 +268,7 @@ For each file: purpose + where it is used in runtime/operator flows.
 - `specs/tla/ControllerReplication.cfg` — TLC constants/properties for controller replication model.
 - `specs/tla/CrossDcReplication.tla` — multi-DC replication convergence model with link failures.
 - `specs/tla/CrossDcReplication.cfg` — TLC constants/properties for cross-DC replication model.
-- `scripts/kcore-infect` — in-place installer for Debian and other systemd Linux hosts. See [kcore-infect.md](./kcore-infect.md).
+- `scripts/kcore-infect` — in-place installer fetched and run on the server: `curl -fsSL https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect | sudo bash -s -- --yes --reboot`. See [kcore-infect.md](./kcore-infect.md).
 - `scripts/build-iso-remote.sh` — remote build automation script; orchestrates ISO build steps on a remote Linux builder host.
 - `scripts/release.sh` — non-interactive local release helper: create/push tag, build ISO plus Linux/macOS `kctl`, package `dist/` + `SHA256SUMS`, and create/upload GitHub Release assets (see `docs/release.md`).
 
