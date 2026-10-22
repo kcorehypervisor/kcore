@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package kcore.vault.install;
+
+// Live Vault image only. The hypervisor installer exposes NodeAdmin on :9091
+// without TLS; this service is the backup appliance equivalent.
+service VaultInstall {
+  rpc Install(InstallRequest) returns (InstallResponse);
+  rpc ListDisks(ListDisksRequest) returns (ListDisksResponse);
+}
+
+message InstallRequest {
+  string os_disk = 1;
+  string data_disk = 2;
+  string hostname = 3;
+  bool reboot = 4;
+}
+
+message InstallResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ListDisksRequest {}
+
+message Disk {
+  string path = 1;
+  string size = 2;
+  string model = 3;
+}
+
+message ListDisksResponse {
+  repeated Disk disks = 1;
+}

@@ -14403,7 +14403,7 @@ var require_public_api = __commonJS({
       const lineCounter$1 = options.lineCounter || prettyErrors && new lineCounter.LineCounter() || null;
       return { lineCounter: lineCounter$1, prettyErrors };
     }
-    function parseAllDocuments(source, options = {}) {
+    function parseAllDocuments2(source, options = {}) {
       const { lineCounter: lineCounter2, prettyErrors } = parseOptions(options);
       const parser$1 = new parser.Parser(lineCounter2?.addNewLine);
       const composer$1 = new composer.Composer(options);
@@ -14478,7 +14478,7 @@ var require_public_api = __commonJS({
       return new Document.Document(value, _replacer, options).toString(options);
     }
     exports.parse = parse3;
-    exports.parseAllDocuments = parseAllDocuments;
+    exports.parseAllDocuments = parseAllDocuments2;
     exports.parseDocument = parseDocument;
     exports.stringify = stringify;
   }
@@ -14854,7 +14854,7 @@ var require_metadata2 = __commonJS({
         }
       }
     }
-    var Metadata = class _Metadata {
+    var Metadata2 = class _Metadata {
       constructor(options = {}) {
         this.internalRepr = /* @__PURE__ */ new Map();
         this.opaqueData = /* @__PURE__ */ new Map();
@@ -15046,7 +15046,7 @@ var require_metadata2 = __commonJS({
         return result;
       }
     };
-    exports.Metadata = Metadata;
+    exports.Metadata = Metadata2;
     var bufToString = (val) => {
       return Buffer.isBuffer(val) ? val.toString("base64") : val;
     };
@@ -18291,15 +18291,15 @@ var require_client_interceptors = __commonJS({
       const parent = (_b = options.parent) !== null && _b !== void 0 ? _b : null;
       const propagateFlags = options.propagate_flags;
       const credentials3 = options.credentials;
-      const call = channel.createCall(path, deadline, host, parent, propagateFlags);
+      const call2 = channel.createCall(path, deadline, host, parent, propagateFlags);
       if (credentials3) {
-        call.setCredentials(credentials3);
+        call2.setCredentials(credentials3);
       }
-      return call;
+      return call2;
     }
     var BaseInterceptingCall = class {
-      constructor(call, methodDefinition) {
-        this.call = call;
+      constructor(call2, methodDefinition) {
+        this.call = call2;
         this.methodDefinition = methodDefinition;
       }
       cancelWithStatus(status, details) {
@@ -18368,8 +18368,8 @@ var require_client_interceptors = __commonJS({
     };
     var BaseUnaryInterceptingCall = class extends BaseInterceptingCall {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      constructor(call, methodDefinition) {
-        super(call, methodDefinition);
+      constructor(call2, methodDefinition) {
+        super(call2, methodDefinition);
       }
       start(metadata, listener) {
         var _a, _b;
@@ -18398,11 +18398,11 @@ var require_client_interceptors = __commonJS({
     var BaseStreamingInterceptingCall = class extends BaseInterceptingCall {
     };
     function getBottomInterceptingCall(channel, options, methodDefinition) {
-      const call = getCall(channel, methodDefinition.path, options);
+      const call2 = getCall(channel, methodDefinition.path, options);
       if (methodDefinition.responseStream) {
-        return new BaseStreamingInterceptingCall(call, methodDefinition);
+        return new BaseStreamingInterceptingCall(call2, methodDefinition);
       } else {
-        return new BaseUnaryInterceptingCall(call, methodDefinition);
+        return new BaseUnaryInterceptingCall(call2, methodDefinition);
       }
     }
     function getInterceptingCall(interceptorArgs, methodDefinition, options, channel) {
@@ -18551,19 +18551,19 @@ var require_client = __commonJS({
           callInterceptors: (_a = callProperties.callOptions.interceptors) !== null && _a !== void 0 ? _a : [],
           callInterceptorProviders: (_b = callProperties.callOptions.interceptor_providers) !== null && _b !== void 0 ? _b : []
         };
-        const call = (0, client_interceptors_1.getInterceptingCall)(interceptorArgs, callProperties.methodDefinition, callProperties.callOptions, callProperties.channel);
-        emitter.call = call;
+        const call2 = (0, client_interceptors_1.getInterceptingCall)(interceptorArgs, callProperties.methodDefinition, callProperties.callOptions, callProperties.channel);
+        emitter.call = call2;
         let responseMessage = null;
         let receivedStatus = false;
         let callerStackError = new Error();
-        call.start(callProperties.metadata, {
+        call2.start(callProperties.metadata, {
           onReceiveMetadata: (metadata2) => {
             emitter.emit("metadata", metadata2);
           },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onReceiveMessage(message) {
             if (responseMessage !== null) {
-              call.cancelWithStatus(constants_1.Status.UNIMPLEMENTED, "Too many responses received");
+              call2.cancelWithStatus(constants_1.Status.UNIMPLEMENTED, "Too many responses received");
             }
             responseMessage = message;
           },
@@ -18591,8 +18591,8 @@ var require_client = __commonJS({
             emitter.emit("status", status);
           }
         });
-        call.sendMessage(argument);
-        call.halfClose();
+        call2.sendMessage(argument);
+        call2.halfClose();
         return emitter;
       }
       makeClientStreamRequest(method, serialize, deserialize, metadata, options, callback) {
@@ -18623,22 +18623,22 @@ var require_client = __commonJS({
           callInterceptors: (_a = callProperties.callOptions.interceptors) !== null && _a !== void 0 ? _a : [],
           callInterceptorProviders: (_b = callProperties.callOptions.interceptor_providers) !== null && _b !== void 0 ? _b : []
         };
-        const call = (0, client_interceptors_1.getInterceptingCall)(interceptorArgs, callProperties.methodDefinition, callProperties.callOptions, callProperties.channel);
-        emitter.call = call;
+        const call2 = (0, client_interceptors_1.getInterceptingCall)(interceptorArgs, callProperties.methodDefinition, callProperties.callOptions, callProperties.channel);
+        emitter.call = call2;
         let responseMessage = null;
         let receivedStatus = false;
         let callerStackError = new Error();
-        call.start(callProperties.metadata, {
+        call2.start(callProperties.metadata, {
           onReceiveMetadata: (metadata2) => {
             emitter.emit("metadata", metadata2);
           },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onReceiveMessage(message) {
             if (responseMessage !== null) {
-              call.cancelWithStatus(constants_1.Status.UNIMPLEMENTED, "Too many responses received");
+              call2.cancelWithStatus(constants_1.Status.UNIMPLEMENTED, "Too many responses received");
             }
             responseMessage = message;
-            call.startRead();
+            call2.startRead();
           },
           onReceiveStatus(status) {
             if (receivedStatus) {
@@ -18714,11 +18714,11 @@ var require_client = __commonJS({
           callInterceptors: (_a = callProperties.callOptions.interceptors) !== null && _a !== void 0 ? _a : [],
           callInterceptorProviders: (_b = callProperties.callOptions.interceptor_providers) !== null && _b !== void 0 ? _b : []
         };
-        const call = (0, client_interceptors_1.getInterceptingCall)(interceptorArgs, callProperties.methodDefinition, callProperties.callOptions, callProperties.channel);
-        stream.call = call;
+        const call2 = (0, client_interceptors_1.getInterceptingCall)(interceptorArgs, callProperties.methodDefinition, callProperties.callOptions, callProperties.channel);
+        stream.call = call2;
         let receivedStatus = false;
         let callerStackError = new Error();
-        call.start(callProperties.metadata, {
+        call2.start(callProperties.metadata, {
           onReceiveMetadata(metadata2) {
             stream.emit("metadata", metadata2);
           },
@@ -18740,8 +18740,8 @@ var require_client = __commonJS({
             stream.emit("status", status);
           }
         });
-        call.sendMessage(argument);
-        call.halfClose();
+        call2.sendMessage(argument);
+        call2.halfClose();
         return stream;
       }
       makeBidiStreamRequest(method, serialize, deserialize, metadata, options) {
@@ -18771,11 +18771,11 @@ var require_client = __commonJS({
           callInterceptors: (_a = callProperties.callOptions.interceptors) !== null && _a !== void 0 ? _a : [],
           callInterceptorProviders: (_b = callProperties.callOptions.interceptor_providers) !== null && _b !== void 0 ? _b : []
         };
-        const call = (0, client_interceptors_1.getInterceptingCall)(interceptorArgs, callProperties.methodDefinition, callProperties.callOptions, callProperties.channel);
-        stream.call = call;
+        const call2 = (0, client_interceptors_1.getInterceptingCall)(interceptorArgs, callProperties.methodDefinition, callProperties.callOptions, callProperties.channel);
+        stream.call = call2;
         let receivedStatus = false;
         let callerStackError = new Error();
-        call.start(callProperties.metadata, {
+        call2.start(callProperties.metadata, {
           onReceiveMetadata(metadata2) {
             stream.emit("metadata", metadata2);
           },
@@ -28783,8 +28783,8 @@ var require_channelz = __commonJS({
         subchannel_ref: subchannelRef
       };
     }
-    function GetChannel(call, callback) {
-      const channelId = parseInt(call.request.channel_id, 10);
+    function GetChannel(call2, callback) {
+      const channelId = parseInt(call2.request.channel_id, 10);
       const channelEntry = entityMaps[
         "channel"
         /* EntityTypes.channel */
@@ -28798,10 +28798,10 @@ var require_channelz = __commonJS({
       }
       callback(null, { channel: getChannelMessage(channelEntry) });
     }
-    function GetTopChannels(call, callback) {
-      const maxResults = parseInt(call.request.max_results, 10) || DEFAULT_MAX_RESULTS;
+    function GetTopChannels(call2, callback) {
+      const maxResults = parseInt(call2.request.max_results, 10) || DEFAULT_MAX_RESULTS;
       const resultList = [];
-      const startId = parseInt(call.request.start_channel_id, 10);
+      const startId = parseInt(call2.request.start_channel_id, 10);
       const channelEntries = entityMaps[
         "channel"
         /* EntityTypes.channel */
@@ -28833,8 +28833,8 @@ var require_channelz = __commonJS({
         listen_socket: listenSocket
       };
     }
-    function GetServer(call, callback) {
-      const serverId = parseInt(call.request.server_id, 10);
+    function GetServer(call2, callback) {
+      const serverId = parseInt(call2.request.server_id, 10);
       const serverEntries = entityMaps[
         "server"
         /* EntityTypes.server */
@@ -28849,9 +28849,9 @@ var require_channelz = __commonJS({
       }
       callback(null, { server: getServerMessage(serverEntry) });
     }
-    function GetServers(call, callback) {
-      const maxResults = parseInt(call.request.max_results, 10) || DEFAULT_MAX_RESULTS;
-      const startId = parseInt(call.request.start_server_id, 10);
+    function GetServers(call2, callback) {
+      const maxResults = parseInt(call2.request.max_results, 10) || DEFAULT_MAX_RESULTS;
+      const startId = parseInt(call2.request.start_server_id, 10);
       const serverEntries = entityMaps[
         "server"
         /* EntityTypes.server */
@@ -28866,8 +28866,8 @@ var require_channelz = __commonJS({
         end: i.equals(serverEntries.end())
       });
     }
-    function GetSubchannel(call, callback) {
-      const subchannelId = parseInt(call.request.subchannel_id, 10);
+    function GetSubchannel(call2, callback) {
+      const subchannelId = parseInt(call2.request.subchannel_id, 10);
       const subchannelEntry = entityMaps[
         "subchannel"
         /* EntityTypes.subchannel */
@@ -28918,9 +28918,9 @@ var require_channelz = __commonJS({
         };
       }
     }
-    function GetSocket(call, callback) {
+    function GetSocket(call2, callback) {
       var _a, _b, _c, _d, _e;
-      const socketId = parseInt(call.request.socket_id, 10);
+      const socketId = parseInt(call2.request.socket_id, 10);
       const socketEntry = entityMaps[
         "socket"
         /* EntityTypes.socket */
@@ -28966,8 +28966,8 @@ var require_channelz = __commonJS({
       };
       callback(null, { socket: socketMessage });
     }
-    function GetServerSockets(call, callback) {
-      const serverId = parseInt(call.request.server_id, 10);
+    function GetServerSockets(call2, callback) {
+      const serverId = parseInt(call2.request.server_id, 10);
       const serverEntry = entityMaps[
         "server"
         /* EntityTypes.server */
@@ -28979,8 +28979,8 @@ var require_channelz = __commonJS({
         });
         return;
       }
-      const startId = parseInt(call.request.start_socket_id, 10);
-      const maxResults = parseInt(call.request.max_results, 10) || DEFAULT_MAX_RESULTS;
+      const startId = parseInt(call2.request.start_socket_id, 10);
+      const maxResults = parseInt(call2.request.max_results, 10) || DEFAULT_MAX_RESULTS;
       const resolvedInfo = serverEntry.getInfo();
       const allSockets = resolvedInfo.sessionChildren.sockets;
       const resultList = [];
@@ -31349,8 +31349,8 @@ var require_transport = __commonJS({
       handleDisconnect() {
         this.clearKeepaliveTimeout();
         this.reportDisconnectToOwner(false);
-        for (const call of this.activeCalls) {
-          call.onDisconnect();
+        for (const call2 of this.activeCalls) {
+          call2.onDisconnect();
         }
         setImmediate(() => {
           this.session.destroy();
@@ -31443,14 +31443,14 @@ var require_transport = __commonJS({
           this.keepaliveTimer = null;
         }
       }
-      removeActiveCall(call) {
-        this.activeCalls.delete(call);
+      removeActiveCall(call2) {
+        this.activeCalls.delete(call2);
         if (this.activeCalls.size === 0) {
           this.session.unref();
         }
       }
-      addActiveCall(call) {
-        this.activeCalls.add(call);
+      addActiveCall(call2) {
+        this.activeCalls.add(call2);
         if (this.activeCalls.size === 1) {
           this.session.ref();
           if (!this.keepaliveWithoutCalls) {
@@ -31480,7 +31480,7 @@ var require_transport = __commonJS({
           this.internalsTrace("session.closed=" + this.session.closed + " session.destroyed=" + this.session.destroyed + " session.socket.destroyed=" + this.session.socket.destroyed);
         }
         let eventTracker;
-        let call;
+        let call2;
         if (this.channelzEnabled) {
           this.streamTracker.addCallStarted();
           eventTracker = {
@@ -31499,7 +31499,7 @@ var require_transport = __commonJS({
             onCallEnd: (status) => {
               var _a;
               (_a = subchannelCallStatsTracker.onCallEnd) === null || _a === void 0 ? void 0 : _a.call(subchannelCallStatsTracker, status);
-              this.removeActiveCall(call);
+              this.removeActiveCall(call2);
             },
             onStreamEnd: (success) => {
               var _a;
@@ -31524,7 +31524,7 @@ var require_transport = __commonJS({
             onCallEnd: (status) => {
               var _a;
               (_a = subchannelCallStatsTracker.onCallEnd) === null || _a === void 0 ? void 0 : _a.call(subchannelCallStatsTracker, status);
-              this.removeActiveCall(call);
+              this.removeActiveCall(call2);
             },
             onStreamEnd: (success) => {
               var _a;
@@ -31532,9 +31532,9 @@ var require_transport = __commonJS({
             }
           };
         }
-        call = new subchannel_call_1.Http2SubchannelCall(http2Stream, eventTracker, listener, this, callId !== null && callId !== void 0 ? callId : (0, call_number_1.getNextCallNumber)());
-        this.addActiveCall(call);
-        return call;
+        call2 = new subchannel_call_1.Http2SubchannelCall(http2Stream, eventTracker, listener, this, callId !== null && callId !== void 0 ? callId : (0, call_number_1.getNextCallNumber)());
+        this.addActiveCall(call2);
+        return call2;
       }
       getChannelzRef() {
         return this.channelzRef;
@@ -32551,8 +32551,8 @@ var require_retrying_call = __commonJS({
           this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
         }
         this.reportStatus({ code: status, details, metadata: new metadata_1.Metadata() });
-        for (const { call } of this.underlyingCalls) {
-          call.cancelWithStatus(status, details);
+        for (const { call: call2 } of this.underlyingCalls) {
+          call2.cancelWithStatus(status, details);
         }
       }
       getPeer() {
@@ -32691,8 +32691,8 @@ var require_retrying_call = __commonJS({
       }
       countActiveCalls() {
         let count = 0;
-        for (const call of this.underlyingCalls) {
-          if ((call === null || call === void 0 ? void 0 : call.state) === "ACTIVE") {
+        for (const call2 of this.underlyingCalls) {
+          if ((call2 === null || call2 === void 0 ? void 0 : call2.state) === "ACTIVE") {
             count += 1;
           }
         }
@@ -32968,9 +32968,9 @@ var require_retrying_call = __commonJS({
             var _a;
             (_a = context.callback) === null || _a === void 0 ? void 0 : _a.call(context);
           });
-          for (const [callIndex, call] of this.underlyingCalls.entries()) {
-            if (call.state === "ACTIVE" && call.nextMessageToSend === messageIndex) {
-              call.call.sendMessageWithContext({
+          for (const [callIndex, call2] of this.underlyingCalls.entries()) {
+            if (call2.state === "ACTIVE" && call2.nextMessageToSend === messageIndex) {
+              call2.call.sendMessageWithContext({
                 callback: (error2) => {
                   this.handleChildWriteCompleted(callIndex, messageIndex);
                 }
@@ -32982,10 +32982,10 @@ var require_retrying_call = __commonJS({
           if (this.committedCallIndex === null) {
             return;
           }
-          const call = this.underlyingCalls[this.committedCallIndex];
+          const call2 = this.underlyingCalls[this.committedCallIndex];
           bufferEntry.callback = context.callback;
-          if (call.state === "ACTIVE" && call.nextMessageToSend === messageIndex) {
-            call.call.sendMessageWithContext({
+          if (call2.state === "ACTIVE" && call2.nextMessageToSend === messageIndex) {
+            call2.call.sendMessageWithContext({
               callback: (error2) => {
                 this.handleChildWriteCompleted(this.committedCallIndex, messageIndex);
               }
@@ -33009,14 +33009,14 @@ var require_retrying_call = __commonJS({
           entryType: "HALF_CLOSE",
           allocated: false
         });
-        for (const call of this.underlyingCalls) {
-          if ((call === null || call === void 0 ? void 0 : call.state) === "ACTIVE") {
-            if (call.nextMessageToSend === halfCloseIndex || call.nextMessageToSend === halfCloseIndex - 1) {
+        for (const call2 of this.underlyingCalls) {
+          if ((call2 === null || call2 === void 0 ? void 0 : call2.state) === "ACTIVE") {
+            if (call2.nextMessageToSend === halfCloseIndex || call2.nextMessageToSend === halfCloseIndex - 1) {
               if (this.traceEnabled) {
-                this.trace("Sending halfClose immediately to child [" + call.call.getCallNumber() + "] - all messages already sent");
+                this.trace("Sending halfClose immediately to child [" + call2.call.getCallNumber() + "] - all messages already sent");
               }
-              call.nextMessageToSend += 1;
-              call.call.halfClose();
+              call2.nextMessageToSend += 1;
+              call2.call.halfClose();
             }
           }
         }
@@ -33316,8 +33316,8 @@ var require_internal_channel = __commonJS({
             if (queueCopy.size > 0) {
               this.callRefTimerUnref();
             }
-            for (const call of queueCopy) {
-              call.doPick();
+            for (const call2 of queueCopy) {
+              call2.doPick();
             }
             this.updateState(connectivityState);
           },
@@ -33354,8 +33354,8 @@ var require_internal_channel = __commonJS({
             if (localQueue.length > 0) {
               this.callRefTimerUnref();
             }
-            for (const call of localQueue) {
-              call.getConfig();
+            for (const call2 of localQueue) {
+              call2.getConfig();
             }
           });
         }, (status) => {
@@ -33373,8 +33373,8 @@ var require_internal_channel = __commonJS({
           if (localQueue.length > 0) {
             this.callRefTimerUnref();
           }
-          for (const call of localQueue) {
-            call.reportResolverError(status);
+          for (const call2 of localQueue) {
+            call2.reportResolverError(status);
           }
         });
         this.filterStackFactory = new filter_stack_1.FilterStackFactory([
@@ -33466,12 +33466,12 @@ var require_internal_channel = __commonJS({
           extraPickInfo
         });
       }
-      queueCallForPick(call) {
-        this.pickQueue.add(call);
+      queueCallForPick(call2) {
+        this.pickQueue.add(call2);
         this.callRefTimerRef();
       }
-      removeCallFromPickQueue(call) {
-        this.pickQueue.delete(call);
+      removeCallFromPickQueue(call2) {
+        this.pickQueue.delete(call2);
         if (this.pickQueue.size === 0) {
           this.callRefTimerUnref();
         }
@@ -33498,8 +33498,8 @@ var require_internal_channel = __commonJS({
           }
         }
       }
-      queueCallForConfig(call) {
-        this.configSelectionQueue.push(call);
+      queueCallForConfig(call2) {
+        this.configSelectionQueue.push(call2);
         this.callRefTimerRef();
       }
       enterIdle() {
@@ -33581,24 +33581,24 @@ var require_internal_channel = __commonJS({
           host: host !== null && host !== void 0 ? host : this.defaultAuthority,
           parentCall
         };
-        const call = new resolving_call_1.ResolvingCall(this, method, finalOptions, this.filterStackFactory.clone(), callNumber);
+        const call2 = new resolving_call_1.ResolvingCall(this, method, finalOptions, this.filterStackFactory.clone(), callNumber);
         this.onCallStart();
-        call.addStatusWatcher((status) => {
+        call2.addStatusWatcher((status) => {
           this.onCallEnd(status);
         });
-        return call;
+        return call2;
       }
       close() {
         var _a;
         this.resolvingLoadBalancer.destroy();
         this.updateState(connectivity_state_1.ConnectivityState.SHUTDOWN);
         this.currentPicker = new ShutdownPicker();
-        for (const call of this.configSelectionQueue) {
-          call.cancelWithStatus(constants_1.Status.UNAVAILABLE, "Channel closed before call started");
+        for (const call2 of this.configSelectionQueue) {
+          call2.cancelWithStatus(constants_1.Status.UNAVAILABLE, "Channel closed before call started");
         }
         this.configSelectionQueue = [];
-        for (const call of this.pickQueue) {
-          call.cancelWithStatus(constants_1.Status.UNAVAILABLE, "Channel closed before call started");
+        for (const call2 of this.pickQueue) {
+          call2.cancelWithStatus(constants_1.Status.UNAVAILABLE, "Channel closed before call started");
         }
         this.pickQueue.clear();
         if (this.callRefTimer) {
@@ -33762,10 +33762,10 @@ var require_server_call = __commonJS({
       return status;
     }
     var ServerUnaryCallImpl = class extends events_1.EventEmitter {
-      constructor(path, call, metadata, request) {
+      constructor(path, call2, metadata, request) {
         super();
         this.path = path;
-        this.call = call;
+        this.call = call2;
         this.metadata = metadata;
         this.request = request;
         this.cancelled = false;
@@ -33794,10 +33794,10 @@ var require_server_call = __commonJS({
     };
     exports.ServerUnaryCallImpl = ServerUnaryCallImpl;
     var ServerReadableStreamImpl = class extends stream_1.Readable {
-      constructor(path, call, metadata) {
+      constructor(path, call2, metadata) {
         super({ objectMode: true });
         this.path = path;
-        this.call = call;
+        this.call = call2;
         this.metadata = metadata;
         this.cancelled = false;
       }
@@ -33828,10 +33828,10 @@ var require_server_call = __commonJS({
     };
     exports.ServerReadableStreamImpl = ServerReadableStreamImpl;
     var ServerWritableStreamImpl = class extends stream_1.Writable {
-      constructor(path, call, metadata, request) {
+      constructor(path, call2, metadata, request) {
         super({ objectMode: true });
         this.path = path;
-        this.call = call;
+        this.call = call2;
         this.metadata = metadata;
         this.request = request;
         this.pendingStatus = {
@@ -33884,10 +33884,10 @@ var require_server_call = __commonJS({
     };
     exports.ServerWritableStreamImpl = ServerWritableStreamImpl;
     var ServerDuplexStreamImpl = class extends stream_1.Duplex {
-      constructor(path, call, metadata) {
+      constructor(path, call2, metadata) {
         super({ objectMode: true });
         this.path = path;
-        this.call = call;
+        this.call = call2;
         this.metadata = metadata;
         this.pendingStatus = {
           code: constants_1.Status.OK,
@@ -34412,12 +34412,12 @@ var require_orca = __commonJS({
       constructor() {
         this.message = {};
         this.serviceImplementation = {
-          StreamCoreMetrics: (call) => {
-            const reportInterval = call.request.report_interval ? (0, duration_1.durationToMs)((0, duration_1.durationMessageToDuration)(call.request.report_interval)) : DEFAULT_REPORT_INTERVAL_MS;
+          StreamCoreMetrics: (call2) => {
+            const reportInterval = call2.request.report_interval ? (0, duration_1.durationToMs)((0, duration_1.durationMessageToDuration)(call2.request.report_interval)) : DEFAULT_REPORT_INTERVAL_MS;
             const reportTimer = setInterval(() => {
-              call.write(this.message);
+              call2.write(this.message);
             }, reportInterval);
-            call.on("cancelled", () => {
+            call2.on("cancelled", () => {
               clearInterval(reportTimer);
             });
           }
@@ -35337,8 +35337,8 @@ var require_server_interceptors = __commonJS({
         responseSerialize: handler.serialize
       };
       const baseCall = new BaseServerInterceptingCall(stream, headers, callEventTracker, handler, options);
-      return interceptors.reduce((call, interceptor) => {
-        return interceptor(methodDefinition, call);
+      return interceptors.reduce((call2, interceptor) => {
+        return interceptor(methodDefinition, call2);
       }, baseCall);
     }
   }
@@ -35428,20 +35428,20 @@ var require_server = __commonJS({
       const unimplementedStatusResponse = getUnimplementedStatusResponse(methodName);
       switch (handlerType) {
         case "unary":
-          return (call, callback) => {
+          return (call2, callback) => {
             callback(unimplementedStatusResponse, null);
           };
         case "clientStream":
-          return (call, callback) => {
+          return (call2, callback) => {
             callback(unimplementedStatusResponse, null);
           };
         case "serverStream":
-          return (call) => {
-            call.emit("error", unimplementedStatusResponse);
+          return (call2) => {
+            call2.emit("error", unimplementedStatusResponse);
           };
         case "bidi":
-          return (call) => {
-            call.emit("error", unimplementedStatusResponse);
+          return (call2) => {
+            call2.emit("error", unimplementedStatusResponse);
           };
         default:
           throw new Error(`Invalid handlerType ${handlerType}`);
@@ -36233,11 +36233,11 @@ var require_server = __commonJS({
               }
             }
           };
-          const call = (0, server_interceptors_1.getServerInterceptingCall)([...extraInterceptors, ...this.interceptors], stream, headers, callEventTracker, handler, this.options);
-          if (!this._runHandlerForCall(call, handler)) {
+          const call2 = (0, server_interceptors_1.getServerInterceptingCall)([...extraInterceptors, ...this.interceptors], stream, headers, callEventTracker, handler, this.options);
+          if (!this._runHandlerForCall(call2, handler)) {
             this.callTracker.addCallFailed();
             channelzSessionInfo === null || channelzSessionInfo === void 0 ? void 0 : channelzSessionInfo.streamTracker.addCallFailed();
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.INTERNAL,
               details: `Unknown handler type: ${handler.type}`
             });
@@ -36256,24 +36256,24 @@ var require_server = __commonJS({
             this._respondWithError(getUnimplementedStatusResponse(path), stream, null);
             return;
           }
-          const call = (0, server_interceptors_1.getServerInterceptingCall)([...extraInterceptors, ...this.interceptors], stream, headers, null, handler, this.options);
-          if (!this._runHandlerForCall(call, handler)) {
-            call.sendStatus({
+          const call2 = (0, server_interceptors_1.getServerInterceptingCall)([...extraInterceptors, ...this.interceptors], stream, headers, null, handler, this.options);
+          if (!this._runHandlerForCall(call2, handler)) {
+            call2.sendStatus({
               code: constants_1.Status.INTERNAL,
               details: `Unknown handler type: ${handler.type}`
             });
           }
         }
-        _runHandlerForCall(call, handler) {
+        _runHandlerForCall(call2, handler) {
           const { type } = handler;
           if (type === "unary") {
-            handleUnary(call, handler);
+            handleUnary(call2, handler);
           } else if (type === "clientStream") {
-            handleClientStreaming(call, handler);
+            handleClientStreaming(call2, handler);
           } else if (type === "serverStream") {
-            handleServerStreaming(call, handler);
+            handleServerStreaming(call2, handler);
           } else if (type === "bidi") {
-            handleBidiStreaming(call, handler);
+            handleBidiStreaming(call2, handler);
           } else {
             return false;
           }
@@ -36607,15 +36607,15 @@ var require_server = __commonJS({
       })(), _a;
     })();
     exports.Server = Server2;
-    async function handleUnary(call, handler) {
+    async function handleUnary(call2, handler) {
       let stream;
       function respond(err, value, trailer, flags) {
         if (err) {
-          call.sendStatus((0, server_call_1.serverErrorToStatus)(err, trailer));
+          call2.sendStatus((0, server_call_1.serverErrorToStatus)(err, trailer));
           return;
         }
-        call.sendMessage(value, () => {
-          call.sendStatus({
+        call2.sendMessage(value, () => {
+          call2.sendStatus({
             code: constants_1.Status.OK,
             details: "OK",
             metadata: trailer !== null && trailer !== void 0 ? trailer : null
@@ -36624,14 +36624,14 @@ var require_server = __commonJS({
       }
       let requestMetadata;
       let requestMessage = null;
-      call.start({
+      call2.start({
         onReceiveMetadata(metadata) {
           requestMetadata = metadata;
-          call.startRead();
+          call2.startRead();
         },
         onReceiveMessage(message) {
           if (requestMessage) {
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.UNIMPLEMENTED,
               details: `Received a second request message for server streaming method ${handler.path}`,
               metadata: null
@@ -36639,18 +36639,18 @@ var require_server = __commonJS({
             return;
           }
           requestMessage = message;
-          call.startRead();
+          call2.startRead();
         },
         onReceiveHalfClose() {
           if (!requestMessage) {
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.UNIMPLEMENTED,
               details: `Received no request message for server streaming method ${handler.path}`,
               metadata: null
             });
             return;
           }
-          stream = new server_call_1.ServerWritableStreamImpl(handler.path, call, requestMetadata, requestMessage);
+          stream = new server_call_1.ServerWritableStreamImpl(handler.path, call2, requestMetadata, requestMessage);
           try {
             handler.func(stream, respond);
           } catch (err) {
@@ -36660,7 +36660,7 @@ var require_server = __commonJS({
             } else {
               details = "Unknown error";
             }
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.UNKNOWN,
               details,
               metadata: null
@@ -36675,24 +36675,24 @@ var require_server = __commonJS({
         }
       });
     }
-    function handleClientStreaming(call, handler) {
+    function handleClientStreaming(call2, handler) {
       let stream;
       function respond(err, value, trailer, flags) {
         if (err) {
-          call.sendStatus((0, server_call_1.serverErrorToStatus)(err, trailer));
+          call2.sendStatus((0, server_call_1.serverErrorToStatus)(err, trailer));
           return;
         }
-        call.sendMessage(value, () => {
-          call.sendStatus({
+        call2.sendMessage(value, () => {
+          call2.sendStatus({
             code: constants_1.Status.OK,
             details: "OK",
             metadata: trailer !== null && trailer !== void 0 ? trailer : null
           });
         });
       }
-      call.start({
+      call2.start({
         onReceiveMetadata(metadata) {
-          stream = new server_call_1.ServerDuplexStreamImpl(handler.path, call, metadata);
+          stream = new server_call_1.ServerDuplexStreamImpl(handler.path, call2, metadata);
           try {
             handler.func(stream, respond);
           } catch (err) {
@@ -36702,7 +36702,7 @@ var require_server = __commonJS({
             } else {
               details = "Unknown error";
             }
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.UNKNOWN,
               details,
               metadata: null
@@ -36724,18 +36724,18 @@ var require_server = __commonJS({
         }
       });
     }
-    function handleServerStreaming(call, handler) {
+    function handleServerStreaming(call2, handler) {
       let stream;
       let requestMetadata;
       let requestMessage = null;
-      call.start({
+      call2.start({
         onReceiveMetadata(metadata) {
           requestMetadata = metadata;
-          call.startRead();
+          call2.startRead();
         },
         onReceiveMessage(message) {
           if (requestMessage) {
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.UNIMPLEMENTED,
               details: `Received a second request message for server streaming method ${handler.path}`,
               metadata: null
@@ -36743,18 +36743,18 @@ var require_server = __commonJS({
             return;
           }
           requestMessage = message;
-          call.startRead();
+          call2.startRead();
         },
         onReceiveHalfClose() {
           if (!requestMessage) {
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.UNIMPLEMENTED,
               details: `Received no request message for server streaming method ${handler.path}`,
               metadata: null
             });
             return;
           }
-          stream = new server_call_1.ServerWritableStreamImpl(handler.path, call, requestMetadata, requestMessage);
+          stream = new server_call_1.ServerWritableStreamImpl(handler.path, call2, requestMetadata, requestMessage);
           try {
             handler.func(stream);
           } catch (err) {
@@ -36764,7 +36764,7 @@ var require_server = __commonJS({
             } else {
               details = "Unknown error";
             }
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.UNKNOWN,
               details,
               metadata: null
@@ -36780,11 +36780,11 @@ var require_server = __commonJS({
         }
       });
     }
-    function handleBidiStreaming(call, handler) {
+    function handleBidiStreaming(call2, handler) {
       let stream;
-      call.start({
+      call2.start({
         onReceiveMetadata(metadata) {
-          stream = new server_call_1.ServerDuplexStreamImpl(handler.path, call, metadata);
+          stream = new server_call_1.ServerDuplexStreamImpl(handler.path, call2, metadata);
           try {
             handler.func(stream);
           } catch (err) {
@@ -36794,7 +36794,7 @@ var require_server = __commonJS({
             } else {
               details = "Unknown error";
             }
-            call.sendStatus({
+            call2.sendStatus({
               code: constants_1.Status.UNKNOWN,
               details,
               metadata: null
@@ -72787,11 +72787,32 @@ function resolveProvisioning(options = {}) {
   }
   const timeoutMs = options.timeoutMs ?? 12e4;
   const checked = assertAddress(address, "provisioning");
+  const authorization = bearer(options.token?.trim() || process.env.KCORE_PROVISIONING_TOKEN?.trim() || entry?.token?.trim());
   if (options.provisioningInsecure === false) {
     const base = resolveConnection(options);
-    return { ...base, address: checked, insecure: false, timeoutMs };
+    return { ...base, address: checked, insecure: false, timeoutMs, authorization };
   }
-  return { address: checked, insecure: true, timeoutMs };
+  return { address: checked, insecure: true, timeoutMs, authorization };
+}
+function resolveVault(options = {}) {
+  const configPath = options.config?.trim() || process.env.KCORE_CONFIG?.trim() || join(homedir(), ".kcore", "config");
+  const file = readContext(configPath);
+  const current = file?.["current-context"];
+  const entry = current && file?.contexts ? file.contexts[current] : void 0;
+  const raw = options.vault?.trim() || process.env.KCORE_VAULT_ENDPOINT?.trim() || entry?.vault?.trim() || "127.0.0.1:9191";
+  const checked = assertAddress(raw.replace(/^https?:\/\//, ""), "vault");
+  const timeoutMs = options.timeoutMs ?? 12e4;
+  const authorization = bearer(options.token?.trim() || process.env.KCORE_VAULT_TOKEN?.trim() || entry?.token?.trim());
+  const insecure = options.vaultInsecure ?? process.env.KCORE_VAULT_TLS !== "1";
+  if (!insecure) {
+    const base = resolveConnection(options);
+    return { ...base, address: checked, insecure: false, timeoutMs, authorization };
+  }
+  return { address: checked, insecure: true, timeoutMs, authorization };
+}
+function bearer(token) {
+  if (!token) return void 0;
+  return /^bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 }
 function readContext(path) {
   try {
@@ -72831,9 +72852,14 @@ function loadMaterial(entry, operator, configPath) {
   };
 }
 function pemBuffer(inline, path, label) {
-  if (inline && inline.trim()) return Buffer.from(inline.trim(), "base64");
-  if (path && path.trim()) return readRequired(path.trim(), label);
-  return void 0;
+  const material = inline && inline.trim() ? Buffer.from(inline.trim(), "base64") : path && path.trim() ? readRequired(path.trim(), label) : void 0;
+  if (!material) return void 0;
+  if (!material.toString("utf8").includes("-----BEGIN")) {
+    throw new InputError(
+      `${label} in the kcore context is not a PEM. cert-data, key-data, and ca-data must be base64-encoded PEM, the same encoding kctl writes.`
+    );
+  }
+  return material;
 }
 function readRequired(path, label) {
   try {
@@ -72857,7 +72883,10 @@ var SERVICE_NAMES = [
   "node-storage",
   "node-info",
   "node-admin",
-  "provisioning"
+  "provisioning",
+  "vault",
+  "vault-mover",
+  "vault-install"
 ];
 var loaded;
 function protoDir() {
@@ -72872,7 +72901,13 @@ function services() {
   if (loaded) return loaded;
   const dir = protoDir();
   const definition = protoLoader.loadSync(
-    [join2(dir, "controller.proto"), join2(dir, "node.proto"), join2(dir, "provisioning.proto")],
+    [
+      join2(dir, "controller.proto"),
+      join2(dir, "node.proto"),
+      join2(dir, "provisioning.proto"),
+      join2(dir, "vault.proto"),
+      join2(dir, "vault_install.proto")
+    ],
     {
       keepCase: false,
       longs: String,
@@ -72891,7 +72926,10 @@ function services() {
     "node-storage": pkg.kcore.node.NodeStorage,
     "node-info": pkg.kcore.node.NodeInfo,
     "node-admin": pkg.kcore.node.NodeAdmin,
-    provisioning: pkg.kcore.provisioning.Provisioning
+    provisioning: pkg.kcore.provisioning.Provisioning,
+    vault: pkg.kcore.vault.Vault,
+    "vault-mover": pkg.kcore.vault.VaultMover,
+    "vault-install": pkg.kcore.vault.install.VaultInstall
   };
   return loaded;
 }
@@ -72926,6 +72964,10 @@ async function callApi(service, address, options, method, request) {
     const conn2 = resolveProvisioning(options);
     return callService(services().provisioning, conn2.address, conn2, method, request);
   }
+  if (service === "vault" || service === "vault-mover" || service === "vault-install") {
+    const conn2 = resolveVault(options);
+    return callService(services()[service], conn2.address, conn2, method, request);
+  }
   const conn = resolveConnection(address ? { ...options, controller: address } : options);
   return callService(services()[service], conn.address, conn, method, request);
 }
@@ -72937,20 +72979,19 @@ function callService(Ctor, address, conn, method, request) {
     throw new InputError(`The gRPC API has no ${method} method.`);
   }
   const deadline = new Date(Date.now() + conn.timeoutMs);
+  const metadata = new grpc.Metadata();
+  if (conn.authorization) metadata.set("authorization", conn.authorization);
   return new Promise((resolve, reject) => {
-    fn.call(
-      client,
-      request,
-      { deadline },
-      (error2, response) => {
-        client.close();
-        if (error2) {
-          reject(new Error(error2.details || error2.message));
-          return;
-        }
-        resolve(response);
+    fn.call(client, request, metadata, { deadline }, (error2, response) => {
+      client.close();
+      if (error2) {
+        const detail = error2.details || error2.message;
+        const missingToken = /authentication required|no authentication provided/i.test(detail) && !conn.authorization;
+        reject(new Error(missingToken ? `${detail}. Set connection.token, or KCORE_PROVISIONING_TOKEN / KCORE_VAULT_TOKEN.` : detail));
+        return;
       }
-    );
+      resolve(response);
+    });
   });
 }
 function redact(value) {
@@ -72958,7 +72999,7 @@ function redact(value) {
   if (!value || typeof value !== "object") return value;
   const out = {};
   for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string" && item.length > 0 && /key.?pem|private.?key|password|secret/i.test(key)) out[key] = "[redacted]";
+    if (typeof item === "string" && item.length > 0 && /key.?pem|private.?key|password|secret|token|authorization/i.test(key)) out[key] = "[redacted]";
     else out[key] = redact(item);
   }
   return out;
@@ -72984,8 +73025,9 @@ var UNIMPLEMENTED = /* @__PURE__ */ new Set([
 function isServiceName(value) {
   return SERVICE_NAMES.includes(value);
 }
+var READ_ONLY = /* @__PURE__ */ new Set(["scanNetwork"]);
 function isReadOnlyMethod(method) {
-  return /^(get|list|classify|check|plan)/.test(method);
+  return READ_ONLY.has(method) || /^(get|list|classify|check|plan)/.test(method);
 }
 function rpcCatalog(service) {
   const names = service ? [service] : [...SERVICE_NAMES];
@@ -73821,6 +73863,119 @@ function same(left, right) {
   return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
 }
 
+// src/vault.ts
+var import_yaml4 = __toESM(require_dist2(), 1);
+function vaultAddress(explicit) {
+  const raw = (explicit || process.env.KCORE_VAULT_ENDPOINT || "127.0.0.1:9191").trim();
+  return raw.replace(/^https?:\/\//, "");
+}
+function unconfirmed(confirm) {
+  if (confirm === true) return void 0;
+  return "confirm must be true";
+}
+function call(address, method, request) {
+  return callApi("vault", void 0, { vault: address }, method, request);
+}
+function documents(text2) {
+  return (0, import_yaml4.parseAllDocuments)(text2).map((doc) => doc.toJSON()).filter((doc) => !!doc && typeof doc === "object");
+}
+function keepOf(spec) {
+  const keep = spec.keep ?? {};
+  const num = (key) => Number(keep[key] ?? spec[`keep_${key}`] ?? 0) || 0;
+  return {
+    hourly: num("hourly"),
+    daily: num("daily"),
+    weekly: num("weekly"),
+    monthly: num("monthly"),
+    yearly: num("yearly")
+  };
+}
+function asStrings(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item));
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  return [];
+}
+async function readVault(address, view) {
+  if (view === "jobs") return call(address, "listBackupJobs", {});
+  if (view === "catalog") return call(address, "listBackups", {});
+  return call(address, "listInventory", {});
+}
+async function applyVault(address, spec) {
+  const kind = String(spec.kind ?? "");
+  if (kind === "BackupTarget") {
+    return call(address, "applyTarget", {
+      target: {
+        name: String(spec.name ?? ""),
+        backend: String(spec.backend ?? "fs"),
+        location: String(spec.location ?? ""),
+        disableObjectLock: Boolean(spec.disable_object_lock)
+      }
+    });
+  }
+  if (kind === "BackupPolicy") {
+    const keep = keepOf(spec);
+    const names = [
+      ...asStrings(spec.target),
+      ...asStrings(spec.targets),
+      ...asStrings(spec.secondary)
+    ];
+    return call(address, "applyBackupPolicy", {
+      policy: {
+        name: String(spec.name ?? ""),
+        schedule: String(spec.schedule ?? "@daily"),
+        consistency: "CONSISTENCY_LEVEL_FS",
+        selectorVmNames: asStrings(spec.vms),
+        targets: names.map((targetName) => ({ targetName, keep })),
+        enabled: spec.enabled !== false,
+        preHook: String(spec.pre_hook ?? ""),
+        postHook: String(spec.post_hook ?? "")
+      }
+    });
+  }
+  if (kind === "Replication") {
+    return call(address, "createReplicationJob", {
+      sourceTarget: String(spec.source ?? spec.source_target ?? ""),
+      destTarget: String(spec.dest ?? spec.dest_target ?? "")
+    });
+  }
+  throw new Error(`unknown vault kind ${kind}`);
+}
+async function operateVault(address, spec) {
+  const action = String(spec.action ?? "");
+  if (action === "backup") {
+    return call(address, "createBackupJob", {
+      vmName: String(spec.vm ?? ""),
+      targetName: String(spec.target ?? ""),
+      consistency: String(spec.consistency ?? "CONSISTENCY_LEVEL_FS"),
+      forceFull: Boolean(spec.force_full)
+    });
+  }
+  if (action === "restore") {
+    return call(address, "createRestoreJob", {
+      backupId: String(spec.backup ?? ""),
+      asVmName: String(spec.as_vm_name ?? ""),
+      destPath: String(spec.dest ?? ""),
+      volumeName: String(spec.volume ?? ""),
+      node: String(spec.node ?? ""),
+      instant: Boolean(spec.instant)
+    });
+  }
+  if (action === "verify") {
+    return call(address, "createVerifyJob", {
+      targetName: String(spec.target ?? ""),
+      full: Boolean(spec.full),
+      bootTest: spec.boot_test !== false
+    });
+  }
+  if (action === "replicate") {
+    return call(address, "createReplicationJob", {
+      sourceTarget: String(spec.source ?? ""),
+      destTarget: String(spec.dest ?? "")
+    });
+  }
+  throw new Error(`unknown vault action ${action}`);
+}
+
 // src/server.ts
 var INSTRUCTIONS = `kcore MCP dials the kcore controller gRPC API. Apply is a declarative upsert: it creates a missing resource, updates mutable fields, and rejects immutable changes.
 
@@ -73830,7 +73985,7 @@ Before every create, update, delete, migrate, drain, or node install:
 3. Call kcore_plan and show that plan.
 4. Call kcore_apply or kcore_delete only after the operator explicitly agrees, with confirm set to true.
 
-Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller, node, or kcore-provisioning method. Provisioning covers images, machines, boot targets, Redfish discovery, BMC boot, and power control. Set connection.provisioning to that controller's host:port. Pass confirm true before a method that is not a get, list, classify, check, or plan.`;
+Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller, node, kcore-provisioning, vault, or vault-install method. Provisioning covers images, machines, boot targets, Redfish, IPMI, DHCP/DNS, LAN scan, Wake-on-LAN, and power control. Set connection.provisioning to that controller's host:port. Vault covers backup policies, jobs, targets, restore, and inventory; it defaults to 127.0.0.1:9191. The controller uses the client certificate in ~/.kcore/config. Provisioning and the vault are plaintext unless connection.provisioningInsecure or connection.vaultInsecure is false. If a server answers Authentication required, set connection.token. Pass confirm true before a method that is not a get, list, classify, check, plan, or scan.`;
 var connectionShape = {
   config: external_exports.string().optional().describe("Path to the kcore context file. Defaults to ~/.kcore/config."),
   controller: external_exports.string().optional().describe("Controller host:port override."),
@@ -73839,7 +73994,10 @@ var connectionShape = {
   operator: external_exports.string().optional().describe("Operator identity for --as."),
   node: external_exports.string().optional().describe("Node-agent host:port for node-scoped commands."),
   provisioning: external_exports.string().optional().describe("kcore-provisioning gRPC host:port. Also read from KCORE_PROVISIONING."),
-  provisioningInsecure: external_exports.boolean().optional().describe("Dial provisioning without TLS. Defaults to true."),
+  provisioningInsecure: external_exports.boolean().optional().describe("Dial provisioning without TLS. Defaults to true. Set false to present the kcore client certificate."),
+  token: external_exports.string().optional().describe("Bearer token when the provisioning controller or vault requires one. Also read from KCORE_PROVISIONING_TOKEN or KCORE_VAULT_TOKEN."),
+  vault: external_exports.string().optional().describe("Vault coordinator host:port. Also read from KCORE_VAULT_ENDPOINT. Defaults to 127.0.0.1:9191."),
+  vaultInsecure: external_exports.boolean().optional().describe("Dial the vault without TLS. Defaults to true unless KCORE_VAULT_TLS=1. Set false to present the kcore client certificate."),
   timeoutMs: external_exports.number().optional().describe("RPC deadline in milliseconds. Defaults to 120000.")
 };
 var specSchema = external_exports.record(external_exports.string(), external_exports.unknown()).optional();
@@ -73852,7 +74010,10 @@ function connectionOf(input, controller) {
     operator: input?.operator,
     timeoutMs: input?.timeoutMs,
     provisioning: input?.provisioning,
-    provisioningInsecure: input?.provisioningInsecure
+    provisioningInsecure: input?.provisioningInsecure,
+    token: input?.token,
+    vault: input?.vault,
+    vaultInsecure: input?.vaultInsecure
   };
 }
 function dial(input, spec) {
@@ -73895,12 +74056,12 @@ function nodeAgentAddress(address) {
   if (port === "9090") return `${address.slice(0, split)}:9091`;
   return address;
 }
-async function execute(call, options) {
-  if (call.target === "node") {
-    if (!call.address) throw new InputError("node address is required");
-    return callNode(call.address, options, call.method, call.request);
+async function execute(call2, options) {
+  if (call2.target === "node") {
+    if (!call2.address) throw new InputError("node address is required");
+    return callNode(call2.address, options, call2.method, call2.request);
   }
-  return callController(options, call.method, call.request);
+  return callController(options, call2.method, call2.request);
 }
 function text(payload) {
   return { content: [{ type: "text", text: JSON.stringify(redact(payload), null, 2) }] };
@@ -73969,7 +74130,7 @@ function createServer() {
     "kcore_rpc",
     {
       title: "Call a kcore gRPC method",
-      description: "Call one implemented unary RPC on the controller, a node, or kcore-provisioning. Omit method to list them. Provisioning methods need connection.provisioning. Request fields use proto JSON names in camelCase. Streaming RPCs and methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true.",
+      description: "Call one implemented unary RPC on the controller, a node, kcore-provisioning, the vault, or the vault installer. Omit method to list them. Provisioning methods need connection.provisioning. Vault defaults to 127.0.0.1:9191. Request fields use proto JSON names in camelCase. Streaming RPCs and methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true. The controller uses the client certificate in ~/.kcore/config. Set connection.token when a server returns Authentication required.",
       inputSchema: {
         service: external_exports.enum(SERVICE_NAMES).optional().describe("gRPC service. Required when method is set."),
         method: external_exports.string().optional().describe("CamelCase RPC name, such as listNodes or getPkiStatus."),
@@ -74056,9 +74217,9 @@ function createServer() {
         const local = diffSpec(prepared.desired.kind, prepared.desired.spec, input.current);
         let cluster;
         if (input.checkCluster) {
-          const call = buildPlanCall(prepared.desired.kind, prepared.desired.spec);
+          const call2 = buildPlanCall(prepared.desired.kind, prepared.desired.spec);
           try {
-            cluster = await execute(call, dial(input.connection, prepared.desired.spec));
+            cluster = await execute(call2, dial(input.connection, prepared.desired.spec));
           } catch (error2) {
             const message = error2 instanceof Error ? error2.message : String(error2);
             if (/not found/i.test(message)) cluster = { found: false, message };
@@ -74069,7 +74230,7 @@ function createServer() {
           ok: true,
           kind: prepared.desired.kind.id,
           plan: local,
-          rpc: buildApply(prepared.desired.kind, prepared.desired.spec).map((call) => call.method),
+          rpc: buildApply(prepared.desired.kind, prepared.desired.spec).map((call2) => call2.method),
           warnings: prepared.advice.warnings,
           recommendedQuestions: prepared.advice.recommended,
           cluster,
@@ -74135,8 +74296,8 @@ function createServer() {
         }
         const options = dial(input.connection, prepared.desired.spec);
         const responses = [];
-        for (const call of buildApply(prepared.desired.kind, prepared.desired.spec)) {
-          responses.push({ method: call.method, response: await execute(call, options) });
+        for (const call2 of buildApply(prepared.desired.kind, prepared.desired.spec)) {
+          responses.push({ method: call2.method, response: await execute(call2, options) });
         }
         return text({
           applied: true,
@@ -74169,9 +74330,9 @@ function createServer() {
           const response2 = await readImages(options, input.connection?.node, input.name);
           return text({ ok: true, method: "listImages", response: response2 });
         }
-        const call = buildRead(kind, input.name);
-        const response = await execute(call, options);
-        return text({ ok: true, method: call.method, response });
+        const call2 = buildRead(kind, input.name);
+        const response = await execute(call2, options);
+        return text({ ok: true, method: call2.method, response });
       } catch (error2) {
         return failure(error2);
       }
@@ -74217,9 +74378,9 @@ function createServer() {
             });
           }
         }
-        const call = buildDelete(kind, input.name);
-        const response = await execute(call, connectionOf(input.connection));
-        return text({ deleted: true, method: call.method, response });
+        const call2 = buildDelete(kind, input.name);
+        const response = await execute(call2, connectionOf(input.connection));
+        return text({ deleted: true, method: call2.method, response });
       } catch (error2) {
         return failure(error2);
       }
@@ -74310,17 +74471,17 @@ function createServer() {
           if (issued.success === false) {
             return text({ applied: false, error: issued.message || "the controller refused the node bootstrap certificate" });
           }
-          const call2 = buildOperation("install-node", input.spec);
+          const call3 = buildOperation("install-node", input.spec);
           const material = resolveConnection(connectionOf(input.connection));
-          call2.request.caCertPem = material.ca?.toString("utf8") ?? "";
-          call2.request.nodeCertPem = issued.certPem ?? "";
-          call2.request.nodeKeyPem = issued.keyPem ?? "";
-          const response2 = await execute(call2, { ...connectionOf(input.connection), timeoutMs: 6e5 });
-          return text({ applied: true, method: call2.method, response: response2 });
+          call3.request.caCertPem = material.ca?.toString("utf8") ?? "";
+          call3.request.nodeCertPem = issued.certPem ?? "";
+          call3.request.nodeKeyPem = issued.keyPem ?? "";
+          const response2 = await execute(call3, { ...connectionOf(input.connection), timeoutMs: 6e5 });
+          return text({ applied: true, method: call3.method, response: response2 });
         }
-        const call = buildOperation(input.action, input.spec);
-        const response = await execute(call, connectionOf(input.connection));
-        return text({ applied: true, method: call.method, response });
+        const call2 = buildOperation(input.action, input.spec);
+        const response = await execute(call2, connectionOf(input.connection));
+        return text({ applied: true, method: call2.method, response });
       } catch (error2) {
         return failure(error2);
       }
@@ -74385,6 +74546,78 @@ function createServer() {
         }
       ]
     })
+  );
+  const vaultAddressSchema = external_exports.string().optional().describe("Vault coordinator host:port. Defaults to KCORE_VAULT_ENDPOINT or 127.0.0.1:9191.");
+  server2.registerTool(
+    "kcore_vault_read",
+    {
+      title: "Read the vault",
+      description: "Read vault inventory, backup jobs, or the backup catalog. Does not change the coordinator.",
+      inputSchema: {
+        view: external_exports.enum(["inventory", "jobs", "catalog"]).describe("What to list."),
+        vault: vaultAddressSchema
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false }
+    },
+    async ({ view, vault }) => {
+      try {
+        return text(await readVault(vaultAddress(vault), view));
+      } catch (error2) {
+        return failure(error2);
+      }
+    }
+  );
+  server2.registerTool(
+    "kcore_vault_apply",
+    {
+      title: "Apply a vault document",
+      description: "Apply BackupPolicy, BackupTarget, or Replication YAML to the vault coordinator. Requires confirm true. These kinds are not cluster resources.",
+      inputSchema: {
+        manifest: external_exports.string().optional().describe("YAML documents. Each document has kind BackupPolicy, BackupTarget, or Replication."),
+        kind: external_exports.enum(["BackupPolicy", "BackupTarget", "Replication"]).optional(),
+        spec: specSchema,
+        confirm: external_exports.boolean().optional().describe("Must be true. The operator has to agree before this runs."),
+        vault: vaultAddressSchema
+      },
+      annotations: { destructiveHint: true, openWorldHint: false }
+    },
+    async ({ manifest, kind, spec, confirm, vault }) => {
+      const refused = unconfirmed(confirm);
+      if (refused) return text({ ok: false, error: refused });
+      try {
+        const docs = manifest ? documents(manifest) : [{ kind, ...spec ?? {} }];
+        const applied = [];
+        for (const doc of docs) {
+          applied.push(await applyVault(vaultAddress(vault), doc));
+        }
+        return text({ ok: true, applied });
+      } catch (error2) {
+        return failure(error2);
+      }
+    }
+  );
+  server2.registerTool(
+    "kcore_vault_operate",
+    {
+      title: "Operate the vault",
+      description: "Start a backup, restore, verify, or replication job. Requires confirm true.",
+      inputSchema: {
+        action: external_exports.enum(["backup", "restore", "verify", "replicate"]),
+        spec: specSchema,
+        confirm: external_exports.boolean().optional().describe("Must be true. The operator has to agree before this runs."),
+        vault: vaultAddressSchema
+      },
+      annotations: { destructiveHint: true, openWorldHint: false }
+    },
+    async ({ action, spec, confirm, vault }) => {
+      const refused = unconfirmed(confirm);
+      if (refused) return text({ ok: false, error: refused });
+      try {
+        return text(await operateVault(vaultAddress(vault), { action, ...spec ?? {} }));
+      } catch (error2) {
+        return failure(error2);
+      }
+    }
   );
   return server2;
 }

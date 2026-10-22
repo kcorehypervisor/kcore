@@ -42,6 +42,30 @@ service Provisioning {
   rpc RevokeCertificate(RevokeCertificateRequest) returns (RevokeCertificateResponse);
   rpc RenewCertificate(RenewCertificateRequest) returns (RenewCertificateResponse);
   rpc GetCaBundle(GetCaBundleRequest) returns (GetCaBundleResponse);
+
+  // IPMI 2.0 over RMCP+. Redfish stays the path for HTTP boot, virtual media,
+  // BIOS, RAID, and disk checks. CallIpmi covers the standard command set;
+  // set raw to send a netfn and command that is not in the catalog.
+  rpc ListIpmiCommands(ListIpmiCommandsRequest) returns (ListIpmiCommandsResponse);
+  rpc CallIpmi(CallIpmiRequest) returns (CallIpmiResponse);
+
+  // Provisioner-host DHCP/DNS (NixOS dnsmasq). Singleton config on this host.
+  rpc UpsertDhcpDns(UpsertDhcpDnsRequest) returns (UpsertDhcpDnsResponse);
+  rpc GetDhcpDns(GetDhcpDnsRequest) returns (GetDhcpDnsResponse);
+  rpc DeleteDhcpDns(DeleteDhcpDnsRequest) returns (DeleteDhcpDnsResponse);
+  rpc UpsertDhcpReservation(UpsertDhcpReservationRequest) returns (UpsertDhcpReservationResponse);
+  rpc ListDhcpReservations(ListDhcpReservationsRequest) returns (ListDhcpReservationsResponse);
+  rpc DeleteDhcpReservation(DeleteDhcpReservationRequest) returns (DeleteDhcpReservationResponse);
+  rpc UpsertDnsRecord(UpsertDnsRecordRequest) returns (UpsertDnsRecordResponse);
+  rpc ListDnsRecords(ListDnsRecordsRequest) returns (ListDnsRecordsResponse);
+  rpc DeleteDnsRecord(DeleteDnsRecordRequest) returns (DeleteDnsRecordResponse);
+  rpc ApplyDhcpDns(ApplyDhcpDnsRequest) returns (ApplyDhcpDnsResponse);
+
+  // LAN discovery and Wake-on-LAN. DiscoverMachine stays the BMC/Redfish path.
+  // ScanNetwork lists hosts that answer on the provisioner LAN. WakeOnLan sends
+  // a magic packet for machines that have no BMC.
+  rpc ScanNetwork(ScanNetworkRequest) returns (ScanNetworkResponse);
+  rpc WakeOnLan(WakeOnLanRequest) returns (WakeOnLanResponse);
 }
 
 // ============================================================================
@@ -456,4 +480,221 @@ message GetCaBundleRequest {
 
 message GetCaBundleResponse {
   string ca_bundle_pem = 1;               // CA certificate(s) in PEM format
+}
+
+// ============================================================================
+// IPMI 2.0
+// ============================================================================
+
+message ListIpmiCommandsRequest {}
+
+message IpmiCommandInfo {
+  string name = 1;
+  uint32 netfn = 2;
+  uint32 cmd = 3;
+  string group = 4;
+  string summary = 5;
+  bool mutates = 6;                       // Power, reset, users, SEL, LAN writes
+}
+
+message ListIpmiCommandsResponse {
+  repeated IpmiCommandInfo commands = 1;
+}
+
+message CallIpmiRequest {
+  string machine_id = 1;                  // ID, name, MAC, or serial. Optional if bmc_address is set
+  string bmc_address = 2;                 // Used when machine_id is empty
+  string command = 3;                     // Catalog name. Ignored when raw is set
+  uint32 netfn = 4;
+  uint32 cmd = 5;
+  bool raw = 6;                           // Send netfn and cmd instead of a catalog name
+  bytes data = 7;                         // Request data after the command byte
+  bool allow_mutation = 8;                // Required when the command changes BMC or chassis state
+}
+
+message CallIpmiResponse {
+  uint32 completion_code = 1;
+  string completion = 2;
+  bytes data = 3;                         // Response bytes after the completion code
+  string decoded_json = 4;
+  uint32 cipher_suite = 5;                // 17 or 3
+}
+
+// ============================================================================
+// Provisioner-host DHCP/DNS (NixOS dnsmasq)
+// ============================================================================
+
+message DhcpDnsConfig {
+  bool enabled = 1;                       // Master switch: false = dnsmasq not started
+  string interface = 2;                   // e.g. br0
+  string cidr = 3;                        // e.g. 192.168.40.0/24
+  string range_start = 4;                 // Inclusive IPv4
+  string range_end = 5;                   // Inclusive IPv4
+  string gateway = 6;                     // Default gateway advertised to clients
+  string domain = 7;                      // Local DNS domain, e.g. lab.kcore.local
+  string http_boot_url = 8;               // If set: also emit option 60 HTTPClient (UEFI HTTP Boot)
+  repeated string dns_servers = 9;        // Upstream forwarders; empty = no forwarders
+  google.protobuf.Timestamp updated_at = 10;
+  // When unset on Upsert, defaults to true. Set false to disallow that role
+  // while keeping desired network settings stored for later.
+  optional bool allow_dhcp = 11;
+  optional bool allow_dns = 12;
+  // DHCP next-server (siaddr / option 66), aka "next computer" — e.g. 192.168.40.10
+  string next_server = 13;
+  // DHCP boot-file-name (option 67). Falls back to http_boot_url when empty.
+  string boot_file = 14;
+}
+
+message DhcpReservation {
+  string id = 1;
+  string mac_address = 2;                 // Normalized AA:BB:CC:DD:EE:FF
+  string ip_address = 3;
+  string hostname = 4;                    // Optional DNS name (single label or FQDN)
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+enum DnsRecordType {
+  DNS_RECORD_TYPE_UNSPECIFIED = 0;
+  DNS_RECORD_TYPE_A = 1;
+  DNS_RECORD_TYPE_AAAA = 2;
+}
+
+message DnsRecord {
+  string id = 1;
+  string name = 2;                        // Hostname or FQDN
+  DnsRecordType record_type = 3;
+  string value = 4;                       // IPv4 or IPv6
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message UpsertDhcpDnsRequest {
+  DhcpDnsConfig config = 1;
+  bool apply = 2;                         // If true, render and trigger apply after save
+}
+
+message UpsertDhcpDnsResponse {
+  DhcpDnsConfig config = 1;
+  bool applied = 2;
+  string message = 3;
+}
+
+message GetDhcpDnsRequest {}
+
+message GetDhcpDnsResponse {
+  DhcpDnsConfig config = 1;
+  bool configured = 2;
+}
+
+message DeleteDhcpDnsRequest {
+  bool apply = 1;                         // If true, render disabled config and apply
+}
+
+message DeleteDhcpDnsResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message UpsertDhcpReservationRequest {
+  string id = 1;                          // Empty = create; set = update by id
+  string mac_address = 2;
+  string ip_address = 3;
+  string hostname = 4;
+  bool apply = 5;
+}
+
+message UpsertDhcpReservationResponse {
+  DhcpReservation reservation = 1;
+  bool applied = 2;
+  string message = 3;
+}
+
+message ListDhcpReservationsRequest {}
+
+message ListDhcpReservationsResponse {
+  repeated DhcpReservation reservations = 1;
+}
+
+message DeleteDhcpReservationRequest {
+  string id = 1;
+  bool apply = 2;
+}
+
+message DeleteDhcpReservationResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message UpsertDnsRecordRequest {
+  string id = 1;                          // Empty = create; set = update by id
+  string name = 2;
+  DnsRecordType record_type = 3;
+  string value = 4;
+  bool apply = 5;
+}
+
+message UpsertDnsRecordResponse {
+  DnsRecord record = 1;
+  bool applied = 2;
+  string message = 3;
+}
+
+message ListDnsRecordsRequest {}
+
+message ListDnsRecordsResponse {
+  repeated DnsRecord records = 1;
+}
+
+message DeleteDnsRecordRequest {
+  string id = 1;
+  bool apply = 2;
+}
+
+message DeleteDnsRecordResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ApplyDhcpDnsRequest {}
+
+message ApplyDhcpDnsResponse {
+  bool success = 1;
+  string staging_path = 2;
+  string message = 3;
+}
+
+// ============================================================================
+// LAN discovery and Wake-on-LAN
+// ============================================================================
+
+message ScanNetworkRequest {
+  string cidr = 1;                        // Empty uses the saved DHCP/DNS CIDR
+  string interface = 2;                   // Optional ping source interface
+}
+
+message NetworkHost {
+  string mac_address = 1;
+  string ip_address = 2;
+  string vendor = 3;                      // IEEE OUI organization, or empty
+  bool registered = 4;
+  string machine_id = 5;                  // Set when registered is true
+  // empty, "installed" (kcoreOS on disk), or "memory" (live installer / kexec).
+  string kcore_runtime = 6;
+}
+
+message ScanNetworkResponse {
+  string cidr = 1;
+  repeated NetworkHost hosts = 2;
+}
+
+message WakeOnLanRequest {
+  string machine_id = 1;                  // Uses the stored MAC when set
+  string mac_address = 2;                 // Used when machine_id is empty
+  string broadcast = 3;                   // Empty uses the DHCP/DNS subnet broadcast
+}
+
+message WakeOnLanResponse {
+  bool success = 1;
+  string message = 2;
 }
