@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { InputError } from "./names.js";
-import { resolveConnection, resolveProvisioning, type ConnectionOptions, type ResolvedConnection } from "./connection.js";
+import { resolveConnection, resolveProvisioning, resolveVault, type ConnectionOptions, type ResolvedConnection } from "./connection.js";
 
 type GrpcClient = {
   close: () => void;
@@ -20,6 +20,9 @@ export const SERVICE_NAMES = [
   "node-info",
   "node-admin",
   "provisioning",
+  "vault",
+  "vault-mover",
+  "vault-install",
 ] as const;
 
 export type ServiceName = (typeof SERVICE_NAMES)[number];
@@ -41,7 +44,13 @@ function services(): Loaded {
   if (loaded) return loaded;
   const dir = protoDir();
   const definition = protoLoader.loadSync(
-    [join(dir, "controller.proto"), join(dir, "node.proto"), join(dir, "provisioning.proto")],
+    [
+      join(dir, "controller.proto"),
+      join(dir, "node.proto"),
+      join(dir, "provisioning.proto"),
+      join(dir, "vault.proto"),
+      join(dir, "vault_install.proto"),
+    ],
     {
       keepCase: false,
       longs: String,
@@ -62,6 +71,11 @@ function services(): Loaded {
         NodeAdmin: grpc.ServiceClientConstructor;
       };
       provisioning: { Provisioning: grpc.ServiceClientConstructor };
+      vault: {
+        Vault: grpc.ServiceClientConstructor;
+        VaultMover: grpc.ServiceClientConstructor;
+        install: { VaultInstall: grpc.ServiceClientConstructor };
+      };
     };
   };
   loaded = {
@@ -73,6 +87,9 @@ function services(): Loaded {
     "node-info": pkg.kcore.node.NodeInfo,
     "node-admin": pkg.kcore.node.NodeAdmin,
     provisioning: pkg.kcore.provisioning.Provisioning,
+    vault: pkg.kcore.vault.Vault,
+    "vault-mover": pkg.kcore.vault.VaultMover,
+    "vault-install": pkg.kcore.vault.install.VaultInstall,
   };
   return loaded;
 }
@@ -124,6 +141,10 @@ export async function callApi(
     const conn = resolveProvisioning(options);
     return callService(services().provisioning, conn.address, conn, method, request);
   }
+  if (service === "vault" || service === "vault-mover" || service === "vault-install") {
+    const conn = resolveVault(options);
+    return callService(services()[service], conn.address, conn, method, request);
+  }
   const conn = resolveConnection(address ? { ...options, controller: address } : options);
   return callService(services()[service], conn.address, conn, method, request);
 }
@@ -142,20 +163,24 @@ function callService(
     throw new InputError(`The gRPC API has no ${method} method.`);
   }
   const deadline = new Date(Date.now() + conn.timeoutMs);
+  const metadata = new grpc.Metadata();
+  if (conn.authorization) metadata.set("authorization", conn.authorization);
   return new Promise((resolve, reject) => {
-    (fn as (req: unknown, meta: { deadline: Date }, cb: (err: grpc.ServiceError | null, res: unknown) => void) => void).call(
-      client,
-      request,
-      { deadline },
-      (error, response) => {
-        client.close();
-        if (error) {
-          reject(new Error(error.details || error.message));
-          return;
-        }
-        resolve(response);
-      },
-    );
+    (fn as (
+      req: unknown,
+      meta: grpc.Metadata,
+      options: { deadline: Date },
+      cb: (err: grpc.ServiceError | null, res: unknown) => void,
+    ) => void).call(client, request, metadata, { deadline }, (error, response) => {
+      client.close();
+      if (error) {
+        const detail = error.details || error.message;
+        const missingToken = /authentication required|no authentication provided/i.test(detail) && !conn.authorization;
+        reject(new Error(missingToken ? `${detail}. Set connection.token, or KCORE_PROVISIONING_TOKEN / KCORE_VAULT_TOKEN.` : detail));
+        return;
+      }
+      resolve(response);
+    });
   });
 }
 
@@ -164,7 +189,7 @@ export function redact(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   const out: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof item === "string" && item.length > 0 && /key.?pem|private.?key|password|secret/i.test(key)) out[key] = "[redacted]";
+    if (typeof item === "string" && item.length > 0 && /key.?pem|private.?key|password|secret|token|authorization/i.test(key)) out[key] = "[redacted]";
     else out[key] = redact(item);
   }
   return out;

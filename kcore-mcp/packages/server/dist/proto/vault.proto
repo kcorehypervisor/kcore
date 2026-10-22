@@ -1,0 +1,670 @@
+syntax = "proto3";
+
+package kcore.vault;
+
+option go_package = "github.com/kcorehypervisor/kcore-vault/api/vault";
+
+import "google/protobuf/timestamp.proto";
+
+// Vault is the paid immutable backup control plane.
+// Cluster I/O uses open-core NodeStorage / Controller RPCs (kcore-rust
+// proto/node.proto and proto/controller.proto); this service owns policies,
+// jobs, repository targets, restore, and verify.
+service Vault {
+  // Status and licence
+  rpc GetVaultStatus(GetVaultStatusRequest) returns (GetVaultStatusResponse);
+
+  // Targets (fs / s3 repositories)
+  rpc ApplyTarget(ApplyTargetRequest) returns (ApplyTargetResponse);
+  rpc GetTarget(GetTargetRequest) returns (GetTargetResponse);
+  rpc ListTargets(ListTargetsRequest) returns (ListTargetsResponse);
+  rpc DeleteTarget(DeleteTargetRequest) returns (DeleteTargetResponse);
+
+  // Policies
+  rpc ApplyBackupPolicy(ApplyBackupPolicyRequest) returns (ApplyBackupPolicyResponse);
+  rpc GetBackupPolicy(GetBackupPolicyRequest) returns (GetBackupPolicyResponse);
+  rpc ListBackupPolicies(ListBackupPoliciesRequest) returns (ListBackupPoliciesResponse);
+  rpc DeleteBackupPolicy(DeleteBackupPolicyRequest) returns (DeleteBackupPolicyResponse);
+
+  // Jobs
+  rpc CreateBackupJob(CreateBackupJobRequest) returns (CreateBackupJobResponse);
+  rpc GetBackupJob(GetBackupJobRequest) returns (GetBackupJobResponse);
+  rpc ListBackupJobs(ListBackupJobsRequest) returns (ListBackupJobsResponse);
+  rpc CancelBackupJob(CancelBackupJobRequest) returns (CancelBackupJobResponse);
+
+  rpc CreateRestoreJob(CreateRestoreJobRequest) returns (CreateRestoreJobResponse);
+  rpc GetRestoreJob(GetRestoreJobRequest) returns (GetRestoreJobResponse);
+  rpc ListRestoreJobs(ListRestoreJobsRequest) returns (ListRestoreJobsResponse);
+  // Copy the instant-recovery overlay onto a cluster volume and close the NBD export.
+  rpc FinalizeInstantRecovery(FinalizeInstantRecoveryRequest) returns (FinalizeInstantRecoveryResponse);
+
+  rpc CreateVerifyJob(CreateVerifyJobRequest) returns (CreateVerifyJobResponse);
+  rpc GetVerifyJob(GetVerifyJobRequest) returns (GetVerifyJobResponse);
+  rpc ListVerifyJobs(ListVerifyJobsRequest) returns (ListVerifyJobsResponse);
+
+  // Catalog
+  rpc ListBackups(ListBackupsRequest) returns (ListBackupsResponse);
+  rpc GetBackup(GetBackupRequest) returns (GetBackupResponse);
+  // DR: rebuild catalog rows from signed manifests in a target repository.
+  rpc ImportCatalog(ImportCatalogRequest) returns (ImportCatalogResponse);
+
+  // Replication: copy every object of one target repository into another.
+  rpc CreateReplicationJob(CreateReplicationJobRequest) returns (CreateReplicationJobResponse);
+  rpc GetReplicationJob(GetReplicationJobRequest) returns (GetReplicationJobResponse);
+  rpc ListReplicationJobs(ListReplicationJobsRequest) returns (ListReplicationJobsResponse);
+
+  // Garbage collection of unreferenced, unlocked packs.
+  rpc RunGarbageCollection(RunGarbageCollectionRequest) returns (RunGarbageCollectionResponse);
+
+  // Licence (advisory in v1; enforce is a config flag)
+  rpc InstallLicence(InstallLicenceRequest) returns (InstallLicenceResponse);
+  rpc GetLicence(GetLicenceRequest) returns (GetLicenceResponse);
+
+  // Live event stream. Clients resume with since_seq (the last seq they applied).
+  rpc WatchEvents(WatchEventsRequest) returns (stream VaultEvent);
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+
+  rpc CancelRestoreJob(CancelRestoreJobRequest) returns (CancelRestoreJobResponse);
+  rpc CancelVerifyJob(CancelVerifyJobRequest) returns (CancelVerifyJobResponse);
+
+  // Cluster inventory cached by the coordinator, with protection status.
+  rpc ListInventory(ListInventoryRequest) returns (ListInventoryResponse);
+  rpc GetDashboardSummary(GetDashboardSummaryRequest) returns (GetDashboardSummaryResponse);
+
+  rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+  rpc AckNotification(AckNotificationRequest) returns (AckNotificationResponse);
+
+  // Read-only file restore of one backed-up volume.
+  rpc OpenFileRestore(OpenFileRestoreRequest) returns (OpenFileRestoreResponse);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc GetFile(GetFileRequest) returns (GetFileResponse);
+  rpc DownloadArchive(DownloadArchiveRequest) returns (GetFileResponse);
+  rpc CloseFileRestore(CloseFileRestoreRequest) returns (CloseFileRestoreResponse);
+
+  // Appliance settings the dashboard edits (SMTP, webhooks, schedules).
+  rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+  rpc ApplySettings(ApplySettingsRequest) returns (ApplySettingsResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Immutability
+// ---------------------------------------------------------------------------
+
+enum ImmutabilityGrade {
+  IMMUTABILITY_GRADE_UNSPECIFIED = 0;
+  IMMUTABILITY_GRADE_NONE = 1;
+  IMMUTABILITY_GRADE_APPLIANCE_ENFORCED = 2;
+  IMMUTABILITY_GRADE_STORAGE_ENFORCED = 3;
+}
+
+enum ConsistencyLevel {
+  CONSISTENCY_LEVEL_UNSPECIFIED = 0;
+  CONSISTENCY_LEVEL_CRASH = 1;
+  CONSISTENCY_LEVEL_FS = 2;
+  CONSISTENCY_LEVEL_APP = 3;
+  CONSISTENCY_LEVEL_COLD = 4;
+}
+
+enum JobPhase {
+  JOB_PHASE_UNSPECIFIED = 0;
+  JOB_PHASE_PREPARING = 1;
+  JOB_PHASE_QUIESCING = 2;
+  JOB_PHASE_SNAPSHOTTING = 3;
+  JOB_PHASE_EXPOSING = 4;
+  JOB_PHASE_TRANSFERRING = 5;
+  JOB_PHASE_SEALING = 6;
+  JOB_PHASE_CLEANING = 7;
+  JOB_PHASE_DONE = 8;
+  JOB_PHASE_FAILED = 9;
+  JOB_PHASE_CANCELLED = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Status / licence
+// ---------------------------------------------------------------------------
+
+message GetVaultStatusRequest {}
+
+message GetVaultStatusResponse {
+  string version = 1;
+  LicenceStatus licence = 2;
+  int32 target_count = 3;
+  int32 policy_count = 4;
+  int32 open_jobs = 5;
+  string message = 6;
+}
+
+message LicenceStatus {
+  string customer = 1;
+  google.protobuf.Timestamp expires = 2;
+  string mode = 3;   // advisory | enforce
+  string status = 4; // valid | expired | missing | over-limit | invalid | unverified
+  int32 limit_vms = 5;
+  int64 limit_tib = 6;
+}
+
+message InstallLicenceRequest {
+  // Signed licence JSON:
+  //   {"customer","expires_unix","limit_vms","limit_tib","mode","signature"}
+  // signature = hex Ed25519 over the canonical payload (the same object
+  // without "signature", keys in that order, compact JSON).
+  bytes licence_toml = 1;
+}
+
+message InstallLicenceResponse {
+  bool success = 1;
+  string message = 2;
+  LicenceStatus licence = 3;
+}
+
+message GetLicenceRequest {}
+message GetLicenceResponse { LicenceStatus licence = 1; }
+
+// ---------------------------------------------------------------------------
+// Targets
+// ---------------------------------------------------------------------------
+
+message Target {
+  string name = 1;
+  // fs | s3
+  string backend = 2;
+  // For fs: absolute path. For s3: bucket URL (https://... or s3://...).
+  string location = 3;
+  ImmutabilityGrade grade = 4;
+  string message = 5;
+  google.protobuf.Timestamp created_at = 6;
+  // s3 only: when false (default) every object is written with S3 Object
+  // Lock COMPLIANCE retention and the target grades storage-enforced.
+  bool disable_object_lock = 7;
+}
+
+message ApplyTargetRequest { Target target = 1; }
+message ApplyTargetResponse {
+  bool success = 1;
+  string message = 2;
+  Target target = 3;
+}
+message GetTargetRequest { string name = 1; }
+message GetTargetResponse { Target target = 1; }
+message ListTargetsRequest {}
+message ListTargetsResponse { repeated Target targets = 1; }
+message DeleteTargetRequest { string name = 1; }
+message DeleteTargetResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Policies
+// ---------------------------------------------------------------------------
+
+message RetentionKeep {
+  int32 hourly = 1;
+  int32 daily = 2;
+  int32 weekly = 3;
+  int32 monthly = 4;
+  int32 yearly = 5;
+}
+
+message TargetRetention {
+  string target_name = 1;
+  RetentionKeep keep = 2;
+  // Minimum retain_until duration, e.g. "14d", "90d".
+  string minimum = 3;
+}
+
+message BackupPolicy {
+  string name = 1;
+  // Label selector: key=value pairs the VM must match.
+  map<string, string> selector_labels = 2;
+  repeated string selector_vm_names = 3;
+  string schedule = 4; // cron or @daily / @hourly
+  ConsistencyLevel consistency = 5;
+  int32 tier0_keep = 6;
+  repeated TargetRetention targets = 7;
+  bool allow_mutable_target = 8;
+  string pre_hook = 9;
+  string post_hook = 10;
+  bool enabled = 11;
+  google.protobuf.Timestamp last_run_at = 12;
+  string last_message = 13;
+}
+
+message ApplyBackupPolicyRequest { BackupPolicy policy = 1; }
+message ApplyBackupPolicyResponse {
+  bool success = 1;
+  string message = 2;
+  BackupPolicy policy = 3;
+}
+message GetBackupPolicyRequest { string name = 1; }
+message GetBackupPolicyResponse { BackupPolicy policy = 1; }
+message ListBackupPoliciesRequest {}
+message ListBackupPoliciesResponse { repeated BackupPolicy policies = 1; }
+message DeleteBackupPolicyRequest { string name = 1; }
+message DeleteBackupPolicyResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Backup jobs
+// ---------------------------------------------------------------------------
+
+message BackupJob {
+  string id = 1;
+  string policy_name = 2;
+  string vm_id = 3;
+  string vm_name = 4;
+  JobPhase phase = 5;
+  ConsistencyLevel consistency = 6;
+  string message = 7;
+  int64 bytes_transferred = 8;
+  google.protobuf.Timestamp started_at = 9;
+  google.protobuf.Timestamp finished_at = 10;
+  string backup_id = 11;
+  string target_name = 12;
+  repeated string volume_names = 13;
+  string parent_backup_id = 14;
+}
+
+message CreateBackupJobRequest {
+  string vm_name = 1;
+  ConsistencyLevel consistency = 2;
+  string target_name = 3;
+  string policy_name = 4;
+  // Local file path for file-based backups (dev / cold filesystem volumes).
+  // When set, the coordinator reads this path instead of dialling the cluster.
+  string source_path = 5;
+  // Cluster volumes to back up. Empty with an empty source_path means every
+  // volume the controller lists for vm_name.
+  repeated string volume_names = 6;
+  // Mover data plane: host:port, "auto" (node address with port 9192), or
+  // empty to stream through Controller.ReadVolumeBlocks.
+  string mover_endpoint = 7;
+  // Skip parent lookup and changed-extent tracking.
+  bool force_full = 8;
+  // Minimum retention such as "30d". Empty uses the coordinator default.
+  string retain = 9;
+}
+message CreateBackupJobResponse {
+  bool success = 1;
+  string message = 2;
+  BackupJob job = 3;
+}
+message GetBackupJobRequest { string id = 1; }
+message GetBackupJobResponse { BackupJob job = 1; }
+message ListBackupJobsRequest {
+  string vm_name = 1;
+  string policy_name = 2;
+}
+message ListBackupJobsResponse { repeated BackupJob jobs = 1; }
+message CancelBackupJobRequest { string id = 1; }
+message CancelBackupJobResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Restore / verify
+// ---------------------------------------------------------------------------
+
+message RestoreJob {
+  string id = 1;
+  string backup_id = 2;
+  string as_vm_name = 3;
+  JobPhase phase = 4;
+  string message = 5;
+  bool in_place = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp finished_at = 8;
+  string volume_name = 9;
+  int64 bytes_written = 10;
+}
+
+message CreateRestoreJobRequest {
+  string backup_id = 1;
+  string as_vm_name = 2;
+  bool in_place = 3;
+  // Optional remaps: source network name -> destination network name.
+  map<string, string> network_map = 4;
+  // Local destination path for file-based restores (dev / DR into raw file).
+  string dest_path = 5;
+  // Cluster restore: create this volume and stream blocks into it with
+  // Controller.WriteVolumeBlocks. Used when dest_path is empty.
+  string volume_name = 6;
+  // ceph (default), lvm, or zfs.
+  string storage_class = 7;
+  // Node id; required by kcore for lvm and zfs.
+  string node = 8;
+  // Which backed-up volume to restore (name or volume id). Empty = first.
+  string source_volume = 9;
+  // Boot the guest from a read-only NBD export plus a node-local qcow2 overlay.
+  // FinalizeInstantRecovery copies the overlay onto a cluster volume.
+  bool instant = 10;
+}
+message CreateRestoreJobResponse {
+  bool success = 1;
+  string message = 2;
+  RestoreJob job = 3;
+}
+message GetRestoreJobRequest { string id = 1; }
+message GetRestoreJobResponse { RestoreJob job = 1; }
+message ListRestoreJobsRequest {}
+message ListRestoreJobsResponse { repeated RestoreJob jobs = 1; }
+
+message FinalizeInstantRecoveryRequest {
+  string job_id = 1;
+  // Cluster volume that receives the overlay extents. Empty uses "<vm>-instant".
+  string volume_name = 2;
+}
+message FinalizeInstantRecoveryResponse {
+  bool success = 1;
+  string message = 2;
+  int64 bytes_written = 3;
+}
+
+message VerifyJob {
+  string id = 1;
+  JobPhase phase = 2;
+  bool full = 3;
+  bool boot_test = 4;
+  string message = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp finished_at = 7;
+  string target_name = 8;
+  int64 packs_checked = 9;
+  int64 chunks_checked = 10;
+  int64 manifests_checked = 11;
+  int32 errors = 12;
+  // Serial transcript from a boot test. Empty when boot_test was not run.
+  string transcript = 13;
+}
+
+message CreateVerifyJobRequest {
+  // full = decrypt every chunk; otherwise one sampled chunk per pack.
+  bool full = 1;
+  bool boot_test = 2;
+  // Empty = every target.
+  string target_name = 3;
+}
+message CreateVerifyJobResponse {
+  bool success = 1;
+  string message = 2;
+  VerifyJob job = 3;
+}
+message GetVerifyJobRequest { string id = 1; }
+message GetVerifyJobResponse { VerifyJob job = 1; }
+message ListVerifyJobsRequest {}
+message ListVerifyJobsResponse { repeated VerifyJob jobs = 1; }
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+message BackupInfo {
+  string id = 1;
+  string vm_id = 2;
+  string vm_name = 3;
+  ConsistencyLevel consistency = 4;
+  string target_name = 5;
+  ImmutabilityGrade grade = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp retain_until = 8;
+  int64 size_bytes = 9;
+  string parent_backup_id = 10;
+  // Soft-expired by retention pruning; objects are deleted by GC once their
+  // repository lock lapses.
+  bool expired = 11;
+  string policy_name = 12;
+  repeated string volume_names = 13;
+}
+
+message ListBackupsRequest {
+  string vm_name = 1;
+  string target_name = 2;
+}
+message ListBackupsResponse { repeated BackupInfo backups = 1; }
+message GetBackupRequest { string id = 1; }
+message GetBackupResponse { BackupInfo backup = 1; }
+
+message ImportCatalogRequest { string target_name = 1; }
+message ImportCatalogResponse {
+  bool success = 1;
+  string message = 2;
+  int32 imported = 3;
+  int32 skipped = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Replication / GC
+// ---------------------------------------------------------------------------
+
+message ReplicationJob {
+  string id = 1;
+  string source_target = 2;
+  string dest_target = 3;
+  JobPhase phase = 4;
+  string message = 5;
+  int64 objects_copied = 6;
+  int64 objects_skipped = 7;
+  int64 bytes_copied = 8;
+  google.protobuf.Timestamp started_at = 9;
+  google.protobuf.Timestamp finished_at = 10;
+}
+
+message CreateReplicationJobRequest {
+  string source_target = 1;
+  string dest_target = 2;
+}
+message CreateReplicationJobResponse {
+  bool success = 1;
+  string message = 2;
+  ReplicationJob job = 3;
+}
+message GetReplicationJobRequest { string id = 1; }
+message GetReplicationJobResponse { ReplicationJob job = 1; }
+message ListReplicationJobsRequest {}
+message ListReplicationJobsResponse { repeated ReplicationJob jobs = 1; }
+
+message RunGarbageCollectionRequest {
+  // Empty = every target.
+  string target_name = 1;
+  bool dry_run = 2;
+}
+message RunGarbageCollectionResponse {
+  bool success = 1;
+  string message = 2;
+  int64 objects_deleted = 3;
+  int64 objects_locked = 4;
+  int64 bytes_freed = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Events, inventory, notifications, file restore
+// ---------------------------------------------------------------------------
+
+message VaultEvent {
+  int64 seq = 1;
+  // job.phase | job.progress | job.log | backup.sealed | restore.done |
+  // verify.result | boottest.result | notification | inventory.changed | target.capacity
+  string kind = 2;
+  string job_id = 3;
+  string level = 4;
+  int32 phase = 5;
+  string message = 6;
+  int64 bytes = 7;
+  int64 at_unix = 8;
+  string resource = 9;
+}
+
+message WatchEventsRequest {
+  int64 since_seq = 1;
+  repeated string kinds = 2;
+}
+
+message ListEventsRequest {
+  int64 since_seq = 1;
+  int32 limit = 2;
+}
+message ListEventsResponse { repeated VaultEvent events = 1; }
+
+message CancelRestoreJobRequest { string id = 1; }
+message CancelRestoreJobResponse {
+  bool success = 1;
+  string message = 2;
+}
+message CancelVerifyJobRequest { string id = 1; }
+message CancelVerifyJobResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message InventoryVm {
+  string id = 1;
+  string name = 2;
+  string node = 3;
+  string state = 4;
+  int32 cpu = 5;
+  int64 memory_bytes = 6;
+  repeated string disks = 7;
+  repeated string nics = 8;
+  map<string, string> labels = 9;
+  string policy = 10;
+  string last_success = 11;
+  string last_failure = 12;
+  string next_run = 13;
+  bool unprotected = 14;
+  bool rpo_breach = 15;
+  string verify_status = 16;
+}
+
+message ListInventoryRequest {}
+message ListInventoryResponse { repeated InventoryVm vms = 1; }
+
+message GetDashboardSummaryRequest {}
+message GetDashboardSummaryResponse {
+  int32 protected = 1;
+  int32 unprotected = 2;
+  int32 failed_24h = 3;
+  int32 rpo_breaches = 4;
+  int32 open_jobs = 5;
+  string message = 6;
+}
+
+message Notification {
+  string id = 1;
+  string severity = 2;
+  string title = 3;
+  string body = 4;
+  int64 event_seq = 5;
+  bool acked = 6;
+  int64 at_unix = 7;
+  string resource = 8;
+}
+message ListNotificationsRequest { bool include_acked = 1; }
+message ListNotificationsResponse { repeated Notification notifications = 1; }
+message AckNotificationRequest { string id = 1; }
+message AckNotificationResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message OpenFileRestoreRequest {
+  string backup_id = 1;
+  string source_volume = 2;
+}
+message OpenFileRestoreResponse {
+  bool success = 1;
+  string message = 2;
+  string mount_id = 3;
+}
+message DirEntry {
+  string name = 1;
+  bool dir = 2;
+  int64 size = 3;
+}
+message ListDirRequest {
+  string mount_id = 1;
+  string path = 2;
+}
+message ListDirResponse {
+  repeated DirEntry entries = 1;
+  string message = 2;
+}
+message GetFileRequest {
+  string mount_id = 1;
+  string path = 2;
+  // Byte offset. Clients loop until offset >= total.
+  int64 offset = 3;
+  // Maximum bytes in this response. Zero means one 1 MiB chunk.
+  int64 length = 4;
+}
+message DownloadArchiveRequest {
+  string mount_id = 1;
+  string path = 2;
+}
+message GetFileResponse {
+  bytes data = 1;
+  string message = 2;
+  string name = 3;
+  // Full file size. data is one chunk, not the whole file.
+  int64 total = 4;
+}
+message CloseFileRestoreRequest { string mount_id = 1; }
+message CloseFileRestoreResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetSettingsRequest {}
+message GetSettingsResponse { string json = 1; }
+message ApplySettingsRequest { string json = 1; }
+message ApplySettingsResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Mover (on-node data plane; pull-only reads of exposed snapshot devices)
+// ---------------------------------------------------------------------------
+
+service VaultMover {
+  // Open a short-lived read lease on a local block device or file.
+  rpc OpenLease(OpenLeaseRequest) returns (OpenLeaseResponse);
+  rpc CloseLease(CloseLeaseRequest) returns (CloseLeaseResponse);
+  // Stream fixed-size chunk payloads for [offset, offset+length).
+  rpc ReadChunks(ReadChunksRequest) returns (stream ChunkPayload);
+}
+
+message OpenLeaseRequest {
+  string path = 1;
+  string purpose = 2; // backup | verify
+}
+
+message OpenLeaseResponse {
+  string lease_id = 1;
+  uint64 size_bytes = 2;
+}
+
+message CloseLeaseRequest { string lease_id = 1; }
+message CloseLeaseResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ReadChunksRequest {
+  string lease_id = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  // Preferred chunk size (default 4 MiB). Must be a power of two ≥ 64 KiB.
+  uint32 chunk_size = 4;
+}
+
+message ChunkPayload {
+  uint64 offset = 1;
+  bytes data = 2;
+  // Keyed BLAKE3 of plaintext when encryption is done on the mover; empty
+  // when the engine hashes after pull.
+  bytes chunk_id = 3;
+  bool all_zero = 4;
+}

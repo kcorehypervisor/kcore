@@ -29,8 +29,10 @@ export function isServiceName(value: string): value is ServiceName {
   return (SERVICE_NAMES as readonly string[]).includes(value);
 }
 
+const READ_ONLY = new Set(["scanNetwork"]);
+
 export function isReadOnlyMethod(method: string): boolean {
-  return /^(get|list|classify|check|plan)/.test(method);
+  return READ_ONLY.has(method) || /^(get|list|classify|check|plan)/.test(method);
 }
 
 export function rpcCatalog(service?: ServiceName): RpcMethod[] {

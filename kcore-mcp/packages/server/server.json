@@ -41,6 +41,30 @@
           "description": "host:port of kcore-provisioning when a call does not set connection.provisioning.",
           "isRequired": false,
           "isSecret": false
+        },
+        {
+          "name": "KCORE_PROVISIONING_TOKEN",
+          "description": "Bearer token for kcore-provisioning when that server requires authorization.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "KCORE_VAULT_ENDPOINT",
+          "description": "host:port of the vault coordinator. Defaults to 127.0.0.1:9191.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "KCORE_VAULT_TOKEN",
+          "description": "Bearer token for the vault coordinator when it requires authorization.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "KCORE_VAULT_TLS",
+          "description": "Set to 1 to present the kcore client certificate to the vault. Otherwise the dial is plaintext.",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }
