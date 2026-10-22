@@ -34,6 +34,7 @@ run_tlc "ControllerNodeReconcile.tla" "ControllerNodeReconcile.cfg"
 run_tlc "ControllerReplication.tla" "ControllerReplication.cfg"
 run_tlc "CrossDcReplication.tla" "CrossDcReplication.cfg"
 run_tlc "DiskLayoutReconcile.tla" "DiskLayoutReconcile.cfg"
+run_tlc "ClickhouseRollout.tla" "ClickhouseRollout.cfg"
 popd >/dev/null
 
 # Design model imported beside the product specs. Same module names, different

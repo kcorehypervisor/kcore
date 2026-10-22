@@ -812,6 +812,52 @@ mod tests {
         assert!(rollout_invariants(&spec, &steps).is_ok());
     }
 
+    /// Planner steps checked by `specs/tla/ClickhouseRollout.tla`.
+    /// `restart-unit` on a server is `RestartServer` (and `FinishServer`
+    /// once the replica is back). `restart-unit` on Keeper is
+    /// `RestartKeeper`. `wait-keeper-quorum` is that action's guard:
+    /// a strict majority of the other voters stay up.
+    #[test]
+    fn planner_steps_match_clickhouse_rollout_tla() {
+        let spec = two_by_two();
+        let health = vec![
+            health_leader("node-105"),
+            health_leader("node-106"),
+            health_leader("node-108"),
+            health_leader("node-109"),
+        ];
+        let steps = plan_rollout(&RolloutRequest {
+            before: Some(&spec),
+            after: &spec,
+            kind: OpKind::Upgrade,
+            health: &health,
+            diff: None,
+            intermediate: false,
+            retain_data: false,
+            skip_access: false,
+            backup_name: String::new(),
+            restore_node: String::new(),
+            removed_replicas: vec![],
+        });
+        assert!(steps
+            .iter()
+            .any(|step| step.kind == RESTART_UNIT && step.unit == "server"));
+        assert!(steps
+            .iter()
+            .any(|step| step.kind == RESTART_UNIT && step.unit == "keeper"));
+        assert!(steps.iter().any(|step| step.kind == WAIT_KEEPER_QUORUM));
+        assert!(rollout_invariants(&spec, &steps).is_ok());
+        assert!(keeper_restart_allowed(&spec, "node-105", &health).is_ok());
+        let mut one_down = health;
+        for row in &mut one_down {
+            if row.node_id == "node-106" {
+                row.keeper_active = false;
+                row.keeper_role = "unknown".into();
+            }
+        }
+        assert!(keeper_restart_allowed(&spec, "node-105", &one_down).is_err());
+    }
+
     #[test]
     fn read_replica_does_not_unlock_a_writable_restart() {
         let mut spec = two_by_two();
