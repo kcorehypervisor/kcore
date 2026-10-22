@@ -6274,12 +6274,29 @@ impl ControllerService {
             self.failover.lease_renew_secs.saturating_mul(1000),
             view.as_ref(),
         ) {
-            let _ = self.db.upsert_cluster_lease(&crate::db::ClusterLeaseRow {
+            let claiming = match &current {
+                Some(row) => term > row.term || row.holder != replication.controller_id,
+                None => true,
+            };
+            // A new term has to wait until this process has pulled from its
+            // peer once. Renewing the term we already hold does not.
+            if claiming && !crate::replication::lease_claim_open(crate::ha::now_unix_ms()) {
+                return;
+            }
+            let row = crate::db::ClusterLeaseRow {
                 name: "failover".into(),
                 holder: replication.controller_id.clone(),
                 expires_at_ms,
                 term,
-            });
+            };
+            if self.db.upsert_cluster_lease(&row).is_ok() {
+                crate::replication::emit_ha_lease(
+                    &self.db,
+                    &replication.controller_id,
+                    &replication.dc_id,
+                    &row,
+                );
+            }
         }
     }
 
@@ -6287,6 +6304,7 @@ impl ControllerService {
         self.maintain_failover_lease();
         if self.failover.enabled && self.failover_may_act() {
             self.failover_not_ready_nodes(announced).await;
+            self.failover_storage_isolated_nodes().await;
             self.replicate_due_zfs().await;
         }
     }
@@ -6441,12 +6459,19 @@ impl ControllerService {
         &self,
         source: &NodeRow,
         images: &[String],
-    ) -> crate::ha::StorageVerdict {
+    ) -> (crate::ha::StorageVerdict, crate::ha::OsdReport) {
         #[cfg(test)]
         {
             let _ = (source, images);
-            self.test_storage_verdict
-                .unwrap_or(crate::ha::StorageVerdict::Dead)
+            let verdict = self
+                .test_storage_verdict
+                .unwrap_or(crate::ha::StorageVerdict::Dead);
+            let osd = match verdict {
+                crate::ha::StorageVerdict::Alive => crate::ha::OsdReport::Up,
+                crate::ha::StorageVerdict::Dead => crate::ha::OsdReport::Down,
+                crate::ha::StorageVerdict::Unknown => crate::ha::OsdReport::Unknown,
+            };
+            (verdict, osd)
         }
         #[cfg(not(test))]
         {
@@ -6459,12 +6484,18 @@ impl ControllerService {
         &self,
         source: &NodeRow,
         images: &[String],
-    ) -> crate::ha::StorageVerdict {
+    ) -> (crate::ha::StorageVerdict, crate::ha::OsdReport) {
         let Ok(hosts) = self.ceph_client_hosts_for_node(source) else {
-            return crate::ha::StorageVerdict::Unknown;
+            return (
+                crate::ha::StorageVerdict::Unknown,
+                crate::ha::OsdReport::Unknown,
+            );
         };
         let Ok(members) = self.db.list_nodes() else {
-            return crate::ha::StorageVerdict::Unknown;
+            return (
+                crate::ha::StorageVerdict::Unknown,
+                crate::ha::OsdReport::Unknown,
+            );
         };
         let host_name = if source.hostname.is_empty() {
             source.id.clone()
@@ -6504,10 +6535,8 @@ impl ControllerService {
                     } else {
                         Some(probe.watcher_from_host)
                     };
-                    return crate::ha::storage_verdict(
-                        crate::ha::parse_osd_report(&probe.osd_state),
-                        watcher,
-                    );
+                    let osd = crate::ha::parse_osd_report(&probe.osd_state);
+                    return (crate::ha::storage_verdict(osd, watcher), osd);
                 }
                 Err(err)
                     if err.code() == tonic::Code::Unimplemented
@@ -6525,7 +6554,10 @@ impl ControllerService {
                 }
             }
         }
-        crate::ha::StorageVerdict::Unknown
+        (
+            crate::ha::StorageVerdict::Unknown,
+            crate::ha::OsdReport::Unknown,
+        )
     }
 
     /// Move Ceph VMs off a node that has already been marked `not-ready`.
@@ -6541,13 +6573,37 @@ impl ControllerService {
         &self,
         node_id: &str,
     ) -> Result<NodeDrainOutcome, Status> {
+        self.failover_node(node_id, false).await
+    }
+
+    /// Fence and move Ceph guests off a host that is still heartbeating but
+    /// whose OSD a peer has seen down, with no watcher left from that host.
+    pub async fn failover_storage_isolated_node(
+        &self,
+        node_id: &str,
+    ) -> Result<NodeDrainOutcome, Status> {
+        self.failover_node(node_id, true).await
+    }
+
+    async fn failover_node(
+        &self,
+        node_id: &str,
+        live_storage: bool,
+    ) -> Result<NodeDrainOutcome, Status> {
         let source = self
             .db
             .get_node(node_id)
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(format!("node '{node_id}' not found")))?;
         let lost = self.db.node_lost_at(node_id).unwrap_or_default();
-        if source.status != "not-ready" && lost.is_empty() {
+        if live_storage {
+            if source.status == "not-ready" {
+                return Ok(NodeDrainOutcome {
+                    migrated: 0,
+                    errors: Vec::new(),
+                });
+            }
+        } else if source.status != "not-ready" && lost.is_empty() {
             return Ok(NodeDrainOutcome {
                 migrated: 0,
                 errors: Vec::new(),
@@ -6555,12 +6611,14 @@ impl ControllerService {
         }
         // A fence hold keeps `lost_at` after the host heartbeats again, so the
         // next beat can still find the placement reports. That timestamp must
-        // not move the guests a second time.
+        // not move the guests a second time. A storage cut is the exception:
+        // the host is still answering, and the peer probe is what says the
+        // disk is gone.
         let recently_seen = self
             .db
             .node_recently_seen(node_id, self.failover.node_timeout_secs)
             .unwrap_or(false);
-        if recently_seen && source.status != "not-ready" {
+        if !live_storage && recently_seen && source.status != "not-ready" {
             return Ok(NodeDrainOutcome {
                 migrated: 0,
                 errors: Vec::new(),
@@ -6585,6 +6643,12 @@ impl ControllerService {
                 .map(|row| row.restart_priority.clone())
                 .unwrap_or_else(|| crate::ha::PRIORITY_MEDIUM.to_string())
         });
+        if live_storage && !vms.iter().any(|vm| vm.storage_backend == "ceph") {
+            return Ok(NodeDrainOutcome {
+                migrated: 0,
+                errors: Vec::new(),
+            });
+        }
         if vms.iter().any(|vm| vm.storage_backend == "ceph") {
             let mut images = Vec::new();
             for vm in vms.iter().filter(|vm| vm.storage_backend == "ceph") {
@@ -6596,27 +6660,40 @@ impl ControllerService {
                 }
             }
             match self.storage_verdict_for_failover(&source, &images).await {
-                crate::ha::StorageVerdict::Alive => {
-                    let _ = self.db.insert_ha_event(
-                        node_id,
-                        "",
-                        "agent-down",
-                        "storage heartbeat still sees this host",
-                    );
+                (crate::ha::StorageVerdict::Alive, _) => {
+                    if !live_storage {
+                        let _ = self.db.insert_ha_event(
+                            node_id,
+                            "",
+                            "agent-down",
+                            "storage heartbeat still sees this host",
+                        );
+                    }
                     return Ok(NodeDrainOutcome {
                         migrated: 0,
                         errors: Vec::new(),
                     });
                 }
-                crate::ha::StorageVerdict::Unknown => {
+                (crate::ha::StorageVerdict::Unknown, _) => {
                     return Ok(NodeDrainOutcome {
                         migrated: 0,
-                        errors: vec![format!(
-                            "storage heartbeat for {node_id} did not answer; guests stay"
-                        )],
+                        errors: if live_storage {
+                            Vec::new()
+                        } else {
+                            vec![format!(
+                                "storage heartbeat for {node_id} did not answer; guests stay"
+                            )]
+                        },
                     });
                 }
-                crate::ha::StorageVerdict::Dead => {}
+                (crate::ha::StorageVerdict::Dead, osd) => {
+                    if live_storage && !crate::ha::live_storage_should_move(osd, Some(false)) {
+                        return Ok(NodeDrainOutcome {
+                            migrated: 0,
+                            errors: Vec::new(),
+                        });
+                    }
+                }
             }
         }
         let all_nodes = self
@@ -6637,6 +6714,9 @@ impl ControllerService {
             let has_replica = vm.storage_backend == "zfs"
                 && !replica_node.is_empty()
                 && policy.map(|row| row.last_replica_at).unwrap_or(0) > 0;
+            if live_storage && vm.storage_backend != "ceph" && !has_replica {
+                continue;
+            }
             if vm.storage_backend != "ceph" && !has_replica {
                 errors.push(format!(
                     "VM '{}' uses {} storage on failed node {node_id}; it stays until the node returns",
@@ -6806,6 +6886,44 @@ impl ControllerService {
         }
 
         Ok(NodeDrainOutcome { migrated, errors })
+    }
+
+    /// Ceph guests on a host that is still heartbeating, but whose OSD a
+    /// peer reports down and whose watcher is gone.
+    async fn failover_storage_isolated_nodes(&self) {
+        let nodes = match self.db.list_nodes() {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                warn!(error = %e, "storage isolation could not list nodes");
+                return;
+            }
+        };
+        for node in nodes {
+            if node.status != "ready" && node.status != "cordoned" {
+                continue;
+            }
+            let health = self.db.node_host_health(&node.id).unwrap_or_default();
+            if !crate::ha::storage_probe_due(&health) {
+                continue;
+            }
+            match self.failover_storage_isolated_node(&node.id).await {
+                Ok(outcome) => {
+                    if outcome.migrated > 0 {
+                        info!(
+                            node_id = %node.id,
+                            migrated = outcome.migrated,
+                            "storage cut moved Ceph VMs"
+                        );
+                    }
+                    for err in outcome.errors {
+                        warn!(node_id = %node.id, "{err}");
+                    }
+                }
+                Err(e) => {
+                    warn!(node_id = %node.id, error = %e, "storage-cut failover failed");
+                }
+            }
+        }
     }
 
     /// One pass of automatic failover for every node currently `not-ready`.
@@ -7420,6 +7538,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     );
                 }
             }
+        } else if req.host_health == "unknown" {
+            // Do not cordon. A peer probe on the HA pass decides whether the
+            // OSD is actually down. One failed query never arrives here: the
+            // agent reports it as ok until the failure repeats.
+            let _ = self.db.set_node_host_health(&req.node_id, "unknown");
         } else if !req.host_health.is_empty() {
             let _ = self.db.set_node_host_health(&req.node_id, "ok");
         }

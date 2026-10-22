@@ -729,24 +729,39 @@ pub fn parse_ceph_df(json: &serde_json::Value) -> ParsedCephDf {
     }
 }
 
-/// `up` when any OSD under `host` is up, `down` when every one is down,
-/// `absent` when the crush host or its OSDs are missing.
 /// `degraded` only when Ceph answered and every OSD on `host` is down.
-/// A missing `ceph` binary or a failed query stays `ok` so a probe blip
-/// does not cordon the host.
+/// A host that is not in the crush map stays `ok`: it has no local OSD to
+/// lose. A failed or timed-out query is `unknown`, not healthy. One unknown
+/// sample is still reported as `ok` by [`debounce_host_health`]; the next
+/// one is not, so a storage cut is visible and a single blip is not.
 pub fn local_osd_health(host: &str) -> &'static str {
     let Ok(out) = Command::new("timeout")
         .args(["15", "ceph", "osd", "tree", "--format", "json"])
         .output()
     else {
-        return "ok";
+        return "unknown";
     };
     if !out.status.success() {
-        return "ok";
+        return "unknown";
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    match host_osd_state(&text, host) {
-        Ok("down") => "degraded",
+    classify_osd_health(host_osd_state(&text, host).unwrap_or("unknown"))
+}
+
+pub fn classify_osd_health(state: &str) -> &'static str {
+    match state {
+        "down" => "degraded",
+        "up" | "absent" => "ok",
+        _ => "unknown",
+    }
+}
+
+/// The first failed query stays `ok`. A second failure, or a confirmed down
+/// OSD, is what the controller is allowed to act on.
+pub fn debounce_host_health(previous_sample: &str, sample: &str) -> &'static str {
+    match sample {
+        "degraded" => "degraded",
+        "unknown" if previous_sample == "unknown" || previous_sample == "degraded" => "unknown",
         _ => "ok",
     }
 }
@@ -879,6 +894,14 @@ mod tests {
         assert_eq!(host_osd_state(json, "node-103").unwrap(), "up");
         assert_eq!(host_osd_state(json, "node-118").unwrap(), "down");
         assert_eq!(host_osd_state(json, "node-119").unwrap(), "absent");
+        assert_eq!(classify_osd_health("down"), "degraded");
+        assert_eq!(classify_osd_health("up"), "ok");
+        assert_eq!(classify_osd_health("absent"), "ok");
+        assert_eq!(classify_osd_health("unknown"), "unknown");
+        assert_eq!(debounce_host_health("ok", "unknown"), "ok");
+        assert_eq!(debounce_host_health("unknown", "unknown"), "unknown");
+        assert_eq!(debounce_host_health("unknown", "ok"), "ok");
+        assert_eq!(debounce_host_health("ok", "degraded"), "degraded");
         assert!(watcher_matches_host(
             "192.168.40.103:0/9",
             &["192.168.40.103".into()]

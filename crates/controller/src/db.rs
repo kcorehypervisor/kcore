@@ -6699,10 +6699,10 @@ impl Database {
     }
 
     pub fn set_node_host_health(&self, node_id: &str, health: &str) -> Result<(), rusqlite::Error> {
-        let health = if health == "degraded" {
-            "degraded"
-        } else {
-            "ok"
+        let health = match health {
+            "degraded" => "degraded",
+            "unknown" => "unknown",
+            _ => "ok",
         };
         let conn = self.lock_conn()?;
         conn.execute(

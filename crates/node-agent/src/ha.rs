@@ -165,6 +165,23 @@ pub fn isolation_due(last_ok: Option<Instant>, now: Instant, timeout: Duration) 
     }
 }
 
+/// A single missed `ceph osd blocklist` query is not proof that storage is
+/// gone. Power-off waits for a second unreachable or fenced reading so a
+/// slow OSD op during a management cut does not stop the guest.
+pub fn confirmed_storage_view(streak: u32, view: StorageView) -> (u32, StorageView) {
+    match view {
+        StorageView::ReachableNotFenced => (0, view),
+        other => {
+            let streak = streak.saturating_add(1);
+            if streak >= 2 {
+                (streak, other)
+            } else {
+                (streak, StorageView::ReachableNotFenced)
+            }
+        }
+    }
+}
+
 pub fn blocklist_contains_host(listing: &str, hosts: &[String]) -> bool {
     let hosts: Vec<&str> = hosts
         .iter()
@@ -497,6 +514,7 @@ pub fn spawn_ha_supervisor(
         let mut last_assigned: Vec<String> = Vec::new();
         let mut last_fence: Vec<String> = Vec::new();
         let mut last_placement = String::new();
+        let mut storage_streak = 0u32;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let (assigned, fence_vms, confirmed, monitors, last_ok, mut last_restart) = {
@@ -525,8 +543,12 @@ pub fn spawn_ha_supervisor(
             let isolate =
                 isolation_due(last_ok, now, Duration::from_secs(ha.isolation_timeout_secs));
             let storage = if isolate && local.iter().any(|vm| vm.backend == "ceph") {
-                storage_view(&local_host_addrs())
+                let view = storage_view(&local_host_addrs());
+                let (streak, view) = confirmed_storage_view(storage_streak, view);
+                storage_streak = streak;
+                view
             } else {
+                storage_streak = 0;
                 StorageView::ReachableNotFenced
             };
             let heartbeats: Vec<(String, i64)> = local
@@ -670,7 +692,7 @@ fn local_host_addrs() -> Vec<String> {
 
 fn storage_view(hosts: &[String]) -> StorageView {
     let Ok(out) = std::process::Command::new("timeout")
-        .args(["5", "ceph", "osd", "blocklist", "ls"])
+        .args(["15", "ceph", "osd", "blocklist", "ls"])
         .output()
     else {
         return StorageView::Unreachable;
@@ -1008,8 +1030,18 @@ mod tests {
             .any(|action| matches!(action, HostAction::Stop(name) if name == "db")));
     }
 
+    #[test]
     fn isolation_waits_for_a_successful_heartbeat() {
         let start = Instant::now();
+        let (streak, quiet) = confirmed_storage_view(0, StorageView::Unreachable);
+        assert_eq!(streak, 1);
+        assert_eq!(quiet, StorageView::ReachableNotFenced);
+        let (streak, stop) = confirmed_storage_view(streak, StorageView::Unreachable);
+        assert_eq!(streak, 2);
+        assert_eq!(stop, StorageView::Unreachable);
+        let (streak, clear) = confirmed_storage_view(streak, StorageView::ReachableNotFenced);
+        assert_eq!(streak, 0);
+        assert_eq!(clear, StorageView::ReachableNotFenced);
         assert!(!isolation_due(None, start, Duration::from_secs(60)));
         assert!(isolation_due(
             Some(start),

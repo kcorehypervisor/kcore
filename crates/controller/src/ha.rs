@@ -290,6 +290,20 @@ pub fn proactive_should_cordon(host_health: &str, status: &str) -> bool {
     host_health == "degraded" && status == "ready"
 }
 
+/// Peer-probe a live host when its agent has confirmed the local OSD is
+/// down, or when the OSD query has failed twice. `ok` is not a probe.
+pub fn storage_probe_due(host_health: &str) -> bool {
+    matches!(host_health, "degraded" | "unknown")
+}
+
+/// A live host is moved only when a peer saw its OSD down and no watcher
+/// from that host remains. An absent crush entry is not enough: a compute
+/// node has no OSD, and a hostname mismatch must not evacuate a guest that
+/// is still the writer. `Down` plus a missing watcher is the storage cut.
+pub fn live_storage_should_move(osd: OsdReport, watcher_from_host: Option<bool>) -> bool {
+    osd == OsdReport::Down && watcher_from_host == Some(false)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionHost {
     pub cpu: i64,
@@ -510,6 +524,25 @@ pub fn decide_lease(
     }
 }
 
+/// A replicated lease replaces the local row when its term is newer, when
+/// the same term names a greater controller id (one writer wins the tie),
+/// or when the same holder extended the expiry.
+pub fn lease_supersedes(current: Option<&LeaseView>, incoming: &LeaseView) -> bool {
+    match current {
+        None => true,
+        Some(cur) if incoming.term > cur.term => true,
+        Some(cur) if incoming.term == cur.term && incoming.holder > cur.holder => true,
+        Some(cur)
+            if incoming.term == cur.term
+                && incoming.holder == cur.holder
+                && incoming.expires_at_ms > cur.expires_at_ms =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -685,6 +718,14 @@ mod tests {
         assert!(proactive_should_cordon("degraded", "ready"));
         assert!(!proactive_should_cordon("degraded", "cordoned"));
         assert!(!proactive_should_cordon("ok", "ready"));
+        assert!(storage_probe_due("degraded"));
+        assert!(storage_probe_due("unknown"));
+        assert!(!storage_probe_due("ok"));
+        assert!(live_storage_should_move(OsdReport::Down, Some(false)));
+        assert!(!live_storage_should_move(OsdReport::Down, Some(true)));
+        assert!(!live_storage_should_move(OsdReport::Down, None));
+        assert!(!live_storage_should_move(OsdReport::Absent, Some(false)));
+        assert!(!live_storage_should_move(OsdReport::Up, Some(false)));
         assert_eq!(
             failure_domain_label(&["role=compute".into(), "failure-domain=rack-a".into()]),
             "rack-a"
@@ -744,6 +785,30 @@ mod tests {
             decide_lease(11_000, "b", true, true, 5_000, 1_000, 1_000, Some(&held)),
             LeaseDecision::Wait
         ));
+        let local = LeaseView {
+            holder: "kcore-controller-192.168.40.105".into(),
+            expires_at_ms: 2_000,
+            term: 4,
+        };
+        let primary = LeaseView {
+            holder: "kcore-controller-192.168.40.107".into(),
+            expires_at_ms: 1_500,
+            term: 4,
+        };
+        assert!(lease_supersedes(None, &local));
+        assert!(lease_supersedes(Some(&local), &primary));
+        assert!(!lease_supersedes(Some(&primary), &local));
+        let renewed = LeaseView {
+            expires_at_ms: 3_000,
+            ..primary.clone()
+        };
+        assert!(lease_supersedes(Some(&primary), &renewed));
+        let older = LeaseView {
+            expires_at_ms: 9_000,
+            term: 3,
+            ..primary.clone()
+        };
+        assert!(!lease_supersedes(Some(&primary), &older));
         assert!(matches!(
             decide_lease(1, "solo", false, false, 9_000, 1, 1_000, None),
             LeaseDecision::Act { .. }

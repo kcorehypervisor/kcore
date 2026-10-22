@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +43,96 @@ const RESERVATION_MAX_RETRIES: i32 = 3;
 const RESERVATION_RETRY_IDLE_SECS: u64 = 2;
 const RESERVATION_RETRY_COOLDOWN_SECS: i64 = 5;
 const RESERVATION_RETRY_BATCH_SIZE: i64 = 32;
+
+/// Claims stay closed until a peer poll has finished, or until discovery
+/// has seen that this controller has no remote peer. `i64::MAX` is closed.
+static LEASE_CLAIM_AFTER_MS: AtomicI64 = AtomicI64::new(i64::MAX);
+
+pub fn lease_claim_open(now_ms: i64) -> bool {
+    now_ms >= LEASE_CLAIM_AFTER_MS.load(Ordering::Relaxed)
+}
+
+fn open_lease_claims() {
+    LEASE_CLAIM_AFTER_MS.store(0, Ordering::Relaxed);
+}
+
+/// Publish the failover lease. Peers apply it only when [`crate::ha::lease_supersedes`]
+/// says the incoming term wins, so two controllers converge on one writer.
+pub fn emit_ha_lease(
+    db: &Database,
+    controller_id: &str,
+    dc_id: &str,
+    row: &crate::db::ClusterLeaseRow,
+) {
+    let logical_ts_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let resource_key = format!("ha/lease/{}", row.name);
+    let envelope = serde_json::json!({
+        "schemaVersion": 1,
+        "opId": uuid::Uuid::new_v4().to_string(),
+        "logicalTsUnixMs": logical_ts_unix_ms,
+        "controllerId": controller_id,
+        "dcId": dc_id,
+        "eventType": "ha.lease",
+        "resourceKey": resource_key,
+        "body": {
+            "name": row.name,
+            "holder": row.holder,
+            "expiresAtMs": row.expires_at_ms,
+            "term": row.term,
+        },
+    });
+    let Ok(payload) = serde_json::to_vec(&envelope) else {
+        return;
+    };
+    if let Err(e) = db.append_replication_outbox("ha.lease", &resource_key, &payload) {
+        warn!(error = %e, "failed to emit ha.lease event");
+    }
+}
+
+fn apply_ha_lease(db: &Database, body: &Value) -> Result<(), String> {
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("failover");
+    let holder = body
+        .get("holder")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ha.lease missing holder".to_string())?;
+    let expires_at_ms = body
+        .get("expiresAtMs")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "ha.lease missing expiresAtMs".to_string())?;
+    let term = body
+        .get("term")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "ha.lease missing term".to_string())?;
+    let incoming = crate::ha::LeaseView {
+        holder: holder.to_string(),
+        expires_at_ms,
+        term,
+    };
+    let current = db
+        .get_cluster_lease(name)
+        .map_err(|e| format!("read lease {name}: {e}"))?;
+    let current_view = current.as_ref().map(|row| crate::ha::LeaseView {
+        holder: row.holder.clone(),
+        expires_at_ms: row.expires_at_ms,
+        term: row.term,
+    });
+    if !crate::ha::lease_supersedes(current_view.as_ref(), &incoming) {
+        return Ok(());
+    }
+    db.upsert_cluster_lease(&crate::db::ClusterLeaseRow {
+        name: name.to_string(),
+        holder: incoming.holder,
+        expires_at_ms: incoming.expires_at_ms,
+        term: incoming.term,
+    })
+    .map_err(|e| format!("upsert lease {name}: {e}"))
+}
 
 /// Emit a `controller.register` event into the replication outbox so that
 /// other controllers discover this one via CRDT materialization.
@@ -203,6 +294,16 @@ fn spawn_peer_discovery(
                     continue;
                 }
             };
+            let remote_peer = peers.iter().any(|peer_row| {
+                if peer_row.controller_id == local_controller_id {
+                    return false;
+                }
+                let addr = peer_row.address.trim();
+                !addr.is_empty() && !same_endpoint(&listen_addr, addr)
+            });
+            if !remote_peer {
+                open_lease_claims();
+            }
             for peer_row in peers {
                 if peer_row.controller_id == local_controller_id {
                     continue;
@@ -316,12 +417,16 @@ async fn replication_peer_loop(
         .await
         {
             Ok(did_work) => {
+                // Events from this poll are applied before a new term may be claimed.
+                open_lease_claims();
                 if did_work {
                     continue;
                 }
                 tokio::time::sleep(Duration::from_secs(idle_secs)).await;
             }
             Err(e) => {
+                // The peer is down. A standby that can see heartbeats may claim.
+                open_lease_claims();
                 warn!(peer = %peer, error = %e, "replication poll failed");
                 tokio::time::sleep(Duration::from_secs(error_secs)).await;
             }
@@ -617,6 +722,7 @@ fn apply_replication_event(
     }
 
     match event.event_type.as_str() {
+        "ha.lease" => apply_ha_lease(db, &body),
         "node.register"
         | "node.heartbeat"
         | "node.approve"
