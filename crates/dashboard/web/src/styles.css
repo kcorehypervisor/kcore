@@ -35,7 +35,7 @@ button.primary { background: var(--accent); border-color: transparent; color: wh
 button.danger { color: var(--bad); }
 .app {
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr);
+  grid-template-columns: 260px minmax(0, 1fr);
   height: 100%;
   min-height: 0;
 }
@@ -47,17 +47,35 @@ button.danger { color: var(--bad); }
 }
 nav {
   border-right: 1px solid var(--line);
-  padding: 20px 14px 40px;
+  padding: 20px 12px 32px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  overflow: auto;
+  gap: 2px;
+  min-width: 0;
   min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
-nav .brand { font-weight: 600; margin-bottom: 12px; }
+nav > * { flex-shrink: 0; }
+nav .brand { font-weight: 600; margin: 0 8px 12px; white-space: nowrap; }
 nav .brand span, .mobile-bar .brand span { color: var(--muted); font-weight: 400; }
-nav .group { margin: 14px 10px 4px; color: var(--muted); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
-nav a { padding: 8px 10px; border-radius: 8px; color: var(--muted); }
+nav .section { display: flex; flex-direction: column; min-width: 0; }
+nav .group {
+  margin: 16px 8px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+nav a {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 nav a.active, nav a:hover { background: var(--bg-2); color: var(--text); }
 .mobile-bar { display: none; }
 main { padding: 24px 28px 48px; min-width: 0; overflow: auto; }
@@ -125,8 +143,8 @@ tr.inspect { cursor: pointer; }
     border-bottom: 1px solid var(--line);
   }
   .mobile-bar .brand { font-weight: 600; }
-  nav { display: none; border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; }
-  nav.open { display: flex; }
+  nav { display: none; border-right: 0; border-bottom: 1px solid var(--line); max-height: 70vh; }
+  nav.open { display: flex; width: 100%; }
   nav .brand { display: none; }
   main { padding: 16px 14px 32px; }
   .card strong.metric { font-size: 22px; }

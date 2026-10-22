@@ -36,7 +36,7 @@ export function Shell() {
           Overview
         </Link>
         {groups.map((group) => (
-          <div key={group.name}>
+          <div className="section" key={group.name}>
             <div className="group">{group.name}</div>
             {group.items.map((resource) => {
               const href = `/r/${resource.id}`;
