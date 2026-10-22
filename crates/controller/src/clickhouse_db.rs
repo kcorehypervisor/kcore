@@ -237,18 +237,63 @@ impl Database {
         cluster: &str,
         members: &[MemberRow],
     ) -> Result<(), String> {
-        let conn = self.lock_conn().map_err(|e| e.to_string())?;
-        conn.execute(
-            "DELETE FROM clickhouse_cluster_members WHERE cluster_name = ?1",
-            params![cluster],
-        )
-        .map_err(|e| e.to_string())?;
+        let mut conn = self.lock_conn().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
         for member in members {
-            conn.execute(
+            let other: Option<String> = tx
+                .query_row(
+                    "SELECT cluster_name FROM clickhouse_cluster_members
+                     WHERE node_id = ?1 AND cluster_name != ?2",
+                    params![member.node_id, cluster],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(other) = other {
+                return Err(node_in_use(&member.node_id, &other));
+            }
+        }
+        let prior = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT node_id, health_json FROM clickhouse_cluster_members
+                     WHERE cluster_name = ?1",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![cluster], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut prior = std::collections::HashMap::new();
+            for row in rows {
+                let (node_id, health) = row.map_err(|e| e.to_string())?;
+                prior.insert(node_id, health);
+            }
+            prior
+        };
+        for member in members {
+            let health = if member.health_json.is_empty() {
+                prior.get(&member.node_id).cloned().unwrap_or_default()
+            } else {
+                member.health_json.clone()
+            };
+            tx.execute(
                 "INSERT INTO clickhouse_cluster_members (
                     cluster_name, node_id, server, keeper, shard_name, replica_name, server_id,
                     learner, advertise_address, iface, read_only, health_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(cluster_name, node_id) DO UPDATE SET
+                    server = excluded.server,
+                    keeper = excluded.keeper,
+                    shard_name = excluded.shard_name,
+                    replica_name = excluded.replica_name,
+                    server_id = excluded.server_id,
+                    learner = excluded.learner,
+                    advertise_address = excluded.advertise_address,
+                    iface = excluded.iface,
+                    read_only = excluded.read_only,
+                    health_json = excluded.health_json",
                 params![
                     cluster,
                     member.node_id,
@@ -261,12 +306,75 @@ impl Database {
                     member.advertise_address,
                     member.iface,
                     i32::from(member.read_only),
-                    member.health_json
+                    health
                 ],
             )
             .map_err(|e| e.to_string())?;
         }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Drop member rows that are no longer in the spec. Departing nodes stay
+    /// claimed until the operation that disables them has succeeded, so a
+    /// second cluster cannot take the node while its unit still belongs to this one.
+    pub fn prune_clickhouse_members(&self, cluster: &str, keep: &[String]) -> Result<(), String> {
+        let conn = self.lock_conn().map_err(|e| e.to_string())?;
+        if keep.is_empty() {
+            conn.execute(
+                "DELETE FROM clickhouse_cluster_members WHERE cluster_name = ?1",
+                params![cluster],
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", keep.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM clickhouse_cluster_members
+             WHERE cluster_name = ?1 AND node_id NOT IN ({placeholders})"
+        );
+        let mut args = Vec::with_capacity(keep.len() + 1);
+        args.push(cluster.to_string());
+        args.extend(keep.iter().cloned());
+        conn.execute(&sql, rusqlite::params_from_iter(args))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clickhouse_node_conflicts(
+        &self,
+        cluster: &str,
+        node_ids: &[String],
+    ) -> Result<Vec<String>, String> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn().map_err(|e| e.to_string())?;
+        let placeholders = std::iter::repeat_n("?", node_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT node_id, cluster_name FROM clickhouse_cluster_members
+             WHERE cluster_name != ?1 AND node_id IN ({placeholders})
+             ORDER BY node_id"
+        );
+        let mut args = Vec::with_capacity(node_ids.len() + 1);
+        args.push(cluster.to_string());
+        args.extend(node_ids.iter().cloned());
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut conflicts = Vec::new();
+        for row in rows {
+            let (node_id, other) = row.map_err(|e| e.to_string())?;
+            conflicts.push(node_in_use(&node_id, &other));
+        }
+        Ok(conflicts)
     }
 
     pub fn list_clickhouse_members(&self, cluster: &str) -> Result<Vec<MemberRow>, String> {
@@ -610,6 +718,10 @@ fn operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow>
         message: row.get(6)?,
         force: force != 0,
     })
+}
+
+fn node_in_use(node: &str, other: &str) -> String {
+    format!("node {node} already runs ClickHouse cluster {other}")
 }
 
 /// Block a host rollout when this node is a ClickHouse member and taking it
