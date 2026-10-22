@@ -731,9 +731,11 @@ pub fn parse_ceph_df(json: &serde_json::Value) -> ParsedCephDf {
 
 /// `degraded` only when Ceph answered and every OSD on `host` is down.
 /// A host that is not in the crush map stays `ok`: it has no local OSD to
-/// lose. A failed or timed-out query is `unknown`, not healthy. One unknown
-/// sample is still reported as `ok` by [`debounce_host_health`]; the next
-/// one is not, so a storage cut is visible and a single blip is not.
+/// lose. A failed or timed-out query is `unknown`, not healthy. Exit 127
+/// means `ceph` is not installed, which is a host with no OSD, so that stays
+/// `ok`. One unknown sample is still reported as `ok` by
+/// [`debounce_host_health`]; the next one is not, so a storage cut is visible
+/// and a single blip is not.
 pub fn local_osd_health(host: &str) -> &'static str {
     let Ok(out) = Command::new("timeout")
         .args(["15", "ceph", "osd", "tree", "--format", "json"])
@@ -742,10 +744,20 @@ pub fn local_osd_health(host: &str) -> &'static str {
         return "unknown";
     };
     if !out.status.success() {
-        return "unknown";
+        return health_when_ceph_cli_fails(out.status.code());
     }
     let text = String::from_utf8_lossy(&out.stdout);
     classify_osd_health(host_osd_state(&text, host).unwrap_or("unknown"))
+}
+
+/// `timeout` exits 127 when `ceph` itself is not on the host. That host has
+/// no local OSD. A timeout (124) or any other Ceph error is `unknown`.
+pub fn health_when_ceph_cli_fails(code: Option<i32>) -> &'static str {
+    if code == Some(127) {
+        "ok"
+    } else {
+        "unknown"
+    }
 }
 
 pub fn classify_osd_health(state: &str) -> &'static str {
@@ -898,6 +910,10 @@ mod tests {
         assert_eq!(classify_osd_health("up"), "ok");
         assert_eq!(classify_osd_health("absent"), "ok");
         assert_eq!(classify_osd_health("unknown"), "unknown");
+        assert_eq!(health_when_ceph_cli_fails(Some(127)), "ok");
+        assert_eq!(health_when_ceph_cli_fails(Some(124)), "unknown");
+        assert_eq!(health_when_ceph_cli_fails(Some(1)), "unknown");
+        assert_eq!(health_when_ceph_cli_fails(None), "unknown");
         assert_eq!(debounce_host_health("ok", "unknown"), "ok");
         assert_eq!(debounce_host_health("unknown", "unknown"), "unknown");
         assert_eq!(debounce_host_health("unknown", "ok"), "ok");
