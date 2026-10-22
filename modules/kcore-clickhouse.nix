@@ -47,6 +47,12 @@ let
   engine =
     days:
     "ENGINE = MergeTree PARTITION BY toYYYYMM(event_date) ORDER BY (event_date, event_time) TTL event_date + INTERVAL ${toString days} DAY";
+  # Stock config.xml already sets partition_by. ClickHouse 26 rejects that
+  # together with an engine string that contains PARTITION BY.
+  systemLog = days: {
+    engine = engine days;
+    partition_by = removeKey;
+  };
   fromEnv = var: {
     "@from_env" = var;
     "@hide_in_preprocessed" = "true";
@@ -135,6 +141,7 @@ let
   serverConfig = {
     logger = {
       level = "information";
+      console = 1;
       log = "${cfg.server.dataPath}/logs/clickhouse-server.log";
       errorlog = "${cfg.server.dataPath}/logs/clickhouse-server.err.log";
     };
@@ -192,14 +199,14 @@ let
       url = "/clickhouse/metrics";
       methods = "GET";
       handler = {
-        type = "predefined";
-        name = "prometheus";
+        # ClickHouse 26 serves this path with handler type prometheus.
+        type = "prometheus";
       };
     };
-    query_log.engine = engine (logDays 14 cfg.server.systemLogs.queryLogDays);
-    part_log.engine = engine (logDays 14 cfg.server.systemLogs.partLogDays);
-    trace_log.engine = engine (logDays 3 cfg.server.systemLogs.traceLogDays);
-    text_log.engine = engine (logDays 7 cfg.server.systemLogs.textLogDays);
+    query_log = systemLog (logDays 14 cfg.server.systemLogs.queryLogDays);
+    part_log = systemLog (logDays 14 cfg.server.systemLogs.partLogDays);
+    trace_log = systemLog (logDays 3 cfg.server.systemLogs.traceLogDays);
+    text_log = systemLog (logDays 7 cfg.server.systemLogs.textLogDays);
   }
   // lib.optionalAttrs cfg.tls.enable {
     tcp_port = removeKey;
@@ -229,10 +236,12 @@ let
     named_collections = collectionAttrs;
   };
   usersConfig = {
-    profiles = profileAttrs;
-    quotas = quotaAttrs;
     users = {
       default = {
+        # The packaged users.xml sets an empty <password> on this user.
+        # Leaving it in place makes ClickHouse reject password_sha256_hex.
+        password = removeKey;
+        no_password = removeKey;
         password_sha256_hex = fromEnv "KCORE_CH_DEFAULT_PASSWORD";
         networks.ip = [ "127.0.0.1" ] ++ cfg.server.clientNetworks;
         profile = "default";
@@ -246,16 +255,16 @@ let
       };
     }
     // userAttrs;
-  };
-  keeperConfig = {
-    logger = {
-      level = "information";
-      log = "${cfg.keeper.dataPath}/logs/clickhouse-keeper.log";
-      errorlog = "${cfg.keeper.dataPath}/logs/clickhouse-keeper.err.log";
-    };
-    listen_host = cfg.advertiseAddress;
+  }
+  // lib.optionalAttrs (profileAttrs != { }) { profiles = profileAttrs; }
+  // lib.optionalAttrs (quotaAttrs != { }) { quotas = quotaAttrs; };
+  # ClickHouse exits 139 (NO_ELEMENTS_IN_CONFIG) when these keys sit at the
+  # root. logger and listen_host stay at the root; the rest belong to keeper_server.
+  keeperServer = {
     server_id = cfg.keeper.serverId;
     storage_path = cfg.keeper.dataPath;
+    log_storage_path = "${cfg.keeper.dataPath}/coordination/log";
+    snapshot_storage_path = "${cfg.keeper.dataPath}/coordination/snapshots";
     raft_configuration = {
       server = map (peer: {
         inherit (peer) id port;
@@ -268,15 +277,27 @@ let
   // lib.optionalAttrs cfg.tls.enable {
     tcp_port = removeKey;
     tcp_port_secure = cfg.ports.keeper;
+  }
+  // lib.optionalAttrs (!cfg.tls.enable) {
+    tcp_port = cfg.ports.keeper;
+  };
+  keeperConfig = {
+    logger = {
+      level = "information";
+      console = 1;
+      log = "${cfg.keeper.dataPath}/logs/clickhouse-keeper.log";
+      errorlog = "${cfg.keeper.dataPath}/logs/clickhouse-keeper.err.log";
+    };
+    listen_host = cfg.advertiseAddress;
+    keeper_server = keeperServer;
+  }
+  // lib.optionalAttrs cfg.tls.enable {
     openSSL.server = {
       certificateFile = cfg.tls.certFile;
       privateKeyFile = cfg.tls.keyFile;
       caConfig = cfg.tls.caFile;
       verificationMode = "strict";
     };
-  }
-  // lib.optionalAttrs (!cfg.tls.enable) {
-    tcp_port = cfg.ports.keeper;
   };
   iptablesRule = port: source: ''
     iptables -A nixos-fw -p tcp --dport ${toString port} -s ${source} -j nixos-fw-accept
@@ -552,17 +573,33 @@ in
     systemd.services.clickhouse = lib.mkIf cfg.server.enable {
       restartIfChanged = false;
       stopIfChanged = false;
+      after = [
+        "network-online.target"
+        "systemd-tmpfiles-resetup.service"
+      ]
+      ++ lib.optional cfg.keeper.enable "clickhouse-keeper.service";
+      wants = [ "network-online.target" ] ++ lib.optional cfg.keeper.enable "clickhouse-keeper.service";
       serviceConfig = {
         EnvironmentFile = "${cfg.secretsDir}/server.env";
+        Restart = "on-failure";
+        RestartSec = "2";
         TimeoutStopSec = "300";
       };
-      unitConfig.RequiresMountsFor = cfg.server.dataPath;
+      unitConfig = {
+        RequiresMountsFor = cfg.server.dataPath;
+        StartLimitBurst = 30;
+        StartLimitIntervalSec = 180;
+      };
     };
 
     systemd.services.clickhouse-keeper = lib.mkIf cfg.keeper.enable {
       description = "ClickHouse Keeper";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      after = [
+        "network-online.target"
+        "systemd-tmpfiles-resetup.service"
+      ];
+      wants = [ "network-online.target" ];
       restartIfChanged = false;
       stopIfChanged = false;
       serviceConfig = {
@@ -601,11 +638,22 @@ in
     systemd.tmpfiles.rules = lib.mkMerge [
       (lib.mkIf cfg.server.enable [
         "d ${cfg.server.dataPath} 0750 clickhouse clickhouse - -"
+        "d ${cfg.server.dataPath}/logs 0750 clickhouse clickhouse - -"
+        "d ${cfg.server.dataPath}/tmp 0750 clickhouse clickhouse - -"
+        "d ${cfg.server.dataPath}/user_files 0750 clickhouse clickhouse - -"
+        "d ${cfg.server.dataPath}/format_schemas 0750 clickhouse clickhouse - -"
+        "d ${cfg.server.dataPath}/access 0750 clickhouse clickhouse - -"
+        "Z ${cfg.server.dataPath} 0750 clickhouse clickhouse - -"
         "d ${cfg.secretsDir} 0700 root root - -"
         "d ${dirOf cfg.tls.certFile} 0750 clickhouse clickhouse - -"
       ])
       (lib.mkIf cfg.keeper.enable [
         "d ${cfg.keeper.dataPath} 0750 clickhouse clickhouse - -"
+        "d ${cfg.keeper.dataPath}/logs 0750 clickhouse clickhouse - -"
+        "d ${cfg.keeper.dataPath}/coordination 0750 clickhouse clickhouse - -"
+        "d ${cfg.keeper.dataPath}/coordination/log 0750 clickhouse clickhouse - -"
+        "d ${cfg.keeper.dataPath}/coordination/snapshots 0750 clickhouse clickhouse - -"
+        "Z ${cfg.keeper.dataPath} 0750 clickhouse clickhouse - -"
       ])
     ];
 
