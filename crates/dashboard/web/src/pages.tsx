@@ -1,94 +1,34 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useParams, useSearch } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useParams } from "@tanstack/react-router";
 import * as Dialog from "@radix-ui/react-dialog";
 import { api, payload, specToValues, type Action, type Catalog, type Field, type Resource, type Row } from "./api";
+import { columnsFor } from "./columns";
+import { Bars, Donut, Meter } from "./charts";
+import { displayTitle, formatDate, pretty, rowTitle, text, toneColor, toneFor, usedPercent } from "./format";
+import {
+  ColumnChooser,
+  DataTable,
+  DetailDrawer,
+  Empty,
+  PeekDialog,
+  RowActions,
+  Skeleton,
+  SummaryPage,
+  Toasts,
+  type Toast,
+} from "./views";
 
-const PAGE_SIZE = 25;
-const COLUMN_LIMIT = 8;
-const PREFERRED_COLUMNS = ["name", "id", "title", "status", "state", "phase", "kind", "node_id"];
-
-function cell(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  if (typeof value === "object") return "";
-  return String(value);
-}
-
-function isRecord(value: unknown): value is Row {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function isObjectArray(value: unknown): value is Row[] {
-  return Array.isArray(value) && value.length > 0 && value.every(isRecord);
-}
-
-/** Scalar text for a table cell. Nested objects stay summarized so a disk
- * inventory cannot stringify into a multi-megabyte DOM node. */
-function cellText(value: unknown): string {
-  if (value === null || value === undefined || value === "") return "";
-  if (typeof value === "string") return value.length > 180 ? `${value.slice(0, 177)}…` : value;
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  if (Array.isArray(value)) {
-    if (value.length === 0) return "";
-    if (value.every((item) => item == null || typeof item !== "object")) {
-      const text = value
-        .filter((item) => item != null && item !== "")
-        .map((item) => String(item))
-        .join(", ");
-      return text.length > 180 ? `${text.slice(0, 177)}…` : text;
-    }
-    return String(value.length);
-  }
-  if (isRecord(value)) {
-    const parts = Object.entries(value)
-      .filter(([, item]) => item != null && item !== "" && typeof item !== "object")
-      .slice(0, 3)
-      .map(([key, item]) => `${key}: ${String(item)}`);
-    const text = parts.join(" · ");
-    return text.length > 180 ? `${text.slice(0, 177)}…` : text;
-  }
-  return String(value);
-}
-
-function columnKeys(rows: Row[]): string[] {
-  const present = new Set<string>();
-  for (const row of rows.slice(0, 30)) {
-    for (const key of Object.keys(row)) present.add(key);
-  }
-  const preferred = PREFERRED_COLUMNS.filter((key) => present.has(key));
-  const rest = [...present].filter((key) => !preferred.includes(key));
-  return [...preferred, ...rest].slice(0, COLUMN_LIMIT);
-}
-
-function haystack(row: Row): string {
-  const parts: string[] = [];
-  let size = 0;
-  const push = (text: string) => {
-    if (size > 4000) return;
-    parts.push(text);
-    size += text.length;
-  };
-  const visit = (value: unknown, depth: number) => {
-    if (size > 4000 || value == null || depth > 2) return;
-    if (typeof value !== "object") {
-      push(String(value));
-      return;
-    }
-    if (Array.isArray(value)) {
-      for (const item of value.slice(0, 40)) visit(item, depth + 1);
-      return;
-    }
-    for (const item of Object.values(value as Row)) visit(item, depth + 1);
-  };
-  visit(row, 0);
-  return parts.join("\u0000").toLowerCase();
-}
-
-function pretty(value: unknown): string {
-  const text = JSON.stringify(value, null, 2) ?? "";
-  if (text.length > 80_000) return `${text.slice(0, 80_000)}\n… truncated`;
-  return text;
-}
+const ESSENTIAL = new Set([
+  "name",
+  "cpu",
+  "memory_bytes",
+  "storage_backend",
+  "storage_size_bytes",
+  "image_url",
+  "image_path",
+  "desired_state",
+]);
 
 const LIST_COLUMNS: Record<string, { name: string; kind?: "bool" | "number" }[]> = {
   nics: [{ name: "network" }, { name: "model" }, { name: "mac_address" }],
@@ -130,92 +70,157 @@ function parseList(raw: string | boolean | undefined): Record<string, string | b
   }
 }
 
-function StateChart({ data }: { data: { state: string; count: number }[] }) {
-  if (data.length === 0) return <p className="muted">No virtual machines yet.</p>;
-  const max = Math.max(...data.map((item) => item.count), 1);
-  return (
-    <div className="bars" role="img" aria-label="Virtual machines by state">
-      {data.map((item) => (
-        <div className="bar-row" key={item.state}>
-          <span>{item.state}</span>
-          <div className="bar-track">
-            <div className="bar-fill" style={{ width: `${(item.count / max) * 100}%` }} />
-          </div>
-          <strong>{item.count}</strong>
-        </div>
-      ))}
-    </div>
-  );
+function haystack(row: Row): string {
+  const parts: string[] = [];
+  let size = 0;
+  const visit = (value: unknown, depth: number) => {
+    if (size > 4000 || value == null || depth > 2) return;
+    if (typeof value !== "object") {
+      parts.push(String(value));
+      size += String(value).length;
+      return;
+    }
+    const items = Array.isArray(value) ? value.slice(0, 40) : Object.values(value);
+    for (const item of items) visit(item, depth + 1);
+  };
+  visit(row, 0);
+  return parts.join("\u0000").toLowerCase();
 }
+
+function detailOf(value: unknown): string | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Row;
+    if (Object.keys(record).length === 1 && record.ok === true) return undefined;
+  }
+  return pretty(value);
+}
+
+const STATE_COLORS = ["#10b981", "#f59e0b", "#f87171", "#6366f1", "#8b5cf6", "#3b82f6"];
 
 export function Overview() {
   const health = useQuery({
-    queryKey: ["rows", "health"],
+    queryKey: ["rows", "health", ""],
     queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/health"),
   });
   const compliance = useQuery({
-    queryKey: ["rows", "compliance"],
+    queryKey: ["rows", "compliance", ""],
     queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/compliance"),
   });
   const vms = useQuery({
     queryKey: ["rows", "vms", ""],
     queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/vms"),
   });
+  const nodes = useQuery({
+    queryKey: ["rows", "nodes", ""],
+    queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/nodes"),
+  });
   const row = health.data?.rows?.[0] ?? {};
   const report = compliance.data?.rows?.[0] ?? {};
   const chart = useMemo(() => {
     const counts = new Map<string, number>();
     for (const vm of vms.data?.rows ?? []) {
-      const state = cell(vm.state) || "unknown";
+      const state = text(vm.state) || "unknown";
       counts.set(state, (counts.get(state) ?? 0) + 1);
     }
     return [...counts.entries()].map(([state, count]) => ({ state, count }));
   }, [vms.data]);
-  const error = health.error ?? compliance.error ?? vms.error;
-  const loading = !error && (health.isLoading || compliance.isLoading || vms.isLoading);
+  const slices = chart.map((item, index) => ({
+    label: item.state,
+    value: item.count,
+    color: toneColor(toneFor(item.state)) === "#6366f1" ? STATE_COLORS[index % STATE_COLORS.length] : toneColor(toneFor(item.state)),
+  }));
+  const running = chart.find((item) => item.state === "running")?.count;
+  const status = text(row.status);
+  const conditions = Array.isArray(row.conditions) ? row.conditions.map((item) => text(item)).filter(Boolean) : [];
+  const capacity = (nodes.data?.rows ?? [])
+    .map((node) => ({
+      name: text(node.hostname) || text(node.name) || text(node.id),
+      cpu: usedPercent(node.cpu_used, node.cpu),
+      memory: usedPercent(node.memory_used, node.memory),
+    }))
+    .filter((node) => node.name && (node.cpu !== null || node.memory !== null))
+    .slice(0, 6);
+  const error = health.error ?? vms.error;
+  const loading = !error && (health.isLoading || vms.isLoading);
 
   return (
-    <>
+    <div className="stack">
       <header className="top">
-        <h1>Overview</h1>
+        <div>
+          <p className="eyebrow">Cluster</p>
+          <h1>Overview</h1>
+        </div>
       </header>
       {error ? <p className="error">{(error as Error).message}</p> : null}
-      {loading ? <p className="muted">Loading cluster…</p> : null}
+      {loading ? <Skeleton /> : null}
+      {status || text(row.headline) ? (
+        <div className={`banner ${toneFor(status)}`}>
+          {status ? <span className={`pill ${toneFor(status)}`}>{status}</span> : null}
+          <strong>{text(row.headline) || "Cluster"}</strong>
+        </div>
+      ) : null}
       <div className="grid">
         <div className="card">
-          <span className="muted">Cluster</span>
-          <strong className="metric">{cell(row.headline) || cell(row.status) || "—"}</strong>
-        </div>
-        <div className="card">
           <span className="muted">Ready nodes</span>
-          <strong className="metric">{cell(row.ready_nodes) || "—"}</strong>
+          <strong className="metric">{text(row.ready_nodes) || "—"}</strong>
         </div>
         <div className="card">
           <span className="muted">Virtual machines</span>
-          <strong className="metric">{cell(row.vm_count) || String(vms.data?.rows.length ?? "—")}</strong>
+          <strong className="metric">{text(row.vm_count) || String(vms.data?.rows.length ?? "—")}</strong>
         </div>
         <div className="card">
-          <span className="muted">Running VMs</span>
-          <strong className="metric">{cell(report.running_vms) || "—"}</strong>
+          <span className="muted">Running</span>
+          <strong className="metric">{(running ?? text(report.running_vms)) || "—"}</strong>
+        </div>
+        <div className="card">
+          <span className="muted">Not ready</span>
+          <strong className="metric">{text(row.not_ready_nodes) || "0"}</strong>
         </div>
       </div>
-      <div className="card chart-card">
-        <span className="muted">VMs by state</span>
-        <StateChart data={chart} />
+      <div className="split">
+        <section className="card stack">
+          <h2>Virtual machines</h2>
+          <Donut slices={slices} />
+        </section>
+        <section className="card stack">
+          <h2>By state</h2>
+          <Bars label="Virtual machines by state" items={chart.map((item) => ({ label: item.state, value: item.count, color: toneColor(toneFor(item.state)) }))} />
+        </section>
       </div>
-    </>
+      {capacity.length ? (
+        <section className="card stack">
+          <h2>Node capacity</h2>
+          {capacity.map((node) => (
+            <div key={node.name} className="stack">
+              <strong>{node.name}</strong>
+              {node.cpu !== null ? <Meter label="CPU" percent={node.cpu} /> : null}
+              {node.memory !== null ? <Meter label="Memory" percent={node.memory} /> : null}
+            </div>
+          ))}
+        </section>
+      ) : null}
+      {conditions.length ? (
+        <section className="card stack">
+          <h2>Conditions</h2>
+          <ul className="alerts">
+            {conditions.map((condition) => (
+              <li key={condition}>{condition}</li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      <div className="quick">
+        <Link to="/r/$id" params={{ id: "vms" }} search={{ q: "" }}>Virtual machines</Link>
+        <Link to="/r/$id" params={{ id: "nodes" }} search={{ q: "" }}>Nodes</Link>
+        <Link to="/r/$id" params={{ id: "health" }} search={{ q: "" }}>Health</Link>
+        <Link to="/r/$id" params={{ id: "storage" }} search={{ q: "" }}>Host storage</Link>
+        <Link to="/r/$id" params={{ id: "audit" }} search={{ q: "" }}>Audit</Link>
+      </div>
+    </div>
   );
 }
 
-function ListField({
-  field,
-  value,
-  onChange,
-}: {
-  field: Field;
-  value: string | boolean | undefined;
-  onChange: (value: string) => void;
-}) {
+function ListField({ field, value, onChange }: { field: Field; value: string | boolean | undefined; onChange: (value: string) => void }) {
   const columns = LIST_COLUMNS[field.name] ?? [{ name: "value" }];
   const rows = parseList(value);
   function write(next: Record<string, string | boolean>[]) {
@@ -237,9 +242,7 @@ function ListField({
                   type="checkbox"
                   checked={Boolean(row[column.name])}
                   onChange={(event) => {
-                    const next = rows.map((item, itemIndex) =>
-                      itemIndex === index ? { ...item, [column.name]: event.target.checked } : item,
-                    );
+                    const next = rows.map((item, itemIndex) => (itemIndex === index ? { ...item, [column.name]: event.target.checked } : item));
                     write(next);
                   }}
                 />
@@ -251,9 +254,7 @@ function ListField({
                 type={column.kind === "number" ? "number" : "text"}
                 value={String(row[column.name] ?? "")}
                 onChange={(event) => {
-                  const next = rows.map((item, itemIndex) =>
-                    itemIndex === index ? { ...item, [column.name]: event.target.value } : item,
-                  );
+                  const next = rows.map((item, itemIndex) => (itemIndex === index ? { ...item, [column.name]: event.target.value } : item));
                   write(next);
                 }}
               />
@@ -271,15 +272,7 @@ function ListField({
   );
 }
 
-function Fields({
-  fields,
-  values,
-  onChange,
-}: {
-  fields: Field[];
-  values: Record<string, string | boolean>;
-  onChange: (name: string, value: string | boolean) => void;
-}) {
+function Fields({ fields, values, onChange }: { fields: Field[]; values: Record<string, string | boolean>; onChange: (name: string, value: string | boolean) => void }) {
   return (
     <>
       {fields.map((field) =>
@@ -291,16 +284,13 @@ function Fields({
             {field.required ? " *" : ""}
             {field.kind === "bool" ? (
               <input type="checkbox" checked={Boolean(values[field.name])} onChange={(event) => onChange(field.name, event.target.checked)} />
-            ) : field.name.includes("nix") ||
-              field.name.endsWith("_pem") ||
-              field.name === "public_key" ||
-              field.name === "cloud_init_user_data" ||
-              field.name === "sqlite_base64" ? (
+            ) : field.name.includes("nix") || field.name.endsWith("_pem") || field.name === "public_key" || field.name === "cloud_init_user_data" || field.name === "sqlite_base64" ? (
               <textarea value={String(values[field.name] ?? "")} onChange={(event) => onChange(field.name, event.target.value)} />
             ) : (
               <input
                 type={field.kind === "number" ? "number" : "text"}
                 value={String(values[field.name] ?? "")}
+                required={field.required}
                 onChange={(event) => onChange(field.name, event.target.value)}
               />
             )}
@@ -320,176 +310,124 @@ type FormRequest = {
   requireForce: boolean;
   resourceId: string;
   rowKey: string;
+  hint: string;
   submit: (form: Record<string, string | boolean>) => Promise<void>;
 };
 
-function Pager({ page, total, onPage }: { page: number; total: number; onPage: (page: number) => void }) {
-  if (total <= PAGE_SIZE) return null;
-  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const safe = Math.min(page, pages - 1);
-  const start = safe * PAGE_SIZE + 1;
-  const end = Math.min(total, start + PAGE_SIZE - 1);
-  return (
-    <div className="pager">
-      <button type="button" disabled={safe === 0} onClick={() => onPage(safe - 1)}>
-        Previous
-      </button>
-      <span className="muted">
-        {start}–{end} of {total}
-      </span>
-      <button type="button" disabled={safe + 1 >= pages} onClick={() => onPage(safe + 1)}>
-        Next
-      </button>
-    </div>
-  );
-}
-
-function DataTable({ rows, trailing, onRow }: { rows: Row[]; trailing?: (row: Row) => ReactNode; onRow?: (row: Row) => void }) {
-  const [page, setPage] = useState(0);
-  const keys = useMemo(() => columnKeys(rows), [rows]);
-  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
-  const safe = Math.min(page, pages - 1);
-  const slice = rows.slice(safe * PAGE_SIZE, safe * PAGE_SIZE + PAGE_SIZE);
-  if (rows.length === 0) return <p className="muted">Nothing here yet.</p>;
-  return (
-    <>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              {keys.map((key) => (
-                <th key={key}>{key}</th>
-              ))}
-              {trailing ? <th /> : null}
-            </tr>
-          </thead>
-          <tbody>
-            {slice.map((row, index) => (
-              <tr
-                key={cell(row.id) || cell(row.name) || String(safe * PAGE_SIZE + index)}
-                className={onRow ? "inspect" : undefined}
-                onClick={onRow ? () => onRow(row) : undefined}
-              >
-                {keys.map((key) => {
-                  const text = cellText(row[key]);
-                  return (
-                    <td key={key} title={text}>
-                      {text}
-                    </td>
-                  );
-                })}
-                {trailing ? <td>{trailing(row)}</td> : null}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <Pager page={safe} total={rows.length} onPage={setPage} />
-    </>
-  );
-}
-
-function Summary({ row }: { row: Row }) {
-  const scalars = Object.entries(row).filter(([, value]) => !isObjectArray(value));
-  const tables = Object.entries(row).filter((entry): entry is [string, Row[]] => isObjectArray(entry[1]));
-  return (
-    <>
-      <div className="grid">
-        {scalars.map(([key, value]) => (
-          <div className="card" key={key}>
-            <span className="muted">{key}</span>
-            <strong>{cellText(value) || "—"}</strong>
-          </div>
-        ))}
-      </div>
-      {tables.map(([key, nested]) => (
-        <section key={key} className="nested">
-          <h2>{key}</h2>
-          <DataTable rows={nested} />
-        </section>
-      ))}
-    </>
-  );
-}
-
-function isSummary(rows: Row[]): boolean {
-  if (rows.length !== 1) return false;
-  const row = rows[0];
-  return Object.values(row).some(isObjectArray) || Object.keys(row).length > COLUMN_LIMIT;
+function useShownColumns(id: string, rows: Row[]) {
+  const defs = useMemo(() => columnsFor(id, rows), [id, rows]);
+  const [picked, setPicked] = useState<string[] | null>(null);
+  useEffect(() => {
+    setPicked(null);
+  }, [id]);
+  const defaults = defs.filter((column) => !column.hidden).map((column) => column.key);
+  const shown = (picked ?? defaults).filter((key) => defs.some((column) => column.key === key));
+  const visible = shown.length ? shown : defaults;
+  function toggle(key: string) {
+    const next = new Set(visible);
+    if (next.has(key)) {
+      if (next.size === 1) return;
+      next.delete(key);
+    } else next.add(key);
+    setPicked(defs.filter((column) => next.has(column.key)).map((column) => column.key));
+  }
+  return { defs, shown: visible, toggle };
 }
 
 export function ResourcePage() {
   const { id } = useParams({ from: "/r/$id" });
+  const { q } = useSearch({ from: "/r/$id" });
   const queryClient = useQueryClient();
-  const catalog = useQuery({
-    queryKey: ["catalog"],
-    queryFn: () => api<Catalog>("/api/v1/catalog"),
-  });
+  const catalog = useQuery({ queryKey: ["catalog"], queryFn: () => api<Catalog>("/api/v1/catalog") });
   const resource = catalog.data?.resources.find((item) => item.id === id);
   const [volume, setVolume] = useState("");
-  const [filter, setFilter] = useState("");
-  const [notice, setNotice] = useState("");
+  const [filter, setFilter] = useState(q);
+  const [since, setSince] = useState("");
+  const [auditAction, setAuditAction] = useState("");
+  const [nodeId, setNodeId] = useState("");
+  const deferredSince = useDeferredValue(since);
+  const deferredAction = useDeferredValue(auditAction);
+  const deferredNode = useDeferredValue(nodeId);
   const [request, setRequest] = useState<FormRequest | null>(null);
-  const [detail, setDetail] = useState("");
-  const [detailOpen, setDetailOpen] = useState(false);
+  const [drawer, setDrawer] = useState<{ row: Row; body: unknown; loading: boolean; error: string } | null>(null);
+  const [peek, setPeek] = useState<{ title: string; rows: Row[] } | null>(null);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const toastId = useRef(1);
 
   useEffect(() => {
+    setFilter(q);
     setVolume("");
-    setFilter("");
-    setNotice("");
+    setSince("");
+    setAuditAction("");
+    setNodeId("");
     setRequest(null);
-    setDetailOpen(false);
-  }, [id]);
+    setDrawer(null);
+    setPeek(null);
+  }, [id, q]);
 
-  const listKey = id === "snapshots" ? volume : "";
+  function push(toast: Omit<Toast, "id">) {
+    const nextId = toastId.current++;
+    setToasts((current) => [...current.slice(-3), { ...toast, id: nextId }]);
+    window.setTimeout(() => setToasts((current) => current.filter((item) => item.id !== nextId)), 8000);
+  }
+
+  const listKey = id === "snapshots" ? volume : id === "audit" ? [deferredSince, deferredAction].filter(Boolean).join("|") : id === "gpus" ? deferredNode : "";
   const rows = useQuery({
     queryKey: ["rows", id, listKey],
     enabled: Boolean(resource?.list),
+    refetchInterval: id === "operations" ? 5_000 : false,
     queryFn: () => {
-      const query = id === "snapshots" && volume ? `?volume=${encodeURIComponent(volume)}` : "";
-      return api<{ rows: Row[] }>(`/api/v1/resources/${id}${query}`);
+      const params = new URLSearchParams();
+      if (id === "snapshots" && volume) params.set("volume", volume);
+      if (id === "audit" && deferredSince) params.set("since", deferredSince);
+      if (id === "audit" && deferredAction) params.set("action", deferredAction);
+      if (id === "gpus" && deferredNode) params.set("node_id", deferredNode);
+      const query = params.toString();
+      return api<{ rows: Row[] }>(`/api/v1/resources/${id}${query ? `?${query}` : ""}`);
     },
   });
 
-  const indexed = useMemo(
-    () => (rows.data?.rows ?? []).map((row) => ({ row, haystack: haystack(row) })),
-    [rows.data],
-  );
+  const indexed = useMemo(() => (rows.data?.rows ?? []).map((row) => ({ row, haystack: haystack(row) })), [rows.data]);
   const visible = useMemo(() => {
     const query = filter.trim().toLowerCase();
     if (!query) return indexed.map((item) => item.row);
     return indexed.filter((item) => item.haystack.includes(query)).map((item) => item.row);
   }, [indexed, filter]);
-  const summary = isSummary(visible);
+  const { defs, shown, toggle } = useShownColumns(id, visible);
+  const board = visible.length === 1 && (rows.data?.rows.length ?? 0) === 1;
 
   async function run(action: Action, row?: Row, form: Record<string, string | boolean> = {}) {
     if (!resource) return;
-    if (action.client && row) {
-      window.location.assign(`/vms/${cell(row[resource.idField])}/console`);
-      return;
+    try {
+      const idValue = row ? text(row[resource.idField]) : text(form.name);
+      const result = await api<unknown>(`/api/v1/resources/${resource.id}/actions`, {
+        method: "POST",
+        body: JSON.stringify({
+          action: action.name,
+          id: idValue,
+          confirm: action.confirm || Boolean(form.confirm),
+          extra: { ...(row ?? {}), ...payload(action.fields, form) },
+        }),
+      });
+      push({ tone: "ok", title: `${action.label} sent`, detail: detailOf(result) });
+      await queryClient.invalidateQueries({ queryKey: ["rows", resource.id] });
+    } catch (error) {
+      push({ tone: "bad", title: (error as Error).message });
     }
-    const idValue = row ? cell(row[resource.idField]) : cell(form.name);
-    const result = await api<unknown>(`/api/v1/resources/${resource.id}/actions`, {
-      method: "POST",
-      body: JSON.stringify({
-        action: action.name,
-        id: idValue,
-        confirm: action.confirm || Boolean(form.confirm),
-        extra: { ...(row ?? {}), ...payload(action.fields, form) },
-      }),
-    });
-    setNotice(pretty(result));
-    await queryClient.invalidateQueries({ queryKey: ["rows", resource.id] });
   }
 
   async function create(form: Record<string, string | boolean>) {
     if (!resource) return;
-    const result = await api<unknown>(`/api/v1/resources/${resource.id}`, {
-      method: "POST",
-      body: JSON.stringify(payload(resource.fields, form)),
-    });
-    setNotice(pretty(result));
-    await queryClient.invalidateQueries({ queryKey: ["rows", resource.id] });
+    try {
+      const result = await api<unknown>(`/api/v1/resources/${resource.id}`, {
+        method: "POST",
+        body: JSON.stringify(payload(resource.fields, form)),
+      });
+      push({ tone: "ok", title: `${displayTitle(resource.id, resource.title)} created`, detail: detailOf(result) });
+      await queryClient.invalidateQueries({ queryKey: ["rows", resource.id] });
+    } catch (error) {
+      push({ tone: "bad", title: (error as Error).message });
+    }
   }
 
   function openForm(
@@ -507,57 +445,74 @@ export function ResourcePage() {
       confirm: Boolean(options.confirm),
       requireForce: Boolean(options.requireForce),
       resourceId: resource.id,
-      rowKey: options.row ? cell(options.row[resource.idField]) : "",
+      rowKey: options.row ? text(options.row[resource.idField]) : "",
+      hint: options.row ? rowTitle(options.row) : "",
       submit,
     });
   }
 
-  async function openDetail(row: Row) {
-    if (!resource?.inspect) return;
-    const key = cell(row[resource.idField]);
-    const body = await api<unknown>(`/api/v1/resources/${resource.id}/items/${encodeURIComponent(key)}`);
-    setDetail(pretty(body));
-    setDetailOpen(true);
+  function openDrawer(row: Row) {
+    if (!resource) return;
+    setDrawer({ row, body: null, loading: Boolean(resource.inspect), error: "" });
+    if (!resource.inspect) return;
+    const key = text(row[resource.idField]);
+    if (!key) {
+      setDrawer({ row, body: null, loading: false, error: "This row has no id." });
+      return;
+    }
+    api<unknown>(`/api/v1/resources/${resource.id}/items/${encodeURIComponent(key)}`)
+      .then((body) => setDrawer((current) => (current && current.row === row ? { ...current, body, loading: false } : current)))
+      .catch((error: Error) => setDrawer((current) => (current && current.row === row ? { ...current, loading: false, error: error.message } : current)));
   }
 
-  if (!resource && catalog.isSuccess) {
-    return <p className="error">Unknown resource.</p>;
-  }
+  if (!resource && catalog.isSuccess) return <p className="error">Unknown resource.</p>;
 
   const actions = (row?: Row) =>
-    resource ? <RowActions resource={resource} row={row} onOpen={openForm} onRun={run} onInspect={openDetail} /> : null;
+    resource ? <RowActions resource={resource} row={row} onOpen={openForm} onRun={run} onInspect={openDrawer} /> : null;
+  const updated = rows.dataUpdatedAt ? formatDate(new Date(rows.dataUpdatedAt).toISOString()) : "";
 
   return (
-    <>
+    <div className="stack">
       <header className="top">
         <div>
-          <h1>{resource?.title ?? id}</h1>
+          {resource ? <p className="eyebrow">{resource.group}</p> : null}
+          <h1>{resource ? displayTitle(resource.id, resource.title) : id}</h1>
           {resource ? (
             <p className="muted">
               {resource.kctl ? `kctl ${resource.kctl}` : ""}
               {resource.terraform.length ? ` · ${resource.terraform.join(", ")}` : ""}
+              {updated ? ` · updated ${updated}` : ""}
             </p>
           ) : null}
         </div>
+        {resource?.list ? (
+          <button type="button" onClick={() => rows.refetch()} disabled={rows.isFetching}>
+            Refresh
+          </button>
+        ) : null}
       </header>
       <div className="toolbar">
-        {resource?.list ? (
-          <input
-            placeholder="Filter"
-            aria-label="Filter"
-            value={filter}
-            onChange={(event) => setFilter(event.target.value)}
-          />
+        {resource?.list && !board ? (
+          <input placeholder="Filter" aria-label="Filter" value={filter} onChange={(event) => setFilter(event.target.value)} />
         ) : null}
         {id === "snapshots" ? (
           <input placeholder="Volume" aria-label="Volume" value={volume} onChange={(event) => setVolume(event.target.value)} />
+        ) : null}
+        {id === "audit" ? (
+          <>
+            <input placeholder="Since" aria-label="Since" value={since} onChange={(event) => setSince(event.target.value)} />
+            <input placeholder="Action" aria-label="Audit action" value={auditAction} onChange={(event) => setAuditAction(event.target.value)} />
+          </>
+        ) : null}
+        {id === "gpus" ? (
+          <input placeholder="Node" aria-label="Node" value={nodeId} onChange={(event) => setNodeId(event.target.value)} />
         ) : null}
         {resource?.creatable ? (
           <button
             type="button"
             className="primary"
             onClick={() =>
-              openForm(`Create ${resource.title}`, resource.fields, create, {
+              openForm(`Create ${displayTitle(resource.id, resource.title)}`, resource.fields, create, {
                 checks: resource.actions.filter((action) => action.name === "plan" || action.name === "classify"),
               })
             }
@@ -571,6 +526,7 @@ export function ResourcePage() {
                 <button
                   type="button"
                   key={action.name}
+                  className={action.confirm ? "danger" : ""}
                   onClick={() => openForm(action.label, action.fields, (form) => run(action, undefined, form), { confirm: action.confirm })}
                 >
                   {action.label}
@@ -578,123 +534,55 @@ export function ResourcePage() {
               ),
             )
           : null}
-        {summary && visible[0] ? actions(visible[0]) : null}
+        {board && visible[0] ? actions(visible[0]) : null}
+        {resource?.list && !board && defs.length ? <ColumnChooser columns={defs} shown={shown} onToggle={toggle} /> : null}
       </div>
-      {catalog.isLoading ? <p className="muted">Loading…</p> : null}
+      {catalog.isLoading || (resource?.list && rows.isLoading) ? <Skeleton /> : null}
       {rows.isError ? <p className="error">{(rows.error as Error).message}</p> : null}
-      {resource && !resource.list ? <p className="muted">The controller has no list for this resource. Create it, then delete by name.</p> : null}
-      {resource?.list && rows.isLoading ? <p className="muted">Loading…</p> : null}
+      {resource && !resource.list ? (
+        <Empty title="No inventory for this resource" body="Create it here, then delete it by name. The controller does not return a list." />
+      ) : null}
       {resource?.list && rows.isSuccess ? (
-        summary && visible[0] ? (
-          <Summary row={visible[0]} />
+        board && visible[0] ? (
+          <SummaryPage id={id} row={visible[0]} onPeek={(title, nested) => setPeek({ title, rows: nested })} />
         ) : (
           <DataTable
-            key={filter}
             rows={visible}
-            onRow={resource.inspect ? (row) => openDetail(row).catch((error: Error) => setNotice(error.message)) : undefined}
-            trailing={(row) => actions(row)}
+            columns={defs}
+            shown={shown}
+            resetKey={`${id}:${filter}`}
+            onPeek={(title, nested) => setPeek({ title, rows: nested })}
+            onRow={openDrawer}
+            trailing={resource.inspect || resource.actions.length ? (row) => actions(row) : undefined}
           />
         )
       ) : null}
-      {notice ? <pre className="log">{notice}</pre> : null}
-      <FormDialog
-        request={request}
-        onClose={() => setRequest(null)}
-        onError={(message) => setNotice(message)}
+      <Toasts items={toasts} onClose={(toast) => setToasts((current) => current.filter((item) => item.id !== toast))} />
+      <PeekDialog peek={peek} onClose={() => setPeek(null)} />
+      <DetailDrawer
+        open={drawer !== null}
+        title={drawer ? rowTitle(drawer.row) : "Details"}
+        row={drawer?.row ?? null}
+        body={drawer?.body}
+        loading={Boolean(drawer?.loading)}
+        error={drawer?.error ?? ""}
+        actions={drawer ? actions(drawer.row) : null}
+        onClose={() => setDrawer(null)}
       />
-      <Dialog.Root open={detailOpen} onOpenChange={setDetailOpen}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="overlay" />
-          <Dialog.Content className="dialog wide">
-            <Dialog.Title>Detail</Dialog.Title>
-            <pre className="detail">{detail}</pre>
-            <div className="buttons">
-              <Dialog.Close asChild>
-                <button type="button">Close</button>
-              </Dialog.Close>
-            </div>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
-    </>
-  );
-}
-
-function RowActions({
-  resource,
-  row,
-  onOpen,
-  onRun,
-  onInspect,
-}: {
-  resource: Resource;
-  row?: Row;
-  onOpen: (
-    title: string,
-    fields: Field[],
-    submit: (form: Record<string, string | boolean>) => Promise<void>,
-    options?: { checks?: Action[]; preload?: boolean; confirm?: boolean; requireForce?: boolean; row?: Row },
-  ) => void;
-  onRun: (action: Action, row: Row, form?: Record<string, string | boolean>) => Promise<void>;
-  onInspect: (row: Row) => Promise<void>;
-}) {
-  const idValue = row ? cell(row[resource.idField]) : "";
-  return (
-    <div className="row-actions" onClick={(event) => event.stopPropagation()}>
-      {resource.inspect && row ? (
-        <button type="button" onClick={() => onInspect(row).catch((error: Error) => alert(error.message))}>
-          Inspect
-        </button>
-      ) : null}
-      {resource.actions.map((action) =>
-        action.client ? (
-          <a key={action.name} href={`/vms/${idValue}/console`}>
-            {action.label}
-          </a>
-        ) : action.fields.length || action.confirm || action.preload ? (
-          <button
-            type="button"
-            key={action.name}
-            className={action.confirm ? "danger" : ""}
-            onClick={() =>
-              onOpen(action.label, action.fields, (form) => onRun(action, row ?? {}, form), {
-                confirm: action.confirm,
-                preload: action.preload,
-                requireForce: action.name === "reset-migrate",
-                row,
-              })
-            }
-          >
-            {action.label}
-          </button>
-        ) : (
-          <button
-            type="button"
-            key={action.name}
-            onClick={() => row && onRun(action, row).catch((error: Error) => alert(error.message))}
-          >
-            {action.label}
-          </button>
-        ),
-      )}
+      <FormDialog request={request} onClose={() => setRequest(null)} onError={(message) => push({ tone: "bad", title: message })} />
     </div>
   );
 }
 
-function FormDialog({
-  request,
-  onClose,
-  onError,
-}: {
-  request: FormRequest | null;
-  onClose: () => void;
-  onError: (message: string) => void;
-}) {
+function FormDialog({ request, onClose, onError }: { request: FormRequest | null; onClose: () => void; onError: (message: string) => void }) {
   const [values, setValues] = useState<Record<string, string | boolean>>({});
   const [note, setNote] = useState("");
   const [ready, setReady] = useState(true);
   const [loadError, setLoadError] = useState("");
-  const wide = request?.fields.some((field) => field.kind === "json") ?? false;
+  const fields = request?.fields ?? [];
+  const essential = fields.filter((field) => ESSENTIAL.has(field.name));
+  const rest = fields.filter((field) => !ESSENTIAL.has(field.name));
+  const split = fields.length > 8 && essential.length > 0;
   const blocked = Boolean(request && ((request.requireForce && !values.force) || (request.preload && !ready)));
 
   useEffect(() => {
@@ -708,9 +596,7 @@ function FormDialog({
     }
     let cancel = false;
     setReady(false);
-    api<{ spec?: Record<string, unknown> }>(
-      `/api/v1/resources/${request.resourceId}/items/${encodeURIComponent(request.rowKey)}`,
-    )
+    api<{ spec?: Record<string, unknown> }>(`/api/v1/resources/${request.resourceId}/items/${encodeURIComponent(request.rowKey)}`)
       .then((body) => {
         if (cancel) return;
         if (!body.spec) {
@@ -735,7 +621,7 @@ function FormDialog({
         method: "POST",
         body: JSON.stringify({
           action: action.name,
-          id: cell(values.name),
+          id: text(values.name),
           confirm: Boolean(values.confirm),
           extra: payload(request.fields, values),
         }),
@@ -750,20 +636,24 @@ function FormDialog({
     <Dialog.Root open={request !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="overlay" />
-        <Dialog.Content className={wide ? "dialog wide" : "dialog"}>
+        <Dialog.Content className={fields.some((field) => field.kind === "json") || split ? "dialog wide" : "dialog"}>
           <Dialog.Title>{request?.title ?? ""}</Dialog.Title>
-          {request?.confirm ? <p>This changes the cluster.</p> : null}
+          {request?.confirm ? (
+            <p>{request.hint ? `${request.title} ${request.hint}.` : `${request.title}.`} This changes the cluster.</p>
+          ) : null}
           {request?.requireForce ? (
             <p>Force clears a stranded receive session on the named node. The controller refuses the node that owns the running VM.</p>
           ) : null}
           {request?.preload ? <p>Loaded from the current cluster spec. Apply sends this form back as the replacement.</p> : null}
           {loadError ? <p className="error">{loadError}</p> : null}
-          <Fields
-            fields={request?.fields ?? []}
-            values={values}
-            onChange={(name, value) => setValues((current) => ({ ...current, [name]: value }))}
-          />
-          {note ? <pre className="detail">{note}</pre> : null}
+          <Fields fields={split ? essential : fields} values={values} onChange={(name, value) => setValues((current) => ({ ...current, [name]: value }))} />
+          {split ? (
+            <details className="advanced">
+              <summary>Advanced</summary>
+              <Fields fields={rest} values={values} onChange={(name, value) => setValues((current) => ({ ...current, [name]: value }))} />
+            </details>
+          ) : null}
+          {note ? <pre className="code">{note}</pre> : null}
           <div className="buttons">
             {request?.checks.map((action) => (
               <button key={action.name} type="button" onClick={() => runCheck(action)}>
