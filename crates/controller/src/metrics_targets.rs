@@ -50,15 +50,73 @@ pub fn render_node_targets(db: &Database, scrape_port: u16) -> Result<String, St
         .map_err(|e| format!("serializing metrics file_sd targets: {e}"))
 }
 
+/// `https://<advertise>:<https port>` for each ClickHouse server member.
+///
+/// Keeper-only members are omitted. A cluster with TLS disabled is omitted:
+/// there is no plaintext public scrape. The metrics password stays in
+/// `GetClickhouseClusterCredentials` and is not written here.
+pub fn render_clickhouse_targets(db: &Database) -> Result<String, String> {
+    let clusters = db
+        .list_clickhouse_clusters()
+        .map_err(|e| format!("listing clickhouse clusters for metrics targets: {e}"))?;
+    let mut entries = Vec::new();
+    for cluster in clusters {
+        let spec = crate::clickhouse_convert::spec_from_json(&cluster.spec_json)?;
+        if spec.tls.disabled {
+            continue;
+        }
+        let port = if spec.ports.https > 0 {
+            spec.ports.https
+        } else {
+            8443
+        };
+        let members = db
+            .list_clickhouse_members(&cluster.name)
+            .map_err(|e| format!("listing clickhouse members for metrics targets: {e}"))?;
+        for member in members {
+            if !member.server || member.advertise_address.is_empty() {
+                continue;
+            }
+            let mut labels = BTreeMap::new();
+            labels.insert("cluster".to_string(), cluster.name.clone());
+            labels.insert("shard".to_string(), member.shard_name.clone());
+            labels.insert("replica".to_string(), member.replica_name.clone());
+            labels.insert("node".to_string(), member.node_id.clone());
+            entries.push(FileSdTarget {
+                targets: vec![https_target(&member.advertise_address, port)],
+                labels,
+            });
+        }
+    }
+    serde_json::to_string_pretty(&entries)
+        .map_err(|e| format!("serializing clickhouse file_sd targets: {e}"))
+}
+
+fn https_target(address: &str, port: i32) -> String {
+    if address.contains(':') && !address.starts_with('[') {
+        format!("https://[{address}]:{port}")
+    } else {
+        format!("https://{address}:{port}")
+    }
+}
+
 /// Atomically rewrite `cfg.file_sd_path` from the current node inventory.
 pub fn write_node_targets(db: &Database, cfg: &MetricsConfig) -> Result<(), String> {
     let body = render_node_targets(db, cfg.scrape_port)?;
-    let path = Path::new(&cfg.file_sd_path);
+    write_file_sd(Path::new(&cfg.file_sd_path), &body)
+}
+
+/// Atomically rewrite the ClickHouse scrape file.
+pub fn write_clickhouse_targets(db: &Database, cfg: &MetricsConfig) -> Result<(), String> {
+    let body = render_clickhouse_targets(db)?;
+    write_file_sd(Path::new(&cfg.clickhouse_file_sd_path), &body)
+}
+
+fn write_file_sd(path: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating metrics file_sd dir {}: {e}", parent.display()))?;
     }
-
     let tmp = temp_path_beside(path);
     std::fs::write(&tmp, format!("{body}\n"))
         .map_err(|e| format!("writing metrics file_sd temp {}: {e}", tmp.display()))?;
@@ -94,6 +152,9 @@ pub fn spawn_file_sd_writer(db: Database, cfg: MetricsConfig) {
     if let Err(e) = write_node_targets(&db, &cfg) {
         warn!(error = %e, "initial metrics file_sd write failed");
     }
+    if let Err(e) = write_clickhouse_targets(&db, &cfg) {
+        warn!(error = %e, "initial clickhouse file_sd write failed");
+    }
 
     tokio::spawn(async move {
         let mut ticker =
@@ -104,6 +165,12 @@ pub fn spawn_file_sd_writer(db: Database, cfg: MetricsConfig) {
             match write_node_targets(&db, &cfg) {
                 Ok(()) => debug!(path = %cfg.file_sd_path, "refreshed metrics file_sd targets"),
                 Err(e) => warn!(error = %e, "metrics file_sd write failed"),
+            }
+            match write_clickhouse_targets(&db, &cfg) {
+                Ok(()) => {
+                    debug!(path = %cfg.clickhouse_file_sd_path, "refreshed clickhouse file_sd targets");
+                }
+                Err(e) => warn!(error = %e, "clickhouse file_sd write failed"),
             }
         }
     });
@@ -172,11 +239,110 @@ mod tests {
             enabled: true,
             file_sd_path: path.to_string_lossy().into(),
             scrape_port: 9100,
-            refresh_interval_secs: 30,
+            ..MetricsConfig::default()
         };
         write_node_targets(&db, &cfg).expect("write");
         let body = std::fs::read_to_string(&path).expect("read");
         assert!(body.contains("10.0.0.5:9100"), "{body}");
         assert!(!dir.path().join(".nodes.json.tmp").exists());
+    }
+
+    #[test]
+    fn clickhouse_targets_list_server_https_and_omit_keepers_and_secrets() {
+        let db = Database::open(":memory:").expect("db");
+        for id in ["node-105", "node-106", "node-108", "node-109", "node-200"] {
+            db.upsert_node(&sample_node(id, "127.0.0.1:9", id))
+                .expect("node");
+        }
+        let yaml = r#"
+kind: ClickhouseCluster
+metadata:
+  name: analytics
+spec:
+  shards:
+    - replicas:
+        - {nodeId: node-105, advertiseAddress: 192.168.40.105, iface: enp6s0}
+        - {nodeId: node-106, advertiseAddress: "2001:db8::106", iface: enp6s0}
+  keepers:
+    - {nodeId: node-105, advertiseAddress: 192.168.40.105, iface: enp6s0}
+    - {nodeId: node-108, advertiseAddress: 192.168.40.108, iface: enp6s0}
+    - {nodeId: node-109, advertiseAddress: 192.168.40.109, iface: enp6s0}
+"#;
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(yaml).expect("manifest");
+        kcore_clickhouse::normalize(&mut spec);
+        db.insert_clickhouse_cluster(&crate::clickhouse_db::ClusterRow {
+            name: "analytics".into(),
+            generation: 1,
+            phase: "ready".into(),
+            message: String::new(),
+            spec_json: serde_json::to_string(&spec).unwrap(),
+            observed_version: String::new(),
+            active_operation_id: String::new(),
+        })
+        .unwrap();
+        db.replace_clickhouse_members(
+            "analytics",
+            &crate::clickhouse_convert::members_from_spec("analytics", &spec),
+        )
+        .unwrap();
+        db.upsert_clickhouse_secrets(
+            "analytics",
+            &crate::clickhouse_db::SecretRow {
+                default_password: "default-secret".into(),
+                default_sha256: "digest".into(),
+                metrics_password: "metrics-secret-do-not-publish".into(),
+                metrics_sha256: "digest".into(),
+                interserver_password: "inter".into(),
+                keeper_password: "keeper".into(),
+                cluster_secret: "cluster".into(),
+                ca_cert_pem: String::new(),
+                ca_key_pem: String::new(),
+            },
+        )
+        .unwrap();
+
+        let open = r#"
+kind: ClickhouseCluster
+metadata:
+  name: open
+spec:
+  tls:
+    disabled: true
+  shards:
+    - replicas:
+        - {nodeId: node-200, advertiseAddress: 192.168.50.200, iface: enp6s0}
+  keepers:
+    - {nodeId: node-200, advertiseAddress: 192.168.50.200, iface: enp6s0}
+"#;
+        let (_name, mut open_spec) = kcore_clickhouse::parse_manifest(open).expect("open");
+        kcore_clickhouse::normalize(&mut open_spec);
+        db.insert_clickhouse_cluster(&crate::clickhouse_db::ClusterRow {
+            name: "open".into(),
+            generation: 1,
+            phase: "ready".into(),
+            message: String::new(),
+            spec_json: serde_json::to_string(&open_spec).unwrap(),
+            observed_version: String::new(),
+            active_operation_id: String::new(),
+        })
+        .unwrap();
+        db.replace_clickhouse_members(
+            "open",
+            &crate::clickhouse_convert::members_from_spec("open", &open_spec),
+        )
+        .unwrap();
+
+        let json = render_clickhouse_targets(&db).expect("render");
+        assert!(json.contains("https://192.168.40.105:8443"), "{json}");
+        assert!(json.contains("https://[2001:db8::106]:8443"), "{json}");
+        assert!(json.contains("\"cluster\": \"analytics\""), "{json}");
+        assert!(json.contains("\"node\": \"node-105\""), "{json}");
+        assert!(json.contains("\"node\": \"node-106\""), "{json}");
+        assert!(!json.contains("192.168.40.108"), "{json}");
+        assert!(!json.contains("192.168.40.109"), "{json}");
+        assert!(!json.contains("192.168.50.200"), "{json}");
+        assert!(!json.contains("metrics-secret-do-not-publish"), "{json}");
+        assert!(!json.contains("9363"), "{json}");
+        assert!(!json.contains("\"open\""), "{json}");
     }
 }

@@ -138,6 +138,9 @@ pub struct MetricsConfig {
     pub enabled: bool,
     #[serde(default = "default_metrics_file_sd_path")]
     pub file_sd_path: String,
+    /// ClickHouse server scrape targets. Keeper-only members are omitted.
+    #[serde(default = "default_clickhouse_file_sd_path")]
+    pub clickhouse_file_sd_path: String,
     #[serde(default = "default_metrics_scrape_port")]
     pub scrape_port: u16,
     #[serde(default = "default_metrics_refresh_secs")]
@@ -149,6 +152,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: false,
             file_sd_path: default_metrics_file_sd_path(),
+            clickhouse_file_sd_path: default_clickhouse_file_sd_path(),
             scrape_port: default_metrics_scrape_port(),
             refresh_interval_secs: default_metrics_refresh_secs(),
         }
@@ -157,6 +161,10 @@ impl Default for MetricsConfig {
 
 fn default_metrics_file_sd_path() -> String {
     "/etc/kcore/metrics/file_sd/nodes.json".to_string()
+}
+
+fn default_clickhouse_file_sd_path() -> String {
+    "/etc/kcore/metrics/file_sd/clickhouse.json".to_string()
 }
 
 fn default_metrics_scrape_port() -> u16 {
@@ -580,6 +588,10 @@ impl Config {
         }
         if self.metrics.enabled {
             crate::path_safety::assert_safe_path(&self.metrics.file_sd_path, "metrics.fileSdPath")?;
+            crate::path_safety::assert_safe_path(
+                &self.metrics.clickhouse_file_sd_path,
+                "metrics.clickhouseFileSdPath",
+            )?;
             if self.metrics.scrape_port == 0 {
                 anyhow::bail!("metrics.scrapePort must be greater than 0");
             }
@@ -1128,6 +1140,10 @@ defaultNetwork:
         assert_eq!(
             cfg.metrics.file_sd_path,
             "/etc/kcore/metrics/file_sd/nodes.json"
+        );
+        assert_eq!(
+            cfg.metrics.clickhouse_file_sd_path,
+            "/etc/kcore/metrics/file_sd/clickhouse.json"
         );
         assert_eq!(cfg.metrics.scrape_port, 9100);
         assert_eq!(cfg.metrics.refresh_interval_secs, 30);
