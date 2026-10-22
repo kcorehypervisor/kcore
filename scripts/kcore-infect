@@ -1,0 +1,1420 @@
+#!/usr/bin/env bash
+# kcore-infect — replace a running Debian, Ubuntu, Fedora, or other systemd
+# Linux with kcoreOS.
+#
+# Same shape as nixos-infect: install Nix beside the current system, build a
+# NixOS generation that imports kcore.nixosModules.kcore-host, install the
+# bootloader, and mark the root for lustrate. The next boot moves the old
+# distro to /old-root and starts kcore.
+#
+# The disk is not repartitioned and is not encrypted. Use the kcore ISO
+# installer when the root disk should be wiped and unlocked with LUKS.
+#
+# Preview:
+#   sudo ./scripts/kcore-infect --dry-run
+# Install this machine as a controller and node, then reboot:
+#   sudo ./scripts/kcore-infect --yes --reboot
+# Join an existing controller (certs come from `kctl write-node-pki`):
+#   sudo ./scripts/kcore-infect --yes --reboot \
+#     --controller 10.0.0.5:9090 --cert-dir /root/node-certs
+
+set -euo pipefail
+
+SHOW_HELP=false
+YES=false
+REBOOT=false
+NO_REBOOT=false
+DRY_RUN=false
+OUT=""
+RUN_CONTROLLER=""
+CERT_DIR=""
+NODE_HOSTNAME=""
+NODE_ID=""
+DC_ID=""
+FLAKE_URL=""
+SYSTEM=""
+IP_ADDR=""
+PREFIX_LEN=""
+GATEWAY=""
+IFACE=""
+MAC_ADDR=""
+NET_MODE=""
+ROOT_UUID=""
+ROOT_FSTYPE=""
+ROOT_OPTS=""
+ROOT_SRC=""
+GRUB_DEVICE=""
+BOOT_MODE=""
+BOOT_EXPLICIT=false
+ESP_MOUNT=""
+ESP_UUID=""
+BOOT_SEPARATE=false
+BOOT_UUID=""
+BOOT_FSTYPE=""
+USE_LVM=false
+VIRT_KIND=""
+DISABLE_VXLAN=false
+ROOT_PASSWORD=""
+INTERNAL_GATEWAY=""
+BOOTLOADER_DONE=false
+ESP_PREPARED=false
+MADE_SWAP=false
+
+CONTROLLERS=()
+NAMESERVERS=()
+SSH_KEYS=()
+SSH_KEY_FILES=()
+SCRAPE_SOURCES=()
+
+usage() {
+  cat <<'EOF'
+kcore-infect — install kcoreOS onto Debian, Ubuntu, Fedora, or another systemd Linux
+
+The next boot replaces this distro. The disk is not wiped and is not encrypted.
+Files from the old system are moved to /old-root. SSH host keys are kept.
+
+Options:
+  --yes                 Replace this system without an interactive prompt
+  --reboot              Reboot after the bootloader is installed
+  --no-reboot           Do not reboot and do not ask
+  --dry-run             Write the NixOS config and stop
+  --out DIR             Directory for --dry-run (default: ./kcore-infect-preview)
+  --run-controller      This machine runs the controller, dashboard, and node agent
+  --controller HOST[:9090]
+                        Controller to join, or an extra controller peer. Repeatable.
+  --cert-dir DIR        CA material for a node joining a cluster, or the existing
+                        cluster CA when adding another controller
+  --hostname NAME       Node hostname (default: this machine's hostname)
+  --node-id ID          node-agent nodeId (default: hostname)
+  --dc-id ID            Datacenter id (default: DC1)
+  --flake URL           kcore flake (default: github:kcorehypervisor/kcore,
+                        or $KCORE_FLAKE). A path: URL is copied into /etc/nixos
+                        so it still exists after the old root is moved aside.
+  --ip ADDR             IPv4 address to publish (default: address on the default route)
+  --iface NAME          NIC enslaved to br0 (default: default-route device)
+  --mac ADDR            MAC pinned onto br0 (default: that NIC's MAC)
+  --dhcp                DHCP on br0 (default when this host already uses DHCP)
+  --static              Keep the current address on br0
+  --prefix N            Prefix length for --static
+  --gateway ADDR        Default gateway for --static
+  --dns ADDR            Nameserver for --static. Repeatable.
+  --root-uuid UUID      Root filesystem UUID (default: detected)
+  --root-fstype TYPE    Root filesystem type
+  --root-opts OPTS      Root mount options. subvol= and subvolid= are kept.
+  --grub-device DEV     BIOS disk for GRUB, such as /dev/vda
+  --boot bios|efi       Firmware mode (default: detected)
+  --esp-mount PATH      EFI system partition mount, such as /boot or /boot/efi
+  --esp-uuid UUID       EFI system partition UUID
+  --virt none|qemu|kvm  Guest profile to import (default: detected)
+  --lvm                 Root is on LVM
+  --ssh-key FILE        Authorized key file to install for root. Repeatable.
+                        /root/.ssh/authorized_keys is imported unless this is a dry run.
+  --root-password PASS  Initial root password (default: kcore, or $KCORE_ROOT_PASSWORD)
+  --disable-vxlan       Do not open UDP 4789
+  -h, --help            Show this help
+
+A first machine with no --controller becomes a controller. It generates a
+cluster CA with kctl and leaves the CA key in /root/.kcore. Copy that
+directory off the machine. The key is not written to /etc/kcore/certs.
+
+A later machine passes --controller and --cert-dir. Produce that directory
+on the CA host:
+
+  kctl write-node-pki --certs-dir /root/.kcore/kcore \
+    --host 10.0.0.6 --out /tmp/node-certs
+EOF
+}
+
+die() {
+  echo "kcore-infect: $*" >&2
+  exit 1
+}
+
+nix_quote() {
+  local value=$1
+  case $value in
+    *\"* | *\\* | *\$* | *\`* | *$'\n'*)
+      return 1
+      ;;
+  esac
+  printf '%s' "$value"
+}
+
+is_ipv4() {
+  local value=$1 octet
+  [[ $value =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for octet in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+    [[ $octet -le 255 ]] || return 1
+  done
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h | --help)
+        SHOW_HELP=true
+        return 0
+        ;;
+      --yes)
+        YES=true
+        shift
+        ;;
+      --reboot)
+        REBOOT=true
+        shift
+        ;;
+      --no-reboot)
+        NO_REBOOT=true
+        shift
+        ;;
+      --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+      --out)
+        OUT=${2:-}
+        shift 2
+        ;;
+      --run-controller)
+        RUN_CONTROLLER=true
+        shift
+        ;;
+      --controller)
+        CONTROLLERS+=("${2:-}")
+        shift 2
+        ;;
+      --cert-dir)
+        CERT_DIR=${2:-}
+        shift 2
+        ;;
+      --hostname)
+        NODE_HOSTNAME=${2:-}
+        shift 2
+        ;;
+      --node-id)
+        NODE_ID=${2:-}
+        shift 2
+        ;;
+      --dc-id)
+        DC_ID=${2:-}
+        shift 2
+        ;;
+      --flake)
+        FLAKE_URL=${2:-}
+        shift 2
+        ;;
+      --ip)
+        IP_ADDR=${2:-}
+        shift 2
+        ;;
+      --prefix)
+        PREFIX_LEN=${2:-}
+        shift 2
+        ;;
+      --gateway)
+        GATEWAY=${2:-}
+        shift 2
+        ;;
+      --dns)
+        NAMESERVERS+=("${2:-}")
+        shift 2
+        ;;
+      --iface)
+        IFACE=${2:-}
+        shift 2
+        ;;
+      --mac)
+        MAC_ADDR=${2:-}
+        shift 2
+        ;;
+      --dhcp)
+        NET_MODE=dhcp
+        shift
+        ;;
+      --static)
+        NET_MODE=static
+        shift
+        ;;
+      --root-uuid)
+        ROOT_UUID=${2:-}
+        shift 2
+        ;;
+      --root-fstype)
+        ROOT_FSTYPE=${2:-}
+        shift 2
+        ;;
+      --root-opts)
+        ROOT_OPTS=${2:-}
+        shift 2
+        ;;
+      --grub-device)
+        GRUB_DEVICE=${2:-}
+        shift 2
+        ;;
+      --boot)
+        BOOT_MODE=${2:-}
+        BOOT_EXPLICIT=true
+        shift 2
+        ;;
+      --esp-mount)
+        ESP_MOUNT=${2:-}
+        shift 2
+        ;;
+      --esp-uuid)
+        ESP_UUID=${2:-}
+        shift 2
+        ;;
+      --virt)
+        VIRT_KIND=${2:-}
+        shift 2
+        ;;
+      --lvm)
+        USE_LVM=true
+        shift
+        ;;
+      --ssh-key)
+        SSH_KEY_FILES+=("${2:-}")
+        shift 2
+        ;;
+      --root-password)
+        ROOT_PASSWORD=${2:-}
+        shift 2
+        ;;
+      --disable-vxlan)
+        DISABLE_VXLAN=true
+        shift
+        ;;
+      --system)
+        SYSTEM=${2:-}
+        shift 2
+        ;;
+      *)
+        die "unknown argument: $1 (try --help)"
+        ;;
+    esac
+  done
+}
+
+apply_defaults() {
+  if [[ -z $FLAKE_URL ]]; then
+    FLAKE_URL=${KCORE_FLAKE:-github:kcorehypervisor/kcore}
+  fi
+  if [[ -z $ROOT_PASSWORD && -n ${KCORE_ROOT_PASSWORD:-} ]]; then
+    ROOT_PASSWORD=$KCORE_ROOT_PASSWORD
+  fi
+  if [[ -z $ROOT_PASSWORD ]]; then
+    ROOT_PASSWORD=kcore
+  fi
+  if [[ -z $DC_ID ]]; then
+    DC_ID=DC1
+  fi
+  if [[ -z $SYSTEM ]]; then
+    case "$(uname -m)" in
+      x86_64)
+        SYSTEM=x86_64-linux
+        ;;
+      aarch64 | arm64)
+        SYSTEM=aarch64-linux
+        ;;
+      *)
+        die "unsupported architecture $(uname -m)"
+        ;;
+    esac
+  fi
+  if [[ -z $RUN_CONTROLLER ]]; then
+    if [[ ${#CONTROLLERS[@]} -eq 0 ]]; then
+      RUN_CONTROLLER=true
+    else
+      RUN_CONTROLLER=false
+    fi
+  fi
+  if [[ -z $OUT ]]; then
+    OUT=./kcore-infect-preview
+  fi
+}
+
+detect_root() {
+  [[ -n $ROOT_UUID && -n $ROOT_FSTYPE ]] && return 0
+  ROOT_SRC=$(findmnt -n -o SOURCE /)
+  [[ -n $ROOT_FSTYPE ]] || ROOT_FSTYPE=$(findmnt -n -o FSTYPE /)
+  [[ -n $ROOT_UUID ]] || ROOT_UUID=$(findmnt -n -o UUID /)
+  [[ -n $ROOT_OPTS ]] || ROOT_OPTS=$(findmnt -n -o OPTIONS / || true)
+  [[ -n $ROOT_SRC ]] || die "could not find the root mount"
+  case $ROOT_SRC in
+    /dev/md*)
+      die "root is on mdraid. kcore-infect does not convert software RAID. Use the kcore ISO."
+      ;;
+  esac
+  local dm uuid
+  dm=$(readlink -f "$ROOT_SRC" || true)
+  dm=${dm##*/}
+  if [[ -r /sys/block/$dm/dm/uuid ]]; then
+    uuid=$(cat "/sys/block/$dm/dm/uuid")
+    case $uuid in
+      CRYPT-LUKS*)
+        die "root is LUKS. kcore-infect keeps the current filesystem and does not enroll unlock. Use the kcore ISO."
+        ;;
+      LVM-*)
+        USE_LVM=true
+        ;;
+    esac
+  fi
+}
+
+disk_for() {
+  local src=$1 name type
+  while read -r name type; do
+    if [[ $type == disk ]]; then
+      printf '/dev/%s' "$name"
+      return 0
+    fi
+  done < <(lsblk -s -n -o NAME,TYPE "$src" 2>/dev/null || true)
+  return 1
+}
+
+detect_boot() {
+  if [[ -z $BOOT_MODE ]]; then
+    if [[ -d /sys/firmware/efi ]]; then
+      BOOT_MODE=efi
+    else
+      BOOT_MODE=bios
+    fi
+  fi
+  if [[ $BOOT_MODE == efi && ( -z $ESP_MOUNT || -z $ESP_UUID ) ]]; then
+    local mp src target fstype
+    for mp in /boot/efi /boot/EFI /efi /boot; do
+      [[ -d $mp ]] || continue
+      target=$(findmnt -n -o TARGET "$mp" 2>/dev/null || true)
+      [[ $target == "$mp" ]] || continue
+      src=$(findmnt -n -o SOURCE "$mp" 2>/dev/null || true)
+      [[ -n $src ]] || continue
+      fstype=$(findmnt -n -o FSTYPE "$mp")
+      [[ $fstype == vfat ]] || die "ESP $mp is $fstype, expected vfat"
+      ESP_MOUNT=$mp
+      ESP_UUID=$(findmnt -n -o UUID "$mp")
+      break
+    done
+    [[ -n $ESP_MOUNT && -n $ESP_UUID ]] || die "UEFI is active but no vfat ESP is mounted. Mount it, or install from the kcore ISO."
+  fi
+  if [[ $BOOT_MODE == bios && -z $GRUB_DEVICE ]]; then
+    [[ -n $ROOT_SRC ]] || ROOT_SRC=$(findmnt -n -o SOURCE /)
+    GRUB_DEVICE=$(disk_for "$ROOT_SRC" || true)
+    [[ -n $GRUB_DEVICE ]] || die "could not find the disk that holds the root filesystem. Pass --grub-device."
+  fi
+  if [[ $BOOT_EXPLICIT != true && $BOOT_SEPARATE == false ]] && findmnt -n /boot >/dev/null 2>&1; then
+    local boot_target
+    boot_target=$(findmnt -n -o TARGET /boot)
+    if [[ $boot_target == /boot && $ESP_MOUNT != /boot ]]; then
+      BOOT_SEPARATE=true
+      BOOT_UUID=$(findmnt -n -o UUID /boot)
+      BOOT_FSTYPE=$(findmnt -n -o FSTYPE /boot)
+    fi
+  fi
+}
+
+detect_net() {
+  if [[ -z $IFACE ]]; then
+    IFACE=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}' || true)
+    [[ -n $IFACE ]] || die "no default route. Pass --iface and --ip."
+  fi
+  if [[ -z $IP_ADDR ]]; then
+    local cidr
+    cidr=$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk 'NR==1 {print $4}' || true)
+    IP_ADDR=${cidr%%/*}
+    if [[ -z $PREFIX_LEN && $cidr == */* ]]; then
+      PREFIX_LEN=${cidr##*/}
+    fi
+  fi
+  [[ -n $IP_ADDR ]] || die "could not detect an IPv4 address. Pass --ip."
+  if [[ -z $MAC_ADDR ]]; then
+    MAC_ADDR=$(cat "/sys/class/net/$IFACE/address" 2>/dev/null || true)
+    [[ -n $MAC_ADDR ]] || die "could not read the MAC address of $IFACE. Pass --mac."
+  fi
+  # DHCP does not need the current gateway. Skip the lookup so a dry run
+  # with explicit addresses does not require iproute2.
+  if [[ -z $GATEWAY && $NET_MODE != dhcp ]]; then
+    GATEWAY=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $3}' || true)
+  fi
+  if [[ -z $NET_MODE ]]; then
+    NET_MODE=static
+    if [[ -d /run/systemd/netif/leases ]] && compgen -G '/run/systemd/netif/leases/*' >/dev/null; then
+      NET_MODE=dhcp
+    fi
+    if command -v networkctl >/dev/null 2>&1; then
+      if networkctl status "$IFACE" 2>/dev/null | grep -qi 'DHCP'; then
+        NET_MODE=dhcp
+      fi
+    fi
+    if compgen -G '/var/lib/dhcp/dhclient*.leases' >/dev/null || [[ -f /var/lib/dhcp/dhclient.leases ]]; then
+      NET_MODE=dhcp
+    fi
+    if command -v nmcli >/dev/null 2>&1; then
+      local method
+      method=$(nmcli -g IP4.METHOD device show "$IFACE" 2>/dev/null || true)
+      if [[ $method == auto ]]; then
+        NET_MODE=dhcp
+      fi
+    fi
+  fi
+  if [[ $NET_MODE == static && ${#NAMESERVERS[@]} -eq 0 && -r /etc/resolv.conf ]]; then
+    local ns
+    while read -r _ ns _; do
+      [[ -n $ns ]] || continue
+      [[ $ns == 127.* || $ns == ::1 ]] && continue
+      NAMESERVERS+=("$ns")
+    done < <(awk '$1=="nameserver" {print $1, $2}' /etc/resolv.conf)
+  fi
+  if [[ $NET_MODE == static && ${#NAMESERVERS[@]} -eq 0 ]]; then
+    NAMESERVERS=(1.1.1.1 8.8.8.8)
+  fi
+}
+
+detect_virt() {
+  [[ -n $VIRT_KIND ]] && return 0
+  VIRT_KIND=none
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    VIRT_KIND=$(systemd-detect-virt 2>/dev/null || true)
+    [[ -n $VIRT_KIND ]] || VIRT_KIND=none
+  fi
+}
+
+import_key_file() {
+  local file=$1 line
+  [[ -f $file ]] || die "ssh key file not found: $file"
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -z $line || $line == \#* ]] && continue
+    case $line in
+      ssh-* | ecdsa-* | sk-*) ;;
+      *) continue ;;
+    esac
+    nix_quote "$line" >/dev/null || die "ssh key in $file contains characters this script will not embed"
+    local existing seen=false
+    for existing in "${SSH_KEYS[@]+"${SSH_KEYS[@]}"}"; do
+      if [[ $existing == "$line" ]]; then
+        seen=true
+        break
+      fi
+    done
+    [[ $seen == true ]] && continue
+    SSH_KEYS+=("$line")
+  done < "$file"
+}
+
+import_ssh_keys() {
+  local file
+  for file in "${SSH_KEY_FILES[@]+"${SSH_KEY_FILES[@]}"}"; do
+    import_key_file "$file"
+  done
+  if [[ $DRY_RUN == true ]]; then
+    return 0
+  fi
+  [[ -f /root/.ssh/authorized_keys ]] && import_key_file /root/.ssh/authorized_keys
+  if [[ -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
+    local home
+    home=$(getent passwd "$SUDO_USER" | cut -d: -f6 || true)
+    if [[ -n $home && -f $home/.ssh/authorized_keys ]]; then
+      import_key_file "$home/.ssh/authorized_keys"
+    fi
+  fi
+}
+
+finalize() {
+  if [[ -z $NODE_HOSTNAME ]]; then
+    NODE_HOSTNAME=$(hostname -s 2>/dev/null || true)
+  fi
+  NODE_HOSTNAME=${NODE_HOSTNAME,,}
+  if [[ -z $NODE_HOSTNAME || $NODE_HOSTNAME == localhost || $NODE_HOSTNAME == localhost.localdomain ]]; then
+    NODE_HOSTNAME="kvm-node-${IP_ADDR//./-}"
+  fi
+  if [[ -z $NODE_ID ]]; then
+    NODE_ID=$NODE_HOSTNAME
+  fi
+  local ep normalized=() seen="|"
+  if [[ $RUN_CONTROLLER == true ]]; then
+    CONTROLLERS=("$IP_ADDR:9090" "${CONTROLLERS[@]+"${CONTROLLERS[@]}"}")
+  fi
+  for ep in "${CONTROLLERS[@]+"${CONTROLLERS[@]}"}"; do
+    [[ $ep == *:* ]] || ep="${ep}:9090"
+    [[ $seen == *"|$ep|"* ]] && continue
+    seen+="$ep|"
+    normalized+=("$ep")
+  done
+  CONTROLLERS=("${normalized[@]+"${normalized[@]}"}")
+  if [[ $IP_ADDR == 10.240.* ]]; then
+    INTERNAL_GATEWAY=10.241.0.1
+  else
+    INTERNAL_GATEWAY=10.240.0.1
+  fi
+  local predictable=true
+  if [[ $IFACE == eth* || $IFACE == enx* ]]; then
+    predictable=false
+  fi
+  PREDICTABLE=$predictable
+  SCRAPE_SOURCES=("127.0.0.1")
+  local host octet1 octet2 octet3 _
+  IFS=. read -r octet1 octet2 octet3 _ <<<"$IP_ADDR"
+  local candidate cidr="$octet1.$octet2.$octet3.0/24"
+  for candidate in "$IP_ADDR" "$cidr"; do
+    local present=false item
+    for item in "${SCRAPE_SOURCES[@]}"; do
+      [[ $item == "$candidate" ]] && present=true
+    done
+    [[ $present == true ]] || SCRAPE_SOURCES+=("$candidate")
+  done
+  for ep in "${CONTROLLERS[@]+"${CONTROLLERS[@]}"}"; do
+    host=${ep%%:*}
+    is_ipv4 "$host" || continue
+    local present=false item
+    for item in "${SCRAPE_SOURCES[@]}"; do
+      [[ $item == "$host" ]] && present=true
+    done
+    [[ $present == true ]] || SCRAPE_SOURCES+=("$host")
+  done
+}
+
+validate_ready() {
+  [[ $SYSTEM == x86_64-linux || $SYSTEM == aarch64-linux ]] || die "system must be x86_64-linux or aarch64-linux"
+  [[ $NODE_HOSTNAME =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || die "hostname must be a DNS label: $NODE_HOSTNAME"
+  [[ $NODE_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || die "node id must be letters, digits, '.', '_' or '-'"
+  [[ $DC_ID =~ ^[A-Za-z0-9._-]{1,32}$ ]] || die "dc id must be letters, digits, '.', '_' or '-'"
+  case $FLAKE_URL in
+    *[[:space:]]* | *\"* | *\'* | *\;* | *\$* | *\\* | *\`*)
+      die "flake url contains characters this script will not embed"
+      ;;
+  esac
+  case $FLAKE_URL in
+    github:* | git+* | path:* | https://* | http://*) ;;
+    *)
+      die "flake url must start with github:, git+, path:, https://, or http://"
+      ;;
+  esac
+  if [[ $FLAKE_URL == path:* ]]; then
+    [[ ${FLAKE_URL#path:} == /* ]] || die "a path flake must be absolute"
+  fi
+  is_ipv4 "$IP_ADDR" || die "not an IPv4 address: $IP_ADDR"
+  [[ $IFACE =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "interface name is not usable in Nix: $IFACE"
+  [[ $MAC_ADDR =~ ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$ ]] || die "MAC address must look like aa:bb:cc:dd:ee:ff"
+  [[ $ROOT_FSTYPE =~ ^(ext2|ext3|ext4|xfs|btrfs|f2fs)$ ]] || die "root filesystem $ROOT_FSTYPE is not supported. Use the kcore ISO to repartition."
+  [[ $ROOT_UUID =~ ^[0-9A-Fa-f-]{8,}$ ]] || die "root filesystem UUID looks wrong: $ROOT_UUID"
+  nix_quote "$ROOT_OPTS" >/dev/null || die "root mount options contain characters this script will not embed"
+  [[ $BOOT_MODE == bios || $BOOT_MODE == efi ]] || die "--boot must be bios or efi"
+  if [[ $BOOT_MODE == bios ]]; then
+    [[ $GRUB_DEVICE =~ ^/dev/[A-Za-z0-9_./-]+$ ]] || die "BIOS install needs --grub-device /dev/..."
+  else
+    [[ $ESP_MOUNT == /boot || $ESP_MOUNT == /boot/efi || $ESP_MOUNT == /efi ]] || die "ESP mount must be /boot, /boot/efi, or /efi"
+    [[ $ESP_UUID =~ ^[0-9A-Fa-f-]{4,}$ ]] || die "ESP UUID looks wrong: $ESP_UUID"
+  fi
+  if [[ $BOOT_SEPARATE == true ]]; then
+    [[ -n $BOOT_UUID && -n $BOOT_FSTYPE ]] || die "separate /boot is missing a UUID or type"
+    nix_quote "$BOOT_FSTYPE" >/dev/null || die "boot filesystem type is not embeddable"
+  fi
+  [[ $NET_MODE == dhcp || $NET_MODE == static ]] || die "--dhcp or --static is required"
+  if [[ $NET_MODE == static ]]; then
+    [[ $PREFIX_LEN =~ ^[0-9]+$ && $PREFIX_LEN -ge 1 && $PREFIX_LEN -le 32 ]] || die "static networking needs --prefix between 1 and 32"
+    is_ipv4 "$GATEWAY" || die "static networking needs an IPv4 --gateway"
+    [[ ${#NAMESERVERS[@]} -gt 0 ]] || die "static networking needs a nameserver"
+  fi
+  local ns
+  for ns in "${NAMESERVERS[@]+"${NAMESERVERS[@]}"}"; do
+    [[ $ns =~ ^[0-9A-Fa-f.:]+$ ]] || die "nameserver is not an address: $ns"
+  done
+  local ep
+  for ep in "${CONTROLLERS[@]+"${CONTROLLERS[@]}"}"; do
+    [[ $ep =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]] || die "controller endpoint must be host:port, got: $ep"
+  done
+  if [[ $RUN_CONTROLLER != true && ${#CONTROLLERS[@]} -eq 0 ]]; then
+    die "pass --controller host:9090 for a node that does not run a controller"
+  fi
+  if [[ $RUN_CONTROLLER != true && -z $CERT_DIR ]]; then
+    die "joining a controller needs --cert-dir with ca.crt, node.crt, and node.key"
+  fi
+  if [[ $RUN_CONTROLLER == true && ${#CONTROLLERS[@]} -gt 1 && -z $CERT_DIR ]]; then
+    die "adding a controller to an existing cluster needs --cert-dir with ca.crt, ca.key, sub-ca.crt, and sub-ca.key"
+  fi
+  nix_quote "$ROOT_PASSWORD" >/dev/null || die "root password contains characters this script will not embed"
+  [[ ${#ROOT_PASSWORD} -le 128 ]] || die "root password is too long"
+  case $VIRT_KIND in
+    none | qemu | kvm | microsoft | oracle | amazon | vmware) ;;
+    *)
+      die "unsupported --virt value: $VIRT_KIND"
+      ;;
+  esac
+  if [[ $DRY_RUN != true && $RUN_CONTROLLER != true ]]; then
+    [[ -f $CERT_DIR/ca.crt && -f $CERT_DIR/node.crt && -f $CERT_DIR/node.key ]] || die "$CERT_DIR must contain ca.crt, node.crt, and node.key"
+  fi
+  if [[ $DRY_RUN != true && $RUN_CONTROLLER == true && -n $CERT_DIR ]]; then
+    [[ -f $CERT_DIR/ca.crt && -f $CERT_DIR/ca.key && -f $CERT_DIR/sub-ca.crt && -f $CERT_DIR/sub-ca.key ]] || die "$CERT_DIR must contain ca.crt, ca.key, sub-ca.crt, and sub-ca.key"
+  fi
+}
+
+fs_options_nix() {
+  local opts=$1 item nix=""
+  [[ -n $opts ]] || return 0
+  local IFS=','
+  set -f
+  # shellcheck disable=SC2086
+  set -- $opts
+  set +f
+  IFS=$' \t\n'
+  for item in "$@"; do
+    case $item in
+      subvol=* | subvolid=*)
+        nix+=" \"$item\""
+        ;;
+    esac
+  done
+  if [[ -n $nix ]]; then
+    printf '      options = [%s ];\n' "$nix"
+  fi
+}
+
+render_flake() {
+  local dir=$1
+  cat >"$dir/flake.nix" <<EOF
+{
+  description = "kcore node installed by kcore-infect";
+
+  inputs.kcore.url = "$FLAKE_URL";
+
+  outputs =
+    { kcore, ... }:
+    let
+      system = "$SYSTEM";
+    in
+    {
+      nixosConfigurations.kcore = kcore.inputs.nixpkgs.lib.nixosSystem {
+        inherit system;
+        specialArgs = {
+          inherit kcore;
+        };
+        modules = [
+          kcore.nixosModules.kcore-host
+          (
+            { kcore, ... }:
+            {
+              services.kcore.version = kcore.packages.\${system}.kcore-node-agent.version;
+              services.kcore.nodeAgent.package = kcore.packages.\${system}.kcore-node-agent;
+              services.kcore.controller.package = kcore.packages.\${system}.kcore-controller;
+              services.kcore.dashboard.package = kcore.packages.\${system}.kcore-dashboard;
+              services.kcore.console.package = kcore.packages.\${system}.kcore-console;
+              services.kcore.kctl.package = kcore.packages.\${system}.kctl;
+            }
+          )
+          ./hardware-configuration.nix
+          ./node.nix
+          ./kcore-vms.nix
+          ./kcore-ceph.nix
+        ];
+      };
+    };
+}
+EOF
+}
+
+render_hardware() {
+  local dir=$1
+  {
+    printf '%s\n' '{ modulesPath, ... }:' '{'
+    if [[ $VIRT_KIND == qemu || $VIRT_KIND == kvm ]]; then
+      printf '%s\n' '  imports = [ (modulesPath + "/profiles/qemu-guest.nix") ];'
+    fi
+    cat <<'EOF'
+  boot.initrd.availableKernelModules = [
+    "ahci"
+    "nvme"
+    "sd_mod"
+    "sr_mod"
+    "virtio_pci"
+    "virtio_blk"
+    "virtio_scsi"
+    "virtio_net"
+    "ata_piix"
+    "uhci_hcd"
+    "ehci_pci"
+    "xhci_pci"
+    "xen_blkfront"
+    "vmw_pvscsi"
+    "hv_vmbus"
+    "hv_storvsc"
+    "hv_netvsc"
+    "ext4"
+    "xfs"
+    "btrfs"
+  ];
+  boot.initrd.kernelModules = [ "nvme" ];
+  boot.loader.systemd-boot.enable = false;
+EOF
+    if [[ $USE_LVM == true ]]; then
+      printf '%s\n' '  boot.initrd.services.lvm.enable = true;'
+    fi
+    if [[ $BOOT_MODE == efi ]]; then
+      cat <<EOF
+  boot.loader.efi.canTouchEfiVariables = false;
+  boot.loader.efi.efiSysMountPoint = "$ESP_MOUNT";
+  boot.loader.grub = {
+    enable = true;
+    device = "nodev";
+    efiSupport = true;
+    efiInstallAsRemovable = true;
+  };
+EOF
+    else
+      cat <<EOF
+  boot.loader.grub = {
+    enable = true;
+    device = "$GRUB_DEVICE";
+  };
+EOF
+    fi
+    cat <<EOF
+  fileSystems."/" = {
+    device = "/dev/disk/by-uuid/$ROOT_UUID";
+    fsType = "$ROOT_FSTYPE";
+EOF
+    fs_options_nix "$ROOT_OPTS"
+    printf '%s\n' '  };'
+    if [[ $BOOT_SEPARATE == true ]]; then
+      cat <<EOF
+  fileSystems."/boot" = {
+    device = "/dev/disk/by-uuid/$BOOT_UUID";
+    fsType = "$BOOT_FSTYPE";
+  };
+EOF
+    fi
+    if [[ $BOOT_MODE == efi && $ESP_MOUNT != /boot ]]; then
+      cat <<EOF
+  fileSystems."$ESP_MOUNT" = {
+    device = "/dev/disk/by-uuid/$ESP_UUID";
+    fsType = "vfat";
+  };
+EOF
+    elif [[ $BOOT_MODE == efi && $ESP_MOUNT == /boot ]]; then
+      cat <<EOF
+  fileSystems."/boot" = {
+    device = "/dev/disk/by-uuid/$ESP_UUID";
+    fsType = "vfat";
+  };
+EOF
+    fi
+    printf '%s\n' '}'
+  } >"$dir/hardware-configuration.nix"
+}
+
+render_node() {
+  local dir=$1
+  local tcp_ports="22 9091" udp_ports="" ssh_nix="" scrape_nix="" key source
+  if [[ $RUN_CONTROLLER == true ]]; then
+    tcp_ports+=" 9090 8080"
+  fi
+  if [[ $DISABLE_VXLAN != true ]]; then
+    udp_ports="4789"
+  fi
+  for key in "${SSH_KEYS[@]+"${SSH_KEYS[@]}"}"; do
+    ssh_nix+=$'\n'"      \"$key\""
+  done
+  for source in "${SCRAPE_SOURCES[@]}"; do
+    scrape_nix+=" \"$source\""
+  done
+  local metrics_server=false
+  if [[ $RUN_CONTROLLER == true ]]; then
+    metrics_server=true
+  fi
+  {
+    cat <<EOF
+{ ... }:
+{
+  networking.hostName = "$NODE_HOSTNAME";
+  networking.useDHCP = false;
+  networking.usePredictableInterfaceNames = $PREDICTABLE;
+  networking.bridges.br0.interfaces = [ "$IFACE" ];
+  networking.interfaces.br0.macAddress = "$MAC_ADDR";
+  networking.interfaces."$IFACE".useDHCP = false;
+EOF
+    if [[ $NET_MODE == dhcp ]]; then
+      cat <<'EOF'
+  networking.interfaces.br0.useDHCP = true;
+  networking.dhcpcd.extraConfig = "timeout 60";
+EOF
+    else
+      local dns_nix="" ns
+      for ns in "${NAMESERVERS[@]}"; do
+        dns_nix+=" \"$ns\""
+      done
+      cat <<EOF
+  networking.interfaces.br0.useDHCP = false;
+  networking.interfaces.br0.ipv4.addresses = [
+    {
+      address = "$IP_ADDR";
+      prefixLength = $PREFIX_LEN;
+    }
+  ];
+  networking.defaultGateway = {
+    address = "$GATEWAY";
+    interface = "br0";
+  };
+  networking.nameservers = [$dns_nix ];
+EOF
+    fi
+    cat <<EOF
+  networking.firewall.enable = true;
+  networking.firewall.allowedTCPPorts = [ $tcp_ports ];
+  networking.firewall.allowedUDPPorts = [ $udp_ports ];
+
+  services.udev.extraRules = ''
+    ATTR{address}=="$MAC_ADDR", NAME="$IFACE"
+  '';
+
+  kcore.metrics = {
+    enable = true;
+    allowedScrapeSources = [$scrape_nix ];
+    server.enable = $metrics_server;
+  };
+
+  users.users.root = {
+    initialPassword = "$ROOT_PASSWORD";
+    openssh.authorizedKeys.keys = [$ssh_nix
+    ];
+  };
+  users.mutableUsers = true;
+
+  services.openssh = {
+    enable = true;
+    settings = {
+      PermitRootLogin = "yes";
+      PasswordAuthentication = true;
+    };
+  };
+
+  services.kcore.nodeAgent.enable = true;
+  services.kcore.controller.enable = $RUN_CONTROLLER;
+  services.kcore.dashboard.enable = $RUN_CONTROLLER;
+  services.kcore.console.enable = true;
+
+  system.stateVersion = "25.05";
+}
+EOF
+  } >"$dir/node.nix"
+}
+
+render_yaml() {
+  local dir=$1
+  local ep lines=""
+  for ep in "${CONTROLLERS[@]}"; do
+    lines+=$'\n'"  - \"$ep\""
+  done
+  cat >"$dir/node-agent.yaml" <<EOF
+nodeId: $NODE_ID
+listenAddr: "0.0.0.0:9091"
+controllerAddr: "${CONTROLLERS[0]}"
+controllers:$lines
+dcId: "$DC_ID"
+vmSocketDir: /run/kcore
+nixConfigPath: /etc/nixos/kcore-vms.nix
+tls:
+  caFile: /etc/kcore/certs/ca.crt
+  certFile: /etc/kcore/certs/node.crt
+  keyFile: /etc/kcore/certs/node.key
+storage:
+  backend: filesystem
+  imageCacheDir: /var/lib/kcore/images
+  filesystemVolumeDir: /var/lib/kcore/volumes
+EOF
+  if [[ $RUN_CONTROLLER != true ]]; then
+    rm -f "$dir/controller.yaml" "$dir/dashboard.env"
+    return 0
+  fi
+  local peers="" peer
+  for ep in "${CONTROLLERS[@]}"; do
+    [[ $ep == "$IP_ADDR:9090" ]] && continue
+    peers+=$'\n'"    - \"$ep\""
+  done
+  if [[ -z $peers ]]; then
+    peer=" []"
+  else
+    peer=$peers
+  fi
+  cat >"$dir/controller.yaml" <<EOF
+listenAddr: "0.0.0.0:9090"
+dbPath: /var/lib/kcore/controller.db
+defaultNetwork:
+  gatewayInterface: br0
+  externalIp: $IP_ADDR
+  gatewayIp: $INTERNAL_GATEWAY
+tls:
+  caFile: /etc/kcore/certs/ca.crt
+  certFile: /etc/kcore/certs/controller.crt
+  keyFile: /etc/kcore/certs/controller.key
+  subCaCertFile: /etc/kcore/certs/sub-ca.crt
+  subCaKeyFile: /etc/kcore/certs/sub-ca.key
+metrics:
+  enabled: true
+  fileSdPath: /etc/kcore/metrics/file_sd/nodes.json
+  scrapePort: 9100
+replication:
+  controllerId: "kcore-controller-$IP_ADDR"
+  dcId: "$DC_ID"
+  peers:$peer
+EOF
+  cat >"$dir/dashboard.env" <<EOF
+KCORE_CONTROLLER=$IP_ADDR:9090
+KCORE_CA_FILE=/etc/kcore/certs/ca.crt
+KCORE_CERT_FILE=/etc/kcore/certs/controller.crt
+KCORE_KEY_FILE=/etc/kcore/certs/controller.key
+LEPTOS_SITE_ADDR=0.0.0.0:8080
+LEPTOS_ENV=PROD
+EOF
+}
+
+render_pki_plan() {
+  local dir=$1
+  {
+    if [[ $RUN_CONTROLLER == true && -z $CERT_DIR ]]; then
+      echo "Generate a new cluster CA with kctl create cluster, then write node and controller certs."
+      echo "The CA private key stays in /root/.kcore/kcore. Copy it off this machine."
+    elif [[ $RUN_CONTROLLER == true ]]; then
+      echo "Sign this controller from the existing CA in $CERT_DIR."
+    else
+      echo "Copy ca.crt, node.crt, and node.key from $CERT_DIR."
+    fi
+  } >"$dir/pki-plan.txt"
+}
+
+render_all() {
+  local dir=$1
+  mkdir -p "$dir"
+  printf '%s\n' '{ ... }: { }' >"$dir/kcore-vms.nix"
+  printf '%s\n' '{ ... }: { }' >"$dir/kcore-ceph.nix"
+  render_flake "$dir"
+  render_hardware "$dir"
+  render_node "$dir"
+  render_yaml "$dir"
+  render_pki_plan "$dir"
+}
+
+print_plan() {
+  local distro=Linux role net boot password
+  if [[ -r /etc/os-release ]]; then
+    distro=$(
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      printf '%s' "${PRETTY_NAME:-Linux}"
+    )
+  fi
+  if [[ $RUN_CONTROLLER == true ]]; then
+    role="controller and node agent"
+  else
+    role="node agent joining ${CONTROLLERS[0]}"
+  fi
+  if [[ $NET_MODE == dhcp ]]; then
+    net="$IFACE moved onto br0, DHCP"
+  else
+    net="$IFACE moved onto br0, $IP_ADDR/$PREFIX_LEN via $GATEWAY"
+  fi
+  if [[ $BOOT_MODE == efi ]]; then
+    boot="UEFI GRUB, ESP $ESP_MOUNT"
+  else
+    boot="BIOS GRUB on $GRUB_DEVICE"
+  fi
+  if [[ $ROOT_PASSWORD == kcore ]]; then
+    password="kcore"
+  else
+    password="(custom)"
+  fi
+  cat <<EOF
+kcore-infect will replace this Linux system with kcoreOS on the next boot.
+
+  Distro:    $distro
+  Root:      $ROOT_FSTYPE $ROOT_UUID
+  Boot:      $boot
+  Network:   $net
+  Role:      $role
+  Hostname:  $NODE_HOSTNAME
+  Flake:     $FLAKE_URL
+  Password:  $password
+
+The disk is not repartitioned and is not encrypted.
+The current system is moved to /old-root.
+SSH host keys and /etc/kcore are kept.
+EOF
+}
+
+require_root() {
+  [[ $(id -u) -eq 0 ]] || die "run as root"
+}
+
+require_linux() {
+  [[ $(uname -s) == Linux ]] || die "kcore-infect runs on Linux"
+}
+
+require_not_nixos() {
+  if [[ -e /run/current-system || -e /etc/NIXOS ]]; then
+    die "this machine is already NixOS. Rebuild it with nixos-rebuild."
+  fi
+  if [[ -e /etc/NIXOS_LUSTRATE ]]; then
+    die "a previous infect is waiting for reboot. Reboot, or restore the old bootloader before removing /etc/NIXOS_LUSTRATE."
+  fi
+}
+
+require_systemd() {
+  [[ $(ps -p 1 -o comm=) == systemd ]] || die "kcoreOS needs systemd. This machine's init is not systemd."
+}
+
+require_disk_space() {
+  local avail
+  avail=$(df -Pk / | awk 'NR==2 {print $4}')
+  if [[ $avail -lt $((12 * 1024 * 1024)) ]]; then
+    die "need at least 12 GiB free on /. The build compiles the kcore Rust packages on this machine."
+  fi
+}
+
+confirm() {
+  [[ $YES == true ]] && return 0
+  [[ -t 0 ]] || die "refusing to replace this system without --yes"
+  local answer
+  read -r -p "Type yes to replace this system with kcoreOS: " answer
+  if [[ $answer != yes ]]; then
+    echo "Cancelled."
+    exit 0
+  fi
+}
+
+install_prereqs() {
+  local missing=false cmd
+  for cmd in curl xzcat tar awk ip; do
+    command -v "$cmd" >/dev/null 2>&1 || missing=true
+  done
+  [[ $missing == true ]] || return 0
+  echo "Installing curl, xz, tar, and iproute."
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y curl xz-utils sudo bzip2 tar gawk iproute2 ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y curl xz sudo bzip2 tar gawk iproute ca-certificates
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y curl xz sudo bzip2 tar gawk iproute ca-certificates
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm curl xz sudo bzip2 tar gawk iproute2 ca-certificates
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install curl xz sudo bzip2 tar gawk iproute2 ca-certificates
+  elif command -v apk >/dev/null 2>&1; then
+    apk add curl xz sudo bzip2 tar gawk iproute2 ca-certificates
+  else
+    die "install curl, xz, tar, and iproute, then re-run"
+  fi
+}
+
+maybe_swap() {
+  local mem
+  mem=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+  if [[ $mem -lt $((6 * 1024 * 1024)) && ! -e /swap.kcore-infect ]]; then
+    echo "Available memory is low. Adding a 4 GiB swap file for the compile."
+    dd if=/dev/zero of=/swap.kcore-infect bs=1M count=4096 status=none
+    chmod 600 /swap.kcore-infect
+    mkswap /swap.kcore-infect >/dev/null
+    swapon /swap.kcore-infect
+    MADE_SWAP=true
+  fi
+}
+
+drop_swap() {
+  if [[ $MADE_SWAP == true ]]; then
+    swapoff /swap.kcore-infect || true
+    rm -f /swap.kcore-infect
+    MADE_SWAP=false
+  fi
+}
+
+load_nix_profile() {
+  if [[ -f /etc/profile.d/nix.sh ]]; then
+    set +u
+    # shellcheck disable=SC1091
+    . /etc/profile.d/nix.sh
+    set -u
+  elif [[ -f /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]]; then
+    set +u
+    # shellcheck disable=SC1091
+    . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+    set -u
+  fi
+  hash -r || true
+}
+
+install_nix() {
+  if [[ -x /nix/var/nix/profiles/default/bin/nix ]] || command -v nix >/dev/null 2>&1; then
+    echo "Nix is already installed."
+  else
+    local tmp
+    tmp=$(mktemp)
+    echo "Installing Nix."
+    curl -fsSL "${NIX_INSTALL_URL:-https://nixos.org/nix/install}" -o "$tmp"
+    bash "$tmp" --daemon --no-channel-add --yes
+    rm -f "$tmp"
+  fi
+  load_nix_profile
+  command -v nix >/dev/null 2>&1 || die "nix is not on PATH after install"
+}
+
+ensure_flakes() {
+  mkdir -p /etc/nix
+  if [[ -f /etc/nix/nix.conf ]] && grep -q 'experimental-features' /etc/nix/nix.conf; then
+    if ! grep -q 'flakes' /etc/nix/nix.conf; then
+      sed -i 's/experimental-features.*/experimental-features = nix-command flakes/' /etc/nix/nix.conf
+    fi
+  else
+    printf '%s\n' 'experimental-features = nix-command flakes' >>/etc/nix/nix.conf
+  fi
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nix-daemon; then
+    systemctl restart nix-daemon
+  fi
+}
+
+stage_path_flake() {
+  [[ $FLAKE_URL == path:* ]] || return 0
+  local src=${FLAKE_URL#path:} dest=/etc/nixos/kcore-src
+  [[ -f $src/flake.nix ]] || die "$src has no flake.nix"
+  mkdir -p "$dest"
+  tar -C "$src" \
+    --exclude target \
+    --exclude result \
+    --exclude result-iso \
+    --exclude .direnv \
+    --exclude .playwright-mcp \
+    --exclude .git \
+    -cf - . | tar -C "$dest" -xf -
+  FLAKE_URL=path:/etc/nixos/kcore-src
+  echo "Copied the local flake to /etc/nixos/kcore-src so rebuilds work after the old root moves aside."
+}
+
+nix_build() {
+  echo "Building kcoreOS. This compiles the Rust packages on this machine."
+  nix build \
+    --profile /nix/var/nix/profiles/system \
+    --extra-experimental-features 'nix-command flakes' \
+    --accept-flake-config \
+    /etc/nixos#nixosConfigurations.kcore.config.system.build.toplevel
+}
+
+prepare_esp() {
+  [[ $BOOT_MODE == efi ]] || return 0
+  local mp=$ESP_MOUNT src
+  if [[ -e ${mp}.bak ]]; then
+    die "${mp}.bak already exists from a previous attempt. Move it back onto $mp before retrying."
+  fi
+  src=$(findmnt -n -o SOURCE "$mp")
+  [[ -n $src ]] || die "ESP $mp is not mounted"
+  umount "$mp" || die "could not unmount $mp. Stop anything using it and re-run."
+  mv "$mp" "${mp}.bak"
+  mkdir -p "$mp"
+  mount "$src" "$mp"
+  ESP_PREPARED=true
+}
+
+restore_esp() {
+  [[ $ESP_PREPARED == true ]] || return 0
+  [[ $BOOTLOADER_DONE == true ]] && return 0
+  local mp=$ESP_MOUNT
+  umount "$mp" || true
+  rm -rf "$mp"
+  if [[ -d ${mp}.bak ]]; then
+    mv "${mp}.bak" "$mp"
+  fi
+  ESP_PREPARED=false
+}
+
+switch_boot() {
+  local sw=/nix/var/nix/profiles/system/bin/switch-to-configuration
+  [[ -x $sw ]] || die "the system profile has no switch-to-configuration"
+  "$sw" boot
+  BOOTLOADER_DONE=true
+  sync
+}
+
+install_pki() {
+  local kctl=/nix/var/nix/profiles/system/sw/bin/kctl
+  [[ -x $kctl ]] || die "the system profile has no kctl"
+  install -d -m 0755 /etc/kcore/certs
+  if [[ $RUN_CONTROLLER == true && -z $CERT_DIR ]]; then
+    install -d -m 0700 /root/.kcore
+    if [[ -e /root/.kcore/kcore/ca.crt ]]; then
+      echo "Replacing the cluster CA left by an earlier attempt."
+      "$kctl" create cluster \
+        --controller "$IP_ADDR:9090" \
+        --context kcore \
+        --certs-dir /root/.kcore/kcore \
+        --force
+    else
+      "$kctl" create cluster \
+        --controller "$IP_ADDR:9090" \
+        --context kcore \
+        --certs-dir /root/.kcore/kcore
+    fi
+    "$kctl" write-node-pki \
+      --certs-dir /root/.kcore/kcore \
+      --host "$IP_ADDR" \
+      --out /etc/kcore/certs \
+      --run-controller
+    echo "Cluster CA key: /root/.kcore/kcore/ca.key"
+    echo "Copy /root/.kcore off this machine. The key is not in /etc/kcore/certs."
+  elif [[ $RUN_CONTROLLER == true ]]; then
+    "$kctl" write-node-pki \
+      --certs-dir "$CERT_DIR" \
+      --host "$IP_ADDR" \
+      --out /etc/kcore/certs \
+      --run-controller
+    install -d -m 0700 /root/.kcore
+    rm -rf /root/.kcore/kcore
+    cp -a "$CERT_DIR" /root/.kcore/kcore
+  else
+    install -m 0644 "$CERT_DIR/ca.crt" /etc/kcore/certs/ca.crt
+    install -m 0644 "$CERT_DIR/node.crt" /etc/kcore/certs/node.crt
+    install -m 0600 "$CERT_DIR/node.key" /etc/kcore/certs/node.key
+  fi
+}
+
+install_runtime_config() {
+  local stage=$1
+  install -d -m 0755 /etc/kcore
+  install_pki
+  install -m 0644 "$stage/node-agent.yaml" /etc/kcore/node-agent.yaml
+  if [[ $RUN_CONTROLLER == true ]]; then
+    install -m 0644 "$stage/controller.yaml" /etc/kcore/controller.yaml
+    install -m 0644 "$stage/dashboard.env" /etc/kcore/dashboard.env
+  fi
+  printf '%s\n' installer-only >/etc/kcore/disk-management-mode
+  ln -sfn disk-management-mode /etc/kcore/disko-management-mode
+  if [[ $DISABLE_VXLAN == true ]]; then
+    : >/etc/kcore/disable-vxlan
+  fi
+}
+
+write_lustrate() {
+  if [[ -L /etc/resolv.conf ]]; then
+    local target
+    target=$(readlink -f /etc/resolv.conf || true)
+    if [[ -n $target && -r $target ]]; then
+      local tmp
+      tmp=$(mktemp)
+      cat "$target" >"$tmp"
+      rm -f /etc/resolv.conf
+      cat "$tmp" >/etc/resolv.conf
+      rm -f "$tmp"
+    fi
+  fi
+  local list=/etc/NIXOS_LUSTRATE key
+  : >"$list"
+  echo etc/nixos >>"$list"
+  echo etc/kcore >>"$list"
+  if [[ -e /etc/resolv.conf ]]; then
+    echo etc/resolv.conf >>"$list"
+  fi
+  if [[ -e /etc/machine-id ]]; then
+    echo etc/machine-id >>"$list"
+  fi
+  if [[ -d /root/.kcore ]]; then
+    echo root/.kcore >>"$list"
+  fi
+  if [[ -d /root/.ssh ]]; then
+    echo root/.ssh >>"$list"
+  fi
+  shopt -s nullglob
+  for key in /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub; do
+    echo "etc/ssh/${key##*/}" >>"$list"
+  done
+  shopt -u nullglob
+  touch /etc/NIXOS
+}
+
+finish_reboot() {
+  drop_swap
+  if [[ $REBOOT == true ]]; then
+    echo "Rebooting into kcoreOS."
+    sync
+    systemctl reboot || reboot
+    return 0
+  fi
+  if [[ $NO_REBOOT == true || ! -t 0 ]]; then
+    echo "Not rebooting. The next boot starts kcoreOS. Pass --reboot to boot now."
+    return 0
+  fi
+  local answer
+  read -r -p "Reboot into kcoreOS now? Type yes: " answer
+  if [[ $answer == yes ]]; then
+    sync
+    systemctl reboot || reboot
+  else
+    echo "Not rebooting. The next boot starts kcoreOS."
+  fi
+}
+
+on_err() {
+  local code=$?
+  restore_esp || true
+  drop_swap || true
+  if [[ $BOOTLOADER_DONE == true ]]; then
+    echo "kcore-infect failed (exit $code) after installing the kcoreOS bootloader." >&2
+    echo "The next reboot starts kcoreOS. /etc/kcore may be incomplete." >&2
+  else
+    echo "kcore-infect failed (exit $code). The original bootloader is still in place." >&2
+  fi
+  exit "$code"
+}
+
+infect() {
+  trap on_err ERR
+  require_root
+  # sudo sometimes keeps the caller's HOME. kctl writes the CA under $HOME.
+  export HOME=/root
+  require_linux
+  require_not_nixos
+  require_systemd
+  require_disk_space
+  print_plan
+  confirm
+  install_prereqs
+  maybe_swap
+  install_nix
+  ensure_flakes
+  mkdir -p /etc/nixos
+  stage_path_flake
+  local stage
+  stage=$(mktemp -d)
+  render_all "$stage"
+  cp "$stage"/*.nix /etc/nixos/
+  nix_build
+  prepare_esp
+  switch_boot
+  install_runtime_config "$stage"
+  write_lustrate
+  trap - ERR
+  finish_reboot
+}
+
+main() {
+  umask 022
+  parse_args "$@"
+  if [[ $SHOW_HELP == true ]]; then
+    usage
+    exit 0
+  fi
+  apply_defaults
+  detect_root
+  detect_boot
+  detect_net
+  detect_virt
+  import_ssh_keys
+  finalize
+  validate_ready
+  if [[ $DRY_RUN == true ]]; then
+    render_all "$OUT"
+    print_plan
+    echo "Dry run wrote $OUT"
+    exit 0
+  fi
+  infect
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
