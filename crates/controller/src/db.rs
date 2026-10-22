@@ -819,7 +819,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 65;
+pub const SCHEMA_VERSION: i32 = 66;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -827,7 +827,9 @@ pub const SCHEMA_VERSION: i32 = 65;
 /// membership columns with defaults. Version 61 adds `vms.labels` with a
 /// default. Version 62 adds vGPU parent and profile columns on `node_gpus`.
 /// Version 63 adds the HA tables. Version 64 adds the fence hold on `node_ha`.
-/// Older readers select the original columns and still open the file.
+/// Version 65 adds the ClickHouse tables. Version 66 adds
+/// `clickhouse_operation_claims`. Older readers select the original columns
+/// and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
 const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_clusters (
@@ -2157,6 +2159,17 @@ impl Database {
 
         if version < 65 {
             conn.execute_batch(crate::clickhouse_db::SCHEMA)?;
+        }
+
+        if version < 66 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS clickhouse_operation_claims (
+                    operation_id TEXT PRIMARY KEY,
+                    holder TEXT NOT NULL,
+                    expires_at_ms INTEGER NOT NULL,
+                    term INTEGER NOT NULL
+                );",
+            )?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
