@@ -57,6 +57,14 @@ pub async fn plan(
     };
     let mut blocking = blocking;
     blocking.extend(extra_block);
+    let member_ids = members_from_spec(&req.name, &spec)
+        .into_iter()
+        .map(|member| member.node_id)
+        .collect::<Vec<_>>();
+    blocking.extend(
+        db.clickhouse_node_conflicts(&req.name, &member_ids)
+            .map_err(internal)?,
+    );
     let mut warnings = warnings;
     warnings.extend(extra_warn);
     let preview = members_from_spec(&req.name, &spec)
@@ -118,6 +126,7 @@ pub async fn create(
         return Err(invalid(blocking.join("; ")));
     }
     require_nodes(db, &spec)?;
+    reject_shared_nodes(db, &req.name, &spec)?;
     let secrets = generate_secrets(&req.name, &spec)?;
     let id = persist_new(
         db,
@@ -160,6 +169,7 @@ pub async fn update(
     if !planned.blocking.is_empty() {
         return Err(invalid(planned.blocking.join("; ")));
     }
+    reject_shared_nodes(db, &req.name, &spec)?;
     let id = persist_generation(
         db,
         &req.name,
@@ -344,6 +354,7 @@ pub async fn scale(
         return Err(invalid(blocking.join("; ")));
     }
     require_nodes(db, &after)?;
+    reject_shared_nodes(db, &req.name, &after)?;
     let planned = diff(&before, &after);
     if !planned.blocking.is_empty() {
         return Err(invalid(planned.blocking.join("; ")));
@@ -413,6 +424,7 @@ pub async fn replace(
         return Err(invalid(blocking.join("; ")));
     }
     require_nodes(db, &after)?;
+    reject_shared_nodes(db, &req.name, &after)?;
     let planned = diff(&before, &after);
     let mut roll = rollout(Some(&before), &after, OpKind::Replace, &planned);
     roll.removed_replicas = vec![removed];
@@ -855,6 +867,19 @@ fn prepare(
     Ok((spec, blocking, warnings))
 }
 
+fn reject_shared_nodes(db: &Database, name: &str, spec: &ClusterSpec) -> Result<(), Status> {
+    let ids = members_from_spec(name, spec)
+        .into_iter()
+        .map(|member| member.node_id)
+        .collect::<Vec<_>>();
+    let conflicts = db.clickhouse_node_conflicts(name, &ids).map_err(internal)?;
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(conflicts.join("; ")))
+    }
+}
+
 fn require_nodes(db: &Database, spec: &ClusterSpec) -> Result<(), Status> {
     let mut missing = Vec::new();
     for member in members_from_spec("", spec) {
@@ -942,14 +967,31 @@ fn persist_new(
         active_operation_id: id.clone(),
     })
     .map_err(internal)?;
+    if let Err(err) = assign_new_cluster(db, name, spec, secrets, &id, kind, &steps, ctx, force) {
+        let _ = db.delete_clickhouse_cluster(name);
+        return Err(err);
+    }
+    Ok(id)
+}
+
+fn assign_new_cluster(
+    db: &Database,
+    name: &str,
+    spec: &ClusterSpec,
+    secrets: &(SecretRow, Vec<CertRow>),
+    id: &str,
+    kind: &str,
+    steps: &[Step],
+    ctx: &OpContext,
+    force: bool,
+) -> Result<(), Status> {
     db.replace_clickhouse_members(name, &members_from_spec(name, spec))
         .map_err(internal)?;
     db.upsert_clickhouse_secrets(name, &secrets.0)
         .map_err(internal)?;
     db.replace_clickhouse_certs(name, &secrets.1)
         .map_err(internal)?;
-    insert_op(db, name, &id, kind, &steps, ctx, force)?;
-    Ok(id)
+    insert_op(db, name, id, kind, steps, ctx, force)
 }
 
 fn persist_generation(
@@ -1187,3 +1229,124 @@ fn invalid(err: impl ToString) -> Status {
 }
 
 use aws_lc_rs::rand::SecureRandom;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    use crate::db::NodeRow;
+
+    fn node(id: &str) -> NodeRow {
+        NodeRow {
+            id: id.into(),
+            hostname: id.into(),
+            address: "127.0.0.1:9".into(),
+            cpu_cores: 2,
+            memory_bytes: 1024,
+            status: "ready".into(),
+            last_heartbeat: String::new(),
+            gateway_interface: "br0".into(),
+            cpu_used: 0,
+            memory_used: 0,
+            storage_backend: "filesystem".into(),
+            disable_vxlan: false,
+            approval_status: "approved".into(),
+            cert_expiry_days: -1,
+            luks_method: String::new(),
+            dc_id: "dc1".into(),
+        }
+    }
+
+    fn manifest(name: &str, node_id: &str, address: &str) -> String {
+        format!(
+            "kind: ClickhouseCluster\nmetadata:\n  name: {name}\nspec:\n  shards:\n    - replicas:\n        - {{nodeId: {node_id}, advertiseAddress: {address}, iface: enp6s0}}\n  keepers:\n    - {{nodeId: {node_id}, advertiseAddress: {address}, iface: enp6s0}}\n"
+        )
+    }
+
+    async fn create_named(db: &Database, yaml: &str) -> Result<String, Status> {
+        let (name, mut spec) = kcore_clickhouse::parse_manifest(yaml).map_err(invalid)?;
+        kcore_clickhouse::normalize(&mut spec);
+        let response = create(
+            db,
+            Request::new(controller_proto::CreateClickhouseClusterRequest {
+                name: name.clone(),
+                spec: Some(spec_to_proto(&spec)),
+                confirm: true,
+            }),
+        )
+        .await?;
+        Ok(response.into_inner().operation_id)
+    }
+
+    #[tokio::test]
+    async fn two_clusters_use_different_nodes_and_a_shared_node_is_refused() {
+        let db = Database::open(":memory:").unwrap();
+        for id in ["node-105", "node-106", "node-107"] {
+            db.upsert_node(&node(id)).unwrap();
+        }
+        create_named(&db, &manifest("analytics", "node-105", "192.168.40.105"))
+            .await
+            .unwrap();
+        create_named(&db, &manifest("billing", "node-106", "192.168.40.106"))
+            .await
+            .unwrap();
+        let names = db
+            .list_clickhouse_clusters()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["analytics".to_string(), "billing".to_string()]);
+
+        let err = create_named(&db, &manifest("stolen", "node-105", "192.168.40.105"))
+            .await
+            .expect_err("a node has one clickhouse unit");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("node-105"));
+        assert!(err.message().contains("analytics"));
+        assert!(db.get_clickhouse_cluster("stolen").unwrap().is_none());
+
+        let (name, mut spec) =
+            kcore_clickhouse::parse_manifest(&manifest("stolen", "node-105", "192.168.40.105"))
+                .unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        let plan = plan(
+            &db,
+            Request::new(controller_proto::PlanClickhouseClusterRequest {
+                name,
+                spec: Some(spec_to_proto(&spec)),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(plan
+            .blocking_issues
+            .iter()
+            .any(|issue| issue.contains("already runs ClickHouse cluster analytics")));
+
+        let mut member = db.list_clickhouse_members("analytics").unwrap().remove(0);
+        member.health_json = r#"{"server_active":true}"#.into();
+        db.replace_clickhouse_members("analytics", &[member.clone()])
+            .unwrap();
+        member.health_json.clear();
+        db.replace_clickhouse_members("analytics", &[member])
+            .unwrap();
+        assert!(db.list_clickhouse_members("analytics").unwrap()[0]
+            .health_json
+            .contains("server_active"));
+
+        let mut extra = db.list_clickhouse_members("analytics").unwrap().remove(0);
+        extra.node_id = "node-107".into();
+        extra.health_json.clear();
+        db.replace_clickhouse_members("analytics", &[extra])
+            .unwrap();
+        assert_eq!(db.list_clickhouse_members("analytics").unwrap().len(), 2);
+        db.prune_clickhouse_members("analytics", &["node-105".into()])
+            .unwrap();
+        let left = db.list_clickhouse_members("analytics").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].node_id, "node-105");
+    }
+}

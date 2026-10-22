@@ -221,6 +221,11 @@ async fn drive_inner<N: ClickhouseNodes>(db: &Database, nodes: &N, id: &str) -> 
         if op.kind == "delete" {
             db.delete_clickhouse_cluster(&cluster.name)?;
         } else {
+            let keep = crate::clickhouse_convert::members_from_spec(&cluster.name, &spec)
+                .into_iter()
+                .map(|member| member.node_id)
+                .collect::<Vec<_>>();
+            db.prune_clickhouse_members(&cluster.name, &keep)?;
             mark_phase(db, &cluster.name, "ready", "")?;
             clear_active(db, &cluster.name)?;
         }
