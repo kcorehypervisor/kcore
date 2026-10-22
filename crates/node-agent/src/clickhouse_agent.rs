@@ -222,6 +222,194 @@ pub fn preflight(
     issues
 }
 
+/// Disk space the agent observed for one declared volume.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeSpace {
+    pub storage_class: String,
+    pub pool: String,
+    pub name: String,
+    pub free_bytes: Option<i64>,
+    pub existing_bytes: Option<i64>,
+}
+
+/// Host facts gathered on the node. The preflight decision does not shell out.
+#[derive(Debug, Clone, Default)]
+pub struct HostFacts {
+    pub ip_addr_json: String,
+    pub networkctl_status: String,
+    pub lease_file_exists: bool,
+    pub listening: Vec<(u16, String)>,
+    pub volumes: Vec<VolumeSpace>,
+    pub package_version: String,
+}
+
+/// Structural preflight plus address, DHCP, ports, and volume room.
+pub fn preflight_with_host(
+    req: &proto::CheckClickhousePreflightRequest,
+    facts: &HostFacts,
+) -> Vec<proto::ClickhousePreflightIssue> {
+    let mut issues = preflight(req);
+    if !req.advertise_address.is_empty() && !req.iface.is_empty() && req.iface != "br0" {
+        match crate::ceph_preflight::iface_has_address(
+            &facts.ip_addr_json,
+            &req.iface,
+            &req.advertise_address,
+        ) {
+            Ok(true) => {}
+            Ok(false) => issues.push(issue(
+                "error",
+                "address",
+                "advertise address is not assigned to iface",
+            )),
+            Err(err) => issues.push(issue("error", "address", &err)),
+        }
+    }
+    if !req.iface.is_empty()
+        && crate::ceph_preflight::iface_appears_dhcp(
+            &facts.networkctl_status,
+            facts.lease_file_exists,
+        )
+    {
+        issues.push(issue("error", "iface", "iface is configured by DHCP"));
+    }
+    let ports = req.ports.unwrap_or_default();
+    let needed = needed_ports(
+        &ports,
+        req.tls_enabled,
+        req.keeper.is_some(),
+        req.server.is_some(),
+        req.server
+            .as_ref()
+            .is_some_and(|server| server.metrics_public),
+    );
+    for port in needed {
+        let port_u = u16::try_from(port).unwrap_or(0);
+        if let Some((_, owner)) = facts.listening.iter().find(|(open, _)| *open == port_u) {
+            if !owner.to_ascii_lowercase().contains("clickhouse") {
+                let who = if owner.is_empty() {
+                    "an unknown process".to_string()
+                } else {
+                    owner.clone()
+                };
+                issues.push(issue(
+                    "error",
+                    "port",
+                    &format!("port {port} is already used by {who}"),
+                ));
+            }
+        }
+    }
+    for volume in [&req.data_volume, &req.keeper_volume].into_iter().flatten() {
+        if volume.name.is_empty() || volume.size_bytes <= 0 {
+            continue;
+        }
+        let found = facts.volumes.iter().find(|row| {
+            row.name == volume.name
+                && row.pool == volume.volume_group
+                && row.storage_class == volume.storage_class
+        });
+        match found {
+            Some(row) if row.existing_bytes == Some(volume.size_bytes) => {}
+            Some(row) if row.existing_bytes.is_some() => {
+                let have = row.existing_bytes.unwrap_or(0);
+                issues.push(issue(
+                    "error",
+                    "volume",
+                    &format!(
+                        "volume {}/{} exists at {have} bytes, not {}",
+                        volume.volume_group, volume.name, volume.size_bytes
+                    ),
+                ));
+            }
+            Some(row) if row.free_bytes.is_some_and(|free| free >= volume.size_bytes) => {}
+            Some(row) if row.free_bytes.is_some() => {
+                let free = row.free_bytes.unwrap_or(0);
+                issues.push(issue(
+                    "error",
+                    "volume",
+                    &format!(
+                        "volume group {} has {free} bytes free, short of {} for {}",
+                        volume.volume_group, volume.size_bytes, volume.name
+                    ),
+                ));
+            }
+            _ => issues.push(issue(
+                "error",
+                "volume",
+                &format!(
+                    "free space for {}/{} was not observed",
+                    volume.volume_group, volume.name
+                ),
+            )),
+        }
+    }
+    if facts.package_version.is_empty() {
+        issues.push(issue(
+            "warning",
+            "package",
+            "package version was not resolved",
+        ));
+    }
+    issues
+}
+
+/// `ss -H -ltnp` rows as `(port, process)`. An empty process means the owner was hidden.
+pub fn parse_listening(ss: &str) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    for line in ss.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(local) = line.split_whitespace().nth(3) else {
+            continue;
+        };
+        let Some(port) = local.rsplit(':').next().and_then(|raw| raw.parse().ok()) else {
+            continue;
+        };
+        let owner = line
+            .split("((\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("")
+            .to_string();
+        out.push((port, owner));
+    }
+    out
+}
+
+pub fn lvm_free_bytes(vgs: &str, pool: &str) -> Option<i64> {
+    bytes_row(vgs, pool, 0, 1)
+}
+
+pub fn lvm_lv_bytes(lvs: &str, pool: &str, name: &str) -> Option<i64> {
+    for line in lvs.lines() {
+        let cols: Vec<_> = line.split_whitespace().collect();
+        if cols.len() >= 3 && cols[0] == name && cols[1] == pool {
+            return cols[2].parse().ok();
+        }
+    }
+    None
+}
+
+pub fn zpool_free_bytes(listing: &str, pool: &str) -> Option<i64> {
+    bytes_row(listing, pool, 0, 1)
+}
+
+pub fn zfs_volume_bytes(listing: &str, name: &str) -> Option<i64> {
+    bytes_row(listing, name, 0, 1)
+}
+
+fn bytes_row(text: &str, key: &str, key_at: usize, value_at: usize) -> Option<i64> {
+    for line in text.lines() {
+        let cols: Vec<_> = line.split_whitespace().collect();
+        if cols.len() > value_at && cols[key_at] == key {
+            return cols[value_at].parse().ok();
+        }
+    }
+    None
+}
+
 pub fn unit_service(unit: &str) -> Result<&'static str, String> {
     match unit {
         "server" => Ok("clickhouse.service"),
@@ -586,6 +774,31 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn needed_ports(
+    ports: &proto::ClickhousePorts,
+    tls: bool,
+    keeper: bool,
+    server: bool,
+    metrics_public: bool,
+) -> Vec<i32> {
+    let mut values = Vec::new();
+    if server {
+        if tls {
+            values.extend([ports.tcp_secure, ports.https, ports.interserver]);
+        } else {
+            values.extend([ports.tcp, ports.http, ports.interserver]);
+        }
+        if metrics_public {
+            values.push(ports.prometheus);
+        }
+    }
+    if keeper {
+        values.extend([ports.keeper, ports.keeper_raft]);
+    }
+    values.retain(|port| *port > 0);
+    values
+}
+
 fn ports_distinct(
     ports: &proto::ClickhousePorts,
     tls: bool,
@@ -735,6 +948,110 @@ mod tests {
         };
         let issues = preflight(&req);
         assert!(issues.iter().any(|issue| issue.check == "iface"));
+    }
+
+    fn host_req() -> proto::CheckClickhousePreflightRequest {
+        proto::CheckClickhousePreflightRequest {
+            cluster_name: "analytics".into(),
+            advertise_address: "192.168.40.105".into(),
+            iface: "enp6s0".into(),
+            package: "clickhouse".into(),
+            tls_enabled: true,
+            ports: Some(proto::ClickhousePorts {
+                tcp_secure: 9440,
+                https: 8443,
+                interserver: 9010,
+                keeper: 9281,
+                keeper_raft: 9234,
+                prometheus: 9363,
+                ..Default::default()
+            }),
+            server: Some(proto::ClickhouseNodeServerConfig {
+                shard_name: "s1".into(),
+                replica_name: "r1".into(),
+                ..Default::default()
+            }),
+            data_volume: Some(proto::ClickhouseHostVolume {
+                name: "ch-data".into(),
+                storage_class: "lvm".into(),
+                volume_group: "vg0".into(),
+                size_bytes: 1_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn good_facts() -> HostFacts {
+        HostFacts {
+            ip_addr_json: r#"[{"ifname":"enp6s0","addr_info":[{"local":"192.168.40.105"}]}]"#
+                .into(),
+            networkctl_status: "State: routable".into(),
+            lease_file_exists: false,
+            listening: vec![(9440, "clickhouse".into())],
+            volumes: vec![VolumeSpace {
+                storage_class: "lvm".into(),
+                pool: "vg0".into(),
+                name: "ch-data".into(),
+                free_bytes: Some(5_000),
+                existing_bytes: None,
+            }],
+            package_version: "26.2.4.23".into(),
+        }
+    }
+
+    #[test]
+    fn host_preflight_accepts_a_static_address_and_an_owned_port() {
+        let issues = preflight_with_host(&host_req(), &good_facts());
+        assert!(issues.iter().all(|issue| issue.severity != "error"));
+    }
+
+    #[test]
+    fn host_preflight_rejects_dhcp_a_foreign_port_and_a_short_volume() {
+        let mut facts = good_facts();
+        facts.lease_file_exists = true;
+        facts.listening = vec![(8443, "nginx".into()), (9010, String::new())];
+        facts.volumes[0].free_bytes = Some(10);
+        let issues = preflight_with_host(&host_req(), &facts);
+        assert!(issues.iter().any(|issue| issue.check == "iface"));
+        assert!(issues.iter().any(|issue| issue.message.contains("nginx")));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.message.contains("unknown process")));
+        assert!(issues.iter().any(|issue| issue.check == "volume"));
+    }
+
+    #[test]
+    fn an_unresolved_package_version_is_a_warning() {
+        let mut facts = good_facts();
+        facts.package_version.clear();
+        let issues = preflight_with_host(&host_req(), &facts);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.severity == "warning" && issue.check == "package"));
+        assert!(issues.iter().all(|issue| issue.severity != "error"));
+    }
+
+    #[test]
+    fn an_existing_volume_of_the_same_size_is_room_enough() {
+        let mut facts = good_facts();
+        facts.volumes[0].free_bytes = Some(0);
+        facts.volumes[0].existing_bytes = Some(1_000);
+        let issues = preflight_with_host(&host_req(), &facts);
+        assert!(issues.iter().all(|issue| issue.check != "volume"));
+    }
+
+    #[test]
+    fn ss_and_lvm_parsers_read_the_owner_and_the_free_bytes() {
+        let rows = parse_listening(
+            "LISTEN 0 128 0.0.0.0:9000 0.0.0.0:* users:((\"clickhouse\",pid=1,fd=3))\n",
+        );
+        assert_eq!(rows, vec![(9000, "clickhouse".into())]);
+        assert_eq!(lvm_free_bytes("  vg0  4096\n", "vg0"), Some(4096));
+        assert_eq!(
+            lvm_lv_bytes("  ch-data vg0 1000\n", "vg0", "ch-data"),
+            Some(1000)
+        );
     }
 
     #[test]

@@ -854,7 +854,7 @@ pub async fn list_backups(
     ))
 }
 
-fn prepare(
+pub(crate) fn prepare(
     name: &str,
     spec: ClickhouseClusterSpec,
 ) -> Result<(ClusterSpec, Vec<String>, Vec<String>), Status> {
@@ -867,7 +867,11 @@ fn prepare(
     Ok((spec, blocking, warnings))
 }
 
-fn reject_shared_nodes(db: &Database, name: &str, spec: &ClusterSpec) -> Result<(), Status> {
+pub(crate) fn reject_shared_nodes(
+    db: &Database,
+    name: &str,
+    spec: &ClusterSpec,
+) -> Result<(), Status> {
     let ids = members_from_spec(name, spec)
         .into_iter()
         .map(|member| member.node_id)
@@ -880,7 +884,7 @@ fn reject_shared_nodes(db: &Database, name: &str, spec: &ClusterSpec) -> Result<
     }
 }
 
-fn require_nodes(db: &Database, spec: &ClusterSpec) -> Result<(), Status> {
+pub(crate) fn require_nodes(db: &Database, spec: &ClusterSpec) -> Result<(), Status> {
     let mut missing = Vec::new();
     for member in members_from_spec("", spec) {
         let known = db.get_node(&member.node_id).map_err(internal)?.is_some();
