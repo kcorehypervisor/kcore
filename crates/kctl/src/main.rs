@@ -90,6 +90,22 @@ enum Command {
         #[command(subcommand)]
         resource: CreateResource,
     },
+    /// Write node certs from a local cluster CA. Does not contact a controller.
+    #[command(name = "write-node-pki")]
+    WriteNodePki {
+        /// Directory from `kctl create cluster` (ca.crt, ca.key, sub-ca material)
+        #[arg(long)]
+        certs_dir: PathBuf,
+        /// Host placed in the certificate CN and SAN
+        #[arg(long)]
+        host: String,
+        /// Directory that receives ca.crt, node.crt, node.key, and controller material
+        #[arg(long)]
+        out: PathBuf,
+        /// Also write controller and sub-CA files for a co-located controller
+        #[arg(long)]
+        run_controller: bool,
+    },
     /// Delete a resource
     Delete {
         #[command(subcommand)]
@@ -2206,6 +2222,14 @@ async fn main() {
                 .unwrap_or_else(|| config::default_cluster_certs_dir(context));
             commands::cluster::create(&config_path, controller, &certs_path, context, *force)
         }
+
+        Command::WriteNodePki {
+            certs_dir,
+            host,
+            out,
+            run_controller,
+        } => pki::write_node_pki(certs_dir, host, out, *run_controller)
+            .map_err(|err| anyhow::anyhow!(err)),
 
         Command::Delete {
             resource:
