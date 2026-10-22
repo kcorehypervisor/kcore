@@ -10,12 +10,12 @@
 # The disk is not repartitioned and is not encrypted. Use the kcore ISO
 # installer when the root disk should be wiped and unlocked with LUKS.
 #
-# Preview:
-#   sudo ./scripts/kcore-infect --dry-run
-# Install this machine as a controller and node, then reboot:
-#   sudo ./scripts/kcore-infect --yes --reboot
+# On the server, download this file and run it:
+#   curl -fsSL https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect | sudo bash -s -- --yes --reboot
+# Preview without installing Nix or changing the bootloader:
+#   curl -fsSL https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect | sudo bash -s -- --dry-run
 # Join an existing controller (certs come from `kctl write-node-pki`):
-#   sudo ./scripts/kcore-infect --yes --reboot \
+#   curl -fsSL https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect | sudo bash -s -- --yes --reboot \
 #     --controller 10.0.0.5:9090 --cert-dir /root/node-certs
 
 set -euo pipefail
@@ -70,8 +70,13 @@ usage() {
   cat <<'EOF'
 kcore-infect — install kcoreOS onto Debian, Ubuntu, Fedora, or another systemd Linux
 
+On the server:
+
+  curl -fsSL https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect | sudo bash -s -- --yes --reboot
+
 The next boot replaces this distro. The disk is not wiped and is not encrypted.
 Files from the old system are moved to /old-root. SSH host keys are kept.
+Flags go after --. A pipe has no prompt, so --yes is required.
 
 Options:
   --yes                 Replace this system without an interactive prompt
@@ -1415,6 +1420,9 @@ main() {
   infect
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+# Executing this file sets BASH_SOURCE to the file. `curl | bash` leaves it
+# unset. Sourcing (the render tests) sets BASH_SOURCE to this file and $0 to
+# the caller, so main stays uncalled.
+if [[ -z ${BASH_SOURCE[0]:-} || ${BASH_SOURCE[0]} == "$0" ]]; then
   main "$@"
 fi

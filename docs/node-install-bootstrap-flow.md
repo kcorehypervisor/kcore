@@ -11,7 +11,13 @@ Install a node from live ISO to disk and ensure that, after reboot:
 
 ## Existing Debian or other Linux
 
-[`scripts/kcore-infect`](../scripts/kcore-infect) converts a running systemd Linux host in place. The disk is not repartitioned and is not encrypted. The procedure in this document is the one that boots the ISO, wipes a disk, and enrolls LUKS. See [kcore-infect](./kcore-infect.md).
+On a running systemd Linux server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect | sudo bash -s -- --yes --reboot
+```
+
+That fetches [`scripts/kcore-infect`](../scripts/kcore-infect) and installs kcoreOS on the filesystem that is already there. The procedure in this document is the one that boots the ISO, wipes a disk, and enrolls LUKS. See [kcore-infect](./kcore-infect.md).
 
 ## Cluster-scoped PKI layout
 
