@@ -32,18 +32,36 @@ export type Catalog = { resources: Resource[] };
 
 export type Row = Record<string, unknown>;
 
+const REQUEST_TIMEOUT_MS = 25_000;
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
-  const res = await fetch(path, { credentials: "same-origin", ...init, headers });
-  if (!res.ok) {
-    throw new Error((await res.text()) || res.statusText);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const parent = init?.signal;
+  if (parent) {
+    if (parent.aborted) controller.abort();
+    else parent.addEventListener("abort", () => controller.abort(), { once: true });
   }
-  const type = res.headers.get("content-type") ?? "";
-  if (type.includes("json")) return (await res.json()) as T;
-  return (await res.text()) as T;
+  try {
+    const res = await fetch(path, { credentials: "same-origin", ...init, headers, signal: controller.signal });
+    if (!res.ok) {
+      throw new Error((await res.text()) || res.statusText);
+    }
+    const type = res.headers.get("content-type") ?? "";
+    if (type.includes("json")) return (await res.json()) as T;
+    return (await res.text()) as T;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("The controller took too long to respond.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function specToValues(fields: Field[], spec: Record<string, unknown>): Record<string, string | boolean> {

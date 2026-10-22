@@ -1,15 +1,93 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "@tanstack/react-router";
-import { createColumnHelper, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api, payload, specToValues, type Action, type Catalog, type Field, type Resource, type Row } from "./api";
+
+const PAGE_SIZE = 25;
+const COLUMN_LIMIT = 8;
+const PREFERRED_COLUMNS = ["name", "id", "title", "status", "state", "phase", "kind", "node_id"];
 
 function cell(value: unknown): string {
   if (value === null || value === undefined) return "";
-  if (typeof value === "object") return JSON.stringify(value);
+  if (typeof value === "object") return "";
   return String(value);
+}
+
+function isRecord(value: unknown): value is Row {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isObjectArray(value: unknown): value is Row[] {
+  return Array.isArray(value) && value.length > 0 && value.every(isRecord);
+}
+
+/** Scalar text for a table cell. Nested objects stay summarized so a disk
+ * inventory cannot stringify into a multi-megabyte DOM node. */
+function cellText(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value === "string") return value.length > 180 ? `${value.slice(0, 177)}…` : value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "";
+    if (value.every((item) => item == null || typeof item !== "object")) {
+      const text = value
+        .filter((item) => item != null && item !== "")
+        .map((item) => String(item))
+        .join(", ");
+      return text.length > 180 ? `${text.slice(0, 177)}…` : text;
+    }
+    return String(value.length);
+  }
+  if (isRecord(value)) {
+    const parts = Object.entries(value)
+      .filter(([, item]) => item != null && item !== "" && typeof item !== "object")
+      .slice(0, 3)
+      .map(([key, item]) => `${key}: ${String(item)}`);
+    const text = parts.join(" · ");
+    return text.length > 180 ? `${text.slice(0, 177)}…` : text;
+  }
+  return String(value);
+}
+
+function columnKeys(rows: Row[]): string[] {
+  const present = new Set<string>();
+  for (const row of rows.slice(0, 30)) {
+    for (const key of Object.keys(row)) present.add(key);
+  }
+  const preferred = PREFERRED_COLUMNS.filter((key) => present.has(key));
+  const rest = [...present].filter((key) => !preferred.includes(key));
+  return [...preferred, ...rest].slice(0, COLUMN_LIMIT);
+}
+
+function haystack(row: Row): string {
+  const parts: string[] = [];
+  let size = 0;
+  const push = (text: string) => {
+    if (size > 4000) return;
+    parts.push(text);
+    size += text.length;
+  };
+  const visit = (value: unknown, depth: number) => {
+    if (size > 4000 || value == null || depth > 2) return;
+    if (typeof value !== "object") {
+      push(String(value));
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 40)) visit(item, depth + 1);
+      return;
+    }
+    for (const item of Object.values(value as Row)) visit(item, depth + 1);
+  };
+  visit(row, 0);
+  return parts.join("\u0000").toLowerCase();
+}
+
+function pretty(value: unknown): string {
+  const text = JSON.stringify(value, null, 2) ?? "";
+  if (text.length > 80_000) return `${text.slice(0, 80_000)}\n… truncated`;
+  return text;
 }
 
 const LIST_COLUMNS: Record<string, { name: string; kind?: "bool" | "number" }[]> = {
@@ -52,6 +130,24 @@ function parseList(raw: string | boolean | undefined): Record<string, string | b
   }
 }
 
+function StateChart({ data }: { data: { state: string; count: number }[] }) {
+  if (data.length === 0) return <p className="muted">No virtual machines yet.</p>;
+  const max = Math.max(...data.map((item) => item.count), 1);
+  return (
+    <div className="bars" role="img" aria-label="Virtual machines by state">
+      {data.map((item) => (
+        <div className="bar-row" key={item.state}>
+          <span>{item.state}</span>
+          <div className="bar-track">
+            <div className="bar-fill" style={{ width: `${(item.count / max) * 100}%` }} />
+          </div>
+          <strong>{item.count}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function Overview() {
   const health = useQuery({
     queryKey: ["rows", "health"],
@@ -62,7 +158,7 @@ export function Overview() {
     queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/compliance"),
   });
   const vms = useQuery({
-    queryKey: ["rows", "vms"],
+    queryKey: ["rows", "vms", ""],
     queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/vms"),
   });
   const row = health.data?.rows?.[0] ?? {};
@@ -76,6 +172,7 @@ export function Overview() {
     return [...counts.entries()].map(([state, count]) => ({ state, count }));
   }, [vms.data]);
   const error = health.error ?? compliance.error ?? vms.error;
+  const loading = !error && (health.isLoading || compliance.isLoading || vms.isLoading);
 
   return (
     <>
@@ -83,33 +180,28 @@ export function Overview() {
         <h1>Overview</h1>
       </header>
       {error ? <p className="error">{(error as Error).message}</p> : null}
+      {loading ? <p className="muted">Loading cluster…</p> : null}
       <div className="grid">
         <div className="card">
           <span className="muted">Cluster</span>
-          <strong>{cell(row.headline) || cell(row.status) || "—"}</strong>
+          <strong className="metric">{cell(row.headline) || cell(row.status) || "—"}</strong>
         </div>
         <div className="card">
           <span className="muted">Ready nodes</span>
-          <strong>{cell(row.ready_nodes) || "—"}</strong>
+          <strong className="metric">{cell(row.ready_nodes) || "—"}</strong>
         </div>
         <div className="card">
           <span className="muted">Virtual machines</span>
-          <strong>{cell(row.vm_count) || String(vms.data?.rows.length ?? "—")}</strong>
+          <strong className="metric">{cell(row.vm_count) || String(vms.data?.rows.length ?? "—")}</strong>
         </div>
         <div className="card">
           <span className="muted">Running VMs</span>
-          <strong>{cell(report.running_vms) || "—"}</strong>
+          <strong className="metric">{cell(report.running_vms) || "—"}</strong>
         </div>
       </div>
-      <div className="card" style={{ marginTop: 12, height: 260 }}>
-        <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={chart}>
-            <XAxis dataKey="state" stroke="#93a0b0" />
-            <YAxis allowDecimals={false} stroke="#93a0b0" />
-            <Tooltip />
-            <Bar dataKey="count" fill="#3b82f6" />
-          </BarChart>
-        </ResponsiveContainer>
+      <div className="card chart-card">
+        <span className="muted">VMs by state</span>
+        <StateChart data={chart} />
       </div>
     </>
   );
@@ -167,10 +259,7 @@ function ListField({
               />
             ),
           )}
-          <button
-            type="button"
-            onClick={() => write(rows.filter((_, itemIndex) => itemIndex !== index))}
-          >
+          <button type="button" onClick={() => write(rows.filter((_, itemIndex) => itemIndex !== index))}>
             Remove
           </button>
         </div>
@@ -195,23 +284,18 @@ function Fields({
     <>
       {fields.map((field) =>
         field.kind === "json" ? (
-          <ListField
-            key={field.name}
-            field={field}
-            value={values[field.name]}
-            onChange={(value) => onChange(field.name, value)}
-          />
+          <ListField key={field.name} field={field} value={values[field.name]} onChange={(value) => onChange(field.name, value)} />
         ) : (
           <label key={field.name}>
             {field.label}
             {field.required ? " *" : ""}
             {field.kind === "bool" ? (
-              <input
-                type="checkbox"
-                checked={Boolean(values[field.name])}
-                onChange={(event) => onChange(field.name, event.target.checked)}
-              />
-            ) : field.name.includes("nix") || field.name.endsWith("_pem") || field.name === "public_key" || field.name === "cloud_init_user_data" || field.name === "sqlite_base64" ? (
+              <input type="checkbox" checked={Boolean(values[field.name])} onChange={(event) => onChange(field.name, event.target.checked)} />
+            ) : field.name.includes("nix") ||
+              field.name.endsWith("_pem") ||
+              field.name === "public_key" ||
+              field.name === "cloud_init_user_data" ||
+              field.name === "sqlite_base64" ? (
               <textarea value={String(values[field.name] ?? "")} onChange={(event) => onChange(field.name, event.target.value)} />
             ) : (
               <input
@@ -227,6 +311,113 @@ function Fields({
   );
 }
 
+type FormRequest = {
+  title: string;
+  fields: Field[];
+  checks: Action[];
+  preload: boolean;
+  confirm: boolean;
+  requireForce: boolean;
+  resourceId: string;
+  rowKey: string;
+  submit: (form: Record<string, string | boolean>) => Promise<void>;
+};
+
+function Pager({ page, total, onPage }: { page: number; total: number; onPage: (page: number) => void }) {
+  if (total <= PAGE_SIZE) return null;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const safe = Math.min(page, pages - 1);
+  const start = safe * PAGE_SIZE + 1;
+  const end = Math.min(total, start + PAGE_SIZE - 1);
+  return (
+    <div className="pager">
+      <button type="button" disabled={safe === 0} onClick={() => onPage(safe - 1)}>
+        Previous
+      </button>
+      <span className="muted">
+        {start}–{end} of {total}
+      </span>
+      <button type="button" disabled={safe + 1 >= pages} onClick={() => onPage(safe + 1)}>
+        Next
+      </button>
+    </div>
+  );
+}
+
+function DataTable({ rows, trailing, onRow }: { rows: Row[]; trailing?: (row: Row) => ReactNode; onRow?: (row: Row) => void }) {
+  const [page, setPage] = useState(0);
+  const keys = useMemo(() => columnKeys(rows), [rows]);
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  const safe = Math.min(page, pages - 1);
+  const slice = rows.slice(safe * PAGE_SIZE, safe * PAGE_SIZE + PAGE_SIZE);
+  if (rows.length === 0) return <p className="muted">Nothing here yet.</p>;
+  return (
+    <>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              {keys.map((key) => (
+                <th key={key}>{key}</th>
+              ))}
+              {trailing ? <th /> : null}
+            </tr>
+          </thead>
+          <tbody>
+            {slice.map((row, index) => (
+              <tr
+                key={cell(row.id) || cell(row.name) || String(safe * PAGE_SIZE + index)}
+                className={onRow ? "inspect" : undefined}
+                onClick={onRow ? () => onRow(row) : undefined}
+              >
+                {keys.map((key) => {
+                  const text = cellText(row[key]);
+                  return (
+                    <td key={key} title={text}>
+                      {text}
+                    </td>
+                  );
+                })}
+                {trailing ? <td>{trailing(row)}</td> : null}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <Pager page={safe} total={rows.length} onPage={setPage} />
+    </>
+  );
+}
+
+function Summary({ row }: { row: Row }) {
+  const scalars = Object.entries(row).filter(([, value]) => !isObjectArray(value));
+  const tables = Object.entries(row).filter((entry): entry is [string, Row[]] => isObjectArray(entry[1]));
+  return (
+    <>
+      <div className="grid">
+        {scalars.map(([key, value]) => (
+          <div className="card" key={key}>
+            <span className="muted">{key}</span>
+            <strong>{cellText(value) || "—"}</strong>
+          </div>
+        ))}
+      </div>
+      {tables.map(([key, nested]) => (
+        <section key={key} className="nested">
+          <h2>{key}</h2>
+          <DataTable rows={nested} />
+        </section>
+      ))}
+    </>
+  );
+}
+
+function isSummary(rows: Row[]): boolean {
+  if (rows.length !== 1) return false;
+  const row = rows[0];
+  return Object.values(row).some(isObjectArray) || Object.keys(row).length > COLUMN_LIMIT;
+}
+
 export function ResourcePage() {
   const { id } = useParams({ from: "/r/$id" });
   const queryClient = useQueryClient();
@@ -238,18 +429,21 @@ export function ResourcePage() {
   const [volume, setVolume] = useState("");
   const [filter, setFilter] = useState("");
   const [notice, setNotice] = useState("");
-  const [open, setOpen] = useState(false);
-  const [title, setTitle] = useState("");
-  const [fields, setFields] = useState<Field[]>([]);
-  const [values, setValues] = useState<Record<string, string | boolean>>({});
-  const [submit, setSubmit] = useState<((values: Record<string, string | boolean>) => Promise<void>) | null>(null);
-  const [checks, setChecks] = useState<Action[]>([]);
-  const [dialogNote, setDialogNote] = useState("");
+  const [request, setRequest] = useState<FormRequest | null>(null);
   const [detail, setDetail] = useState("");
   const [detailOpen, setDetailOpen] = useState(false);
 
+  useEffect(() => {
+    setVolume("");
+    setFilter("");
+    setNotice("");
+    setRequest(null);
+    setDetailOpen(false);
+  }, [id]);
+
+  const listKey = id === "snapshots" ? volume : "";
   const rows = useQuery({
-    queryKey: ["rows", id, volume],
+    queryKey: ["rows", id, listKey],
     enabled: Boolean(resource?.list),
     queryFn: () => {
       const query = id === "snapshots" && volume ? `?volume=${encodeURIComponent(volume)}` : "";
@@ -257,44 +451,16 @@ export function ResourcePage() {
     },
   });
 
-  const visible = (rows.data?.rows ?? []).filter((row) => {
-    if (!filter) return true;
-    return JSON.stringify(row).toLowerCase().includes(filter.toLowerCase());
-  });
-
-  const columns = useMemo(() => {
-    const helper = createColumnHelper<Row>();
-    const keys = Object.keys(visible[0] ?? {}).slice(0, 8);
-    const data = keys.map((key) =>
-      helper.accessor((row) => cell(row[key]), { id: key, header: key }),
-    );
-    const actions = helper.display({
-      id: "actions",
-      header: "",
-      cell: (info) =>
-        resource ? (
-          <RowActions resource={resource} row={info.row.original} onRun={run} onInspect={openDetail} />
-        ) : null,
-    });
-    return [...data, actions];
-  }, [visible, resource]);
-
-  const table = useReactTable({ data: visible, columns, getCoreRowModel: getCoreRowModel() });
-
-  function openDialog(
-    nextTitle: string,
-    nextFields: Field[],
-    runSubmit: (form: Record<string, string | boolean>) => Promise<void>,
-    nextChecks: Action[] = [],
-  ) {
-    setTitle(nextTitle);
-    setFields(nextFields);
-    setValues({});
-    setSubmit(() => runSubmit);
-    setChecks(nextChecks);
-    setDialogNote("");
-    setOpen(true);
-  }
+  const indexed = useMemo(
+    () => (rows.data?.rows ?? []).map((row) => ({ row, haystack: haystack(row) })),
+    [rows.data],
+  );
+  const visible = useMemo(() => {
+    const query = filter.trim().toLowerCase();
+    if (!query) return indexed.map((item) => item.row);
+    return indexed.filter((item) => item.haystack.includes(query)).map((item) => item.row);
+  }, [indexed, filter]);
+  const summary = isSummary(visible);
 
   async function run(action: Action, row?: Row, form: Record<string, string | boolean> = {}) {
     if (!resource) return;
@@ -312,7 +478,7 @@ export function ResourcePage() {
         extra: { ...(row ?? {}), ...payload(action.fields, form) },
       }),
     });
-    setNotice(JSON.stringify(result, null, 2));
+    setNotice(pretty(result));
     await queryClient.invalidateQueries({ queryKey: ["rows", resource.id] });
   }
 
@@ -322,40 +488,44 @@ export function ResourcePage() {
       method: "POST",
       body: JSON.stringify(payload(resource.fields, form)),
     });
-    setNotice(JSON.stringify(result, null, 2));
+    setNotice(pretty(result));
     await queryClient.invalidateQueries({ queryKey: ["rows", resource.id] });
+  }
+
+  function openForm(
+    title: string,
+    fields: Field[],
+    submit: (form: Record<string, string | boolean>) => Promise<void>,
+    options: { checks?: Action[]; preload?: boolean; confirm?: boolean; requireForce?: boolean; row?: Row } = {},
+  ) {
+    if (!resource) return;
+    setRequest({
+      title,
+      fields,
+      checks: options.checks ?? [],
+      preload: Boolean(options.preload),
+      confirm: Boolean(options.confirm),
+      requireForce: Boolean(options.requireForce),
+      resourceId: resource.id,
+      rowKey: options.row ? cell(options.row[resource.idField]) : "",
+      submit,
+    });
   }
 
   async function openDetail(row: Row) {
     if (!resource?.inspect) return;
     const key = cell(row[resource.idField]);
     const body = await api<unknown>(`/api/v1/resources/${resource.id}/items/${encodeURIComponent(key)}`);
-    setDetail(JSON.stringify(body, null, 2));
+    setDetail(pretty(body));
     setDetailOpen(true);
-  }
-
-  async function runCheck(action: Action) {
-    try {
-      const result = await api<unknown>(`/api/v1/resources/${resource?.id}/actions`, {
-        method: "POST",
-        body: JSON.stringify({
-          action: action.name,
-          id: cell(values.name),
-          confirm: Boolean(values.confirm),
-          extra: payload(fields, values),
-        }),
-      });
-      setDialogNote(JSON.stringify(result, null, 2));
-    } catch (error) {
-      setDialogNote((error as Error).message);
-    }
   }
 
   if (!resource && catalog.isSuccess) {
     return <p className="error">Unknown resource.</p>;
   }
 
-  const wide = fields.some((field) => field.kind === "json");
+  const actions = (row?: Row) =>
+    resource ? <RowActions resource={resource} row={row} onOpen={openForm} onRun={run} onInspect={openDetail} /> : null;
 
   return (
     <>
@@ -371,20 +541,25 @@ export function ResourcePage() {
         </div>
       </header>
       <div className="toolbar">
-        <input placeholder="Filter" value={filter} onChange={(event) => setFilter(event.target.value)} />
+        {resource?.list ? (
+          <input
+            placeholder="Filter"
+            aria-label="Filter"
+            value={filter}
+            onChange={(event) => setFilter(event.target.value)}
+          />
+        ) : null}
         {id === "snapshots" ? (
-          <input placeholder="Volume" value={volume} onChange={(event) => setVolume(event.target.value)} />
+          <input placeholder="Volume" aria-label="Volume" value={volume} onChange={(event) => setVolume(event.target.value)} />
         ) : null}
         {resource?.creatable ? (
           <button
+            type="button"
             className="primary"
             onClick={() =>
-              openDialog(
-                `Create ${resource.title}`,
-                resource.fields,
-                create,
-                resource.actions.filter((action) => action.name === "plan" || action.name === "classify"),
-              )
+              openForm(`Create ${resource.title}`, resource.fields, create, {
+                checks: resource.actions.filter((action) => action.name === "plan" || action.name === "classify"),
+              })
             }
           >
             Create
@@ -393,71 +568,40 @@ export function ResourcePage() {
         {resource && !resource.list
           ? resource.actions.map((action) =>
               action.client ? null : (
-                <button key={action.name} onClick={() => openDialog(action.label, action.fields, (form) => run(action, undefined, form))}>
+                <button
+                  type="button"
+                  key={action.name}
+                  onClick={() => openForm(action.label, action.fields, (form) => run(action, undefined, form), { confirm: action.confirm })}
+                >
                   {action.label}
                 </button>
               ),
             )
           : null}
+        {summary && visible[0] ? actions(visible[0]) : null}
       </div>
+      {catalog.isLoading ? <p className="muted">Loading…</p> : null}
       {rows.isError ? <p className="error">{(rows.error as Error).message}</p> : null}
       {resource && !resource.list ? <p className="muted">The controller has no list for this resource. Create it, then delete by name.</p> : null}
-      <table>
-        <thead>
-          {table.getHeaderGroups().map((group) => (
-            <tr key={group.id}>
-              {group.headers.map((header) => (
-                <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>
-              ))}
-            </tr>
-          ))}
-        </thead>
-        <tbody>
-          {table.getRowModel().rows.map((row) => (
-            <tr
-              key={row.id}
-              className={resource?.inspect ? "inspect" : undefined}
-              onClick={() => {
-                openDetail(row.original).catch((error: Error) => setNotice(error.message));
-              }}
-            >
-              {row.getVisibleCells().map((cellItem) => (
-                <td key={cellItem.id}>{flexRender(cellItem.column.columnDef.cell, cellItem.getContext())}</td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {resource?.list && rows.isLoading ? <p className="muted">Loading…</p> : null}
+      {resource?.list && rows.isSuccess ? (
+        summary && visible[0] ? (
+          <Summary row={visible[0]} />
+        ) : (
+          <DataTable
+            key={filter}
+            rows={visible}
+            onRow={resource.inspect ? (row) => openDetail(row).catch((error: Error) => setNotice(error.message)) : undefined}
+            trailing={(row) => actions(row)}
+          />
+        )
+      ) : null}
       {notice ? <pre className="log">{notice}</pre> : null}
-      <Dialog.Root open={open} onOpenChange={setOpen}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="overlay" />
-          <Dialog.Content className={wide ? "dialog wide" : "dialog"}>
-            <Dialog.Title>{title}</Dialog.Title>
-            <Fields fields={fields} values={values} onChange={(name, value) => setValues((current) => ({ ...current, [name]: value }))} />
-            {dialogNote ? <pre className="detail">{dialogNote}</pre> : null}
-            <div className="buttons">
-              {checks.map((action) => (
-                <button key={action.name} type="button" onClick={() => runCheck(action)}>
-                  {action.label}
-                </button>
-              ))}
-              <Dialog.Close asChild>
-                <button>Cancel</button>
-              </Dialog.Close>
-              <button
-                className="primary"
-                onClick={() => {
-                  setOpen(false);
-                  submit?.(values).catch((error: Error) => setNotice(error.message));
-                }}
-              >
-                Apply
-              </button>
-            </div>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
+      <FormDialog
+        request={request}
+        onClose={() => setRequest(null)}
+        onError={(message) => setNotice(message)}
+      />
       <Dialog.Root open={detailOpen} onOpenChange={setDetailOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="overlay" />
@@ -466,7 +610,7 @@ export function ResourcePage() {
             <pre className="detail">{detail}</pre>
             <div className="buttons">
               <Dialog.Close asChild>
-                <button>Close</button>
+                <button type="button">Close</button>
               </Dialog.Close>
             </div>
           </Dialog.Content>
@@ -479,29 +623,56 @@ export function ResourcePage() {
 function RowActions({
   resource,
   row,
+  onOpen,
   onRun,
   onInspect,
 }: {
   resource: Resource;
-  row: Row;
-  onRun: (action: Action, row: Row) => Promise<void>;
+  row?: Row;
+  onOpen: (
+    title: string,
+    fields: Field[],
+    submit: (form: Record<string, string | boolean>) => Promise<void>,
+    options?: { checks?: Action[]; preload?: boolean; confirm?: boolean; requireForce?: boolean; row?: Row },
+  ) => void;
+  onRun: (action: Action, row: Row, form?: Record<string, string | boolean>) => Promise<void>;
   onInspect: (row: Row) => Promise<void>;
 }) {
-  const id = cell(row[resource.idField]);
+  const idValue = row ? cell(row[resource.idField]) : "";
   return (
     <div className="row-actions" onClick={(event) => event.stopPropagation()}>
-      {resource.inspect ? (
-        <button onClick={() => onInspect(row).catch((error: Error) => alert(error.message))}>Inspect</button>
+      {resource.inspect && row ? (
+        <button type="button" onClick={() => onInspect(row).catch((error: Error) => alert(error.message))}>
+          Inspect
+        </button>
       ) : null}
       {resource.actions.map((action) =>
         action.client ? (
-          <a key={action.name} href={`/vms/${id}/console`}>
+          <a key={action.name} href={`/vms/${idValue}/console`}>
             {action.label}
           </a>
         ) : action.fields.length || action.confirm || action.preload ? (
-          <ActionButton key={action.name} resource={resource} action={action} row={row} onRun={onRun} />
+          <button
+            type="button"
+            key={action.name}
+            className={action.confirm ? "danger" : ""}
+            onClick={() =>
+              onOpen(action.label, action.fields, (form) => onRun(action, row ?? {}, form), {
+                confirm: action.confirm,
+                preload: action.preload,
+                requireForce: action.name === "reset-migrate",
+                row,
+              })
+            }
+          >
+            {action.label}
+          </button>
         ) : (
-          <button key={action.name} onClick={() => onRun(action, row).catch((error: Error) => alert(error.message))}>
+          <button
+            type="button"
+            key={action.name}
+            onClick={() => row && onRun(action, row).catch((error: Error) => alert(error.message))}
+          >
             {action.label}
           </button>
         ),
@@ -510,38 +681,43 @@ function RowActions({
   );
 }
 
-function ActionButton({
-  resource,
-  action,
-  row,
-  onRun,
+function FormDialog({
+  request,
+  onClose,
+  onError,
 }: {
-  resource: Resource;
-  action: Action;
-  row: Row;
-  onRun: (action: Action, row: Row, form?: Record<string, string | boolean>) => Promise<void>;
+  request: FormRequest | null;
+  onClose: () => void;
+  onError: (message: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [values, setValues] = useState<Record<string, string | boolean>>({});
+  const [note, setNote] = useState("");
+  const [ready, setReady] = useState(true);
   const [loadError, setLoadError] = useState("");
-  const [ready, setReady] = useState(!action.preload);
-  const wide = action.fields.some((field) => field.kind === "json");
-  const blocked = (action.name === "reset-migrate" && !values.force) || (action.preload && !ready);
+  const wide = request?.fields.some((field) => field.kind === "json") ?? false;
+  const blocked = Boolean(request && ((request.requireForce && !values.force) || (request.preload && !ready)));
 
   useEffect(() => {
-    if (!open || !action.preload) return;
+    if (!request) return;
+    setValues({});
+    setNote("");
+    setLoadError("");
+    if (!request.preload) {
+      setReady(true);
+      return;
+    }
     let cancel = false;
     setReady(false);
-    setLoadError("");
-    const key = cell(row[resource.idField]);
-    api<{ spec?: Record<string, unknown> }>(`/api/v1/resources/${resource.id}/items/${encodeURIComponent(key)}`)
+    api<{ spec?: Record<string, unknown> }>(
+      `/api/v1/resources/${request.resourceId}/items/${encodeURIComponent(request.rowKey)}`,
+    )
       .then((body) => {
         if (cancel) return;
         if (!body.spec) {
           setLoadError("The controller returned no spec. Update was not loaded.");
           return;
         }
-        setValues(specToValues(action.fields, body.spec));
+        setValues(specToValues(request.fields, body.spec));
         setReady(true);
       })
       .catch((error: Error) => {
@@ -550,35 +726,63 @@ function ActionButton({
     return () => {
       cancel = true;
     };
-  }, [open, action, resource.id, resource.idField, row]);
+  }, [request]);
+
+  async function runCheck(action: Action) {
+    if (!request) return;
+    try {
+      const result = await api<unknown>(`/api/v1/resources/${request.resourceId}/actions`, {
+        method: "POST",
+        body: JSON.stringify({
+          action: action.name,
+          id: cell(values.name),
+          confirm: Boolean(values.confirm),
+          extra: payload(request.fields, values),
+        }),
+      });
+      setNote(pretty(result));
+    } catch (error) {
+      setNote((error as Error).message);
+    }
+  }
 
   return (
-    <Dialog.Root open={open} onOpenChange={setOpen}>
-      <Dialog.Trigger asChild>
-        <button className={action.confirm ? "danger" : ""}>{action.label}</button>
-      </Dialog.Trigger>
+    <Dialog.Root open={request !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="overlay" />
         <Dialog.Content className={wide ? "dialog wide" : "dialog"}>
-          <Dialog.Title>{action.label}</Dialog.Title>
-          {action.confirm ? <p>This changes the cluster.</p> : null}
-          {action.name === "reset-migrate" ? (
+          <Dialog.Title>{request?.title ?? ""}</Dialog.Title>
+          {request?.confirm ? <p>This changes the cluster.</p> : null}
+          {request?.requireForce ? (
             <p>Force clears a stranded receive session on the named node. The controller refuses the node that owns the running VM.</p>
           ) : null}
-          {action.preload ? <p>Loaded from the current cluster spec. Apply sends this form back as the replacement.</p> : null}
+          {request?.preload ? <p>Loaded from the current cluster spec. Apply sends this form back as the replacement.</p> : null}
           {loadError ? <p className="error">{loadError}</p> : null}
-          <Fields fields={action.fields} values={values} onChange={(name, value) => setValues((current) => ({ ...current, [name]: value }))} />
+          <Fields
+            fields={request?.fields ?? []}
+            values={values}
+            onChange={(name, value) => setValues((current) => ({ ...current, [name]: value }))}
+          />
+          {note ? <pre className="detail">{note}</pre> : null}
           <div className="buttons">
+            {request?.checks.map((action) => (
+              <button key={action.name} type="button" onClick={() => runCheck(action)}>
+                {action.label}
+              </button>
+            ))}
             <Dialog.Close asChild>
-              <button>Cancel</button>
+              <button type="button">Cancel</button>
             </Dialog.Close>
             <button
+              type="button"
               className="primary"
               disabled={blocked}
               onClick={() => {
-                if (blocked) return;
-                setOpen(false);
-                onRun(action, row, values).catch((error: Error) => alert(error.message));
+                if (!request || blocked) return;
+                const pending = request.submit;
+                const current = values;
+                onClose();
+                pending(current).catch((error: Error) => onError(error.message));
               }}
             >
               Apply

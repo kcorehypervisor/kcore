@@ -1,9 +1,34 @@
 //! gRPC client for the controller (kctl-equivalent transport).
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use crate::config::DashboardConfig;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn channel_cache() -> &'static Mutex<HashMap<String, Channel>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Channel>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn channel_key(cfg: &DashboardConfig) -> String {
+    let domain = cfg.tls_domain.as_deref().unwrap_or("");
+    let cert = cfg
+        .cert
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    format!(
+        "{}|{}|{}|{}",
+        cfg.insecure, cfg.controller_addr, domain, cert
+    )
+}
 
 pub mod controller_proto {
     #![allow(clippy::result_large_err, clippy::double_must_use)]
@@ -23,9 +48,28 @@ pub fn endpoint_host(address: &str) -> Option<&str> {
 }
 
 pub async fn connect_channel(cfg: &DashboardConfig) -> Result<Channel> {
+    // Every dashboard page used to open a new connection. Reuse one HTTP/2
+    // channel per controller so navigation does not pay for a handshake again.
+    let key = channel_key(cfg);
+    if let Some(channel) = channel_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(channel);
+    }
+
     let scheme = if cfg.insecure { "http" } else { "https" };
     let uri = format!("{scheme}://{}", cfg.controller_addr);
-    let mut endpoint = Endpoint::from_shared(uri.clone()).context("invalid controller URI")?;
+    let mut endpoint = Endpoint::from_shared(uri)
+        .context("invalid controller URI")?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true);
 
     if !cfg.insecure {
         let (ca_pem, cert_pem, key_pem) = cfg.tls_pem_strings()?;
@@ -44,12 +88,17 @@ pub async fn connect_channel(cfg: &DashboardConfig) -> Result<Channel> {
             .context("TLS config for controller endpoint")?;
     }
 
-    endpoint.connect().await.with_context(|| {
+    let channel = endpoint.connect().await.with_context(|| {
         format!(
             "gRPC connect to {} failed (check KCORE_CONTROLLER matches a SAN in the controller cert)",
             cfg.controller_addr,
         )
-    })
+    })?;
+    channel_cache()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(key, channel.clone());
+    Ok(channel)
 }
 
 pub async fn get_compliance(
