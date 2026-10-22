@@ -98,7 +98,7 @@ See: [Security model](docs/security.md)
   - `kctl operator issue-cert <name>` → writes `~/.kcore/operators/<name>/operator.{crt,key}`
   - Optional default in `~/.kcore/config`: set `operator: <name>` on the context so you do not need `--as` every time.
 - Install nodes from live ISO: `kctl --node <host:9091> node install ...`
-- Install onto a running Debian, Ubuntu, or other systemd Linux (the disk is not wiped): [`scripts/kcore-infect`](scripts/kcore-infect). See [kcore-infect](docs/kcore-infect.md).
+- Install onto a running Debian, Ubuntu, or other systemd Linux. On that server: `curl -fsSL https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect | sudo bash -s -- --yes --reboot`. See [kcore-infect](docs/kcore-infect.md).
 - Create VMs with a direct HTTPS image URL + checksum:
   `kctl create vm <name> --storage-backend <filesystem|lvm|zfs> --storage-size-bytes <bytes> --image <https-url> --image-sha256 <sha256>`
 - Create VMs from node-local uploaded image path:
