@@ -143,6 +143,13 @@ in
         "nix-command"
         "flakes"
       ];
+      # A fresh install must be able to nixos-rebuild without a channel and
+      # without a hand-written NIX_PATH. The nixpkgs source stays in the
+      # system closure because this path is part of the generation.
+      nix.nixPath = [
+        "nixos-config=/etc/nixos/configuration.nix"
+        "nixpkgs=${pkgs.path}"
+      ];
       # A later nixpkgs default of broker makes nixos-rebuild refuse to switch
       # a running node. Callers do not set this.
       services.dbus.implementation = lib.mkDefault "dbus";
@@ -232,6 +239,12 @@ in
     })
     (lib.mkIf cfg.console.enable {
       environment.systemPackages = [ cfg.console.package ];
+      # The branding unit otherwise stays off, or falls back to /opt/kcore
+      # and fails the switch when that path is not there.
+      services.kcore-console = {
+        enable = true;
+        package = cfg.console.package;
+      };
     })
     {
       environment.systemPackages = lib.mkIf (cfg.kctl.package != null) [ cfg.kctl.package ];

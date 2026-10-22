@@ -345,6 +345,15 @@ async fn send_heartbeat_once(
             }
         };
         let host = crate::system_update::read_host_report();
+        // Crush names the host by hostname. A node id that is not that name
+        // is absent from the tree, and absence must stay "ok".
+        let crush_host = hostname::get()
+            .ok()
+            .and_then(|name| name.into_string().ok())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| cfg.node_id.clone());
+        let sample = crate::ceph_bootstrap::local_osd_health(&crush_host);
+        let host_health = observed_host_health(sample);
         match client
             .heartbeat(controller_proto::HeartbeatRequest {
                 node_id: cfg.node_id.clone(),
@@ -363,6 +372,12 @@ async fn send_heartbeat_once(
                 schema_version: host.schema_version,
                 nixpkgs_rev: host.nixpkgs_rev,
                 ha_actions: ha_actions.clone(),
+                host_health: host_health.to_string(),
+                host_health_reason: match host_health.as_str() {
+                    "degraded" => "local OSD down".into(),
+                    "unknown" => "local OSD query failed".into(),
+                    _ => String::new(),
+                },
             })
             .await
         {
@@ -373,6 +388,7 @@ async fn send_heartbeat_once(
                     guard.last_ok = Some(std::time::Instant::now());
                     if resp.assignment_confirmed {
                         guard.assigned = resp.assigned_vm_ids;
+                        guard.fence_vms = resp.fence_vm_ids;
                         guard.confirmed = true;
                     }
                     guard.monitors = resp
@@ -561,6 +577,9 @@ pub(crate) async fn connect_channel(
     cfg: &Config,
     endpoint: &str,
 ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
+    // A powered-off controller accepts the TCP handshake into a black hole.
+    // Without this, the agent never reaches the next controller in the list.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     if let Some(tls) = cfg.tls.as_ref() {
         let ca_pem = std::fs::read_to_string(&tls.ca_file)?;
         let cert_pem = std::fs::read_to_string(&tls.cert_file)?;
@@ -571,14 +590,26 @@ pub(crate) async fn connect_channel(
             .identity(Identity::from_pem(cert_pem, key_pem))
             .domain_name(domain);
         Ok(Channel::from_shared(endpoint.to_string())?
+            .connect_timeout(CONNECT_TIMEOUT)
             .tls_config(tls_config)?
             .connect()
             .await?)
     } else {
         Ok(Channel::from_shared(endpoint.to_string())?
+            .connect_timeout(CONNECT_TIMEOUT)
             .connect()
             .await?)
     }
+}
+
+/// Remember the raw sample so two failures in a row are reported, while the
+/// value sent to the controller stays quiet for a single blip.
+fn observed_host_health(sample: &str) -> String {
+    static LAST_SAMPLE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let mut last = LAST_SAMPLE.lock().unwrap_or_else(|err| err.into_inner());
+    let reported = crate::ceph_bootstrap::debounce_host_health(&last, sample);
+    *last = sample.to_string();
+    reported.to_string()
 }
 
 /// Detects the LUKS encryption method on the root filesystem.

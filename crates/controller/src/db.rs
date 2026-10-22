@@ -819,7 +819,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 64;
+pub const SCHEMA_VERSION: i32 = 65;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -827,6 +827,7 @@ pub const SCHEMA_VERSION: i32 = 64;
 /// membership columns with defaults. Version 61 adds `vms.labels` with a
 /// default. Version 62 adds vGPU parent and profile columns on `node_gpus`.
 /// Version 63 adds the HA tables. Version 64 adds the fence hold on `node_ha`.
+/// Version 65 adds `node_ha.host_health` for proactive cordon.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2150,6 +2151,20 @@ impl Database {
                 if has == 0 {
                     conn.execute(&format!("ALTER TABLE node_ha ADD COLUMN {column}"), [])?;
                 }
+            }
+        }
+
+        if version < 65 {
+            let has: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('node_ha') WHERE name = 'host_health'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has == 0 {
+                conn.execute(
+                    "ALTER TABLE node_ha ADD COLUMN host_health TEXT NOT NULL DEFAULT 'ok'",
+                    [],
+                )?;
             }
         }
 
@@ -6681,6 +6696,33 @@ impl Database {
             params![node_id],
         )?;
         Ok(was)
+    }
+
+    pub fn set_node_host_health(&self, node_id: &str, health: &str) -> Result<(), rusqlite::Error> {
+        let health = match health {
+            "degraded" => "degraded",
+            "unknown" => "unknown",
+            _ => "ok",
+        };
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO node_ha (node_id, host_health) VALUES (?1, ?2)
+             ON CONFLICT(node_id) DO UPDATE SET host_health = excluded.host_health",
+            params![node_id, health],
+        )?;
+        Ok(())
+    }
+
+    pub fn node_host_health(&self, node_id: &str) -> Result<String, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let health: String = conn
+            .query_row(
+                "SELECT host_health FROM node_ha WHERE node_id = ?1",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "ok".into());
+        Ok(health)
     }
 
     pub fn mark_direct_seen(&self, node_id: &str) -> Result<(), rusqlite::Error> {

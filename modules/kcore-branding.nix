@@ -22,9 +22,7 @@ let
 in
 {
   options.services.kcore-console = {
-    enable = lib.mkEnableOption "kcore appliance console" // {
-      default = true;
-    };
+    enable = lib.mkEnableOption "kcore appliance console";
     product = lib.mkOption {
       type = lib.types.strMatching "[a-z0-9-]*";
       default = "";

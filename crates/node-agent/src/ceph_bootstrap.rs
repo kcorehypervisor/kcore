@@ -253,10 +253,11 @@ pub fn mon_already_initialized(daemon_id: &str) -> bool {
 }
 
 /// Only the first mon in the spec may create a brand-new single-member
-/// monmap. Any other member that cannot reach a running cluster must fail
-/// instead of founding a second cluster with the same fsid.
-pub fn may_found_cluster(daemon_id: &str, mons: &[MonMember]) -> bool {
-    mons.first().is_some_and(|m| m.id == daemon_id)
+/// monmap, and only when the controller says this cluster has not been
+/// founded yet. Any other member, or a first mon whose keys already exist,
+/// must fail instead of founding a second cluster with the same fsid.
+pub fn may_found_cluster(daemon_id: &str, mons: &[MonMember], allow_found: bool) -> bool {
+    allow_found && mons.first().is_some_and(|m| m.id == daemon_id)
 }
 
 /// Both messenger versions, so a mon never joins as v1-only. For `monmaptool
@@ -282,6 +283,7 @@ fn adopt_running_monmap(
     daemon_id: &str,
     mons: &[MonMember],
     monmap_path: &Path,
+    allow_found: bool,
 ) -> Result<bool, String> {
     let Some(me) = mons.iter().find(|m| m.id == daemon_id) else {
         return Ok(false);
@@ -302,7 +304,7 @@ fn adopt_running_monmap(
         std::fs::copy(monmap_path, &saved).map_err(|e| format!("save monmap: {e}"))?;
     } else if Path::new(&saved).is_file() {
         std::fs::copy(&saved, monmap_path).map_err(|e| format!("restore saved monmap: {e}"))?;
-    } else if may_found_cluster(daemon_id, mons) {
+    } else if may_found_cluster(daemon_id, mons, allow_found) {
         return Ok(false);
     } else {
         return Err(format!(
@@ -346,7 +348,12 @@ fn adopt_running_monmap(
     Ok(true)
 }
 
-pub fn mkfs_mon(pkg: &BootstrapPackage, daemon_id: &str, mons: &[MonMember]) -> Result<(), String> {
+pub fn mkfs_mon(
+    pkg: &BootstrapPackage,
+    daemon_id: &str,
+    mons: &[MonMember],
+    allow_found: bool,
+) -> Result<(), String> {
     if mon_already_initialized(daemon_id) {
         return Ok(());
     }
@@ -355,7 +362,7 @@ pub fn mkfs_mon(pkg: &BootstrapPackage, daemon_id: &str, mons: &[MonMember]) -> 
     let mon_kr = tmp.path().join("mon.keyring");
     std::fs::write(&mon_kr, &pkg.mon_keyring).map_err(|e| e.to_string())?;
 
-    if !adopt_running_monmap(daemon_id, mons, &monmap)? {
+    if !adopt_running_monmap(daemon_id, mons, &monmap, allow_found)? {
         // First mon: single-member monmap so this daemon can form quorum alone.
         // Listing every future member here left them as 0.0.0.0 placeholders and
         // the mon stayed in "probing" forever — blocking ensure_mgr_keyring and
@@ -722,6 +729,104 @@ pub fn parse_ceph_df(json: &serde_json::Value) -> ParsedCephDf {
     }
 }
 
+/// `degraded` only when Ceph answered and every OSD on `host` is down.
+/// A host that is not in the crush map stays `ok`: it has no local OSD to
+/// lose. A failed or timed-out query is `unknown`, not healthy. One unknown
+/// sample is still reported as `ok` by [`debounce_host_health`]; the next
+/// one is not, so a storage cut is visible and a single blip is not.
+pub fn local_osd_health(host: &str) -> &'static str {
+    let Ok(out) = Command::new("timeout")
+        .args(["15", "ceph", "osd", "tree", "--format", "json"])
+        .output()
+    else {
+        return "unknown";
+    };
+    if !out.status.success() {
+        return "unknown";
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    classify_osd_health(host_osd_state(&text, host).unwrap_or("unknown"))
+}
+
+pub fn classify_osd_health(state: &str) -> &'static str {
+    match state {
+        "down" => "degraded",
+        "up" | "absent" => "ok",
+        _ => "unknown",
+    }
+}
+
+/// The first failed query stays `ok`. A second failure, or a confirmed down
+/// OSD, is what the controller is allowed to act on.
+pub fn debounce_host_health(previous_sample: &str, sample: &str) -> &'static str {
+    match sample {
+        "degraded" => "degraded",
+        "unknown" if previous_sample == "unknown" || previous_sample == "degraded" => "unknown",
+        _ => "ok",
+    }
+}
+
+pub fn host_osd_state(tree_json: &str, host: &str) -> Result<&'static str, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(tree_json).map_err(|e| format!("osd tree: {e}"))?;
+    let nodes = value
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .ok_or_else(|| "osd tree has no nodes".to_string())?;
+    let Some(crush_host) = nodes.iter().find(|node| {
+        node.get("type").and_then(|t| t.as_str()) == Some("host")
+            && node.get("name").and_then(|n| n.as_str()) == Some(host)
+    }) else {
+        return Ok("absent");
+    };
+    let children = crush_host
+        .get("children")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut saw = false;
+    let mut any_up = false;
+    for child in children {
+        let Some(id) = child.as_i64() else {
+            continue;
+        };
+        let Some(osd) = nodes.iter().find(|node| {
+            node.get("type").and_then(|t| t.as_str()) == Some("osd")
+                && node.get("id").and_then(|n| n.as_i64()) == Some(id)
+        }) else {
+            continue;
+        };
+        saw = true;
+        if osd.get("status").and_then(|s| s.as_str()) == Some("up") {
+            any_up = true;
+        }
+    }
+    if !saw {
+        return Ok("absent");
+    }
+    Ok(if any_up { "up" } else { "down" })
+}
+
+/// True when a watcher address belongs to one of `hosts` (IP, ignoring port,
+/// nonce, and the `v1:` / `v2:` messenger prefix).
+pub fn watcher_matches_host(address: &str, hosts: &[String]) -> bool {
+    let addr = address.trim();
+    let addr = addr
+        .strip_prefix("v1:")
+        .or_else(|| addr.strip_prefix("v2:"))
+        .unwrap_or(addr);
+    let host = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        let without_nonce = addr.split('/').next().unwrap_or(addr);
+        without_nonce
+            .rsplit_once(':')
+            .map(|(ip, _)| ip)
+            .unwrap_or(without_nonce)
+    };
+    !host.is_empty() && hosts.iter().any(|candidate| candidate == host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,12 +884,50 @@ mod tests {
     }
 
     #[test]
+    fn osd_tree_reports_the_named_host() {
+        let json = r#"{"nodes":[
+            {"id":-3,"name":"node-103","type":"host","children":[0]},
+            {"id":0,"name":"osd.0","type":"osd","status":"up"},
+            {"id":-4,"name":"node-118","type":"host","children":[1]},
+            {"id":1,"name":"osd.1","type":"osd","status":"down"}
+        ]}"#;
+        assert_eq!(host_osd_state(json, "node-103").unwrap(), "up");
+        assert_eq!(host_osd_state(json, "node-118").unwrap(), "down");
+        assert_eq!(host_osd_state(json, "node-119").unwrap(), "absent");
+        assert_eq!(classify_osd_health("down"), "degraded");
+        assert_eq!(classify_osd_health("up"), "ok");
+        assert_eq!(classify_osd_health("absent"), "ok");
+        assert_eq!(classify_osd_health("unknown"), "unknown");
+        assert_eq!(debounce_host_health("ok", "unknown"), "ok");
+        assert_eq!(debounce_host_health("unknown", "unknown"), "unknown");
+        assert_eq!(debounce_host_health("unknown", "ok"), "ok");
+        assert_eq!(debounce_host_health("ok", "degraded"), "degraded");
+        assert!(watcher_matches_host(
+            "192.168.40.103:0/9",
+            &["192.168.40.103".into()]
+        ));
+        assert!(watcher_matches_host(
+            "v1:192.168.40.103:0/9",
+            &["192.168.40.103".into()]
+        ));
+        assert!(watcher_matches_host(
+            "[2001:db8::103]:0/9",
+            &["2001:db8::103".into()]
+        ));
+        assert!(!watcher_matches_host(
+            "192.168.40.145:0/9",
+            &["192.168.40.103".into()]
+        ));
+    }
+
+    #[test]
     fn only_the_first_mon_may_found_a_cluster() {
         let mons = parse_mon_map("dell-1=10.10.0.11,dell-2=10.10.0.12,dell-3=10.10.0.13").unwrap();
-        assert!(may_found_cluster("dell-1", &mons));
-        assert!(!may_found_cluster("dell-2", &mons));
-        assert!(!may_found_cluster("dell-3", &mons));
-        assert!(!may_found_cluster("dell-1", &[]));
+        assert!(may_found_cluster("dell-1", &mons, true));
+        assert!(!may_found_cluster("dell-2", &mons, true));
+        assert!(!may_found_cluster("dell-3", &mons, true));
+        assert!(!may_found_cluster("dell-1", &[], true));
+        assert!(!may_found_cluster("dell-1", &mons, false));
     }
 
     #[test]

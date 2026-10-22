@@ -78,6 +78,10 @@ pkgs.runCommand "kcore-host-eval"
     test ${toString cfg.boot.loader.timeout} = 5
     test ${toString cfg.boot.kernel.sysctl."kernel.panic"} = 10
     test -n ${lib.escapeShellArg cfg.systemd.services.kcore-node-agent.serviceConfig.ExecStart}
+    test ${lib.boolToString cfg.services.kcore-console.enable} = true
+    test ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} != ""
+    echo ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} | grep -q hello
+    echo ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} | grep -qv /opt/kcore
     test -n ${lib.escapeShellArg cfg.systemd.services.kcore-controller.serviceConfig.ExecStart}
     test ${lib.boolToString cfg.systemd.services.kcore-boot-confirm.enable} = true
     test -n ${lib.escapeShellArg cfg.systemd.services."kcore-vm-guest".serviceConfig.ExecStart}

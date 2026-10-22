@@ -397,6 +397,11 @@ DROP TABLE IF EXISTS vm_ha;",
 ALTER TABLE node_ha DROP COLUMN fence_pending;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 65,
+        sql: "ALTER TABLE node_ha DROP COLUMN host_health;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

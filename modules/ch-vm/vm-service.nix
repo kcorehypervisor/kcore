@@ -223,6 +223,18 @@ let
           fi
           local DEV
           DEV="$(nbd_dev "$IMAGE")"
+          # A device left from an earlier start can still be listed after its
+          # Ceph session died. Reusing it boots the guest on a disk with no
+          # watcher, so a failover looks successful while the guest cannot write.
+          if [ -n "$DEV" ]; then
+            local watchers
+            watchers="$(rbd status "$IMAGE" --format json 2>/dev/null | jq -r '(.watchers // []) | length' || true)"
+            if [ "$watchers" = "0" ]; then
+              echo "RBD $IMAGE is mapped at $DEV with no watcher; mapping it again"
+              rbd device unmap -t nbd "$DEV" || true
+              DEV=""
+            fi
+          fi
           if [ -z "$DEV" ]; then
             modprobe nbd || true
             DEV="$(${pkgs.systemd}/bin/systemd-run --scope --quiet --collect -- \

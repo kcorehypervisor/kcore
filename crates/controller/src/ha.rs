@@ -183,16 +183,128 @@ pub fn priority_rank(priority: &str) -> u8 {
 
 /// High priority first, then larger memory, so a scarce host takes the
 /// guests the operator marked and the ones that are hardest to place.
+/// A VM whose labels name `kcore.restartAfter` starts after that guest.
 pub fn sort_for_restart(vms: &mut [VmRow], priority_of: impl Fn(&VmRow) -> String) {
-    vms.sort_by(|a, b| {
-        priority_rank(&priority_of(a))
-            .cmp(&priority_rank(&priority_of(b)))
-            .then(b.memory_bytes.cmp(&a.memory_bytes))
-            .then(a.id.cmp(&b.id))
-    });
+    if vms.len() < 2 {
+        return;
+    }
+    let mut pending: Vec<VmRow> = vms.to_vec();
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let ready: Vec<usize> = pending
+            .iter()
+            .enumerate()
+            .filter(|(_, vm)| {
+                let after = restart_after_label(&vm.labels);
+                after.is_empty()
+                    || !pending
+                        .iter()
+                        .any(|other| other.name == after || other.id == after)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let pick = if ready.is_empty() {
+            0
+        } else {
+            ready
+                .into_iter()
+                .min_by(|&a, &b| {
+                    priority_rank(&priority_of(&pending[a]))
+                        .cmp(&priority_rank(&priority_of(&pending[b])))
+                        .then(pending[b].memory_bytes.cmp(&pending[a].memory_bytes))
+                        .then(pending[a].id.cmp(&pending[b].id))
+                })
+                .unwrap_or(0)
+        };
+        ordered.push(pending.remove(pick));
+    }
+    vms.clone_from_slice(&ordered);
 }
 
+/// Label `kcore.restartAfter` is the VM name or id that must restart first.
+pub fn restart_after_label(labels: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(labels) else {
+        return String::new();
+    };
+    value
+        .get("kcore.restartAfter")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// `failure-domain=<name>` on a node label. Empty means the host fails alone.
+pub fn failure_domain_label(labels: &[String]) -> String {
+    labels
+        .iter()
+        .find_map(|label| label.strip_prefix("failure-domain="))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// What a healthy Ceph member reported about the host that stopped heartbeating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsdReport {
+    Up,
+    Down,
+    Absent,
+    Unknown,
+}
+
+/// Whether failover may fence this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageVerdict {
+    /// OSDs are up or a watcher from this host remains. Restart the agent.
+    Alive,
+    /// Storage has let go of the host. Fence, then move protected guests.
+    Dead,
+    /// Ceph did not answer. Do not start a second writer.
+    Unknown,
+}
+
+pub fn parse_osd_report(raw: &str) -> OsdReport {
+    match raw.trim() {
+        "up" => OsdReport::Up,
+        "down" => OsdReport::Down,
+        "absent" => OsdReport::Absent,
+        _ => OsdReport::Unknown,
+    }
+}
+
+/// `watcher_from_host` is `None` when the watcher list itself could not be read.
+pub fn storage_verdict(osd: OsdReport, watcher_from_host: Option<bool>) -> StorageVerdict {
+    if osd == OsdReport::Up || watcher_from_host == Some(true) {
+        return StorageVerdict::Alive;
+    }
+    if osd == OsdReport::Unknown || watcher_from_host.is_none() {
+        return StorageVerdict::Unknown;
+    }
+    StorageVerdict::Dead
+}
+
+/// A host that is still heartbeating with its own OSDs down is cordoned.
+pub fn proactive_should_cordon(host_health: &str, status: &str) -> bool {
+    host_health == "degraded" && status == "ready"
+}
+
+/// Peer-probe a live host when its agent has confirmed the local OSD is
+/// down, or when the OSD query has failed twice. `ok` is not a probe.
+pub fn storage_probe_due(host_health: &str) -> bool {
+    matches!(host_health, "degraded" | "unknown")
+}
+
+/// A live host is moved only when a peer saw its OSD down and no watcher
+/// from that host remains. An absent crush entry is not enough: a compute
+/// node has no OSD, and a hostname mismatch must not evacuate a guest that
+/// is still the writer. `Down` plus a missing watcher is the storage cut.
+pub fn live_storage_should_move(osd: OsdReport, watcher_from_host: Option<bool>) -> bool {
+    osd == OsdReport::Down && watcher_from_host == Some(false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionHost {
     pub cpu: i64,
     pub memory: i64,
@@ -200,6 +312,8 @@ pub struct AdmissionHost {
     pub survivor: bool,
     /// This host can fail and its protected guests must fit elsewhere.
     pub can_fail: bool,
+    /// Hosts that share a non-empty domain fail together. Empty fails alone.
+    pub domain: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,18 +368,35 @@ pub fn admission(hosts: &[AdmissionHost], vms: &[AdmissionVm], tolerate: i32) ->
         }
     }
 
-    let mut failing: Vec<usize> = (0..hosts.len())
-        .filter(|&i| hosts[i].can_fail || hosts[i].survivor)
-        .collect();
-    failing.sort_by(|&a, &b| {
-        reserved[b]
-            .1
-            .cmp(&reserved[a].1)
-            .then(reserved[b].0.cmp(&reserved[a].0))
-            .then(a.cmp(&b))
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for index in 0..hosts.len() {
+        if !(hosts[index].can_fail || hosts[index].survivor) {
+            continue;
+        }
+        let domain = hosts[index].domain.trim();
+        if domain.is_empty() {
+            groups.push(vec![index]);
+            continue;
+        }
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| hosts[group[0]].domain.trim() == domain)
+        {
+            group.push(index);
+        } else {
+            groups.push(vec![index]);
+        }
+    }
+    let group_mem = |group: &[usize]| group.iter().map(|&index| reserved[index].1).sum::<i64>();
+    let group_cpu = |group: &[usize]| group.iter().map(|&index| reserved[index].0).sum::<i64>();
+    groups.sort_by(|a, b| {
+        group_mem(b)
+            .cmp(&group_mem(a))
+            .then(group_cpu(b).cmp(&group_cpu(a)))
+            .then(a[0].cmp(&b[0]))
     });
     let lose = tolerate as usize;
-    let lost: Vec<usize> = failing.into_iter().take(lose).collect();
+    let lost: Vec<usize> = groups.into_iter().take(lose).flatten().collect();
     let lost_cpu: i64 = lost.iter().map(|&i| reserved[i].0).sum();
     let lost_mem: i64 = lost.iter().map(|&i| reserved[i].1).sum();
 
@@ -393,6 +524,25 @@ pub fn decide_lease(
     }
 }
 
+/// A replicated lease replaces the local row when its term is newer, when
+/// the same term names a greater controller id (one writer wins the tie),
+/// or when the same holder extended the expiry.
+pub fn lease_supersedes(current: Option<&LeaseView>, incoming: &LeaseView) -> bool {
+    match current {
+        None => true,
+        Some(cur) if incoming.term > cur.term => true,
+        Some(cur) if incoming.term == cur.term && incoming.holder > cur.holder => true,
+        Some(cur)
+            if incoming.term == cur.term
+                && incoming.holder == cur.holder
+                && incoming.expires_at_ms > cur.expires_at_ms =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -424,6 +574,7 @@ mod tests {
             memory,
             survivor,
             can_fail,
+            domain: String::new(),
         }
     }
 
@@ -510,6 +661,78 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_failure_domain_is_lost_as_one_unit() {
+        let mut rack = host(8, 32, true, true);
+        rack.domain = "rack-a".into();
+        let mut other = host(8, 32, true, true);
+        other.domain = "rack-a".into();
+        let spare = host(8, 32, true, true);
+        let report = admission(&[rack, other, spare], &[vm(0, 4, 20), vm(1, 4, 20)], 1);
+        assert_eq!(report.capacity, CAPACITY_INSUFFICIENT);
+        assert!(report.message.contains("shortfall"), "{}", report.message);
+    }
+
+    #[test]
+    fn restart_order_runs_the_dependency_first() {
+        let mut app = row("app", "high", 4);
+        app.labels = r#"{"kcore.restartAfter":"db"}"#.into();
+        let db = row("db", "low", 1);
+        let mut vms = vec![app, db];
+        sort_for_restart(&mut vms, |vm| {
+            if vm.name == "app" {
+                "high".into()
+            } else {
+                "low".into()
+            }
+        });
+        assert_eq!(vms[0].name, "db");
+        assert_eq!(vms[1].name, "app");
+    }
+
+    #[test]
+    fn a_live_osd_or_watcher_keeps_the_host_and_silence_does_not_fence() {
+        assert_eq!(
+            storage_verdict(OsdReport::Up, Some(false)),
+            StorageVerdict::Alive
+        );
+        assert_eq!(
+            storage_verdict(OsdReport::Down, Some(true)),
+            StorageVerdict::Alive
+        );
+        assert_eq!(
+            storage_verdict(OsdReport::Down, Some(false)),
+            StorageVerdict::Dead
+        );
+        assert_eq!(
+            storage_verdict(OsdReport::Absent, Some(false)),
+            StorageVerdict::Dead
+        );
+        assert_eq!(
+            storage_verdict(OsdReport::Unknown, Some(false)),
+            StorageVerdict::Unknown
+        );
+        assert_eq!(
+            storage_verdict(OsdReport::Down, None),
+            StorageVerdict::Unknown
+        );
+        assert!(proactive_should_cordon("degraded", "ready"));
+        assert!(!proactive_should_cordon("degraded", "cordoned"));
+        assert!(!proactive_should_cordon("ok", "ready"));
+        assert!(storage_probe_due("degraded"));
+        assert!(storage_probe_due("unknown"));
+        assert!(!storage_probe_due("ok"));
+        assert!(live_storage_should_move(OsdReport::Down, Some(false)));
+        assert!(!live_storage_should_move(OsdReport::Down, Some(true)));
+        assert!(!live_storage_should_move(OsdReport::Down, None));
+        assert!(!live_storage_should_move(OsdReport::Absent, Some(false)));
+        assert!(!live_storage_should_move(OsdReport::Up, Some(false)));
+        assert_eq!(
+            failure_domain_label(&["role=compute".into(), "failure-domain=rack-a".into()]),
+            "rack-a"
+        );
+    }
+
+    #[test]
     fn a_cordoned_host_can_fail_but_cannot_take_guests() {
         let hosts = vec![
             host(8, 100, false, true),
@@ -562,6 +785,30 @@ mod tests {
             decide_lease(11_000, "b", true, true, 5_000, 1_000, 1_000, Some(&held)),
             LeaseDecision::Wait
         ));
+        let local = LeaseView {
+            holder: "kcore-controller-192.168.40.105".into(),
+            expires_at_ms: 2_000,
+            term: 4,
+        };
+        let primary = LeaseView {
+            holder: "kcore-controller-192.168.40.107".into(),
+            expires_at_ms: 1_500,
+            term: 4,
+        };
+        assert!(lease_supersedes(None, &local));
+        assert!(lease_supersedes(Some(&local), &primary));
+        assert!(!lease_supersedes(Some(&primary), &local));
+        let renewed = LeaseView {
+            expires_at_ms: 3_000,
+            ..primary.clone()
+        };
+        assert!(lease_supersedes(Some(&primary), &renewed));
+        let older = LeaseView {
+            expires_at_ms: 9_000,
+            term: 3,
+            ..primary.clone()
+        };
+        assert!(!lease_supersedes(Some(&primary), &older));
         assert!(matches!(
             decide_lease(1, "solo", false, false, 9_000, 1, 1_000, None),
             LeaseDecision::Act { .. }
