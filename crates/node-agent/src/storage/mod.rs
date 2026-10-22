@@ -1162,8 +1162,26 @@ pub struct HostStorageProbe {
     pub detail: String,
 }
 
+/// `rbd status` often cannot answer while the host OSD is down, because the
+/// primary it would ask is the OSD that failed. The OSD tree already said
+/// `down`. Leaving `queried` false there keeps the guest on a disk the peer
+/// can see is gone. An up or unknown OSD still refuses the probe: a failed
+/// listing is not evidence that the writer left.
+pub fn probe_when_watcher_list_fails(
+    osd_state: &str,
+    detail: impl Into<String>,
+) -> HostStorageProbe {
+    HostStorageProbe {
+        queried: osd_state == "down",
+        osd_state: osd_state.to_string(),
+        watcher_from_host: false,
+        detail: detail.into(),
+    }
+}
+
 /// Ask Ceph whether `host` still owns its OSDs or still watches `images`.
-/// A command failure leaves `queried` false so the controller does not fence.
+/// A command failure leaves `queried` false so the controller does not fence,
+/// unless the OSD tree already reported that host down.
 pub fn probe_host_storage(
     host: &str,
     source_hosts: &[String],
@@ -1195,23 +1213,13 @@ pub fn probe_host_storage(
         ) {
             Ok(json) => json,
             Err(err) => {
-                return HostStorageProbe {
-                    queried: false,
-                    osd_state,
-                    watcher_from_host: false,
-                    detail: err.to_string(),
-                };
+                return probe_when_watcher_list_fails(&osd_state, err.to_string());
             }
         };
         let watchers = match parse_rbd_status_watchers(&status) {
             Ok(list) => list,
             Err(err) => {
-                return HostStorageProbe {
-                    queried: false,
-                    osd_state,
-                    watcher_from_host: false,
-                    detail: err.to_string(),
-                };
+                return probe_when_watcher_list_fails(&osd_state, err.to_string());
             }
         };
         if watchers
@@ -1240,21 +1248,32 @@ pub fn ceph_fence_volume(
 ) -> Result<FenceOutcome, StorageError> {
     let handle = validate_rbd_pool_image_handle(backend_handle)?;
     let handle = handle.as_str();
-    let status = run_cmd_capture(
+    // The range is the fence. A status command that cannot reach the down
+    // primary must not skip it: that is the storage cut, and an unlisted
+    // writer is why the range exists.
+    let (watchers, locks) = match run_cmd_capture(
         "rbd",
         &["status", handle, "--format", "json"],
         ErrorKind::Internal,
-    )?;
-    let watchers = parse_rbd_status_watchers(&status)?;
-    let locks = match run_cmd_capture(
-        "rbd",
-        &["lock", "ls", handle, "--format", "json"],
-        ErrorKind::Internal,
     ) {
-        Ok(json) => parse_rbd_lock_ls(&json)?,
+        Ok(status) => {
+            let watchers = parse_rbd_status_watchers(&status)?;
+            let locks = match run_cmd_capture(
+                "rbd",
+                &["lock", "ls", handle, "--format", "json"],
+                ErrorKind::Internal,
+            ) {
+                Ok(json) => parse_rbd_lock_ls(&json)?,
+                Err(e) => {
+                    tracing::warn!(handle, error = %e, "rbd lock ls failed; fencing watchers only");
+                    Vec::new()
+                }
+            };
+            (watchers, locks)
+        }
         Err(e) => {
-            tracing::warn!(handle, error = %e, "rbd lock ls failed; fencing watchers only");
-            Vec::new()
+            tracing::warn!(handle, error = %e, "rbd status failed; blocklisting the host range");
+            (Vec::new(), Vec::new())
         }
     };
     let plan = plan_fence(handle, &watchers, &locks, source_hosts)?;
@@ -2010,6 +2029,20 @@ mod tests {
             .is_empty());
         let err = fence_targets("kcore-vms/img", &[], &[], &[]).unwrap_err();
         assert!(matches!(err.kind(), ErrorKind::InvalidArgument));
+    }
+
+    #[test]
+    fn a_down_osd_still_counts_when_the_watcher_list_fails() {
+        let down = probe_when_watcher_list_fails("down", "rbd status timed out");
+        assert!(down.queried);
+        assert!(!down.watcher_from_host);
+        assert_eq!(down.osd_state, "down");
+        assert!(down.detail.contains("timed out"));
+        let up = probe_when_watcher_list_fails("up", "rbd status timed out");
+        assert!(!up.queried);
+        assert!(!up.watcher_from_host);
+        let unknown = probe_when_watcher_list_fails("unknown", "rbd status timed out");
+        assert!(!unknown.queried);
     }
 
     #[test]
