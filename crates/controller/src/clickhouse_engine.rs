@@ -24,6 +24,11 @@ use crate::node_proto;
 static IN_FLIGHT: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
+static HOLDER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+
+const CLAIM_TTL_MS: i64 = 30_000;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct OpContext {
     pub backup_name: String,
@@ -140,7 +145,28 @@ pub async fn drive<N: ClickhouseNodes>(db: &Database, nodes: &N, id: &str) -> Re
             return Ok(());
         }
     }
+    let now = unix_now_ms();
+    let claimed = match db.claim_clickhouse_operation(id, &HOLDER, now + CLAIM_TTL_MS, now) {
+        Ok(claimed) => claimed,
+        Err(err) => {
+            if let Ok(mut flight) = IN_FLIGHT.lock() {
+                flight.remove(id);
+            }
+            return Err(err);
+        }
+    };
+    if !claimed {
+        if let Ok(mut flight) = IN_FLIGHT.lock() {
+            flight.remove(id);
+        }
+        return Ok(());
+    }
     let result = drive_inner(db, nodes, id).await;
+    if let Ok(Some(op)) = db.get_clickhouse_operation(id) {
+        if matches!(op.state.as_str(), "succeeded" | "failed" | "cancelled") {
+            let _ = db.release_clickhouse_operation_claim(id, &HOLDER);
+        }
+    }
     if let Ok(mut flight) = IN_FLIGHT.lock() {
         flight.remove(id);
     }
@@ -515,6 +541,13 @@ fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
@@ -2558,5 +2591,83 @@ spec:
                 .state,
             "succeeded"
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_claim_skips_the_driver() {
+        let fake = fake_nodes();
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-claimed");
+        db.insert_clickhouse_operation(&OperationRow {
+            id: "op-claimed".into(),
+            cluster_name: "analytics".into(),
+            kind: "update".into(),
+            state: "pending".into(),
+            steps_json: serde_json::to_string(&vec![pending_apply()]).unwrap(),
+            context_json: "{}".into(),
+            message: String::new(),
+            force: false,
+        })
+        .unwrap();
+        let now = unix_now_ms();
+        assert!(db
+            .claim_clickhouse_operation("op-claimed", "other-controller", now + 60_000, now)
+            .unwrap());
+        drive(&db, &fake, "op-claimed").await.unwrap();
+        assert_eq!(
+            db.get_clickhouse_operation("op-claimed")
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending"
+        );
+        let claim = db
+            .clickhouse_operation_claim("op-claimed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.0, "other-controller");
+        assert_eq!(*fake.applies.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_claim_resumes_after_succeeded_steps() {
+        let fake = fake_nodes();
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-expired");
+        let mut done = restart_step("node-105", "server");
+        done.state = "succeeded".into();
+        db.insert_clickhouse_operation(&OperationRow {
+            id: "op-expired".into(),
+            cluster_name: "analytics".into(),
+            kind: "upgrade".into(),
+            state: "running".into(),
+            steps_json: serde_json::to_string(&vec![done, pending_apply()]).unwrap(),
+            context_json: "{}".into(),
+            message: String::new(),
+            force: false,
+        })
+        .unwrap();
+        let now = unix_now_ms();
+        assert!(db
+            .claim_clickhouse_operation("op-expired", "other-controller", now - 1_000, now)
+            .unwrap());
+        drive(&db, &fake, "op-expired").await.unwrap();
+        assert!(fake.units.lock().unwrap().is_empty());
+        assert_eq!(*fake.applies.lock().unwrap(), 1);
+        assert_eq!(
+            db.get_clickhouse_operation("op-expired")
+                .unwrap()
+                .unwrap()
+                .state,
+            "succeeded"
+        );
+        assert!(db
+            .clickhouse_operation_claim("op-expired")
+            .unwrap()
+            .is_none());
     }
 }

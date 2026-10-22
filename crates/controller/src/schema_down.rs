@@ -407,6 +407,11 @@ DROP TABLE IF EXISTS clickhouse_cluster_members;
 DROP TABLE IF EXISTS clickhouse_clusters;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 66,
+        sql: "DROP TABLE IF EXISTS clickhouse_operation_claims;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

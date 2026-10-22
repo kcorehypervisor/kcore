@@ -683,6 +683,63 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
     }
+
+    /// Compare-and-swap the driver of one operation. A live other holder leaves
+    /// the row unchanged and this returns false. The HA lease table is not used.
+    pub fn claim_clickhouse_operation(
+        &self,
+        operation_id: &str,
+        holder: &str,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        let conn = self.lock_conn().map_err(|e| e.to_string())?;
+        let changed = conn
+            .execute(
+                "INSERT INTO clickhouse_operation_claims
+                    (operation_id, holder, expires_at_ms, term)
+                 VALUES (?1, ?2, ?3, 1)
+                 ON CONFLICT(operation_id) DO UPDATE SET
+                    holder = excluded.holder,
+                    expires_at_ms = excluded.expires_at_ms,
+                    term = clickhouse_operation_claims.term + 1
+                 WHERE clickhouse_operation_claims.holder = excluded.holder
+                    OR clickhouse_operation_claims.expires_at_ms <= ?4",
+                params![operation_id, holder, expires_at_ms, now_ms],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(changed > 0)
+    }
+
+    pub fn release_clickhouse_operation_claim(
+        &self,
+        operation_id: &str,
+        holder: &str,
+    ) -> Result<(), String> {
+        let conn = self.lock_conn().map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM clickhouse_operation_claims
+             WHERE operation_id = ?1 AND holder = ?2",
+            params![operation_id, holder],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clickhouse_operation_claim(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<(String, i64, i64)>, String> {
+        let conn = self.lock_conn().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT holder, expires_at_ms, term
+             FROM clickhouse_operation_claims WHERE operation_id = ?1",
+            params![operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
 }
 
 fn member_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemberRow> {
