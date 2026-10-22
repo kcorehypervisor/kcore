@@ -94,6 +94,13 @@ pub trait ClickhouseNodes {
         cluster: &'a str,
         role: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Host preflight. The default accepts so tests that never dial stay quiet.
+    fn preflight<'a>(
+        &'a self,
+        _cluster: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub fn spawn(db: Database, clients: NodeClients) {
@@ -157,6 +164,15 @@ async fn drive_inner<N: ClickhouseNodes>(db: &Database, nodes: &N, id: &str) -> 
         return Ok(());
     };
     let spec = spec_from_json(&cluster.spec_json)?;
+    if preflight_before_steps(&op.kind, &steps) {
+        if let Err(err) = nodes.preflight(&cluster.name).await {
+            op.state = "failed".into();
+            op.message = err.clone();
+            db.update_clickhouse_operation(&op)?;
+            mark_phase(db, &cluster.name, "failed", &err)?;
+            return Ok(());
+        }
+    }
     let mut index = 0;
     while index < steps.len() {
         if steps[index].state == "succeeded" || steps[index].state == "skipped" {
@@ -1215,6 +1231,20 @@ impl ClickhouseNodes for GrpcNodes {
             release_node_volumes(&self.db, &self.clients, cluster, node_id, role).await
         })
     }
+
+    fn preflight<'a>(
+        &'a self,
+        cluster: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let row = self
+                .db
+                .get_clickhouse_cluster(cluster)?
+                .ok_or_else(|| format!("clickhouse cluster {cluster} not found"))?;
+            let spec = spec_from_json(&row.spec_json)?;
+            require_preflight(&self.db, &self.clients, cluster, &spec).await
+        })
+    }
 }
 
 async fn admin(
@@ -1235,6 +1265,153 @@ async fn admin(
     clients
         .get_admin(&node.address)
         .ok_or_else(|| format!("no admin client for {}", node.address))
+}
+
+/// One node's host preflight. `unreachable` is set when the node did not answer.
+#[derive(Debug, Clone)]
+pub struct NodePreflightReport {
+    pub node_id: String,
+    pub unreachable: Option<String>,
+    pub issues: Vec<node_proto::ClickhousePreflightIssue>,
+}
+
+/// Dial every member. A transport failure is recorded on that node.
+pub async fn collect_preflight(
+    db: &Database,
+    clients: &NodeClients,
+    cluster: &str,
+    spec: &ClusterSpec,
+) -> Result<Vec<NodePreflightReport>, String> {
+    let members = crate::clickhouse_convert::members_from_spec(cluster, spec);
+    let mut reports = Vec::with_capacity(members.len());
+    for member in &members {
+        let req = preflight_request(cluster, spec, member);
+        match dial_preflight(db, clients, &member.node_id, req).await {
+            Ok(resp) => reports.push(NodePreflightReport {
+                node_id: member.node_id.clone(),
+                unreachable: None,
+                issues: resp.issues,
+            }),
+            Err(err) => reports.push(NodePreflightReport {
+                node_id: member.node_id.clone(),
+                unreachable: Some(err),
+                issues: Vec::new(),
+            }),
+        }
+    }
+    Ok(reports)
+}
+
+/// Refuse when any member is unreachable or returned an error-severity issue.
+pub async fn require_preflight(
+    db: &Database,
+    clients: &NodeClients,
+    cluster: &str,
+    spec: &ClusterSpec,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for report in collect_preflight(db, clients, cluster, spec).await? {
+        if let Some(err) = report.unreachable {
+            errors.push(format!("{}: {err}", report.node_id));
+            continue;
+        }
+        for issue in report.issues {
+            if issue.severity == "error" {
+                errors.push(format!("{}: {}", report.node_id, issue.message));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Fold host answers into a plan. Silence stays a warning so the RPC still succeeds.
+pub fn merge_plan_preflight(
+    blocking: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    plans: &mut [crate::controller_proto::ClickhouseNodePlan],
+    reports: &[NodePreflightReport],
+) {
+    for report in reports {
+        let Some(plan) = plans.iter_mut().find(|plan| plan.node_id == report.node_id) else {
+            continue;
+        };
+        if let Some(err) = &report.unreachable {
+            warnings.push(format!(
+                "{} did not answer preflight: {err}",
+                report.node_id
+            ));
+            continue;
+        }
+        for issue in &report.issues {
+            if issue.severity == "error" {
+                plan.preflight_passed = false;
+                plan.issues.push(issue.message.clone());
+                blocking.push(format!("{}: {}", report.node_id, issue.message));
+            } else if issue.severity == "warning" {
+                warnings.push(format!("{}: {}", report.node_id, issue.message));
+            }
+        }
+    }
+}
+
+fn preflight_before_steps(kind: &str, steps: &[Step]) -> bool {
+    matches!(kind, "create" | "scale" | "replace" | "upgrade")
+        && steps.iter().all(|step| step.state == "pending")
+}
+
+fn preflight_request(
+    cluster: &str,
+    spec: &ClusterSpec,
+    member: &crate::clickhouse_db::MemberRow,
+) -> node_proto::CheckClickhousePreflightRequest {
+    let mounts = volumes_for_node(cluster, spec, &member.node_id, "both");
+    node_proto::CheckClickhousePreflightRequest {
+        cluster_name: cluster.into(),
+        server: member
+            .server
+            .then(|| node_server(spec, cluster, &member.node_id)),
+        keeper: member
+            .keeper
+            .then(|| node_keeper(spec, cluster, &member.node_id)),
+        advertise_address: member.advertise_address.clone(),
+        iface: member.iface.clone(),
+        package: spec.package.clone(),
+        ports: Some(node_ports(spec)),
+        tls_enabled: !spec.tls.disabled,
+        data_volume: host_volume(&mounts, "server"),
+        keeper_volume: host_volume(&mounts, "keeper"),
+    }
+}
+
+fn host_volume(mounts: &[VolumeMount], role: &str) -> Option<node_proto::ClickhouseHostVolume> {
+    mounts
+        .iter()
+        .find(|mount| mount.role == role)
+        .map(|mount| node_proto::ClickhouseHostVolume {
+            name: mount.name.clone(),
+            storage_class: mount.storage_class.clone(),
+            volume_group: mount.volume_group.clone(),
+            size_bytes: mount.size_bytes,
+            fs_type: mount.fs_type.clone(),
+        })
+}
+
+async fn dial_preflight(
+    db: &Database,
+    clients: &NodeClients,
+    node_id: &str,
+    req: node_proto::CheckClickhousePreflightRequest,
+) -> Result<node_proto::CheckClickhousePreflightResponse, String> {
+    let mut client = admin(db, clients, node_id).await?;
+    client
+        .check_clickhouse_preflight(Request::new(req))
+        .await
+        .map(|resp| resp.into_inner())
+        .map_err(|err| err.to_string())
 }
 
 fn build_apply(
@@ -1639,6 +1816,7 @@ mod tests {
         reloads: Mutex<u32>,
         applies: Mutex<u32>,
         fail_unit: Mutex<Option<String>>,
+        fail_preflight: Mutex<Option<String>>,
     }
 
     impl ClickhouseNodes for Fake {
@@ -1731,6 +1909,13 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
         }
+        fn preflight<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            let err = self.fail_preflight.lock().unwrap().clone();
+            Box::pin(async move { err.map_or(Ok(()), Err) })
+        }
     }
 
     fn fake_nodes() -> Fake {
@@ -1739,6 +1924,7 @@ mod tests {
             reloads: Mutex::new(0),
             applies: Mutex::new(0),
             fail_unit: Mutex::new(None),
+            fail_preflight: Mutex::new(None),
         }
     }
 
@@ -2216,5 +2402,161 @@ spec:
             Some("restart keeper node-106")
         );
         assert!(units.iter().any(|unit| unit == "restart keeper node-105"));
+    }
+
+    fn pending_apply() -> Step {
+        Step {
+            kind: APPLY_NIX.into(),
+            node_id: "node-105".into(),
+            unit: String::new(),
+            detail: String::new(),
+            group: 1,
+            state: "pending".into(),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn preflight_runs_only_before_the_first_step_of_a_membership_change() {
+        let pending = pending_apply();
+        assert!(preflight_before_steps(
+            "create",
+            std::slice::from_ref(&pending)
+        ));
+        assert!(preflight_before_steps(
+            "scale",
+            std::slice::from_ref(&pending)
+        ));
+        assert!(preflight_before_steps(
+            "replace",
+            std::slice::from_ref(&pending)
+        ));
+        assert!(preflight_before_steps(
+            "upgrade",
+            std::slice::from_ref(&pending)
+        ));
+        assert!(!preflight_before_steps(
+            "update",
+            std::slice::from_ref(&pending)
+        ));
+        assert!(!preflight_before_steps(
+            "delete",
+            std::slice::from_ref(&pending)
+        ));
+        let mut started = pending.clone();
+        started.state = "succeeded".into();
+        assert!(!preflight_before_steps("upgrade", &[started, pending]));
+    }
+
+    #[test]
+    fn plan_preflight_merges_errors_and_keeps_silence_as_a_warning() {
+        let mut blocking = Vec::new();
+        let mut warnings = Vec::new();
+        let mut plans = vec![
+            crate::controller_proto::ClickhouseNodePlan {
+                node_id: "node-105".into(),
+                preflight_passed: true,
+                ..Default::default()
+            },
+            crate::controller_proto::ClickhouseNodePlan {
+                node_id: "node-106".into(),
+                preflight_passed: true,
+                ..Default::default()
+            },
+        ];
+        merge_plan_preflight(
+            &mut blocking,
+            &mut warnings,
+            &mut plans,
+            &[
+                NodePreflightReport {
+                    node_id: "node-105".into(),
+                    unreachable: None,
+                    issues: vec![node_proto::ClickhousePreflightIssue {
+                        severity: "error".into(),
+                        check: "port".into(),
+                        message: "port 8443 is already used by nginx".into(),
+                    }],
+                },
+                NodePreflightReport {
+                    node_id: "node-106".into(),
+                    unreachable: Some("connection refused".into()),
+                    issues: vec![],
+                },
+            ],
+        );
+        assert!(blocking.iter().any(|line| line.contains("nginx")));
+        assert!(!plans[0].preflight_passed);
+        assert!(plans[0].issues.iter().any(|line| line.contains("nginx")));
+        assert!(warnings.iter().any(|line| line.contains("did not answer")));
+        assert!(plans[1].preflight_passed);
+        assert!(blocking.iter().all(|line| !line.contains("node-106")));
+    }
+
+    #[tokio::test]
+    async fn create_refuses_before_nix_when_preflight_fails() {
+        let fake = fake_nodes();
+        *fake.fail_preflight.lock().unwrap() = Some("iface is configured by DHCP".into());
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-preflight");
+        db.insert_clickhouse_operation(&OperationRow {
+            id: "op-preflight".into(),
+            cluster_name: "analytics".into(),
+            kind: "create".into(),
+            state: "pending".into(),
+            steps_json: serde_json::to_string(&vec![pending_apply()]).unwrap(),
+            context_json: "{}".into(),
+            message: String::new(),
+            force: true,
+        })
+        .unwrap();
+        drive(&db, &fake, "op-preflight").await.unwrap();
+        let op = db
+            .get_clickhouse_operation("op-preflight")
+            .unwrap()
+            .unwrap();
+        assert_eq!(op.state, "failed");
+        assert!(op.message.contains("DHCP"));
+        assert_eq!(*fake.applies.lock().unwrap(), 0);
+        assert_eq!(
+            db.get_clickhouse_cluster("analytics")
+                .unwrap()
+                .unwrap()
+                .phase,
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_started_roll_does_not_preflight_again() {
+        let fake = fake_nodes();
+        *fake.fail_preflight.lock().unwrap() = Some("iface is configured by DHCP".into());
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-started");
+        let mut done = pending_apply();
+        done.state = "succeeded".into();
+        db.insert_clickhouse_operation(&OperationRow {
+            id: "op-started".into(),
+            cluster_name: "analytics".into(),
+            kind: "scale".into(),
+            state: "running".into(),
+            steps_json: serde_json::to_string(&vec![done]).unwrap(),
+            context_json: "{}".into(),
+            message: String::new(),
+            force: false,
+        })
+        .unwrap();
+        drive(&db, &fake, "op-started").await.unwrap();
+        assert_eq!(
+            db.get_clickhouse_operation("op-started")
+                .unwrap()
+                .unwrap()
+                .state,
+            "succeeded"
+        );
     }
 }

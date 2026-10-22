@@ -4595,7 +4595,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
     ) -> Result<Response<proto::CheckClickhousePreflightResponse>, Status> {
         auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
         let req = request.into_inner();
-        let mut issues = crate::clickhouse_agent::preflight(&req);
+        let facts = clickhouse_host_facts(&req).await;
+        let version = facts.package_version.clone();
+        let mut issues = crate::clickhouse_agent::preflight_with_host(&req, &facts);
         if !clock_synchronized().await {
             issues.push(proto::ClickhousePreflightIssue {
                 severity: "warning".into(),
@@ -4607,7 +4609,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         Ok(Response::new(proto::CheckClickhousePreflightResponse {
             ok,
             issues,
-            resolved_version: String::new(),
+            resolved_version: version,
             nix_action: if std::path::Path::new(crate::clickhouse_agent::VALUES_FILE).exists() {
                 "rebuild".into()
             } else {
@@ -4771,6 +4773,142 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             result,
         }))
     }
+}
+
+async fn clickhouse_host_facts(
+    req: &proto::CheckClickhousePreflightRequest,
+) -> crate::clickhouse_agent::HostFacts {
+    use crate::clickhouse_agent::{parse_listening, HostFacts};
+    let ip_addr_json = command_stdout("ip", &["-j", "addr"]).await;
+    let networkctl_status = command_stdout("networkctl", &["status", &req.iface]).await;
+    let ss = command_stdout("ss", &["-H", "-ltnp"]).await;
+    let package = if req.package.is_empty() {
+        "clickhouse"
+    } else {
+        req.package.as_str()
+    };
+    let mut volumes = Vec::new();
+    for volume in [&req.data_volume, &req.keeper_volume].into_iter().flatten() {
+        if volume.name.is_empty() {
+            continue;
+        }
+        volumes.push(volume_space(volume).await);
+    }
+    HostFacts {
+        ip_addr_json,
+        networkctl_status,
+        lease_file_exists: dhcp_lease_exists(&req.iface),
+        listening: parse_listening(&ss),
+        volumes,
+        package_version: package_version(package).await,
+    }
+}
+
+fn dhcp_lease_exists(iface: &str) -> bool {
+    [
+        format!("/var/lib/NetworkManager/dhclient-{iface}.lease"),
+        format!("/run/systemd/netif/leases/{iface}"),
+        format!("/var/lib/dhcpcd/{iface}.lease"),
+    ]
+    .iter()
+    .any(|path| std::path::Path::new(path).exists())
+}
+
+async fn volume_space(
+    volume: &proto::ClickhouseHostVolume,
+) -> crate::clickhouse_agent::VolumeSpace {
+    use crate::clickhouse_agent::{
+        lvm_free_bytes, lvm_lv_bytes, zfs_volume_bytes, zpool_free_bytes, VolumeSpace,
+    };
+    if volume.storage_class == "lvm" {
+        let vgs = command_stdout(
+            "vgs",
+            &[
+                "--noheadings",
+                "--units",
+                "b",
+                "--nosuffix",
+                "-o",
+                "vg_name,vg_free",
+            ],
+        )
+        .await;
+        let lvs = command_stdout(
+            "lvs",
+            &[
+                "--noheadings",
+                "--units",
+                "b",
+                "--nosuffix",
+                "-o",
+                "lv_name,vg_name,lv_size",
+            ],
+        )
+        .await;
+        return VolumeSpace {
+            storage_class: volume.storage_class.clone(),
+            pool: volume.volume_group.clone(),
+            name: volume.name.clone(),
+            free_bytes: lvm_free_bytes(&vgs, &volume.volume_group),
+            existing_bytes: lvm_lv_bytes(&lvs, &volume.volume_group, &volume.name),
+        };
+    }
+    if volume.storage_class == "zfs" {
+        let pools = command_stdout("zpool", &["list", "-Hp", "-o", "name,free"]).await;
+        let full = format!("{}/{}", volume.volume_group, volume.name);
+        let vols = command_stdout("zfs", &["list", "-Hp", "-o", "name,volsize", &full]).await;
+        return VolumeSpace {
+            storage_class: volume.storage_class.clone(),
+            pool: volume.volume_group.clone(),
+            name: volume.name.clone(),
+            free_bytes: zpool_free_bytes(&pools, &volume.volume_group),
+            existing_bytes: zfs_volume_bytes(&vols, &full),
+        };
+    }
+    VolumeSpace {
+        storage_class: volume.storage_class.clone(),
+        pool: volume.volume_group.clone(),
+        name: volume.name.clone(),
+        free_bytes: None,
+        existing_bytes: None,
+    }
+}
+
+async fn package_version(package: &str) -> String {
+    if package != "clickhouse" && package != "clickhouse-lts" {
+        return String::new();
+    }
+    let expr = format!("(import <nixpkgs> {{}}).{package}.version");
+    let evaluated = command_stdout("nix", &["eval", "--raw", "--expr", &expr]).await;
+    let evaluated = evaluated.trim().to_string();
+    if !evaluated.is_empty() {
+        return evaluated;
+    }
+    command_stdout(package, &["--version"])
+        .await
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.')
+        .to_string()
+}
+
+async fn command_stdout(program: &str, args: &[&str]) -> String {
+    let Ok(finished) = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        Command::new(program).args(args).output(),
+    )
+    .await
+    else {
+        return String::new();
+    };
+    let Ok(output) = finished else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 async fn clock_synchronized() -> bool {
