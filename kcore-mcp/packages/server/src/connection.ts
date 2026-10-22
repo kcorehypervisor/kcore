@@ -15,6 +15,12 @@ export type ConnectionOptions = {
   provisioning?: string;
   /** Provisioning listens without TLS unless this is false. */
   provisioningInsecure?: boolean;
+  /** Bearer token for provisioning or the vault. Sent as an Authorization header. */
+  token?: string;
+  /** Vault coordinator host:port. */
+  vault?: string;
+  /** Vault listens without TLS unless this is false. */
+  vaultInsecure?: boolean;
 };
 
 export type ResolvedConnection = {
@@ -25,6 +31,8 @@ export type ResolvedConnection = {
   cert?: Buffer;
   key?: Buffer;
   timeoutMs: number;
+  /** Value of the authorization metadata header, including the Bearer prefix. */
+  authorization?: string;
 };
 
 type ContextFile = {
@@ -45,6 +53,8 @@ type ContextEntry = {
   ca?: string;
   operator?: string;
   provisioning?: string;
+  token?: string;
+  vault?: string;
 };
 
 export function resolveConnection(options: ConnectionOptions = {}): ResolvedConnection {
@@ -88,11 +98,38 @@ export function resolveProvisioning(options: ConnectionOptions = {}): ResolvedCo
   }
   const timeoutMs = options.timeoutMs ?? 120_000;
   const checked = assertAddress(address, "provisioning");
+  const authorization = bearer(options.token?.trim() || process.env.KCORE_PROVISIONING_TOKEN?.trim() || entry?.token?.trim());
   if (options.provisioningInsecure === false) {
     const base = resolveConnection(options);
-    return { ...base, address: checked, insecure: false, timeoutMs };
+    return { ...base, address: checked, insecure: false, timeoutMs, authorization };
   }
-  return { address: checked, insecure: true, timeoutMs };
+  return { address: checked, insecure: true, timeoutMs, authorization };
+}
+
+export function resolveVault(options: ConnectionOptions = {}): ResolvedConnection {
+  const configPath = options.config?.trim() || process.env.KCORE_CONFIG?.trim() || join(homedir(), ".kcore", "config");
+  const file = readContext(configPath);
+  const current = file?.["current-context"];
+  const entry = current && file?.contexts ? file.contexts[current] : undefined;
+  const raw =
+    options.vault?.trim() ||
+    process.env.KCORE_VAULT_ENDPOINT?.trim() ||
+    entry?.vault?.trim() ||
+    "127.0.0.1:9191";
+  const checked = assertAddress(raw.replace(/^https?:\/\//, ""), "vault");
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  const authorization = bearer(options.token?.trim() || process.env.KCORE_VAULT_TOKEN?.trim() || entry?.token?.trim());
+  const insecure = options.vaultInsecure ?? process.env.KCORE_VAULT_TLS !== "1";
+  if (!insecure) {
+    const base = resolveConnection(options);
+    return { ...base, address: checked, insecure: false, timeoutMs, authorization };
+  }
+  return { address: checked, insecure: true, timeoutMs, authorization };
+}
+
+function bearer(token: string | undefined): string | undefined {
+  if (!token) return undefined;
+  return /^bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 }
 
 function readContext(path: string): ContextFile | undefined {
@@ -135,9 +172,18 @@ function loadMaterial(entry: ContextEntry | undefined, operator: string, configP
 }
 
 function pemBuffer(inline: string | undefined, path: string | undefined, label: string): Buffer | undefined {
-  if (inline && inline.trim()) return Buffer.from(inline.trim(), "base64");
-  if (path && path.trim()) return readRequired(path.trim(), label);
-  return undefined;
+  const material = inline && inline.trim()
+    ? Buffer.from(inline.trim(), "base64")
+    : path && path.trim()
+      ? readRequired(path.trim(), label)
+      : undefined;
+  if (!material) return undefined;
+  if (!material.toString("utf8").includes("-----BEGIN")) {
+    throw new InputError(
+      `${label} in the kcore context is not a PEM. cert-data, key-data, and ca-data must be base64-encoded PEM, the same encoding kctl writes.`,
+    );
+  }
+  return material;
 }
 
 function readRequired(path: string, label: string): Buffer {

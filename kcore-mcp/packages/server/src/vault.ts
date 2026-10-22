@@ -1,32 +1,7 @@
-import { join } from "node:path";
-import * as grpc from "@grpc/grpc-js";
-import * as protoLoader from "@grpc/proto-loader";
 import { parseAllDocuments } from "yaml";
-import { protoDir } from "./grpc.js";
+import { callApi } from "./grpc.js";
 
 export type VaultKind = "BackupPolicy" | "BackupTarget" | "Replication";
-
-type VaultCtor = new (address: string, creds: grpc.ChannelCredentials) => grpc.Client;
-
-let ctor: VaultCtor | undefined;
-
-function vaultCtor(): VaultCtor {
-  if (ctor) return ctor;
-  const dir = protoDir();
-  const definition = protoLoader.loadSync(join(dir, "vault.proto"), {
-    keepCase: false,
-    longs: String,
-    enums: String,
-    defaults: true,
-    oneofs: true,
-    includeDirs: [dir],
-  });
-  const pkg = grpc.loadPackageDefinition(definition) as unknown as {
-    kcore: { vault: { Vault: VaultCtor } };
-  };
-  ctor = pkg.kcore.vault.Vault;
-  return ctor;
-}
 
 export function vaultAddress(explicit?: string): string {
   const raw = (explicit || process.env.KCORE_VAULT_ENDPOINT || "127.0.0.1:9191").trim();
@@ -39,24 +14,7 @@ export function unconfirmed(confirm: boolean | undefined): string | undefined {
 }
 
 function call(address: string, method: string, request: Record<string, unknown>): Promise<unknown> {
-  const Client = vaultCtor();
-  const client = new Client(address, grpc.credentials.createInsecure()) as grpc.Client & Record<string, unknown>;
-  const fn = client[method];
-  if (typeof fn !== "function") {
-    client.close();
-    return Promise.reject(new Error(`vault method ${method} is not available`));
-  }
-  return new Promise((resolve, reject) => {
-    (fn as (req: unknown, cb: (err: Error | null, resp: unknown) => void) => void).call(
-      client,
-      request,
-      (err, resp) => {
-        client.close();
-        if (err) reject(err);
-        else resolve(resp);
-      },
-    );
-  });
+  return callApi("vault", undefined, { vault: address }, method, request);
 }
 
 export function documents(text: string): Array<Record<string, unknown>> {

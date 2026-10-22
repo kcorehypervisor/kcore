@@ -21,7 +21,7 @@ Before every create, update, delete, migrate, drain, or node install:
 3. Call kcore_plan and show that plan.
 4. Call kcore_apply or kcore_delete only after the operator explicitly agrees, with confirm set to true.
 
-Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller, node, or kcore-provisioning method. Provisioning covers images, machines, boot targets, Redfish discovery, BMC boot, and power control. Set connection.provisioning to that controller's host:port. Pass confirm true before a method that is not a get, list, classify, check, or plan.`;
+Ask for image URLs, checksums, addresses, disk devices, and SSH keys. Use kcore_catalog when you are unsure which resource matches the request. kcore_rpc calls any other implemented unary controller, node, kcore-provisioning, vault, or vault-install method. Provisioning covers images, machines, boot targets, Redfish, IPMI, DHCP/DNS, LAN scan, Wake-on-LAN, and power control. Set connection.provisioning to that controller's host:port. Vault covers backup policies, jobs, targets, restore, and inventory; it defaults to 127.0.0.1:9191. The controller uses the client certificate in ~/.kcore/config. Provisioning and the vault are plaintext unless connection.provisioningInsecure or connection.vaultInsecure is false. If a server answers Authentication required, set connection.token. Pass confirm true before a method that is not a get, list, classify, check, plan, or scan.`;
 
 const connectionShape = {
   config: z.string().optional().describe("Path to the kcore context file. Defaults to ~/.kcore/config."),
@@ -31,7 +31,10 @@ const connectionShape = {
   operator: z.string().optional().describe("Operator identity for --as."),
   node: z.string().optional().describe("Node-agent host:port for node-scoped commands."),
   provisioning: z.string().optional().describe("kcore-provisioning gRPC host:port. Also read from KCORE_PROVISIONING."),
-  provisioningInsecure: z.boolean().optional().describe("Dial provisioning without TLS. Defaults to true."),
+  provisioningInsecure: z.boolean().optional().describe("Dial provisioning without TLS. Defaults to true. Set false to present the kcore client certificate."),
+  token: z.string().optional().describe("Bearer token when the provisioning controller or vault requires one. Also read from KCORE_PROVISIONING_TOKEN or KCORE_VAULT_TOKEN."),
+  vault: z.string().optional().describe("Vault coordinator host:port. Also read from KCORE_VAULT_ENDPOINT. Defaults to 127.0.0.1:9191."),
+  vaultInsecure: z.boolean().optional().describe("Dial the vault without TLS. Defaults to true unless KCORE_VAULT_TLS=1. Set false to present the kcore client certificate."),
   timeoutMs: z.number().optional().describe("RPC deadline in milliseconds. Defaults to 120000."),
 };
 
@@ -49,6 +52,9 @@ function connectionOf(input: ConnectionInput | undefined, controller?: string): 
     timeoutMs: input?.timeoutMs,
     provisioning: input?.provisioning,
     provisioningInsecure: input?.provisioningInsecure,
+    token: input?.token,
+    vault: input?.vault,
+    vaultInsecure: input?.vaultInsecure,
   };
 }
 
@@ -188,7 +194,7 @@ export function createServer(): McpServer {
     {
       title: "Call a kcore gRPC method",
       description:
-        "Call one implemented unary RPC on the controller, a node, or kcore-provisioning. Omit method to list them. Provisioning methods need connection.provisioning. Request fields use proto JSON names in camelCase. Streaming RPCs and methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true.",
+        "Call one implemented unary RPC on the controller, a node, kcore-provisioning, the vault, or the vault installer. Omit method to list them. Provisioning methods need connection.provisioning. Vault defaults to 127.0.0.1:9191. Request fields use proto JSON names in camelCase. Streaming RPCs and methods that always return UNIMPLEMENTED are not listed. Mutations require confirm true. The controller uses the client certificate in ~/.kcore/config. Set connection.token when a server returns Authentication required.",
       inputSchema: {
         service: z.enum(SERVICE_NAMES).optional().describe("gRPC service. Required when method is set."),
         method: z.string().optional().describe("CamelCase RPC name, such as listNodes or getPkiStatus."),

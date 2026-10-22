@@ -26,7 +26,7 @@ npm run build
 | `kcore_delete` | Delete, or cancel a non-terminal cluster update. |
 | `kcore_operation` | Power state, migrate, drain, cordon, node approval, update approve/rollback, node install. |
 | `kcore_catalog` | Resource kinds and which fields are mutable. |
-| `kcore_rpc` | Any implemented unary controller, node, or kcore-provisioning RPC. Omit `method` to list them. Provisioning needs `connection.provisioning`. Mutations need `confirm: true`. |
+| `kcore_rpc` | Any implemented unary controller, node, kcore-provisioning, vault, or vault-install RPC. Omit `method` to list them. Provisioning needs `connection.provisioning`. Vault defaults to `127.0.0.1:9191`. Mutations need `confirm: true`. |
 
 Node install partitions disks. It runs only after the operator sets `spec.acknowledge` to `wipe the selected disks`.
 
@@ -83,7 +83,7 @@ From a checkout, before the package is on npm:
 }
 ```
 
-The server speaks stdio and reads `~/.kcore/config` on the machine where it runs. `KCORE_CONFIG` overrides that path. `KCORE_PROVISIONING` sets the default provisioning address.
+The server speaks stdio and reads `~/.kcore/config` on the machine where it runs. `KCORE_CONFIG` overrides that path. The controller call presents the context client certificate. `KCORE_PROVISIONING` sets the default provisioning address. Provisioning and the vault listen in plaintext unless `connection.provisioningInsecure` or `connection.vaultInsecure` is false (or `KCORE_VAULT_TLS=1`). `KCORE_PROVISIONING_TOKEN` and `KCORE_VAULT_TOKEN` are sent as a bearer token when those servers require one. `KCORE_VAULT_ENDPOINT` overrides the vault address.
 
 ## Publish
 
