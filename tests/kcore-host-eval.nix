@@ -83,6 +83,9 @@ pkgs.runCommand "kcore-host-eval"
     echo ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} | grep -q hello
     echo ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} | grep -qv /opt/kcore
     test -n ${lib.escapeShellArg cfg.systemd.services.kcore-controller.serviceConfig.ExecStart}
+    test ${cfg.systemd.services.kcore-controller.environment.KCORE_WEB_ENABLED} = true
+    echo ${lib.escapeShellArg cfg.systemd.services.kcore-controller.environment.KCORE_WEB_UI_DIR} | grep -q /share/kcore-dashboard
+    echo ${lib.escapeShellArg (toString cfg.networking.firewall.allowedTCPPorts)} | grep -qw 9443
     test ${lib.boolToString cfg.systemd.services.kcore-boot-confirm.enable} = true
     test -n ${lib.escapeShellArg cfg.systemd.services."kcore-vm-guest".serviceConfig.ExecStart}
     echo ${lib.escapeShellArg cfg.environment.etc."kcore/version".text} | grep -q 0.4.2

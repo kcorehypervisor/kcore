@@ -484,6 +484,10 @@ web:
 
 Without a `tls` block the web listener runs in clear text. This is only possible with `--allow-insecure`, and the controller logs a warning.
 
+On kcoreOS, `services.kcore.dashboard.enable = true` turns the listener on without editing `controller.yaml`. The host module sets `KCORE_WEB_ENABLED`, `KCORE_WEB_LISTEN_ADDR` (`services.kcore.dashboard.listenAddress`, default `0.0.0.0:9443`), and `KCORE_WEB_UI_DIR` (`share/kcore-dashboard` of `services.kcore.dashboard.package`) on `kcore-controller.service`, and opens the port. These variables override the `web` block. Open `https://<controller>:9443/` and sign in.
+
+The dashboard is static files and has no backend of its own. Every page calls the controller's RPCs over gRPC-web. The VM serial console uses `OpenVmConsole`, a server stream, for output and `SendVmConsoleInput` for keystrokes, because browsers cannot send a client stream over gRPC-web. Only the session that opened a console can type into it.
+
 **Identity.** A session or API token for operator `alice` is checked exactly like the client certificate `CN=kctl:alice`. It has the same roles, the same `require_*_operator` checks, and the same compliance table. Node and peer-controller RPCs stay closed to it. The audit log records `web:alice` for a session and `api-token:alice/<id>` for an API token.
 
 **Sign-in.**

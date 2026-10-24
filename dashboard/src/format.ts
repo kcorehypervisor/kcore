@@ -1,4 +1,4 @@
-import type { Row } from "./api";
+import type { Row } from "./rows";
 
 const TITLES: Record<string, string> = {
   network: "Host networking",

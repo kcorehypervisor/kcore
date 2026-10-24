@@ -498,6 +498,7 @@ pub struct ControllerService {
     webhooks: crate::webhooks::Dispatcher,
     overcommit: crate::scheduler::Overcommit,
     failover: crate::config::FailoverConfig,
+    web_consoles: WebConsoles,
     #[cfg(test)]
     test_push_hook: Option<PushHook>,
     #[cfg(test)]
@@ -505,6 +506,18 @@ pub struct ControllerService {
     #[cfg(test)]
     test_storage_verdict: Option<crate::ha::StorageVerdict>,
 }
+
+/// Open browser consoles. Input arrives as unary calls, so each one needs
+/// the node stream that `OpenVmConsole` opened.
+#[derive(Clone, Default)]
+struct WebConsoles(Arc<Mutex<HashMap<String, WebConsole>>>);
+
+struct WebConsole {
+    owner: String,
+    to_node: mpsc::Sender<node_proto::ConsoleMessage>,
+}
+
+const WEB_CONSOLE_MAX_INPUT: usize = 64 * 1024;
 
 fn network_policies_by_name(
     db: &crate::db::Database,
@@ -820,6 +833,7 @@ impl ControllerService {
             webhooks: crate::webhooks::Dispatcher::noop(),
             overcommit: crate::scheduler::Overcommit::default(),
             failover: crate::config::FailoverConfig::default(),
+            web_consoles: WebConsoles::default(),
             #[cfg(test)]
             test_push_hook: None,
             #[cfg(test)]
@@ -1007,6 +1021,7 @@ impl ControllerService {
             webhooks: crate::webhooks::Dispatcher::noop(),
             overcommit: crate::scheduler::Overcommit::default(),
             failover: crate::config::FailoverConfig::default(),
+            web_consoles: WebConsoles::default(),
             test_push_hook: Some(hook),
             test_fence_hook: None,
             test_storage_verdict: None,
@@ -5189,6 +5204,62 @@ impl ControllerService {
         }
     }
 
+    /// Open the node's serial console for a VM. Returns the VM name, the
+    /// node id, the sender for keystrokes, and the node's output stream.
+    async fn connect_vm_console(
+        &self,
+        vm_key: &str,
+        first_data: Vec<u8>,
+    ) -> Result<
+        (
+            String,
+            String,
+            mpsc::Sender<node_proto::ConsoleMessage>,
+            tonic::Streaming<node_proto::ConsoleMessage>,
+        ),
+        Status,
+    > {
+        let vm_key = vm_key.trim();
+        if vm_key.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_name is required on the first console message",
+            ));
+        }
+        let node = self.resolve_node_for_vm(vm_key, "")?;
+        let db_vm = self
+            .db
+            .get_vm(vm_key)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .or_else(|| {
+                self.db
+                    .list_vms_for_node(&node.id)
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|vm| vm.name == vm_key))
+            })
+            .ok_or_else(|| Status::not_found(format!("VM {vm_key} not found")))?;
+        let vm_name = db_vm.name.clone();
+
+        let mut admin = self.ensure_admin_client_for_node(&node).await?;
+
+        let (to_node_tx, to_node_rx) = mpsc::channel::<node_proto::ConsoleMessage>(64);
+        // Opening message must be queued before the RPC await — the node
+        // handler blocks on the first stream message before returning.
+        to_node_tx
+            .send(node_proto::ConsoleMessage {
+                vm_name: vm_name.clone(),
+                data: first_data,
+            })
+            .await
+            .map_err(|_| Status::unavailable("failed to open console stream to node"))?;
+
+        let from_node = admin
+            .attach_vm_console(ReceiverStream::new(to_node_rx))
+            .await
+            .map_err(|e| Status::unavailable(format!("node AttachVmConsole: {e}")))?
+            .into_inner();
+        Ok((vm_name, node.id, to_node_tx, from_node))
+    }
+
     pub(crate) fn audit_actor<T>(request: &Request<T>) -> String {
         if let Some(actor) = AUDIT_ACTOR_OVERRIDE.with(|c| c.borrow().clone()) {
             return actor;
@@ -8967,53 +9038,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("console stream is empty"))?;
-        let vm_key = first.vm_name.trim();
-        if vm_key.is_empty() {
-            return Err(Status::invalid_argument(
-                "vm_name is required on the first console message",
-            ));
-        }
-
-        let node = self.resolve_node_for_vm(vm_key, "")?;
-        let db_vm = self
-            .db
-            .get_vm(vm_key)
-            .map_err(|e| Status::internal(e.to_string()))?
-            .or_else(|| {
-                self.db
-                    .list_vms_for_node(&node.id)
-                    .ok()
-                    .and_then(|rows| rows.into_iter().find(|vm| vm.name == vm_key))
-            })
-            .ok_or_else(|| Status::not_found(format!("VM {vm_key} not found")))?;
-        let vm_name = db_vm.name.clone();
-
-        let mut admin = self.ensure_admin_client_for_node(&node).await?;
-
-        let (to_node_tx, to_node_rx) = mpsc::channel::<node_proto::ConsoleMessage>(64);
-        // Opening message must be queued before the RPC await — the node
-        // handler blocks on the first stream message before returning.
-        to_node_tx
-            .send(node_proto::ConsoleMessage {
-                vm_name: vm_name.clone(),
-                data: first.data,
-            })
-            .await
-            .map_err(|_| Status::unavailable("failed to open console stream to node"))?;
-
-        let node_outbound = ReceiverStream::new(to_node_rx);
-        let mut from_node = admin
-            .attach_vm_console(node_outbound)
-            .await
-            .map_err(|e| Status::unavailable(format!("node AttachVmConsole: {e}")))?
-            .into_inner();
+        let (vm_name, node_id, to_node_tx, mut from_node) =
+            self.connect_vm_console(&first.vm_name, first.data).await?;
 
         // Session established: who opened which console, and when (created_at).
         self.record_audit(
             &actor,
             "AttachVmConsole",
             &format!("vm/{vm_name}"),
-            serde_json::json!({ "nodeId": node.id }).to_string(),
+            serde_json::json!({ "nodeId": node_id }).to_string(),
         );
 
         let (out_tx, out_rx) =
@@ -9058,6 +9091,115 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         Ok(Response::new(
             Box::pin(ReceiverStream::new(out_rx)) as Self::AttachVmConsoleStream
+        ))
+    }
+
+    type OpenVmConsoleStream = Pin<
+        Box<dyn Stream<Item = Result<controller_proto::VmConsoleEvent, Status>> + Send + 'static>,
+    >;
+
+    async fn open_vm_console(
+        &self,
+        request: Request<controller_proto::OpenVmConsoleRequest>,
+    ) -> Result<Response<Self::OpenVmConsoleStream>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let owner = auth::peer_cn(&request).unwrap_or_default();
+        let (vm_name, node_id, to_node, mut from_node) = self
+            .connect_vm_console(&request.get_ref().vm_name, Vec::new())
+            .await?;
+        self.record_audit(
+            &actor,
+            "AttachVmConsole",
+            &format!("vm/{vm_name}"),
+            serde_json::json!({ "nodeId": node_id, "transport": "grpc-web" }).to_string(),
+        );
+
+        let session_id = Uuid::new_v4().to_string();
+        self.web_consoles
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.clone(), WebConsole { owner, to_node });
+
+        let (out_tx, out_rx) =
+            mpsc::channel::<Result<controller_proto::VmConsoleEvent, Status>>(64);
+        let _ = out_tx
+            .send(Ok(controller_proto::VmConsoleEvent {
+                session_id: session_id.clone(),
+                data: Vec::new(),
+            }))
+            .await;
+        let sessions = self.web_consoles.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = from_node.message() => match msg {
+                        Ok(Some(msg)) => {
+                            let event = controller_proto::VmConsoleEvent {
+                                session_id: String::new(),
+                                data: msg.data,
+                            };
+                            if out_tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = out_tx.send(Err(e)).await;
+                            break;
+                        }
+                    },
+                    _ = out_tx.closed() => break,
+                }
+            }
+            sessions
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&session_id);
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(out_rx)) as Self::OpenVmConsoleStream
+        ))
+    }
+
+    async fn send_vm_console_input(
+        &self,
+        request: Request<controller_proto::SendVmConsoleInputRequest>,
+    ) -> Result<Response<controller_proto::SendVmConsoleInputResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let owner = auth::peer_cn(&request).unwrap_or_default();
+        let req = request.into_inner();
+        if req.data.len() > WEB_CONSOLE_MAX_INPUT {
+            return Err(Status::invalid_argument(
+                "console input is larger than 64 KiB",
+            ));
+        }
+        let to_node = {
+            let sessions = self
+                .web_consoles
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match sessions.get(&req.session_id) {
+                Some(session) if session.owner == owner => session.to_node.clone(),
+                _ => return Err(Status::not_found("console session not found")),
+            }
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            to_node.send(node_proto::ConsoleMessage {
+                vm_name: String::new(),
+                data: req.data,
+            }),
+        )
+        .await
+        .map_err(|_| Status::unavailable("console input is backed up"))?
+        .map_err(|_| Status::not_found("console session ended"))?;
+        Ok(Response::new(
+            controller_proto::SendVmConsoleInputResponse {},
         ))
     }
 
@@ -22930,5 +23072,78 @@ mod tests {
         .into_inner();
         assert!(deleted.success);
         assert!(db.get_postgresql("app").unwrap().is_none());
+    }
+
+    fn web_request<T>(operator: &str, msg: T) -> Request<T> {
+        let mut req = Request::new(msg);
+        req.extensions_mut().insert(auth::WebIdentity {
+            operator: operator.to_string(),
+            token_id: format!("tok-{operator}"),
+            kind: auth::WebTokenKind::Session,
+            max_role: None,
+            expires_at: i64::MAX,
+        });
+        req
+    }
+
+    #[tokio::test]
+    async fn web_console_input_reaches_only_the_owners_session() {
+        let db = Database::open(":memory:").expect("open db");
+        for name in ["alice", "bob"] {
+            db.create_operator(name).unwrap();
+            db.grant_operator_role_str(name, "vm-admin").unwrap();
+        }
+        let svc = ControllerService::new(
+            db,
+            NodeClients::new(None),
+            test_network(),
+            empty_sub_ca(),
+            None,
+            false,
+            false,
+        );
+        let (to_node, mut node_rx) = mpsc::channel(4);
+        svc.web_consoles.0.lock().unwrap().insert(
+            "s1".to_string(),
+            WebConsole {
+                owner: "kctl:alice".to_string(),
+                to_node,
+            },
+        );
+        let input = |operator: &str, data: Vec<u8>| {
+            web_request(
+                operator,
+                controller_proto::SendVmConsoleInputRequest {
+                    session_id: "s1".to_string(),
+                    data,
+                },
+            )
+        };
+        use controller_proto::controller_server::Controller as _;
+
+        let err = svc
+            .send_vm_console_input(input("bob", b"ls\n".to_vec()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(node_rx.try_recv().is_err());
+
+        let err = svc
+            .send_vm_console_input(input("alice", vec![0; WEB_CONSOLE_MAX_INPUT + 1]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        svc.send_vm_console_input(input("alice", b"ls\n".to_vec()))
+            .await
+            .expect("owner input");
+        assert_eq!(node_rx.recv().await.unwrap().data, b"ls\n");
+
+        drop(node_rx);
+        let err = svc
+            .send_vm_console_input(input("alice", b"x".to_vec()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }

@@ -810,7 +810,7 @@ render_node() {
   local dir=$1
   local tcp_ports="22 9091" udp_ports="" ssh_nix="" scrape_nix="" key source
   if [[ $RUN_CONTROLLER == true ]]; then
-    tcp_ports+=" 9090 8080"
+    tcp_ports+=" 9090 9443"
   fi
   if [[ $DISABLE_VXLAN != true ]]; then
     udp_ports="4789"
@@ -926,7 +926,7 @@ storage:
   filesystemVolumeDir: /var/lib/kcore/volumes
 EOF
   if [[ $RUN_CONTROLLER != true ]]; then
-    rm -f "$dir/controller.yaml" "$dir/dashboard.env"
+    rm -f "$dir/controller.yaml"
     return 0
   fi
   local peers="" peer
@@ -960,14 +960,6 @@ replication:
   controllerId: "kcore-controller-$IP_ADDR"
   dcId: "$DC_ID"
   peers:$peer
-EOF
-  cat >"$dir/dashboard.env" <<EOF
-KCORE_CONTROLLER=$IP_ADDR:9090
-KCORE_CA_FILE=/etc/kcore/certs/ca.crt
-KCORE_CERT_FILE=/etc/kcore/certs/controller.crt
-KCORE_KEY_FILE=/etc/kcore/certs/controller.key
-LEPTOS_SITE_ADDR=0.0.0.0:8080
-LEPTOS_ENV=PROD
 EOF
 }
 
@@ -1285,7 +1277,6 @@ install_runtime_config() {
   install -m 0644 "$stage/node-agent.yaml" /etc/kcore/node-agent.yaml
   if [[ $RUN_CONTROLLER == true ]]; then
     install -m 0644 "$stage/controller.yaml" /etc/kcore/controller.yaml
-    install -m 0644 "$stage/dashboard.env" /etc/kcore/dashboard.env
   fi
   printf '%s\n' installer-only >/etc/kcore/disk-management-mode
   ln -sfn disk-management-mode /etc/kcore/disko-management-mode

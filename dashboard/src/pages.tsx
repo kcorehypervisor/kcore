@@ -1,8 +1,11 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams, useSearch } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as Dialog from "@radix-ui/react-dialog";
-import { api, payload, specToValues, type Action, type Catalog, type Field, type Resource, type Row } from "./api";
+import { fileToBase64, findResource, isDownload, isReveal, type Action, type Field, type Resource, type Reveal } from "./catalog";
+import type { Values } from "./forms";
+import { errorMessage } from "./rpc";
+import type { Row } from "./rows";
 import { columnsFor } from "./columns";
 import { Bars, Donut, Meter } from "./charts";
 import { displayTitle, formatDate, pretty, rowTitle, text, toneColor, toneFor, usedPercent } from "./format";
@@ -19,16 +22,9 @@ import {
   type Toast,
 } from "./views";
 
-const ESSENTIAL = new Set([
-  "name",
-  "cpu",
-  "memory_bytes",
-  "storage_backend",
-  "storage_size_bytes",
-  "image_url",
-  "image_path",
-  "desired_state",
-]);
+type FormValues = Record<string, string | boolean>;
+
+const ESSENTIAL = new Set(["name", "cpu", "memory_bytes", "storage_backend", "storage_size_bytes", "image_url", "image_sha256", "image_path", "desired_state"]);
 
 const LIST_COLUMNS: Record<string, { name: string; kind?: "bool" | "number" }[]> = {
   nics: [{ name: "network" }, { name: "model" }, { name: "mac_address" }],
@@ -59,15 +55,47 @@ const LIST_COLUMNS: Record<string, { name: string; kind?: "bool" | "number" }[]>
   ],
 };
 
-function parseList(raw: string | boolean | undefined): Record<string, string | boolean>[] {
+function parseList(raw: string | boolean | undefined): FormValues[] {
   if (typeof raw !== "string" || !raw.trim()) return [];
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item) => item && typeof item === "object") as Record<string, string | boolean>[];
+    return parsed.filter((item) => item && typeof item === "object") as FormValues[];
   } catch {
     return [];
   }
+}
+
+function specToValues(fields: Field[], spec: Values): FormValues {
+  const values: FormValues = {};
+  for (const field of fields) {
+    const raw = spec[field.name];
+    if (raw === undefined || raw === null) continue;
+    if (field.kind === "bool") values[field.name] = Boolean(raw);
+    else if (field.kind === "json") values[field.name] = JSON.stringify(raw);
+    else if (Array.isArray(raw)) values[field.name] = raw.join(", ");
+    else values[field.name] = String(raw);
+  }
+  return values;
+}
+
+function payload(fields: Field[], values: FormValues): Values {
+  const body: Values = {};
+  for (const field of fields) {
+    const raw = values[field.name];
+    if (raw === undefined || raw === "") continue;
+    if (field.kind === "bool") body[field.name] = Boolean(raw);
+    else if (field.kind === "json") {
+      const source = String(raw).trim();
+      if (!source) continue;
+      try {
+        body[field.name] = JSON.parse(source);
+      } catch {
+        throw new Error(`${field.label} must be a JSON list`);
+      }
+    } else body[field.name] = raw;
+  }
+  return body;
 }
 
 function haystack(row: Row): string {
@@ -90,35 +118,43 @@ function haystack(row: Row): string {
 function detailOf(value: unknown): string | undefined {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const record = value as Row;
-    if (Object.keys(record).length === 1 && record.ok === true) return undefined;
+    const keys = Object.keys(record).filter((key) => key !== "ok");
+    if (!keys.length) return undefined;
+    if (keys.length === 1 && typeof record[keys[0]] === "string") return String(record[keys[0]]);
   }
   return pretty(value);
 }
 
+function saveFile(name: string, data: Uint8Array, type: string) {
+  const blob = new Blob([data as BlobPart], { type });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = name;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(link.href), 1_000);
+}
+
+function useRows(resource: Resource | undefined, filters: Values) {
+  return useQuery({
+    queryKey: ["rows", resource?.id ?? "", JSON.stringify(filters)],
+    enabled: Boolean(resource?.list),
+    refetchInterval: resource?.refreshMs ?? false,
+    queryFn: () => resource!.list!(filters),
+  });
+}
+
 const STATE_COLORS = ["#10b981", "#f59e0b", "#f87171", "#6366f1", "#8b5cf6", "#3b82f6"];
+const NO_FILTERS: Values = {};
 
 export function Overview() {
-  const health = useQuery({
-    queryKey: ["rows", "health", ""],
-    queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/health"),
-  });
-  const compliance = useQuery({
-    queryKey: ["rows", "compliance", ""],
-    queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/compliance"),
-  });
-  const vms = useQuery({
-    queryKey: ["rows", "vms", ""],
-    queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/vms"),
-  });
-  const nodes = useQuery({
-    queryKey: ["rows", "nodes", ""],
-    queryFn: () => api<{ rows: Row[] }>("/api/v1/resources/nodes"),
-  });
-  const row = health.data?.rows?.[0] ?? {};
-  const report = compliance.data?.rows?.[0] ?? {};
+  const health = useRows(findResource("health"), NO_FILTERS);
+  const vms = useRows(findResource("vms"), NO_FILTERS);
+  const nodes = useRows(findResource("nodes"), NO_FILTERS);
+  const updates = useRows(findResource("cluster-updates"), NO_FILTERS);
+  const row = health.data?.[0] ?? {};
   const chart = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const vm of vms.data?.rows ?? []) {
+    for (const vm of vms.data ?? []) {
       const state = text(vm.state) || "unknown";
       counts.set(state, (counts.get(state) ?? 0) + 1);
     }
@@ -132,14 +168,15 @@ export function Overview() {
   const running = chart.find((item) => item.state === "running")?.count;
   const status = text(row.status);
   const conditions = Array.isArray(row.conditions) ? row.conditions.map((item) => text(item)).filter(Boolean) : [];
-  const capacity = (nodes.data?.rows ?? [])
+  const capacity = (nodes.data ?? [])
     .map((node) => ({
-      name: text(node.hostname) || text(node.name) || text(node.id),
-      cpu: usedPercent(node.cpu_used, node.cpu),
-      memory: usedPercent(node.memory_used, node.memory),
+      name: text(node.hostname) || text(node.node_id),
+      cpu: usedPercent(node.cpu_cores_used, node.cpu_cores),
+      memory: usedPercent(node.memory_bytes_used, node.memory_bytes),
     }))
     .filter((node) => node.name && (node.cpu !== null || node.memory !== null))
     .slice(0, 6);
+  const active = (updates.data ?? []).filter((update) => !["succeeded", "cancelled", "rolled-back", "failed"].includes(text(update.phase)));
   const error = health.error ?? vms.error;
   const loading = !error && (health.isLoading || vms.isLoading);
 
@@ -151,12 +188,13 @@ export function Overview() {
           <h1>Overview</h1>
         </div>
       </header>
-      {error ? <p className="error">{(error as Error).message}</p> : null}
+      {error ? <p className="error">{errorMessage(error)}</p> : null}
       {loading ? <Skeleton /> : null}
-      {status || text(row.headline) ? (
+      {status ? (
         <div className={`banner ${toneFor(status)}`}>
-          {status ? <span className={`pill ${toneFor(status)}`}>{status}</span> : null}
-          <strong>{text(row.headline) || "Cluster"}</strong>
+          <span className={`pill ${toneFor(status)}`}>{status}</span>
+          <strong>Cluster</strong>
+          {text(row.failover_capacity) ? <span className="muted">Failover capacity {text(row.failover_capacity)}</span> : null}
         </div>
       ) : null}
       <div className="grid">
@@ -166,11 +204,11 @@ export function Overview() {
         </div>
         <div className="card">
           <span className="muted">Virtual machines</span>
-          <strong className="metric">{text(row.vm_count) || String(vms.data?.rows.length ?? "—")}</strong>
+          <strong className="metric">{text(row.vm_count) || String(vms.data?.length ?? "—")}</strong>
         </div>
         <div className="card">
           <span className="muted">Running</span>
-          <strong className="metric">{(running ?? text(report.running_vms)) || "—"}</strong>
+          <strong className="metric">{running ?? "0"}</strong>
         </div>
         <div className="card">
           <span className="muted">Not ready</span>
@@ -187,6 +225,21 @@ export function Overview() {
           <Bars label="Virtual machines by state" items={chart.map((item) => ({ label: item.state, value: item.count, color: toneColor(toneFor(item.state)) }))} />
         </section>
       </div>
+      {active.length ? (
+        <section className="card stack">
+          <h2>Updates in progress</h2>
+          <ul className="alerts">
+            {active.map((update) => (
+              <li key={text(update.name)}>
+                <Link to="/r/$id" params={{ id: "cluster-updates" }} search={{ q: text(update.name) }}>
+                  {text(update.name)}
+                </Link>{" "}
+                {text(update.version)} · {text(update.phase)} · approval {text(update.approval_status)}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       {capacity.length ? (
         <section className="card stack">
           <h2>Node capacity</h2>
@@ -223,7 +276,7 @@ export function Overview() {
 function ListField({ field, value, onChange }: { field: Field; value: string | boolean | undefined; onChange: (value: string) => void }) {
   const columns = LIST_COLUMNS[field.name] ?? [{ name: "value" }];
   const rows = parseList(value);
-  function write(next: Record<string, string | boolean>[]) {
+  function write(next: FormValues[]) {
     onChange(JSON.stringify(next));
   }
   return (
@@ -241,22 +294,17 @@ function ListField({ field, value, onChange }: { field: Field; value: string | b
                 <input
                   type="checkbox"
                   checked={Boolean(row[column.name])}
-                  onChange={(event) => {
-                    const next = rows.map((item, itemIndex) => (itemIndex === index ? { ...item, [column.name]: event.target.checked } : item));
-                    write(next);
-                  }}
+                  onChange={(event) => write(rows.map((item, itemIndex) => (itemIndex === index ? { ...item, [column.name]: event.target.checked } : item)))}
                 />
               </label>
             ) : (
               <input
                 key={column.name}
                 placeholder={column.name}
+                aria-label={`${field.label} ${index + 1} ${column.name}`}
                 type={column.kind === "number" ? "number" : "text"}
                 value={String(row[column.name] ?? "")}
-                onChange={(event) => {
-                  const next = rows.map((item, itemIndex) => (itemIndex === index ? { ...item, [column.name]: event.target.value } : item));
-                  write(next);
-                }}
+                onChange={(event) => write(rows.map((item, itemIndex) => (itemIndex === index ? { ...item, [column.name]: event.target.value } : item)))}
               />
             ),
           )}
@@ -272,31 +320,52 @@ function ListField({ field, value, onChange }: { field: Field; value: string | b
   );
 }
 
-function Fields({ fields, values, onChange }: { fields: Field[]; values: Record<string, string | boolean>; onChange: (name: string, value: string | boolean) => void }) {
+function FileField({ field, onChange }: { field: Field; onChange: (value: string) => void }) {
+  const [name, setName] = useState("");
+  return (
+    <label>
+      {field.label}
+      {field.required ? " *" : ""}
+      <input
+        type="file"
+        onChange={async (event) => {
+          const picked = event.target.files?.[0];
+          if (!picked) return;
+          setName(`${picked.name} (${picked.size.toLocaleString("en-GB")} bytes)`);
+          onChange(await fileToBase64(picked));
+        }}
+      />
+      {name ? <span className="muted">{name}</span> : null}
+    </label>
+  );
+}
+
+function Fields({ fields, values, onChange }: { fields: Field[]; values: FormValues; onChange: (name: string, value: string | boolean) => void }) {
   return (
     <>
-      {fields.map((field) =>
-        field.kind === "json" ? (
-          <ListField key={field.name} field={field} value={values[field.name]} onChange={(value) => onChange(field.name, value)} />
-        ) : (
-          <label key={field.name}>
+      {fields.map((field) => {
+        if (field.kind === "json") return <ListField key={field.name} field={field} value={values[field.name]} onChange={(value) => onChange(field.name, value)} />;
+        if (field.kind === "file") return <FileField key={field.name} field={field} onChange={(value) => onChange(field.name, value)} />;
+        return (
+          <label key={field.name} className={field.kind === "bool" ? "check" : undefined}>
+            {field.kind === "bool" ? <input type="checkbox" checked={Boolean(values[field.name])} onChange={(event) => onChange(field.name, event.target.checked)} /> : null}
             {field.label}
             {field.required ? " *" : ""}
-            {field.kind === "bool" ? (
-              <input type="checkbox" checked={Boolean(values[field.name])} onChange={(event) => onChange(field.name, event.target.checked)} />
-            ) : field.name.includes("nix") || field.name.endsWith("_pem") || field.name === "public_key" || field.name === "cloud_init_user_data" || field.name === "sqlite_base64" ? (
-              <textarea value={String(values[field.name] ?? "")} onChange={(event) => onChange(field.name, event.target.value)} />
-            ) : (
+            {field.kind === "multiline" ? (
+              <textarea value={String(values[field.name] ?? "")} placeholder={field.placeholder} onChange={(event) => onChange(field.name, event.target.value)} />
+            ) : field.kind !== "bool" ? (
               <input
-                type={field.kind === "number" ? "number" : "text"}
+                type={field.kind === "number" ? "number" : field.kind === "secret" ? "password" : "text"}
+                autoComplete={field.kind === "secret" ? "new-password" : "off"}
+                placeholder={field.placeholder}
                 value={String(values[field.name] ?? "")}
                 required={field.required}
                 onChange={(event) => onChange(field.name, event.target.value)}
               />
-            )}
+            ) : null}
           </label>
-        ),
-      )}
+        );
+      })}
     </>
   );
 }
@@ -308,10 +377,10 @@ type FormRequest = {
   preload: boolean;
   confirm: boolean;
   requireForce: boolean;
-  resourceId: string;
+  resource: Resource;
   rowKey: string;
   hint: string;
-  submit: (form: Record<string, string | boolean>) => Promise<void>;
+  submit: (form: FormValues) => Promise<void>;
 };
 
 function useShownColumns(id: string, rows: Row[]) {
@@ -337,29 +406,22 @@ function useShownColumns(id: string, rows: Row[]) {
 export function ResourcePage() {
   const { id } = useParams({ from: "/r/$id" });
   const { q } = useSearch({ from: "/r/$id" });
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const catalog = useQuery({ queryKey: ["catalog"], queryFn: () => api<Catalog>("/api/v1/catalog") });
-  const resource = catalog.data?.resources.find((item) => item.id === id);
-  const [volume, setVolume] = useState("");
+  const resource = findResource(id);
   const [filter, setFilter] = useState(q);
-  const [since, setSince] = useState("");
-  const [auditAction, setAuditAction] = useState("");
-  const [nodeId, setNodeId] = useState("");
-  const deferredSince = useDeferredValue(since);
-  const deferredAction = useDeferredValue(auditAction);
-  const deferredNode = useDeferredValue(nodeId);
+  const [filters, setFilters] = useState<Values>({});
+  const deferredFilters = useDeferredValue(filters);
   const [request, setRequest] = useState<FormRequest | null>(null);
   const [drawer, setDrawer] = useState<{ row: Row; body: unknown; loading: boolean; error: string } | null>(null);
   const [peek, setPeek] = useState<{ title: string; rows: Row[] } | null>(null);
+  const [reveal, setReveal] = useState<{ title: string; value: Reveal } | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(1);
 
   useEffect(() => {
     setFilter(q);
-    setVolume("");
-    setSince("");
-    setAuditAction("");
-    setNodeId("");
+    setFilters({});
     setRequest(null);
     setDrawer(null);
     setPeek(null);
@@ -371,69 +433,59 @@ export function ResourcePage() {
     window.setTimeout(() => setToasts((current) => current.filter((item) => item.id !== nextId)), 8000);
   }
 
-  const listKey = id === "snapshots" ? volume : id === "audit" ? [deferredSince, deferredAction].filter(Boolean).join("|") : id === "gpus" ? deferredNode : "";
-  const rows = useQuery({
-    queryKey: ["rows", id, listKey],
-    enabled: Boolean(resource?.list),
-    refetchInterval: id === "operations" ? 5_000 : false,
-    queryFn: () => {
-      const params = new URLSearchParams();
-      if (id === "snapshots" && volume) params.set("volume", volume);
-      if (id === "audit" && deferredSince) params.set("since", deferredSince);
-      if (id === "audit" && deferredAction) params.set("action", deferredAction);
-      if (id === "gpus" && deferredNode) params.set("node_id", deferredNode);
-      const query = params.toString();
-      return api<{ rows: Row[] }>(`/api/v1/resources/${id}${query ? `?${query}` : ""}`);
-    },
-  });
-
-  const indexed = useMemo(() => (rows.data?.rows ?? []).map((row) => ({ row, haystack: haystack(row) })), [rows.data]);
+  const rows = useRows(resource, deferredFilters);
+  const indexed = useMemo(() => (rows.data ?? []).map((row) => ({ row, haystack: haystack(row) })), [rows.data]);
   const visible = useMemo(() => {
-    const query = filter.trim().toLowerCase();
-    if (!query) return indexed.map((item) => item.row);
-    return indexed.filter((item) => item.haystack.includes(query)).map((item) => item.row);
+    const needle = filter.trim().toLowerCase();
+    if (!needle) return indexed.map((item) => item.row);
+    return indexed.filter((item) => item.haystack.includes(needle)).map((item) => item.row);
   }, [indexed, filter]);
   const { defs, shown, toggle } = useShownColumns(id, visible);
-  const board = visible.length === 1 && (rows.data?.rows.length ?? 0) === 1;
+  const board = Boolean(resource?.single) && visible.length === 1;
 
-  async function run(action: Action, row?: Row, form: Record<string, string | boolean> = {}) {
+  function settle(title: string, result: unknown) {
+    if (isDownload(result)) {
+      saveFile(result.download.filename, result.download.data, result.download.type);
+      push({ tone: "ok", title: `${title}: saved ${result.download.filename}` });
+      return;
+    }
+    if (isReveal(result)) {
+      setReveal({ title, value: result });
+      return;
+    }
+    push({ tone: "ok", title: `${title} sent`, detail: detailOf(result) });
+  }
+
+  async function run(action: Action, row?: Row, form: FormValues = {}) {
     if (!resource) return;
+    if (action.console && row) {
+      navigate({ to: "/console/$vm", params: { vm: text(row.name) || text(row[resource.idField]) } });
+      return;
+    }
     try {
-      const idValue = row ? text(row[resource.idField]) : text(form.name);
-      const result = await api<unknown>(`/api/v1/resources/${resource.id}/actions`, {
-        method: "POST",
-        body: JSON.stringify({
-          action: action.name,
-          id: idValue,
-          confirm: action.confirm || Boolean(form.confirm),
-          extra: { ...(row ?? {}), ...payload(action.fields, form) },
-        }),
-      });
-      push({ tone: "ok", title: `${action.label} sent`, detail: detailOf(result) });
+      const result = await action.run({ ...(row ?? {}), ...payload(action.fields, form) });
+      settle(action.label, result);
       await queryClient.invalidateQueries({ queryKey: ["rows", resource.id] });
     } catch (error) {
-      push({ tone: "bad", title: (error as Error).message });
+      push({ tone: "bad", title: `${action.label} failed`, detail: errorMessage(error) });
     }
   }
 
-  async function create(form: Record<string, string | boolean>) {
-    if (!resource) return;
+  async function create(form: FormValues) {
+    if (!resource?.create) return;
+    const title = `Create ${displayTitle(resource.id, resource.title)}`;
     try {
-      const result = await api<unknown>(`/api/v1/resources/${resource.id}`, {
-        method: "POST",
-        body: JSON.stringify(payload(resource.fields, form)),
-      });
-      push({ tone: "ok", title: `${displayTitle(resource.id, resource.title)} created`, detail: detailOf(result) });
+      settle(title, await resource.create(payload(resource.fields, form)));
       await queryClient.invalidateQueries({ queryKey: ["rows", resource.id] });
     } catch (error) {
-      push({ tone: "bad", title: (error as Error).message });
+      push({ tone: "bad", title: `${title} failed`, detail: errorMessage(error) });
     }
   }
 
   function openForm(
     title: string,
     fields: Field[],
-    submit: (form: Record<string, string | boolean>) => Promise<void>,
+    submit: (form: FormValues) => Promise<void>,
     options: { checks?: Action[]; preload?: boolean; confirm?: boolean; requireForce?: boolean; row?: Row } = {},
   ) {
     if (!resource) return;
@@ -444,7 +496,7 @@ export function ResourcePage() {
       preload: Boolean(options.preload),
       confirm: Boolean(options.confirm),
       requireForce: Boolean(options.requireForce),
-      resourceId: resource.id,
+      resource,
       rowKey: options.row ? text(options.row[resource.idField]) : "",
       hint: options.row ? rowTitle(options.row) : "",
       submit,
@@ -453,98 +505,81 @@ export function ResourcePage() {
 
   function openDrawer(row: Row) {
     if (!resource) return;
-    setDrawer({ row, body: null, loading: Boolean(resource.inspect), error: "" });
-    if (!resource.inspect) return;
+    const inspect = resource.inspect;
+    setDrawer({ row, body: null, loading: Boolean(inspect), error: "" });
+    if (!inspect) return;
     const key = text(row[resource.idField]);
     if (!key) {
       setDrawer({ row, body: null, loading: false, error: "This row has no id." });
       return;
     }
-    api<unknown>(`/api/v1/resources/${resource.id}/items/${encodeURIComponent(key)}`)
+    inspect(key)
       .then((body) => setDrawer((current) => (current && current.row === row ? { ...current, body, loading: false } : current)))
-      .catch((error: Error) => setDrawer((current) => (current && current.row === row ? { ...current, loading: false, error: error.message } : current)));
+      .catch((error: unknown) => setDrawer((current) => (current && current.row === row ? { ...current, loading: false, error: errorMessage(error) } : current)));
   }
 
-  if (!resource && catalog.isSuccess) return <p className="error">Unknown resource.</p>;
+  if (!resource) return <Empty title="Unknown page" body={`There is no resource called ${id}.`} />;
 
-  const actions = (row?: Row) =>
-    resource ? <RowActions resource={resource} row={row} onOpen={openForm} onRun={run} onInspect={openDrawer} /> : null;
+  const actions = (row?: Row) => <RowActions resource={resource} row={row} onOpen={openForm} onRun={run} onInspect={openDrawer} />;
   const updated = rows.dataUpdatedAt ? formatDate(new Date(rows.dataUpdatedAt).toISOString()) : "";
 
   return (
     <div className="stack">
       <header className="top">
         <div>
-          {resource ? <p className="eyebrow">{resource.group}</p> : null}
-          <h1>{resource ? displayTitle(resource.id, resource.title) : id}</h1>
-          {resource ? (
-            <p className="muted">
-              {resource.kctl ? `kctl ${resource.kctl}` : ""}
-              {resource.terraform.length ? ` · ${resource.terraform.join(", ")}` : ""}
-              {updated ? ` · updated ${updated}` : ""}
-            </p>
-          ) : null}
+          <p className="eyebrow">{resource.group}</p>
+          <h1>{displayTitle(resource.id, resource.title)}</h1>
+          <p className="muted">
+            {resource.kctl ? `kctl ${resource.kctl}` : ""}
+            {resource.terraform.length ? ` · ${resource.terraform.join(", ")}` : ""}
+            {updated ? ` · updated ${updated}` : ""}
+          </p>
         </div>
-        {resource?.list ? (
-          <button type="button" onClick={() => rows.refetch()} disabled={rows.isFetching}>
-            Refresh
-          </button>
-        ) : null}
+        <button type="button" onClick={() => rows.refetch()} disabled={rows.isFetching}>
+          Refresh
+        </button>
       </header>
       <div className="toolbar">
-        {resource?.list && !board ? (
-          <input placeholder="Filter" aria-label="Filter" value={filter} onChange={(event) => setFilter(event.target.value)} />
-        ) : null}
-        {id === "snapshots" ? (
-          <input placeholder="Volume" aria-label="Volume" value={volume} onChange={(event) => setVolume(event.target.value)} />
-        ) : null}
-        {id === "audit" ? (
-          <>
-            <input placeholder="Since" aria-label="Since" value={since} onChange={(event) => setSince(event.target.value)} />
-            <input placeholder="Action" aria-label="Audit action" value={auditAction} onChange={(event) => setAuditAction(event.target.value)} />
-          </>
-        ) : null}
-        {id === "gpus" ? (
-          <input placeholder="Node" aria-label="Node" value={nodeId} onChange={(event) => setNodeId(event.target.value)} />
-        ) : null}
-        {resource?.creatable ? (
+        {!board ? <input placeholder="Filter" aria-label="Filter" value={filter} onChange={(event) => setFilter(event.target.value)} /> : null}
+        {resource.filters?.map((item) =>
+          item.kind === "bool" ? (
+            <label key={item.name} className="check">
+              <input type="checkbox" checked={Boolean(filters[item.name])} onChange={(event) => setFilters((current) => ({ ...current, [item.name]: event.target.checked }))} />
+              {item.label}
+            </label>
+          ) : (
+            <input
+              key={item.name}
+              placeholder={item.placeholder ?? item.label}
+              aria-label={item.label}
+              value={String(filters[item.name] ?? "")}
+              onChange={(event) => setFilters((current) => ({ ...current, [item.name]: event.target.value }))}
+            />
+          ),
+        )}
+        {resource.create ? (
           <button
             type="button"
             className="primary"
             onClick={() =>
               openForm(`Create ${displayTitle(resource.id, resource.title)}`, resource.fields, create, {
-                checks: resource.actions.filter((action) => action.name === "plan" || action.name === "classify"),
+                checks: resource.actions.filter((action) => resource.checks?.includes(action.name)),
               })
             }
           >
             Create
           </button>
         ) : null}
-        {resource && !resource.list
-          ? resource.actions.map((action) =>
-              action.client ? null : (
-                <button
-                  type="button"
-                  key={action.name}
-                  className={action.confirm ? "danger" : ""}
-                  onClick={() => openForm(action.label, action.fields, (form) => run(action, undefined, form), { confirm: action.confirm })}
-                >
-                  {action.label}
-                </button>
-              ),
-            )
-          : null}
         {board && visible[0] ? actions(visible[0]) : null}
-        {resource?.list && !board && defs.length ? <ColumnChooser columns={defs} shown={shown} onToggle={toggle} /> : null}
+        {!board && defs.length ? <ColumnChooser columns={defs} shown={shown} onToggle={toggle} /> : null}
       </div>
-      {catalog.isLoading || (resource?.list && rows.isLoading) ? <Skeleton /> : null}
-      {rows.isError ? <p className="error">{(rows.error as Error).message}</p> : null}
-      {resource && !resource.list ? (
-        <Empty title="No inventory for this resource" body="Create it here, then delete it by name. The controller does not return a list." />
-      ) : null}
-      {resource?.list && rows.isSuccess ? (
+      {rows.isLoading ? <Skeleton /> : null}
+      {rows.isError ? <p className="error">{errorMessage(rows.error)}</p> : null}
+      {rows.isSuccess ? (
         board && visible[0] ? (
           <SummaryPage id={id} row={visible[0]} onPeek={(title, nested) => setPeek({ title, rows: nested })} />
+        ) : visible.length === 0 ? (
+          <Empty title={`No ${displayTitle(resource.id, resource.title).toLowerCase()}`} body={resource.create ? "Create one with the button above." : "The controller returned no rows."} />
         ) : (
           <DataTable
             rows={visible}
@@ -559,6 +594,7 @@ export function ResourcePage() {
       ) : null}
       <Toasts items={toasts} onClose={(toast) => setToasts((current) => current.filter((item) => item.id !== toast))} />
       <PeekDialog peek={peek} onClose={() => setPeek(null)} />
+      <RevealDialog reveal={reveal} onClose={() => setReveal(null)} />
       <DetailDrawer
         open={drawer !== null}
         title={drawer ? rowTitle(drawer.row) : "Details"}
@@ -574,8 +610,40 @@ export function ResourcePage() {
   );
 }
 
+function RevealDialog({ reveal, onClose }: { reveal: { title: string; value: Reveal } | null; onClose: () => void }) {
+  return (
+    <Dialog.Root open={reveal !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="overlay" />
+        <Dialog.Content className="dialog wide">
+          <Dialog.Title>{reveal?.title ?? ""}</Dialog.Title>
+          {reveal?.value.note ? <p className="banner warn">{reveal.value.note}</p> : null}
+          {Object.entries(reveal?.value.reveal ?? {}).map(([key, value]) => (
+            <section key={key} className="stack">
+              <div className="row-head">
+                <strong>{key}</strong>
+                <button type="button" onClick={() => navigator.clipboard?.writeText(value)}>
+                  Copy
+                </button>
+              </div>
+              <pre className="code">{value || "—"}</pre>
+            </section>
+          ))}
+          <div className="buttons">
+            <Dialog.Close asChild>
+              <button type="button" className="primary">
+                Done
+              </button>
+            </Dialog.Close>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
 function FormDialog({ request, onClose, onError }: { request: FormRequest | null; onClose: () => void; onError: (message: string) => void }) {
-  const [values, setValues] = useState<Record<string, string | boolean>>({});
+  const [values, setValues] = useState<FormValues>({});
   const [note, setNote] = useState("");
   const [ready, setReady] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -596,7 +664,12 @@ function FormDialog({ request, onClose, onError }: { request: FormRequest | null
     }
     let cancel = false;
     setReady(false);
-    api<{ spec?: Record<string, unknown> }>(`/api/v1/resources/${request.resourceId}/items/${encodeURIComponent(request.rowKey)}`)
+    const inspect = request.resource.inspect;
+    if (!inspect) {
+      setLoadError("This resource has no stored spec to load.");
+      return;
+    }
+    inspect(request.rowKey)
       .then((body) => {
         if (cancel) return;
         if (!body.spec) {
@@ -606,8 +679,8 @@ function FormDialog({ request, onClose, onError }: { request: FormRequest | null
         setValues(specToValues(request.fields, body.spec));
         setReady(true);
       })
-      .catch((error: Error) => {
-        if (!cancel) setLoadError(error.message);
+      .catch((error: unknown) => {
+        if (!cancel) setLoadError(errorMessage(error));
       });
     return () => {
       cancel = true;
@@ -617,18 +690,9 @@ function FormDialog({ request, onClose, onError }: { request: FormRequest | null
   async function runCheck(action: Action) {
     if (!request) return;
     try {
-      const result = await api<unknown>(`/api/v1/resources/${request.resourceId}/actions`, {
-        method: "POST",
-        body: JSON.stringify({
-          action: action.name,
-          id: text(values.name),
-          confirm: Boolean(values.confirm),
-          extra: payload(request.fields, values),
-        }),
-      });
-      setNote(pretty(result));
+      setNote(pretty(await action.run(payload(request.fields, values))));
     } catch (error) {
-      setNote((error as Error).message);
+      setNote(errorMessage(error));
     }
   }
 
@@ -636,14 +700,10 @@ function FormDialog({ request, onClose, onError }: { request: FormRequest | null
     <Dialog.Root open={request !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="overlay" />
-        <Dialog.Content className={fields.some((field) => field.kind === "json") || split ? "dialog wide" : "dialog"}>
+        <Dialog.Content className={fields.some((field) => field.kind === "json" || field.kind === "multiline") || split ? "dialog wide" : "dialog"}>
           <Dialog.Title>{request?.title ?? ""}</Dialog.Title>
-          {request?.confirm ? (
-            <p>{request.hint ? `${request.title} ${request.hint}.` : `${request.title}.`} This changes the cluster.</p>
-          ) : null}
-          {request?.requireForce ? (
-            <p>Force clears a stranded receive session on the named node. The controller refuses the node that owns the running VM.</p>
-          ) : null}
+          {request?.confirm ? <p>{request.hint ? `${request.title} ${request.hint}.` : `${request.title}.`} This changes the cluster.</p> : null}
+          {request?.requireForce ? <p>Force clears a stranded receive session on the named node. The controller refuses the node that owns the running VM.</p> : null}
           {request?.preload ? <p>Loaded from the current cluster spec. Apply sends this form back as the replacement.</p> : null}
           {loadError ? <p className="error">{loadError}</p> : null}
           <Fields fields={split ? essential : fields} values={values} onChange={(name, value) => setValues((current) => ({ ...current, [name]: value }))} />
@@ -665,14 +725,14 @@ function FormDialog({ request, onClose, onError }: { request: FormRequest | null
             </Dialog.Close>
             <button
               type="button"
-              className="primary"
+              className={request?.confirm ? "danger" : "primary"}
               disabled={blocked}
               onClick={() => {
                 if (!request || blocked) return;
                 const pending = request.submit;
                 const current = values;
                 onClose();
-                pending(current).catch((error: Error) => onError(error.message));
+                pending(current).catch((error: unknown) => onError(errorMessage(error)));
               }}
             >
               Apply
