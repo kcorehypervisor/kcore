@@ -751,6 +751,9 @@ fn apply_replication_event(
         | "operator.delete"
         | "operator_role.grant"
         | "operator_role.revoke"
+        | "operator_credentials.set"
+        | "auth_token.create"
+        | "auth_token.revoke"
         | "disk_layout.create"
         | "disk_layout.delete"
         | "volume.create"
@@ -1946,6 +1949,16 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let _ = db
                 .revoke_operator_role_str(op, role)
                 .map_err(|e| format!("revoke operator role {op}/{role}: {e}"))?;
+            Ok(())
+        }
+        "operator_credentials.set" => crate::web_auth::apply_replicated_credentials(db, &body)
+            .map_err(|e| format!("{}: {e}", head.resource_key)),
+        "auth_token.create" => crate::web_auth::apply_replicated_token(db, &body)
+            .map_err(|e| format!("{}: {e}", head.resource_key)),
+        "auth_token.revoke" => {
+            let id = required_str(&body, "id", &head.resource_key)?;
+            db.delete_auth_token(id)
+                .map_err(|e| format!("delete auth token {id}: {e}"))?;
             Ok(())
         }
         "controller.register" => {
@@ -3593,6 +3606,7 @@ mod tests {
             scheduler: Default::default(),
             failover: Default::default(),
             metrics: Default::default(),
+            web: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 
@@ -3635,6 +3649,7 @@ mod tests {
             scheduler: Default::default(),
             failover: Default::default(),
             metrics: Default::default(),
+            web: Default::default(),
         };
         emit_controller_register(&db, &cfg);
 

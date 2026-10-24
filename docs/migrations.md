@@ -26,7 +26,11 @@ schema_version
 
 ## Current schema version
 
-**60**
+**66**
+
+Version 66 adds `operator_credentials`, `operator_login_state`, and
+`auth_tokens` for web sign-in. Rolling back to 65 drops all three, which ends
+every web session and removes every dashboard password and TOTP setup.
 
 `Database::migrate` applies each `up`. `Database::migrate_down(target)` applies
 the matching `down` from `crates/controller/src/schema_down.rs` and refuses a
@@ -69,6 +73,7 @@ migrations are 38–45 in that file.
 | 48 → 49 | New `pending_node_config_push` table. | After automatic failover, the failed node's next heartbeat pushes a config that no longer starts the moved guests. |
 | 56 → 57 | New `node_host_status` table. | Record the booted NixOS generation and the update capability reported by each node. |
 | 58 → 59 | `CREATE TABLE IF NOT EXISTS node_host_status`. | Version 58 changes nothing. A database already stamped 58 never ran step 57, so version 59 creates the table. |
+| 65 → 66 | New `operator_credentials`, `operator_login_state`, and `auth_tokens` tables. | Password and TOTP sign-in for the controller web listener, and its bearer tokens. |
 
 ## Adding a new migration
 

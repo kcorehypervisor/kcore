@@ -52,6 +52,7 @@ mod vm_operation_reconciler;
 mod volume_crypto;
 mod volume_export;
 mod volume_snapshot;
+mod web_auth;
 mod webhooks;
 
 use std::sync::{Arc, Mutex};
@@ -181,6 +182,22 @@ async fn main() -> anyhow::Result<()> {
     }
     replication::spawn_compensation_executor(database.clone());
     replication::spawn_head_materializer(database.clone());
+    {
+        let db = database.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                tick.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if let Err(e) = db.delete_expired_auth_tokens(now) {
+                    warn!(error = %e, "failed to prune expired auth tokens");
+                }
+            }
+        });
+    }
     replication::spawn_reservation_retry_executor(database.clone());
     disk_reconciler::spawn_disk_layout_reconciler(
         database.clone(),
@@ -393,6 +410,20 @@ async fn main() -> anyhow::Result<()> {
         // custom ClientCertVerifier, so the interceptor is the earliest place
         // we can reject a revoked peer. The health service is not wrapped.
         let limiter = rate_limit::RateLimiter::from_config(&cfg.rate_limit);
+        let auth_service = web_auth::AuthService::new(
+            database.clone(),
+            svc.clone(),
+            cfg.web.clone(),
+            cfg.tls.is_some(),
+            bootstrap_kctl,
+        );
+        let auth_svc = InterceptedService::new(
+            InterceptedService::new(
+                controller_proto::auth_server::AuthServer::new(auth_service.clone()),
+                pki::revocation::interceptor(revocation.clone()),
+            ),
+            limiter.interceptor(),
+        );
         let controller_server = controller_proto::controller_server::ControllerServer::new(svc)
             .max_decoding_message_size(40 * 1024 * 1024)
             .max_encoding_message_size(40 * 1024 * 1024);
@@ -445,14 +476,55 @@ async fn main() -> anyhow::Result<()> {
             let _ = action_tx.send(result);
         });
 
-        server
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let web_task = if cfg.web.enabled {
+            let web_addr: std::net::SocketAddr = cfg.web.listen_addr.parse()?;
+            let acceptor = match cfg.tls.as_ref() {
+                Some(tls) => Some(web_auth::listener::tls_acceptor(
+                    &tls.cert_file,
+                    &tls.key_file,
+                )?),
+                None => None,
+            };
+            let routes = tonic::service::Routes::new(controller_svc.clone())
+                .add_service(admin_svc.clone())
+                .add_service(auth_svc.clone());
+            let web = web_auth::listener::WebServer::new(
+                web_addr,
+                acceptor,
+                routes,
+                web_auth::listener::TokenGate::new(database.clone(), cfg.web.session_idle_secs),
+                cfg.web.ui_dir.as_ref().map(std::path::PathBuf::from),
+            );
+            let mut stop = stop_rx.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = web
+                    .run(async move {
+                        let _ = stop.changed().await;
+                    })
+                    .await
+                {
+                    warn!(error = %e, "web listener stopped");
+                }
+            }))
+        } else {
+            None
+        };
+
+        let served = server
             .add_service(health_svc)
             .add_service(controller_svc)
             .add_service(admin_svc)
+            .add_service(auth_svc)
             .serve_with_shutdown(addr, async {
                 let _ = action_rx.await;
             })
-            .await?;
+            .await;
+        let _ = stop_tx.send(true);
+        if let Some(task) = web_task {
+            let _ = task.await;
+        }
+        served?;
 
         if matches!(LAST_ACTION.lock().unwrap().as_deref(), Some("shutdown")) {
             break;

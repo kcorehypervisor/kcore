@@ -3,6 +3,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
+mod auth_store;
+pub use auth_store::{AuthTokenRow, OperatorCredentials};
+
 fn is_sqlite_memory_database_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     if lower == ":memory:" {
@@ -819,7 +822,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 65;
+pub const SCHEMA_VERSION: i32 = 66;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -2166,6 +2169,39 @@ impl Database {
                     [],
                 )?;
             }
+        }
+
+        if version < 66 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS operator_credentials (
+                    operator_name TEXT PRIMARY KEY REFERENCES operators(name) ON DELETE CASCADE,
+                    password_hash TEXT NOT NULL DEFAULT '',
+                    totp_secret TEXT NOT NULL DEFAULT '',
+                    totp_enabled INTEGER NOT NULL DEFAULT 0,
+                    recovery_codes TEXT NOT NULL DEFAULT '[]',
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS operator_login_state (
+                    operator_name TEXT PRIMARY KEY REFERENCES operators(name) ON DELETE CASCADE,
+                    failed_attempts INTEGER NOT NULL DEFAULT 0,
+                    locked_until INTEGER NOT NULL DEFAULT 0,
+                    last_totp_step INTEGER NOT NULL DEFAULT 0,
+                    pending_totp_secret TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS auth_tokens (
+                    id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    operator_name TEXT NOT NULL REFERENCES operators(name) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    max_role TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    last_used_at INTEGER NOT NULL DEFAULT 0,
+                    created_from TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_auth_tokens_operator ON auth_tokens(operator_name);",
+            )?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;

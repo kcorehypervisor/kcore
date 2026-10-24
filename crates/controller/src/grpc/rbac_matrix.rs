@@ -181,6 +181,34 @@ pub(crate) static CONTROLLER_ADMIN_RPC_ACL: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// `Auth` RPCs. Identities: `anyone` reaches Login without a token; `web:pending`
+/// is the token Login returns; `web:session` and `web:api` are bearer tokens on
+/// the web listener. Self-service RPCs act only on the caller's own operator.
+pub(crate) static AUTH_RPC_ACL: &[(&str, &str, &str)] = &[
+    ("Login", "anyone", ""),
+    ("VerifySecondFactor", "web:pending", ""),
+    ("BeginTotpEnrollment", "web:pending|web:session", ""),
+    ("ConfirmTotpEnrollment", "web:pending|web:session", ""),
+    ("Logout", "web:pending|web:session|web:api", ""),
+    ("WhoAmI", "kctl|kctl:*|web:session|web:api", ""),
+    ("ChangePassword", "web:session", ""),
+    ("ListSessions", "kctl:*|web:session|web:api", ""),
+    ("RevokeSession", "kctl:*|web:session|web:api", ""),
+    ("CreateApiToken", "web:session", ""),
+    ("ListApiTokens", "kctl:*|web:session|web:api", ""),
+    ("RevokeApiToken", "kctl:*|web:session|web:api", ""),
+    (
+        "SetOperatorPassword",
+        "kctl|kctl:*|web:session|web:api",
+        "cluster-admin",
+    ),
+    (
+        "ResetOperatorSecondFactor",
+        "kctl|kctl:*|web:session|web:api",
+        "cluster-admin",
+    ),
+];
+
 /// Full access-control table returned by `GetComplianceReport`.
 pub(crate) fn compliance_access_control_entries() -> Vec<controller_proto::AccessControlEntry> {
     let mut v = vec![
@@ -206,6 +234,7 @@ pub(crate) fn compliance_access_control_entries() -> Vec<controller_proto::Acces
             .iter()
             .map(|(m, id, r)| acl_entry(m, id, r)),
     );
+    v.extend(AUTH_RPC_ACL.iter().map(|(m, id, r)| acl_entry(m, id, r)));
     v
 }
 

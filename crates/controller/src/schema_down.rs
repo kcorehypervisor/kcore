@@ -402,6 +402,13 @@ ALTER TABLE node_ha DROP COLUMN fence_pending;",
         sql: "ALTER TABLE node_ha DROP COLUMN host_health;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 66,
+        sql: "DROP TABLE IF EXISTS auth_tokens;
+DROP TABLE IF EXISTS operator_login_state;
+DROP TABLE IF EXISTS operator_credentials;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

@@ -1569,6 +1569,13 @@ enum OperatorAction {
         #[arg(long)]
         role: OperatorRoleArg,
     },
+    /// Set the dashboard password and end the operator's web sessions.
+    /// Prompts without echo on a terminal, otherwise reads one line from stdin.
+    #[command(name = "set-password")]
+    SetPassword { name: String },
+    /// Clear TOTP and recovery codes. The next dashboard login enrolls again.
+    #[command(name = "reset-2fa")]
+    Reset2fa { name: String },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -3206,6 +3213,18 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::operator::revoke_role(&info, name, *role).await
+        }
+        Command::Operator {
+            action: OperatorAction::SetPassword { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::set_password(&info, name).await
+        }
+        Command::Operator {
+            action: OperatorAction::Reset2fa { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::operator::reset_second_factor(&info, name).await
         }
 
         Command::Drain {
