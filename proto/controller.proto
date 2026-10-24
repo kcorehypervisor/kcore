@@ -24,6 +24,11 @@ service Controller {
   // AttachVmConsole proxies a bidirectional serial console session to the
   // node hosting the VM (see NodeAdmin.AttachVmConsole).
   rpc AttachVmConsole(stream ConsoleMessage) returns (stream ConsoleMessage);
+  // The same console for gRPC-web, which has no client streaming. The first
+  // event carries session_id; send keystrokes with SendVmConsoleInput. The
+  // session ends when the caller stops reading the stream.
+  rpc OpenVmConsole(OpenVmConsoleRequest) returns (stream VmConsoleEvent);
+  rpc SendVmConsoleInput(SendVmConsoleInputRequest) returns (SendVmConsoleInputResponse);
   rpc CreateWorkload(CreateWorkloadRequest) returns (CreateWorkloadResponse);
   rpc DeleteWorkload(DeleteWorkloadRequest) returns (DeleteWorkloadResponse);
   rpc SetWorkloadDesiredState(SetWorkloadDesiredStateRequest) returns (SetWorkloadDesiredStateResponse);
@@ -559,6 +564,24 @@ message ConsoleMessage {
   string vm_name = 1; // required on the first client → server message
   bytes data = 2;     // raw serial bytes
 }
+
+message OpenVmConsoleRequest {
+  string vm_name = 1;
+}
+
+message VmConsoleEvent {
+  // Set on the first event only.
+  string session_id = 1;
+  bytes data = 2;
+}
+
+message SendVmConsoleInputRequest {
+  string session_id = 1;
+  // At most 64 KiB.
+  bytes data = 2;
+}
+
+message SendVmConsoleInputResponse {}
 
 message CreateWorkloadRequest {
   WorkloadKind kind = 1;

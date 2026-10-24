@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
 import * as Dialog from "@radix-ui/react-dialog";
-import { api, type Catalog, type Resource } from "./api";
+import { RESOURCES, type Resource } from "./catalog";
 import { displayTitle, HIDDEN_NAV } from "./format";
+import { Logo } from "./Logo";
+import { useSession } from "./session";
 
 function groupResources(resources: Resource[]) {
   const groups: { name: string; items: Resource[] }[] = [];
@@ -35,21 +36,6 @@ function Glyph({ name }: { name: string }) {
   );
 }
 
-function Logo({ id }: { id: string }) {
-  return (
-    <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
-      <defs>
-        <linearGradient id={id} x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#6366f1" />
-          <stop offset="1" stopColor="#8b5cf6" />
-        </linearGradient>
-      </defs>
-      <rect width="32" height="32" rx="8" fill={`url(#${id})`} />
-      <path d="M10 8v16M10 16l11-8M10 16l11 8" stroke="white" strokeWidth="2.2" fill="none" strokeLinecap="round" />
-    </svg>
-  );
-}
-
 function readClosed(): Record<string, boolean> {
   try {
     const parsed = JSON.parse(localStorage.getItem("kcore-nav-groups") ?? "{}") as unknown;
@@ -68,10 +54,13 @@ export function Shell() {
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
   const [closed, setClosed] = useState<Record<string, boolean>>(readClosed);
-  const catalog = useQuery({ queryKey: ["catalog"], queryFn: () => api<Catalog>("/api/v1/catalog") });
-  const groups = useMemo(() => groupResources(catalog.data?.resources ?? []), [catalog.data]);
+  const session = useSession();
+  const groups = useMemo(() => groupResources(RESOURCES), []);
   const destinations = useMemo(() => {
-    const items = [{ href: "/", title: "Overview", group: "Cluster", id: "" }];
+    const items = [
+      { href: "/", title: "Overview", group: "Cluster", id: "" },
+      { href: "/account", title: "Account", group: "Identity", id: "" },
+    ];
     for (const group of groups) {
       for (const resource of group.items) {
         items.push({ href: `/r/${resource.id}`, title: displayTitle(resource.id, resource.title), group: group.name, id: resource.id });
@@ -124,6 +113,7 @@ export function Shell() {
   function go(href: string) {
     setPalette(false);
     if (href === "/") navigate({ to: "/" });
+    else if (href === "/account") navigate({ to: "/account" });
     else navigate({ to: "/r/$id", params: { id: href.replace("/r/", "") }, search: { q: "" } });
   }
 
@@ -166,7 +156,15 @@ export function Shell() {
                 })}
           </div>
         ))}
-        {catalog.isError ? <p className="error">{(catalog.error as Error).message}</p> : null}
+        <div className="who">
+          <Link to="/account" className={path === "/account" ? "active" : ""}>
+            <strong>{session.operator}</strong>
+            <span className="muted">{session.role || "no role"}</span>
+          </Link>
+          <button type="button" className="ghost" onClick={() => session.logout()}>
+            Sign out
+          </button>
+        </div>
       </nav>
       <div className="workspace">
         <header className="mobile-bar">

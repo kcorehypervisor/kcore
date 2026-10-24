@@ -1,5 +1,7 @@
 import { createRootRoute, createRoute, createRouter } from "@tanstack/react-router";
 import { Shell } from "./App";
+import { AccountPage } from "./Account";
+import { ConsolePage } from "./Console";
 import { Overview, ResourcePage } from "./pages";
 
 const root = createRootRoute({ component: Shell });
@@ -12,9 +14,11 @@ const resource = createRoute({
   }),
   component: ResourcePage,
 });
+const consoleRoute = createRoute({ getParentRoute: () => root, path: "/console/$vm", component: ConsolePage });
+const account = createRoute({ getParentRoute: () => root, path: "/account", component: AccountPage });
 
 export const router = createRouter({
-  routeTree: root.addChildren([overview, resource]),
+  routeTree: root.addChildren([overview, resource, consoleRoute, account]),
 });
 
 declare module "@tanstack/react-router" {

@@ -1,4 +1,4 @@
-import type { Row } from "./api";
+import type { Row } from "./rows";
 import { isObjectArray, label, looksLikeDate } from "./format";
 
 export type Kind = "text" | "status" | "bool" | "number" | "bytes" | "date" | "id" | "nested" | "list";

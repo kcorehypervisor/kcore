@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import * as Dialog from "@radix-ui/react-dialog";
-import type { Action, Field, Resource, Row } from "./api";
+import type { Action, Field, Resource } from "./catalog";
+import type { Row } from "./rows";
 import { columnsFor, type Column } from "./columns";
 import { Donut, Gauge } from "./charts";
 import {
@@ -275,7 +276,7 @@ function looksStatus(key: string): boolean {
 export function RecordView({ value, depth = 0 }: { value: unknown; depth?: number }) {
   if (Array.isArray(value)) {
     if (isObjectArray(value)) return <NestedTable rows={value} />;
-    return <p>{value.map((item) => text(item)).filter(Boolean).join(", ") || "—"}</p>;
+    return <p>{(value as unknown[]).map((item) => text(item)).filter(Boolean).join(", ") || "—"}</p>;
   }
   if (!isRecord(value)) return <p>{text(value) || "—"}</p>;
   const entries = Object.entries(value).filter(([, item]) => item !== null && item !== undefined && item !== "");
@@ -427,7 +428,7 @@ export function DetailDrawer({
 }
 
 function splitActions(actions: Action[]) {
-  const primary = actions.find((action) => !action.confirm && !action.client && action.fields.length === 0 && action.name !== "delete");
+  const primary = actions.find((action) => !action.confirm && !action.console && action.fields.length === 0 && action.name !== "delete");
   return { primary, rest: actions.filter((action) => action !== primary) };
 }
 
@@ -451,7 +452,6 @@ export function RowActions({
 }) {
   const [menu, setMenu] = useState<{ top: number; left: number } | null>(null);
   const { primary, rest } = splitActions(resource.actions);
-  const idValue = row ? text(row[resource.idField]) : "";
   useEffect(() => {
     if (!menu) return;
     function onKey(event: KeyboardEvent) {
@@ -472,7 +472,10 @@ export function RowActions({
   function activate(action: Action) {
     setMenu(null);
     if (!row) return;
-    if (action.client) return;
+    if (action.console) {
+      onRun(action, row).catch(() => undefined);
+      return;
+    }
     if (action.fields.length || action.confirm || action.preload) {
       onOpen(action.label, action.fields, (form) => onRun(action, row, form), {
         confirm: action.confirm,
@@ -492,17 +495,11 @@ export function RowActions({
           Open
         </button>
       ) : null}
-      {rest.map((action) =>
-        action.client ? (
-          <a key={action.name} role="menuitem" href={`/vms/${idValue}/console`}>
-            {action.label}
-          </a>
-        ) : (
-          <button type="button" role="menuitem" key={action.name} className={action.confirm ? "danger" : ""} onClick={() => activate(action)}>
-            {action.label}
-          </button>
-        ),
-      )}
+      {rest.map((action) => (
+        <button type="button" role="menuitem" key={action.name} className={action.confirm ? "danger" : ""} onClick={() => activate(action)}>
+          {action.label}
+        </button>
+      ))}
     </>
   );
   const hasMenu = Boolean(row && resource.inspect) || rest.length > 0;
