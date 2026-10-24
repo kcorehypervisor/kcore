@@ -4825,7 +4825,6 @@ fn prepare_system_update_blocking(
         "kcore-node-agent",
         "kcore-controller",
         "kctl",
-        "kcore-dashboard",
         "kcore-console",
     ];
     let mut bins = std::collections::HashMap::new();
@@ -4940,15 +4939,14 @@ fn activate_system_update_blocking(manifest_path: &Path, _mode: String) -> Resul
     );
 
     // Restart sibling services synchronously (they don't kill us).
-    for unit in ["kcore-controller.service", "kcore-dashboard.service"] {
-        let out = std::process::Command::new("systemctl")
-            .args(["try-restart", unit])
-            .output();
-        if let Ok(o) = out {
-            if !o.status.success() {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                tracing::warn!(unit, stderr = %stderr.trim(), "try-restart failed");
-            }
+    let unit = "kcore-controller.service";
+    if let Ok(o) = std::process::Command::new("systemctl")
+        .args(["try-restart", unit])
+        .output()
+    {
+        if !o.status.success() {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!(unit, stderr = %stderr.trim(), "try-restart failed");
         }
     }
 
@@ -5008,11 +5006,9 @@ fn rollback_blocking(rollback_dir: &Path) -> Result<String, String> {
         std::fs::rename(&tmp, &dest)
             .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dest.display()))?;
     }
-    for unit in ["kcore-controller.service", "kcore-dashboard.service"] {
-        let _ = std::process::Command::new("systemctl")
-            .args(["try-restart", unit])
-            .output();
-    }
+    let _ = std::process::Command::new("systemctl")
+        .args(["try-restart", "kcore-controller.service"])
+        .output();
     let _ = std::process::Command::new("systemd-run")
         .args([
             "--collect",

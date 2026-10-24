@@ -38,6 +38,8 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_BEFORE_RENEW: &[(&str, &str)] = &[
     ("GetVm", "read-only"),
     ("ListVms", "read-only"),
     ("AttachVmConsole", "vm-admin"),
+    ("OpenVmConsole", "vm-admin"),
+    ("SendVmConsoleInput", "vm-admin"),
     ("CreateWorkload", "vm-admin"),
     ("DeleteWorkload", "vm-admin"),
     ("SetWorkloadDesiredState", "vm-admin"),

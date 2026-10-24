@@ -243,7 +243,11 @@ impl AuthService {
                 .unwrap_or_default(),
             created_at: created,
             expires_at: created + ttl_secs,
-            last_used_at: created,
+            last_used_at: if kind == WebTokenKind::Api {
+                0
+            } else {
+                created
+            },
             created_from: created_from.to_string(),
         };
         self.db.insert_auth_token(&row).map_err(db_err)?;

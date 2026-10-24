@@ -62,7 +62,12 @@ in
     ./kcore-branding.nix
     ./kcore-ceph.nix
     ./kcore-metrics.nix
-    ./kcore-dashboard.nix
+    (lib.mkRemovedOptionModule [
+      "services"
+      "kcore"
+      "dashboard"
+      "environmentFile"
+    ] "The dashboard is served by the controller's web listener and talks gRPC-web to it.")
   ];
 
   options.services.kcore = {
@@ -97,14 +102,20 @@ in
     };
 
     dashboard = {
-      enable = lib.mkEnableOption "kcore dashboard";
+      enable = lib.mkEnableOption "the web dashboard on the controller's gRPC-web listener";
       package = lib.mkOption {
         type = lib.types.package;
-        description = "Package providing bin/kcore-dashboard.";
+        description = "Package providing share/kcore-dashboard, the static dashboard files.";
       };
-      environmentFile = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
-        default = "/etc/kcore/dashboard.env";
+      listenAddress = lib.mkOption {
+        type = lib.types.str;
+        default = "0.0.0.0:9443";
+        description = "Address of the controller's web listener (gRPC-web, bearer tokens, TLS).";
+      };
+      openFirewall = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Open the web listener port in the host firewall.";
       };
     };
 
@@ -139,6 +150,12 @@ in
 
   config = lib.mkMerge [
     {
+      assertions = [
+        {
+          assertion = cfg.dashboard.enable -> cfg.controller.enable;
+          message = "services.kcore.dashboard is served by the controller; enable services.kcore.controller too.";
+        }
+      ];
       nix.settings.experimental-features = [
         "nix-command"
         "flakes"
@@ -230,12 +247,17 @@ in
           User = "root";
           LimitNOFILE = 65536;
         };
+        environment = lib.mkIf cfg.dashboard.enable {
+          KCORE_WEB_ENABLED = "true";
+          KCORE_WEB_LISTEN_ADDR = cfg.dashboard.listenAddress;
+          KCORE_WEB_UI_DIR = "${cfg.dashboard.package}/share/kcore-dashboard";
+        };
       };
-      services.kcore-dashboard = lib.mkIf cfg.dashboard.enable {
-        enable = true;
-        inherit (cfg.dashboard) package environmentFile;
-        openFirewall = true;
-      };
+      networking.firewall.allowedTCPPorts =
+        lib.mkIf (cfg.dashboard.enable && cfg.dashboard.openFirewall)
+          [
+            (lib.toInt (lib.last (lib.splitString ":" cfg.dashboard.listenAddress)))
+          ];
     })
     (lib.mkIf cfg.console.enable {
       environment.systemPackages = [ cfg.console.package ];

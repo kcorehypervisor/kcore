@@ -70,7 +70,7 @@ grep -q 'caFile: /etc/kcore/certs/ca.crt' "$tmp/controller/node-agent.yaml"
 grep -q 'gatewayIp: 10.240.0.1' "$tmp/controller/controller.yaml"
 grep -q 'externalIp: 10.1.2.3' "$tmp/controller/controller.yaml"
 grep -F -q 'peers: []' "$tmp/controller/controller.yaml"
-grep -q 'KCORE_CONTROLLER=10.1.2.3:9090' "$tmp/controller/dashboard.env"
+grep -q '9443' "$tmp/controller/node.nix"
 grep -q 'Generate a new cluster CA' "$tmp/controller/pki-plan.txt"
 grep -q 'Dry run wrote' "$tmp/controller.out"
 
@@ -128,7 +128,7 @@ if grep -q '4789' "$tmp/agent/node.nix"; then
   echo "vxlan port opened despite --disable-vxlan" >&2
   exit 1
 fi
-if [[ -f $tmp/agent/controller.yaml || -f $tmp/agent/dashboard.env ]]; then
+if [[ -f $tmp/agent/controller.yaml ]]; then
   echo "agent render wrote controller files" >&2
   exit 1
 fi
