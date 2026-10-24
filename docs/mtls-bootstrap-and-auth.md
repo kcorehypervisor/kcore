@@ -118,7 +118,7 @@ Components authenticate each other by Common Name (CN) extracted from the client
 
 | Component | CN pattern | Authorization check |
 |-----------|-----------|---------------------|
-| kctl (legacy bootstrap) | `kctl` | exact match; treated as **cluster-admin** only while the `operators` table is empty, or when `auth.bootstrap_kctl: true` in controller config — otherwise denied |
+| kctl (legacy bootstrap) | `kctl` | exact match; treated as **cluster-admin** only until a `cluster-admin` operator has an issued certificate, or when `auth.bootstrap_kctl: true` in controller config — otherwise denied |
 | kctl (named operator) | `kctl:<name>` | must exist in `operators` with at least one role; effective capability is the highest of assigned roles (`read-only` < `vm-admin` < `cluster-admin`) |
 | Controller | `kcore-controller-{host}` | prefix match `kcore-controller-` |
 | Node agent | `kcore-node-{host}` | prefix match `kcore-node-` |
@@ -140,9 +140,9 @@ Roles are stored in SQLite (`operators`, `operator_roles`) and replicate across 
 **Bootstrap flow**
 
 1. `kctl create cluster` still produces the legacy client cert `CN=kctl` (often embedded in context config).
-2. While no operators exist, that cert acts as cluster-admin so you can run `kctl operator create alice`, `kctl operator grant-role alice --role cluster-admin`, and `kctl operator issue-cert alice`.
+2. Until some operator holds `cluster-admin` and has an issued certificate, that cert acts as cluster-admin so you can run `kctl operator create alice`, `kctl operator grant-role alice --role cluster-admin`, and `kctl operator issue-cert alice`.
 3. Material lands under `~/.kcore/operators/alice/operator.{crt,key}`; use `kctl --as alice ...` (or `operator:` in the context) for subsequent calls.
-4. After the first operator exists, legacy `CN=kctl` is rejected unless you set `auth.bootstrap_kctl: true` on the controller (escape hatch only).
+4. Once `issue-cert` gives a cluster-admin operator its certificate, legacy `CN=kctl` is rejected unless you set `auth.bootstrap_kctl: true` on the controller (escape hatch only). Run `kctl operator set-password alice` with `--as alice` after that point.
 
 See also: `kctl get compliance-report` → **access_control** lists each RPC with `required_operator_role`.
 
@@ -483,6 +483,10 @@ web:
 ```
 
 Without a `tls` block the web listener runs in clear text. This is only possible with `--allow-insecure`, and the controller logs a warning.
+
+On kcoreOS, `services.kcore.dashboard.enable = true` turns the listener on without editing `controller.yaml`. The host module sets `KCORE_WEB_ENABLED`, `KCORE_WEB_LISTEN_ADDR` (`services.kcore.dashboard.listenAddress`, default `0.0.0.0:9443`), and `KCORE_WEB_UI_DIR` (`share/kcore-dashboard` of `services.kcore.dashboard.package`) on `kcore-controller.service`, and opens the port. These variables override the `web` block. Open `https://<controller>:9443/` and sign in.
+
+The dashboard is static files and has no backend of its own. Every page calls the controller's RPCs over gRPC-web. The VM serial console uses `OpenVmConsole`, a server stream, for output and `SendVmConsoleInput` for keystrokes, because browsers cannot send a client stream over gRPC-web. Only the session that opened a console can type into it.
 
 **Identity.** A session or API token for operator `alice` is checked exactly like the client certificate `CN=kctl:alice`. It has the same roles, the same `require_*_operator` checks, and the same compliance table. Node and peer-controller RPCs stay closed to it. The audit log records `web:alice` for a session and `api-token:alice/<id>` for an API token.
 

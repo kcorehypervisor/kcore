@@ -51,7 +51,7 @@ impl OperatorRole {
 
 #[derive(Debug, Clone)]
 pub enum ManagementPeer {
-    /// Legacy single-operator cert; bootstrap-only when operators exist unless `bootstrap_kctl` is set.
+    /// Legacy single-operator cert; retired once a cluster-admin operator has a cert, unless `bootstrap_kctl` is set.
     LegacyKctl,
     /// Per-operator cert `CN=kctl:<name>`.
     NamedOperator(String),
@@ -215,14 +215,14 @@ fn effective_operator_role(
     match peer {
         ManagementPeer::PeerController => Ok(OperatorRole::ClusterAdmin),
         ManagementPeer::LegacyKctl => {
-            let n = db
-                .count_operators()
-                .map_err(|e| Status::internal(format!("operator CountOperators db error: {e}")))?;
-            if n == 0 || bootstrap_kctl {
+            let retired = db
+                .has_certified_cluster_admin()
+                .map_err(|e| Status::internal(format!("operator lookup db error: {e}")))?;
+            if !retired || bootstrap_kctl {
                 Ok(OperatorRole::ClusterAdmin)
             } else {
                 Err(Status::permission_denied(
-                    "legacy CN=kctl client is disabled after operators are configured; use a per-operator certificate (CN=kctl:<name>)",
+                    "legacy CN=kctl client is disabled once a cluster-admin operator has a certificate; use a per-operator certificate (CN=kctl:<name>)",
                 ))
             }
         }
@@ -450,6 +450,31 @@ mod tests {
         assert_eq!(
             OperatorRole::from_db_str("backup-operator"),
             Some(OperatorRole::BackupOperator)
+        );
+    }
+
+    #[test]
+    fn legacy_kctl_survives_bootstrap_until_an_admin_has_a_cert() {
+        let db = Database::open(":memory:").expect("db");
+        let legacy = || effective_operator_role(&db, &ManagementPeer::LegacyKctl, false);
+        assert_eq!(legacy().unwrap(), OperatorRole::ClusterAdmin);
+
+        db.create_operator("alice").unwrap();
+        assert_eq!(legacy().unwrap(), OperatorRole::ClusterAdmin);
+        db.grant_operator_role_str("alice", "cluster-admin")
+            .unwrap();
+        assert_eq!(legacy().unwrap(), OperatorRole::ClusterAdmin);
+
+        db.create_operator("bob").unwrap();
+        db.grant_operator_role_str("bob", "read-only").unwrap();
+        db.set_operator_cert_serial("bob", "0b").unwrap();
+        assert_eq!(legacy().unwrap(), OperatorRole::ClusterAdmin);
+
+        db.set_operator_cert_serial("alice", "0a").unwrap();
+        assert!(legacy().is_err());
+        assert_eq!(
+            effective_operator_role(&db, &ManagementPeer::LegacyKctl, true).unwrap(),
+            OperatorRole::ClusterAdmin
         );
     }
 }

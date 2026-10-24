@@ -59,7 +59,6 @@
               || (toString path) == "${toString ./.}/modules"
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
-              || pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/assets/" (toString path)
               || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path);
           };
 
@@ -106,38 +105,44 @@
             }
           );
 
-          kcore-dashboard = craneLib.buildPackage (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              pname = "kcore-dashboard";
-              cargoExtraArgs = "-p kcore-dashboard";
-              src = pkgs.lib.cleanSourceWith {
-                src = ./.;
-                filter =
-                  path: type:
-                  (craneLib.filterCargoSources path type)
-                  || pkgs.lib.hasPrefix "${toString ./.}/proto/" (toString path)
-                  || (toString path) == "${toString ./.}/modules"
-                  || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
-                  || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
-                  || pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/assets/" (toString path)
-                  || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path)
-                  || (
-                    pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/web/" (toString path)
-                    && !pkgs.lib.hasInfix "/node_modules/" (toString path)
-                    && !pkgs.lib.hasInfix "/dist/" (toString path)
-                  );
-              };
-              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.nodejs ];
-              preBuild = ''
-                cd crates/dashboard/web
-                npm ci --ignore-scripts
-                npm run build
-                cd ../..
-              '';
-            }
-          );
+          # Static files only. The controller's web listener serves them and
+          # answers the dashboard's gRPC-web calls on the same port.
+          kcore-dashboard = pkgs.buildNpmPackage {
+            pname = "kcore-dashboard";
+            version = kcoreVersion;
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter =
+                path: _type:
+                let
+                  p = toString path;
+                in
+                p == "${toString ./.}/proto"
+                || pkgs.lib.hasPrefix "${toString ./.}/proto/" p
+                || p == "${toString ./.}/dashboard"
+                || (
+                  pkgs.lib.hasPrefix "${toString ./.}/dashboard/" p
+                  && !pkgs.lib.hasInfix "/node_modules" p
+                  && !pkgs.lib.hasInfix "/dist" p
+                  && !pkgs.lib.hasInfix "/src/gen" p
+                );
+            };
+            sourceRoot = "source/dashboard";
+            npmDepsHash = "sha256-QvyG8RRTLPk6gulqcKXfm7wTJJ4Ik7LZ7qOHoiG7ZX8=";
+            nativeBuildInputs = [ pkgs.protobuf ];
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              npx vitest run
+              runHook postCheck
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/share
+              cp -r dist $out/share/kcore-dashboard
+              runHook postInstall
+            '';
+          };
 
           kcoreGitRev = inputs.self.shortRev or inputs.self.dirtyShortRev or "dev";
 
@@ -279,7 +284,6 @@
         let
           kcoreVersion = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile ./VERSION);
           chVmModule = ./modules/ch-vm;
-          dashboardModule = ./modules/kcore-dashboard.nix;
           cephModule = ./modules/kcore-ceph.nix;
           metricsModule = ./modules/kcore-metrics.nix;
         in
@@ -288,7 +292,6 @@
             ch-vm = chVmModule;
             default = chVmModule;
             kcore-disko = ./modules/kcore-disko.nix;
-            kcore-dashboard = dashboardModule;
             kcore-ceph = cephModule;
             kcore-metrics = metricsModule;
             kcore-host = ./modules/kcore-host.nix;
@@ -308,7 +311,6 @@
                   inherit (inputs.self.packages.x86_64-linux) kctl;
                   nodeAgent = inputs.self.packages.x86_64-linux.kcore-node-agent;
                   controller = inputs.self.packages.x86_64-linux.kcore-controller;
-                  dashboard = inputs.self.packages.x86_64-linux.kcore-dashboard;
                   kcoreConsole = inputs.self.packages.x86_64-linux.kcore-console;
                   diskoPackage = inputs.disko.packages.x86_64-linux.default;
                 in
@@ -350,7 +352,7 @@
                     22
                     9090
                     9091
-                    8080
+                    9443
                   ];
 
                   users.users.root.initialPassword = "kcore";
@@ -415,7 +417,6 @@
                     nodeAgent
                     controller
                     kctl
-                    dashboard
                     diskoPackage
                     (pkgs.writeShellScriptBin "install-to-disk" ''
                                                                 set -euo pipefail
@@ -636,7 +637,7 @@
                                                                     printf "%-14s %s\n" "NAME" "ENDPOINT / STATUS"
                                                                     printf "%-14s %s\n" "node-agent" "$(service_status kcore-node-agent.service 9091)"
                                                                     printf "%-14s %s\n" "controller" "$(service_status kcore-controller.service 9090)"
-                                                                    printf "%-14s %s\n" "dashboard" "$(service_status kcore-dashboard.service 8080)"
+                                                                    printf "%-14s %s\n" "dashboard" "$(service_status kcore-controller.service 9443)"
                                                                     printf "%-14s %s\n" "metrics" "$(service_status prometheus-node-exporter.service 9100)"
                                                                     printf "%-14s %s\n" "victoriametrics" "$(service_status victoriametrics.service 8428)"
                                                                     printf "\nAccess\n"
@@ -1163,18 +1164,6 @@
                       REPLEOF
                                                                 fi
 
-                                                                if [ "$RUN_CONTROLLER" = "true" ]; then
-                                                                  cat > /mnt/etc/kcore/dashboard.env <<DASHENV
-                      KCORE_CONTROLLER=$EXTERNAL_IP:9090
-                      KCORE_CA_FILE=/etc/kcore/certs/ca.crt
-                      KCORE_CERT_FILE=/etc/kcore/certs/controller.crt
-                      KCORE_KEY_FILE=/etc/kcore/certs/controller.key
-                      LEPTOS_SITE_ADDR=0.0.0.0:8080
-                      LEPTOS_ENV=PROD
-                      DASHENV
-                                                                  chmod 0644 /mnt/etc/kcore/dashboard.env
-                                                                fi
-
                                                                 cat > /mnt/etc/nixos/kcore-vms.nix <<'VMSEOF'
                       { ... }:
                       {
@@ -1186,7 +1175,7 @@
                                                                 EXTRA_UDP_PORTS=""
                                                                 NODE_AGENT_AFTER='"network-online.target"'
                                                                 if [ "$RUN_CONTROLLER" = "true" ]; then
-                                                                  EXTRA_TCP_PORTS="9090 8080"
+                                                                  EXTRA_TCP_PORTS="9090 9443"
                                                                   NODE_AGENT_AFTER='"network-online.target" "kcore-controller.service"'
                                                                 fi
                                                                 if [ "$DISABLE_VXLAN" != "true" ]; then
@@ -1235,28 +1224,6 @@
                                                 };
                                               };
                       CTRLSVC
-                                                                  )
-                                                                fi
-
-                                                                DASHBOARD_SERVICE=""
-                                                                if [ "$RUN_CONTROLLER" = "true" ]; then
-                                                                  DASHBOARD_SERVICE=$(cat <<'DASHSVC'
-                                              systemd.services.kcore-dashboard = {
-                                                description = "kcore Dashboard";
-                                                wantedBy = [ "multi-user.target" ];
-                                                after = [ "network-online.target" "kcore-controller.service" ];
-                                                wants = [ "network-online.target" ];
-                                                serviceConfig = {
-                                                  Type = "simple";
-                                                  EnvironmentFile = "/etc/kcore/dashboard.env";
-                                                  ExecStart = "/opt/kcore/bin/kcore-dashboard";
-                                                  Restart = "always";
-                                                  RestartSec = "10s";
-                                                  User = "root";
-                                                  LimitNOFILE = 65536;
-                                                };
-                                              };
-                      DASHSVC
                                                                   )
                                                                 fi
 

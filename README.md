@@ -84,7 +84,7 @@ See: [Architecture](docs/Architecture.md)
 - mTLS is the default production posture; insecure mode is opt-in via `--allow-insecure` / `--insecure`.
 - Cluster PKI is created by `kctl create cluster`.
 - Node install flow sends only required cert/key material to target nodes; private key files are written with restricted permissions.
-- **RBAC**: controller APIs enforce flat roles (`read-only`, `vm-admin`, `cluster-admin`) keyed off operator client cert CN `kctl:<name>` (see [mTLS bootstrap and authentication](docs/mtls-bootstrap-and-auth.md)); legacy `CN=kctl` is bootstrap-only once operators exist.
+- **RBAC**: controller APIs enforce flat roles (`read-only`, `vm-admin`, `cluster-admin`) keyed off operator client cert CN `kctl:<name>` (see [mTLS bootstrap and authentication](docs/mtls-bootstrap-and-auth.md)); legacy `CN=kctl` is retired once a cluster-admin operator has its own certificate.
 - Known security work still pending: certificate rotation workflows and revocation checks (CRL/OCSP).
 
 See: [Security model](docs/security.md)
