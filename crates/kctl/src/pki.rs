@@ -420,6 +420,56 @@ run `kctl create cluster --context <cluster-name> --controller <host:9090>` and 
     })
 }
 
+/// Write the certs a node needs under `out_dir`.
+///
+/// The cluster CA key stays in `certs_dir`. kcore-infect calls this after
+/// `kctl create cluster` (or with a CA copied from the operator) so the first
+/// boot has mTLS files and the root key is not placed in `/etc/kcore/certs`.
+pub fn write_node_pki(
+    certs_dir: &Path,
+    host: &str,
+    out_dir: &Path,
+    run_controller: bool,
+) -> Result<(), String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("host is empty".to_string());
+    }
+    let payload = load_install_pki(certs_dir, host, run_controller)?;
+    if payload.ca_cert_pem.is_empty()
+        || payload.node_cert_pem.is_empty()
+        || payload.node_key_pem.is_empty()
+    {
+        return Err("node certificate material was empty".to_string());
+    }
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("creating {}: {e}", out_dir.display()))?;
+    write_file(&out_dir.join("ca.crt"), &payload.ca_cert_pem, 0o644)?;
+    write_file(&out_dir.join("node.crt"), &payload.node_cert_pem, 0o644)?;
+    write_file(&out_dir.join("node.key"), &payload.node_key_pem, 0o600)?;
+    if run_controller {
+        if payload.controller_cert_pem.is_empty()
+            || payload.controller_key_pem.is_empty()
+            || payload.sub_ca_cert_pem.is_empty()
+            || payload.sub_ca_key_pem.is_empty()
+        {
+            return Err("controller certificate material was empty".to_string());
+        }
+        write_file(
+            &out_dir.join("controller.crt"),
+            &payload.controller_cert_pem,
+            0o644,
+        )?;
+        write_file(
+            &out_dir.join("controller.key"),
+            &payload.controller_key_pem,
+            0o600,
+        )?;
+        write_file(&out_dir.join("sub-ca.crt"), &payload.sub_ca_cert_pem, 0o644)?;
+        write_file(&out_dir.join("sub-ca.key"), &payload.sub_ca_key_pem, 0o600)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +537,72 @@ mod tests {
             !payload.controller_key_pem.is_empty(),
             "controller key should be sent when node co-locates controller"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_node_pki_writes_controller_files_and_keeps_the_ca_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let certs = tmp.path().join("cluster");
+        let out = tmp.path().join("node");
+        create_cluster_pki(&certs, "10.0.0.8", false).expect("create pki");
+
+        write_node_pki(&certs, "10.0.0.8", &out, true).expect("write node pki");
+
+        for name in [
+            "ca.crt",
+            "node.crt",
+            "node.key",
+            "controller.crt",
+            "controller.key",
+            "sub-ca.crt",
+            "sub-ca.key",
+        ] {
+            assert!(out.join(name).is_file(), "{name} missing");
+        }
+        assert!(!out.join("ca.key").exists());
+        assert!(!out.join("kctl.key").exists());
+        let cert = std::fs::read_to_string(out.join("node.crt")).expect("node cert");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        let mode = std::fs::metadata(out.join("node.key"))
+            .expect("node key metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let controller_mode = std::fs::metadata(out.join("controller.key"))
+            .expect("controller key metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(controller_mode, 0o600);
+    }
+
+    #[test]
+    fn write_node_pki_omits_controller_material_for_an_agent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let certs = tmp.path().join("cluster");
+        let out = tmp.path().join("node");
+        create_cluster_pki(&certs, "10.0.0.8", false).expect("create pki");
+
+        write_node_pki(&certs, "10.0.0.9", &out, false).expect("write node pki");
+
+        assert!(out.join("ca.crt").is_file());
+        assert!(out.join("node.crt").is_file());
+        assert!(out.join("node.key").is_file());
+        assert!(!out.join("controller.crt").exists());
+        assert!(!out.join("controller.key").exists());
+        assert!(!out.join("sub-ca.crt").exists());
+        assert!(!out.join("ca.key").exists());
+    }
+
+    #[test]
+    fn write_node_pki_rejects_an_empty_host() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = write_node_pki(tmp.path(), "  ", tmp.path(), false).expect_err("empty host");
+        assert!(err.contains("empty"));
     }
 
     #[test]

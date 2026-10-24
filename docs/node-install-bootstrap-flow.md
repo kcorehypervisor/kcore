@@ -9,6 +9,16 @@ Install a node from live ISO to disk and ensure that, after reboot:
 - the node can join or host the controller as configured
 - certificate trust is anchored in the selected cluster CA
 
+## Existing Debian or other Linux
+
+On a running systemd Linux server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kcorehypervisor/kcore/main/scripts/kcore-infect | sudo bash -s -- --yes --reboot
+```
+
+That fetches [`scripts/kcore-infect`](../scripts/kcore-infect) and installs kcoreOS on the filesystem that is already there. The procedure in this document is the one that boots the ISO, wipes a disk, and enrolls LUKS. See [kcore-infect](./kcore-infect.md).
+
 ## Cluster-scoped PKI layout
 
 Expected local layout on the operator machine:

@@ -6,7 +6,13 @@ import { router } from "./router";
 import "./styles.css";
 
 const queryClient = new QueryClient({
-  defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
+  defaultOptions: {
+    queries: {
+      refetchOnWindowFocus: false,
+      retry: 1,
+      staleTime: 15_000,
+    },
+  },
 });
 
 createRoot(document.getElementById("root")!).render(

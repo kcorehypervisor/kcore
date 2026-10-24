@@ -214,6 +214,12 @@
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
+            # The stdenv shell is bash, but the `bash` name is not on PATH.
+            kcore-infect = pkgs.runCommand "kcore-infect-test" { } ''
+              export PATH="${pkgs.lib.removeSuffix "/bash" pkgs.stdenv.shell}:$PATH"
+              bash ${./scripts/kcore-infect-test.sh} ${./scripts/kcore-infect}
+              touch $out
+            '';
             fmt-nix =
               pkgs.runCommand "check-nix-fmt"
                 {
