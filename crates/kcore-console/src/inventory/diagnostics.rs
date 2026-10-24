@@ -13,7 +13,6 @@ pub fn kcore_diagnostics() -> Vec<ServiceLine> {
     const UNITS: &[(&str, &str)] = &[
         ("kcore-node-agent", "kcore-node-agent.service"),
         ("kcore-controller", "kcore-controller.service"),
-        ("kcore-dashboard", "kcore-dashboard.service"),
     ];
     let mut v = Vec::new();
     let has_systemctl = which_systemctl();

@@ -96,6 +96,11 @@ jobs:
       - name: Nix format check
         run: nix build --no-link .#checks.x86_64-linux.fmt-nix
 
+      # Generates the TypeScript client from proto/, typechecks, runs vitest,
+      # and builds the static files the controller serves.
+      - name: Dashboard build
+        run: nix build --no-link -L .#kcore-dashboard
+
   gitleaks:
     runs-on: ubuntu-latest
     timeout-minutes: 10

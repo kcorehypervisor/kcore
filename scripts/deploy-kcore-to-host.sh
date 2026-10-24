@@ -2,7 +2,8 @@
 # Copy freshly built kcore packages to a NixOS host via nix copy and
 # activate them without a full OS reinstall.
 #
-# Deploys: kcore-dashboard, kcore-controller, kcore-node-agent
+# Deploys: kcore-controller, kcore-node-agent, and the dashboard's static
+# files, which the controller serves on its web listener (9443).
 #
 # Activation strategy (in order):
 #   1. If units ExecStart /opt/kcore/bin/*, replace those binaries (kcoreOS
@@ -32,7 +33,7 @@ run_ssh() {
   fi
 }
 
-echo "==> Building kcore-dashboard, kcore-controller, kcore-node-agent from $FLAKE"
+echo "==> Building kcore-controller, kcore-node-agent, kcore-dashboard from $FLAKE"
 DASH="$(nix build "$FLAKE#kcore-dashboard" --no-link --print-out-paths)"
 CTRL="$(nix build "$FLAKE#kcore-controller" --no-link --print-out-paths)"
 AGENT="$(nix build "$FLAKE#kcore-node-agent" --no-link --print-out-paths)"
@@ -82,30 +83,29 @@ etc_systemd_writable() {
 }
 
 write_dropin() {
-  local name="$1" exe="$2"
+  local name="$1" exe="$2" env="${3:-}"
   $SUDO mkdir -p "/etc/systemd/system/${name}.service.d"
   $SUDO tee "/etc/systemd/system/${name}.service.d/z-nix-store-override.conf" >/dev/null <<EOF
 [Service]
 ExecStart=
 ExecStart=$exe
+$env
 EOF
   echo "    override $name -> $exe"
 }
 
 # Prefer /opt/kcore/bin when that is what the units already run — works on
 # installed kcoreOS without touching read-only systemd unit trees.
-if unit_uses_opt_bin kcore-dashboard || unit_uses_opt_bin kcore-controller || unit_uses_opt_bin kcore-node-agent; then
+if unit_uses_opt_bin kcore-controller || unit_uses_opt_bin kcore-node-agent; then
   echo "    using /opt/kcore/bin symlinks"
-  install_opt_bin kcore-dashboard "$DASH/bin/kcore-dashboard"
+  echo "    note: the dashboard files change only through services.kcore.dashboard in the host config"
   install_opt_bin kcore-controller "$CTRL/bin/kcore-controller"
   install_opt_bin kcore-node-agent "$AGENT/bin/kcore-node-agent"
 elif etc_systemd_writable; then
   echo "    using systemd drop-ins"
-  if systemctl cat kcore-dashboard &>/dev/null; then
-    write_dropin kcore-dashboard "$DASH/bin/kcore-dashboard"
-  fi
   if systemctl cat kcore-controller &>/dev/null; then
-    write_dropin kcore-controller "$CTRL/bin/kcore-controller --config /etc/kcore/controller.yaml"
+    write_dropin kcore-controller "$CTRL/bin/kcore-controller --config /etc/kcore/controller.yaml" \
+      "Environment=KCORE_WEB_ENABLED=true KCORE_WEB_UI_DIR=$DASH/share/kcore-dashboard"
   fi
   if systemctl cat kcore-node-agent &>/dev/null; then
     write_dropin kcore-node-agent "$AGENT/bin/kcore-node-agent --config /etc/kcore/node-agent.yaml"
@@ -135,11 +135,10 @@ sync_effective_exec() {
     echo "    synced effective ExecStart $unit -> $exe"
   fi
 }
-sync_effective_exec kcore-dashboard "$DASH/bin/kcore-dashboard"
 sync_effective_exec kcore-controller "$CTRL/bin/kcore-controller"
 sync_effective_exec kcore-node-agent "$AGENT/bin/kcore-node-agent"
 
-for u in kcore-dashboard kcore-controller kcore-node-agent; do
+for u in kcore-controller kcore-node-agent; do
   if systemctl cat "$u" &>/dev/null; then
     $SUDO systemctl restart "$u"
     echo "    restarted $u"
@@ -147,7 +146,7 @@ for u in kcore-dashboard kcore-controller kcore-node-agent; do
 done
 
 echo "==> status (first lines)"
-for u in kcore-dashboard kcore-controller kcore-node-agent; do
+for u in kcore-controller kcore-node-agent; do
   if systemctl cat "$u" &>/dev/null; then
     $SUDO systemctl --no-pager -l status "$u" | head -12 || true
     echo ""
@@ -155,8 +154,8 @@ for u in kcore-dashboard kcore-controller kcore-node-agent; do
 done
 
 echo "==> binary versions (mtime / path)"
-ls -l /opt/kcore/bin/kcore-dashboard /opt/kcore/bin/kcore-controller /opt/kcore/bin/kcore-node-agent 2>/dev/null || true
+ls -l /opt/kcore/bin/kcore-controller /opt/kcore/bin/kcore-node-agent 2>/dev/null || true
 REMOTE
 
 HOST_ONLY="${TARGET#*@}"
-echo "Done. Open http://${HOST_ONLY}:8080/vms (hard-refresh). Serial console needs a running VM."
+echo "Done. Open https://${HOST_ONLY}:9443/ and sign in. Serial console needs a running VM."

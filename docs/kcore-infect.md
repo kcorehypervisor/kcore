@@ -42,7 +42,7 @@ On the next boot:
 - DHCP is used when the old system was using DHCP; otherwise the current address is pinned
 - root can log in over SSH. The initial password is `kcore` unless you pass `--root-password` or set `KCORE_ROOT_PASSWORD`
 - authorized keys from `/root/.ssh/authorized_keys` are installed for root
-- the controller listens on `:9090`, the dashboard on `:8080`, and the node agent on `:9091`
+- the controller listens on `:9090`, the dashboard and its gRPC-web API on `:9443` (HTTPS, operator login with TOTP), and the node agent on `:9091`
 
 The cluster CA is created with `kctl create cluster`. The CA private key stays in `/root/.kcore/kcore` and is not copied to `/etc/kcore/certs`. Copy `/root/.kcore` to the operator machine, then remove the CA key from the node if this host should not keep it.
 
