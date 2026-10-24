@@ -762,8 +762,16 @@ mod tests {
         );
     }
 
+    /// These tests bind the real migrate range. Cargo runs them in parallel,
+    /// and a sibling can take 18000 in the gap between release and re-reserve.
+    async fn migrate_port_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
     #[tokio::test]
     async fn reserve_port_returns_port_in_reserved_range() {
+        let _lock = migrate_port_lock().await;
         let state = LiveMigrateState::new();
         let port = state.reserve_port().await.expect("reserve");
         assert!(port >= MIGRATE_PORT_BASE);
@@ -772,6 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_port_does_not_hand_out_the_same_port_twice() {
+        let _lock = migrate_port_lock().await;
         let state = LiveMigrateState::new();
         let first = state.reserve_port().await.expect("first");
         let second = state.reserve_port().await.expect("second");
@@ -780,6 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserved_port_stays_bound_until_the_listener_is_released() {
+        let _lock = migrate_port_lock().await;
         let state = LiveMigrateState::new();
         let port = state.reserve_port().await.expect("reserve");
         assert!(
@@ -793,6 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_explicit_port_rejects_an_already_reserved_port() {
+        let _lock = migrate_port_lock().await;
         let state = LiveMigrateState::new();
         let port = state.reserve_port().await.expect("reserve");
         let err = state
@@ -804,6 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn released_port_can_be_reserved_again() {
+        let _lock = migrate_port_lock().await;
         let state = LiveMigrateState::new();
         let port = state.reserve_port().await.expect("reserve");
         state.release_port(port).await;
@@ -1076,6 +1088,7 @@ mod tests {
 
     #[tokio::test]
     async fn observe_receive_reports_the_in_memory_session_and_its_port() {
+        let _lock = migrate_port_lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let state = LiveMigrateState::new();
         let port = state.reserve_port().await.expect("reserve");

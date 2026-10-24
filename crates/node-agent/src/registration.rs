@@ -268,7 +268,11 @@ fn parse_first_ipv4_addr(addr_stdout: &str) -> Option<String> {
 
 pub fn start_heartbeat_loop(cfg: Config, registration_done: Arc<Notify>) {
     let shared = Arc::new(std::sync::Mutex::new(crate::ha::HaShared::default()));
-    crate::ha::spawn_ha_supervisor(Arc::clone(&shared), cfg.ha.clone());
+    crate::ha::spawn_ha_supervisor(
+        Arc::clone(&shared),
+        cfg.ha.clone(),
+        cfg.vm_socket_dir.clone(),
+    );
     tokio::spawn(async move {
         registration_done.notified().await;
         loop {

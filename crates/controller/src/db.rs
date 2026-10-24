@@ -6821,6 +6821,25 @@ impl Database {
         rows.collect()
     }
 
+    pub fn set_vm_runtime_by_id(&self, vm_id: &str, state: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE vms SET runtime_state = ?2 WHERE id = ?1",
+            params![vm_id, state],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn set_guest_heartbeat_by_id(&self, vm_id: &str, unix: i64) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO vm_ha (vm_id, last_guest_heartbeat) VALUES (?1, ?2)
+             ON CONFLICT(vm_id) DO UPDATE SET last_guest_heartbeat = excluded.last_guest_heartbeat",
+            params![vm_id, unix],
+        )?;
+        Ok(())
+    }
+
     pub fn set_vm_replica_progress(
         &self,
         vm_id: &str,
