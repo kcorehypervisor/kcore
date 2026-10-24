@@ -250,6 +250,17 @@ pub fn blocklist_contains_host(listing: &str, hosts: &[String]) -> bool {
     })
 }
 
+/// A guest tools file is the heartbeat when the guest has written one.
+/// Until then, the last time the VMM answered `vm.info` is the heartbeat,
+/// so a wedged hypervisor is restarted and a healthy guest without tools is not.
+pub fn effective_monitor_heartbeat(guest_unix: i64, vmm_unix: i64) -> i64 {
+    if guest_unix > 0 {
+        guest_unix
+    } else {
+        vmm_unix
+    }
+}
+
 pub fn monitor_actions(
     monitors: &[(String, i64)],
     heartbeats: &[(String, i64)],
@@ -560,9 +571,54 @@ pub struct HaShared {
     pub last_restart: Vec<(String, i64)>,
 }
 
+async fn monitor_heartbeats(
+    vmm: &crate::vmm::Client,
+    monitors: &[(String, i64)],
+    guest_dir: &str,
+    vmm_seen: &mut Vec<(String, i64)>,
+) -> Vec<(String, i64)> {
+    if monitors.is_empty() {
+        return Vec::new();
+    }
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
+        .unwrap_or(0);
+    let mut heartbeats = Vec::new();
+    for (name, _) in monitors {
+        // A stopped unit is an operator power-off. Monitoring must not turn
+        // that guest back on. A wedged running VMM stays active and then
+        // stops answering, which is the case that restarts.
+        if unit_is_inactive(&vm_unit(name)) {
+            continue;
+        }
+        let guest = read_guest_heartbeat(Path::new(guest_dir), name);
+        let mut vmm_unix = vmm_seen
+            .iter()
+            .find(|(vm, _)| vm == name)
+            .map(|(_, ts)| *ts)
+            .unwrap_or(0);
+        if let Some(info) = vmm.get_vm_info(name).await {
+            if info.state.eq_ignore_ascii_case("running")
+                || info.state.eq_ignore_ascii_case("paused")
+            {
+                vmm_unix = now_unix;
+                if let Some(slot) = vmm_seen.iter_mut().find(|(vm, _)| vm == name) {
+                    slot.1 = now_unix;
+                } else {
+                    vmm_seen.push((name.clone(), now_unix));
+                }
+            }
+        }
+        heartbeats.push((name.clone(), effective_monitor_heartbeat(guest, vmm_unix)));
+    }
+    heartbeats
+}
+
 pub fn spawn_ha_supervisor(
     shared: std::sync::Arc<std::sync::Mutex<HaShared>>,
     ha: crate::config::NodeHaConfig,
+    socket_dir: String,
 ) {
     tokio::spawn(async move {
         let started = Instant::now();
@@ -571,6 +627,8 @@ pub fn spawn_ha_supervisor(
         let mut last_fence: Vec<String> = Vec::new();
         let mut last_placement = String::new();
         let mut storage_streak = 0u32;
+        let mut vmm_seen: Vec<(String, i64)> = Vec::new();
+        let vmm = crate::vmm::Client::new(&socket_dir);
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let (assigned, fence_vms, confirmed, monitors, last_ok, mut last_restart) = {
@@ -607,15 +665,8 @@ pub fn spawn_ha_supervisor(
                 storage_streak = 0;
                 StorageView::ReachableNotFenced
             };
-            let heartbeats: Vec<(String, i64)> = local
-                .iter()
-                .map(|vm| {
-                    (
-                        vm.name.clone(),
-                        read_guest_heartbeat(Path::new(&ha.guest_heartbeat_dir), &vm.name),
-                    )
-                })
-                .collect();
+            let heartbeats =
+                monitor_heartbeats(&vmm, &monitors, &ha.guest_heartbeat_dir, &mut vmm_seen).await;
             let now_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
@@ -1075,6 +1126,26 @@ mod tests {
         )
         .is_empty());
         assert!(monitor_actions(&[("web".into(), 120)], &[], 1_000, &[]).is_empty());
+    }
+
+    #[test]
+    fn vmm_heartbeat_keeps_a_guest_without_tools_and_a_stale_file_still_restarts() {
+        let live = effective_monitor_heartbeat(0, 900);
+        assert!(
+            monitor_actions(&[("web".into(), 120)], &[("web".into(), live)], 1_000, &[]).is_empty()
+        );
+        let wedged = effective_monitor_heartbeat(0, 800);
+        assert_eq!(
+            monitor_actions(
+                &[("web".into(), 120)],
+                &[("web".into(), wedged)],
+                1_000,
+                &[]
+            ),
+            vec![HostAction::Restart("web".into())]
+        );
+        // The guest file wins once it exists, even if the VMM just answered.
+        assert_eq!(effective_monitor_heartbeat(100, 990), 100);
     }
 
     #[test]

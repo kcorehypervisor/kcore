@@ -92,6 +92,88 @@ pub fn emit_ha_lease(
     }
 }
 
+/// Copy one VM's restart priority, monitoring, and replica progress to the
+/// other controller. Failover on the standby reads `vm_ha`; without this
+/// event it treats every guest as medium priority and has no ZFS replica.
+pub fn emit_vm_ha(db: &Database, controller_id: &str, dc_id: &str, row: &crate::db::VmHaRow) {
+    let logical_ts_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    // Separate from `vm/{id}`. The materializer keeps one head per key, so a
+    // policy event on the VM key would replace the spec a new peer still needs.
+    let resource_key = format!("vm-ha/{}", row.vm_id);
+    let envelope = serde_json::json!({
+        "schemaVersion": 1,
+        "opId": uuid::Uuid::new_v4().to_string(),
+        "logicalTsUnixMs": logical_ts_unix_ms,
+        "controllerId": controller_id,
+        "dcId": dc_id,
+        "eventType": "vm.ha",
+        "resourceKey": resource_key,
+        "body": vm_ha_body(row),
+    });
+    let Ok(payload) = serde_json::to_vec(&envelope) else {
+        return;
+    };
+    if let Err(e) = db.append_replication_outbox("vm.ha", &resource_key, &payload) {
+        warn!(vm_id = %row.vm_id, error = %e, "failed to emit vm.ha event");
+    }
+}
+
+/// Copy observed runtime to the standby. Failover restarts a guest only when
+/// that copy says `running` or `paused`. A stopped record is left stopped.
+pub fn emit_vm_state(
+    db: &Database,
+    controller_id: &str,
+    dc_id: &str,
+    vm_id: &str,
+    runtime_state: &str,
+    guest_heartbeat: i64,
+) {
+    if vm_id.is_empty() || runtime_state.is_empty() {
+        return;
+    }
+    let logical_ts_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let resource_key = format!("vm-state/{vm_id}");
+    let envelope = serde_json::json!({
+        "schemaVersion": 1,
+        "opId": uuid::Uuid::new_v4().to_string(),
+        "logicalTsUnixMs": logical_ts_unix_ms,
+        "controllerId": controller_id,
+        "dcId": dc_id,
+        "eventType": "vm.state",
+        "resourceKey": resource_key,
+        "body": {
+            "vmId": vm_id,
+            "runtimeState": runtime_state,
+            "guestHeartbeat": guest_heartbeat,
+        },
+    });
+    let Ok(payload) = serde_json::to_vec(&envelope) else {
+        return;
+    };
+    if let Err(e) = db.append_replication_outbox("vm.state", &resource_key, &payload) {
+        warn!(vm_id, error = %e, "failed to emit vm.state event");
+    }
+}
+
+pub(crate) fn vm_ha_body(row: &crate::db::VmHaRow) -> Value {
+    serde_json::json!({
+        "vmId": row.vm_id,
+        "restartPriority": row.restart_priority,
+        "vmMonitoring": row.vm_monitoring,
+        "vmMonitoringSecs": row.vm_monitoring_secs,
+        "replicaNode": row.replica_node,
+        "replicaIntervalSecs": row.replica_interval_secs,
+        "lastReplicaAt": row.last_replica_at,
+        "lastReplicaSnapshot": row.last_replica_snapshot,
+    })
+}
+
 fn apply_ha_lease(db: &Database, body: &Value) -> Result<(), String> {
     let name = body
         .get("name")
@@ -736,6 +818,8 @@ fn apply_replication_event(
         | "vm.delete"
         | "vm.desired_state.set"
         | "vm.migrate"
+        | "vm.ha"
+        | "vm.state"
         | "network.create"
         | "network.delete"
         | "postgresql.create"
@@ -1113,7 +1197,12 @@ fn process_materialization_once(db: &Database) -> Result<bool, String> {
         {
             continue;
         }
-        apply_head_to_domain(db, head)?;
+        if let Err(err) = apply_head_to_domain(db, head) {
+            if err.contains("not materialized yet") {
+                continue;
+            }
+            return Err(err);
+        }
         db.upsert_materialized_replication_head(
             &head.resource_key,
             &head.last_op_id,
@@ -1547,7 +1636,16 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 db.set_vm_anti_affinity(vm_id, group)
                     .map_err(|e| format!("setting anti-affinity for vm {vm_id}: {e}"))?;
             }
+            apply_vm_ha_from_body(db, vm_id, &body)?;
             Ok(())
+        }
+        "vm.ha" => {
+            let vm_id = vm_id_from_body_or_resource(&body, &head.resource_key)?;
+            apply_vm_ha_from_body(db, vm_id, &body)
+        }
+        "vm.state" => {
+            let vm_id = vm_id_from_body_or_resource(&body, &head.resource_key)?;
+            apply_vm_state_from_body(db, vm_id, &body)
         }
         "vm.desired_state.set" => {
             let vm_id = vm_id_from_body_or_resource(&body, &head.resource_key)?;
@@ -2160,6 +2258,125 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
     }
 }
 
+fn apply_vm_ha_from_body(db: &Database, vm_id: &str, body: &Value) -> Result<(), String> {
+    let has_policy = body.get("restartPriority").is_some()
+        || body.get("vmMonitoring").is_some()
+        || body.get("replicaNode").is_some()
+        || body.get("lastReplicaAt").is_some();
+    if !has_policy {
+        return Ok(());
+    }
+    let existing = db
+        .get_vm_ha(vm_id)
+        .map_err(|e| format!("read vm_ha {vm_id}: {e}"))?;
+    let text = |key: &str, fallback: &str| -> String {
+        body.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let number = |key: &str, fallback: i64| -> i64 {
+        body.get(key).and_then(Value::as_i64).unwrap_or(fallback)
+    };
+    let row = crate::db::VmHaRow {
+        vm_id: vm_id.to_string(),
+        restart_priority: text(
+            "restartPriority",
+            existing
+                .as_ref()
+                .map(|row| row.restart_priority.as_str())
+                .unwrap_or("medium"),
+        ),
+        vm_monitoring: text(
+            "vmMonitoring",
+            existing
+                .as_ref()
+                .map(|row| row.vm_monitoring.as_str())
+                .unwrap_or("off"),
+        ),
+        vm_monitoring_secs: number(
+            "vmMonitoringSecs",
+            existing
+                .as_ref()
+                .map(|row| row.vm_monitoring_secs)
+                .unwrap_or(0),
+        ),
+        replica_node: body
+            .get("replicaNode")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|row| row.replica_node.clone())
+                    .unwrap_or_default()
+            }),
+        replica_interval_secs: number(
+            "replicaIntervalSecs",
+            existing
+                .as_ref()
+                .map(|row| row.replica_interval_secs)
+                .unwrap_or(0),
+        ),
+        last_replica_at: number(
+            "lastReplicaAt",
+            existing
+                .as_ref()
+                .map(|row| row.last_replica_at)
+                .unwrap_or(0),
+        ),
+        last_replica_snapshot: body
+            .get("lastReplicaSnapshot")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|row| row.last_replica_snapshot.clone())
+                    .unwrap_or_default()
+            }),
+        last_guest_heartbeat: existing
+            .as_ref()
+            .map(|row| row.last_guest_heartbeat)
+            .unwrap_or(0),
+    };
+    db.upsert_vm_ha(&row)
+        .map_err(|e| format!("upsert vm_ha {vm_id}: {e}"))?;
+    // Policy upsert leaves replica progress alone so a repeated create does
+    // not wipe a snapshot the standby already stored. A vm.ha event is the
+    // one that moves that progress.
+    if body.get("lastReplicaAt").is_some() || body.get("lastReplicaSnapshot").is_some() {
+        db.set_vm_replica_progress(vm_id, row.last_replica_at, &row.last_replica_snapshot)
+            .map_err(|e| format!("set replica progress {vm_id}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn apply_vm_state_from_body(db: &Database, vm_id: &str, body: &Value) -> Result<(), String> {
+    let Some(state) = body.get("runtimeState").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if state.is_empty() {
+        return Ok(());
+    }
+    let updated = db
+        .set_vm_runtime_by_id(vm_id, state)
+        .map_err(|e| format!("set runtime {vm_id}: {e}"))?;
+    if !updated {
+        // The VM spec head may not be materialized yet. Retry without
+        // blocking every other resource: the materializer skips this error.
+        return Err(format!("vm {vm_id} not materialized yet"));
+    }
+    if let Some(heartbeat) = body.get("guestHeartbeat").and_then(Value::as_i64) {
+        if heartbeat > 0 {
+            db.set_guest_heartbeat_by_id(vm_id, heartbeat)
+                .map_err(|e| format!("set guest heartbeat {vm_id}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn pci_devices_from_replication_body(body: &Value) -> Result<String, String> {
     let Some(value) = body.get("pciDevices") else {
         return Ok(String::new());
@@ -2223,6 +2440,9 @@ fn vm_id_from_body_or_resource<'a>(
     }
     resource_key
         .strip_prefix("vm/")
+        .or_else(|| resource_key.strip_prefix("vm-ha/"))
+        .or_else(|| resource_key.strip_prefix("vm-state/"))
+        .filter(|id| !id.is_empty())
         .ok_or_else(|| format!("missing vmId for {resource_key}"))
 }
 
@@ -2755,6 +2975,95 @@ mod tests {
             .expect("node lookup")
             .is_some());
         assert!(db.get_vm("v-missing-node").expect("vm lookup").is_some());
+    }
+
+    #[test]
+    fn replicated_ha_policy_survives_on_the_standby_and_keeps_replica_progress() {
+        let db = Database::open(":memory:").expect("open db");
+        let create = ReplicationResourceHeadRow {
+            resource_key: "vm/vm-ha".to_string(),
+            last_op_id: "op-1".to_string(),
+            last_logical_ts_unix_ms: 1,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 1,
+            last_event_type: "vm.create".to_string(),
+            last_body_json: r#"{"vmId":"vm-ha","name":"db","nodeId":"node-a","cpu":2,"memoryBytes":2147483648,"storageBackend":"zfs","restartPriority":"high","vmMonitoring":"restart","vmMonitoringSecs":90,"replicaNode":"node-b","replicaIntervalSecs":300,"lastReplicaAt":0,"lastReplicaSnapshot":""}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &create).expect("create");
+        let row = db.get_vm_ha("vm-ha").expect("read").expect("row");
+        assert_eq!(row.restart_priority, "high");
+        assert_eq!(row.vm_monitoring, "restart");
+        assert_eq!(row.vm_monitoring_secs, 90);
+        assert_eq!(row.replica_node, "node-b");
+        assert_eq!(row.last_replica_at, 0);
+
+        let progress = ReplicationResourceHeadRow {
+            resource_key: "vm-ha/vm-ha".to_string(),
+            last_op_id: "op-2".to_string(),
+            last_logical_ts_unix_ms: 2,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 2,
+            last_event_type: "vm.ha".to_string(),
+            last_body_json: r#"{"vmId":"vm-ha","restartPriority":"high","vmMonitoring":"restart","vmMonitoringSecs":90,"replicaNode":"node-b","replicaIntervalSecs":300,"lastReplicaAt":1700000000,"lastReplicaSnapshot":"kcore-auto"}"#.to_string(),
+        };
+        apply_head_to_domain(&db, &progress).expect("progress");
+        let row = db.get_vm_ha("vm-ha").expect("read").expect("row");
+        assert_eq!(row.last_replica_at, 1_700_000_000);
+        assert_eq!(row.last_replica_snapshot, "kcore-auto");
+        assert_eq!(row.restart_priority, "high");
+        let vm = db.get_vm("vm-ha").expect("vm").expect("still present");
+        assert_eq!(vm.name, "db");
+
+        let observed = ReplicationResourceHeadRow {
+            resource_key: "vm-state/vm-ha".to_string(),
+            last_op_id: "op-3".to_string(),
+            last_logical_ts_unix_ms: 3,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 3,
+            last_event_type: "vm.state".to_string(),
+            last_body_json:
+                r#"{"vmId":"vm-ha","runtimeState":"running","guestHeartbeat":1700000100}"#
+                    .to_string(),
+        };
+        apply_head_to_domain(&db, &observed).expect("state");
+        let vm = db.get_vm("vm-ha").expect("vm").expect("still present");
+        assert_eq!(vm.name, "db");
+        assert_eq!(vm.runtime_state, "running");
+        assert!(crate::ha::should_restart(&vm.runtime_state, vm.auto_start));
+        let row = db.get_vm_ha("vm-ha").expect("read").expect("row");
+        assert_eq!(row.restart_priority, "high");
+        assert_eq!(row.last_replica_snapshot, "kcore-auto");
+        assert_eq!(row.last_guest_heartbeat, 1_700_000_100);
+
+        let early = ReplicationResourceHeadRow {
+            resource_key: "vm-state/missing".to_string(),
+            last_op_id: "op-early".to_string(),
+            last_logical_ts_unix_ms: 4,
+            last_policy_priority: 0,
+            last_intent_epoch: 0,
+            last_validity: "valid".to_string(),
+            last_safety_class: "safe".to_string(),
+            last_controller_id: "ctrl-a".to_string(),
+            last_event_id: 4,
+            last_event_type: "vm.state".to_string(),
+            last_body_json: r#"{"vmId":"missing","runtimeState":"running"}"#.to_string(),
+        };
+        db.upsert_replication_resource_head(&early)
+            .expect("early head");
+        assert!(!process_materialization_once(&db).expect("skip missing vm"));
+        assert!(db.get_vm("missing").expect("lookup").is_none());
     }
 
     /// Regression: materialization applied `vm.create` as delete-then-insert,

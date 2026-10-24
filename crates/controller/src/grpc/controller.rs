@@ -4531,6 +4531,8 @@ impl ControllerService {
                 error = %e,
                 "applied desired state but could not record runtime state"
             );
+        } else {
+            self.replicate_vm_observation(&stored_vm.id, observed);
         }
         let desired_state = if auto_start {
             node_proto::VmDesiredState::Running as i32
@@ -6300,8 +6302,86 @@ impl ControllerService {
         }
     }
 
+    /// One pass after startup, and only from the controller that already holds
+    /// the failover lease. A standby that publishes its stale runtime would
+    /// tell the primary that a running guest is stopped.
+    fn publish_ha_snapshot_once(&self) {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // 0 unseen, 1 started as the lease holder, 2 replica, 3 published.
+        static ROLE: AtomicU8 = AtomicU8::new(0);
+        let role = ROLE.load(Ordering::Relaxed);
+        if role == 2 || role == 3 {
+            return;
+        }
+        let Some(rep) = &self.replication else {
+            ROLE.store(3, Ordering::Relaxed);
+            return;
+        };
+        if role == 0 {
+            ROLE.store(
+                if self.failover_may_act() { 1 } else { 2 },
+                Ordering::Relaxed,
+            );
+        }
+        if ROLE.load(Ordering::Relaxed) != 1 || !self.failover_may_act() {
+            return;
+        }
+        let Ok(policies) = self.db.list_vm_ha() else {
+            return;
+        };
+        let Ok(vms) = self.db.list_vms() else {
+            return;
+        };
+        for row in &policies {
+            crate::replication::emit_vm_ha(&self.db, &rep.controller_id, &rep.dc_id, row);
+        }
+        for vm in &vms {
+            let heartbeat = policies
+                .iter()
+                .find(|row| row.vm_id == vm.id)
+                .map(|row| row.last_guest_heartbeat)
+                .unwrap_or(0);
+            crate::replication::emit_vm_state(
+                &self.db,
+                &rep.controller_id,
+                &rep.dc_id,
+                &vm.id,
+                &vm.runtime_state,
+                heartbeat,
+            );
+        }
+        ROLE.store(3, Ordering::Relaxed);
+        info!(
+            policies = policies.len(),
+            vms = vms.len(),
+            "published HA policy and runtime to the standby"
+        );
+    }
+
+    fn replicate_vm_observation(&self, vm_id: &str, runtime_state: &str) {
+        let Some(rep) = &self.replication else {
+            return;
+        };
+        let heartbeat = self
+            .db
+            .get_vm_ha(vm_id)
+            .ok()
+            .flatten()
+            .map(|row| row.last_guest_heartbeat)
+            .unwrap_or(0);
+        crate::replication::emit_vm_state(
+            &self.db,
+            &rep.controller_id,
+            &rep.dc_id,
+            vm_id,
+            runtime_state,
+            heartbeat,
+        );
+    }
+
     pub async fn ha_pass(&self, announced: &mut std::collections::HashSet<String>) {
         self.maintain_failover_lease();
+        self.publish_ha_snapshot_once();
         if self.failover.enabled && self.failover_may_act() {
             self.failover_not_ready_nodes(announced).await;
             self.failover_storage_isolated_nodes().await;
@@ -6385,6 +6465,16 @@ impl ControllerService {
             {
                 Ok(snapshot) => {
                     let _ = self.db.set_vm_replica_progress(&vm.id, now, &snapshot);
+                    if let (Some(rep), Ok(Some(row))) =
+                        (&self.replication, self.db.get_vm_ha(&vm.id))
+                    {
+                        crate::replication::emit_vm_ha(
+                            &self.db,
+                            &rep.controller_id,
+                            &rep.dc_id,
+                            &row,
+                        );
+                    }
                     let _ = self.db.insert_ha_event(
                         &source.id,
                         &vm.id,
@@ -7779,6 +7869,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .apply_vm_runtime_state(&req.node_id, &vm.name, state_str)
             {
                 Ok(crate::db::VmRuntimeApply::Changed(change)) => {
+                    self.replicate_vm_observation(&change.vm_id, &change.current);
                     self.webhooks.emit(
                         crate::webhooks::EVENT_VM_STATE_CHANGED,
                         format!("vm/{}", change.name),
@@ -8267,7 +8358,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
             return Err(Status::internal(format!("storing vm: {e}")));
         }
-        let _ = self.db.upsert_vm_ha(&crate::db::VmHaRow {
+        let ha_row = crate::db::VmHaRow {
             vm_id: vm.id.clone(),
             restart_priority: ha_policy.restart_priority,
             vm_monitoring: ha_policy.vm_monitoring,
@@ -8277,7 +8368,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             last_replica_at: 0,
             last_replica_snapshot: String::new(),
             last_guest_heartbeat: 0,
-        });
+        };
+        let _ = self.db.upsert_vm_ha(&ha_row);
         if !assigned_gpus.is_empty() {
             if let Err(e) = self.db.set_vm_gpu(&vm.id, &assigned_gpus) {
                 self.rollback_created_vm(&node, &vm).await;
@@ -8443,6 +8535,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "extraNics": extra_nic_body,
                 "ipv6Addresses": ipv6_body,
                 "antiAffinity": anti_affinity,
+                "restartPriority": ha_row.restart_priority,
+                "vmMonitoring": ha_row.vm_monitoring,
+                "vmMonitoringSecs": ha_row.vm_monitoring_secs,
+                "replicaNode": ha_row.replica_node,
+                "replicaIntervalSecs": ha_row.replica_interval_secs,
+                "lastReplicaAt": ha_row.last_replica_at,
+                "lastReplicaSnapshot": ha_row.last_replica_snapshot,
             }),
         );
 
@@ -18386,7 +18485,7 @@ mod tests {
         NodeRow {
             id: "node-1".to_string(),
             hostname: "node-1".to_string(),
-            address: "127.0.0.1:9091".to_string(),
+            address: "127.0.0.1:59991".to_string(),
             cpu_cores: 4,
             memory_bytes: 8 * 1024 * 1024 * 1024,
             status: "ready".to_string(),
@@ -18932,7 +19031,7 @@ mod tests {
 
         let mut candidate = test_node();
         candidate.id = "node-zfs".to_string();
-        candidate.address = "127.0.0.2:9091".to_string();
+        candidate.address = "127.0.0.2:59991".to_string();
         candidate.storage_backend = "zfs".to_string();
         db.upsert_node(&candidate).expect("insert candidate");
 
@@ -19059,7 +19158,7 @@ mod tests {
 
         let mut candidate = test_node();
         candidate.id = "node-candidate".to_string();
-        candidate.address = "127.0.0.2:9091".to_string();
+        candidate.address = "127.0.0.2:59991".to_string();
         db.upsert_node(&candidate).expect("insert candidate node");
 
         let hook: PushHook = Arc::new(|_n: &NodeRow| Ok(()));
@@ -19185,7 +19284,7 @@ mod tests {
         let mut node_b = test_node();
         node_b.id = "node-b".to_string();
         node_b.hostname = "node-b".to_string();
-        node_b.address = "127.0.0.2:9091".to_string();
+        node_b.address = "127.0.0.2:59991".to_string();
         db.upsert_node(&node_b).expect("insert node-b");
 
         let mut vm1 = test_vm("node-a");
@@ -19265,7 +19364,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         db.upsert_node(&node_b).unwrap();
         let mut vm = test_vm("node-a");
         vm.storage_backend = "filesystem".into();
@@ -19309,7 +19408,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         node_b.storage_backend = "lvm".into();
         db.upsert_node(&node_b).unwrap();
         let mut vm = test_vm("node-a");
@@ -19354,7 +19453,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         db.upsert_node(&node_b).unwrap();
         let mut vm = test_vm("node-a");
         vm.pci_devices = "0000:03:00.0,0000:03:00.1".into();
@@ -19418,7 +19517,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         db.upsert_node(&node_b).unwrap();
         db.replace_node_gpus("node-a", &[gpu_row("node-a", "radeon0", "0000:03:00.0")])
             .unwrap();
@@ -19499,7 +19598,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         db.upsert_node(&node_b).unwrap();
         db.replace_node_gpus(
             "node-a",
@@ -19578,7 +19677,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         db.upsert_node(&node_b).unwrap();
         db.replace_node_gpus(
             "node-a",
@@ -19649,7 +19748,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         db.upsert_node(&node_b).unwrap();
 
         let mut movable = test_vm("node-a");
@@ -19810,7 +19909,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         db.upsert_node(&node_b).unwrap();
 
         let mut spec = make_ceph_spec(&["node-a", "node-b"]);
@@ -20555,7 +20654,7 @@ mod tests {
         db.upsert_node(&node_a).unwrap();
         let mut node_b = test_node();
         node_b.id = "node-b".into();
-        node_b.address = "127.0.0.2:9091".into();
+        node_b.address = "127.0.0.2:59991".into();
         db.upsert_node(&node_b).unwrap();
 
         let mut spec = make_ceph_spec(&["node-a", "node-b"]);
@@ -21201,7 +21300,7 @@ mod tests {
                 Request::new(controller_proto::RegisterNodeRequest {
                     node_id: "node-1".to_string(),
                     hostname: "node-1".to_string(),
-                    address: "127.0.0.1:9091".to_string(),
+                    address: "127.0.0.1:59991".to_string(),
                     capacity: Some(controller_proto::NodeCapacity {
                         cpu_cores: 4,
                         memory_bytes: 8_000_000_000,
@@ -21253,7 +21352,7 @@ mod tests {
             let register = || controller_proto::RegisterNodeRequest {
                 node_id: "node-1".to_string(),
                 hostname: "node-1".to_string(),
-                address: "127.0.0.1:9091".to_string(),
+                address: "127.0.0.1:59991".to_string(),
                 capacity: Some(controller_proto::NodeCapacity {
                     cpu_cores: 4,
                     memory_bytes: 8_000_000_000,
@@ -22077,7 +22176,7 @@ mod tests {
     }
 
     /// Regression: an idempotent `CreateVm` whose `target_node` was the
-    /// node *address* (e.g. `127.0.0.1:9091`) used to trip the immutable
+    /// node *address* (e.g. `127.0.0.1:59991`) used to trip the immutable
     /// "target_node" diff because the stored row holds the canonical
     /// node id. Re-applying the same manifest must return UNCHANGED.
     #[tokio::test]
