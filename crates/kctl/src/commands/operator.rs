@@ -156,3 +156,92 @@ pub async fn revoke_role(info: &ConnectionInfo, name: &str, role: OperatorRoleAr
     }
     Ok(())
 }
+
+struct EchoOff {
+    fd: i32,
+    original: libc::termios,
+}
+
+impl EchoOff {
+    fn enter() -> Option<Self> {
+        let fd = libc::STDIN_FILENO;
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return None;
+        }
+        let mut quiet = original;
+        quiet.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+            return None;
+        }
+        Some(Self { fd, original })
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+fn read_line_quiet(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let guard = EchoOff::enter();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if guard.is_some() {
+        eprintln!();
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn read_new_password(name: &str) -> Result<String> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    let first = read_line_quiet(&format!("New dashboard password for '{name}': "))?;
+    let second = read_line_quiet("Repeat it: ")?;
+    if first != second {
+        anyhow::bail!("the passwords do not match");
+    }
+    Ok(first)
+}
+
+pub async fn set_password(info: &ConnectionInfo, name: &str) -> Result<()> {
+    let password = read_new_password(name)?;
+    let mut client = client::auth_client(info).await?;
+    let resp = client
+        .set_operator_password(proto::SetOperatorPasswordRequest {
+            name: name.to_string(),
+            password,
+        })
+        .await?
+        .into_inner();
+    println!(
+        "password set for '{name}' ({} web session(s) ended)",
+        resp.sessions_revoked
+    );
+    Ok(())
+}
+
+pub async fn reset_second_factor(info: &ConnectionInfo, name: &str) -> Result<()> {
+    let mut client = client::auth_client(info).await?;
+    let resp = client
+        .reset_operator_second_factor(proto::ResetOperatorSecondFactorRequest {
+            name: name.to_string(),
+        })
+        .await?
+        .into_inner();
+    println!(
+        "TOTP cleared for '{name}' ({} web session(s) ended); the next dashboard login enrolls again",
+        resp.sessions_revoked
+    );
+    Ok(())
+}

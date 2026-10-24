@@ -113,6 +113,12 @@ pub fn take(tokens: f64, elapsed_secs: f64, rps: f64, burst: f64) -> (f64, bool)
 }
 
 fn peer_key<T>(request: &Request<T>) -> String {
+    if let Some(web) = crate::auth::web_identity(request) {
+        return format!("web:{}", web.operator);
+    }
+    if let Some(peer) = request.extensions().get::<crate::auth::WebPeer>() {
+        return format!("addr:{}", peer.remote_addr.ip());
+    }
     if let Some((_, cn)) = crate::pki::revocation::peer_cert_identity(request) {
         let cn = cn.trim();
         if !cn.is_empty() {

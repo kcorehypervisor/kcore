@@ -101,9 +101,94 @@ pub fn validate_operator_name(name: &str) -> Result<(), Status> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebTokenKind {
+    /// Password checked, second factor still due.
+    Pending,
+    Session,
+    Api,
+}
+
+impl WebTokenKind {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            WebTokenKind::Pending => "pending",
+            WebTokenKind::Session => "session",
+            WebTokenKind::Api => "api",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(WebTokenKind::Pending),
+            "session" => Some(WebTokenKind::Session),
+            "api" => Some(WebTokenKind::Api),
+            _ => None,
+        }
+    }
+}
+
+/// Request extension set by the web listener after a bearer token checks out.
+/// The mTLS listener never sets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebIdentity {
+    pub operator: String,
+    pub token_id: String,
+    pub kind: WebTokenKind,
+    /// API tokens may be capped below the operator's own role.
+    pub max_role: Option<OperatorRole>,
+    pub expires_at: i64,
+}
+
+pub fn web_identity<T>(request: &Request<T>) -> Option<&WebIdentity> {
+    request.extensions().get::<WebIdentity>()
+}
+
+/// Peer address recorded by the web listener, which has no tonic connect info.
+#[derive(Debug, Clone, Copy)]
+pub struct WebPeer {
+    pub remote_addr: std::net::SocketAddr,
+}
+
+/// Remote address of the caller on either listener.
+pub fn remote_addr<T>(request: &Request<T>) -> Option<std::net::SocketAddr> {
+    if let Some(peer) = request.extensions().get::<WebPeer>() {
+        return Some(peer.remote_addr);
+    }
+    if let Some(tls) = request.extensions().get::<TlsConnectInfo<TcpConnectInfo>>() {
+        return tls.get_ref().remote_addr();
+    }
+    request
+        .extensions()
+        .get::<TcpConnectInfo>()
+        .and_then(TcpConnectInfo::remote_addr)
+}
+
+/// Caller identity in `CN` form. A web session or API token is the named
+/// operator `kctl:<name>`, so every role check treats it like that operator's
+/// certificate. A pending token maps to a name no check accepts.
+pub fn peer_cn<T>(request: &Request<T>) -> Option<String> {
+    if let Some(web) = web_identity(request) {
+        return Some(match web.kind {
+            WebTokenKind::Pending => format!("web-pending:{}", web.operator),
+            WebTokenKind::Session | WebTokenKind::Api => {
+                format!("{CN_KCTL_PREFIX}{}", web.operator)
+            }
+        });
+    }
+    cert_cn(request)
+}
+
+fn apply_token_cap<T>(request: &Request<T>, role: OperatorRole) -> OperatorRole {
+    match web_identity(request).and_then(|web| web.max_role) {
+        Some(cap) => role.min(cap),
+        None => role,
+    }
+}
+
 /// Extract the Common Name from the peer's TLS client certificate.
 /// Returns `None` when TLS is not in use or no client cert was presented.
-pub fn peer_cn<T>(request: &Request<T>) -> Option<String> {
+fn cert_cn<T>(request: &Request<T>) -> Option<String> {
     let tls_info = request
         .extensions()
         .get::<TlsConnectInfo<TcpConnectInfo>>()?;
@@ -207,7 +292,8 @@ pub fn controller_operator_role<T>(
         }
     };
     let peer = classify_management_peer(&cn)?;
-    effective_operator_role(db, &peer, bootstrap_kctl)
+    let role = effective_operator_role(db, &peer, bootstrap_kctl)?;
+    Ok(apply_token_cap(request, role))
 }
 
 /// Authorize `ControllerAdmin` RPCs (historically CN=kctl only — never peer controllers).
@@ -251,7 +337,7 @@ pub fn require_admin_operator<T>(
         )));
     };
 
-    let effective = effective_operator_role(db, &peer, bootstrap_kctl)?;
+    let effective = apply_token_cap(request, effective_operator_role(db, &peer, bootstrap_kctl)?);
 
     if effective.satisfies(required) {
         Ok(())

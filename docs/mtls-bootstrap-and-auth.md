@@ -466,6 +466,50 @@ kctl rotate certs --controller <new-host:port>
 
 This re-signs the controller certificate with a host-specific CN and new SAN. The new cert must be deployed to the controller node and the service restarted.
 
+## 4b) Web listener and dashboard sign-in
+
+Browsers cannot present a client certificate in a usable way, so the controller has a second listener for them. It serves the same `Controller` and `ControllerAdmin` services plus `Auth`, over gRPC-web (HTTP/1.1) and gRPC (HTTP/2). It uses the controller's server certificate and asks for no client certificate. Every RPC except `Auth/Login` needs `authorization: Bearer <token>`. Paths that are not RPCs serve the static dashboard from `web.uiDir`, with a strict Content-Security-Policy and `index.html` as the fallback for client-side routes.
+
+```yaml
+web:
+  enabled: true
+  listenAddr: 0.0.0.0:9443       # must differ from listenAddr
+  uiDir: /run/current-system/sw/share/kcore-dashboard   # optional
+  sessionTtlSecs: 43200          # absolute session lifetime
+  sessionIdleSecs: 3600          # a session ends after this long without a request
+  totpIssuer: kcore              # label in the authenticator app
+  maxFailedLogins: 5             # wrong passwords or codes in a row
+  lockoutSecs: 900
+```
+
+Without a `tls` block the web listener runs in clear text. This is only possible with `--allow-insecure`, and the controller logs a warning.
+
+**Identity.** A session or API token for operator `alice` is checked exactly like the client certificate `CN=kctl:alice`. It has the same roles, the same `require_*_operator` checks, and the same compliance table. Node and peer-controller RPCs stay closed to it. The audit log records `web:alice` for a session and `api-token:alice/<id>` for an API token.
+
+**Sign-in.**
+
+1. `Login(username, password)` returns a pending token that lasts five minutes. The pending token can reach only `VerifySecondFactor`, `BeginTotpEnrollment`, `ConfirmTotpEnrollment`, and `Logout`.
+2. If TOTP is set up, `VerifySecondFactor` takes a six-digit code (RFC 6238, SHA-1, 30 s, one step of clock skew) or one recovery code. A code's time step can be used only once.
+3. If TOTP is not set up yet, the operator must enroll first: `BeginTotpEnrollment` returns the secret and an `otpauth://` URI, and `ConfirmTotpEnrollment` with the first code turns TOTP on, returns ten recovery codes once, and issues the session. A password alone cannot replace a TOTP setup that already works.
+
+There is no session without a second factor.
+
+**Bootstrap.** An operator needs a password before the first web login. Use a cluster-admin certificate:
+
+```bash
+kctl operator create alice
+kctl operator grant-role alice --role vm-admin
+kctl operator set-password alice      # prompts twice; reads one line from stdin when piped
+```
+
+`kctl operator reset-2fa alice` clears TOTP and the recovery codes when a phone is lost. Both commands end the operator's web sessions.
+
+**Tokens.** Tokens are 256-bit random values. The controller stores only their SHA-256. The prefix shows the kind: `kcp_` pending, `kcs_` session, `kct_` API token. `CreateApiToken` needs a signed-in session. The token is shown once, lasts 1 to 365 days (90 by default), and can be capped below the operator's role with `max_role`. An API token cannot create tokens, change the password, or change TOTP. `ChangePassword` ends the operator's other sessions.
+
+**Storage and replication.** Passwords are PBKDF2-HMAC-SHA256 with 600,000 iterations and a 16-byte salt, computed by aws-lc-rs. The table `operator_credentials` holds the password hash, the TOTP seed (stored in the clear, because it is needed to check a code), and SHA-256 hashes of the unused recovery codes. It replicates to peer controllers as `operator_credentials.set`, last writer wins. When a peer applies an admin password set or a 2FA reset, it also ends that peer's sessions for the operator. API tokens replicate as `auth_token.create` and `auth_token.revoke`. Sessions, pending tokens, the lockout counter, and the used TOTP step stay on the controller that issued or recorded them. A web session therefore works only against the controller where it signed in.
+
+**Throttling.** Each address may try `Login` 20 times a minute. After `maxFailedLogins` wrong passwords or codes in a row, the operator is locked for `lockoutSecs`, and `SetOperatorPassword` lifts the lock. An unknown user name costs the same PBKDF2 work as a known one and gets the same error.
+
 ## 5) Security posture and current limits
 
 mTLS materially reduces MITM risk and blocks unauthenticated network clients from calling gRPC endpoints when TLS is enabled on both sides.
@@ -494,6 +538,7 @@ Remaining gaps to track:
 - **no OCSP stapling** — `tonic` 0.12 exposes neither a rustls `CertifiedKey` nor a `ServerCertVerifier`, so a stapled response can be neither produced nor consumed during a handshake. The controller runs a full OCSP responder and the node-agent queries it directly instead; see §4.6.
 - revocation is enforced at the application layer (a `tonic` interceptor), not inside the TLS handshake, for the same reason: `ServerTlsConfig` takes no custom `ClientCertVerifier`. A revoked peer completes the handshake and is then rejected before any handler runs.
 - RBAC is intentionally flat (no per-network / namespace scopes yet)
+- web sign-in has a password and TOTP only. No SSO (OIDC or SAML) and no WebAuthn yet. The TOTP seed is stored in the clear in the controller database.
 
 ## 6) Verification checklist
 

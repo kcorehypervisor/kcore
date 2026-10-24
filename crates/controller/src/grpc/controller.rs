@@ -5191,9 +5191,17 @@ impl ControllerService {
         }
     }
 
-    fn audit_actor<T>(request: &Request<T>) -> String {
+    pub(crate) fn audit_actor<T>(request: &Request<T>) -> String {
         if let Some(actor) = AUDIT_ACTOR_OVERRIDE.with(|c| c.borrow().clone()) {
             return actor;
+        }
+        if let Some(web) = auth::web_identity(request) {
+            return match web.kind {
+                auth::WebTokenKind::Api => format!("api-token:{}/{}", web.operator, web.token_id),
+                auth::WebTokenKind::Session | auth::WebTokenKind::Pending => {
+                    format!("web:{}", web.operator)
+                }
+            };
         }
         auth::peer_cn(request).unwrap_or_else(|| "insecure".to_string())
     }
@@ -5205,7 +5213,13 @@ impl ControllerService {
         AuditActorGuard
     }
 
-    fn record_audit(&self, actor: &str, action: &str, resource: &str, detail: impl Into<String>) {
+    pub(crate) fn record_audit(
+        &self,
+        actor: &str,
+        action: &str,
+        resource: &str,
+        detail: impl Into<String>,
+    ) {
         let detail = detail.into();
         if let Err(e) = self.db.append_audit_event(actor, action, resource, &detail) {
             error!(
@@ -5218,7 +5232,7 @@ impl ControllerService {
         }
     }
 
-    fn log_replication_event_required(
+    pub(crate) fn log_replication_event_required(
         &self,
         actor: &str,
         audit_action: Option<&str>,

@@ -47,6 +47,75 @@ pub struct Config {
     /// Prometheus file_sd targets written for VictoriaMetrics (host metrics).
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// gRPC-web listener for the dashboard and API tokens.
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// Second listener for browsers and token clients. It speaks gRPC-web and
+/// gRPC over HTTP/1.1 and HTTP/2, uses the controller's server certificate
+/// without asking for a client certificate, and requires a bearer token on
+/// every RPC except `Auth/Login`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_web_listen_addr")]
+    pub listen_addr: String,
+    /// Static dashboard files served for every path that is not an RPC.
+    #[serde(default)]
+    pub ui_dir: Option<String>,
+    #[serde(default = "default_web_session_ttl_secs")]
+    pub session_ttl_secs: i64,
+    #[serde(default = "default_web_session_idle_secs")]
+    pub session_idle_secs: i64,
+    #[serde(default = "default_web_totp_issuer")]
+    pub totp_issuer: String,
+    /// Wrong passwords or codes in a row before the operator is locked out.
+    #[serde(default = "default_web_max_failed_logins")]
+    pub max_failed_logins: i64,
+    #[serde(default = "default_web_lockout_secs")]
+    pub lockout_secs: i64,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: default_web_listen_addr(),
+            ui_dir: None,
+            session_ttl_secs: default_web_session_ttl_secs(),
+            session_idle_secs: default_web_session_idle_secs(),
+            totp_issuer: default_web_totp_issuer(),
+            max_failed_logins: default_web_max_failed_logins(),
+            lockout_secs: default_web_lockout_secs(),
+        }
+    }
+}
+
+fn default_web_listen_addr() -> String {
+    "0.0.0.0:9443".to_string()
+}
+
+fn default_web_session_ttl_secs() -> i64 {
+    12 * 3600
+}
+
+fn default_web_session_idle_secs() -> i64 {
+    3600
+}
+
+fn default_web_totp_issuer() -> String {
+    "kcore".to_string()
+}
+
+fn default_web_max_failed_logins() -> i64 {
+    5
+}
+
+fn default_web_lockout_secs() -> i64 {
+    900
 }
 
 /// Automatic placement of shared-disk VMs when a node becomes unreachable.
@@ -601,6 +670,42 @@ impl Config {
             }
         }
         self.validate_pki()?;
+        self.validate_web()?;
+        Ok(())
+    }
+
+    fn validate_web(&self) -> Result<()> {
+        let web = &self.web;
+        if !web.enabled {
+            return Ok(());
+        }
+        let Ok(addr) = web.listen_addr.parse::<std::net::SocketAddr>() else {
+            anyhow::bail!(
+                "web.listenAddr '{}' is not a valid socket address",
+                web.listen_addr
+            );
+        };
+        if self.listen_addr.parse::<std::net::SocketAddr>().ok() == Some(addr) {
+            anyhow::bail!("web.listenAddr must differ from listenAddr");
+        }
+        if let Some(dir) = &web.ui_dir {
+            crate::path_safety::assert_safe_path(dir, "web.uiDir")?;
+        }
+        if web.session_ttl_secs < 60 || web.session_ttl_secs > 30 * 86400 {
+            anyhow::bail!("web.sessionTtlSecs must be between 60 and 2592000");
+        }
+        if web.session_idle_secs < 60 || web.session_idle_secs > web.session_ttl_secs {
+            anyhow::bail!("web.sessionIdleSecs must be at least 60 and at most web.sessionTtlSecs");
+        }
+        if web.totp_issuer.trim().is_empty() || web.totp_issuer.contains(':') {
+            anyhow::bail!("web.totpIssuer must be non-empty and must not contain ':'");
+        }
+        if web.max_failed_logins < 1 {
+            anyhow::bail!("web.maxFailedLogins must be at least 1");
+        }
+        if web.lockout_secs < 1 {
+            anyhow::bail!("web.lockoutSecs must be at least 1");
+        }
         Ok(())
     }
 

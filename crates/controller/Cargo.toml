@@ -31,6 +31,13 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["tls", "transport"] }
+tonic-web = "0.12"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
 url = "2"
 webpki-roots = "1"
 tonic-health = "0.12"
@@ -50,7 +57,6 @@ tonic-build = "0.12"
 [dev-dependencies]
 proptest = "1.11"
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

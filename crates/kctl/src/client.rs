@@ -307,6 +307,13 @@ fn endpoint_host(address: &str) -> Option<&str> {
         .or(Some(address))
 }
 
+pub async fn auth_client(
+    info: &ConnectionInfo,
+) -> Result<controller_proto::auth_client::AuthClient<Channel>> {
+    let channel = connect_with_timeout(info, DEFAULT_RPC_TIMEOUT).await?;
+    Ok(controller_proto::auth_client::AuthClient::new(channel))
+}
+
 pub async fn controller_client(
     info: &ConnectionInfo,
 ) -> Result<controller_proto::controller_client::ControllerClient<Channel>> {

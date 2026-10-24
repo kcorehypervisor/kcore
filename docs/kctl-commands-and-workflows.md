@@ -582,6 +582,8 @@ Day-0 on a fresh cluster:
 
 Other subcommands: `kctl operator list`, `kctl operator get <name>`, `kctl operator delete <name>`, `kctl operator revoke-role <name> --role <role>`.
 
+Dashboard sign-in: `kctl operator set-password <name>` sets the web password. On a terminal it prompts twice without echo. Otherwise it reads one line from stdin. `kctl operator reset-2fa <name>` clears TOTP and the recovery codes, so the next web login enrolls again. Both commands need cluster-admin and end the operator's web sessions. See [Web listener and dashboard sign-in](./mtls-bootstrap-and-auth.md#4b-web-listener-and-dashboard-sign-in).
+
 See [mTLS bootstrap and authentication](./mtls-bootstrap-and-auth.md) for the role lattice and compliance reporting.
 
 New environment:

@@ -978,6 +978,207 @@ service ControllerAdmin {
   rpc ResolveReplicationConflict(ResolveReplicationConflictRequest) returns (ResolveReplicationConflictResponse);
 }
 
+// Auth signs operators in on the controller web listener (gRPC-web and gRPC
+// with a bearer token). The mTLS listener keeps client certificates.
+//
+// A web session needs a password and a TOTP code. Login returns a pending
+// token that is good for five minutes and only for the second-factor RPCs.
+// An operator without TOTP must enroll before the first session is issued.
+// Send tokens as `authorization: Bearer <token>`.
+service Auth {
+  rpc Login(LoginRequest) returns (LoginResponse);
+  // Pending token only. Accepts a TOTP code or one unused recovery code.
+  rpc VerifySecondFactor(VerifySecondFactorRequest) returns (VerifySecondFactorResponse);
+  // Pending token or session. Replaces any enrollment not yet confirmed.
+  rpc BeginTotpEnrollment(BeginTotpEnrollmentRequest) returns (BeginTotpEnrollmentResponse);
+  // Turns TOTP on and returns recovery codes once. With a pending token the
+  // response also carries the first session.
+  rpc ConfirmTotpEnrollment(ConfirmTotpEnrollmentRequest) returns (ConfirmTotpEnrollmentResponse);
+  // Revokes the token on this request.
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+  // Session only. Revokes the operator's other sessions.
+  rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
+  // The caller's own sessions on this controller.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc RevokeSession(RevokeSessionRequest) returns (RevokeSessionResponse);
+  // Session only. An API token skips TOTP, so it is shown once and can be
+  // capped below the operator's own role.
+  rpc CreateApiToken(CreateApiTokenRequest) returns (CreateApiTokenResponse);
+  rpc ListApiTokens(ListApiTokensRequest) returns (ListApiTokensResponse);
+  rpc RevokeApiToken(RevokeApiTokenRequest) returns (RevokeApiTokenResponse);
+  // cluster-admin. Sets the password, revokes the operator's sessions, and
+  // keeps TOTP as it is.
+  rpc SetOperatorPassword(SetOperatorPasswordRequest) returns (SetOperatorPasswordResponse);
+  // cluster-admin. Clears TOTP and recovery codes. The next login enrolls again.
+  rpc ResetOperatorSecondFactor(ResetOperatorSecondFactorRequest) returns (ResetOperatorSecondFactorResponse);
+}
+
+enum LoginStep {
+  LOGIN_STEP_UNSPECIFIED = 0;
+  // Send VerifySecondFactor with the pending token.
+  LOGIN_STEP_TOTP = 1;
+  // Send BeginTotpEnrollment, then ConfirmTotpEnrollment, with the pending token.
+  LOGIN_STEP_ENROLL_TOTP = 2;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  string pending_token = 1;
+  LoginStep next_step = 2;
+  google.protobuf.Timestamp pending_expires_at = 3;
+}
+
+message AuthSession {
+  string token = 1;
+  string token_id = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  // Idle seconds before the session ends. Each request resets the clock.
+  int64 idle_timeout_secs = 4;
+}
+
+message VerifySecondFactorRequest {
+  string totp_code = 1;
+  string recovery_code = 2;
+}
+
+message VerifySecondFactorResponse {
+  AuthSession session = 1;
+  int32 recovery_codes_left = 2;
+}
+
+message BeginTotpEnrollmentRequest {}
+
+message BeginTotpEnrollmentResponse {
+  // Base32 (RFC 4648, no padding).
+  string secret = 1;
+  string otpauth_uri = 2;
+  string issuer = 3;
+  string account = 4;
+  int32 digits = 5;
+  int32 period_secs = 6;
+}
+
+message ConfirmTotpEnrollmentRequest {
+  string totp_code = 1;
+}
+
+message ConfirmTotpEnrollmentResponse {
+  repeated string recovery_codes = 1;
+  AuthSession session = 2;
+}
+
+message LogoutRequest {}
+
+message LogoutResponse {}
+
+message WhoAmIRequest {}
+
+enum AuthMethod {
+  AUTH_METHOD_UNSPECIFIED = 0;
+  AUTH_METHOD_CLIENT_CERTIFICATE = 1;
+  AUTH_METHOD_SESSION = 2;
+  AUTH_METHOD_API_TOKEN = 3;
+  // Plaintext listener started with --allow-insecure.
+  AUTH_METHOD_INSECURE = 4;
+}
+
+message WhoAmIResponse {
+  string operator = 1;
+  AuthMethod method = 2;
+  // Highest role in effect, after an API token cap.
+  OperatorRoleKind effective_role = 3;
+  repeated OperatorRoleKind roles = 4;
+  bool totp_enabled = 5;
+  bool password_set = 6;
+  string token_id = 7;
+  google.protobuf.Timestamp expires_at = 8;
+}
+
+message ChangePasswordRequest {
+  string current_password = 1;
+  string new_password = 2;
+}
+
+message ChangePasswordResponse {
+  int32 sessions_revoked = 1;
+}
+
+message AuthTokenInfo {
+  string token_id = 1;
+  string operator = 2;
+  // "session" or "api".
+  string kind = 3;
+  string name = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  google.protobuf.Timestamp last_used_at = 7;
+  string created_from = 8;
+  // Unspecified means the operator's own role.
+  OperatorRoleKind max_role = 9;
+  bool current = 10;
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated AuthTokenInfo sessions = 1;
+}
+
+message RevokeSessionRequest {
+  string token_id = 1;
+}
+
+message RevokeSessionResponse {}
+
+message CreateApiTokenRequest {
+  string name = 1;
+  // 1 to 365. 0 means 90.
+  int32 expires_in_days = 2;
+  OperatorRoleKind max_role = 3;
+}
+
+message CreateApiTokenResponse {
+  string token = 1;
+  AuthTokenInfo info = 2;
+}
+
+message ListApiTokensRequest {
+  // cluster-admin only. Empty lists the caller's tokens.
+  string operator = 1;
+}
+
+message ListApiTokensResponse {
+  repeated AuthTokenInfo tokens = 1;
+}
+
+message RevokeApiTokenRequest {
+  string token_id = 1;
+}
+
+message RevokeApiTokenResponse {}
+
+message SetOperatorPasswordRequest {
+  string name = 1;
+  string password = 2;
+}
+
+message SetOperatorPasswordResponse {
+  int32 sessions_revoked = 1;
+}
+
+message ResetOperatorSecondFactorRequest {
+  string name = 1;
+}
+
+message ResetOperatorSecondFactorResponse {
+  int32 sessions_revoked = 1;
+}
+
 message GetReplicationEventsRequest {
   int64 after_event_id = 1; // Exclusive cursor; 0 means from start.
   int32 limit = 2; // Max rows to return; defaults server-side when <= 0.
