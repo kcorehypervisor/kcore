@@ -331,13 +331,18 @@ fn render_route(
         handle.push(waf);
     }
 
-    if let Some(rl) = &input.gateway.rate_limit {
+    let per_minute = route.rate_limit.or(input
+        .gateway
+        .rate_limit
+        .as_ref()
+        .map(|r| r.requests_per_minute));
+    if let Some(max_events) = per_minute {
         handle.push(json!({
             "handler": "rate_limit",
             "rate_limits": {"client": {
                 "key": "{http.request.remote.host}",
                 "window": "1m",
-                "max_events": rl.requests_per_minute
+                "max_events": max_events
             }}
         }));
     }

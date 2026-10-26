@@ -4634,6 +4634,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             &req.path,
             &req.body,
             &req.content_type,
+            &req.bearer_token,
         )
         .await
         {

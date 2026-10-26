@@ -43,6 +43,10 @@ pub struct IngressState {
     pub vms: Vec<VmRow>,
     pub nodes: Vec<NodeRow>,
     pub networks: Vec<NetworkRow>,
+    /// Owner of each route (`k8s:cluster/ns/ingress`); empty for operator routes.
+    pub route_owners: BTreeMap<String, String>,
+    /// Resolved Kubernetes backends by [`Backend::key`], or why they could not be.
+    pub k8s: BTreeMap<String, Result<Vec<String>, String>>,
     /// Stored documents that no longer parse; reported by every plan.
     pub corrupt: Vec<String>,
 }
@@ -60,6 +64,7 @@ pub fn load_state(db: &Database) -> Result<IngressState, String> {
     for row in db.list_ingress_routes("").map_err(|e| e.to_string())? {
         match ingress_spec::parse_route(&row.spec_json) {
             Ok(spec) => {
+                st.route_owners.insert(row.name.clone(), row.owner.clone());
                 st.routes.insert(row.name, spec);
             }
             Err(e) => st.corrupt.push(format!("route {}: {e}", row.name)),
@@ -156,12 +161,56 @@ pub fn plan_gateway(st: &IngressState, name: &str) -> Plan {
         }
     }
 
-    let routes: BTreeMap<String, RouteSpec> = st
+    let mut routes: BTreeMap<String, RouteSpec> = st
         .routes
         .iter()
         .filter(|(_, r)| r.gateway == name)
         .map(|(n, r)| (n.clone(), r.clone()))
         .collect();
+    // Routes mirrored from Kubernetes must not take the gateway down: one with a
+    // problem is left out and reported, instead of failing every other route.
+    let owned: Vec<String> = routes
+        .keys()
+        .filter(|n| st.route_owners.get(*n).is_some_and(|o| !o.is_empty()))
+        .cloned()
+        .collect();
+    for n in owned {
+        let route = &routes[&n];
+        let mut problems = Vec::new();
+        if let Err(e) = validate_route(route) {
+            problems.push(e);
+        }
+        for path in &route.paths {
+            for b in &path.backends {
+                if let Err(e) = resolve_backend(st, &node_ids, b) {
+                    problems.push(e);
+                }
+            }
+        }
+        if let Some(p) = route
+            .waf
+            .policy
+            .as_ref()
+            .filter(|p| !st.policies.contains_key(*p))
+        {
+            problems.push(format!("WafPolicy {p} does not exist"));
+        }
+        let clash = route.hosts.iter().find(|h| {
+            routes.iter().any(|(other, r)| {
+                other != &n
+                    && r.hosts.iter().any(|x| x.eq_ignore_ascii_case(h))
+                    && (st.route_owners.get(other).is_none_or(|o| o.is_empty()) || other < &n)
+            })
+        });
+        if let Some(h) = clash {
+            problems.push(format!("host {h} is already served by another route"));
+        }
+        if !problems.is_empty() {
+            plan.warnings
+                .push(format!("route {n} skipped: {}", problems.join("; ")));
+            routes.remove(&n);
+        }
+    }
     for (rname, route) in &routes {
         if let Err(e) = validate_route(route) {
             plan.errors.push(format!("route {rname}: {e}"));
@@ -303,6 +352,11 @@ fn resolve_backend(
 ) -> Result<Vec<String>, String> {
     match b {
         Backend::External { .. } => Ok(Vec::new()),
+        Backend::Kubernetes { .. } => match st.k8s.get(&b.key()) {
+            Some(Ok(addrs)) => Ok(addrs.clone()),
+            Some(Err(e)) => Err(format!("kubernetes backend {}: {e}", b.key())),
+            None => Err(format!("kubernetes backend {} was not resolved", b.key())),
+        },
         Backend::Container { name, .. } => Err(format!(
             "container backend {name}: node agents do not report container addresses yet; \
              use an external backend with the container's address"
@@ -427,6 +481,23 @@ pub fn ingress_nix_for_node(
     None
 }
 
+/// Resolves the Kubernetes backends of every stored route into `st.k8s`.
+pub async fn resolve_kubernetes(db: &Database, clients: &NodeClients, st: &mut IngressState) {
+    let mut wanted: Vec<Backend> = Vec::new();
+    for r in st.routes.values() {
+        for b in r.paths.iter().flat_map(|p| &p.backends) {
+            if matches!(b, Backend::Kubernetes { .. }) && !wanted.iter().any(|w| w.key() == b.key())
+            {
+                wanted.push(b.clone());
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return;
+    }
+    st.k8s = crate::ingress_kubernetes::resolve_backends(db, clients, &wanted).await;
+}
+
 // -------------------------------------------------------------- reconciler
 
 pub fn spawn_ingress_reconciler(
@@ -452,6 +523,16 @@ async fn reconcile_once(
     webhooks: &crate::webhooks::Dispatcher,
 ) -> Result<(), String> {
     let st = load_state(db)?;
+    // Ingress controller mode first, so the routes it mirrors are in this tick.
+    let mut mirrored = false;
+    for (name, gw) in &st.gateways {
+        if gw.kubernetes.as_ref().is_some_and(|k| k.ingress_controller) {
+            crate::ingress_kubernetes::sync_ingresses(db, clients, name, gw).await;
+            mirrored = true;
+        }
+    }
+    let mut st = if mirrored { load_state(db)? } else { st };
+    resolve_kubernetes(db, clients, &mut st).await;
     for name in st.gateways.keys() {
         if let Err(error) = reconcile_gateway(db, clients, webhooks, &st, name).await {
             warn!(gateway = %name, %error, "ingress gateway reconcile failed");
@@ -907,5 +988,70 @@ mod tests {
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(plan.rendered.unwrap().json.contains("new.example.com"));
         assert!(apply_document(&mut st, "Nope", "x", "{}").is_err());
+    }
+
+    fn k8s_route(host: &str, service: &str) -> RouteSpec {
+        ingress_spec::parse_route(&format!(
+            r#"{{"gateway":"edge","hosts":["{host}"],"paths":[{{"prefix":"/","backends":[
+                {{"kind":"kubernetes","cluster":"lab","namespace":"prod","service":"{service}","port":"http"}}]}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    const K8S_KEY: &str = "k8s/lab/prod/web:http:LoadBalancer";
+
+    #[test]
+    fn kubernetes_backends_use_the_resolved_addresses() {
+        let mut st = state();
+        st.routes
+            .insert("k".into(), k8s_route("k.example.com", "web"));
+        st.k8s
+            .insert(K8S_KEY.into(), Ok(vec!["192.168.40.201:80".into()]));
+        let plan = plan_gateway(&st, "edge");
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(plan.rendered.unwrap().json.contains("192.168.40.201:80"));
+        // An operator route that cannot be resolved fails the plan.
+        st.k8s
+            .insert(K8S_KEY.into(), Err("no load balancer address yet".into()));
+        let plan = plan_gateway(&st, "edge");
+        assert!(plan.rendered.is_none());
+        assert!(plan
+            .errors
+            .iter()
+            .any(|e| e.contains("no load balancer address yet")));
+    }
+
+    #[test]
+    fn a_broken_mirrored_route_is_skipped_not_fatal() {
+        let mut st = state();
+        st.routes
+            .insert("k8s-lab-prod-web".into(), k8s_route("k.example.com", "web"));
+        st.route_owners
+            .insert("k8s-lab-prod-web".into(), "k8s:lab/prod/web".into());
+        st.k8s
+            .insert(K8S_KEY.into(), Err("service has no ready endpoints".into()));
+        let plan = plan_gateway(&st, "edge");
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        let json = plan.rendered.unwrap().json;
+        assert!(json.contains("shop.example.com") && !json.contains("k.example.com"));
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|w| w.contains("k8s-lab-prod-web skipped") && w.contains("no ready endpoints")));
+    }
+
+    #[test]
+    fn a_mirrored_route_loses_a_host_clash_with_an_operator_route() {
+        let mut st = state();
+        st.routes
+            .insert("k8s-x".into(), k8s_route("shop.example.com", "web"));
+        st.route_owners
+            .insert("k8s-x".into(), "k8s:lab/prod/x".into());
+        st.k8s
+            .insert(K8S_KEY.into(), Ok(vec!["192.168.40.201:80".into()]));
+        let plan = plan_gateway(&st, "edge");
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(plan.warnings.iter().any(|w| w.contains("already served")));
+        assert!(plan.rendered.unwrap().json.contains("10.240.0.5:8080"));
     }
 }

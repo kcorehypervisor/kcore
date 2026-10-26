@@ -23,6 +23,20 @@ pub async fn kubernetes_request(
     body: &str,
     content_type: &str,
 ) -> Result<(i32, String), String> {
+    kubernetes_request_as(clients, address, method, path, body, content_type, "").await
+}
+
+/// Like [`kubernetes_request`], authenticated as a ServiceAccount token when
+/// `bearer_token` is not empty and as the admin client certificate otherwise.
+pub async fn kubernetes_request_as(
+    clients: &NodeClients,
+    address: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    content_type: &str,
+    bearer_token: &str,
+) -> Result<(i32, String), String> {
     if clients.get_admin(address).is_none() {
         clients
             .connect(address)
@@ -38,6 +52,7 @@ pub async fn kubernetes_request(
             path: path.to_string(),
             body: body.to_string(),
             content_type: content_type.to_string(),
+            bearer_token: bearer_token.to_string(),
         }))
         .await
         .map_err(|err| format!("kubernetes admin {method} {path}: {err}"))?

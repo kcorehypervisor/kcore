@@ -32,6 +32,17 @@ pub struct GatewaySpec {
     pub rate_limit: Option<RateLimit>,
     #[serde(default)]
     pub access_log: bool,
+    /// Serve `Ingress` objects of these clusters (`ingressClassName: kcore`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes: Option<KubernetesIngress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KubernetesIngress {
+    #[serde(default)]
+    pub ingress_controller: bool,
+    pub clusters: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +144,9 @@ pub struct RouteSpec {
     /// TCP routes: send the PROXY protocol v2 header to the backend.
     #[serde(default)]
     pub proxy_protocol: bool,
+    /// Requests per minute per client for this route; replaces the gateway's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<u32>,
     #[serde(default)]
     pub tls: RouteTls,
     #[serde(default)]
@@ -191,9 +205,57 @@ fn default_ca_bundle() -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Backend {
-    Vm { name: String, port: u16 },
-    Container { name: String, port: u16 },
-    External { address: String },
+    Vm {
+        name: String,
+        port: u16,
+    },
+    Container {
+        name: String,
+        port: u16,
+    },
+    External {
+        address: String,
+    },
+    /// A Service of a kcore Kubernetes cluster.
+    Kubernetes {
+        cluster: String,
+        namespace: String,
+        service: String,
+        /// Service port, by name or number.
+        port: PortRef,
+        /// How the Service is reached; `loadBalancer` when omitted.
+        #[serde(default)]
+        endpoints: K8sEndpoints,
+    },
+}
+
+/// A Kubernetes Service port: a name (`http`) or a number (`8080`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PortRef {
+    Number(u16),
+    Name(String),
+}
+
+impl std::fmt::Display for PortRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortRef::Number(n) => write!(f, "{n}"),
+            PortRef::Name(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum K8sEndpoints {
+    /// The Service's `status.loadBalancer.ingress` address.
+    #[default]
+    LoadBalancer,
+    /// `nodePort` on every ready worker node.
+    NodePort,
+    /// Pod addresses from the Service's EndpointSlices; needs routable pod IPs.
+    Pods,
 }
 
 impl Backend {
@@ -203,6 +265,13 @@ impl Backend {
             Backend::Vm { name, port } => format!("vm/{name}:{port}"),
             Backend::Container { name, port } => format!("container/{name}:{port}"),
             Backend::External { address } => format!("external/{address}"),
+            Backend::Kubernetes {
+                cluster,
+                namespace,
+                service,
+                port,
+                endpoints,
+            } => format!("k8s/{cluster}/{namespace}/{service}:{port}:{endpoints:?}"),
         }
     }
 }
@@ -522,6 +591,17 @@ pub fn validate_gateway(spec: &GatewaySpec) -> Result<(), String> {
     {
         return Err("tls-alpn-01 needs a listener on port 443".into());
     }
+    if let Some(k) = &spec.kubernetes {
+        if k.ingress_controller && k.clusters.is_empty() {
+            return Err("kubernetes.ingressController needs at least one cluster".into());
+        }
+        let mut seen = BTreeSet::new();
+        for c in &k.clusters {
+            if c.trim().is_empty() || !seen.insert(c) {
+                return Err("kubernetes.clusters must be non-empty and unique".into());
+            }
+        }
+    }
     if let Some(rl) = &spec.rate_limit {
         if rl.requests_per_minute == 0 {
             return Err("rateLimit.requestsPerMinute must be positive".into());
@@ -556,6 +636,9 @@ fn validate_http_route(spec: &RouteSpec) -> Result<(), String> {
     }
     if spec.port.is_some() || !spec.backends.is_empty() || spec.proxy_protocol {
         return Err("port, backends and proxyProtocol belong to kind: tcp routes".into());
+    }
+    if spec.rate_limit == Some(0) {
+        return Err("rateLimit must be positive".into());
     }
     if spec.paths.is_empty() {
         return Err("paths must contain at least one prefix".into());
@@ -660,6 +743,36 @@ fn validate_backend(what: &str, b: &Backend) -> Result<(), String> {
         Backend::Vm { name, port } | Backend::Container { name, port } => {
             if name.trim().is_empty() || *port == 0 {
                 return Err(format!("{what}: backend needs a name and a port"));
+            }
+        }
+        Backend::Kubernetes {
+            cluster,
+            namespace,
+            service,
+            port,
+            ..
+        } => {
+            let dns_label = |v: &str| {
+                !v.is_empty()
+                    && v.len() <= 63
+                    && v.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            };
+            if cluster.trim().is_empty() || !dns_label(namespace) || !dns_label(service) {
+                return Err(format!(
+                    "{what}: kubernetes backend needs a cluster, a namespace and a service name"
+                ));
+            }
+            match port {
+                PortRef::Number(0) => {
+                    return Err(format!("{what}: kubernetes backend port must not be 0"))
+                }
+                PortRef::Name(n) if !dns_label(n) => {
+                    return Err(format!(
+                        "{what}: kubernetes backend port name {n:?} is not valid"
+                    ))
+                }
+                _ => {}
             }
         }
         Backend::External { address } => {
@@ -1046,11 +1159,16 @@ mod tests {
         const GATEWAY: &str = include_str!("../../../examples/ingress/gateway.yaml");
         const GATEWAY_HA: &str = include_str!("../../../examples/ingress/gateway-ha.yaml");
         const ROUTE: &str = include_str!("../../../examples/ingress/route.yaml");
+        const ROUTE_K8S: &str = include_str!("../../../examples/ingress/route-k8s.yaml");
+        const ROUTE_TCP: &str = include_str!("../../../examples/ingress/route-tcp.yaml");
+        const ROUTE_WILD: &str = include_str!("../../../examples/ingress/route-wildcard.yaml");
         validate_waf_policy(&parse_waf_policy(&example_spec(POLICY)).unwrap()).unwrap();
         for g in [GATEWAY, GATEWAY_HA] {
             validate_gateway(&parse_gateway(&example_spec(g)).unwrap()).unwrap();
         }
-        validate_route(&parse_route(&example_spec(ROUTE)).unwrap()).unwrap();
+        for r in [ROUTE, ROUTE_K8S, ROUTE_TCP, ROUTE_WILD] {
+            validate_route(&parse_route(&example_spec(r)).unwrap()).unwrap();
+        }
     }
 
     fn tcp_route() -> RouteSpec {

@@ -236,6 +236,7 @@ impl ControllerService {
                 ..Default::default()
             }));
         }
+        ingress_reconciler::resolve_kubernetes(&self.db, &self.clients, &mut st).await;
         let plan = ingress_reconciler::plan_gateway(&st, &gateway);
         let applied: Vec<NodeStatusJson> = self
             .db
@@ -482,6 +483,7 @@ impl ControllerService {
         // Surface this route's own problems now rather than at the next tick.
         let mut st = self.ingress_state()?;
         st.routes.insert(name.clone(), spec.clone());
+        ingress_reconciler::resolve_kubernetes(&self.db, &self.clients, &mut st).await;
         let plan = ingress_reconciler::plan_gateway(&st, &spec.gateway);
         let own: Vec<&String> = plan
             .errors

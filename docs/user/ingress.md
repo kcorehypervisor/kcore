@@ -104,10 +104,63 @@ Events are kept for 14 days.
 |--------|-------------|
 | `vm` | The VM's recorded address and the given port |
 | `external` | `address:port` exactly as written |
+| `kubernetes` | A Service of a kcore Kubernetes cluster (see below) |
 
 `container` backends are accepted by the schema but refused at plan time: node
 agents do not report container addresses yet. Point an `external` backend at the
 container's address instead.
+
+## Kubernetes
+
+A route can name a Service of a kcore Kubernetes cluster:
+
+```yaml
+backends:
+  - kind: kubernetes
+    cluster: lab-ha
+    namespace: shop
+    service: api
+    port: http                 # Service port, by name or number
+    endpoints: loadBalancer    # loadBalancer | nodePort | pods
+```
+
+`loadBalancer` uses the Service's external address, `nodePort` the node port on
+every ready worker, and `pods` the ready addresses from its EndpointSlices (pod
+IPs must be routable from the gateway). The controller resolves the Service on
+every reconcile, so a changed address is picked up without touching the route.
+
+### Ingress objects
+
+With `kubernetes.ingressController: true` on the gateway, the gateway also
+serves `Ingress` objects whose `ingressClassName` is `kcore`:
+
+```yaml
+spec:
+  kubernetes:
+    ingressController: true
+    clusters: [lab-ha]
+```
+
+The controller creates the `kcore` IngressClass, mirrors each Ingress rule into
+a read-only route (`kctl get ingress-routes` shows `owner=k8s:<cluster>/<ns>/<ingress>`),
+removes the route when the Ingress goes, and writes the gateway address into
+`status.loadBalancer`. Annotations:
+
+| Annotation | Route field |
+|------------|-------------|
+| `ingress.kcore.io/waf-policy` | `waf.policy` |
+| `ingress.kcore.io/waf-mode` | `waf.mode` (`detect`, `block`, `off`) |
+| `ingress.kcore.io/rate-limit` | requests per minute per client |
+
+Certificates come from ACME for the hosts of the rules; `spec.tls` is ignored.
+A mirrored route with a problem (a Service with no address yet, a host that an
+operator route already serves) is left out and shown as a warning in
+`kctl ingress plan`; it never blocks the other routes.
+
+The controller reaches the cluster as a dedicated `kcore-ingress` ServiceAccount,
+not the admin kubeconfig. Its ClusterRole reads Ingresses, Services,
+EndpointSlices and Nodes, and writes only `ingresses/status` and the
+IngressClass. Its token lives for an hour and is held in memory.
 
 ## Certificates
 
@@ -168,8 +221,8 @@ obtain them; shared certificate storage is not available yet.
 
 ## Limits today
 
-- Active/active gateways, Kubernetes `Ingress` objects and shared certificate
-  storage are not built yet. `backendTls` with the cluster CA (`kcore-pki`) is
+- Active/active gateways and shared certificate storage are not built yet.
+  Gateway API `HTTPRoute` is not served; only `Ingress`. `backendTls` with the cluster CA (`kcore-pki`) is
   not available either: give the PEM.
 - A gateway binds a public address on a hypervisor host. The service runs as a
   dynamic user with only `CAP_NET_BIND_SERVICE`, and its admin socket is

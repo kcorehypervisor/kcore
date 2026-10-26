@@ -1781,6 +1781,9 @@ message KubernetesAdminRequest {
   string path = 2;
   string body = 3;
   string content_type = 4;
+  // When set, authenticate with this bearer token (a scoped ServiceAccount
+  // token) instead of the admin client certificate.
+  string bearer_token = 5;
 }
 
 message KubernetesAdminResponse {

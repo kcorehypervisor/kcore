@@ -1,0 +1,17 @@
+# A Service of a kcore Kubernetes cluster as a backend. `endpoints` is
+# loadBalancer (default), nodePort or pods (needs routable pod IPs).
+kind: IngressRoute
+metadata:
+  name: api
+spec:
+  gateway: edge
+  hosts: [api.example.com]
+  paths:
+    - prefix: /
+      backends:
+        - kind: kubernetes
+          cluster: lab-ha
+          namespace: shop
+          service: api
+          port: http
+          endpoints: loadBalancer

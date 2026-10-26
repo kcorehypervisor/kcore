@@ -23,6 +23,7 @@ mod guest_ops;
 mod ha;
 mod host_volume;
 mod ingress_events;
+mod ingress_kubernetes;
 mod ingress_reconciler;
 mod ingress_render;
 mod ingress_spec;
