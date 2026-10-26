@@ -259,6 +259,15 @@ in
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
+        # The listener address is the VIP, and keepalived adds that address only
+        # after Caddy's admin socket answers. Binding it before it exists needs
+        # nonlocal bind; otherwise the unit exits, the VRRP check fails, and the
+        # address is never added.
+        boot.kernel.sysctl = {
+          "net.ipv4.ip_nonlocal_bind" = 1;
+          "net.ipv6.ip_nonlocal_bind" = 1;
+        };
+
         assertions = [
           {
             assertion = cfg.listenAddresses != [ ];

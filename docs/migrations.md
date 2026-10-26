@@ -77,7 +77,8 @@ migrations are 38–45 in that file.
 | 48 → 49 | New `pending_node_config_push` table. | After automatic failover, the failed node's next heartbeat pushes a config that no longer starts the moved guests. |
 | 56 → 57 | New `node_host_status` table. | Record the booted NixOS generation and the update capability reported by each node. |
 | 58 → 59 | `CREATE TABLE IF NOT EXISTS node_host_status`. | Version 58 changes nothing. A database already stamped 58 never ran step 57, so version 59 creates the table. |
-| 65 → 66 | New `operator_credentials`, `operator_login_state`, and `auth_tokens` tables. | Password and TOTP sign-in for the controller web listener, and its bearer tokens. || 66 → 67 | New `ingress_gateways`, `ingress_gateway_status`, `ingress_routes`, `ingress_route_status`, `waf_policies` and `waf_events` tables. | Ingress gateway resources, their reconciler status, and the Coraza audit events nodes report. |
+| 65 → 66 | New `operator_credentials`, `operator_login_state`, and `auth_tokens` tables. | Password and TOTP sign-in for the controller web listener, and its bearer tokens. |
+| 66 → 67 | New `ingress_gateways`, `ingress_gateway_status`, `ingress_routes`, `ingress_route_status`, `waf_policies` and `waf_events` tables. | Ingress gateway resources, their reconciler status, and the Coraza audit events nodes report. |
 
 ## Adding a new migration
 

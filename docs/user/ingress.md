@@ -216,7 +216,9 @@ to the backend, on a path or on a TCP route.
 List two nodes and add `highAvailability` with a VIP that is one of the listener
 addresses. keepalived holds the VIP on one node (the first listed is preferred),
 and the node that holds it is shown in `kctl describe ingress-gateway`. A VIP
-move fires the `ingress.vip.moved` webhook.
+move fires the `ingress.vip.moved` webhook. Caddy binds that address before
+keepalived creates it (`net.ipv4.ip_nonlocal_bind`), and keepalived only keeps
+the address while Caddy's admin socket answers, so the two cannot deadlock.
 
 Set `tls.storage: replicated` so a failover does not mean new certificates:
 

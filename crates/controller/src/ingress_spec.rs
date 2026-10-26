@@ -583,14 +583,6 @@ pub fn validate_gateway(spec: &GatewaySpec) -> Result<(), String> {
             ));
         }
     }
-    if let Some(d) = &spec.tls.acme.dns01 {
-        if !matches!(d.provider.as_str(), "cloudflare" | "route53" | "rfc2136") {
-            return Err(format!(
-                "tls.acme.dns01.provider {:?} must be cloudflare, route53 or rfc2136",
-                d.provider
-            ));
-        }
-    }
     if spec.tls.acme.challenges.iter().any(|c| c == "http-01")
         && !spec.listeners.iter().any(|l| l.ports.contains(&80))
     {

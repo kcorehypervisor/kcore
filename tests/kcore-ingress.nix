@@ -26,6 +26,9 @@ let
           listen = [
             ":80"
             ":443"
+            # Not assigned to any interface. The module's nonlocal-bind sysctl
+            # is what makes this succeed; a VIP works the same way.
+            "192.0.2.10:8443"
           ];
           routes = [
             {
@@ -115,7 +118,11 @@ pkgs.testers.runNixOSTest {
     gateway.wait_for_unit("pebble.service")
     gateway.wait_for_unit("backend.service")
     gateway.wait_for_unit("kcore-ingress.service")
-    gateway.wait_for_open_port(80)
+    # The unit boots a bootstrap config that only opens the admin socket.
+    # Port 80 exists after the configuration below is loaded.
+    gateway.wait_for_open_port(14000)
+    gateway.wait_for_file("/run/kcore-ingress/admin.sock")
+    gateway.succeed("sysctl -n net.ipv4.ip_nonlocal_bind | grep -q 1")
 
     # Push the rendered configuration the way the node agent does.
     gateway.succeed(
@@ -124,14 +131,21 @@ pkgs.testers.runNixOSTest {
         "--data-binary @${caddyConfig} http://localhost/load"
     )
 
-    gateway.wait_until_succeeds(
+    gateway.wait_until_succeeds("ss -H -ltn sport = :8443 | grep -q 192.0.2.10")
+
+    # Pebble 2.x generates its issuance root at startup. The minica file only
+    # authenticates the ACME and management listeners.
+    gateway.succeed(
         "curl -fsS --cacert ${pebbleCerts}/pebble.minica.pem "
+        "https://localhost:15000/roots/0 -o /tmp/pebble-root.pem"
+    )
+    gateway.wait_until_succeeds(
+        "curl -fsS --cacert /tmp/pebble-root.pem "
         "--resolve ${host}:443:127.0.0.1 https://${host}/ | grep -q kcore-backend",
         timeout=120,
     )
 
-    # Pebble issues from its own root, which the minica file does not carry.
-    # Verify the served chain is the one ACME issued rather than a fallback.
+    # The served chain is the one ACME issued, not Caddy's internal issuer.
     gateway.succeed(
         "echo | openssl s_client -connect 127.0.0.1:443 -servername ${host} 2>/dev/null "
         "| openssl x509 -noout -issuer | grep -qi pebble"
