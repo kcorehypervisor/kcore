@@ -31,17 +31,21 @@ let
   # Caddy's metrics listen on every address; only the hosts that may scrape
   # node_exporter can reach them. The metrics module is optional.
   scrapeSources = lib.unique (
-    builtins.filter (s: s != "") (lib.attrByPath [ "kcore" "metrics" "allowedScrapeSources" ] [ ] config)
+    builtins.filter (s: s != "") (
+      lib.attrByPath [ "kcore" "metrics" "allowedScrapeSources" ] [ ] config
+    )
   );
   listenerAddresses = lib.unique cfg.listenAddresses;
-  tcpListeners = cfg.tcpListeners;
+  inherit (cfg) tcpListeners;
   tcpPorts = [
     80
     443
   ];
   inputRules =
     lib.concatMapStrings (addr: ''
-      ip daddr ${addr} tcp dport { ${lib.concatMapStringsSep ", " toString tcpPorts} } accept comment "kcore-ingress"
+      ip daddr ${addr} tcp dport { ${
+        lib.concatMapStringsSep ", " toString tcpPorts
+      } } accept comment "kcore-ingress"
     '') listenerAddresses
     + lib.optionalString cfg.http3 (
       lib.concatMapStrings (addr: ''
