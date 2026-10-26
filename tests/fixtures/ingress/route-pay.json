@@ -1,0 +1,23 @@
+{
+  "gateway": "edge",
+  "hosts": [
+    "pay.example.com",
+    "*.apps.example.com"
+  ],
+  "paths": [
+    {
+      "prefix": "/",
+      "backends": [
+        {
+          "kind": "external",
+          "address": "192.168.40.50:8443"
+        }
+      ],
+      "backendTls": {
+        "serverName": "payments.internal",
+        "caBundle": "-----BEGIN CERTIFICATE-----\nMIICJzCCAcwCCQDHBTqO2JEkvDAKBggqhkjOPQQDAjAgMR4wHAYDVQQDDBVrY29y\nZSB0ZXN0IGJhY2tlbmQgQ0EwIBcNMjYxMDI2MTQ0MTI0WhgPMjEyNjEwMDIxNDQx\nMjRaMCAxHjAcBgNVBAMMFWtjb3JlIHRlc3QgYmFja2VuZCBDQTCCAUswggEDBgcq\nhkjOPQIBMIH3AgEBMCwGByqGSM49AQECIQD/////AAAAAQAAAAAAAAAAAAAAAP//\n/////////////zBbBCD/////AAAAAQAAAAAAAAAAAAAAAP///////////////AQg\nWsY12Ko6k+ez671VdpiGvGUdBrDMU7D2O848PifSYEsDFQDEnTYIhucEk2pmeOET\nnSa3gZ9+kARBBGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4a\nf5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfUCIQD/////AAAAAP//////////vOb6\nracXnoTzucrC/GMlUQIBAQNCAARyOLhx6lgm/bOSvzEwQc6WkKR1gF40GKrSLL0K\nORx85MCamgis15TVmUr7+8ZvJnM7eKuZxlClnBSW5LlV3P/FMAoGCCqGSM49BAMC\nA0kAMEYCIQCMJuZ0lu1TdpUAykuCY4L+Ksic1c1VLW/qxa5J0P6eVwIhAOvLVyUU\nM4w5P5MKUznk3aQnB56slaiZ0iNks8KeyLGD\n-----END CERTIFICATE-----\n"
+      },
+      "proxyProtocol": true
+    }
+  ]
+}

@@ -244,6 +244,8 @@ service Controller {
   rpc ListWafPolicies(ListWafPoliciesRequest) returns (ListWafPoliciesResponse);
   rpc DeleteWafPolicy(DeleteWafPolicyRequest) returns (DeleteWafPolicyResponse);
   rpc ListWafEvents(ListWafEventsRequest) returns (ListWafEventsResponse);
+  // Writes a secret file (for example dns.env) on every node of a gateway.
+  rpc SetIngressSecret(SetIngressSecretRequest) returns (SetIngressSecretResponse);
   // Node agent -> controller: batches of Coraza audit events.
   rpc ReportWafEvents(ReportWafEventsRequest) returns (ReportWafEventsResponse);
 
@@ -3420,3 +3422,13 @@ message ReportWafEventsRequest {
   repeated WafEvent events = 3;
 }
 message ReportWafEventsResponse { int32 accepted = 1; }
+
+message SetIngressSecretRequest {
+  string gateway = 1;
+  string name = 2;      // file name, for example dns.env
+  bytes content = 3;
+}
+message SetIngressSecretResponse {
+  bool success = 1;
+  repeated string nodes = 2; // nodes the file was written to
+}

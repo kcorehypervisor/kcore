@@ -16314,6 +16314,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.ingress_report_waf_events(request).await
     }
 
+    async fn set_ingress_secret(
+        &self,
+        request: Request<controller_proto::SetIngressSecretRequest>,
+    ) -> Result<Response<controller_proto::SetIngressSecretResponse>, Status> {
+        self.ingress_set_secret(request).await
+    }
+
     async fn create_object_store(
         &self,
         request: Request<controller_proto::CreateObjectStoreRequest>,

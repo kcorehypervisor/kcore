@@ -631,6 +631,10 @@ pub struct IngressNix {
     pub http3: bool,
     pub acme_email: String,
     pub vip: Option<IngressVipNix>,
+    /// Extra `(address, port)` pairs carried by TCP routes.
+    pub tcp_listeners: Vec<(String, u16)>,
+    /// A DNS-01 provider is configured: read `/etc/kcore/ingress/dns.env`.
+    pub dns_credentials: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,6 +700,22 @@ fn render_ingress(ing: &IngressNix) -> Option<String> {
         "    acme.email = \"{}\";\n",
         nix_escape(&ing.acme_email)
     ));
+    if ing.dns_credentials {
+        out.push_str("    acme.credentialsFile = \"/etc/kcore/ingress/dns.env\";\n");
+    }
+    if !ing.tcp_listeners.is_empty() {
+        if !ing.tcp_listeners.iter().all(|(a, p)| ip_ok(a) && *p != 0) {
+            return None;
+        }
+        out.push_str("    tcpListeners = [\n");
+        for (addr, port) in &ing.tcp_listeners {
+            out.push_str(&format!(
+                "      {{ address = \"{}\"; port = {port}; }}\n",
+                nix_escape(addr)
+            ));
+        }
+        out.push_str("    ];\n");
+    }
     if let Some(v) = &ing.vip {
         let iface_ok = !v.interface.is_empty()
             && v.interface.len() <= 15
@@ -754,6 +774,8 @@ mod tests {
             listen_addresses: vec!["203.0.113.10".into()],
             http3: true,
             acme_email: "ops@example.com".into(),
+            tcp_listeners: vec![("203.0.113.10".into(), 5432)],
+            dns_credentials: true,
             vip: vip.then(|| IngressVipNix {
                 address: "203.0.113.10".into(),
                 interface: "eno1".into(),
@@ -772,6 +794,8 @@ mod tests {
         assert!(out.contains("kcore.ingress = {"), "{out}");
         assert!(out.contains("listenAddresses = [ \"203.0.113.10\" ];"));
         assert!(out.contains("virtualRouterId = 61;"));
+        assert!(out.contains("{ address = \"203.0.113.10\"; port = 5432; }"));
+        assert!(out.contains("acme.credentialsFile = \"/etc/kcore/ingress/dns.env\";"));
         assert!(out.contains("peers = [ \"10.0.0.2\" ];"));
         assert!(out.trim_end().ends_with('}'));
         assert_eq!(with_ingress(base.clone(), None), base);

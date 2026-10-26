@@ -138,6 +138,7 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_AFTER_RENEW: &[(&str, &str)] = &[
     ("ListWafPolicies", "read-only"),
     ("DeleteWafPolicy", "cluster-admin"),
     ("ListWafEvents", "read-only"),
+    ("SetIngressSecret", "cluster-admin"),
     ("CreateObjectStore", "cluster-admin"),
     ("GetObjectStore", "read-only"),
     ("ListObjectStores", "read-only"),

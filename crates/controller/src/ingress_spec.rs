@@ -72,7 +72,22 @@ pub struct Acme {
     pub ca: String,
     #[serde(default = "default_challenges")]
     pub challenges: Vec<String>,
+    /// DNS-01 provider; required for wildcard hosts and for `dns-01`. The
+    /// credentials live in `/etc/kcore/ingress/dns.env` on each gateway node
+    /// (written with `kctl ingress secret set`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns01: Option<Dns01>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Dns01 {
+    /// `cloudflare`, `route53` or `rfc2136`.
+    pub provider: String,
+}
+
+/// Credentials file name the DNS-01 provider reads its environment from.
+pub const DNS_SECRET_NAME: &str = "dns.env";
 
 fn default_ca() -> String {
     "letsencrypt".into()
@@ -100,8 +115,24 @@ fn default_rate_key() -> String {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RouteSpec {
     pub gateway: String,
+    /// `http` (default) terminates TLS and applies the WAF; `tcp` forwards raw
+    /// TCP or, with `hosts`, passes TLS through by SNI.
+    #[serde(default)]
+    pub kind: RouteKind,
+    /// HTTP: the hostnames served. TCP: SNI names to match (empty matches any).
+    #[serde(default)]
     pub hosts: Vec<String>,
+    #[serde(default)]
     pub paths: Vec<PathSpec>,
+    /// TCP routes: the listening port. It must be one of a gateway listener's ports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// TCP routes: where connections go.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<Backend>,
+    /// TCP routes: send the PROXY protocol v2 header to the backend.
+    #[serde(default)]
+    pub proxy_protocol: bool,
     #[serde(default)]
     pub tls: RouteTls,
     #[serde(default)]
@@ -116,6 +147,14 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteKind {
+    #[default]
+    Http,
+    Tcp,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PathSpec {
@@ -125,6 +164,28 @@ pub struct PathSpec {
     pub load_balancing: LoadBalancing,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheck>,
+    /// Re-encrypt to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_tls: Option<BackendTls>,
+    /// Send the PROXY protocol v2 header to the backend.
+    #[serde(default)]
+    pub proxy_protocol: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BackendTls {
+    /// Name to verify the backend certificate against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// `system` (public CAs) or a PEM bundle. There is no switch to skip
+    /// verification: a backend with a private certificate is given its PEM.
+    #[serde(default = "default_ca_bundle")]
+    pub ca_bundle: String,
+}
+
+fn default_ca_bundle() -> String {
+    "system".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -427,8 +488,28 @@ pub fn validate_gateway(spec: &GatewaySpec) -> Result<(), String> {
     for c in &spec.tls.acme.challenges {
         match c.as_str() {
             "http-01" | "tls-alpn-01" => {}
-            "dns-01" => return Err("dns-01 is not supported yet".into()),
+            "dns-01" => {
+                if spec.tls.acme.dns01.is_none() {
+                    return Err("challenge dns-01 needs tls.acme.dns01.provider".into());
+                }
+            }
             other => return Err(format!("unknown ACME challenge {other:?}")),
+        }
+    }
+    if let Some(d) = &spec.tls.acme.dns01 {
+        if !matches!(d.provider.as_str(), "cloudflare" | "route53" | "rfc2136") {
+            return Err(format!(
+                "tls.acme.dns01.provider {:?} must be cloudflare, route53 or rfc2136",
+                d.provider
+            ));
+        }
+    }
+    if let Some(d) = &spec.tls.acme.dns01 {
+        if !matches!(d.provider.as_str(), "cloudflare" | "route53" | "rfc2136") {
+            return Err(format!(
+                "tls.acme.dns01.provider {:?} must be cloudflare, route53 or rfc2136",
+                d.provider
+            ));
         }
     }
     if spec.tls.acme.challenges.iter().any(|c| c == "http-01")
@@ -456,15 +537,25 @@ pub fn validate_route(spec: &RouteSpec) -> Result<(), String> {
     if spec.gateway.trim().is_empty() {
         return Err("gateway is required".into());
     }
-    if spec.hosts.is_empty() {
-        return Err("hosts must name at least one hostname".into());
-    }
     let mut seen = BTreeSet::new();
     for h in &spec.hosts {
         validate_hostname(h)?;
         if !seen.insert(h.to_ascii_lowercase()) {
             return Err(format!("host {h} is listed twice"));
         }
+    }
+    match spec.kind {
+        RouteKind::Http => validate_http_route(spec),
+        RouteKind::Tcp => validate_tcp_route(spec),
+    }
+}
+
+fn validate_http_route(spec: &RouteSpec) -> Result<(), String> {
+    if spec.hosts.is_empty() {
+        return Err("hosts must name at least one hostname".into());
+    }
+    if spec.port.is_some() || !spec.backends.is_empty() || spec.proxy_protocol {
+        return Err("port, backends and proxyProtocol belong to kind: tcp routes".into());
     }
     if spec.paths.is_empty() {
         return Err("paths must contain at least one prefix".into());
@@ -514,23 +605,76 @@ pub fn validate_route(spec: &RouteSpec) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_tcp_route(spec: &RouteSpec) -> Result<(), String> {
+    let port = spec.port.ok_or("tcp routes need a port")?;
+    if port == 0 || port == 80 || port == 443 {
+        return Err("tcp route port must not be 0, 80 or 443 (those carry HTTP)".into());
+    }
+    if !spec.paths.is_empty() {
+        return Err("tcp routes have no paths".into());
+    }
+    if spec.waf.policy.is_some() || spec.waf.mode.is_some() || !spec.waf.exclusions.is_empty() {
+        return Err("tcp routes carry no WAF".into());
+    }
+    if spec.headers.hsts || !spec.headers.forwarded.is_empty() {
+        return Err("tcp routes have no HTTP headers".into());
+    }
+    if spec.backends.is_empty() {
+        return Err("tcp routes need at least one backend".into());
+    }
+    for b in &spec.backends {
+        validate_backend("tcp route", b)?;
+    }
+    Ok(())
+}
+
+/// True for `*.example.com` style hosts.
+pub fn is_wildcard_host(h: &str) -> bool {
+    h.starts_with("*.")
+}
+
 fn validate_hostname(h: &str) -> Result<(), String> {
-    if h.starts_with("*.") {
+    let name = h.strip_prefix("*.").unwrap_or(h);
+    if is_wildcard_host(h) && !name.contains('.') {
         return Err(format!(
-            "wildcard host {h} needs DNS-01, which is not supported yet"
+            "wildcard host {h} needs a registered domain after *."
         ));
     }
-    let ok = !h.is_empty()
-        && h.len() <= 253
-        && h.split('.').all(|label| {
+    let ok = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
                 && !label.starts_with('-')
                 && !label.ends_with('-')
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         });
-    if !ok || h.parse::<IpAddr>().is_ok() {
+    if !ok || name.parse::<IpAddr>().is_ok() {
         return Err(format!("{h:?} is not a valid DNS hostname"));
+    }
+    Ok(())
+}
+
+fn validate_backend(what: &str, b: &Backend) -> Result<(), String> {
+    match b {
+        Backend::Vm { name, port } | Backend::Container { name, port } => {
+            if name.trim().is_empty() || *port == 0 {
+                return Err(format!("{what}: backend needs a name and a port"));
+            }
+        }
+        Backend::External { address } => {
+            let ok = address
+                .rsplit_once(':')
+                .map(|(host, port)| {
+                    !host.is_empty() && port.parse::<u16>().map(|n| n != 0).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if !ok {
+                return Err(format!(
+                    "{what}: external address {address:?} must be host:port"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -546,30 +690,7 @@ fn validate_path(p: &PathSpec) -> Result<(), String> {
         return Err(format!("path {} needs at least one backend", p.prefix));
     }
     for b in &p.backends {
-        match b {
-            Backend::Vm { name, port } | Backend::Container { name, port } => {
-                if name.trim().is_empty() || *port == 0 {
-                    return Err(format!(
-                        "path {}: backend needs a name and a port",
-                        p.prefix
-                    ));
-                }
-            }
-            Backend::External { address } => {
-                let ok = address
-                    .rsplit_once(':')
-                    .map(|(host, port)| {
-                        !host.is_empty() && port.parse::<u16>().map(|n| n != 0).unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if !ok {
-                    return Err(format!(
-                        "path {}: external address {address:?} must be host:port",
-                        p.prefix
-                    ));
-                }
-            }
-        }
+        validate_backend(&format!("path {}", p.prefix), b)?;
     }
     if !matches!(
         p.load_balancing.policy.as_str(),
@@ -602,7 +723,45 @@ fn validate_path(p: &PathSpec) -> Result<(), String> {
             ));
         }
     }
+    if let Some(t) = &p.backend_tls {
+        validate_backend_tls(&p.prefix, t)?;
+    }
     Ok(())
+}
+
+fn validate_backend_tls(prefix: &str, t: &BackendTls) -> Result<(), String> {
+    if let Some(n) = &t.server_name {
+        validate_hostname(n).map_err(|e| format!("path {prefix}: backendTls.serverName: {e}"))?;
+    }
+    match t.ca_bundle.as_str() {
+        "system" => Ok(()),
+        "kcore-pki" => Err(format!(
+            "path {prefix}: backendTls.caBundle kcore-pki is not available yet; give the PEM"
+        )),
+        pem_text => {
+            let certs = pem_certificates(pem_text);
+            if certs.is_empty() {
+                Err(format!(
+                    "path {prefix}: backendTls.caBundle must be \"system\" or a PEM certificate bundle"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// DER bytes of every certificate in a PEM bundle.
+pub fn pem_certificates(text: &str) -> Vec<Vec<u8>> {
+    pem::parse_many(text)
+        .map(|blocks| {
+            blocks
+                .into_iter()
+                .filter(|b| b.tag() == "CERTIFICATE")
+                .map(|b| b.into_contents())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn validate_duration(d: &str) -> Result<(), String> {
@@ -675,13 +834,36 @@ fn validate_cidr(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Hostnames must be unique across the routes of one gateway.
+/// Hostnames must be unique across the HTTP routes of one gateway, and a TCP
+/// port is shared only by routes that match different SNI names.
 pub fn check_host_conflicts(routes: &BTreeMap<String, RouteSpec>) -> Result<(), String> {
     let mut owner: BTreeMap<String, &str> = BTreeMap::new();
+    let mut tcp: BTreeMap<u16, Vec<(&str, &RouteSpec)>> = BTreeMap::new();
     for (name, r) in routes {
+        if r.kind == RouteKind::Tcp {
+            if let Some(port) = r.port {
+                tcp.entry(port).or_default().push((name, r));
+            }
+            continue;
+        }
         for h in &r.hosts {
             if let Some(prev) = owner.insert(h.to_ascii_lowercase(), name) {
                 return Err(format!("host {h} is used by routes {prev} and {name}"));
+            }
+        }
+    }
+    for (port, users) in &tcp {
+        let mut sni: BTreeSet<String> = BTreeSet::new();
+        for (name, r) in users {
+            if users.len() > 1 && r.hosts.is_empty() {
+                return Err(format!(
+                    "tcp route {name} matches every connection on port {port}, which another route also uses"
+                ));
+            }
+            for h in &r.hosts {
+                if !sni.insert(h.to_ascii_lowercase()) {
+                    return Err(format!("tcp port {port}: SNI {h} is used twice"));
+                }
             }
         }
     }
@@ -772,14 +954,24 @@ mod tests {
 
         let mut g = gateway();
         g.tls.acme.challenges = vec!["dns-01".into()];
-        assert!(validate_gateway(&g).unwrap_err().contains("not supported"));
+        assert!(validate_gateway(&g).unwrap_err().contains("dns01.provider"));
+        g.tls.acme.dns01 = Some(Dns01 {
+            provider: "cloudflare".into(),
+        });
+        validate_gateway(&g).unwrap();
+        g.tls.acme.dns01 = Some(Dns01 {
+            provider: "godaddy".into(),
+        });
+        assert!(validate_gateway(&g).is_err());
     }
 
     #[test]
     fn route_rules() {
         let mut r = route();
         r.hosts = vec!["*.example.com".into()];
-        assert!(validate_route(&r).unwrap_err().contains("DNS-01"));
+        validate_route(&r).unwrap();
+        r.hosts = vec!["*.com".into()];
+        assert!(validate_route(&r).is_err());
 
         let mut r = route();
         r.hosts = vec!["bad host".into()];
@@ -859,5 +1051,73 @@ mod tests {
             validate_gateway(&parse_gateway(&example_spec(g)).unwrap()).unwrap();
         }
         validate_route(&parse_route(&example_spec(ROUTE)).unwrap()).unwrap();
+    }
+
+    fn tcp_route() -> RouteSpec {
+        parse_route(
+            r#"{"gateway":"edge","kind":"tcp","port":5432,
+                "backends":[{"kind":"external","address":"10.0.0.9:5432"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tcp_routes_have_their_own_rules() {
+        validate_route(&tcp_route()).unwrap();
+        let mut r = tcp_route();
+        r.port = None;
+        assert!(validate_route(&r).unwrap_err().contains("port"));
+        let mut r = tcp_route();
+        r.port = Some(443);
+        assert!(validate_route(&r).is_err());
+        let mut r = tcp_route();
+        r.backends.clear();
+        assert!(validate_route(&r).is_err());
+        let mut r = tcp_route();
+        r.waf.mode = Some("block".into());
+        assert!(validate_route(&r).unwrap_err().contains("no WAF"));
+        let mut r = tcp_route();
+        r.hosts = vec!["db.example.com".into()];
+        validate_route(&r).unwrap();
+        // HTTP routes cannot borrow TCP fields.
+        let mut h = route();
+        h.port = Some(5432);
+        assert!(validate_route(&h).is_err());
+    }
+
+    #[test]
+    fn tcp_port_sharing_needs_distinct_sni() {
+        let mut a = tcp_route();
+        a.hosts = vec!["a.example.com".into()];
+        let mut b = tcp_route();
+        b.hosts = vec!["b.example.com".into()];
+        let routes = BTreeMap::from([("a".to_string(), a.clone()), ("b".to_string(), b)]);
+        check_host_conflicts(&routes).unwrap();
+        let catch_all = BTreeMap::from([("a".to_string(), a), ("c".to_string(), tcp_route())]);
+        assert!(check_host_conflicts(&catch_all)
+            .unwrap_err()
+            .contains("matches every connection"));
+    }
+
+    #[test]
+    fn backend_tls_requires_a_real_pem_or_system() {
+        let mut r = route();
+        r.paths[0].backend_tls = Some(BackendTls {
+            server_name: Some("payments.internal".into()),
+            ca_bundle: "system".into(),
+        });
+        validate_route(&r).unwrap();
+        for bad in ["kcore-pki", "not a pem", ""] {
+            r.paths[0].backend_tls = Some(BackendTls {
+                server_name: None,
+                ca_bundle: bad.into(),
+            });
+            assert!(validate_route(&r).is_err(), "{bad:?}");
+        }
+        r.paths[0].backend_tls = Some(BackendTls {
+            server_name: None,
+            ca_bundle: include_str!("../../../tests/fixtures/ingress/backend-ca.pem").into(),
+        });
+        validate_route(&r).unwrap();
     }
 }

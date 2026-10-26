@@ -1,0 +1,21 @@
+# A wildcard host needs a DNS-01 provider on the gateway:
+#
+#   spec.tls.acme.dns01.provider: cloudflare   # or route53, rfc2136
+#   kctl ingress secret set --gateway edge -f dns.env
+#
+# dns.env holds the provider's variables, for example CLOUDFLARE_API_TOKEN=...
+# The route re-encrypts to the backend and verifies it against the given CA.
+kind: IngressRoute
+metadata:
+  name: apps
+spec:
+  gateway: edge
+  hosts: ["*.apps.example.com"]
+  paths:
+    - prefix: /
+      backends:
+        - kind: external
+          address: 192.168.40.50:8443
+      backendTls:
+        serverName: apps.internal
+        caBundle: system

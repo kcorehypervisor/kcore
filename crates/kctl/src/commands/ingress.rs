@@ -449,6 +449,40 @@ pub async fn delete(info: &ConnectionInfo, kind: &str, name: &str) -> Result<()>
     }
 }
 
+// ------------------------------------------------------------------ secrets
+
+/// Writes the DNS-01 credentials file (`dns.env`) on every gateway node.
+/// The file content is read from `file`, or from stdin when `file` is `-`.
+pub async fn secret_set(
+    info: &ConnectionInfo,
+    gateway: &str,
+    name: &str,
+    file: &str,
+) -> Result<()> {
+    use std::io::Read;
+    let content = if file == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .context("reading stdin")?;
+        buf
+    } else {
+        std::fs::read(file).with_context(|| format!("reading {file}"))?
+    };
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .set_ingress_secret(pb::SetIngressSecretRequest {
+            gateway: gateway.into(),
+            name: name.into(),
+            content,
+        })
+        .await
+        .context("set_ingress_secret rpc")?
+        .into_inner();
+    println!("Wrote {name} on {}.", resp.nodes.join(", "));
+    Ok(())
+}
+
 // --------------------------------------------------------------- WAF events
 
 /// Parses `30s`, `15m`, `1h`, `24h`, `7d` into seconds.

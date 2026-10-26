@@ -1,0 +1,188 @@
+{
+  "admin": {
+    "listen": "unix//run/kcore-ingress/admin.sock|0600"
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "kcore": {
+          "listen": [
+            "203.0.113.10:80",
+            "203.0.113.10:443"
+          ],
+          "metrics": {},
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "load_balancing": {
+                    "selection_policy": {
+                      "policy": "round_robin"
+                    }
+                  },
+                  "transport": {
+                    "protocol": "http",
+                    "proxy_protocol": "v2",
+                    "tls": {
+                      "ca": {
+                        "provider": "inline",
+                        "trusted_ca_certs": [
+                          "MIICJzCCAcwCCQDHBTqO2JEkvDAKBggqhkjOPQQDAjAgMR4wHAYDVQQDDBVrY29yZSB0ZXN0IGJhY2tlbmQgQ0EwIBcNMjYxMDI2MTQ0MTI0WhgPMjEyNjEwMDIxNDQxMjRaMCAxHjAcBgNVBAMMFWtjb3JlIHRlc3QgYmFja2VuZCBDQTCCAUswggEDBgcqhkjOPQIBMIH3AgEBMCwGByqGSM49AQECIQD/////AAAAAQAAAAAAAAAAAAAAAP///////////////zBbBCD/////AAAAAQAAAAAAAAAAAAAAAP///////////////AQgWsY12Ko6k+ez671VdpiGvGUdBrDMU7D2O848PifSYEsDFQDEnTYIhucEk2pmeOETnSa3gZ9+kARBBGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfUCIQD/////AAAAAP//////////vOb6racXnoTzucrC/GMlUQIBAQNCAARyOLhx6lgm/bOSvzEwQc6WkKR1gF40GKrSLL0KORx85MCamgis15TVmUr7+8ZvJnM7eKuZxlClnBSW5LlV3P/FMAoGCCqGSM49BAMCA0kAMEYCIQCMJuZ0lu1TdpUAykuCY4L+Ksic1c1VLW/qxa5J0P6eVwIhAOvLVyUUM4w5P5MKUznk3aQnB56slaiZ0iNks8KeyLGD"
+                        ]
+                      },
+                      "server_name": "payments.internal"
+                    }
+                  },
+                  "upstreams": [
+                    {
+                      "dial": "192.168.40.50:8443"
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "*.apps.example.com",
+                    "pay.example.com"
+                  ],
+                  "path": [
+                    "/*"
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        },
+        "metrics": {
+          "automatic_https": {
+            "disable": true
+          },
+          "listen": [
+            "127.0.0.1:2020"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "metrics"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "layer4": {
+      "servers": {
+        "tcp-5432": {
+          "listen": [
+            "203.0.113.10:5432"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "proxy",
+                  "proxy_protocol": "v2",
+                  "upstreams": [
+                    {
+                      "dial": [
+                        "10.0.0.8:5432"
+                      ]
+                    },
+                    {
+                      "dial": [
+                        "10.0.0.9:5432"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "tcp-8443": {
+          "listen": [
+            "203.0.113.10:8443"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "proxy",
+                  "upstreams": [
+                    {
+                      "dial": [
+                        "10.0.0.7:443"
+                      ]
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "tls": {
+                    "sni": [
+                      "pg.example.com"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "automation": {
+        "policies": [
+          {
+            "issuers": [
+              {
+                "ca": "https://acme-v02.api.letsencrypt.org/directory",
+                "email": "ops@example.com",
+                "module": "acme"
+              }
+            ],
+            "subjects": [
+              "pay.example.com"
+            ]
+          },
+          {
+            "issuers": [
+              {
+                "ca": "https://acme-v02.api.letsencrypt.org/directory",
+                "challenges": {
+                  "dns": {
+                    "provider": {
+                      "api_token": "{env.CLOUDFLARE_API_TOKEN}",
+                      "name": "cloudflare"
+                    }
+                  },
+                  "http": {
+                    "disabled": true
+                  },
+                  "tls-alpn": {
+                    "disabled": true
+                  }
+                },
+                "email": "ops@example.com",
+                "module": "acme"
+              }
+            ],
+            "subjects": [
+              "*.apps.example.com"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "storage": {
+    "module": "file_system",
+    "root": "/var/lib/kcore/ingress/certmagic"
+  }
+}

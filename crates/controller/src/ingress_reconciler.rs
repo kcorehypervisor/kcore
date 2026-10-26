@@ -21,8 +21,8 @@ use crate::db::{
 };
 use crate::ingress_render::{render_caddy, NodePaths, RenderInput, Rendered};
 use crate::ingress_spec::{
-    self, check_host_conflicts, validate_gateway, validate_route, validate_waf_policy, Backend,
-    GatewaySpec, RouteSpec, WafPolicySpec,
+    self, check_host_conflicts, is_wildcard_host, validate_gateway, validate_route,
+    validate_waf_policy, Backend, GatewaySpec, RouteKind, RouteSpec, WafPolicySpec,
 };
 use crate::node_client::NodeClients;
 use crate::node_proto;
@@ -170,13 +170,32 @@ pub fn plan_gateway(st: &IngressState, name: &str) -> Plan {
     if let Err(e) = check_host_conflicts(&routes) {
         plan.errors.push(e);
     }
+    for (rname, r) in &routes {
+        match r.kind {
+            RouteKind::Http => {
+                if r.hosts.iter().any(|h| is_wildcard_host(h)) && gateway.tls.acme.dns01.is_none() {
+                    plan.errors.push(format!(
+                        "route {rname}: wildcard hosts need tls.acme.dns01 on gateway {name}"
+                    ));
+                }
+            }
+            RouteKind::Tcp => {
+                let port = r.port.unwrap_or(0);
+                if !gateway.listeners.iter().any(|l| l.ports.contains(&port)) {
+                    plan.errors.push(format!(
+                        "route {rname}: no listener of gateway {name} carries tcp port {port}"
+                    ));
+                }
+            }
+        }
+    }
 
     // WAF policies named by the gateway default or a route must exist and be valid.
     let mut used_policies = BTreeSet::new();
     if let Some(p) = &gateway.default_waf_policy {
         used_policies.insert(p.clone());
     }
-    for r in routes.values() {
+    for r in routes.values().filter(|r| r.kind == RouteKind::Http) {
         if r.waf.mode.as_deref() == Some("off") {
             continue;
         }
@@ -196,7 +215,13 @@ pub fn plan_gateway(st: &IngressState, name: &str) -> Plan {
             None => plan.errors.push(format!("WafPolicy {p} does not exist")),
         }
     }
-    for (rname, r) in &routes {
+    for (rname, r) in routes.iter().filter(|(_, r)| r.kind == RouteKind::Tcp) {
+        let _ = r;
+        plan.warnings.push(format!(
+            "route {rname} is a TCP route: the WAF does not inspect it"
+        ));
+    }
+    for (rname, r) in routes.iter().filter(|(_, r)| r.kind == RouteKind::Http) {
         let covered = r.waf.mode.as_deref() == Some("off")
             || r.waf.policy.is_some()
             || gateway.default_waf_policy.is_some();
@@ -210,7 +235,11 @@ pub fn plan_gateway(st: &IngressState, name: &str) -> Plan {
         }
     }
 
-    let hostnames: usize = routes.values().map(|r| r.hosts.len()).sum();
+    let hostnames: usize = routes
+        .values()
+        .filter(|r| r.kind == RouteKind::Http)
+        .map(|r| r.hosts.len())
+        .sum();
     if gateway.tls.acme.ca == "letsencrypt" && hostnames > LE_HOSTNAME_WARN {
         plan.warnings.push(format!(
             "{hostnames} hostnames on Let's Encrypt production exceeds the 50 per week certificate limit"
@@ -221,16 +250,22 @@ pub fn plan_gateway(st: &IngressState, name: &str) -> Plan {
     let mut backends: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (rname, r) in &routes {
         let mut dials = Vec::new();
-        for path in &r.paths {
-            for b in &path.backends {
+        let mut groups: Vec<(String, &Vec<Backend>)> = r
+            .paths
+            .iter()
+            .map(|p| (format!("path {}", p.prefix), &p.backends))
+            .collect();
+        if r.kind == RouteKind::Tcp {
+            groups.push(("tcp".to_string(), &r.backends));
+        }
+        for (what, list) in groups {
+            for b in list {
                 match resolve_backend(st, &node_ids, b) {
                     Ok(addrs) => {
                         dials.extend(addrs.iter().cloned());
                         backends.insert(b.key(), addrs);
                     }
-                    Err(e) => plan
-                        .errors
-                        .push(format!("route {rname} path {}: {e}", path.prefix)),
+                    Err(e) => plan.errors.push(format!("route {rname} {what}: {e}")),
                 }
                 if let Backend::External { address } = b {
                     dials.push(address.clone());
@@ -333,7 +368,7 @@ pub fn ingress_nix_for_node(
     st: &IngressState,
     node: &NodeRow,
 ) -> Option<crate::nixgen::IngressNix> {
-    for gw in st.gateways.values() {
+    for (gw_name, gw) in &st.gateways {
         let Some(idx) = gw
             .nodes
             .iter()
@@ -365,11 +400,28 @@ pub fn ingress_nix_for_node(
                 peers,
             }
         });
+        let mut tcp_listeners = Vec::new();
+        for r in st
+            .routes
+            .values()
+            .filter(|r| &r.gateway == gw_name && r.kind == RouteKind::Tcp)
+        {
+            let Some(port) = r.port else { continue };
+            for l in gw.listeners.iter().filter(|l| l.ports.contains(&port)) {
+                let entry = (l.address.clone(), port);
+                if !tcp_listeners.contains(&entry) {
+                    tcp_listeners.push(entry);
+                }
+            }
+        }
+        tcp_listeners.sort();
         return Some(crate::nixgen::IngressNix {
             listen_addresses: gw.listeners.iter().map(|l| l.address.clone()).collect(),
             http3: gw.listeners.iter().any(|l| l.http3),
             acme_email: gw.tls.acme.email.clone(),
             vip,
+            tcp_listeners,
+            dns_credentials: gw.tls.acme.dns01.is_some(),
         });
     }
     None

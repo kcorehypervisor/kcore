@@ -831,6 +831,26 @@ enum IngressAction {
         #[command(subcommand)]
         action: IngressWafAction,
     },
+    /// Secrets the gateway reads from disk
+    Secret {
+        #[command(subcommand)]
+        action: IngressSecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum IngressSecretAction {
+    /// Write the DNS-01 credentials file (dns.env) on every gateway node
+    Set {
+        #[arg(long)]
+        gateway: String,
+        /// File name; only dns.env exists today
+        #[arg(long, default_value = "dns.env")]
+        name: String,
+        /// Read the content from this file, or `-` for stdin
+        #[arg(short = 'f', long = "filename")]
+        file: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2852,6 +2872,20 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::ingress::plan(&info, files, gateway.as_deref(), *show_config).await
+        }
+        Command::Ingress {
+            action:
+                IngressAction::Secret {
+                    action:
+                        IngressSecretAction::Set {
+                            gateway,
+                            name,
+                            file,
+                        },
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::secret_set(&info, gateway, name, file).await
         }
         Command::Ingress {
             action:

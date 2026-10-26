@@ -111,10 +111,52 @@ container's address instead.
 
 ## Certificates
 
-Certificates come from ACME with HTTP-01 and TLS-ALPN-01. Caddy keeps them in
-`/var/lib/kcore/ingress/certmagic` on each gateway node. Hostnames are the union
-of the `hosts` of the gateway's routes. Wildcard hosts need DNS-01, which is not
-available yet.
+Certificates come from ACME. HTTP-01 and TLS-ALPN-01 are the defaults. Caddy
+keeps the certificates in `/var/lib/kcore/ingress/certmagic` on each gateway
+node. Hostnames are the union of the `hosts` of the gateway's HTTP routes.
+
+### Wildcards and DNS-01
+
+A wildcard host such as `*.apps.example.com` needs a DNS-01 provider on the
+gateway:
+
+```yaml
+spec:
+  tls:
+    acme:
+      email: ops@example.com
+      dns01:
+        provider: cloudflare        # cloudflare | route53 | rfc2136
+```
+
+Give each gateway node the provider's credentials as an environment file. The
+file is written with mode 0600 outside the Nix store and never logged:
+
+```bash
+printf 'CLOUDFLARE_API_TOKEN=%s\n' "$TOKEN" | kctl ingress secret set --gateway edge -f -
+```
+
+Variables read by each provider: `CLOUDFLARE_API_TOKEN`; the standard `AWS_*`
+variables for route53; `RFC2136_SERVER`, `RFC2136_KEY_NAME`, `RFC2136_KEY_ALG`
+and `RFC2136_KEY` for rfc2136. Wildcard names use DNS-01 and the other names
+keep using the challenges the gateway lists. List only `dns-01` in
+`challenges` to use DNS-01 for every name.
+
+## TCP routes and TLS passthrough
+
+`kind: tcp` forwards raw TCP to its backends, for Postgres, SSH bastions and
+similar. Add `hosts` to match by SNI and pass TLS through untouched. The route
+needs a `port` that one of the gateway's listeners carries (not 80 or 443), and
+the firewall opens it on exactly those addresses. The WAF does not inspect TCP
+routes and `plan` says so. See [route-tcp.yaml](../../examples/ingress/route-tcp.yaml).
+
+## TLS to backends and the PROXY protocol
+
+`backendTls` on a path re-encrypts to the backend and always verifies it:
+`caBundle: system` uses the public CAs, or give a PEM bundle for a private CA.
+There is no option to skip verification. Set `serverName` to the name in the
+backend's certificate. `proxyProtocol: true` sends the PROXY protocol v2 header
+to the backend, on a path or on a TCP route.
 
 ## High availability
 
@@ -126,8 +168,9 @@ obtain them; shared certificate storage is not available yet.
 
 ## Limits today
 
-- Active/active gateways, wildcard certificates, TCP routes, TLS to backends,
-  Kubernetes `Ingress` objects and shared certificate storage are not built yet.
+- Active/active gateways, Kubernetes `Ingress` objects and shared certificate
+  storage are not built yet. `backendTls` with the cluster CA (`kcore-pki`) is
+  not available either: give the PEM.
 - A gateway binds a public address on a hypervisor host. The service runs as a
   dynamic user with only `CAP_NET_BIND_SERVICE`, and its admin socket is
   reachable by root only.

@@ -6,13 +6,15 @@
 //! Coraza directives. Neither touches the database or the network, so both are
 //! covered by golden files under `tests/fixtures/ingress/`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aws_lc_rs::digest;
+use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 use crate::ingress_spec::{
-    acme_directory_url, Backend, GatewaySpec, PathSpec, RouteSpec, WafExclusion, WafPolicySpec,
+    acme_directory_url, is_wildcard_host, pem_certificates, Backend, BackendTls, GatewaySpec,
+    PathSpec, RouteKind, RouteSpec, WafExclusion, WafPolicySpec,
 };
 
 /// Where the node-local pieces live; supplied by the node's Nix module values.
@@ -55,9 +57,16 @@ pub struct Rendered {
 
 pub fn render_caddy(input: &RenderInput<'_>) -> Result<Rendered, String> {
     let gw = input.gateway;
+    // Ports owned by TCP routes belong to the layer-4 app, not the HTTP server.
+    let tcp_ports: BTreeSet<u16> = input
+        .routes
+        .values()
+        .filter(|r| r.kind == RouteKind::Tcp)
+        .filter_map(|r| r.port)
+        .collect();
     let mut listen = Vec::new();
     for l in &gw.listeners {
-        for port in &l.ports {
+        for port in l.ports.iter().filter(|p| !tcp_ports.contains(p)) {
             listen.push(Value::String(format!(
                 "{}:{port}",
                 host_port_addr(&l.address)
@@ -67,9 +76,14 @@ pub fn render_caddy(input: &RenderInput<'_>) -> Result<Rendered, String> {
     let http3 = gw.listeners.iter().any(|l| l.http3);
 
     let mut routes = Vec::new();
+    let mut tcp_routes: Vec<(&String, &RouteSpec)> = Vec::new();
     let mut subjects = Vec::new();
     let mut any_redirect = false;
     for (name, route) in input.routes {
+        if route.kind == RouteKind::Tcp {
+            tcp_routes.push((name, route));
+            continue;
+        }
         any_redirect |= route.redirect_http;
         let mut hosts: Vec<String> = route.hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
         hosts.sort();
@@ -115,6 +129,9 @@ pub fn render_caddy(input: &RenderInput<'_>) -> Result<Rendered, String> {
             }
         }}),
     );
+    if !tcp_routes.is_empty() {
+        apps.insert("layer4".into(), render_layer4(input, &tcp_routes)?);
+    }
     if !subjects.is_empty() {
         apps.insert("tls".into(), render_tls(gw, &subjects));
     }
@@ -141,28 +158,137 @@ pub fn render_caddy(input: &RenderInput<'_>) -> Result<Rendered, String> {
     Ok(Rendered { json, hash })
 }
 
+/// One layer-4 server per TCP port. Routes with SNI names come before the
+/// catch-all so a specific name is never shadowed.
+fn render_layer4(
+    input: &RenderInput<'_>,
+    tcp_routes: &[(&String, &RouteSpec)],
+) -> Result<Value, String> {
+    let mut by_port: BTreeMap<u16, Vec<(&String, &RouteSpec)>> = BTreeMap::new();
+    for (name, r) in tcp_routes {
+        let port = r
+            .port
+            .ok_or_else(|| format!("tcp route {name} has no port"))?;
+        by_port.entry(port).or_default().push((name, r));
+    }
+    let mut servers = Map::new();
+    for (port, mut routes) in by_port {
+        let listen: Vec<String> = input
+            .gateway
+            .listeners
+            .iter()
+            .filter(|l| l.ports.contains(&port))
+            .map(|l| format!("{}:{port}", host_port_addr(&l.address)))
+            .collect();
+        if listen.is_empty() {
+            return Err(format!("no gateway listener carries tcp port {port}"));
+        }
+        routes.sort_by_key(|(name, r)| (r.hosts.is_empty(), (*name).clone()));
+        let mut rendered = Vec::new();
+        for (name, r) in routes {
+            let mut dials = Vec::new();
+            for b in &r.backends {
+                dials.extend(resolve(input, name, "tcp", b)?);
+            }
+            dials.sort();
+            dials.dedup();
+            let mut proxy = Map::new();
+            proxy.insert("handler".into(), json!("proxy"));
+            proxy.insert(
+                "upstreams".into(),
+                Value::Array(dials.iter().map(|d| json!({"dial": [d]})).collect()),
+            );
+            if r.proxy_protocol {
+                proxy.insert("proxy_protocol".into(), json!("v2"));
+            }
+            let mut route = Map::new();
+            if !r.hosts.is_empty() {
+                let mut sni: Vec<String> = r.hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
+                sni.sort();
+                route.insert("match".into(), json!([{"tls": {"sni": sni}}]));
+            }
+            route.insert("handle".into(), json!([Value::Object(proxy)]));
+            rendered.push(Value::Object(route));
+        }
+        servers.insert(
+            format!("tcp-{port}"),
+            json!({"listen": listen, "routes": rendered}),
+        );
+    }
+    Ok(json!({"servers": Value::Object(servers)}))
+}
+
+fn dns_provider(provider: &str) -> Value {
+    match provider {
+        "cloudflare" => json!({"name": "cloudflare", "api_token": "{env.CLOUDFLARE_API_TOKEN}"}),
+        "rfc2136" => json!({
+            "name": "rfc2136",
+            "server": "{env.RFC2136_SERVER}",
+            "key_name": "{env.RFC2136_KEY_NAME}",
+            "key_alg": "{env.RFC2136_KEY_ALG}",
+            "key": "{env.RFC2136_KEY}"
+        }),
+        // route53 reads the standard AWS_* variables from the credentials file.
+        other => json!({"name": other}),
+    }
+}
+
+/// ACME automation policies. Wildcard names need DNS-01. Other names use the
+/// HTTP challenges when the gateway enables them, and DNS-01 when `dns-01` is
+/// the only challenge listed.
 fn render_tls(gw: &GatewaySpec, subjects: &[String]) -> Value {
     let acme = &gw.tls.acme;
-    let mut issuer = Map::new();
-    issuer.insert("module".into(), json!("acme"));
-    issuer.insert("email".into(), json!(acme.email));
-    issuer.insert("ca".into(), json!(acme_directory_url(&acme.ca)));
-    let mut challenges = Map::new();
-    if !acme.challenges.iter().any(|c| c == "http-01") {
+    let enabled = |c: &str| acme.challenges.iter().any(|x| x == c);
+    let http_enabled = enabled("http-01") || enabled("tls-alpn-01");
+    let (wild, plain): (Vec<&String>, Vec<&String>) =
+        subjects.iter().partition(|s| is_wildcard_host(s));
+    let (std_subjects, dns_subjects): (Vec<&String>, Vec<&String>) = if http_enabled {
+        (plain, wild)
+    } else {
+        (Vec::new(), subjects.iter().collect())
+    };
+
+    let issuer = |challenges: Map<String, Value>| {
+        let mut issuer = Map::new();
+        issuer.insert("module".into(), json!("acme"));
+        issuer.insert("email".into(), json!(acme.email));
+        issuer.insert("ca".into(), json!(acme_directory_url(&acme.ca)));
+        if !challenges.is_empty() {
+            issuer.insert("challenges".into(), Value::Object(challenges));
+        }
+        Value::Object(issuer)
+    };
+
+    let mut policies = Vec::new();
+    if !std_subjects.is_empty() {
+        let mut challenges = Map::new();
+        if !enabled("http-01") {
+            challenges.insert("http".into(), json!({"disabled": true}));
+        }
+        if !enabled("tls-alpn-01") {
+            challenges.insert("tls-alpn".into(), json!({"disabled": true}));
+        }
+        policies.push(json!({
+            "subjects": std_subjects,
+            "issuers": [issuer(challenges)]
+        }));
+    }
+    if !dns_subjects.is_empty() {
+        let provider = acme
+            .dns01
+            .as_ref()
+            .map(|d| dns_provider(&d.provider))
+            .unwrap_or(Value::Null);
+        let mut challenges = Map::new();
+        challenges.insert("dns".into(), json!({"provider": provider}));
         challenges.insert("http".into(), json!({"disabled": true}));
-    }
-    if !acme.challenges.iter().any(|c| c == "tls-alpn-01") {
         challenges.insert("tls-alpn".into(), json!({"disabled": true}));
+        policies.push(json!({
+            "subjects": dns_subjects,
+            "issuers": [issuer(challenges)]
+        }));
     }
-    if !challenges.is_empty() {
-        issuer.insert("challenges".into(), Value::Object(challenges));
-    }
-    json!({
-        "automation": {"policies": [{
-            "subjects": subjects,
-            "issuers": [Value::Object(issuer)]
-        }]}
-    })
+    json!({"automation": {"policies": policies}})
 }
 
 fn render_route(
@@ -284,6 +410,17 @@ fn render_proxy(input: &RenderInput<'_>, route: &str, path: &PathSpec) -> Result
         Value::Array(dials.iter().map(|d| json!({"dial": d})).collect()),
     );
     proxy.insert("load_balancing".into(), Value::Object(lb));
+    if path.backend_tls.is_some() || path.proxy_protocol {
+        let mut transport = Map::new();
+        transport.insert("protocol".into(), json!("http"));
+        if let Some(t) = &path.backend_tls {
+            transport.insert("tls".into(), render_backend_tls(t));
+        }
+        if path.proxy_protocol {
+            transport.insert("proxy_protocol".into(), json!("v2"));
+        }
+        proxy.insert("transport".into(), Value::Object(transport));
+    }
     if let Some(h) = &path.health_check {
         proxy.insert(
             "health_checks".into(),
@@ -295,6 +432,26 @@ fn render_proxy(input: &RenderInput<'_>, route: &str, path: &PathSpec) -> Result
         );
     }
     Ok(Value::Object(proxy))
+}
+
+/// Upstream TLS settings. Verification is always on; a private CA is given as
+/// an inline pool of DER certificates.
+fn render_backend_tls(t: &BackendTls) -> Value {
+    let mut tls = Map::new();
+    if let Some(name) = &t.server_name {
+        tls.insert("server_name".into(), json!(name));
+    }
+    if t.ca_bundle != "system" {
+        let certs: Vec<String> = pem_certificates(&t.ca_bundle)
+            .iter()
+            .map(|der| base64::engine::general_purpose::STANDARD.encode(der))
+            .collect();
+        tls.insert(
+            "ca".into(),
+            json!({"provider": "inline", "trusted_ca_certs": certs}),
+        );
+    }
+    Value::Object(tls)
 }
 
 fn resolve(
@@ -606,5 +763,135 @@ mod tests {
     fn ipv6_listener_is_bracketed() {
         assert_eq!(host_port_addr("2001:db8::1"), "[2001:db8::1]");
         assert_eq!(host_port_addr("203.0.113.10"), "203.0.113.10");
+    }
+
+    const GATEWAY_MULTI: &str = include_str!("../../../tests/fixtures/ingress/gateway-multi.json");
+    const ROUTE_PAY: &str = include_str!("../../../tests/fixtures/ingress/route-pay.json");
+    const ROUTE_DB: &str = include_str!("../../../tests/fixtures/ingress/route-db.json");
+    const ROUTE_SNI: &str = include_str!("../../../tests/fixtures/ingress/route-sni.json");
+    const GOLDEN_MULTI: &str =
+        include_str!("../../../tests/fixtures/ingress/caddy-multi.golden.json");
+
+    fn render_multi() -> Rendered {
+        let gateway = parse_gateway(GATEWAY_MULTI).unwrap();
+        let routes = BTreeMap::from([
+            ("pay".to_string(), parse_route(ROUTE_PAY).unwrap()),
+            ("db".to_string(), parse_route(ROUTE_DB).unwrap()),
+            ("sni".to_string(), parse_route(ROUTE_SNI).unwrap()),
+        ]);
+        let backends = BTreeMap::new();
+        let policies = BTreeMap::new();
+        let paths = NodePaths::default();
+        render_caddy(&RenderInput {
+            gateway: &gateway,
+            routes: &routes,
+            waf_policies: &policies,
+            backends: &backends,
+            paths: &paths,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn multi_matches_golden_file() {
+        let got = render_multi();
+        if std::env::var_os("KCORE_UPDATE_GOLDEN").is_some() {
+            std::fs::write(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/ingress/caddy-multi.golden.json"
+                ),
+                &got.json,
+            )
+            .unwrap();
+        }
+        assert_eq!(got.json.trim_end(), GOLDEN_MULTI.trim_end());
+    }
+
+    #[test]
+    fn tcp_ports_leave_the_http_server() {
+        let v: Value = serde_json::from_str(&render_multi().json).unwrap();
+        let http: Vec<&str> = v["apps"]["http"]["servers"]["kcore"]["listen"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap())
+            .collect();
+        assert_eq!(http, ["203.0.113.10:80", "203.0.113.10:443"]);
+        let l4 = &v["apps"]["layer4"]["servers"];
+        assert_eq!(l4["tcp-5432"]["listen"][0], "203.0.113.10:5432");
+        let handler = &l4["tcp-5432"]["routes"][0]["handle"][0];
+        assert_eq!(handler["handler"], "proxy");
+        assert_eq!(handler["proxy_protocol"], "v2");
+        assert_eq!(handler["upstreams"][0]["dial"][0], "10.0.0.8:5432");
+        // SNI passthrough matches on the ClientHello and has no catch-all.
+        assert_eq!(
+            l4["tcp-8443"]["routes"][0]["match"][0]["tls"]["sni"][0],
+            "pg.example.com"
+        );
+    }
+
+    #[test]
+    fn wildcard_uses_dns01_and_plain_hosts_use_http() {
+        let v: Value = serde_json::from_str(&render_multi().json).unwrap();
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .unwrap();
+        assert_eq!(policies.len(), 2);
+        let std = &policies[0];
+        assert_eq!(std["subjects"], json!(["pay.example.com"]));
+        assert!(std["issuers"][0]["challenges"]["dns"].is_null());
+        let dns = &policies[1];
+        assert_eq!(dns["subjects"], json!(["*.apps.example.com"]));
+        assert_eq!(
+            dns["issuers"][0]["challenges"]["dns"]["provider"]["name"],
+            "cloudflare"
+        );
+        assert_eq!(dns["issuers"][0]["challenges"]["http"]["disabled"], true);
+        // Passthrough hosts get no certificate: the backend terminates TLS.
+        assert!(!serde_json::to_string(&v["apps"]["tls"])
+            .unwrap()
+            .contains("pg.example.com"));
+    }
+
+    #[test]
+    fn backend_tls_and_proxy_protocol_reach_the_transport() {
+        let v: Value = serde_json::from_str(&render_multi().json).unwrap();
+        let proxy = &v["apps"]["http"]["servers"]["kcore"]["routes"][0]["handle"][0];
+        let transport = if proxy["handler"] == "reverse_proxy" {
+            &proxy["transport"]
+        } else {
+            &v["apps"]["http"]["servers"]["kcore"]["routes"][0]["handle"][1]["transport"]
+        };
+        assert_eq!(transport["protocol"], "http");
+        assert_eq!(transport["proxy_protocol"], "v2");
+        assert_eq!(transport["tls"]["server_name"], "payments.internal");
+        assert_eq!(transport["tls"]["ca"]["provider"], "inline");
+        assert!(transport["tls"]["ca"]["trusted_ca_certs"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("MII"));
+    }
+
+    #[test]
+    fn dns_only_gateway_puts_every_host_on_dns01() {
+        let mut gateway = parse_gateway(GATEWAY_MULTI).unwrap();
+        gateway.tls.acme.challenges = vec!["dns-01".into()];
+        let routes = BTreeMap::from([("pay".to_string(), parse_route(ROUTE_PAY).unwrap())]);
+        let paths = NodePaths::default();
+        let out = render_caddy(&RenderInput {
+            gateway: &gateway,
+            routes: &routes,
+            waf_policies: &BTreeMap::new(),
+            backends: &BTreeMap::new(),
+            paths: &paths,
+        })
+        .unwrap();
+        let v: Value = serde_json::from_str(&out.json).unwrap();
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0]["subjects"].as_array().unwrap().len(), 2);
     }
 }

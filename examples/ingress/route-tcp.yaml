@@ -1,0 +1,16 @@
+# Raw TCP (here Postgres) through the gateway. TCP routes are not inspected by
+# the WAF. The gateway must have a listener that carries the port.
+#
+# With `hosts` the route passes TLS through by SNI instead: the backend, not the
+# gateway, terminates TLS and holds the certificate.
+kind: IngressRoute
+metadata:
+  name: db
+spec:
+  gateway: edge
+  kind: tcp
+  port: 5432
+  proxyProtocol: true
+  backends:
+    - kind: external
+      address: 10.0.0.9:5432

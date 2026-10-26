@@ -843,4 +843,68 @@ impl ControllerService {
             accepted: accepted as i32,
         }))
     }
+
+    pub(super) async fn ingress_set_secret(
+        &self,
+        request: Request<pb::SetIngressSecretRequest>,
+    ) -> Result<Response<pb::SetIngressSecretResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = req.name.trim().to_string();
+        // Only the DNS-01 credentials file exists today; refusing other names
+        // keeps this from becoming an arbitrary root file writer.
+        if name != ingress_spec::DNS_SECRET_NAME {
+            return Err(Status::invalid_argument(format!(
+                "secret name must be {}",
+                ingress_spec::DNS_SECRET_NAME
+            )));
+        }
+        if req.content.is_empty() || req.content.len() > 16 * 1024 {
+            return Err(Status::invalid_argument("secret must be 1 byte to 16 KiB"));
+        }
+        let gateway = req.gateway.trim().to_string();
+        let row = self
+            .db
+            .get_ingress_gateway(&gateway)
+            .map_err(internal)?
+            .ok_or_else(|| Status::not_found(format!("IngressGateway '{gateway}' not found")))?;
+        let spec = ingress_spec::parse_gateway(&row.spec_json).map_err(Status::internal)?;
+        let nodes = self.db.list_nodes().map_err(internal)?;
+        let mut written = Vec::new();
+        for n in &spec.nodes {
+            let node = nodes
+                .iter()
+                .find(|row| &row.id == n || &row.hostname == n)
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!("node {n} is not registered"))
+                })?;
+            let mut admin = self.ensure_admin_client_for_node(node).await?;
+            admin
+                .write_ingress_secret(crate::node_proto::WriteIngressSecretRequest {
+                    name: name.clone(),
+                    content: req.content.clone(),
+                })
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!(
+                        "writing the secret on {}: {}",
+                        node.id,
+                        e.message()
+                    ))
+                })?;
+            written.push(node.id.clone());
+        }
+        // The content is never logged or audited, only the fact and the targets.
+        self.record_audit(
+            &actor,
+            "SetIngressSecret",
+            &gateway,
+            format!("name={name} nodes={}", written.join(",")),
+        );
+        Ok(Response::new(pb::SetIngressSecretResponse {
+            success: true,
+            nodes: written,
+        }))
+    }
 }

@@ -29,6 +29,7 @@ let
   keepalivedNotrack = import ./kcore-keepalived-notrack.nix { inherit pkgs; };
 
   listenerAddresses = lib.unique cfg.listenAddresses;
+  tcpListeners = cfg.tcpListeners;
   tcpPorts = [
     80
     443
@@ -41,7 +42,10 @@ let
       lib.concatMapStrings (addr: ''
         ip daddr ${addr} udp dport 443 accept comment "kcore-ingress-http3"
       '') listenerAddresses
-    );
+    )
+    + lib.concatMapStrings (l: ''
+      ip daddr ${l.address} tcp dport ${toString l.port} accept comment "kcore-ingress-tcp"
+    '') tcpListeners;
   iptablesRules =
     verb:
     lib.concatMapStrings (
@@ -56,7 +60,12 @@ let
           lib.optionalString (verb == "D") "|| true"
         }
       ''
-    ) listenerAddresses;
+    ) listenerAddresses
+    + lib.concatMapStrings (l: ''
+      iptables -${verb} nixos-fw -d ${lib.escapeShellArg l.address} -p tcp --dport ${toString l.port} -j nixos-fw-accept ${
+        lib.optionalString (verb == "D") "|| true"
+      }
+    '') tcpListeners;
 
   peers = lib.filter (ip: ip != cfg.vip.sourceAddress) cfg.vip.peers;
   keepalivedConf = pkgs.writeText "keepalived-ingress.conf" ''
@@ -110,6 +119,25 @@ in
         Addresses the gateway listens on (a VIP or an address on this node).
         The firewall opens ports 80 and 443 on exactly these destinations.
       '';
+    };
+
+    tcpListeners = lib.mkOption {
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            address = lib.mkOption {
+              type = lib.types.str;
+              description = "Address the TCP route listens on.";
+            };
+            port = lib.mkOption {
+              type = lib.types.port;
+              description = "TCP port of the route.";
+            };
+          };
+        }
+      );
+      default = [ ];
+      description = "Address and port pairs carried by layer-4 (TCP) routes; opened in the firewall.";
     };
 
     http3 = lib.mkOption {
