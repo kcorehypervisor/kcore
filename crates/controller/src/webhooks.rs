@@ -41,6 +41,9 @@ pub const EVENT_NODE_LOST: &str = "node.lost";
 pub const EVENT_VM_FAILOVER_STARTED: &str = "vm.failover.started";
 pub const EVENT_VM_FAILOVER_COMPLETED: &str = "vm.failover.completed";
 pub const EVENT_VM_FAILOVER_FAILED: &str = "vm.failover.failed";
+pub const EVENT_INGRESS_WAF_BLOCKED: &str = "ingress.waf.blocked";
+pub const EVENT_INGRESS_WAF_DETECTED: &str = "ingress.waf.detected";
+pub const EVENT_INGRESS_VIP_MOVED: &str = "ingress.vip.moved";
 
 pub const KNOWN_EVENTS: &[&str] = &[
     EVENT_NODE_HEARTBEAT_MISSED,
@@ -53,6 +56,9 @@ pub const KNOWN_EVENTS: &[&str] = &[
     EVENT_VM_FAILOVER_STARTED,
     EVENT_VM_FAILOVER_COMPLETED,
     EVENT_VM_FAILOVER_FAILED,
+    EVENT_INGRESS_WAF_BLOCKED,
+    EVENT_INGRESS_WAF_DETECTED,
+    EVENT_INGRESS_VIP_MOVED,
 ];
 
 const QUEUE_CAPACITY: usize = 256;

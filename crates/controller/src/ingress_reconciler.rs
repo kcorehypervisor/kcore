@@ -429,26 +429,35 @@ pub fn ingress_nix_for_node(
 
 // -------------------------------------------------------------- reconciler
 
-pub fn spawn_ingress_reconciler(db: Database, clients: NodeClients) {
+pub fn spawn_ingress_reconciler(
+    db: Database,
+    clients: NodeClients,
+    webhooks: crate::webhooks::Dispatcher,
+) {
     tokio::spawn(async move {
         let mut ticker = time::interval(RECONCILE_TICK);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Err(error) = reconcile_once(&db, &clients).await {
+            if let Err(error) = reconcile_once(&db, &clients, &webhooks).await {
                 warn!(%error, "ingress reconcile tick failed");
             }
         }
     });
 }
 
-async fn reconcile_once(db: &Database, clients: &NodeClients) -> Result<(), String> {
+async fn reconcile_once(
+    db: &Database,
+    clients: &NodeClients,
+    webhooks: &crate::webhooks::Dispatcher,
+) -> Result<(), String> {
     let st = load_state(db)?;
     for name in st.gateways.keys() {
-        if let Err(error) = reconcile_gateway(db, clients, &st, name).await {
+        if let Err(error) = reconcile_gateway(db, clients, webhooks, &st, name).await {
             warn!(gateway = %name, %error, "ingress gateway reconcile failed");
         }
     }
+    crate::ingress_events::flush_waf_events(webhooks);
     let cutoff = now_unix() - WAF_EVENT_RETENTION_SECS;
     if let Err(e) = db.prune_waf_events(cutoff) {
         debug!(error = %e, "waf event prune failed");
@@ -491,6 +500,7 @@ pub struct UpstreamJson {
 async fn reconcile_gateway(
     db: &Database,
     clients: &NodeClients,
+    webhooks: &crate::webhooks::Dispatcher,
     st: &IngressState,
     name: &str,
 ) -> Result<(), String> {
@@ -517,6 +527,18 @@ async fn reconcile_gateway(
     for node in &plan.nodes {
         statuses.push(reconcile_node(clients, node, rendered).await);
     }
+    let previous: Vec<NodeStatusJson> = db
+        .get_ingress_gateway_status(name)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s.nodes_json).ok())
+        .unwrap_or_default();
+    crate::ingress_events::emit_vip_move(
+        webhooks,
+        name,
+        crate::ingress_events::vip_holder(&previous).as_ref(),
+        crate::ingress_events::vip_holder(&statuses).as_ref(),
+    );
     let ready = statuses.iter().filter(|s| s.healthy).count();
     let phase = if ready == statuses.len() {
         "ready"

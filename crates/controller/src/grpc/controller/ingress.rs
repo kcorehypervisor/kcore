@@ -839,6 +839,15 @@ impl ControllerService {
             })
             .collect();
         let accepted = self.db.insert_waf_events(&rows).map_err(internal)?;
+        for r in &rows {
+            crate::ingress_events::record_waf_event(
+                &r.gateway,
+                &r.route,
+                r.action == "blocked",
+                r.rule_id,
+                &r.client_ip,
+            );
+        }
         Ok(Response::new(pb::ReportWafEventsResponse {
             accepted: accepted as i32,
         }))

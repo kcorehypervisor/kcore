@@ -22,6 +22,7 @@ mod grpc;
 mod guest_ops;
 mod ha;
 mod host_volume;
+mod ingress_events;
 mod ingress_reconciler;
 mod ingress_render;
 mod ingress_spec;
@@ -213,7 +214,6 @@ async fn main() -> anyhow::Result<()> {
     ceph_cluster_reconciler::spawn_ceph_cluster_reconciler(database.clone(), clients.clone());
     shared_filesystem_reconciler::spawn_shared_filesystem_reconciler(database.clone());
     object_store_reconciler::spawn_object_store_reconciler(database.clone());
-    ingress_reconciler::spawn_ingress_reconciler(database.clone(), clients.clone());
     cluster_update_reconciler::spawn_cluster_update_reconciler(database.clone(), clients.clone());
     snapshot_policy_reconciler::spawn_snapshot_policy_reconciler(database.clone(), clients.clone());
     vm_operation_reconciler::spawn_vm_operation_reconciler(database.clone(), clients.clone());
@@ -268,6 +268,11 @@ async fn main() -> anyhow::Result<()> {
 
     let webhooks =
         webhooks::Dispatcher::spawn(&cfg.webhooks, webhooks::EventSource::from_config(&cfg));
+    ingress_reconciler::spawn_ingress_reconciler(
+        database.clone(),
+        clients.clone(),
+        webhooks.clone(),
+    );
 
     cert_rotation_reconciler::spawn_cert_rotation_reconciler(
         cert_rotation_reconciler::CertRotationContext {
