@@ -215,13 +215,33 @@ to the backend, on a path or on a TCP route.
 
 List two nodes and add `highAvailability` with a VIP that is one of the listener
 addresses. keepalived holds the VIP on one node (the first listed is preferred),
-and the node that holds it is shown in `kctl describe ingress-gateway`. Each
-node keeps its own certificates, so after a failover the standby may need to
-obtain them; shared certificate storage is not available yet.
+and the node that holds it is shown in `kctl describe ingress-gateway`. A VIP
+move fires the `ingress.vip.moved` webhook.
+
+Set `tls.storage: replicated` so a failover does not mean new certificates:
+
+```yaml
+spec:
+  tls:
+    storage: replicated
+```
+
+The controller copies the VIP holder's certificate store (certificates and ACME
+account keys, never locks) to the standby whenever they differ. Only the node
+that holds the VIP, or one that already has every certificate, runs ACME; a
+standby without the certificates yet gets a configuration with certificate
+management off, so it never attempts a challenge that the other node would
+receive. After a failover the new holder already has the certificates and
+carries on.
+
+`tls.storage: shared-filesystem` (a CephFS mount) is not available: nodes do not
+mount a `SharedFilesystem` yet. If the holder fails right after renewing and
+before the copy, the standby serves the previous certificate, which is still
+valid for at least 30 days under default renewal timing.
 
 ## Limits today
 
-- Active/active gateways and shared certificate storage are not built yet.
+- Active/active gateways and CephFS-backed certificate storage are not built yet.
   Gateway API `HTTPRoute` is not served; only `Ingress`. `backendTls` with the cluster CA (`kcore-pki`) is
   not available either: give the PEM.
 - A gateway binds a public address on a hypervisor host. The service runs as a

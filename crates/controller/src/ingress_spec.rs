@@ -66,8 +66,18 @@ pub struct HighAvailability {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GatewayTls {
     pub acme: Acme,
+    /// Where certificates are kept: `local` (each node its own) or
+    /// `replicated` (two nodes; the controller copies the VIP holder's store to
+    /// the standby, and only a node that holds the VIP, or already has every
+    /// certificate, runs ACME).
+    #[serde(default = "default_storage")]
+    pub storage: String,
     #[serde(default = "default_min_tls")]
     pub min_version: String,
+}
+
+fn default_storage() -> String {
+    "local".into()
 }
 
 fn default_min_tls() -> String {
@@ -590,6 +600,22 @@ pub fn validate_gateway(spec: &GatewaySpec) -> Result<(), String> {
         && !spec.listeners.iter().any(|l| l.ports.contains(&443))
     {
         return Err("tls-alpn-01 needs a listener on port 443".into());
+    }
+    match spec.tls.storage.as_str() {
+        "local" => {}
+        "replicated" => {
+            if spec.high_availability.is_none() {
+                return Err("tls.storage replicated needs highAvailability (two nodes)".into());
+            }
+        }
+        "shared-filesystem" => {
+            return Err(
+                "tls.storage shared-filesystem is not available: nodes do not mount a \
+                 SharedFilesystem yet; use replicated"
+                    .into(),
+            )
+        }
+        other => return Err(format!("tls.storage {other:?} must be local or replicated")),
     }
     if let Some(k) = &spec.kubernetes {
         if k.ingress_controller && k.clusters.is_empty() {
@@ -1237,5 +1263,58 @@ mod tests {
             ca_bundle: include_str!("../../../tests/fixtures/ingress/backend-ca.pem").into(),
         });
         validate_route(&r).unwrap();
+    }
+
+    #[test]
+    fn storage_modes_are_checked() {
+        let mut g = gateway();
+        g.tls.storage = "replicated".into();
+        assert!(validate_gateway(&g)
+            .unwrap_err()
+            .contains("highAvailability"));
+        g.nodes = vec!["a".into(), "b".into()];
+        g.high_availability = Some(HighAvailability {
+            vip_address: "203.0.113.10".into(),
+            vip_interface: "eno1".into(),
+            virtual_router_id: 61,
+        });
+        validate_gateway(&g).unwrap();
+        g.tls.storage = "shared-filesystem".into();
+        assert!(validate_gateway(&g).unwrap_err().contains("not available"));
+        g.tls.storage = "ceph".into();
+        assert!(validate_gateway(&g).is_err());
+    }
+
+    #[test]
+    fn kubernetes_backends_and_controller_settings_validate() {
+        let mut r = route();
+        r.paths[0].backends = vec![parse_backend(
+            r#"{"kind":"kubernetes","cluster":"lab","namespace":"shop","service":"api","port":"http"}"#,
+        )];
+        validate_route(&r).unwrap();
+        r.paths[0].backends = vec![parse_backend(
+            r#"{"kind":"kubernetes","cluster":"lab","namespace":"Shop","service":"api","port":8080,"endpoints":"nodePort"}"#,
+        )];
+        assert!(validate_route(&r).is_err(), "uppercase namespace");
+        r.paths[0].backends = vec![parse_backend(
+            r#"{"kind":"kubernetes","cluster":"lab","namespace":"shop","service":"api","port":0}"#,
+        )];
+        assert!(validate_route(&r).is_err(), "port 0");
+
+        let mut g = gateway();
+        g.kubernetes = Some(KubernetesIngress {
+            ingress_controller: true,
+            clusters: vec![],
+        });
+        assert!(validate_gateway(&g).is_err());
+        g.kubernetes = Some(KubernetesIngress {
+            ingress_controller: true,
+            clusters: vec!["lab".into()],
+        });
+        validate_gateway(&g).unwrap();
+    }
+
+    fn parse_backend(json: &str) -> Backend {
+        serde_json::from_str(json).unwrap()
     }
 }

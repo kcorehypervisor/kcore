@@ -121,6 +121,12 @@ pub struct Plan {
     pub warnings: Vec<String>,
     pub nodes: Vec<GatewayNode>,
     pub rendered: Option<Rendered>,
+    /// The same configuration without certificate management, for a standby
+    /// that has not received the holder's certificates. Only set for
+    /// `tls.storage: replicated`.
+    pub rendered_standby: Option<Rendered>,
+    /// Hostnames of the HTTP routes: the certificates a node must hold.
+    pub cert_hosts: BTreeSet<String>,
     /// Resolved dial addresses per route, for status reporting.
     pub route_dials: BTreeMap<String, Vec<String>>,
 }
@@ -330,17 +336,132 @@ pub fn plan_gateway(st: &IngressState, name: &str) -> Plan {
         return plan;
     }
     let paths = NodePaths::default();
-    match render_caddy(&RenderInput {
-        gateway,
-        routes: &routes,
-        waf_policies: &policies,
-        backends: &backends,
-        paths: &paths,
-    }) {
+    let render = |issue: bool| {
+        render_caddy(&RenderInput {
+            gateway,
+            routes: &routes,
+            waf_policies: &policies,
+            backends: &backends,
+            paths: &paths,
+            issue,
+        })
+    };
+    match render(true) {
         Ok(r) => plan.rendered = Some(r),
         Err(e) => plan.errors.push(e),
     }
+    if gateway.tls.storage == "replicated" {
+        match render(false) {
+            Ok(r) => plan.rendered_standby = Some(r),
+            Err(e) => plan.errors.push(e),
+        }
+    }
+    plan.cert_hosts = routes
+        .values()
+        .filter(|r| r.kind == RouteKind::Http)
+        .flat_map(|r| r.hosts.iter().map(|h| h.to_ascii_lowercase()))
+        .collect();
     plan
+}
+
+/// CertMagic stores `*.example.com` under `wildcard_.example.com`.
+pub fn normalize_cert_host(dir: &str) -> String {
+    match dir.strip_prefix("wildcard_.") {
+        Some(rest) => format!("*.{rest}"),
+        None => dir.to_ascii_lowercase(),
+    }
+}
+
+/// Whether `node_id` may obtain and renew certificates this tick. With a
+/// replicated store only the VIP holder (the first node while nobody holds it
+/// yet) may, plus any node that already has every certificate: loading what is
+/// in its store needs no challenge, and it must be ready to take over.
+pub fn node_may_issue(plan: &Plan, node_id: &str, previous: &[NodeStatusJson]) -> bool {
+    if plan.rendered_standby.is_none() {
+        return true;
+    }
+    let holder = crate::ingress_events::vip_holder(previous)
+        .map(|(id, _)| id)
+        .or_else(|| plan.nodes.first().map(|n| n.id.clone()));
+    if holder.as_deref() == Some(node_id) {
+        return true;
+    }
+    let have: BTreeSet<String> = previous
+        .iter()
+        .find(|s| s.node_id == node_id)
+        .map(|s| {
+            s.certs
+                .iter()
+                .map(|c| normalize_cert_host(&c.host))
+                .collect()
+        })
+        .unwrap_or_default();
+    !plan.cert_hosts.is_empty() && plan.cert_hosts.is_subset(&have)
+}
+
+/// The configuration to load on `node_id`.
+pub fn render_for_node<'a>(
+    plan: &'a Plan,
+    node_id: &str,
+    previous: &[NodeStatusJson],
+) -> Option<&'a Rendered> {
+    if node_may_issue(plan, node_id, previous) {
+        plan.rendered.as_ref()
+    } else {
+        plan.rendered_standby.as_ref().or(plan.rendered.as_ref())
+    }
+}
+
+/// True when the holder has a certificate the standby lacks or has an older
+/// copy of.
+pub fn certs_differ(holder: &[CertJson], standby: &[CertJson]) -> bool {
+    holder.iter().any(|h| {
+        !standby.iter().any(|s| {
+            normalize_cert_host(&s.host) == normalize_cert_host(&h.host)
+                && s.issuer == h.issuer
+                && s.not_after == h.not_after
+        })
+    })
+}
+
+/// Copies the holder's certificate store to the standby through the controller.
+async fn relay_store(
+    clients: &NodeClients,
+    from: &GatewayNode,
+    to: &GatewayNode,
+) -> Result<usize, String> {
+    for n in [from, to] {
+        if clients.get_admin(&n.address).is_none() {
+            clients
+                .connect(&n.address)
+                .await
+                .map_err(|e| format!("connect {}: {e}", n.id))?;
+        }
+    }
+    let mut src = clients
+        .get_admin(&from.address)
+        .ok_or("no connection to the holder")?;
+    let export = src
+        .export_ingress_store(node_proto::ExportIngressStoreRequest {})
+        .await
+        .map_err(|e| format!("export from {}: {}", from.id, e.message()))?
+        .into_inner();
+    let mut dst = clients
+        .get_admin(&to.address)
+        .ok_or("no connection to the standby")?;
+    let import = dst
+        .import_ingress_store(node_proto::ImportIngressStoreRequest {
+            archive: export.archive,
+            digest: export.digest,
+        })
+        .await
+        .map_err(|e| format!("import to {}: {}", to.id, e.message()))?
+        .into_inner();
+    if import.success {
+        Ok(import.files as usize)
+    } else {
+        Err(format!("import to {} refused: {}", to.id, import.message))
+    }
 }
 
 /// Resolves a backend to `ip:port` dial addresses. `external` is handled by the
@@ -604,16 +725,18 @@ async fn reconcile_gateway(
         return Ok(());
     };
 
-    let mut statuses = Vec::new();
-    for node in &plan.nodes {
-        statuses.push(reconcile_node(clients, node, rendered).await);
-    }
     let previous: Vec<NodeStatusJson> = db
         .get_ingress_gateway_status(name)
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s.nodes_json).ok())
         .unwrap_or_default();
+    let mut statuses = Vec::new();
+    for node in &plan.nodes {
+        let for_node = render_for_node(&plan, &node.id, &previous).unwrap_or(rendered);
+        statuses.push(reconcile_node(clients, node, for_node).await);
+    }
+    sync_replicated_store(clients, &plan, &statuses).await;
     crate::ingress_events::emit_vip_move(
         webhooks,
         name,
@@ -648,6 +771,35 @@ async fn reconcile_gateway(
     let route_phase = if phase == "ready" { "ready" } else { "pending" };
     mark_routes(db, st, name, route_phase, "", &statuses, &plan);
     Ok(())
+}
+
+/// With a replicated store, keeps the standby's certificates equal to the
+/// VIP holder's.
+async fn sync_replicated_store(clients: &NodeClients, plan: &Plan, statuses: &[NodeStatusJson]) {
+    if plan.rendered_standby.is_none() || statuses.len() != 2 {
+        return;
+    }
+    let Some(holder) = statuses.iter().find(|s| !s.vip_holder.is_empty()) else {
+        return;
+    };
+    let Some(standby) = statuses.iter().find(|s| s.node_id != holder.node_id) else {
+        return;
+    };
+    if !certs_differ(&holder.certs, &standby.certs) {
+        return;
+    }
+    let (Some(from), Some(to)) = (
+        plan.nodes.iter().find(|n| n.id == holder.node_id),
+        plan.nodes.iter().find(|n| n.id == standby.node_id),
+    ) else {
+        return;
+    };
+    match relay_store(clients, from, to).await {
+        Ok(files) => {
+            info!(from = %from.id, to = %to.id, files, "ingress certificate store replicated")
+        }
+        Err(error) => warn!(%error, "ingress certificate store replication failed"),
+    }
 }
 
 async fn reconcile_node(
@@ -1053,5 +1205,107 @@ mod tests {
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(plan.warnings.iter().any(|w| w.contains("already served")));
         assert!(plan.rendered.unwrap().json.contains("10.240.0.5:8080"));
+    }
+
+    fn ha_state() -> IngressState {
+        let mut st = state();
+        let gw = st.gateways.get_mut("edge").unwrap();
+        gw.nodes = vec!["node-1".into(), "node-2".into()];
+        gw.high_availability = Some(ingress_spec::HighAvailability {
+            vip_address: "203.0.113.10".into(),
+            vip_interface: "eno1".into(),
+            virtual_router_id: 61,
+        });
+        gw.tls.storage = "replicated".into();
+        // The VM is on node-1's NAT network: make it an external backend instead.
+        st.routes.get_mut("shop").unwrap().paths[0].backends = vec![Backend::External {
+            address: "192.168.40.50:80".into(),
+        }];
+        st
+    }
+
+    fn node_status(id: &str, holder: &str, hosts: &[&str]) -> NodeStatusJson {
+        NodeStatusJson {
+            node_id: id.into(),
+            vip_holder: holder.into(),
+            certs: hosts
+                .iter()
+                .map(|h| CertJson {
+                    host: (*h).into(),
+                    issuer: "acme".into(),
+                    not_after: "2027-01-01T00:00:00Z".into(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replicated_storage_renders_a_standby_without_certificate_management() {
+        let plan = plan_gateway(&ha_state(), "edge");
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        let primary = plan.rendered.as_ref().unwrap();
+        let standby = plan.rendered_standby.as_ref().unwrap();
+        assert_ne!(primary.hash, standby.hash);
+        assert!(primary.json.contains("\"automation\""));
+        assert!(!standby.json.contains("\"automation\""));
+        assert!(standby.json.contains("\"disable\": true"));
+        assert_eq!(
+            plan.cert_hosts,
+            BTreeSet::from(["shop.example.com".to_string()])
+        );
+        // A local store has no standby variant.
+        assert!(plan_gateway(&state(), "edge").rendered_standby.is_none());
+    }
+
+    #[test]
+    fn only_the_holder_or_a_fully_supplied_node_issues() {
+        let plan = plan_gateway(&ha_state(), "edge");
+        // Nobody holds the VIP yet: the first node issues, the second waits.
+        assert!(node_may_issue(&plan, "node-1", &[]));
+        assert!(!node_may_issue(&plan, "node-2", &[]));
+        // node-2 holds the VIP: it issues, node-1 waits until it has the certificates.
+        let prev = vec![
+            node_status("node-1", "", &[]),
+            node_status("node-2", "203.0.113.10", &["shop.example.com"]),
+        ];
+        assert!(node_may_issue(&plan, "node-2", &prev));
+        assert!(!node_may_issue(&plan, "node-1", &prev));
+        // Once node-1 holds the certificates it loads them (and can take over).
+        let prev = vec![
+            node_status("node-1", "", &["shop.example.com"]),
+            node_status("node-2", "203.0.113.10", &["shop.example.com"]),
+        ];
+        assert!(node_may_issue(&plan, "node-1", &prev));
+        let chosen = render_for_node(&plan, "node-1", &prev).unwrap();
+        assert_eq!(chosen.hash, plan.rendered.as_ref().unwrap().hash);
+        let waiting = render_for_node(&plan, "node-1", &[node_status("node-2", "x", &[])]).unwrap();
+        assert_eq!(waiting.hash, plan.rendered_standby.as_ref().unwrap().hash);
+    }
+
+    #[test]
+    fn certificate_comparison_ignores_wildcard_spelling() {
+        let cert = |host: &str, until: &str| CertJson {
+            host: host.into(),
+            issuer: "acme".into(),
+            not_after: until.into(),
+        };
+        let holder = vec![cert("wildcard_.apps.example.com", "2027-01-01T00:00:00Z")];
+        assert!(!certs_differ(
+            &holder,
+            &[cert("*.apps.example.com", "2027-01-01T00:00:00Z")]
+        ));
+        // A renewed certificate (new expiry) is a difference.
+        assert!(certs_differ(
+            &holder,
+            &[cert("*.apps.example.com", "2026-12-01T00:00:00Z")]
+        ));
+        assert!(certs_differ(&holder, &[]));
+        assert!(!certs_differ(&[], &[cert("a", "x")]));
+        assert_eq!(
+            normalize_cert_host("wildcard_.apps.example.com"),
+            "*.apps.example.com"
+        );
+        assert_eq!(normalize_cert_host("Shop.Example.com"), "shop.example.com");
     }
 }

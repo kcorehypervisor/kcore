@@ -247,10 +247,12 @@ impl ControllerService {
         let nodes = plan
             .rendered
             .as_ref()
-            .map(|r| {
+            .map(|primary| {
                 plan.nodes
                     .iter()
                     .map(|n| {
+                        let r = ingress_reconciler::render_for_node(&plan, &n.id, &applied)
+                            .unwrap_or(primary);
                         let applied_hash = applied
                             .iter()
                             .find(|a| a.node_id == n.id)

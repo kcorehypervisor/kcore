@@ -46,6 +46,10 @@ pub struct RenderInput<'a> {
     /// entry, or an empty list, is a render error rather than a silent drop.
     pub backends: &'a BTreeMap<String, Vec<String>>,
     pub paths: &'a NodePaths,
+    /// Whether this node may obtain and renew certificates. A standby that has
+    /// not yet received the holder's certificates must not try: its ACME
+    /// challenges would land on the other node and fail.
+    pub issue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,7 +114,10 @@ pub fn render_caddy(input: &RenderInput<'_>) -> Result<Rendered, String> {
     if http3 {
         server.insert("protocols".into(), json!(["h1", "h2", "h3"]));
     }
-    if !any_redirect {
+    if !input.issue {
+        // Without this Caddy would manage certificates for the route hosts anyway.
+        server.insert("automatic_https".into(), json!({"disable": true}));
+    } else if !any_redirect {
         server.insert("automatic_https".into(), json!({"disable_redirects": true}));
     }
     if gw.access_log {
@@ -132,7 +139,7 @@ pub fn render_caddy(input: &RenderInput<'_>) -> Result<Rendered, String> {
     if !tcp_routes.is_empty() {
         apps.insert("layer4".into(), render_layer4(input, &tcp_routes)?);
     }
-    if !subjects.is_empty() {
+    if !subjects.is_empty() && input.issue {
         apps.insert("tls".into(), render_tls(gw, &subjects));
     }
 
@@ -632,6 +639,7 @@ mod tests {
             waf_policies: &policies,
             backends: &backends(),
             paths: &paths,
+            issue: true,
         })
         .unwrap()
     }
@@ -740,6 +748,7 @@ mod tests {
             waf_policies: &policies,
             backends: &BTreeMap::new(),
             paths: &paths,
+            issue: true,
         })
         .unwrap_err();
         assert!(err.contains("no resolved address"), "{err}");
@@ -756,6 +765,7 @@ mod tests {
             waf_policies: &BTreeMap::new(),
             backends: &backends(),
             paths: &paths,
+            issue: true,
         })
         .unwrap_err();
         assert!(
@@ -793,6 +803,7 @@ mod tests {
             waf_policies: &policies,
             backends: &backends,
             paths: &paths,
+            issue: true,
         })
         .unwrap()
     }
@@ -890,6 +901,7 @@ mod tests {
             waf_policies: &BTreeMap::new(),
             backends: &BTreeMap::new(),
             paths: &paths,
+            issue: true,
         })
         .unwrap();
         let v: Value = serde_json::from_str(&out.json).unwrap();

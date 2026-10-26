@@ -2085,6 +2085,50 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn export_ingress_store(
+        &self,
+        request: Request<proto::ExportIngressStoreRequest>,
+    ) -> Result<Response<proto::ExportIngressStoreResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let (archive, digest, files) =
+            crate::ingress::export_store(&crate::ingress::IngressPaths::default())
+                .map_err(Status::failed_precondition)?;
+        Ok(Response::new(proto::ExportIngressStoreResponse {
+            archive,
+            digest,
+            files: files as i32,
+        }))
+    }
+
+    async fn import_ingress_store(
+        &self,
+        request: Request<proto::ImportIngressStoreRequest>,
+    ) -> Result<Response<proto::ImportIngressStoreResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let paths = crate::ingress::IngressPaths::default();
+        let files = match crate::ingress::import_store(&paths, &req.archive, &req.digest) {
+            Ok(n) => n,
+            Err(message) => {
+                return Ok(Response::new(proto::ImportIngressStoreResponse {
+                    success: false,
+                    files: 0,
+                    message,
+                }))
+            }
+        };
+        // Caddy reads storage when a configuration loads, so load it again.
+        let message = crate::ingress::reload_stored_config(&paths)
+            .await
+            .err()
+            .unwrap_or_default();
+        Ok(Response::new(proto::ImportIngressStoreResponse {
+            success: true,
+            files: files as i32,
+            message,
+        }))
+    }
+
     async fn write_ingress_secret(
         &self,
         request: Request<proto::WriteIngressSecretRequest>,

@@ -108,6 +108,10 @@ service NodeAdmin {
   rpc ApplyIngressConfig(ApplyIngressConfigRequest) returns (ApplyIngressConfigResponse);
   rpc GetIngressStatus(GetIngressStatusRequest) returns (GetIngressStatusResponse);
   rpc WriteIngressSecret(WriteIngressSecretRequest) returns (WriteIngressSecretResponse);
+  // Replicated certificate store: the controller reads the VIP holder's store
+  // and writes it to the standby.
+  rpc ExportIngressStore(ExportIngressStoreRequest) returns (ExportIngressStoreResponse);
+  rpc ImportIngressStore(ImportIngressStoreRequest) returns (ImportIngressStoreResponse);
 
   // GetNixApplyStatus reports whether the rebuild started by a previous
   // ApplyNixConfig has finished activating. Callers that must observe the new
@@ -1979,3 +1983,19 @@ message WriteIngressSecretRequest {
   bytes content = 2;
 }
 message WriteIngressSecretResponse { bool success = 1; string path = 2; }
+
+message ExportIngressStoreRequest {}
+message ExportIngressStoreResponse {
+  bytes archive = 1; // JSON document of files; opaque to the controller
+  string digest = 2; // SHA-256 hex of archive
+  int32 files = 3;
+}
+message ImportIngressStoreRequest {
+  bytes archive = 1;
+  string digest = 2;
+}
+message ImportIngressStoreResponse {
+  bool success = 1;
+  int32 files = 2;
+  string message = 3;
+}

@@ -14,6 +14,7 @@ spec:
     vipInterface: eno1
     virtualRouterId: 61
   tls:
+    storage: replicated      # the controller copies the VIP holder's certificates to the standby
     acme:
       email: ops@example.com
       ca: letsencrypt

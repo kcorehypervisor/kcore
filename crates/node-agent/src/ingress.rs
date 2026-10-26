@@ -336,6 +336,176 @@ fn cert_not_after(pem_bytes: &[u8]) -> Option<String> {
     ))
 }
 
+// --------------------------------------------------------- certificate store
+
+const MAX_STORE_BYTES: usize = 8 << 20;
+const MAX_STORE_FILES: usize = 2048;
+/// Top-level directories of the CertMagic store that are replicated. Locks are
+/// node-local and never copied.
+const STORE_DIRS: [&str; 3] = ["certificates", "acme", "ocsp"];
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoreFile {
+    path: String,
+    mode: u32,
+    data: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoreArchive {
+    files: Vec<StoreFile>,
+}
+
+fn store_root(paths: &IngressPaths) -> PathBuf {
+    paths.state_dir.join("certmagic")
+}
+
+/// Packs the replicated parts of the certificate store.
+pub fn export_store(paths: &IngressPaths) -> Result<(Vec<u8>, String, usize), String> {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    let root = store_root(paths);
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    for top in STORE_DIRS {
+        let mut stack = vec![root.join(top)];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(path);
+                } else if meta.is_file() {
+                    let data = std::fs::read(&path)
+                        .map_err(|e| format!("read {}: {e}", path.display()))?;
+                    total += data.len();
+                    if total > MAX_STORE_BYTES || files.len() >= MAX_STORE_FILES {
+                        return Err("certificate store is too large to replicate".into());
+                    }
+                    let rel = path
+                        .strip_prefix(&root)
+                        .map_err(|_| "path outside the store".to_string())?
+                        .to_string_lossy()
+                        .to_string();
+                    files.push(StoreFile {
+                        path: rel,
+                        mode: meta.permissions().mode() & 0o777,
+                        data: base64::engine::general_purpose::STANDARD.encode(data),
+                    });
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let n = files.len();
+    let archive = serde_json::to_vec(&StoreArchive { files }).map_err(|e| e.to_string())?;
+    let digest = sha256_hex(&archive);
+    Ok((archive, digest, n))
+}
+
+/// A relative path made only of normal components under a replicated directory.
+fn safe_store_path(rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let p = Path::new(rel);
+    let mut comps = p.components();
+    let first = match comps.next()? {
+        Component::Normal(c) => c.to_str()?,
+        _ => return None,
+    };
+    if !STORE_DIRS.contains(&first) {
+        return None;
+    }
+    if p.components().any(|c| !matches!(c, Component::Normal(_))) || p.components().count() < 2 {
+        return None;
+    }
+    // `components` drops `.` and doubled separators; require the path to be
+    // exactly what it normalises to.
+    let normal: PathBuf = p.components().collect();
+    if normal.to_str() != Some(rel) {
+        return None;
+    }
+    Some(p.to_path_buf())
+}
+
+/// Hands `path` to the owner of the store directory (the service's dynamic
+/// user), so Caddy can read keys the agent wrote as root.
+fn chown_like(path: &Path, owner_of: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = std::fs::metadata(owner_of) {
+        if let Ok(c) = std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()) {
+            // SAFETY: `c` is a valid NUL-terminated path for the call.
+            unsafe { libc::chown(c.as_ptr(), meta.uid(), meta.gid()) };
+        }
+    }
+}
+
+/// Writes an exported store into this node's store. Existing files with other
+/// names are left alone.
+pub fn import_store(paths: &IngressPaths, archive: &[u8], digest: &str) -> Result<usize, String> {
+    use base64::Engine;
+    if archive.len() > MAX_STORE_BYTES * 2 {
+        return Err("archive is too large".into());
+    }
+    if sha256_hex(archive) != digest {
+        return Err("archive digest mismatch".into());
+    }
+    let parsed: StoreArchive =
+        serde_json::from_slice(archive).map_err(|e| format!("archive is not valid: {e}"))?;
+    if parsed.files.len() > MAX_STORE_FILES {
+        return Err("archive has too many files".into());
+    }
+    let root = store_root(paths);
+    std::fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
+    chown_like(&root, &paths.state_dir);
+    let mut written = 0;
+    for f in &parsed.files {
+        let rel = safe_store_path(&f.path)
+            .ok_or_else(|| format!("unsafe path {:?} in archive", f.path))?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&f.data)
+            .map_err(|e| format!("{}: {e}", f.path))?;
+        let dest = root.join(&rel);
+        // Create and hand over every missing directory on the way.
+        let mut dir = root.clone();
+        for comp in rel.parent().into_iter().flat_map(|p| p.components()) {
+            dir.push(comp);
+            if !dir.exists() {
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("create {}: {e}", dir.display()))?;
+                chown_like(&dir, &root);
+            }
+        }
+        // Keys stay private; everything else is world-readable like Caddy writes it.
+        let mode = if f.mode & 0o077 == 0 { 0o600 } else { 0o644 };
+        write_atomic(&dest, &data, mode)?;
+        chown_like(&dest, &root);
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Loads the stored configuration again so Caddy re-reads certificates that
+/// were just written to its storage. A node with no stored config has nothing
+/// to reload.
+pub async fn reload_stored_config(paths: &IngressPaths) -> Result<(), String> {
+    let Ok(config) = std::fs::read(paths.config_file()) else {
+        return Ok(());
+    };
+    let (status, body) =
+        admin_request(&paths.admin_socket, Method::POST, "/load", Some(config)).await?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!(
+            "reload answered {status}: {}",
+            String::from_utf8_lossy(&body).trim()
+        ))
+    }
+}
+
 // ------------------------------------------------------------------ secrets
 
 /// Writes `name` under the secrets directory with mode 0600. The name must be
@@ -714,5 +884,85 @@ mod tests {
         assert!(fib_trie_has_local(table, "10.0.0.1"));
         assert!(!fib_trie_has_local(table, "10.0.0.255"));
         assert!(!fib_trie_has_local(table, "10.0.0.9"));
+    }
+
+    fn store_paths(dir: &Path) -> IngressPaths {
+        IngressPaths {
+            state_dir: dir.join("state"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn store_round_trips_and_keeps_keys_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let from = store_paths(src.path());
+        let host = from
+            .state_dir
+            .join("certmagic/certificates/acme-v02-directory/shop.example.com");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("shop.example.com.crt"), b"CERT").unwrap();
+        std::fs::write(host.join("shop.example.com.key"), b"KEY").unwrap();
+        std::fs::set_permissions(
+            host.join("shop.example.com.key"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        // Locks stay local.
+        let locks = from.state_dir.join("certmagic/locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        std::fs::write(locks.join("issue_cert_x.lock"), b"x").unwrap();
+
+        let (archive, digest, n) = export_store(&from).unwrap();
+        assert_eq!(n, 2);
+        let to = store_paths(dst.path());
+        std::fs::create_dir_all(&to.state_dir).unwrap();
+        assert_eq!(import_store(&to, &archive, &digest).unwrap(), 2);
+        let out = to
+            .state_dir
+            .join("certmagic/certificates/acme-v02-directory/shop.example.com");
+        assert_eq!(
+            std::fs::read(out.join("shop.example.com.crt")).unwrap(),
+            b"CERT"
+        );
+        let key_mode = std::fs::metadata(out.join("shop.example.com.key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(key_mode, 0o600);
+        assert!(!to.state_dir.join("certmagic/locks").exists());
+    }
+
+    #[test]
+    fn import_rejects_tampering_and_unsafe_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = store_paths(dir.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let archive = br#"{"files":[]}"#;
+        assert!(import_store(&paths, archive, "bad")
+            .unwrap_err()
+            .contains("digest"));
+        for evil in [
+            "../escape",
+            "/etc/passwd",
+            "certificates",
+            "locks/x",
+            "certificates/../../x",
+            "acme/./x",
+        ] {
+            let a = format!(r#"{{"files":[{{"path":"{evil}","mode":420,"data":""}}]}}"#);
+            let d = sha256_hex(a.as_bytes());
+            assert!(
+                import_store(&paths, a.as_bytes(), &d)
+                    .unwrap_err()
+                    .contains("unsafe path"),
+                "{evil}"
+            );
+        }
+        assert!(safe_store_path("certificates/a/b.crt").is_some());
+        assert!(safe_store_path("acme/x/users/u/key").is_some());
     }
 }
