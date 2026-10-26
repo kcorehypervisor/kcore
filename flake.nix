@@ -168,6 +168,7 @@
         {
           packages = {
             default = kcore-node-agent;
+            caddy-kcore = import ./modules/kcore-ingress-caddy.nix { inherit pkgs; };
             inherit
               kcore-node-agent
               kcore-controller
@@ -214,6 +215,7 @@
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
               consoleModule = ./modules/kcore-branding.nix;
             };
+            kcore-ingress = import ./tests/kcore-ingress.nix { inherit pkgs; };
             kcore-host-eval = import ./tests/kcore-host-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;

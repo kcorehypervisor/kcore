@@ -41,6 +41,17 @@ let
             allowedScrapeSources = [ "127.0.0.1" ];
             server.enable = true;
           };
+          kcore.ingress = {
+            enable = true;
+            package = pkgs.hello;
+            listenAddresses = [ "203.0.113.10" ];
+            vip = {
+              address = "203.0.113.10";
+              interface = "eth0";
+              sourceAddress = "192.0.2.5";
+              peers = [ "192.0.2.6" ];
+            };
+          };
           ch-vm.vms = {
             enable = true;
             cloudHypervisorPackage = pkgs.cloud-hypervisor;
@@ -101,5 +112,11 @@ pkgs.runCommand "kcore-host-eval"
     test ${lib.boolToString cfg.systemd.services.kcore-boot-confirm.enable} = true
     test -n ${lib.escapeShellArg cfg.systemd.services."kcore-vm-guest".serviceConfig.ExecStart}
     echo ${lib.escapeShellArg cfg.environment.etc."kcore/version".text} | grep -q 0.4.2
+    test ${lib.boolToString cfg.systemd.services.kcore-ingress.serviceConfig.DynamicUser} = true
+    test ${lib.boolToString cfg.systemd.services.kcore-ingress.serviceConfig.NoNewPrivileges} = true
+    echo ${lib.escapeShellArg cfg.systemd.services.kcore-ingress.serviceConfig.ExecStart} | grep -q hello
+    echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q 'dport 443'
+    echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q 'udp --dport 443'
+    test -n ${lib.escapeShellArg cfg.systemd.services.keepalived-ingress.serviceConfig.ExecStart}
     touch $out
   ''
