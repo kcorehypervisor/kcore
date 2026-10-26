@@ -70,8 +70,11 @@ Operator documentation is in [user/ingress.md](./user/ingress.md).
 - Gateway API `HTTPRoute`.
 - A Terraform provider (none exists in this repository).
 - The mirrored-route status does not report the time of the last WAF block.
-- Nothing beyond unit and evaluation checks has run: the Pebble VM test, the
-  keepalived failover test and the lab gates below need a Linux host.
+- Checked so far: unit tests, Nix evaluation of the modules and tests, and the
+  golden configurations load in the real Caddy build (`kcore-ingress-config`,
+  `caddy validate`, run on macOS). Not run: the Pebble VM test
+  (`kcore-ingress`), a failover test, and the lab gates below; they need a
+  Linux host.
 
 ## Where we are
 

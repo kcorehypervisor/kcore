@@ -218,6 +218,13 @@
               consoleModule = ./modules/kcore-branding.nix;
             };
             kcore-ingress = import ./tests/kcore-ingress.nix { inherit pkgs; };
+            # The renderer's golden configurations must load in the real Caddy
+            # build, with every plugin it uses.
+            kcore-ingress-config = import ./tests/kcore-ingress-config.nix {
+              inherit pkgs;
+              caddy = import ./modules/kcore-ingress-caddy.nix { inherit pkgs; };
+              fixtures = ./tests/fixtures/ingress;
+            };
             kcore-host-eval = import ./tests/kcore-host-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;
