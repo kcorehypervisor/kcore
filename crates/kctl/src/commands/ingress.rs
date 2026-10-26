@@ -670,7 +670,10 @@ mod tests {
             plan_target(&[route.clone(), gw.clone()], None).unwrap(),
             "edge"
         );
-        assert_eq!(plan_target(&[route.clone()], None).unwrap(), "other");
+        assert_eq!(
+            plan_target(std::slice::from_ref(&route), None).unwrap(),
+            "other"
+        );
         assert_eq!(plan_target(&[route, gw], Some("x")).unwrap(), "x");
         assert!(plan_target(&[], None).is_err());
     }
