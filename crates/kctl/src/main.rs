@@ -111,6 +111,11 @@ enum Command {
         #[command(subcommand)]
         resource: DeleteResource,
     },
+    /// Ingress gateway: plan a configuration, tune the WAF
+    Ingress {
+        #[command(subcommand)]
+        action: IngressAction,
+    },
     /// Start a resource
     Start {
         #[command(subcommand)]
@@ -808,7 +813,60 @@ enum CreateResource {
 }
 
 #[derive(Subcommand)]
+enum IngressAction {
+    /// Validate documents against the cluster and show what would be loaded
+    Plan {
+        /// IngressGateway, IngressRoute or WafPolicy manifest (repeatable)
+        #[arg(short = 'f', long = "filename", required = true)]
+        files: Vec<String>,
+        /// Gateway to render; defaults to the one the documents name
+        #[arg(long)]
+        gateway: Option<String>,
+        /// Also print the rendered Caddy JSON
+        #[arg(long)]
+        show_config: bool,
+    },
+    /// WAF tuning
+    Waf {
+        #[command(subcommand)]
+        action: IngressWafAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum IngressWafAction {
+    /// Set a route's WAF mode: detect, block or off
+    #[command(name = "set-mode")]
+    SetMode {
+        #[arg(long)]
+        route: String,
+        /// detect | block | off
+        mode: String,
+    },
+    /// Print exclusions that would have cleared recent detections, as YAML
+    Suggest {
+        #[arg(long)]
+        route: String,
+        /// Look-back window, for example 24h or 7d
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Ignore rule/path pairs seen fewer times than this
+        #[arg(long, default_value_t = 3)]
+        min_events: usize,
+    },
+}
+
+#[derive(Subcommand)]
 enum DeleteResource {
+    /// Delete an IngressGateway
+    #[command(name = "ingress-gateway", alias = "ingressgateway")]
+    IngressGateway { name: String },
+    /// Delete an IngressRoute
+    #[command(name = "ingress-route", alias = "ingressroute")]
+    IngressRoute { name: String },
+    /// Delete a WafPolicy
+    #[command(name = "waf-policy", alias = "wafpolicy")]
+    WafPolicy { name: String },
     /// Delete a virtual machine
     Vm {
         /// VM ID or name
@@ -1151,6 +1209,42 @@ enum UpdateResource {
 
 #[derive(Subcommand)]
 enum GetResource {
+    /// List IngressGateways, or describe one when NAME is given
+    #[command(
+        name = "ingress-gateways",
+        alias = "ingress-gateway",
+        alias = "ingressgateway"
+    )]
+    IngressGateways { name: Option<String> },
+    /// List IngressRoutes, or describe one when NAME is given
+    #[command(
+        name = "ingress-routes",
+        alias = "ingress-route",
+        alias = "ingressroute"
+    )]
+    IngressRoutes {
+        name: Option<String>,
+        /// Only routes of this gateway
+        #[arg(long)]
+        gateway: Option<String>,
+    },
+    /// List WafPolicies, or describe one when NAME is given
+    #[command(name = "waf-policies", alias = "waf-policy", alias = "wafpolicy")]
+    WafPolicies { name: Option<String> },
+    /// List WAF events reported by gateway nodes
+    #[command(name = "waf-events", alias = "waf-event")]
+    WafEvents {
+        #[arg(long)]
+        route: Option<String>,
+        /// Look-back window, for example 1h or 7d
+        #[arg(long)]
+        since: Option<String>,
+        /// Only this CRS rule id
+        #[arg(long)]
+        rule: Option<i32>,
+        #[arg(long, default_value_t = 200)]
+        limit: i32,
+    },
     /// Get or list virtual machines
     #[command(alias = "vm")]
     Vms {
@@ -1334,6 +1428,15 @@ enum GetResource {
 
 #[derive(Subcommand)]
 enum DescribeResource {
+    /// Describe an IngressGateway
+    #[command(name = "ingress-gateway", alias = "ingressgateway")]
+    IngressGateway { name: String },
+    /// Describe an IngressRoute
+    #[command(name = "ingress-route", alias = "ingressroute")]
+    IngressRoute { name: String },
+    /// Describe a WafPolicy
+    #[command(name = "waf-policy", alias = "wafpolicy")]
+    WafPolicy { name: String },
     /// Describe a virtual machine
     #[command(alias = "vms")]
     Vm {
@@ -2738,6 +2841,116 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::ceph_dashboard_credentials::get(&info, name).await
+        }
+        Command::Ingress {
+            action:
+                IngressAction::Plan {
+                    files,
+                    gateway,
+                    show_config,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::plan(&info, files, gateway.as_deref(), *show_config).await
+        }
+        Command::Ingress {
+            action:
+                IngressAction::Waf {
+                    action: IngressWafAction::SetMode { route, mode },
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::set_mode(&info, route, mode).await
+        }
+        Command::Ingress {
+            action:
+                IngressAction::Waf {
+                    action:
+                        IngressWafAction::Suggest {
+                            route,
+                            since,
+                            min_events,
+                        },
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::waf_suggest(&info, route, since, *min_events).await
+        }
+        Command::Delete {
+            resource: DeleteResource::IngressGateway { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::delete(&info, commands::ingress::KIND_GATEWAY, name).await
+        }
+        Command::Delete {
+            resource: DeleteResource::IngressRoute { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::delete(&info, commands::ingress::KIND_ROUTE, name).await
+        }
+        Command::Delete {
+            resource: DeleteResource::WafPolicy { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::delete(&info, commands::ingress::KIND_POLICY, name).await
+        }
+        Command::Get {
+            resource: GetResource::IngressGateways { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            match name {
+                Some(n) => commands::ingress::describe_gateway(&info, n).await,
+                None => commands::ingress::list_gateways(&info).await,
+            }
+        }
+        Command::Get {
+            resource: GetResource::IngressRoutes { name, gateway },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            match name {
+                Some(n) => commands::ingress::describe_route(&info, n).await,
+                None => commands::ingress::list_routes(&info, gateway.as_deref()).await,
+            }
+        }
+        Command::Get {
+            resource: GetResource::WafPolicies { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            match name {
+                Some(n) => commands::ingress::describe_policy(&info, n).await,
+                None => commands::ingress::list_policies(&info).await,
+            }
+        }
+        Command::Get {
+            resource:
+                GetResource::WafEvents {
+                    route,
+                    since,
+                    rule,
+                    limit,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::waf_events(&info, route.as_deref(), since.as_deref(), *rule, *limit)
+                .await
+        }
+        Command::Describe {
+            resource: DescribeResource::IngressGateway { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::describe_gateway(&info, name).await
+        }
+        Command::Describe {
+            resource: DescribeResource::IngressRoute { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::describe_route(&info, name).await
+        }
+        Command::Describe {
+            resource: DescribeResource::WafPolicy { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ingress::describe_policy(&info, name).await
         }
         Command::Get {
             resource: GetResource::SharedFilesystems,
