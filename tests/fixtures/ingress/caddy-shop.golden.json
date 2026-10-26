@@ -1,0 +1,209 @@
+{
+  "admin": {
+    "listen": "unix//run/kcore-ingress/admin.sock|0600"
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "kcore": {
+          "listen": [
+            "203.0.113.10:80",
+            "203.0.113.10:443"
+          ],
+          "logs": {},
+          "metrics": {},
+          "protocols": [
+            "h1",
+            "h2",
+            "h3"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "headers",
+                  "request": {
+                    "set": {
+                      "X-Real-IP": [
+                        "{http.request.remote.host}"
+                      ]
+                    }
+                  },
+                  "response": {
+                    "set": {
+                      "Strict-Transport-Security": [
+                        "max-age=31536000"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "directives": "Include @coraza.conf-recommended\nInclude @crs-setup.conf.example\nSecAction \"id:900000,phase:1,pass,nolog,setvar:tx.blocking_paranoia_level=1\"\nSecAction \"id:900110,phase:1,pass,nolog,setvar:tx.inbound_anomaly_score_threshold=5,setvar:tx.outbound_anomaly_score_threshold=4\"\nSecAction \"id:900200,phase:1,pass,nolog,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'\"\nSecAction \"id:900220,phase:1,pass,nolog,setvar:'tx.allowed_request_content_type=|application/json| |application/x-www-form-urlencoded| |multipart/form-data|'\"\nSecRule REMOTE_ADDR \"@ipMatch 192.0.2.0/24\" \"id:110000,phase:1,deny,status:403,log,msg:'ip denied'\"\nInclude @owasp_crs/*.conf\nSecRequestBodyLimit 1048576\nSecResponseBodyAccess Off\nSecRuleEngine On\nSecAuditEngine RelevantOnly\nSecAuditLogFormat JSON\nSecAuditLogParts ABCFHZ\nSecAuditLog /var/log/kcore/ingress/waf.jsonl\nSecRule REQUEST_URI \"@beginsWith /api/search\" \"id:1142100,phase:1,pass,nolog,ctl:ruleRemoveTargetById=942100;ARGS:q\"\nSecRule REQUEST_HEADERS:User-Agent \"@pm sqlmap nikto\" \"id:10001,phase:1,deny,status:403,log,msg:'scanner'\"\n",
+                  "handler": "waf",
+                  "load_owasp_crs": true
+                },
+                {
+                  "handler": "rate_limit",
+                  "rate_limits": {
+                    "client": {
+                      "key": "{http.request.remote.host}",
+                      "max_events": 600,
+                      "window": "1m"
+                    }
+                  }
+                },
+                {
+                  "handler": "reverse_proxy",
+                  "load_balancing": {
+                    "selection_policy": {
+                      "policy": "round_robin"
+                    }
+                  },
+                  "upstreams": [
+                    {
+                      "dial": "10.240.10.50:80"
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "shop.example.com",
+                    "www.shop.example.com"
+                  ],
+                  "path": [
+                    "/legacy",
+                    "/legacy/*"
+                  ]
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [
+                {
+                  "handler": "headers",
+                  "request": {
+                    "set": {
+                      "X-Real-IP": [
+                        "{http.request.remote.host}"
+                      ]
+                    }
+                  },
+                  "response": {
+                    "set": {
+                      "Strict-Transport-Security": [
+                        "max-age=31536000"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "directives": "Include @coraza.conf-recommended\nInclude @crs-setup.conf.example\nSecAction \"id:900000,phase:1,pass,nolog,setvar:tx.blocking_paranoia_level=1\"\nSecAction \"id:900110,phase:1,pass,nolog,setvar:tx.inbound_anomaly_score_threshold=5,setvar:tx.outbound_anomaly_score_threshold=4\"\nSecAction \"id:900200,phase:1,pass,nolog,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'\"\nSecAction \"id:900220,phase:1,pass,nolog,setvar:'tx.allowed_request_content_type=|application/json| |application/x-www-form-urlencoded| |multipart/form-data|'\"\nSecRule REMOTE_ADDR \"@ipMatch 192.0.2.0/24\" \"id:110000,phase:1,deny,status:403,log,msg:'ip denied'\"\nInclude @owasp_crs/*.conf\nSecRequestBodyLimit 1048576\nSecResponseBodyAccess Off\nSecRuleEngine On\nSecAuditEngine RelevantOnly\nSecAuditLogFormat JSON\nSecAuditLogParts ABCFHZ\nSecAuditLog /var/log/kcore/ingress/waf.jsonl\nSecRule REQUEST_URI \"@beginsWith /api/search\" \"id:1142100,phase:1,pass,nolog,ctl:ruleRemoveTargetById=942100;ARGS:q\"\nSecRule REQUEST_HEADERS:User-Agent \"@pm sqlmap nikto\" \"id:10001,phase:1,deny,status:403,log,msg:'scanner'\"\n",
+                  "handler": "waf",
+                  "load_owasp_crs": true
+                },
+                {
+                  "handler": "rate_limit",
+                  "rate_limits": {
+                    "client": {
+                      "key": "{http.request.remote.host}",
+                      "max_events": 600,
+                      "window": "1m"
+                    }
+                  }
+                },
+                {
+                  "handler": "reverse_proxy",
+                  "health_checks": {
+                    "active": {
+                      "expect_status": 200,
+                      "interval": "10s",
+                      "uri": "/healthz"
+                    }
+                  },
+                  "load_balancing": {
+                    "selection_policy": {
+                      "policy": "least_conn"
+                    },
+                    "try_duration": "5s"
+                  },
+                  "upstreams": [
+                    {
+                      "dial": "10.240.10.102:8080"
+                    },
+                    {
+                      "dial": "10.240.10.103:8080"
+                    }
+                  ]
+                }
+              ],
+              "match": [
+                {
+                  "host": [
+                    "shop.example.com",
+                    "www.shop.example.com"
+                  ],
+                  "path": [
+                    "/*"
+                  ]
+                }
+              ],
+              "terminal": true
+            }
+          ]
+        },
+        "metrics": {
+          "automatic_https": {
+            "disable": true
+          },
+          "listen": [
+            "127.0.0.1:2020"
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "metrics"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "automation": {
+        "policies": [
+          {
+            "issuers": [
+              {
+                "ca": "https://acme-staging-v02.api.letsencrypt.org/directory",
+                "email": "ops@example.com",
+                "module": "acme"
+              }
+            ],
+            "subjects": [
+              "shop.example.com",
+              "www.shop.example.com"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "logging": {
+    "logs": {
+      "default": {
+        "encoder": {
+          "format": "json"
+        }
+      }
+    }
+  },
+  "storage": {
+    "module": "file_system",
+    "root": "/var/lib/kcore/ingress/certmagic"
+  }
+}

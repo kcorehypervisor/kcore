@@ -22,6 +22,8 @@ mod grpc;
 mod guest_ops;
 mod ha;
 mod host_volume;
+mod ingress_render;
+mod ingress_spec;
 mod kubernetes_admin;
 mod kubernetes_lifecycle;
 mod kubernetes_local;
