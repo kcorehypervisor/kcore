@@ -1,7 +1,8 @@
 # Ingress: Caddy load balancer with Coraza WAF: plan
 
-Status: design. Nothing in this document is implemented. It is written
-against the code on the `dashboard-grpc-web` branch (schema version 66).
+Status: largely implemented on the `feat/ingress-gateway` branch; see
+"Implementation status" below for what is built, what differs from this plan, and
+what is not built. The sections after that are the original design.
 
 The question this answers is "how does traffic from the internet reach a
 VM, a container, or a Kubernetes service on kcore, over HTTPS, with a
@@ -14,6 +15,63 @@ balances.
 Phases are ordered by what an operator can verify in a lab. No calendar
 estimates: each phase names the subsystems it touches and the gate that
 closes it.
+
+## Implementation status
+
+Operator documentation is in [user/ingress.md](./user/ingress.md).
+
+**Built**
+
+- Phase 0: pinned `caddy.withPlugins` build (`nix build .#caddy-kcore`),
+  `modules/kcore-ingress.nix` (hardened unit, firewall, VIP, scrape-source rule
+  for metrics), `tests/kcore-ingress.nix` (Pebble) and host-eval coverage.
+- Phase 1: migration 67, the three resources and their RPCs, `PlanIngress`,
+  the renderer and reconciler, `nixgen::with_ingress`, node agent apply/status/
+  secret, the WAF log tailer, `kctl` verbs, VM and external backends.
+- Phase 2: Kubernetes Service backends (`loadBalancer`, `nodePort`, `pods`),
+  Ingress controller mode through a dedicated `kcore-ingress` ServiceAccount.
+- Phase 3: keepalived VIP, holder reporting, `ingress.vip.moved`, and the
+  replicated certificate store (see below).
+- Phase 4: `kctl ingress waf suggest` and `set-mode`, per-route exclusions,
+  custom rules, rate limits (gateway and route), IP allow and deny lists,
+  `ingress.waf.*` webhooks, event retention, dashboard section, Caddy metrics in
+  the VictoriaMetrics targets.
+- Phase 5: layer-4 TCP and SNI-passthrough routes, DNS-01 (Cloudflare, Route 53,
+  RFC 2136) and wildcard hosts, `backendTls` with `system` or a PEM bundle, and
+  PROXY protocol v2.
+- MCP catalog and advise entries.
+
+**Differences from the plan**
+
+- Proto messages carry `spec_json` (the canonical camelCase document) instead of
+  mirrored message types; the controller parses it strictly (unknown fields are
+  an error) and validates it.
+- The admin socket is `/run/kcore-ingress/admin.sock`.
+- coraza-caddy is v2.5.0 and caddy-l4 v0.1.0: the newer releases need a Caddy
+  newer than the one in nixpkgs.
+- `SyncIngressStore` (streaming, agent to agent) became `ExportIngressStore` and
+  `ImportIngressStore`, relayed by the controller, because node agents only
+  accept calls from the controller. Only a node that holds the VIP, or already
+  has every certificate, runs ACME.
+- The DNS-01 credentials file is fixed (`/etc/kcore/ingress/dns.env`) and is
+  written with `kctl ingress secret set` (`SetIngressSecret`).
+- Gateways, routes and policies are not replicated between controllers
+  (`ingress.*` replication events were not added), like `SharedFilesystem`.
+- Caddy metrics listen on every address; the firewall opens the port only to
+  `kcore.metrics.allowedScrapeSources`, so VictoriaMetrics can scrape it.
+
+**Not built**
+
+- `kind: container` backends: node agents do not report container addresses.
+- NAT DHCP reservations for referenced VMs, and the gateway joining a `vxlan`
+  network it is not a member of. A route to such a VM is refused with the fix.
+- `tls.storage: shared-filesystem`: nodes do not mount a `SharedFilesystem`.
+- `issuer: kcore-pki` and `backendTls.caBundle: kcore-pki`.
+- Gateway API `HTTPRoute`.
+- A Terraform provider (none exists in this repository).
+- The mirrored-route status does not report the time of the last WAF block.
+- Nothing beyond unit and evaluation checks has run: the Pebble VM test, the
+  keepalived failover test and the lab gates below need a Linux host.
 
 ## Where we are
 

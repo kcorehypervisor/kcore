@@ -28,6 +28,11 @@ let
 
   keepalivedNotrack = import ./kcore-keepalived-notrack.nix { inherit pkgs; };
 
+  # Caddy's metrics listen on every address; only the hosts that may scrape
+  # node_exporter can reach them. The metrics module is optional.
+  scrapeSources = lib.unique (
+    builtins.filter (s: s != "") (lib.attrByPath [ "kcore" "metrics" "allowedScrapeSources" ] [ ] config)
+  );
   listenerAddresses = lib.unique cfg.listenAddresses;
   tcpListeners = cfg.tcpListeners;
   tcpPorts = [
@@ -45,7 +50,10 @@ let
     )
     + lib.concatMapStrings (l: ''
       ip daddr ${l.address} tcp dport ${toString l.port} accept comment "kcore-ingress-tcp"
-    '') tcpListeners;
+    '') tcpListeners
+    + lib.concatMapStrings (src: ''
+      ip saddr ${src} tcp dport ${toString cfg.metricsPort} accept comment "kcore-ingress-metrics"
+    '') scrapeSources;
   iptablesRules =
     verb:
     lib.concatMapStrings (
@@ -65,7 +73,12 @@ let
       iptables -${verb} nixos-fw -d ${lib.escapeShellArg l.address} -p tcp --dport ${toString l.port} -j nixos-fw-accept ${
         lib.optionalString (verb == "D") "|| true"
       }
-    '') tcpListeners;
+    '') tcpListeners
+    + lib.concatMapStrings (src: ''
+      iptables -${verb} nixos-fw -s ${lib.escapeShellArg src} -p tcp --dport ${toString cfg.metricsPort} -j nixos-fw-accept ${
+        lib.optionalString (verb == "D") "|| true"
+      }
+    '') scrapeSources;
 
   peers = lib.filter (ip: ip != cfg.vip.sourceAddress) cfg.vip.peers;
   keepalivedConf = pkgs.writeText "keepalived-ingress.conf" ''
@@ -226,7 +239,10 @@ in
     metricsPort = lib.mkOption {
       type = lib.types.port;
       default = 2020;
-      description = "Loopback port for Caddy's Prometheus metrics endpoint.";
+      description = ''
+        Port of Caddy's Prometheus metrics endpoint. It listens on every address
+        but the firewall opens it only to kcore.metrics.allowedScrapeSources.
+      '';
     };
 
     wafAuditLogPath = lib.mkOption {
@@ -302,7 +318,7 @@ in
             KCORE_INGRESS_CERT_STORE =
               if cfg.storage.mode == "shared-filesystem" then cfg.storage.sharedFilesystemMount else certStore;
             KCORE_INGRESS_WAF_AUDIT_LOG = cfg.wafAuditLogPath;
-            KCORE_INGRESS_METRICS_ADDR = "127.0.0.1:${toString cfg.metricsPort}";
+            KCORE_INGRESS_METRICS_ADDR = "0.0.0.0:${toString cfg.metricsPort}";
           };
         };
 

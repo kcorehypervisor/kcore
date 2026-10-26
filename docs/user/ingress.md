@@ -239,6 +239,20 @@ mount a `SharedFilesystem` yet. If the holder fails right after renewing and
 before the copy, the standby serves the previous certificate, which is still
 valid for at least 30 days under default renewal timing.
 
+## Metrics
+
+Each gateway node serves Caddy's Prometheus metrics on port 2020 (request rate,
+latency, upstream health, TLS handshakes). The firewall opens that port only to
+`kcore.metrics.allowedScrapeSources`, and the controller adds every gateway node
+to the VictoriaMetrics targets (`ingress.json` next to `nodes.json`) with the
+labels `role=ingress-gateway` and `gateway=<name>`.
+
+## Webhooks
+
+`ingress.waf.blocked` and `ingress.waf.detected` fire once per route per minute
+with the count, top rules and top clients. `ingress.vip.moved` fires when the
+VIP changes node. See [webhooks.md](../webhooks.md).
+
 ## Limits today
 
 - Active/active gateways and CephFS-backed certificate storage are not built yet.

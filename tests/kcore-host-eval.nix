@@ -45,6 +45,12 @@ let
             enable = true;
             package = pkgs.hello;
             listenAddresses = [ "203.0.113.10" ];
+            tcpListeners = [
+              {
+                address = "203.0.113.10";
+                port = 5432;
+              }
+            ];
             vip = {
               address = "203.0.113.10";
               interface = "eth0";
@@ -118,5 +124,7 @@ pkgs.runCommand "kcore-host-eval"
     echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q 'dport 443'
     echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q 'udp --dport 443'
     test -n ${lib.escapeShellArg cfg.systemd.services.keepalived-ingress.serviceConfig.ExecStart}
+    echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q -- '-s 127.0.0.1 -p tcp --dport 2020'
+    echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q -- '-d 203.0.113.10 -p tcp --dport 5432'
     touch $out
   ''

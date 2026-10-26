@@ -17,6 +17,10 @@ use crate::ingress_spec::{
     PathSpec, RouteKind, RouteSpec, WafExclusion, WafPolicySpec,
 };
 
+/// Port of Caddy's Prometheus endpoint on gateway nodes. The firewall opens it
+/// only to `kcore.metrics.allowedScrapeSources`.
+pub const INGRESS_METRICS_PORT: u16 = 2020;
+
 /// Where the node-local pieces live; supplied by the node's Nix module values.
 #[derive(Debug, Clone)]
 pub struct NodePaths {
@@ -32,7 +36,7 @@ impl Default for NodePaths {
             admin_socket: "/run/kcore-ingress/admin.sock".into(),
             cert_store: "/var/lib/kcore/ingress/certmagic".into(),
             waf_audit_log: "/var/log/kcore/ingress/waf.jsonl".into(),
-            metrics_addr: "127.0.0.1:2020".into(),
+            metrics_addr: format!("0.0.0.0:{INGRESS_METRICS_PORT}"),
         }
     }
 }
