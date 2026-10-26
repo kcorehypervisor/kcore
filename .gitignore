@@ -3,8 +3,9 @@
 
 /target
 /result
-crates/dashboard/web/node_modules
-crates/dashboard/web/dist
+dashboard/node_modules
+dashboard/dist
+dashboard/src/gen
 /result-*
 /result-kctl
 /dist
@@ -21,3 +22,4 @@ k8s-config-node-*.nix
 *.kubeconfig
 *.csr
 *.srl
+.playwright-mcp/

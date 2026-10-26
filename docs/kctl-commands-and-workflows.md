@@ -571,7 +571,7 @@ Top-level commands:
 
 ### RBAC bootstrap (per-operator certificates)
 
-After `kctl create cluster`, the context still uses the legacy **`CN=kctl`** client material. That identity is accepted as **cluster-admin only until the first row appears in the controller `operators` table** (or forever if the controller sets `auth.bootstrap_kctl: true` — not recommended for production).
+After `kctl create cluster`, the context still uses the legacy **`CN=kctl`** client material. That identity is accepted as **cluster-admin only until a `cluster-admin` operator has an issued certificate** (or forever if the controller sets `auth.bootstrap_kctl: true` — not recommended for production).
 
 Day-0 on a fresh cluster:
 

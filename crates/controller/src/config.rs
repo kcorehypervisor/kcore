@@ -94,6 +94,27 @@ impl Default for WebConfig {
     }
 }
 
+impl WebConfig {
+    /// The NixOS module sets these on the controller unit, so the dashboard
+    /// follows `services.kcore.dashboard` without rewriting controller.yaml.
+    fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(raw) = var("KCORE_WEB_ENABLED") {
+            self.enabled = match raw.trim() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                other => anyhow::bail!("KCORE_WEB_ENABLED must be true or false, got '{other}'"),
+            };
+        }
+        if let Some(addr) = var("KCORE_WEB_LISTEN_ADDR").filter(|v| !v.trim().is_empty()) {
+            self.listen_addr = addr.trim().to_string();
+        }
+        if let Some(dir) = var("KCORE_WEB_UI_DIR").filter(|v| !v.trim().is_empty()) {
+            self.ui_dir = Some(dir.trim().to_string());
+        }
+        Ok(())
+    }
+}
+
 fn default_web_listen_addr() -> String {
     "0.0.0.0:9443".to_string()
 }
@@ -563,7 +584,7 @@ fn default_dc_id() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthConfig {
-    /// When true, legacy `CN=kctl` keeps cluster-admin even after operators exist.
+    /// When true, legacy `CN=kctl` keeps cluster-admin after a cluster-admin operator has a cert.
     #[serde(default)]
     pub bootstrap_kctl: bool,
 }
@@ -607,7 +628,8 @@ impl Config {
         crate::path_safety::assert_safe_path(path, "config file path")?;
         let contents = std::fs::read_to_string(Path::new(path))
             .with_context(|| format!("reading config {path}"))?;
-        let cfg: Config = serde_yaml::from_str(&contents).context("parsing config")?;
+        let mut cfg: Config = serde_yaml::from_str(&contents).context("parsing config")?;
+        cfg.web.apply_env(|key| std::env::var(key).ok())?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -1345,5 +1367,43 @@ webhooks:
             let err = load_with(name, snippet).expect_err("must fail");
             assert!(err.to_string().contains(needle), "{name}: {err}");
         }
+    }
+
+    #[test]
+    fn web_env_overrides_the_yaml_section() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let mut web = WebConfig::default();
+        web.apply_env(env(&[])).unwrap();
+        assert!(!web.enabled);
+        assert_eq!(web.listen_addr, "0.0.0.0:9443");
+
+        web.apply_env(env(&[
+            ("KCORE_WEB_ENABLED", "true"),
+            ("KCORE_WEB_LISTEN_ADDR", "10.0.0.5:9443"),
+            (
+                "KCORE_WEB_UI_DIR",
+                "/nix/store/x-kcore-dashboard/share/kcore-dashboard",
+            ),
+        ]))
+        .unwrap();
+        assert!(web.enabled);
+        assert_eq!(web.listen_addr, "10.0.0.5:9443");
+        assert_eq!(
+            web.ui_dir.as_deref(),
+            Some("/nix/store/x-kcore-dashboard/share/kcore-dashboard")
+        );
+
+        web.apply_env(env(&[("KCORE_WEB_ENABLED", "0")])).unwrap();
+        assert!(!web.enabled);
+        assert!(web
+            .apply_env(env(&[("KCORE_WEB_ENABLED", "maybe")]))
+            .is_err());
     }
 }

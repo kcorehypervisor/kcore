@@ -6426,6 +6426,21 @@ impl Database {
         conn.query_row("SELECT COUNT(*) FROM operators", [], |row| row.get(0))
     }
 
+    /// True once some operator can administer the cluster with its own client
+    /// certificate, which is when the shared `CN=kctl` bootstrap cert retires.
+    pub fn has_certified_cluster_admin(&self) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM operators o
+                JOIN operator_roles r ON r.operator_name = o.name
+                WHERE r.role = 'cluster-admin' AND o.cert_serial != ''
+            )",
+            [],
+            |row| row.get(0),
+        )
+    }
+
     pub fn create_operator(&self, name: &str) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         let now = Self::unix_now_secs();

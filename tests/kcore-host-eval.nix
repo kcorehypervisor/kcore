@@ -30,10 +30,7 @@ let
             enable = true;
             package = pkgs.hello;
           };
-          services.kcore.dashboard = {
-            enable = true;
-            package = pkgs.hello;
-          };
+          services.kcore.dashboard.package = pkgs.hello;
           services.kcore.console = {
             enable = true;
             package = pkgs.hello;
@@ -65,6 +62,19 @@ let
     ];
   };
   cfg = eval.config;
+  # A host flake from before the dashboard default sets no dashboard package.
+  noDashboardPackage = nixosSystem {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    modules = [
+      ../modules/kcore-host.nix
+      {
+        services.kcore.controller = {
+          enable = true;
+          package = pkgs.hello;
+        };
+      }
+    ];
+  };
 in
 pkgs.runCommand "kcore-host-eval"
   {
@@ -83,6 +93,11 @@ pkgs.runCommand "kcore-host-eval"
     echo ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} | grep -q hello
     echo ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} | grep -qv /opt/kcore
     test -n ${lib.escapeShellArg cfg.systemd.services.kcore-controller.serviceConfig.ExecStart}
+    test ${lib.boolToString cfg.services.kcore.dashboard.enable} = true
+    test ${lib.boolToString noDashboardPackage.config.services.kcore.dashboard.enable} = false
+    test ${cfg.systemd.services.kcore-controller.environment.KCORE_WEB_ENABLED} = true
+    echo ${lib.escapeShellArg cfg.systemd.services.kcore-controller.environment.KCORE_WEB_UI_DIR} | grep -q /share/kcore-dashboard
+    echo ${lib.escapeShellArg (toString cfg.networking.firewall.allowedTCPPorts)} | grep -qw 9443
     test ${lib.boolToString cfg.systemd.services.kcore-boot-confirm.enable} = true
     test -n ${lib.escapeShellArg cfg.systemd.services."kcore-vm-guest".serviceConfig.ExecStart}
     echo ${lib.escapeShellArg cfg.environment.etc."kcore/version".text} | grep -q 0.4.2
