@@ -409,6 +409,11 @@ DROP TABLE IF EXISTS operator_login_state;
 DROP TABLE IF EXISTS operator_credentials;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 67,
+        sql: crate::db::INGRESS_TABLES_DOWN,
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

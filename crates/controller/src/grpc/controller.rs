@@ -1,3 +1,5 @@
+mod ingress;
+
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -1252,6 +1254,9 @@ impl ControllerService {
                 node.id
             )));
         }
+        let ingress_nix = crate::ingress_reconciler::load_state(&self.db)
+            .ok()
+            .and_then(|st| crate::ingress_reconciler::ingress_nix_for_node(&st, node));
         let nix_config = nixgen::with_postgresql(
             nixgen::generate_node_config_inner(
                 &vms,
@@ -1275,6 +1280,7 @@ impl ControllerService {
             ),
             postgresql_nix.as_ref(),
         );
+        let nix_config = nixgen::with_ingress(nix_config, ingress_nix.as_ref());
 
         for vm in &vms {
             if vm.image_url.is_empty() {
@@ -16194,6 +16200,118 @@ impl controller_proto::controller_server::Controller for ControllerService {
         Ok(Response::new(
             controller_proto::DeleteSharedFilesystemResponse { success },
         ))
+    }
+
+    async fn plan_ingress(
+        &self,
+        request: Request<controller_proto::PlanIngressRequest>,
+    ) -> Result<Response<controller_proto::PlanIngressResponse>, Status> {
+        self.ingress_plan(request).await
+    }
+
+    async fn create_ingress_gateway(
+        &self,
+        request: Request<controller_proto::CreateIngressGatewayRequest>,
+    ) -> Result<Response<controller_proto::CreateIngressGatewayResponse>, Status> {
+        self.ingress_create_gateway(request).await
+    }
+
+    async fn get_ingress_gateway(
+        &self,
+        request: Request<controller_proto::GetIngressGatewayRequest>,
+    ) -> Result<Response<controller_proto::GetIngressGatewayResponse>, Status> {
+        self.ingress_get_gateway(request).await
+    }
+
+    async fn list_ingress_gateways(
+        &self,
+        request: Request<controller_proto::ListIngressGatewaysRequest>,
+    ) -> Result<Response<controller_proto::ListIngressGatewaysResponse>, Status> {
+        self.ingress_list_gateways(request).await
+    }
+
+    async fn delete_ingress_gateway(
+        &self,
+        request: Request<controller_proto::DeleteIngressGatewayRequest>,
+    ) -> Result<Response<controller_proto::DeleteIngressGatewayResponse>, Status> {
+        self.ingress_delete_gateway(request).await
+    }
+
+    async fn create_ingress_route(
+        &self,
+        request: Request<controller_proto::CreateIngressRouteRequest>,
+    ) -> Result<Response<controller_proto::CreateIngressRouteResponse>, Status> {
+        self.ingress_create_route(request).await
+    }
+
+    async fn get_ingress_route(
+        &self,
+        request: Request<controller_proto::GetIngressRouteRequest>,
+    ) -> Result<Response<controller_proto::GetIngressRouteResponse>, Status> {
+        self.ingress_get_route(request).await
+    }
+
+    async fn list_ingress_routes(
+        &self,
+        request: Request<controller_proto::ListIngressRoutesRequest>,
+    ) -> Result<Response<controller_proto::ListIngressRoutesResponse>, Status> {
+        self.ingress_list_routes(request).await
+    }
+
+    async fn delete_ingress_route(
+        &self,
+        request: Request<controller_proto::DeleteIngressRouteRequest>,
+    ) -> Result<Response<controller_proto::DeleteIngressRouteResponse>, Status> {
+        self.ingress_delete_route(request).await
+    }
+
+    async fn set_ingress_route_waf_mode(
+        &self,
+        request: Request<controller_proto::SetIngressRouteWafModeRequest>,
+    ) -> Result<Response<controller_proto::SetIngressRouteWafModeResponse>, Status> {
+        self.ingress_set_route_waf_mode(request).await
+    }
+
+    async fn create_waf_policy(
+        &self,
+        request: Request<controller_proto::CreateWafPolicyRequest>,
+    ) -> Result<Response<controller_proto::CreateWafPolicyResponse>, Status> {
+        self.ingress_create_waf_policy(request).await
+    }
+
+    async fn get_waf_policy(
+        &self,
+        request: Request<controller_proto::GetWafPolicyRequest>,
+    ) -> Result<Response<controller_proto::GetWafPolicyResponse>, Status> {
+        self.ingress_get_waf_policy(request).await
+    }
+
+    async fn list_waf_policies(
+        &self,
+        request: Request<controller_proto::ListWafPoliciesRequest>,
+    ) -> Result<Response<controller_proto::ListWafPoliciesResponse>, Status> {
+        self.ingress_list_waf_policies(request).await
+    }
+
+    async fn delete_waf_policy(
+        &self,
+        request: Request<controller_proto::DeleteWafPolicyRequest>,
+    ) -> Result<Response<controller_proto::DeleteWafPolicyResponse>, Status> {
+        self.ingress_delete_waf_policy(request).await
+    }
+
+    async fn list_waf_events(
+        &self,
+        request: Request<controller_proto::ListWafEventsRequest>,
+    ) -> Result<Response<controller_proto::ListWafEventsResponse>, Status> {
+        self.ingress_list_waf_events(request).await
+    }
+
+    async fn report_waf_events(
+        &self,
+        request: Request<controller_proto::ReportWafEventsRequest>,
+    ) -> Result<Response<controller_proto::ReportWafEventsResponse>, Status> {
+        self.ingress_report_waf_events(request).await
     }
 
     async fn create_object_store(

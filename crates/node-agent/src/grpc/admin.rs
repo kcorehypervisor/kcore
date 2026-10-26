@@ -2046,6 +2046,63 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn apply_ingress_config(
+        &self,
+        request: Request<proto::ApplyIngressConfigRequest>,
+    ) -> Result<Response<proto::ApplyIngressConfigResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let paths = crate::ingress::IngressPaths::default();
+        let response = match crate::ingress::apply_config(&paths, &req.config_json, &req.hash).await
+        {
+            Ok(applied_hash) => proto::ApplyIngressConfigResponse {
+                success: true,
+                applied_hash,
+                message: String::new(),
+            },
+            Err(message) => proto::ApplyIngressConfigResponse {
+                success: false,
+                applied_hash: String::new(),
+                message,
+            },
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn get_ingress_status(
+        &self,
+        request: Request<proto::GetIngressStatusRequest>,
+    ) -> Result<Response<proto::GetIngressStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let s = crate::ingress::status(&crate::ingress::IngressPaths::default()).await;
+        Ok(Response::new(proto::GetIngressStatusResponse {
+            running: s.running,
+            applied_hash: s.applied_hash,
+            vip_holder: s.vip_holder,
+            certs: s.certs,
+            upstreams: s.upstreams,
+            message: s.message,
+        }))
+    }
+
+    async fn write_ingress_secret(
+        &self,
+        request: Request<proto::WriteIngressSecretRequest>,
+    ) -> Result<Response<proto::WriteIngressSecretResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let path = crate::ingress::write_secret(
+            &crate::ingress::IngressPaths::default(),
+            &req.name,
+            &req.content,
+        )
+        .map_err(Status::invalid_argument)?;
+        Ok(Response::new(proto::WriteIngressSecretResponse {
+            success: true,
+            path: path.display().to_string(),
+        }))
+    }
+
     async fn get_nix_apply_status(
         &self,
         request: Request<proto::GetNixApplyStatusRequest>,

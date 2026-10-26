@@ -103,6 +103,12 @@ service NodeAdmin {
   // provided content and (optionally) triggers a nixos-rebuild.
   rpc ApplyNixConfig(ApplyNixConfigRequest) returns (ApplyNixConfigResponse);
 
+  // Ingress gateway: load Caddy JSON through the admin socket, report
+  // certificate and upstream state, and write DNS-01 style secrets.
+  rpc ApplyIngressConfig(ApplyIngressConfigRequest) returns (ApplyIngressConfigResponse);
+  rpc GetIngressStatus(GetIngressStatusRequest) returns (GetIngressStatusResponse);
+  rpc WriteIngressSecret(WriteIngressSecretRequest) returns (WriteIngressSecretResponse);
+
   // GetNixApplyStatus reports whether the rebuild started by a previous
   // ApplyNixConfig has finished activating. Callers that must observe the new
   // configuration (live migration handoff, drain) poll this before continuing.
@@ -1933,3 +1939,40 @@ message FinalizeInstantDiskResponse {
   int64 bytes_written = 3;
   string volume_path = 4;
 }
+
+// --- Ingress gateway ---------------------------------------------------------------------------
+
+message ApplyIngressConfigRequest {
+  string config_json = 1; // rendered Caddy JSON
+  string hash = 2;        // SHA-256 of config_json, echoed in status
+}
+message ApplyIngressConfigResponse {
+  bool success = 1;
+  string applied_hash = 2;
+  string message = 3;
+}
+
+message GetIngressStatusRequest {}
+message IngressCertInfo {
+  string host = 1;
+  string issuer = 2;
+  string not_after = 3;
+}
+message IngressUpstreamInfo {
+  string address = 1;
+  bool healthy = 2;
+}
+message GetIngressStatusResponse {
+  bool running = 1;
+  string applied_hash = 2;
+  string vip_holder = 3;
+  repeated IngressCertInfo certs = 4;
+  repeated IngressUpstreamInfo upstreams = 5;
+  string message = 6;
+}
+
+message WriteIngressSecretRequest {
+  string name = 1;     // file name under /etc/kcore/ingress, e.g. dns.env
+  bytes content = 2;
+}
+message WriteIngressSecretResponse { bool success = 1; string path = 2; }
