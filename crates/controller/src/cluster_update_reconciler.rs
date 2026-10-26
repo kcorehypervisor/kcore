@@ -573,30 +573,49 @@ async fn kubernetes_peer_and_name(
     let rows = db
         .list_kubernetes_cluster_nodes(&membership.cluster_name)
         .map_err(|e| format!("list cluster members: {e}"))?;
-    let control_planes: Vec<_> = rows
-        .iter()
-        .filter(|row| row.role == "control-plane")
-        .collect();
-    let chosen = control_planes
-        .iter()
-        .find(|row| row.node_id != node_id)
-        .or_else(|| control_planes.first())
-        .ok_or_else(|| format!("cluster {} has no control-plane", membership.cluster_name))?;
-    let peer = db
-        .get_node(&chosen.node_id)
-        .map_err(|e| format!("get node: {e}"))?
-        .ok_or_else(|| format!("control-plane {} disappeared", chosen.node_id))?;
-    if peer.address.is_empty() {
+    let candidates = peer_candidates(&rows, node_id);
+    if candidates.is_empty() {
         return Err(format!(
-            "control-plane {} has no agent address",
-            chosen.node_id
+            "cluster {} has no control-plane",
+            membership.cluster_name
         ));
+    }
+    let mut failures = Vec::new();
+    let mut reached = None;
+    for candidate in candidates {
+        let peer = db
+            .get_node(candidate)
+            .map_err(|e| format!("get node: {e}"))?;
+        let Some(peer) = peer.filter(|peer| !peer.address.is_empty()) else {
+            failures.push(format!("{candidate}: no agent address"));
+            continue;
+        };
+        match crate::kubernetes_admin::list_nodes(clients, &peer.address).await {
+            Ok(listed) => {
+                reached = Some((peer.address, listed));
+                break;
+            }
+            Err(e) => failures.push(format!("{candidate}: {e}")),
+        }
+    }
+    let Some((peer_address, listed)) = reached else {
+        return Err(format!(
+            "no control-plane of cluster {} answered: {}",
+            membership.cluster_name,
+            failures.join("; ")
+        ));
+    };
+    if !failures.is_empty() {
+        warn!(
+            node_id,
+            skipped = %failures.join("; "),
+            "kubernetes control-plane peers unreachable, using {peer_address}"
+        );
     }
     let node = db
         .get_node(node_id)
         .map_err(|e| format!("get node: {e}"))?
         .ok_or_else(|| format!("node {node_id} disappeared"))?;
-    let listed = crate::kubernetes_admin::list_nodes(clients, &peer.address).await?;
     let ip = if membership.advertise_address.is_empty() {
         node.address.split(':').next().unwrap_or("").to_string()
     } else {
@@ -614,7 +633,22 @@ async fn kubernetes_peer_and_name(
         db.upsert_kubernetes_cluster_node(&stored)
             .map_err(|e| format!("store kubernetes node name: {e}"))?;
     }
-    Ok((peer.address, name))
+    Ok((peer_address, name))
+}
+
+/// Control planes to ask about `node_id`, other members first. The node itself
+/// is the last resort because its API server goes down during the switch.
+fn peer_candidates<'a>(
+    rows: &'a [crate::db::KubernetesClusterNodeRow],
+    node_id: &str,
+) -> Vec<&'a str> {
+    let control_planes = rows.iter().filter(|row| row.role == "control-plane");
+    control_planes
+        .clone()
+        .filter(|row| row.node_id != node_id)
+        .chain(control_planes.filter(|row| row.node_id == node_id))
+        .map(|row| row.node_id.as_str())
+        .collect()
 }
 
 async fn prepare_on_node(
@@ -678,4 +712,45 @@ async fn rollback_on_node(
         .await
         .map_err(|e| format!("rollback_system_update: {e}"))?
         .into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::KubernetesClusterNodeRow;
+
+    fn member(node_id: &str, role: &str) -> KubernetesClusterNodeRow {
+        KubernetesClusterNodeRow {
+            cluster_name: "k".into(),
+            node_id: node_id.into(),
+            role: role.into(),
+            advertise_address: String::new(),
+            iface: String::new(),
+            initial_cluster: false,
+            join_existing: false,
+            kubelet_ready: false,
+            pending_join: false,
+            pending_removal: false,
+            k8s_node_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn peer_candidates_try_every_other_control_plane_before_self() {
+        let rows = vec![
+            member("node-105", "control-plane"),
+            member("node-107", "control-plane"),
+            member("node-200", "worker"),
+            member("node-119", "control-plane"),
+        ];
+        assert_eq!(
+            peer_candidates(&rows, "node-107"),
+            vec!["node-105", "node-119", "node-107"]
+        );
+        assert_eq!(
+            peer_candidates(&rows, "node-200"),
+            vec!["node-105", "node-107", "node-119"]
+        );
+        assert!(peer_candidates(&[member("node-200", "worker")], "node-200").is_empty());
+    }
 }
