@@ -842,4 +842,22 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(parse_route(&json).unwrap(), r);
     }
+
+    fn example_spec(yaml: &str) -> String {
+        let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        serde_json::to_string(&doc["spec"]).unwrap()
+    }
+
+    #[test]
+    fn shipped_examples_parse_and_validate() {
+        const POLICY: &str = include_str!("../../../examples/ingress/waf-policy.yaml");
+        const GATEWAY: &str = include_str!("../../../examples/ingress/gateway.yaml");
+        const GATEWAY_HA: &str = include_str!("../../../examples/ingress/gateway-ha.yaml");
+        const ROUTE: &str = include_str!("../../../examples/ingress/route.yaml");
+        validate_waf_policy(&parse_waf_policy(&example_spec(POLICY)).unwrap()).unwrap();
+        for g in [GATEWAY, GATEWAY_HA] {
+            validate_gateway(&parse_gateway(&example_spec(g)).unwrap()).unwrap();
+        }
+        validate_route(&parse_route(&example_spec(ROUTE)).unwrap()).unwrap();
+    }
 }

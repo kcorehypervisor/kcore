@@ -1,0 +1,42 @@
+# Hostnames and paths to backends. VMs on a NAT network must be on a gateway
+# node; use a vxlan network (every gateway node must join it) or an external
+# backend otherwise.
+#
+#   kctl ingress plan -f examples/ingress/route.yaml --show-config
+#   kctl apply -f examples/ingress/route.yaml
+#   kctl ingress waf set-mode --route shop block     # after reading waf-events
+kind: IngressRoute
+metadata:
+  name: shop
+spec:
+  gateway: edge
+  hosts: [shop.example.com, www.shop.example.com]
+  paths:
+    - prefix: /
+      backends:
+        - kind: vm
+          name: shop-web-1
+          port: 8080
+        - kind: vm
+          name: shop-web-2
+          port: 8080
+      loadBalancing:
+        policy: least_conn
+        tryDuration: 5s
+      healthCheck:
+        path: /healthz
+        interval: 10s
+        expectStatus: 200
+    - prefix: /legacy
+      backends:
+        - kind: external
+          address: 192.168.40.50:8443
+  waf:
+    exclusions:
+      - ruleId: 942100
+        path: /api/search
+        arg: q
+  headers:
+    hsts: true
+    forwarded: [X-Real-IP]
+  redirectHttp: true

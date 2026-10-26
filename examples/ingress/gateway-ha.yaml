@@ -1,0 +1,20 @@
+# Two gateway nodes sharing a VIP (keepalived). The first node listed is
+# preferred (VRRP priority 100), the second takes over (50).
+kind: IngressGateway
+metadata:
+  name: edge
+spec:
+  nodes: [node-105, node-107]
+  listeners:
+    - address: 203.0.113.10
+      ports: [80, 443]
+      http3: true
+  highAvailability:
+    vipAddress: 203.0.113.10
+    vipInterface: eno1
+    virtualRouterId: 61
+  tls:
+    acme:
+      email: ops@example.com
+      ca: letsencrypt
+  defaultWafPolicy: crs-default
