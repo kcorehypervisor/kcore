@@ -23,6 +23,12 @@ The intent is to check protocol-level safety/liveness properties with TLC.
   - Separates intra-DC and cross-DC anti-entropy actions.
   - Checks no-double-apply plus eventual cross-DC convergence after work is applied.
 
+- `ClickhouseRollout.tla` + `ClickhouseRollout.cfg`
+  - Two shards, two replicas, three voting Keepers.
+  - A server restart leaves the other replica of that shard up.
+  - A Keeper restart leaves a strict majority of the other voters up.
+  - `FinishServer` and `FinishKeeper` give every state a successor.
+
 - `DiskLayoutReconcile.tla` + `DiskLayoutReconcile.cfg`
   - Per-resource state machine for the controller-orchestrated `DiskLayout`.
   - Models `Generation` (controller-owned), `Observed` + `Phase` (node-owned),
