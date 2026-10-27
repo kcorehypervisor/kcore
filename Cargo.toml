@@ -11,6 +11,7 @@ members = [
     "crates/node-agent",
     "crates/controller",
     "crates/kctl",
+    "crates/kcore-provisioning",
 ]
 resolver = "2"
 

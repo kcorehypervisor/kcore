@@ -190,6 +190,14 @@
                 '';
               };
             };
+          kcore-provisioning = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "kcore-provisioning";
+              cargoExtraArgs = "-p kcore-provisioning";
+            }
+          );
         in
         {
           packages = {
@@ -203,6 +211,7 @@
               kcore-console
               kcore-disk-verify
               nvidia-vgpu-manager
+              kcore-provisioning
               ;
             amd-gim = pkgs.callPackage ./pkgs/amd-gim { inherit (pkgs.linuxPackages) kernel; };
           };
@@ -215,6 +224,7 @@
               kcore-dashboard
               kcore-console
               kcore-disk-verify
+              kcore-provisioning
               ;
             clippy = craneLib.cargoClippy (
               commonArgs
@@ -268,6 +278,11 @@
               bash ${./scripts/kcore-infect-test.sh} ${./scripts/kcore-infect}
               touch $out
             '';
+            provisioning-module-eval = import ./tests/provisioning-module-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
             fmt-nix =
               pkgs.runCommand "check-nix-fmt"
                 {
@@ -340,6 +355,7 @@
             kcore-slurm = slurmModule;
             kcore-metrics = metricsModule;
             kcore-host = ./modules/kcore-host.nix;
+            kcore-provisioning = ./modules/kcore-provisioning.nix;
           };
 
           nixosConfigurations =
