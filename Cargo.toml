@@ -12,6 +12,7 @@ members = [
     "crates/controller",
     "crates/kctl",
     "crates/dashboard",
+    "crates/kcore-provisioning",
 ]
 resolver = "2"
 
