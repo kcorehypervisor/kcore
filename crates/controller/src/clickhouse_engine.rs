@@ -170,6 +170,11 @@ async fn drive_inner<N: ClickhouseNodes>(db: &Database, nodes: &N, id: &str) -> 
             op.state = "cancelled".into();
             break;
         }
+        if defer_leader_restart(&spec, &mut steps, index, &health_of(db, &cluster.name)) {
+            op.steps_json = serde_json::to_string(&steps).map_err(|e| e.to_string())?;
+            db.update_clickhouse_operation(&op)?;
+            return Ok(());
+        }
         let prior = steps.clone();
         let fate = run_step(
             db,
@@ -586,9 +591,7 @@ fn clear_active(db: &Database, name: &str) -> Result<(), String> {
 
 pub async fn refresh_health<N: ClickhouseNodes>(db: &Database, nodes: &N) -> Result<(), String> {
     for cluster in db.list_clickhouse_clusters()? {
-        if !cluster.active_operation_id.is_empty() {
-            continue;
-        }
+        let busy = !cluster.active_operation_id.is_empty();
         let spec = spec_from_json(&cluster.spec_json)?;
         let mut health = Vec::new();
         let mut complete = true;
@@ -604,7 +607,7 @@ pub async fn refresh_health<N: ClickhouseNodes>(db: &Database, nodes: &N) -> Res
                 }
             }
         }
-        if !complete {
+        if !complete || busy {
             continue;
         }
         let phase = observed_phase(&spec, &health);
@@ -618,6 +621,44 @@ pub async fn refresh_health<N: ClickhouseNodes>(db: &Database, nodes: &N) -> Res
         }
     }
     Ok(())
+}
+
+/// A Keeper leader restart waits until a later voting follower restart has
+/// run. The plan is built with empty health, so the leader is only known
+/// once a poll has landed.
+fn defer_leader_restart(
+    spec: &ClusterSpec,
+    steps: &mut [Step],
+    index: usize,
+    health: &[MemberHealth],
+) -> bool {
+    let step = &steps[index];
+    if step.kind != RESTART_UNIT || step.unit != "keeper" {
+        return false;
+    }
+    let is_leader = health
+        .iter()
+        .any(|row| row.node_id == step.node_id && row.keeper_role == "leader");
+    if !is_leader {
+        return false;
+    }
+    let Some(offset) = steps.iter().skip(index + 1).position(|next| {
+        next.kind == RESTART_UNIT
+            && next.unit == "keeper"
+            && next.state != "succeeded"
+            && next.state != "skipped"
+            && spec
+                .keepers
+                .iter()
+                .any(|keeper| keeper.node_id == next.node_id && !keeper.learner)
+            && !health
+                .iter()
+                .any(|row| row.node_id == next.node_id && row.keeper_role == "leader")
+    }) else {
+        return false;
+    };
+    steps.swap(index, index + 1 + offset);
+    true
 }
 
 fn member_node_ids(spec: &ClusterSpec) -> Vec<String> {
@@ -2086,5 +2127,94 @@ spec:
         let op = db.get_clickhouse_operation("op-answered").unwrap().unwrap();
         assert_eq!(op.state, "failed");
         assert!(!op.message.contains("may still be present"));
+    }
+
+    #[tokio::test]
+    async fn refresh_records_health_during_an_operation_without_rotating() {
+        let fake = fake_nodes();
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-busy");
+        let ca = crate::clickhouse_pki::issue_ca("analytics").unwrap();
+        db.upsert_clickhouse_secrets(
+            "analytics",
+            &SecretRow {
+                default_password: "pw".into(),
+                default_sha256: "digest".into(),
+                metrics_password: "metrics".into(),
+                metrics_sha256: "digest".into(),
+                interserver_password: "inter".into(),
+                keeper_password: "keeper".into(),
+                cluster_secret: "secret".into(),
+                ca_cert_pem: ca.cert_pem,
+                ca_key_pem: ca.key_pem,
+            },
+        )
+        .unwrap();
+        db.upsert_clickhouse_cert(
+            "analytics",
+            &crate::clickhouse_db::CertRow {
+                node_id: "node-109".into(),
+                cert_pem: "old".into(),
+                key_pem: "old".into(),
+                not_after_unix: 1,
+            },
+        )
+        .unwrap();
+        refresh_health(&db, &fake).await.unwrap();
+        let cluster = db.get_clickhouse_cluster("analytics").unwrap().unwrap();
+        assert_eq!(cluster.phase, "upgrading");
+        assert_eq!(cluster.active_operation_id, "op-busy");
+        let members = db.list_clickhouse_members("analytics").unwrap();
+        assert!(members.iter().any(|member| {
+            member.node_id == "node-105"
+                && member.health_json.contains("\"keeper_role\":\"leader\"")
+        }));
+        let certs = db.list_clickhouse_certs("analytics").unwrap();
+        assert_eq!(certs[0].cert_pem, "old");
+        assert_eq!(*fake.reloads.lock().unwrap(), 0);
+        assert_eq!(*fake.applies.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn keeper_leader_restart_waits_behind_a_pending_follower() {
+        let fake = fake_nodes();
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-leader");
+        write_health(&db, &member_health("node-105", true, true, "leader"));
+        write_health(&db, &member_health("node-106", true, true, "follower"));
+        write_health(&db, &member_health("node-108", true, true, "follower"));
+        db.insert_clickhouse_operation(&OperationRow {
+            id: "op-leader".into(),
+            cluster_name: "analytics".into(),
+            kind: "upgrade".into(),
+            state: "pending".into(),
+            steps_json: serde_json::to_string(&vec![
+                restart_step("node-105", "keeper"),
+                restart_step("node-106", "keeper"),
+            ])
+            .unwrap(),
+            context_json: "{}".into(),
+            message: String::new(),
+            force: false,
+        })
+        .unwrap();
+        drive(&db, &fake, "op-leader").await.unwrap();
+        assert!(fake.units.lock().unwrap().is_empty());
+        let op = db.get_clickhouse_operation("op-leader").unwrap().unwrap();
+        let steps: Vec<Step> = serde_json::from_str(&op.steps_json).unwrap();
+        assert_eq!(steps[0].node_id, "node-106");
+        assert_eq!(steps[1].node_id, "node-105");
+        assert_eq!(op.state, "running");
+        drive(&db, &fake, "op-leader").await.unwrap();
+        let units = fake.units.lock().unwrap().clone();
+        assert_eq!(
+            units.first().map(String::as_str),
+            Some("restart keeper node-106")
+        );
+        assert!(units.iter().any(|unit| unit == "restart keeper node-105"));
     }
 }
