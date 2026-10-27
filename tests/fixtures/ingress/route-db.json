@@ -1,0 +1,16 @@
+{
+  "gateway": "edge",
+  "kind": "tcp",
+  "port": 5432,
+  "proxyProtocol": true,
+  "backends": [
+    {
+      "kind": "external",
+      "address": "10.0.0.9:5432"
+    },
+    {
+      "kind": "external",
+      "address": "10.0.0.8:5432"
+    }
+  ]
+}

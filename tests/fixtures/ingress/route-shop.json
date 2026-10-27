@@ -1,0 +1,23 @@
+{
+  "gateway": "edge",
+  "hosts": ["www.shop.example.com", "shop.example.com"],
+  "paths": [
+    {
+      "prefix": "/",
+      "backends": [
+        {"kind": "vm", "name": "shop-web-1", "port": 8080},
+        {"kind": "vm", "name": "shop-web-2", "port": 8080}
+      ],
+      "loadBalancing": {"policy": "least_conn", "tryDuration": "5s"},
+      "healthCheck": {"path": "/healthz", "interval": "10s", "expectStatus": 200}
+    },
+    {
+      "prefix": "/legacy",
+      "backends": [{"kind": "container", "name": "legacy-php", "port": 80}]
+    }
+  ],
+  "waf": {
+    "exclusions": [{"ruleId": 942100, "path": "/api/search", "arg": "q"}]
+  },
+  "headers": {"hsts": true, "forwarded": ["X-Real-IP"]}
+}

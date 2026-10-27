@@ -50,10 +50,57 @@ pub fn render_node_targets(db: &Database, scrape_port: u16) -> Result<String, St
         .map_err(|e| format!("serializing metrics file_sd targets: {e}"))
 }
 
+/// Targets for the ingress gateways' Caddy metrics: every node of every gateway.
+pub fn render_ingress_targets(db: &Database) -> Result<String, String> {
+    let nodes = db.list_nodes().map_err(|e| format!("listing nodes: {e}"))?;
+    let gateways = db
+        .list_ingress_gateways()
+        .map_err(|e| format!("listing ingress gateways: {e}"))?;
+    let mut entries: Vec<FileSdTarget> = Vec::new();
+    for row in gateways {
+        let Ok(spec) = crate::ingress_spec::parse_gateway(&row.spec_json) else {
+            continue;
+        };
+        for name in &spec.nodes {
+            let Some(node) = nodes.iter().find(|n| &n.id == name || &n.hostname == name) else {
+                continue;
+            };
+            let host = grpc_address_host(&node.address);
+            if host.is_empty() || host == "0.0.0.0" || host == "::" {
+                continue;
+            }
+            let port = crate::ingress_render::INGRESS_METRICS_PORT;
+            let target = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
+            let mut labels = BTreeMap::new();
+            labels.insert("node_id".to_string(), node.id.clone());
+            labels.insert("role".to_string(), "ingress-gateway".to_string());
+            labels.insert("gateway".to_string(), row.name.clone());
+            entries.push(FileSdTarget {
+                targets: vec![target],
+                labels,
+            });
+        }
+    }
+    serde_json::to_string_pretty(&entries)
+        .map_err(|e| format!("serializing ingress file_sd targets: {e}"))
+}
+
 /// Atomically rewrite `cfg.file_sd_path` from the current node inventory.
 pub fn write_node_targets(db: &Database, cfg: &MetricsConfig) -> Result<(), String> {
     let body = render_node_targets(db, cfg.scrape_port)?;
     let path = Path::new(&cfg.file_sd_path);
+    write_atomic(path, &body)?;
+    // Gateway nodes also expose Caddy metrics; the file is always rewritten so
+    // a deleted gateway's targets disappear.
+    let ingress = render_ingress_targets(db)?;
+    write_atomic(&path.with_file_name("ingress.json"), &ingress)
+}
+
+fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating metrics file_sd dir {}: {e}", parent.display()))?;
@@ -178,5 +225,39 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("read");
         assert!(body.contains("10.0.0.5:9100"), "{body}");
         assert!(!dir.path().join(".nodes.json.tmp").exists());
+    }
+
+    #[test]
+    fn ingress_targets_cover_every_gateway_node() {
+        let db = Database::open(":memory:").expect("db");
+        db.upsert_node(&sample_node("node-1", "192.168.40.10:9091", "kvm1"))
+            .expect("register");
+        db.upsert_node(&sample_node("node-2", "192.168.40.11:9091", "kvm2"))
+            .expect("register");
+        db.upsert_ingress_gateway(&crate::db::IngressGatewayRow {
+            name: "edge".into(),
+            generation: 1,
+            spec_json: r#"{"nodes":["node-1","kvm2"],
+                "listeners":[{"address":"203.0.113.10","ports":[80,443]}],
+                "tls":{"acme":{"email":"ops@example.com"}}}"#
+                .into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .expect("gateway");
+        let json: serde_json::Value =
+            serde_json::from_str(&render_ingress_targets(&db).expect("render")).expect("json");
+        let targets: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["targets"][0].as_str().unwrap())
+            .collect();
+        assert_eq!(targets, ["192.168.40.10:2020", "192.168.40.11:2020"]);
+        assert_eq!(json[0]["labels"]["gateway"], "edge");
+        assert_eq!(json[0]["labels"]["role"], "ingress-gateway");
+        // No gateways: an empty list, so stale targets are removed.
+        db.delete_ingress_gateway("edge").unwrap();
+        assert_eq!(render_ingress_targets(&db).unwrap().trim(), "[]");
     }
 }

@@ -1,0 +1,12 @@
+{
+  "engine": "detect",
+  "crs": {
+    "paranoiaLevel": 1,
+    "inboundAnomalyThreshold": 5,
+    "outboundAnomalyThreshold": 4,
+    "allowedMethods": ["GET", "HEAD", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"],
+    "allowedContentTypes": ["application/json", "application/x-www-form-urlencoded", "multipart/form-data"]
+  },
+  "ipDenyList": ["192.0.2.0/24"],
+  "customRules": "SecRule REQUEST_HEADERS:User-Agent \"@pm sqlmap nikto\" \"id:10001,phase:1,deny,status:403,log,msg:'scanner'\""
+}

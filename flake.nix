@@ -56,6 +56,8 @@
               path: type:
               (craneLib.filterCargoSources path type)
               || pkgs.lib.hasPrefix "${toString ./.}/proto/" (toString path)
+              || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/ingress/" (toString path)
+              || pkgs.lib.hasPrefix "${toString ./.}/examples/ingress/" (toString path)
               || (toString path) == "${toString ./.}/modules"
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
@@ -168,6 +170,7 @@
         {
           packages = {
             default = kcore-node-agent;
+            caddy-kcore = import ./modules/kcore-ingress-caddy.nix { inherit pkgs; };
             inherit
               kcore-node-agent
               kcore-controller
@@ -213,6 +216,14 @@
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
               consoleModule = ./modules/kcore-branding.nix;
+            };
+            kcore-ingress = import ./tests/kcore-ingress.nix { inherit pkgs; };
+            # The renderer's golden configurations must load in the real Caddy
+            # build, with every plugin it uses.
+            kcore-ingress-config = import ./tests/kcore-ingress-config.nix {
+              inherit pkgs;
+              caddy = import ./modules/kcore-ingress-caddy.nix { inherit pkgs; };
+              fixtures = ./tests/fixtures/ingress;
             };
             kcore-host-eval = import ./tests/kcore-host-eval.nix {
               inherit pkgs;

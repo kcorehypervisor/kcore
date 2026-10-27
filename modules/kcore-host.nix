@@ -62,6 +62,7 @@ in
     ./ch-vm
     ./kcore-branding.nix
     ./kcore-ceph.nix
+    ./kcore-ingress.nix
     ./kcore-metrics.nix
     (lib.mkRemovedOptionModule [
       "services"

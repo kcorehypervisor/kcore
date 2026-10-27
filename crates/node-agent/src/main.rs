@@ -15,6 +15,7 @@ mod grpc;
 mod guest_ops;
 mod ha;
 mod host_cpu;
+mod ingress;
 mod instant;
 mod issue_screen;
 mod live_migrate;
@@ -158,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         let reg_cfg = cfg.clone();
         let registered = registration::register_with_controller_tracked(reg_cfg);
         registration::start_heartbeat_loop(cfg.clone(), registered.clone());
+        ingress::spawn_waf_tailer(cfg.clone());
         pki::rotate::spawn_rotation_loop(cfg.clone(), reload.clone());
         pki::revocation::spawn_crl_refresh_loop(cfg.clone(), revocation.clone());
     }

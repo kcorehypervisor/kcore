@@ -1,0 +1,23 @@
+{
+  "gateway": "edge",
+  "hosts": [
+    "pay.example.com",
+    "*.apps.example.com"
+  ],
+  "paths": [
+    {
+      "prefix": "/",
+      "backends": [
+        {
+          "kind": "external",
+          "address": "192.168.40.50:8443"
+        }
+      ],
+      "backendTls": {
+        "serverName": "payments.internal",
+        "caBundle": "-----BEGIN CERTIFICATE-----\nMIIBMTCB2AIJAK04+HrJ3V3/MAoGCCqGSM49BAMCMCAxHjAcBgNVBAMMFWtjb3Jl\nIHRlc3QgYmFja2VuZCBDQTAgFw0yNjEwMjYxNTMxMzRaGA8yMTI2MTAwMjE1MzEz\nNFowIDEeMBwGA1UEAwwVa2NvcmUgdGVzdCBiYWNrZW5kIENBMFkwEwYHKoZIzj0C\nAQYIKoZIzj0DAQcDQgAEKptylfbd+UQSDW+De+6zvyH6fhu9R54Wr18+HMgrt/bB\nhmUsfJ1AKURiZMqGwxQx110FefnubVBYsMVljHFb2zAKBggqhkjOPQQDAgNIADBF\nAiBNIbyxtxNAKkQ1VmC9/hzkgUtmrFcxxDVj5RVXQ54TzAIhALRGYODB3f4X2HnX\n2TS7fOq4rx4dscwXI4MW1At8Yzmp\n-----END CERTIFICATE-----\n"
+      },
+      "proxyProtocol": true
+    }
+  ]
+}

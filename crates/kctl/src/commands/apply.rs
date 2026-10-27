@@ -101,6 +101,9 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
             "sharedfilesystem" | "shared-filesystem" | "shared_filesystem" => {
                 return shared_filesystem::apply_from_file(info, file).await
             }
+            k if crate::commands::ingress::canonical_kind(k).is_some() => {
+                return crate::commands::ingress::apply_from_file(info, file).await
+            }
             "objectstore" | "object-store" | "object_store" => {
                 return object_store::apply_from_file(info, file).await
             }

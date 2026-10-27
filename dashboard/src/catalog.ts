@@ -115,6 +115,66 @@ function ok(resp: { success?: boolean; message?: string }, extra: Record<string,
   return { ok: true, ...(resp.message ? { message: resp.message } : {}), ...extra };
 }
 
+
+const specField = (label: string): Field => ({ name: "spec", label, kind: "multiline", required: true, placeholder: '{"hosts": ["shop.example.com"], ...}' });
+
+/** The spec the form carries: JSON, checked here so the error shows before a round trip. */
+function specJson(v: Values, allowEmpty = false): string {
+  const raw = text(v, "spec");
+  if (!raw && allowEmpty) return "{}";
+  if (!raw) throw new FormError("Spec is required");
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    return JSON.stringify(parsed);
+  } catch {
+    throw new FormError("Spec must be a JSON object");
+  }
+}
+
+/** The stored spec of a gateway, route, or policy row, as an object. */
+function parsedSpec(row: Row): unknown {
+  try {
+    return JSON.parse(String(row.spec_json ?? "{}"));
+  } catch {
+    return row.spec_json;
+  }
+}
+
+function specObject(row: Row): Record<string, unknown> {
+  const spec = parsedSpec(row);
+  return spec && typeof spec === "object" && !Array.isArray(spec) ? (spec as Record<string, unknown>) : {};
+}
+
+function ingressGatewayRow(row: Row): Row {
+  const status = (row.status ?? {}) as Row;
+  const nodes = (Array.isArray(status.nodes) ? status.nodes : []) as Row[];
+  return {
+    ...flatten(row),
+    nodes: nodes.map((n) => n.node_id),
+    ready_nodes: `${nodes.filter((n) => n.healthy).length}/${nodes.length}`,
+    vip_holder: nodes.find((n) => n.vip_holder)?.node_id ?? null,
+  };
+}
+
+function ingressRouteRow(row: Row): Row {
+  const spec = specObject(row);
+  const waf = (spec.waf ?? {}) as Row;
+  return {
+    ...flatten(row),
+    kind: spec.kind ?? "http",
+    hosts: spec.hosts ?? [],
+    waf_mode: waf.mode ?? "policy default",
+    managed_by: row.owner || null,
+  };
+}
+
+function wafPolicyRow(row: Row): Row {
+  const spec = specObject(row);
+  const crs = (spec.crs ?? {}) as Row;
+  return { ...row, engine: spec.engine ?? "detect", paranoia_level: crs.paranoiaLevel ?? 1 };
+}
+
 function backend(name: string): StorageBackendType {
   switch (name.toLowerCase()) {
     case "filesystem":
@@ -1004,6 +1064,122 @@ export const RESOURCES: Resource[] = [
         return { ok: true };
       }),
     ],
+  },
+  {
+    id: "ingress-gateways",
+    noun: "ingress gateway",
+    title: "Ingress gateways",
+    group: "Ingress",
+    terraform: [],
+    kctl: "get ingress-gateways",
+    idField: "name",
+    refreshMs: 10000,
+    fields: [f("name", "Name", true), specField("Spec (JSON)")],
+    list: async () => rowsOf(await controller.listIngressGateways({}), "gateways").map(ingressGatewayRow),
+    create: async (v) => {
+      const resp = await controller.createIngressGateway({ name: required(v, "name"), specJson: specJson(v) });
+      return ok(resp, { action: resp.action });
+    },
+    inspect: async (key) => {
+      const gateway = rowOf(await controller.getIngressGateway({ name: key })).gateway as Row;
+      return { detail: { ...gateway, spec_json: parsedSpec(gateway) } };
+    },
+    actions: [
+      act("delete", "Delete", true, [], async (v) => {
+        await controller.deleteIngressGateway({ name: ident(v) });
+        return { ok: true };
+      }),
+    ],
+  },
+  {
+    id: "ingress-routes",
+    noun: "ingress route",
+    title: "Ingress routes",
+    group: "Ingress",
+    terraform: [],
+    kctl: "get ingress-routes",
+    idField: "name",
+    refreshMs: 10000,
+    fields: [f("name", "Name", true), specField("Spec (JSON)")],
+    filters: [f("gateway", "Gateway")],
+    list: async (filters) => rowsOf(await controller.listIngressRoutes({ gateway: text(filters, "gateway") }), "routes").map(ingressRouteRow),
+    create: async (v) => {
+      const resp = await controller.createIngressRoute({ name: required(v, "name"), specJson: specJson(v) });
+      return ok(resp, { action: resp.action });
+    },
+    // The route page: certificate, upstream health and what the WAF saw lately.
+    inspect: async (key) => {
+      const route = rowOf(await controller.getIngressRoute({ name: key })).route as Row;
+      const since = BigInt(Math.floor(Date.now() / 1000) - 24 * 3600);
+      const events = rowsOf(await controller.listWafEvents({ route: key, sinceUnix: since, limit: 50 }), "events");
+      return { detail: { ...route, spec_json: parsedSpec(route), waf_events_24h: events } };
+    },
+    actions: [
+      act(
+        "waf-mode",
+        "Set WAF mode",
+        true,
+        [pick("mode", "Mode", ["detect", "block", "off"], true)],
+        async (v) => ok(await controller.setIngressRouteWafMode({ name: ident(v), mode: required(v, "mode") })),
+      ),
+      act("delete", "Delete", true, [], async (v) => {
+        await controller.deleteIngressRoute({ name: ident(v) });
+        return { ok: true };
+      }),
+    ],
+  },
+  {
+    id: "waf-policies",
+    noun: "WAF policy",
+    title: "WAF policies",
+    group: "Ingress",
+    terraform: [],
+    kctl: "get waf-policies",
+    idField: "name",
+    fields: [f("name", "Name", true), specField("Spec (JSON)")],
+    list: async () => rowsOf(await controller.listWafPolicies({}), "policies").map(wafPolicyRow),
+    create: async (v) => {
+      const resp = await controller.createWafPolicy({ name: required(v, "name"), specJson: specJson(v, true) });
+      return ok(resp, { action: resp.action });
+    },
+    inspect: async (key) => {
+      const policy = rowOf(await controller.getWafPolicy({ name: key })).policy as Row;
+      return { detail: { ...policy, spec_json: parsedSpec(policy) } };
+    },
+    actions: [
+      act("delete", "Delete", true, [], async (v) => {
+        await controller.deleteWafPolicy({ name: ident(v) });
+        return { ok: true };
+      }),
+    ],
+  },
+  {
+    id: "waf-events",
+    noun: "WAF event",
+    title: "WAF events",
+    group: "Ingress",
+    terraform: [],
+    kctl: "get waf-events",
+    idField: "id",
+    refreshMs: 10000,
+    fields: [],
+    filters: [f("route", "Route"), f("rule_id", "Rule ID"), f("since_hours", "Since (hours)")],
+    list: async (filters) => {
+      const hours = text(filters, "since_hours") ? Number(text(filters, "since_hours")) : 24;
+      if (!Number.isFinite(hours) || hours <= 0) throw new FormError("Since must be a positive number of hours");
+      const rule = text(filters, "rule_id") ? Number(text(filters, "rule_id")) : 0;
+      if (!Number.isInteger(rule) || rule < 0) throw new FormError("Rule ID must be a whole number");
+      return rowsOf(
+        await controller.listWafEvents({
+          route: text(filters, "route"),
+          ruleId: rule,
+          sinceUnix: BigInt(Math.floor(Date.now() / 1000 - hours * 3600)),
+          limit: 200,
+        }),
+        "events",
+      );
+    },
+    actions: [],
   },
   {
     id: "object-stores",

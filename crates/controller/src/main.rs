@@ -22,6 +22,11 @@ mod grpc;
 mod guest_ops;
 mod ha;
 mod host_volume;
+mod ingress_events;
+mod ingress_kubernetes;
+mod ingress_reconciler;
+mod ingress_render;
+mod ingress_spec;
 mod kubernetes_admin;
 mod kubernetes_lifecycle;
 mod kubernetes_local;
@@ -264,6 +269,11 @@ async fn main() -> anyhow::Result<()> {
 
     let webhooks =
         webhooks::Dispatcher::spawn(&cfg.webhooks, webhooks::EventSource::from_config(&cfg));
+    ingress_reconciler::spawn_ingress_reconciler(
+        database.clone(),
+        clients.clone(),
+        webhooks.clone(),
+    );
 
     cert_rotation_reconciler::spawn_cert_rotation_reconciler(
         cert_rotation_reconciler::CertRotationContext {

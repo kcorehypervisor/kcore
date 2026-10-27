@@ -4,7 +4,12 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 mod auth_store;
+mod ingress_store;
 pub use auth_store::{AuthTokenRow, OperatorCredentials};
+pub use ingress_store::{
+    IngressGatewayRow, IngressGatewayStatusRow, IngressRouteRow, IngressRouteStatusRow,
+    WafEventFilter, WafEventRow, WafPolicyRow, INGRESS_TABLES_DOWN,
+};
 
 fn is_sqlite_memory_database_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -822,7 +827,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 66;
+pub const SCHEMA_VERSION: i32 = 67;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -830,7 +835,8 @@ pub const SCHEMA_VERSION: i32 = 66;
 /// membership columns with defaults. Version 61 adds `vms.labels` with a
 /// default. Version 62 adds vGPU parent and profile columns on `node_gpus`.
 /// Version 63 adds the HA tables. Version 64 adds the fence hold on `node_ha`.
-/// Version 65 adds `node_ha.host_health` for proactive cordon.
+/// Version 65 adds `node_ha.host_health` for proactive cordon. Version 67 adds
+/// the ingress tables, which an older reader never selects.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2202,6 +2208,10 @@ impl Database {
                 );
                 CREATE INDEX IF NOT EXISTS idx_auth_tokens_operator ON auth_tokens(operator_name);",
             )?;
+        }
+
+        if version < 67 {
+            conn.execute_batch(ingress_store::INGRESS_TABLES)?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;

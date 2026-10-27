@@ -21,11 +21,15 @@ struct AdminCreds {
     key_pem: String,
 }
 
+/// Calls the API with the admin client certificate, or, when `bearer_token`
+/// is not empty, as that token (a scoped ServiceAccount). The server address
+/// and CA always come from the admin kubeconfig.
 pub async fn call_admin_conf(
     method: &str,
     path: &str,
     body: &str,
     content_type: &str,
+    bearer_token: &str,
 ) -> Result<(i32, String)> {
     let method = method.trim().to_ascii_uppercase();
     if !matches!(method.as_str(), "GET" | "POST" | "PATCH" | "PUT" | "DELETE") {
@@ -41,7 +45,11 @@ pub async fn call_admin_conf(
     } else {
         content_type
     };
-    https_request(&creds, &method, path, body, content_type).await
+    let token = bearer_token.trim();
+    if token.contains(['\r', '\n', ' ']) {
+        anyhow::bail!("bearer token is not a single header value");
+    }
+    https_request(&creds, &method, path, body, content_type, token).await
 }
 
 fn validate_api_path(path: &str) -> Result<()> {
@@ -110,15 +118,20 @@ async fn https_request(
     path: &str,
     body: &str,
     content_type: &str,
+    bearer_token: &str,
 ) -> Result<(i32, String)> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in pem_certs(&creds.ca_pem)? {
         roots.add(cert).context("kubernetes CA")?;
     }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(pem_certs(&creds.cert_pem)?, pem_key(&creds.key_pem)?)
-        .context("admin client certificate")?;
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let config = if bearer_token.is_empty() {
+        builder
+            .with_client_auth_cert(pem_certs(&creds.cert_pem)?, pem_key(&creds.key_pem)?)
+            .context("admin client certificate")?
+    } else {
+        builder.with_no_client_auth()
+    };
     let name = ServerName::try_from(creds.server_name.clone()).context("api server name")?;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&creds.addr))
@@ -133,6 +146,9 @@ async fn https_request(
         "{method} {path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: close\r\n",
         creds.server_name
     );
+    if !bearer_token.is_empty() {
+        request.push_str(&format!("Authorization: Bearer {bearer_token}\r\n"));
+    }
     if !body.is_empty() || matches!(method, "POST" | "PATCH" | "PUT" | "DELETE") {
         request.push_str(&format!(
             "Content-Type: {content_type}\r\nContent-Length: {}\r\n",

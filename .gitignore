@@ -19,6 +19,8 @@ dashboard/src/gen
 k8s-config-node-*.nix
 *.key
 *.pem
+# Public certificate for the ingress backend-TLS parser test. Not a private key.
+!tests/fixtures/ingress/backend-ca.pem
 *.kubeconfig
 *.csr
 *.srl

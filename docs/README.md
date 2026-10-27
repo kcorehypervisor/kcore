@@ -23,6 +23,7 @@ This directory contains the complete implementation plan for running Kubernetes 
 ### Other bare-metal services
 - **ClickHouse design:** [bare-metal-clickhouse.md](./bare-metal-clickhouse.md) - Shards, replicas, Keeper, rolling operations, test plan
 - **ClickHouse proto:** [proto-snippets-clickhouse.proto](./proto-snippets-clickhouse.proto) - Controller and node RPCs (compiles standalone)
+- **Ingress design:** [ingress-waf-load-balancer-plan.md](./ingress-waf-load-balancer-plan.md) - Caddy HTTPS load balancer with Coraza WAF and Let's Encrypt, fronting VMs, containers, and Kubernetes services
 
 ## 🎯 What This Implements
 

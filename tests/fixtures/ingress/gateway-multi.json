@@ -1,0 +1,5 @@
+{
+  "nodes": ["node-105"],
+  "listeners": [{"address": "203.0.113.10", "ports": [80, 443, 5432, 8443]}],
+  "tls": {"acme": {"email": "ops@example.com", "dns01": {"provider": "cloudflare"}}}
+}

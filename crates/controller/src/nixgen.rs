@@ -624,6 +624,138 @@ fn render_postgresql(pg: &PostgresqlNix) -> Option<String> {
     ))
 }
 
+/// The `kcore.ingress` settings of one gateway node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressNix {
+    pub listen_addresses: Vec<String>,
+    pub http3: bool,
+    pub acme_email: String,
+    pub vip: Option<IngressVipNix>,
+    /// Extra `(address, port)` pairs carried by TCP routes.
+    pub tcp_listeners: Vec<(String, u16)>,
+    /// A DNS-01 provider is configured: read `/etc/kcore/ingress/dns.env`.
+    pub dns_credentials: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressVipNix {
+    pub address: String,
+    pub interface: String,
+    pub virtual_router_id: u8,
+    pub priority: u8,
+    pub source_address: String,
+    pub peers: Vec<String>,
+}
+
+/// Append `kcore.ingress` to a generated node module.
+///
+/// Values come from validated specs, but this text is written as root during
+/// `nixos-rebuild`, so addresses must parse as IPs and the interface must be a
+/// plain name; anything else leaves the block out.
+pub fn with_ingress(config: String, ingress: Option<&IngressNix>) -> String {
+    let Some(ingress) = ingress else {
+        return config;
+    };
+    let Some(block) = render_ingress(ingress) else {
+        return config;
+    };
+    splice_module_block(config, &block)
+}
+
+fn splice_module_block(config: String, block: &str) -> String {
+    let trimmed = config.trim_end();
+    let Some(body) = trimmed.strip_suffix('}') else {
+        return format!("{config}{block}");
+    };
+    format!("{body}{block}}}\n")
+}
+
+fn render_ingress(ing: &IngressNix) -> Option<String> {
+    use std::net::IpAddr;
+    let ip_ok = |s: &str| s.parse::<IpAddr>().is_ok();
+    if ing.listen_addresses.is_empty() || !ing.listen_addresses.iter().all(|a| ip_ok(a)) {
+        return None;
+    }
+    if ing
+        .acme_email
+        .chars()
+        .any(|c| c.is_control() || c == '"' || c == '\\' || c == '$')
+    {
+        return None;
+    }
+    let quote_list = |items: &[String]| {
+        items
+            .iter()
+            .map(|i| format!("\"{}\"", nix_escape(i)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut out = String::from("  kcore.ingress = {\n    enable = true;\n");
+    out.push_str(&format!(
+        "    listenAddresses = [ {} ];\n",
+        quote_list(&ing.listen_addresses)
+    ));
+    out.push_str(&format!("    http3 = {};\n", ing.http3));
+    out.push_str(&format!(
+        "    acme.email = \"{}\";\n",
+        nix_escape(&ing.acme_email)
+    ));
+    if ing.dns_credentials {
+        out.push_str("    acme.credentialsFile = \"/etc/kcore/ingress/dns.env\";\n");
+    }
+    if !ing.tcp_listeners.is_empty() {
+        if !ing.tcp_listeners.iter().all(|(a, p)| ip_ok(a) && *p != 0) {
+            return None;
+        }
+        out.push_str("    tcpListeners = [\n");
+        for (addr, port) in &ing.tcp_listeners {
+            out.push_str(&format!(
+                "      {{ address = \"{}\"; port = {port}; }}\n",
+                nix_escape(addr)
+            ));
+        }
+        out.push_str("    ];\n");
+    }
+    if let Some(v) = &ing.vip {
+        let iface_ok = !v.interface.is_empty()
+            && v.interface.len() <= 15
+            && v.interface
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+        if !ip_ok(&v.address)
+            || !ip_ok(&v.source_address)
+            || !v.peers.iter().all(|p| ip_ok(p))
+            || !iface_ok
+            || v.virtual_router_id == 0
+            || v.priority == 0
+        {
+            return None;
+        }
+        out.push_str("    vip = {\n");
+        out.push_str(&format!(
+            "      address = \"{}\";\n",
+            nix_escape(&v.address)
+        ));
+        out.push_str(&format!(
+            "      interface = \"{}\";\n",
+            nix_escape(&v.interface)
+        ));
+        out.push_str(&format!(
+            "      virtualRouterId = {};\n",
+            v.virtual_router_id
+        ));
+        out.push_str(&format!("      priority = {};\n", v.priority));
+        out.push_str(&format!(
+            "      sourceAddress = \"{}\";\n",
+            nix_escape(&v.source_address)
+        ));
+        out.push_str(&format!("      peers = [ {} ];\n", quote_list(&v.peers)));
+        out.push_str("    };\n");
+    }
+    out.push_str("  };\n");
+    Some(out)
+}
+
 fn safe_postgresql_ident(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -636,6 +768,53 @@ fn safe_postgresql_ident(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ingress(vip: bool) -> IngressNix {
+        IngressNix {
+            listen_addresses: vec!["203.0.113.10".into()],
+            http3: true,
+            acme_email: "ops@example.com".into(),
+            tcp_listeners: vec![("203.0.113.10".into(), 5432)],
+            dns_credentials: true,
+            vip: vip.then(|| IngressVipNix {
+                address: "203.0.113.10".into(),
+                interface: "eno1".into(),
+                virtual_router_id: 61,
+                priority: 100,
+                source_address: "10.0.0.1".into(),
+                peers: vec!["10.0.0.2".into()],
+            }),
+        }
+    }
+
+    #[test]
+    fn with_ingress_appends_a_module_block() {
+        let base = "{ config, pkgs, ... }:\n{\n  networking.hostName = \"n\";\n}\n".to_string();
+        let out = with_ingress(base.clone(), Some(&ingress(true)));
+        assert!(out.contains("kcore.ingress = {"), "{out}");
+        assert!(out.contains("listenAddresses = [ \"203.0.113.10\" ];"));
+        assert!(out.contains("virtualRouterId = 61;"));
+        assert!(out.contains("{ address = \"203.0.113.10\"; port = 5432; }"));
+        assert!(out.contains("acme.credentialsFile = \"/etc/kcore/ingress/dns.env\";"));
+        assert!(out.contains("peers = [ \"10.0.0.2\" ];"));
+        assert!(out.trim_end().ends_with('}'));
+        assert_eq!(with_ingress(base.clone(), None), base);
+        assert!(!with_ingress(base, Some(&ingress(false))).contains("vip ="));
+    }
+
+    #[test]
+    fn with_ingress_refuses_unsafe_values() {
+        let base = "{\n}\n".to_string();
+        let mut bad = ingress(true);
+        bad.listen_addresses = vec!["1.2.3.4\"; evil = true; \"".into()];
+        assert_eq!(with_ingress(base.clone(), Some(&bad)), base);
+        let mut bad = ingress(true);
+        bad.vip.as_mut().unwrap().interface = "eno1\"; x".into();
+        assert_eq!(with_ingress(base.clone(), Some(&bad)), base);
+        let mut bad = ingress(false);
+        bad.acme_email = "a@b\" ;".into();
+        assert_eq!(with_ingress(base.clone(), Some(&bad)), base);
+    }
     use crate::db::VolumeRow;
 
     fn vm(auto_start: bool, name: &str) -> VmRow {

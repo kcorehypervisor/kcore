@@ -1,0 +1,14 @@
+{
+  "gateway": "edge",
+  "kind": "tcp",
+  "port": 8443,
+  "hosts": [
+    "pg.example.com"
+  ],
+  "backends": [
+    {
+      "kind": "external",
+      "address": "10.0.0.7:443"
+    }
+  ]
+}

@@ -136,6 +136,32 @@ export const KINDS: ResourceKind[] = [
     immutable: ["cephCluster"],
   },
   {
+    id: "ingress-gateway",
+    yamlKind: "IngressGateway",
+    title: "Ingress gateway",
+    summary:
+      "HTTPS gateway (Caddy + Coraza WAF) on one or two nodes. Applying it enables the service on those nodes through a NixOS rebuild. Needs a public listener address, an ACME email, and port 80 for HTTP-01.",
+    mutable: ["nodes", "listeners", "highAvailability", "tls", "defaultWafPolicy", "rateLimit", "accessLog", "kubernetes"],
+    immutable: ["name"],
+  },
+  {
+    id: "ingress-route",
+    yamlKind: "IngressRoute",
+    title: "Ingress route",
+    summary:
+      "Hostnames and paths mapped to VM, external, or Kubernetes backends, or a TCP/SNI route. Plan validates against the cluster and renders the gateway configuration. Start with the WAF in detect mode.",
+    mutable: ["hosts", "paths", "port", "backends", "proxyProtocol", "rateLimit", "waf", "headers", "redirectHttp", "tls"],
+    immutable: ["name", "gateway", "kind"],
+  },
+  {
+    id: "waf-policy",
+    yamlKind: "WafPolicy",
+    title: "WAF policy",
+    summary: "OWASP Core Rule Set through Coraza: paranoia level, thresholds, IP lists, custom rules. New policies should start with engine detect.",
+    mutable: ["engine", "crs", "requestBodyLimitBytes", "responseBodyInspection", "ipAllowList", "ipDenyList", "customRules", "audit"],
+    immutable: ["name"],
+  },
+  {
     id: "image",
     yamlKind: "Image",
     title: "Node image",

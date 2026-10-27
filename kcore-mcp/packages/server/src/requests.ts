@@ -54,6 +54,12 @@ export function buildApply(kind: ResourceKind, spec: Record<string, unknown>): R
       return [{ target: "controller", method: "createCephCluster", request: { cephCluster: cephMessage(spec) } }];
     case "shared-filesystem":
       return [{ target: "controller", method: "createSharedFilesystem", request: { sharedFilesystem: filesystemMessage(spec) } }];
+    case "ingress-gateway":
+      return [{ target: "controller", method: "createIngressGateway", request: ingressRequest(spec) }];
+    case "ingress-route":
+      return [{ target: "controller", method: "createIngressRoute", request: ingressRequest(spec) }];
+    case "waf-policy":
+      return [{ target: "controller", method: "createWafPolicy", request: ingressRequest(spec) }];
     case "object-store":
       return [{ target: "controller", method: "createObjectStore", request: { objectStore: objectStoreMessage(spec) } }];
     case "cluster-update":
@@ -112,6 +118,18 @@ export function buildRead(kind: ResourceKind, name?: string): RpcCall {
       return named
         ? { target: "controller", method: "getSharedFilesystem", request: { name: named } }
         : { target: "controller", method: "listSharedFilesystems", request: {} };
+    case "ingress-gateway":
+      return named
+        ? { target: "controller", method: "getIngressGateway", request: { name: named } }
+        : { target: "controller", method: "listIngressGateways", request: {} };
+    case "ingress-route":
+      return named
+        ? { target: "controller", method: "getIngressRoute", request: { name: named } }
+        : { target: "controller", method: "listIngressRoutes", request: { gateway: "" } };
+    case "waf-policy":
+      return named
+        ? { target: "controller", method: "getWafPolicy", request: { name: named } }
+        : { target: "controller", method: "listWafPolicies", request: {} };
     case "object-store":
       return named
         ? { target: "controller", method: "getObjectStore", request: { name: named } }
@@ -156,6 +174,12 @@ export function buildDelete(kind: ResourceKind, name: string): RpcCall {
       return { target: "controller", method: "deleteCephCluster", request: { name: id } };
     case "shared-filesystem":
       return { target: "controller", method: "deleteSharedFilesystem", request: { name: id } };
+    case "ingress-gateway":
+      return { target: "controller", method: "deleteIngressGateway", request: { name: id } };
+    case "ingress-route":
+      return { target: "controller", method: "deleteIngressRoute", request: { name: id } };
+    case "waf-policy":
+      return { target: "controller", method: "deleteWafPolicy", request: { name: id } };
     case "object-store":
       return { target: "controller", method: "deleteObjectStore", request: { name: id } };
     case "cluster-update":
@@ -166,6 +190,19 @@ export function buildDelete(kind: ResourceKind, name: string): RpcCall {
 }
 
 export function buildPlanCall(kind: ResourceKind, spec: Record<string, unknown>, name?: string): RpcCall {
+  if (kind.id === "ingress-gateway" || kind.id === "ingress-route" || kind.id === "waf-policy") {
+    const request = ingressRequest(spec);
+    const gateway = kind.id === "ingress-gateway" ? request.name : typeof spec.gateway === "string" ? spec.gateway : "";
+    if (kind.id !== "waf-policy" && !gateway) throw new InputError("an ingress route needs a gateway to plan against");
+    return {
+      target: "controller",
+      method: "planIngress",
+      request: {
+        gateway,
+        documents: [{ kind: kind.yamlKind, name: request.name, specJson: request.specJson }],
+      },
+    };
+  }
   if (kind.id === "disk-layout") {
     return { target: "controller", method: "classifyDiskLayout", request: { diskLayout: diskLayoutMessage(spec) } };
   }
@@ -499,6 +536,18 @@ function cephMessage(spec: Record<string, unknown>): Record<string, unknown> {
       nodes: Array.isArray(spec.nodes) ? spec.nodes : [],
     },
   };
+}
+
+/**
+ * Ingress resources travel as the canonical JSON spec: the name is separate and
+ * everything else is the spec, which the controller parses strictly.
+ */
+function ingressRequest(spec: Record<string, unknown>): { name: string; specJson: string } {
+  const name = assertName(required(spec, "name", "name"), "name");
+  const { name: _name, kind: _kind, ...rest } = spec;
+  void _name;
+  void _kind;
+  return { name, specJson: JSON.stringify(rest) };
 }
 
 function filesystemMessage(spec: Record<string, unknown>): Record<string, unknown> {

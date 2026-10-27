@@ -15,6 +15,9 @@ the event.
 | `vm.created` | `CreateVm` stored a new VM. |
 | `vm.deleted` | `DeleteVm` removed a VM. |
 | `vm.migrated` | `MigrateVm` finished a live or cold move. |
+| `ingress.waf.blocked` | Gateway nodes reported requests the WAF refused. One event per route per minute, with `count`, `topRules` and `topClients`. |
+| `ingress.waf.detected` | Same, for requests a rule matched while the route was in `detect` mode. |
+| `ingress.vip.moved` | The node holding an ingress gateway's VIP changed. `data` has `from`, `to` and `address`. |
 
 Each controller delivers events it observes itself. Set `replication.controllerId`
 when several controllers post to the same URL; the field is copied onto every

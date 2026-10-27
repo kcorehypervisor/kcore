@@ -96,6 +96,11 @@ jobs:
       - name: Nix format check
         run: nix build --no-link .#checks.x86_64-linux.fmt-nix
 
+      # The rendered Caddy JSON must load in the pinned plugin build. This does
+      # not boot a VM; the Pebble test is checks.x86_64-linux.kcore-ingress.
+      - name: Ingress Caddy configuration
+        run: nix build --no-link .#checks.x86_64-linux.kcore-ingress-config
+
       # Generates the TypeScript client from proto/, typechecks, runs vitest,
       # and builds the static files the controller serves.
       - name: Dashboard build

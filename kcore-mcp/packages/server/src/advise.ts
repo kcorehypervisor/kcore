@@ -42,6 +42,9 @@ const INTENT: Array<[RegExp, string]> = [
   [/\bceph\b/i, "ceph-cluster"],
   [/\bcephfs\b|\bshared filesystems?\b/i, "shared-filesystem"],
   [/\bobject stores?\b|\brgw\b|\bs3\b/i, "object-store"],
+  [/\bwaf polic(?:y|ies)\b/i, "waf-policy"],
+  [/\bingress routes?\b/i, "ingress-route"],
+  [/\bingress gateways?\b|\bhttps load balancer\b/i, "ingress-gateway"],
   [/\bcluster updates?\b|\brolling update\b/i, "cluster-update"],
   [/\bclusters?\b|\bcontext\b|\bbootstrap\b/i, "cluster"],
 ];
@@ -320,6 +323,75 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           { example: "0" },
         ),
       ].filter((item) => item.required);
+    case "ingress-gateway":
+      return [
+        question("name", "What should the ingress gateway be called?", "Routes refer to the gateway by this name.", missing(spec, "name")),
+        question(
+          "nodes",
+          "Which node (or two nodes, for a shared VIP) should run it?",
+          "Applying the gateway rebuilds those nodes' NixOS configuration. Two nodes also need highAvailability.",
+          missing(spec, "nodes"),
+          { example: "node-105" },
+        ),
+        question(
+          "listeners",
+          "Which public address and ports should it listen on?",
+          "The address must exist on the node (or be the VIP). HTTP-01 certificates need port 80 reachable from the internet.",
+          missing(spec, "listeners"),
+          { example: "203.0.113.10 ports 80 and 443" },
+        ),
+        question(
+          "tls",
+          "What email should ACME use, and should it start on Let's Encrypt staging?",
+          "The email receives expiry notices. Staging has no rate limits while the setup is tested.",
+          missing(spec, "tls"),
+          { example: "ops@example.com, letsencrypt-staging" },
+        ),
+      ].filter((item) => item.required);
+    case "ingress-route":
+      return [
+        question("name", "What should the route be called?", "It is the handle for status, WAF events and changes.", missing(spec, "name")),
+        question("gateway", "Which ingress gateway serves it?", "A route belongs to exactly one gateway.", missing(spec, "gateway")),
+        question(
+          "hosts",
+          "Which hostnames should it serve?",
+          "Each hostname belongs to one route. A wildcard needs a DNS-01 provider on the gateway. DNS must point at the gateway address.",
+          missing(spec, "hosts") && spec.kind !== "tcp",
+          { example: "shop.example.com" },
+        ),
+        question(
+          "backends",
+          "Where should traffic go (VM, external address, or a Kubernetes Service)?",
+          "A NAT VM must be on a gateway node. Otherwise use a vxlan network, an external address, or a Kubernetes Service.",
+          missing(spec, "paths") && missing(spec, "backends"),
+          { example: "vm shop-web-1 port 8080" },
+        ),
+        question(
+          "waf",
+          "Should the WAF start in detect mode?",
+          "detect logs what CRS would block and lets traffic through. Read kctl get waf-events, then switch to block.",
+          false,
+          { choices: ["detect", "block", "off"] },
+        ),
+      ].filter((item) => item.required || (item.id === "waf" && missing(spec, "waf")));
+    case "waf-policy":
+      return [
+        question("name", "What should the WAF policy be called?", "Gateways and routes refer to it by name.", missing(spec, "name")),
+        question(
+          "engine",
+          "Should it start in detect or block mode?",
+          "detect only logs. A new policy should start there so false positives show up before they block real traffic.",
+          false,
+          { choices: ["detect", "block"] },
+        ),
+        question(
+          "crs",
+          "Which CRS paranoia level (1 to 4)?",
+          "Level 1 has the fewest false positives. Higher levels block more and need more exclusions.",
+          false,
+          { choices: ["1", "2", "3", "4"] },
+        ),
+      ].filter((item) => item.required || (item.id !== "name" && missing(spec, item.id)));
     case "object-store":
       return [
         question("name", "What should the object store be called?", "The RGW service is reconciled under this name.", missing(spec, "name")),

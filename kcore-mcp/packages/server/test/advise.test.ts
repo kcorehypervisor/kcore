@@ -99,3 +99,26 @@ test("cluster advice asks for the controller address", () => {
   const advice = advise({ kind: "cluster", spec: {} });
   assert.ok(advice.blocking.some((item) => item.id === "controller"));
 });
+
+test("ingress resources are recognised and ask for what they need", () => {
+  assert.equal(inferKind("set up an ingress gateway for shop.example.com"), "ingress-gateway");
+  assert.equal(inferKind("add an ingress route for the shop"), "ingress-route");
+  assert.equal(inferKind("create a waf policy"), "waf-policy");
+  const gateway = advise({ kind: "ingress-gateway", spec: {} });
+  assert.deepEqual(
+    gateway.blocking.map((item) => item.id),
+    ["name", "nodes", "listeners", "tls"],
+  );
+  const route = advise({ kind: "ingress-route", spec: { name: "shop", gateway: "edge" } });
+  assert.deepEqual(
+    route.blocking.map((item) => item.id),
+    ["hosts", "backends"],
+  );
+  // A TCP route has no hostnames to ask for.
+  const tcp = advise({
+    kind: "ingress-route",
+    spec: { name: "db", gateway: "edge", kind: "tcp", backends: [{ kind: "external", address: "10.0.0.9:5432" }] },
+  });
+  assert.equal(tcp.blocking.length, 0);
+  assert.equal(advise({ kind: "waf-policy", spec: { name: "crs" } }).blocking.length, 0);
+});

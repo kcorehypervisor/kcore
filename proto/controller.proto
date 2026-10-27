@@ -227,6 +227,28 @@ service Controller {
   rpc ListSharedFilesystems(ListSharedFilesystemsRequest) returns (ListSharedFilesystemsResponse);
   rpc DeleteSharedFilesystem(DeleteSharedFilesystemRequest) returns (DeleteSharedFilesystemResponse);
 
+  // Ingress gateway (Caddy + Coraza WAF). Specs travel as the canonical
+  // camelCase JSON documents; the controller parses them strictly.
+  rpc PlanIngress(PlanIngressRequest) returns (PlanIngressResponse);
+  rpc CreateIngressGateway(CreateIngressGatewayRequest) returns (CreateIngressGatewayResponse);
+  rpc GetIngressGateway(GetIngressGatewayRequest) returns (GetIngressGatewayResponse);
+  rpc ListIngressGateways(ListIngressGatewaysRequest) returns (ListIngressGatewaysResponse);
+  rpc DeleteIngressGateway(DeleteIngressGatewayRequest) returns (DeleteIngressGatewayResponse);
+  rpc CreateIngressRoute(CreateIngressRouteRequest) returns (CreateIngressRouteResponse);
+  rpc GetIngressRoute(GetIngressRouteRequest) returns (GetIngressRouteResponse);
+  rpc ListIngressRoutes(ListIngressRoutesRequest) returns (ListIngressRoutesResponse);
+  rpc DeleteIngressRoute(DeleteIngressRouteRequest) returns (DeleteIngressRouteResponse);
+  rpc SetIngressRouteWafMode(SetIngressRouteWafModeRequest) returns (SetIngressRouteWafModeResponse);
+  rpc CreateWafPolicy(CreateWafPolicyRequest) returns (CreateWafPolicyResponse);
+  rpc GetWafPolicy(GetWafPolicyRequest) returns (GetWafPolicyResponse);
+  rpc ListWafPolicies(ListWafPoliciesRequest) returns (ListWafPoliciesResponse);
+  rpc DeleteWafPolicy(DeleteWafPolicyRequest) returns (DeleteWafPolicyResponse);
+  rpc ListWafEvents(ListWafEventsRequest) returns (ListWafEventsResponse);
+  // Writes a secret file (for example dns.env) on every node of a gateway.
+  rpc SetIngressSecret(SetIngressSecretRequest) returns (SetIngressSecretResponse);
+  // Node agent -> controller: batches of Coraza audit events.
+  rpc ReportWafEvents(ReportWafEventsRequest) returns (ReportWafEventsResponse);
+
   // ObjectStore (RGW) — S3-compatible object storage on Ceph.
   rpc CreateObjectStore(CreateObjectStoreRequest) returns (CreateObjectStoreResponse);
   rpc GetObjectStore(GetObjectStoreRequest) returns (GetObjectStoreResponse);
@@ -3226,4 +3248,187 @@ message GetKubernetesClusterHealthResponse {
   int32 etcd_member_count = 7;
   bool api_server_reachable = 8;
   repeated NodeHealth node_health = 9;
+}
+
+// --- Ingress gateway (Caddy + Coraza) --------------------------------------------------------
+// See docs/ingress-waf-load-balancer-plan.md. `spec_json` is the canonical camelCase document.
+
+message IngressCertStatus {
+  string host = 1;
+  string issuer = 2;
+  string not_after = 3; // RFC 3339
+}
+
+message IngressUpstreamHealth {
+  string address = 1;
+  bool healthy = 2;
+}
+
+message IngressNodeStatus {
+  string node_id = 1;
+  string desired_hash = 2;
+  string applied_hash = 3;
+  bool healthy = 4;
+  string message = 5;
+  string vip_holder = 6; // address this node serves the VIP for, empty when it is not the holder
+  repeated IngressCertStatus certs = 7;
+  repeated IngressUpstreamHealth upstreams = 8;
+}
+
+message IngressGatewayStatus {
+  int64 observed_generation = 1;
+  string phase = 2; // pending | applying | ready | degraded | failed
+  string message = 3;
+  repeated IngressNodeStatus nodes = 4;
+}
+
+message IngressGateway {
+  string name = 1;
+  int64 generation = 2;
+  string spec_json = 3;
+  IngressGatewayStatus status = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message IngressRouteStatus {
+  string phase = 1; // pending | ready | degraded
+  string message = 2;
+  repeated IngressCertStatus certs = 3;
+  repeated IngressUpstreamHealth upstreams = 4;
+  string last_waf_block_at = 5;
+}
+
+message IngressRoute {
+  string name = 1;
+  int64 generation = 2;
+  string gateway = 3;
+  string spec_json = 4;
+  // Empty for operator routes; k8s:<cluster>/<ns>/<ingress> for synthesised ones.
+  string owner = 5;
+  IngressRouteStatus status = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message WafPolicy {
+  string name = 1;
+  int64 generation = 2;
+  string spec_json = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+message WafEvent {
+  int64 id = 1;
+  string gateway = 2;
+  string route = 3;
+  string node_id = 4;
+  int32 rule_id = 5;
+  string severity = 6;
+  string client_ip = 7;
+  string host = 8;
+  string uri = 9;
+  string action = 10; // detected | blocked
+  string tx_id = 11;
+  string raw_json = 12;
+  google.protobuf.Timestamp created_at = 13;
+}
+
+// One document overlaid on stored state for PlanIngress.
+message IngressDocument {
+  string kind = 1; // IngressGateway | IngressRoute | WafPolicy
+  string name = 2;
+  string spec_json = 3;
+}
+
+message PlanIngressRequest {
+  string gateway = 1; // gateway whose configuration is rendered
+  repeated IngressDocument documents = 2;
+}
+message PlanIngressNode {
+  string node_id = 1;
+  string caddy_json = 2;
+  string hash = 3;
+  string applied_hash = 4; // what the node last reported; empty when unknown
+  bool changed = 5;
+}
+message PlanIngressResponse {
+  repeated string errors = 1;
+  repeated string warnings = 2;
+  repeated PlanIngressNode nodes = 3;
+}
+
+message CreateIngressGatewayRequest { string name = 1; string spec_json = 2; }
+message CreateIngressGatewayResponse {
+  bool success = 1;
+  IngressGateway gateway = 2;
+  ApplyAction action = 3;
+  repeated string changed_fields = 4;
+}
+message GetIngressGatewayRequest { string name = 1; }
+message GetIngressGatewayResponse { IngressGateway gateway = 1; }
+message ListIngressGatewaysRequest {}
+message ListIngressGatewaysResponse { repeated IngressGateway gateways = 1; }
+message DeleteIngressGatewayRequest { string name = 1; }
+message DeleteIngressGatewayResponse { bool success = 1; }
+
+message CreateIngressRouteRequest { string name = 1; string spec_json = 2; }
+message CreateIngressRouteResponse {
+  bool success = 1;
+  IngressRoute route = 2;
+  ApplyAction action = 3;
+  repeated string changed_fields = 4;
+}
+message GetIngressRouteRequest { string name = 1; }
+message GetIngressRouteResponse { IngressRoute route = 1; }
+message ListIngressRoutesRequest { string gateway = 1; }
+message ListIngressRoutesResponse { repeated IngressRoute routes = 1; }
+message DeleteIngressRouteRequest { string name = 1; }
+message DeleteIngressRouteResponse { bool success = 1; }
+message SetIngressRouteWafModeRequest {
+  string name = 1;
+  string mode = 2; // detect | block | off
+}
+message SetIngressRouteWafModeResponse { bool success = 1; IngressRoute route = 2; }
+
+message CreateWafPolicyRequest { string name = 1; string spec_json = 2; }
+message CreateWafPolicyResponse {
+  bool success = 1;
+  WafPolicy policy = 2;
+  ApplyAction action = 3;
+  repeated string changed_fields = 4;
+}
+message GetWafPolicyRequest { string name = 1; }
+message GetWafPolicyResponse { WafPolicy policy = 1; }
+message ListWafPoliciesRequest {}
+message ListWafPoliciesResponse { repeated WafPolicy policies = 1; }
+message DeleteWafPolicyRequest { string name = 1; }
+message DeleteWafPolicyResponse { bool success = 1; }
+
+message ListWafEventsRequest {
+  string gateway = 1;
+  string route = 2;
+  int32 rule_id = 3;       // 0 = any
+  string client_ip = 4;
+  int64 since_unix = 5;    // 0 = no lower bound
+  int32 limit = 6;         // 0 = default (200)
+}
+message ListWafEventsResponse { repeated WafEvent events = 1; }
+
+message ReportWafEventsRequest {
+  string node_id = 1;
+  string gateway = 2;
+  repeated WafEvent events = 3;
+}
+message ReportWafEventsResponse { int32 accepted = 1; }
+
+message SetIngressSecretRequest {
+  string gateway = 1;
+  string name = 2;      // file name, for example dns.env
+  bytes content = 3;
+}
+message SetIngressSecretResponse {
+  bool success = 1;
+  repeated string nodes = 2; // nodes the file was written to
 }

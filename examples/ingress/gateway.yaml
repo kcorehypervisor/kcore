@@ -1,0 +1,24 @@
+# One HTTPS gateway on a single node. Use letsencrypt-staging while testing:
+# production Let's Encrypt rate-limits failed validations.
+#
+#   kctl ingress plan -f examples/ingress/gateway.yaml
+#   kctl apply -f examples/ingress/gateway.yaml
+#
+# The listener address must be present on the node. http-01 needs port 80.
+kind: IngressGateway
+metadata:
+  name: edge
+spec:
+  nodes: [node-105]
+  listeners:
+    - address: 203.0.113.10
+      ports: [80, 443]
+      http3: true
+  tls:
+    acme:
+      email: ops@example.com
+      ca: letsencrypt-staging
+  defaultWafPolicy: crs-default
+  rateLimit:
+    requestsPerMinute: 600
+  accessLog: true
