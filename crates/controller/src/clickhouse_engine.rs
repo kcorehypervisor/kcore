@@ -198,9 +198,13 @@ async fn drive_inner<N: ClickhouseNodes>(db: &Database, nodes: &N, id: &str) -> 
                         steps[index].kind.as_str(),
                         "stop-unit" | "apply-nix" | "release-volume"
                     )
+                    && node_did_not_answer(&err)
                 {
+                    let note =
+                        format!("node did not answer; unit or volume may still be present: {err}");
                     steps[index].state = "skipped".into();
-                    steps[index].message = err;
+                    steps[index].message = note.clone();
+                    op.message = note;
                     index += 1;
                     continue;
                 }
@@ -297,11 +301,21 @@ async fn run_step<N: ClickhouseNodes>(
             } else {
                 "stop"
             };
-            if step.kind == RESTART_UNIT && step.unit == "server" {
-                if let Err(err) = safe_to_take_down(spec, &step.node_id, &health_of(db, cluster)) {
-                    if !err.contains("one writable") && !err.contains("no other healthy") {
-                        return timed_out(step, spec).unwrap_or(StepFate::Pause);
-                    }
+            if step.kind == RESTART_UNIT {
+                let health = health_of(db, cluster);
+                let gate = if step.unit == "keeper" {
+                    keeper_restart_allowed(spec, &step.node_id, &health)
+                } else {
+                    safe_to_take_down(spec, &step.node_id, &health)
+                };
+                if let Err(err) = gate {
+                    tracing::info!(
+                        %err,
+                        node = %step.node_id,
+                        unit = %step.unit,
+                        "clickhouse restart deferred"
+                    );
+                    return timed_out(step, spec).unwrap_or(StepFate::Pause);
                 }
             }
             match nodes.set_unit(&step.node_id, &step.unit, action).await {
@@ -464,6 +478,16 @@ fn timed_out(step: &mut Step, spec: &ClusterSpec) -> Option<StepFate> {
     } else {
         None
     }
+}
+
+fn node_did_not_answer(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("unavailable")
+        || err.contains("transport")
+        || err.contains("connection refused")
+        || err.contains("timed out")
+        || err.contains("timeout")
+        || err.contains("deadline")
 }
 
 fn unix_now() -> i64 {
@@ -1573,6 +1597,7 @@ mod tests {
         units: Mutex<Vec<String>>,
         reloads: Mutex<u32>,
         applies: Mutex<u32>,
+        fail_unit: Mutex<Option<String>>,
     }
 
     impl ClickhouseNodes for Fake {
@@ -1633,9 +1658,13 @@ mod tests {
             action: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
             let record = format!("{action} {unit} {node_id}");
+            let fail = self.fail_unit.lock().unwrap().clone();
             Box::pin(async move {
                 self.units.lock().unwrap().push(record);
-                Ok(())
+                match fail {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                }
             })
         }
         fn admin<'a>(
@@ -1663,14 +1692,124 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reload_update_never_restarts_a_unit() {
-        let _ = Arc::new(0);
-        let fake = Fake {
+    fn fake_nodes() -> Fake {
+        Fake {
             units: Mutex::new(vec![]),
             reloads: Mutex::new(0),
             applies: Mutex::new(0),
-        };
+            fail_unit: Mutex::new(None),
+        }
+    }
+
+    const ANALYTICS: &str = r#"
+kind: ClickhouseCluster
+metadata:
+  name: analytics
+spec:
+  shards:
+    - replicas:
+        - {nodeId: node-105, advertiseAddress: 192.168.40.105, iface: enp6s0}
+        - {nodeId: node-106, advertiseAddress: 192.168.40.106, iface: enp6s0}
+    - replicas:
+        - {nodeId: node-108, advertiseAddress: 192.168.40.108, iface: enp6s0}
+        - {nodeId: node-109, advertiseAddress: 192.168.40.109, iface: enp6s0}
+  keepers:
+    - {nodeId: node-105, advertiseAddress: 192.168.40.105, iface: enp6s0}
+    - {nodeId: node-106, advertiseAddress: 192.168.40.106, iface: enp6s0}
+    - {nodeId: node-108, advertiseAddress: 192.168.40.108, iface: enp6s0}
+"#;
+
+    fn seed_analytics(db: &Database, spec: &kcore_clickhouse::ClusterSpec, op_id: &str) {
+        for id in ["node-105", "node-106", "node-108", "node-109"] {
+            db.upsert_node(&crate::db::NodeRow {
+                id: id.into(),
+                hostname: id.into(),
+                address: "127.0.0.1:9".into(),
+                cpu_cores: 2,
+                memory_bytes: 1024,
+                status: "ready".into(),
+                last_heartbeat: String::new(),
+                gateway_interface: "br0".into(),
+                cpu_used: 0,
+                memory_used: 0,
+                storage_backend: "filesystem".into(),
+                disable_vxlan: false,
+                approval_status: "approved".into(),
+                cert_expiry_days: -1,
+                luks_method: String::new(),
+                dc_id: "dc1".into(),
+            })
+            .unwrap();
+        }
+        db.insert_clickhouse_cluster(&crate::clickhouse_db::ClusterRow {
+            name: "analytics".into(),
+            generation: 2,
+            phase: "upgrading".into(),
+            message: String::new(),
+            spec_json: serde_json::to_string(spec).unwrap(),
+            observed_version: String::new(),
+            active_operation_id: op_id.into(),
+        })
+        .unwrap();
+        db.replace_clickhouse_members(
+            "analytics",
+            &crate::clickhouse_convert::members_from_spec("analytics", spec),
+        )
+        .unwrap();
+    }
+
+    fn member_health(node: &str, server: bool, keeper: bool, role: &str) -> MemberHealth {
+        MemberHealth {
+            node_id: node.into(),
+            server_active: server,
+            keeper_active: keeper,
+            keeper_role: role.into(),
+            readonly_tables: 0,
+            max_delay_seconds: 0,
+            keeper_session_ok: server,
+            version: String::new(),
+        }
+    }
+
+    fn write_health(db: &Database, health: &MemberHealth) {
+        db.set_clickhouse_member_health(
+            "analytics",
+            &health.node_id,
+            &serde_json::to_string(health).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn queue_restart(db: &Database, op_id: &str, step: Step, force: bool) {
+        db.insert_clickhouse_operation(&OperationRow {
+            id: op_id.into(),
+            cluster_name: "analytics".into(),
+            kind: "upgrade".into(),
+            state: "pending".into(),
+            steps_json: serde_json::to_string(&vec![step]).unwrap(),
+            context_json: "{}".into(),
+            message: String::new(),
+            force,
+        })
+        .unwrap();
+    }
+
+    fn restart_step(node: &str, unit: &str) -> Step {
+        Step {
+            kind: RESTART_UNIT.into(),
+            node_id: node.into(),
+            unit: unit.into(),
+            detail: String::new(),
+            group: 1,
+            state: "pending".into(),
+            message: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_update_never_restarts_a_unit() {
+        let _ = Arc::new(0);
+        let fake = fake_nodes();
         let db = Database::open(":memory:").unwrap();
         let yaml = r#"
 kind: ClickhouseCluster
@@ -1770,11 +1909,7 @@ spec:
 
     #[tokio::test]
     async fn refresh_rotates_an_expired_server_cert_and_marks_ready() {
-        let fake = Fake {
-            units: Mutex::new(vec![]),
-            reloads: Mutex::new(0),
-            applies: Mutex::new(0),
-        };
+        let fake = fake_nodes();
         let db = Database::open(":memory:").unwrap();
         let yaml = r#"
 kind: ClickhouseCluster
@@ -1864,5 +1999,92 @@ spec:
         assert!(certs[0].cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(*fake.reloads.lock().unwrap() >= 1);
         assert!(fake.units.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_pauses_when_the_other_replica_is_down() {
+        let fake = fake_nodes();
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-replica");
+        write_health(&db, &member_health("node-105", true, true, "follower"));
+        write_health(&db, &member_health("node-106", false, true, "follower"));
+        write_health(&db, &member_health("node-108", true, true, "leader"));
+        write_health(&db, &member_health("node-109", true, false, ""));
+        queue_restart(&db, "op-replica", restart_step("node-105", "server"), true);
+        drive(&db, &fake, "op-replica").await.unwrap();
+        assert!(fake.units.lock().unwrap().is_empty());
+        let op = db.get_clickhouse_operation("op-replica").unwrap().unwrap();
+        assert_eq!(op.state, "running");
+        let steps: Vec<Step> = serde_json::from_str(&op.steps_json).unwrap();
+        assert_eq!(steps[0].state, "pending");
+        assert!(steps[0].message.parse::<i64>().is_ok());
+    }
+
+    #[tokio::test]
+    async fn keeper_restart_pauses_when_quorum_would_break() {
+        let fake = fake_nodes();
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-keeper");
+        write_health(&db, &member_health("node-105", true, true, "follower"));
+        write_health(&db, &member_health("node-106", true, false, "unknown"));
+        write_health(&db, &member_health("node-108", true, true, "leader"));
+        queue_restart(&db, "op-keeper", restart_step("node-105", "keeper"), false);
+        drive(&db, &fake, "op-keeper").await.unwrap();
+        assert!(fake.units.lock().unwrap().is_empty());
+        let op = db.get_clickhouse_operation("op-keeper").unwrap().unwrap();
+        assert_eq!(op.state, "running");
+    }
+
+    #[tokio::test]
+    async fn missing_health_pauses_until_the_step_times_out() {
+        let fake = fake_nodes();
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        spec.step_timeout_seconds = 1;
+        seed_analytics(&db, &spec, "op-timeout");
+        let mut step = restart_step("node-105", "server");
+        step.message = (unix_now() - 30).to_string();
+        queue_restart(&db, "op-timeout", step, true);
+        drive(&db, &fake, "op-timeout").await.unwrap();
+        assert!(fake.units.lock().unwrap().is_empty());
+        let op = db.get_clickhouse_operation("op-timeout").unwrap().unwrap();
+        assert_eq!(op.state, "failed");
+        assert!(op.message.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn force_skips_a_stop_only_when_the_node_did_not_answer() {
+        let fake = fake_nodes();
+        *fake.fail_unit.lock().unwrap() = Some("connection refused".into());
+        let db = Database::open(":memory:").unwrap();
+        let (_name, mut spec) = kcore_clickhouse::parse_manifest(ANALYTICS).unwrap();
+        kcore_clickhouse::normalize(&mut spec);
+        seed_analytics(&db, &spec, "op-silent");
+        let mut step = restart_step("node-109", "server");
+        step.kind = STOP_UNIT.into();
+        queue_restart(&db, "op-silent", step, true);
+        drive(&db, &fake, "op-silent").await.unwrap();
+        let op = db.get_clickhouse_operation("op-silent").unwrap().unwrap();
+        assert_eq!(op.state, "succeeded");
+        assert!(op.message.contains("may still be present"));
+        let steps: Vec<Step> = serde_json::from_str(&op.steps_json).unwrap();
+        assert_eq!(steps[0].state, "skipped");
+
+        let answered = fake_nodes();
+        *answered.fail_unit.lock().unwrap() = Some("unit is degraded".into());
+        let db = Database::open(":memory:").unwrap();
+        seed_analytics(&db, &spec, "op-answered");
+        let mut step = restart_step("node-109", "server");
+        step.kind = STOP_UNIT.into();
+        queue_restart(&db, "op-answered", step, true);
+        drive(&db, &answered, "op-answered").await.unwrap();
+        let op = db.get_clickhouse_operation("op-answered").unwrap().unwrap();
+        assert_eq!(op.state, "failed");
+        assert!(!op.message.contains("may still be present"));
     }
 }
