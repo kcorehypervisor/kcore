@@ -9,7 +9,7 @@
 let
   mirrorCheck = pkgs.rustPlatform.buildRustPackage {
     pname = "kcore-volume-mirror";
-    version = "0.5.0";
+    version = "0.6.1";
     src = pkgs.lib.cleanSourceWith {
       src = ../.;
       filter =
