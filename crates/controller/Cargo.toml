@@ -1,6 +1,6 @@
 [package]
 name = "kcore-controller"
-version = "0.5.0"
+version = "0.6.1"
 edition = "2021"
 # examples/create_k8s_cluster.rs references modules that are not beside it.
 # Leave it out of the package so rustfmt and cargo test do not try to load them.
