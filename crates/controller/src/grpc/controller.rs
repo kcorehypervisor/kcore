@@ -17286,19 +17286,63 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::PlanClickhouseClusterRequest>,
     ) -> Result<Response<controller_proto::PlanClickhouseClusterResponse>, Status> {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
-        crate::clickhouse_api::plan(&self.db, request).await
+        let name = request.get_ref().name.clone();
+        let spec = request.get_ref().spec.clone();
+        let response = crate::clickhouse_api::plan(&self.db, request).await?;
+        let mut body = response.into_inner();
+        if let Some(spec) = spec {
+            if let Ok((spec, _, _)) = crate::clickhouse_api::prepare(&name, spec) {
+                match crate::clickhouse_engine::collect_preflight(
+                    &self.db,
+                    &self.clients,
+                    &name,
+                    &spec,
+                )
+                .await
+                {
+                    Ok(reports) => crate::clickhouse_engine::merge_plan_preflight(
+                        &mut body.blocking_issues,
+                        &mut body.warnings,
+                        &mut body.node_plans,
+                        &reports,
+                    ),
+                    Err(err) => {
+                        body.warnings
+                            .push(format!("preflight was not collected: {err}"));
+                    }
+                }
+            }
+        }
+        Ok(Response::new(body))
     }
 
     async fn create_clickhouse_cluster(
         &self,
         request: Request<controller_proto::CreateClickhouseClusterRequest>,
     ) -> Result<Response<controller_proto::CreateClickhouseClusterResponse>, Status> {
-        clickhouse_audit!(
-            self,
-            request,
-            "CreateClickhouseCluster",
-            crate::clickhouse_api::create
-        )
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let name = request.get_ref().name.clone();
+        if let Some(spec) = request.get_ref().spec.clone() {
+            if let Ok((spec, blocking, _)) = crate::clickhouse_api::prepare(&name, spec) {
+                if blocking.is_empty()
+                    && crate::clickhouse_api::require_nodes(&self.db, &spec).is_ok()
+                    && crate::clickhouse_api::reject_shared_nodes(&self.db, &name, &spec).is_ok()
+                {
+                    crate::clickhouse_engine::require_preflight(
+                        &self.db,
+                        &self.clients,
+                        &name,
+                        &spec,
+                    )
+                    .await
+                    .map_err(Status::failed_precondition)?;
+                }
+            }
+        }
+        let response = crate::clickhouse_api::create(&self.db, request).await?;
+        self.record_audit(&actor, "CreateClickhouseCluster", &name, "");
+        Ok(response)
     }
 
     async fn update_clickhouse_cluster(
