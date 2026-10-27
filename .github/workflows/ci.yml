@@ -93,6 +93,9 @@ jobs:
       - name: Local disk migration rehearsal
         run: nix build --no-link .#checks.x86_64-linux.local-disk-migrate
 
+      - name: Provisioning module eval
+        run: nix build --no-link .#checks.x86_64-linux.provisioning-module-eval
+
       - name: Nix format check
         run: nix build --no-link .#checks.x86_64-linux.fmt-nix
 
