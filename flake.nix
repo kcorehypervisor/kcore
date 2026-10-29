@@ -342,10 +342,15 @@
 
                   boot.loader.timeout = lib.mkForce 0;
                   boot.loader.systemd-boot.editor = false;
-                  boot.kernelParams = [
-                    "quiet"
-                    "loglevel=3"
-                  ];
+                  boot.kernelParams = [ "quiet" ];
+                  # The branding module turns local login off. Without the
+                  # console unit, tty1 stays on the kernel log (USB -71,
+                  # kvm_amd) and the machine looks crashed.
+                  boot.consoleLogLevel = lib.mkForce 1;
+                  services.kcore-console = {
+                    enable = true;
+                    package = kcoreConsole;
+                  };
                   boot.kernelModules = [
                     "kvm"
                     "kvm-intel"
@@ -1344,9 +1349,18 @@
                       NIXEOF
 
                                                                 cp /etc/kcore/installed-flake.nix /mnt/etc/nixos/flake.nix
-                                                                echo "Installing kcoreOS from the host flake (this will take 10-20 minutes)..."
+                                                                echo "Building kcoreOS on the installer store (this will take 10-20 minutes)..."
                                                                 export NIX_CONFIG="experimental-features = nix-command flakes"
-                                                                nixos-install --flake /mnt/etc/nixos#kcore --no-root-passwd
+                                                                # Flake install mode evaluates in the destination store. Nix 2.31 aborts
+                                                                # in copyInputToStore when these path inputs already have a nar hash in
+                                                                # this store. Build here, copy the closure, then install that system.
+                                                                SYSTEM=$(nix build --impure --offline --no-link --print-out-paths \
+                                                                  '/mnt/etc/nixos#nixosConfigurations.kcore.config.system.build.toplevel')
+                                                                nix copy --no-check-sigs --to /mnt \
+                                                                  "$SYSTEM" \
+                                                                  "${inputs.nixpkgs.outPath}" \
+                                                                  "${./.}"
+                                                                nixos-install --system "$SYSTEM" --root /mnt --no-root-passwd
 
                                                                 # Enroll TPM2 and add recovery key
                                                                 if [ "$LUKS_METHOD" = "tpm2" ]; then

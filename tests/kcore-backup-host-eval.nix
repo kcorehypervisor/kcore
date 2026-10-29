@@ -58,5 +58,7 @@ pkgs.runCommand "kcore-backup-host-eval"
     test ${flag (lib.hasInfix "services.kcore-vault.enable = true;" installScript)} = 1
     test ${flag (lib.hasInfix "443" installScript)} = 1
     test ${flag (lib.hasInfix "10809" installScript)} = 1
+    test ${flag (lib.hasInfix "nixos-install --system \"\$SYSTEM\" --root /mnt --no-root-passwd" installScript)} = 1
+    test ${flag (lib.hasInfix "nixos-install --flake" installScript)} = 0
     touch $out
   ''
