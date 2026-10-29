@@ -91,20 +91,43 @@ async fn reconcile_update(
     let activation = activation_mode_string(&spec).to_string();
     let peers = db.list_controller_peers().unwrap_or_default();
     nodes.sort_by(|left, right| {
-        let rank = |node_id: &str| {
-            let address = db
-                .get_node(node_id)
-                .ok()
-                .flatten()
-                .map(|node| node.address)
-                .unwrap_or_default();
-            let host = address.split(':').next().unwrap_or("").to_string();
-            let controller = peers.iter().any(|peer| {
-                peer.address == address || peer.address.split(':').next() == Some(host.as_str())
-            });
-            (u8::from(controller), node_id.to_string())
+        let slurm_rank = |node_id: &str| {
+            let member = db.get_slurm_cluster_node(node_id).ok().flatten()?;
+            let roles: Vec<&str> = member.roles.split(',').collect();
+            if roles.contains(&"dbd") {
+                Some(0u8)
+            } else if roles.contains(&"controller") {
+                Some(1u8)
+            } else if roles.contains(&"compute") {
+                Some(2u8)
+            } else {
+                Some(3u8)
+            }
         };
-        rank(&left.node_id).cmp(&rank(&right.node_id))
+        match (slurm_rank(&left.node_id), slurm_rank(&right.node_id)) {
+            (Some(left_rank), Some(right_rank)) => {
+                (left_rank, left.node_id.clone()).cmp(&(right_rank, right.node_id.clone()))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                let rank = |node_id: &str| {
+                    let address = db
+                        .get_node(node_id)
+                        .ok()
+                        .flatten()
+                        .map(|node| node.address)
+                        .unwrap_or_default();
+                    let host = address.split(':').next().unwrap_or("").to_string();
+                    let controller = peers.iter().any(|peer| {
+                        peer.address == address
+                            || peer.address.split(':').next() == Some(host.as_str())
+                    });
+                    (u8::from(controller), node_id.to_string())
+                };
+                rank(&left.node_id).cmp(&rank(&right.node_id))
+            }
+        }
     });
 
     // Pick the first node still needing work. Controllers sort last.
@@ -212,6 +235,28 @@ async fn reconcile_update(
                 return Ok(());
             }
             "prepared" => {
+                if let Ok(Some(member)) = db.get_slurm_cluster_node(&node_row.node_id) {
+                    if member.roles.split(',').any(|role| role == "compute") {
+                        match drain_slurm_member(db, clients, &node_row.node_id).await {
+                            Ok(()) => {
+                                db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                                    phase: "drained".into(),
+                                    ..node_row.clone()
+                                })
+                                .map_err(|e| format!("mark slurm node drained: {e}"))?;
+                            }
+                            Err(err) => {
+                                db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                                    phase: "failed".into(),
+                                    last_error: err,
+                                    ..node_row.clone()
+                                })
+                                .map_err(|e| format!("mark slurm drain failed: {e}"))?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
                 match kubernetes_host_action(db, &node_row.node_id, "prepared") {
                     Ok(crate::kubernetes_lifecycle::HostAction::WaitOtherControlPlane) => {
                         return Ok(());
@@ -517,6 +562,49 @@ fn other_control_plane_is_mid_update(db: &Database, node_id: &str) -> Result<boo
         }
     }
     Ok(false)
+}
+
+async fn drain_slurm_member(
+    db: &Database,
+    clients: &NodeClients,
+    node_id: &str,
+) -> Result<(), String> {
+    let member = db
+        .get_slurm_cluster_node(node_id)
+        .map_err(|e| format!("get slurm membership: {e}"))?
+        .ok_or_else(|| format!("node {node_id} is not a Slurm member"))?;
+    let cluster = db
+        .get_slurm_cluster(&member.cluster_name)
+        .map_err(|e| format!("get slurm cluster: {e}"))?
+        .ok_or_else(|| format!("SlurmCluster {} disappeared", member.cluster_name))?;
+    let spec = crate::slurm_cluster_spec::spec_from_json(&cluster.spec_json)
+        .map_err(|e| format!("decode slurm spec: {e}"))?;
+    let controller = db
+        .get_node(&spec.controller.node_id)
+        .map_err(|e| format!("get slurm controller node: {e}"))?
+        .ok_or_else(|| "slurm controller node is not registered".to_string())?;
+    if clients.get_admin(&controller.address).is_none() {
+        clients
+            .connect(&controller.address)
+            .await
+            .map_err(|e| format!("connect slurm controller {}: {e}", controller.address))?;
+    }
+    let mut admin = clients
+        .get_admin(&controller.address)
+        .ok_or_else(|| format!("no admin client for {}", controller.address))?;
+    let response = admin
+        .slurm_control(Request::new(node_proto::SlurmControlRequest {
+            verb: "drain".into(),
+            node_name: node_id.to_string(),
+            reason: "kcore cluster update".into(),
+        }))
+        .await
+        .map_err(|e| format!("drain slurm node {node_id}: {e}"))?
+        .into_inner();
+    if !response.success {
+        return Err(format!("drain slurm node {node_id}: {}", response.message));
+    }
+    Ok(())
 }
 
 async fn drain_kubernetes_member(

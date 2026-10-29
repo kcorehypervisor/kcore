@@ -61,6 +61,7 @@
               || (toString path) == "${toString ./.}/modules"
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
+              || (toString path) == "${toString ./.}/modules/kcore-slurm.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path);
           };
 
@@ -206,6 +207,12 @@
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
+            slurm-module-eval = import ./tests/slurm-module-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
+            kcore-slurm = import ./tests/kcore-slurm.nix { inherit pkgs; };
             ch-vm-module-eval = import ./tests/ch-vm-module-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;
@@ -296,6 +303,7 @@
           kcoreVersion = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile ./VERSION);
           chVmModule = ./modules/ch-vm;
           cephModule = ./modules/kcore-ceph.nix;
+          slurmModule = ./modules/kcore-slurm.nix;
           metricsModule = ./modules/kcore-metrics.nix;
         in
         {
@@ -304,6 +312,7 @@
             default = chVmModule;
             kcore-disko = ./modules/kcore-disko.nix;
             kcore-ceph = cephModule;
+            kcore-slurm = slurmModule;
             kcore-metrics = metricsModule;
             kcore-host = ./modules/kcore-host.nix;
           };
@@ -996,6 +1005,7 @@
 
                                                                 echo "kcore packages come from the host flake; not copying /opt/kcore/bin."
                                                                 printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-ceph.nix
+                                                                printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-slurm.nix
                                                                 # The format already happened. The saved graph must not point at
                                                                 # /tmp, which is gone after reboot.
                                                                 sed 's|passwordFile = "/tmp/luks/password"|passwordFile = "/etc/kcore/recovery/crypto_keyfile.bin"|' /tmp/disko-config.nix > /mnt/etc/nixos/disko-config.nix
@@ -1480,6 +1490,7 @@
                               ./node.nix
                               ./kcore-vms.nix
                               ./kcore-ceph.nix
+                              ./kcore-slurm.nix
                             ];
                           };
                         };

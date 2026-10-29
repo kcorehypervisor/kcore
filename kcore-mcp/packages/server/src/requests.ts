@@ -40,6 +40,10 @@ export function buildApply(kind: ResourceKind, spec: Record<string, unknown>): R
       return [{ target: "controller", method: "createWorkload", request: containerRequest(spec) }];
     case "postgresql":
       return [{ target: "controller", method: "createPostgresql", request: postgresqlRequest(spec) }];
+    case "slurm-cluster": {
+      const request = slurmClusterRequest(spec);
+      return [{ target: "controller", method: "createSlurmCluster", request }];
+    }
     case "volume":
       return [{ target: "controller", method: "createVolume", request: volumeRequest(spec) }];
     case "volume-snapshot":
@@ -92,6 +96,10 @@ export function buildRead(kind: ResourceKind, name?: string): RpcCall {
       return named
         ? { target: "controller", method: "getPostgresql", request: { name: named } }
         : { target: "controller", method: "listPostgresqls", request: {} };
+    case "slurm-cluster":
+      return named
+        ? { target: "controller", method: "getSlurmCluster", request: { name: named } }
+        : { target: "controller", method: "listSlurmClusters", request: {} };
     case "volume":
       return named
         ? { target: "controller", method: "getVolume", request: { name: named } }
@@ -208,6 +216,14 @@ export function buildPlanCall(kind: ResourceKind, spec: Record<string, unknown>,
   }
   if (kind.id === "cluster-update") {
     return { target: "controller", method: "planClusterUpdate", request: { spec: clusterUpdateMessage(spec) } };
+  }
+  if (kind.id === "slurm-cluster") {
+    const request = slurmClusterRequest(spec);
+    return {
+      target: "controller",
+      method: "planSlurmCluster",
+      request: { name: request.name, spec: request.spec },
+    };
   }
   return buildRead(kind, name ?? (typeof spec.name === "string" ? spec.name : undefined));
 }
@@ -637,6 +653,65 @@ function hostOf(address: string): string {
 function stringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
+}
+
+function slurmClusterRequest(spec: Record<string, unknown>): {
+  name: string;
+  spec: Record<string, unknown>;
+} {
+  const name = assertName(required(spec, "name", "name"), "name");
+  const controller = spec.controller as Record<string, unknown> | undefined;
+  if (!controller || typeof controller !== "object") {
+    throw new InputError("controller is required (nodeId, address, iface)");
+  }
+  const controllerSpec = {
+    nodeId: required(controller, "nodeId", "controller.nodeId"),
+    address: required(controller, "address", "controller.address"),
+    iface: required(controller, "iface", "controller.iface"),
+  };
+  const compute = Array.isArray(spec.compute) ? spec.compute : [];
+  if (compute.length === 0) {
+    throw new InputError("at least one compute node is required");
+  }
+  const computeSpec = compute.map((item, index) => {
+    if (!item || typeof item !== "object") {
+      throw new InputError(`compute[${index}] must be an object`);
+    }
+    const node = item as Record<string, unknown>;
+    return {
+      nodeId: required(node, "nodeId", `compute[${index}].nodeId`),
+      address: required(node, "address", `compute[${index}].address`),
+      iface: required(node, "iface", `compute[${index}].iface`),
+      partitions: Array.isArray(node.partitions) ? node.partitions : [],
+      reserve: node.reserve ?? { cores: 0, memoryMb: 0 },
+      gres: opt(node, "gres") ?? "none",
+    };
+  });
+  const partitions = Array.isArray(spec.partitions) ? spec.partitions : [];
+  if (partitions.length === 0) {
+    throw new InputError("at least one partition is required");
+  }
+  const storage = (spec.storage as Record<string, unknown> | undefined) ?? {
+    mode: "nfs",
+    exports: ["/home", "/scratch"],
+  };
+  return {
+    name,
+    spec: {
+      clusterName: opt(spec, "clusterName") ?? name,
+      controller: controllerSpec,
+      backupController: spec.backupController ?? null,
+      login: spec.login ?? { nodeIds: [] },
+      accounting: spec.accounting ?? { enabled: false },
+      compute: computeSpec,
+      partitions,
+      users: Array.isArray(spec.users) ? spec.users : [],
+      storage,
+      extraConfig: opt(spec, "extraConfig") ?? "",
+      allowControllerHost: spec.allowControllerHost === true,
+      gpuDriver: spec.gpuDriver === true,
+    },
+  };
 }
 
 const POSTGRESQL_PACKAGES = new Set([

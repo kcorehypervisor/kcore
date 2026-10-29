@@ -322,7 +322,10 @@ let
         '') vmCfg.dataDisks}
       '';
 
-      normalizedPci = map (dev: dev // { address = lib.toLower dev.address; }) vmCfg.pciDevices;
+      excludedPci = map lib.toLower config.ch-vm.vfio.excludePciIds;
+      normalizedPci = builtins.filter (dev: !(builtins.elem (lib.toLower dev.address) excludedPci)) (
+        map (dev: dev // { address = lib.toLower dev.address; }) vmCfg.pciDevices
+      );
       vfioDevices = builtins.filter (dev: dev.vgpuProfile == null) normalizedPci;
       vgpuDevices = builtins.filter (dev: dev.vgpuProfile != null) normalizedPci;
       sysfs = config.ch-vm.vms.sysfsRoot;

@@ -159,7 +159,7 @@ After the GitHub Release is up:
 
    `/docs/user/` stays the latest stable pages. `/docs/X.Y.Z/` is the frozen copy. The schema version is `SCHEMA_VERSION` in `crates/controller/src/db.rs`.
 
-2. Cut `terraform-provider-kcore` at the same `X.Y.Z`. Its `kcore_cluster_update` resource must accept the same target, strategy, `update_kind`, tested pins, and schema fields as the YAML. Publish it to the Terraform Registry. Reboot stays `kctl update cluster reboot`.
+2. Cut `terraform-provider-kcore` at the same `X.Y.Z`. The `kcore_slurm_cluster` resource is cut with the same `VERSION`. Its `kcore_cluster_update` resource must accept the same target, strategy, `update_kind`, tested pins, and schema fields as the YAML. Publish it to the Terraform Registry. Reboot stays `kctl update cluster reboot`.
 
 3. `make verify-release` checks the signature. It does not deploy the site or the provider.
 

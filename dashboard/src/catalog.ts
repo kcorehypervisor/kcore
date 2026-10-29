@@ -169,6 +169,22 @@ function ingressRouteRow(row: Row): Row {
   };
 }
 
+function slurmClusterRow(row: Row): Row {
+  const spec = (row.spec ?? {}) as Row;
+  const status = (row.status ?? {}) as Row;
+  const nodes = (Array.isArray(status.nodes) ? status.nodes : []) as Row[];
+  const controller = (spec.controller ?? {}) as Row;
+  const state = (name: string) => nodes.filter((n) => n.slurm_state === name).length;
+  return {
+    ...flatten(row),
+    controller_node: controller.nodeId ?? null,
+    compute_count: Array.isArray(spec.compute) ? spec.compute.length : 0,
+    idle_nodes: state("idle"),
+    alloc_nodes: state("alloc"),
+    down_nodes: state("down"),
+  };
+}
+
 function wafPolicyRow(row: Row): Row {
   const spec = specObject(row);
   const crs = (spec.crs ?? {}) as Row;
@@ -1614,6 +1630,28 @@ export const RESOURCES: Resource[] = [
       act("reload-tls", "Reload TLS", true, [long("cert_pem", "Certificate", true), secret("key_pem", "Key")], async (v) =>
         ok(await controller.reloadTls({ certPem: required(v, "cert_pem"), keyPem: required(v, "key_pem") })),
       ),
+    ],
+  },
+  {
+    id: "slurm-cluster",
+    noun: "Slurm cluster",
+    title: "Slurm",
+    group: "Services",
+    terraform: ["kcore_slurm_cluster"],
+    kctl: "get slurm-cluster",
+    idField: "name",
+    fields: [f("name", "Name", true), f("cluster_name", "Cluster name"), f("controller_node", "Controller node"), num("compute_count", "Compute nodes")],
+    list: async () => rowsOf(await controller.listSlurmClusters({}), "clusters").map(slurmClusterRow),
+    inspect: async (key) => ({ detail: rowOf(await controller.getSlurmCluster({ name: key })).cluster }),
+    actions: [
+      act("delete", "Delete", true, [], async (v) => {
+        await controller.deleteSlurmCluster({ name: ident(v), force: false });
+        return { ok: true };
+      }),
+      act("rotate-munge-key", "Rotate munge key", true, [], async (v) => {
+        await controller.rotateSlurmMungeKey({ name: ident(v) });
+        return { ok: true };
+      }),
     ],
   },
   {

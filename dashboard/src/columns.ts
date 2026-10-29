@@ -279,6 +279,15 @@ export const PRESETS: Record<string, Column[]> = {
     col("revocation_reason", "text", { label: "Revocation reason", hidden: true }),
     col("fingerprint_sha256", "id", { label: "Fingerprint", hidden: true }),
   ],
+  "slurm-cluster": [
+    col("name"),
+    col("phase", "status"),
+    col("controller_node", "text", { label: "Controller", link: "nodes" }),
+    col("compute_count", "number", { label: "Compute" }),
+    col("idle_nodes", "number", { label: "Idle" }),
+    col("alloc_nodes", "number", { label: "Alloc" }),
+    col("down_nodes", "number", { label: "Down" }),
+  ],
   postgresql: [
     col("name"),
     col("database"),

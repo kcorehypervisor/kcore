@@ -21,6 +21,7 @@ mod issue_screen;
 mod live_migrate;
 mod lvm_ops;
 mod nixgen_k8s;
+mod nixgen_slurm;
 mod path_safety;
 mod pki;
 mod rate_limit;

@@ -1,7 +1,7 @@
 use crate::client::{self, controller_proto};
 use crate::commands::{
     ceph_cluster, container, disk_layout, network, object_store, postgresql, security_group,
-    shared_filesystem, ssh_key, vm,
+    shared_filesystem, slurm, ssh_key, vm,
 };
 use crate::config::ConnectionInfo;
 use anyhow::{Context, Result};
@@ -92,6 +92,9 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
             }
             "container" => return container::create_from_manifest(info, file).await,
             "postgresql" | "postgres" => return postgresql::create_from_manifest(info, file).await,
+            "slurmcluster" | "slurm-cluster" | "slurm_cluster" => {
+                return slurm::apply_from_file(info, file).await
+            }
             "disklayout" | "disk-layout" | "disk_layout" => {
                 return disk_layout::apply_from_file(info, file).await
             }

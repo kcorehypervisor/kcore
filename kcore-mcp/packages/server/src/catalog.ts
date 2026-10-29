@@ -55,6 +55,15 @@ export const KINDS: ResourceKind[] = [
     immutable: ["publicKey"],
   },
   {
+    id: "slurm-cluster",
+    yamlKind: "SlurmCluster",
+    title: "Slurm cluster",
+    summary:
+      "Slurm host services on disjoint kcoreOS nodes: slurmctld, slurmdbd, slurmd, and login roles. Compute members are cordoned so the VM scheduler leaves them to slurmd. One node belongs to at most one cluster.",
+    mutable: ["compute", "partitions", "users", "storage", "extraConfig", "accounting", "backupController", "gres", "reserve"],
+    immutable: ["clusterName", "controller.nodeId"],
+  },
+  {
     id: "postgresql",
     yamlKind: "Postgresql",
     title: "PostgreSQL database",

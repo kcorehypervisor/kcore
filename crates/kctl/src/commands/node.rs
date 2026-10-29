@@ -46,6 +46,7 @@ pub async fn uncordon(info: &ConnectionInfo, node_id: &str) -> Result<()> {
     let resp = client
         .uncordon_node(controller_proto::UncordonNodeRequest {
             node_id: node_id.to_string(),
+            force: false,
         })
         .await?
         .into_inner();

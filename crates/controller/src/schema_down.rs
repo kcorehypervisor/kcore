@@ -414,6 +414,12 @@ DROP TABLE IF EXISTS operator_credentials;",
         sql: crate::db::INGRESS_TABLES_DOWN,
         irreversible: false,
     },
+    SchemaDown {
+        version: 68,
+        sql: "DROP TABLE IF EXISTS slurm_cluster_nodes;
+DROP TABLE IF EXISTS slurm_clusters;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]
