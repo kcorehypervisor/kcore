@@ -127,9 +127,18 @@ pkgs.runCommand "kcore-host-eval"
     test -n ${lib.escapeShellArg cfg.systemd.services.keepalived-ingress.serviceConfig.ExecStart}
     echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q -- '-s 127.0.0.1 -p tcp --dport 2020'
     echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q -- '-d 203.0.113.10 -p tcp --dport 5432'
+    grep -F -q 'nix build --impure --no-link --print-out-paths' ${../flake.nix}
     grep -F -q 'nixos-install --system "$SYSTEM" --root /mnt --no-root-passwd' ${../flake.nix}
+    if grep -F -q -- '--offline' ${../flake.nix}; then
+      echo "install-to-disk must leave substituters enabled"
+      exit 1
+    fi
     if grep -F -q 'nixos-install --flake' ${../flake.nix}; then
       echo "install-to-disk must build on the installer store, then nixos-install --system"
+      exit 1
+    fi
+    if grep -F -q -- '--store /mnt' ${../flake.nix}; then
+      echo "install-to-disk must not build into the destination store"
       exit 1
     fi
     touch $out

@@ -48,7 +48,7 @@ Expected local layout on the operator machine:
 7. Live `node-agent` writes certs to `/etc/kcore/certs` and starts `install-to-disk`.
 8. Installer generates a `disko-config.nix` from install parameters and runs `disko --mode format,mount` to partition, encrypt, format, and mount disks declaratively. The LUKS root device is read from `cryptsetup status cryptroot` after that, not guessed from the disk name.
 9. Installer copies `/etc/kcore/*`, binaries, and NixOS config into `/mnt` on target disk. For key-file unlock, the passphrase is stored at `/etc/kcore/recovery/crypto_keyfile.bin` on both the live system (so `nixos-install` can put it in the initrd) and the installed system (so a later rebuild can too). It is not copied onto the unencrypted ESP. Data disks accept the same `nvme0n1` or `/dev/nvme0n1` forms as the OS disk, and must not be that disk.
-10. `nixos-install` completes and host reboots from installed disk.
+10. The installer builds the NixOS system in the installer store with substituters left enabled, copies that closure onto the target disk, and installs it with `nixos-install --system`. Evaluating the flake in the target store hits the Nix 2.31 `copyInputToStore` assertion for path inputs that already have a nar hash. Disabling substituters makes the installer build that system from source. The host then reboots from the installed disk.
 11. Installed services read `/etc/kcore/certs/*` and start successfully.
 12. Installer writes `/etc/kcore/disko-management-mode=installer-only` to enforce safe default ownership split.
 
@@ -135,7 +135,9 @@ flowchart TD
   hwcfg["nixos-generate-config<br/>--root /mnt"]
   copyBin["Copy binaries, certs,<br/>kcore YAML configs"]
   cfg["Write configuration.nix<br/>with LUKS boot config"]
-  install["nixos-install"]
+  build["nix build in the installer store<br/>substituters enabled"]
+  copyClosure["nix copy closure to /mnt"]
+  install["nixos-install --system"]
   tpmEnroll["TPM2 enrollment<br/>if tpm2 method"]
   reboot["Reboot from<br/>installed disk"]
   match["node-agent.yaml storage<br/>matches VG / pool in layout"]
@@ -145,7 +147,9 @@ flowchart TD
   diskoRun --> hwcfg
   hwcfg --> copyBin
   copyBin --> cfg
-  cfg --> install
+  cfg --> build
+  build --> copyClosure
+  copyClosure --> install
   install --> tpmEnroll
   tpmEnroll --> reboot
   reboot --> match
