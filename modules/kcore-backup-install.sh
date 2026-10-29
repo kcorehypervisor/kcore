@@ -304,9 +304,15 @@ cat > /mnt/etc/kcore/vault.nix.example <<'EOF'
 # cluster controller when the repository is ready.
 EOF
 
-echo "Installing the backup appliance (this builds the system from the ISO store)..."
+echo "Building the backup appliance on the installer store..."
 export NIX_CONFIG="experimental-features = nix-command flakes"
-nixos-install --flake /mnt/etc/nixos#kcore-backup --no-root-passwd
+# Flake install mode evaluates in the destination store. Nix 2.31 aborts
+# in copyInputToStore when the path inputs already have a nar hash in this
+# store. Build here, copy the closure, then install that system.
+SYSTEM=$(nix build --impure --no-link --print-out-paths \
+  '/mnt/etc/nixos#nixosConfigurations.kcore-backup.config.system.build.toplevel')
+nix copy --no-check-sigs --to /mnt "$SYSTEM" "@NIXPKGS@" "@KCORE@"
+nixos-install --system "$SYSTEM" --root /mnt --no-root-passwd
 
 echo
 echo "Installed. LUKS recovery key: /root/luks-recovery-key.txt on the new system."

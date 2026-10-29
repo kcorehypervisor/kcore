@@ -108,6 +108,7 @@ pkgs.runCommand "kcore-host-eval"
     test ${lib.boolToString cfg.services.kcore-console.enable} = true
     test ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} != ""
     echo ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} | grep -q hello
+    echo ${lib.escapeShellArg (toString cfg.systemd.services.kcore-console.serviceConfig.ExecStartPre)} | grep -q 'dmesg -n 1'
     echo ${lib.escapeShellArg cfg.systemd.services.kcore-console.serviceConfig.ExecStart} | grep -qv /opt/kcore
     test -n ${lib.escapeShellArg cfg.systemd.services.kcore-controller.serviceConfig.ExecStart}
     test ${lib.boolToString cfg.services.kcore.dashboard.enable} = true
@@ -126,5 +127,10 @@ pkgs.runCommand "kcore-host-eval"
     test -n ${lib.escapeShellArg cfg.systemd.services.keepalived-ingress.serviceConfig.ExecStart}
     echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q -- '-s 127.0.0.1 -p tcp --dport 2020'
     echo ${lib.escapeShellArg cfg.networking.firewall.extraCommands} | grep -q -- '-d 203.0.113.10 -p tcp --dport 5432'
+    grep -F -q 'nixos-install --system "$SYSTEM" --root /mnt --no-root-passwd' ${../flake.nix}
+    if grep -F -q 'nixos-install --flake' ${../flake.nix}; then
+      echo "install-to-disk must build on the installer store, then nixos-install --system"
+      exit 1
+    fi
     touch $out
   ''

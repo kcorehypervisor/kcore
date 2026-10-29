@@ -147,6 +147,8 @@ in
             ]
           )
         }:/run/wrappers/bin";
+        # Kernel USB faults are written to the active VT and cover this TUI.
+        ExecStartPre = "${pkgs.util-linux}/bin/dmesg -n 1";
         UMask = "0077";
         NoNewPrivileges = true;
         ProtectSystem = true;
