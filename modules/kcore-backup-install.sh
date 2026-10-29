@@ -306,9 +306,12 @@ EOF
 
 echo "Building the backup appliance on the installer store..."
 export NIX_CONFIG="experimental-features = nix-command flakes"
-# Flake install mode evaluates in the destination store. Nix 2.31 aborts
-# in copyInputToStore when the path inputs already have a nar hash in this
-# store. Build here, copy the closure, then install that system.
+# Build in this store, copy the closure onto the target, then install that
+# system. Evaluating the flake in the target store hits the Nix 2.31
+# copyInputToStore assertion once these path inputs have a nar hash.
+# Substituters stay enabled: the installed configuration is not the live
+# ISO closure, and fetching missing paths from the binary cache is what
+# makes the build finish.
 SYSTEM=$(nix build --impure --no-link --print-out-paths \
   '/mnt/etc/nixos#nixosConfigurations.kcore-backup.config.system.build.toplevel')
 nix copy --no-check-sigs --to /mnt "$SYSTEM" "@NIXPKGS@" "@KCORE@"
