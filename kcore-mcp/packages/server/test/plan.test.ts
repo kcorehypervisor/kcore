@@ -116,3 +116,42 @@ test("a cluster update is a CreateClusterUpdate RPC", () => {
   });
   assert.equal(call.method, "createClusterUpdate");
 });
+
+test("a SlurmCluster apply is a CreateSlurmCluster RPC", () => {
+  const kind = findKind("slurm-cluster");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    name: "hpc-a",
+    controller: { nodeId: "node-1", address: "10.0.0.1", iface: "enp6s0" },
+    compute: [
+      { nodeId: "node-2", address: "10.0.0.2", iface: "enp6s0", partitions: ["batch"], gres: "none" },
+    ],
+    partitions: [{ name: "batch", default: true }],
+  });
+  assert.equal(call.method, "createSlurmCluster");
+  assert.equal((call.request as { name: string }).name, "hpc-a");
+});
+
+test("a SlurmCluster plan refuses missing answers", () => {
+  const kind = findKind("slurm-cluster");
+  assert.ok(kind);
+  assert.throws(() => buildApply(kind, { name: "hpc-a" }), /controller is required/);
+});
+
+test("a complete SlurmCluster spec is accepted", () => {
+  const kind = findKind("slurm-cluster");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    name: "hpc-a",
+    controller: { nodeId: "node-1", address: "10.0.0.1", iface: "enp6s0" },
+    compute: [
+      { nodeId: "node-2", address: "10.0.0.2", iface: "enp6s0", partitions: ["batch"], gres: "none" },
+    ],
+    partitions: [{ name: "batch", default: true }],
+    users: [{ name: "alice", uid: 2001, sshKeys: ["ssh-ed25519 AAAA"] }],
+    storage: { mode: "nfs", exports: ["/home", "/scratch"] },
+  });
+  const spec = (call.request as { spec: Record<string, unknown> }).spec;
+  assert.equal(spec.clusterName, "hpc-a");
+  assert.equal((spec.compute as unknown[]).length, 1);
+});

@@ -10,6 +10,7 @@ let
     inherit (pkgs.stdenv.hostPlatform) system;
     modules = [
       ../modules/kcore-host.nix
+      ../modules/kcore-slurm.nix
       (
         { pkgs, ... }:
         {
@@ -36,6 +37,7 @@ let
             package = pkgs.hello;
           };
           services.kcore.kctl.package = pkgs.hello;
+          kcore.slurm.enable = false;
           kcore.metrics = {
             enable = true;
             allowedScrapeSources = [ "127.0.0.1" ];

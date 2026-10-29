@@ -825,6 +825,9 @@ fn apply_replication_event(
         | "postgresql.create"
         | "postgresql.update"
         | "postgresql.delete"
+        | "slurm_cluster.create"
+        | "slurm_cluster.update"
+        | "slurm_cluster.delete"
         | "security_group.create"
         | "security_group.delete"
         | "security_group.attach"
@@ -1167,6 +1170,13 @@ fn apply_domain_compensation(
                 let _ = db
                     .delete_postgresql(name)
                     .map_err(|e| format!("compensate postgresql.create delete {name}: {e}"))?;
+            }
+        }
+        "slurm_cluster.create" => {
+            if let Some(name) = loser_body.get("name").and_then(Value::as_str) {
+                let _ = db
+                    .delete_slurm_cluster(name)
+                    .map_err(|e| format!("compensate slurm_cluster.create delete {name}: {e}"))?;
             }
         }
         _ => {}
@@ -2124,6 +2134,100 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 .map_err(|e| format!("delete postgresql {name}: {e}"))?;
             Ok(())
         }
+        "slurm_cluster.create" | "slurm_cluster.update" => {
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let generation = body
+                .get("generation")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| format!("missing generation for {}", head.resource_key))?;
+            let spec_json = required_str(&body, "specJson", &head.resource_key)?;
+            let status_json = body
+                .get("statusJson")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let munge_key = body
+                .get("mungeKeyHex")
+                .and_then(Value::as_str)
+                .map(slurm_unhex)
+                .unwrap_or_default();
+            let dbd_password = body
+                .get("dbdPassword")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            db.upsert_slurm_cluster(&crate::db::SlurmClusterRow {
+                name: name.to_string(),
+                spec_json: spec_json.to_string(),
+                generation,
+                munge_key,
+                dbd_password,
+                status_json,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .map_err(|e| format!("upsert slurm cluster {name}: {e}"))?;
+            let mut rows = Vec::new();
+            if let Some(nodes) = body.get("nodes").and_then(Value::as_array) {
+                for node in nodes {
+                    let Some(node_id) = node.get("nodeId").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if db
+                        .get_node(node_id)
+                        .map_err(|e| format!("get node {node_id}: {e}"))?
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    rows.push(crate::db::SlurmClusterNodeRow {
+                        node_id: node_id.to_string(),
+                        cluster_name: name.to_string(),
+                        roles: node
+                            .get("roles")
+                            .map(|roles| {
+                                roles
+                                    .as_array()
+                                    .map(|items| {
+                                        items
+                                            .iter()
+                                            .filter_map(Value::as_str)
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    })
+                                    .or_else(|| roles.as_str().map(ToString::to_string))
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default(),
+                        applied_generation: node
+                            .get("appliedGeneration")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0),
+                        slurm_state: node
+                            .get("slurmState")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        config_hash: node
+                            .get("configHash")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        updated_at: String::new(),
+                    });
+                }
+            }
+            db.replace_slurm_cluster_nodes(name, &rows)
+                .map_err(|e| format!("replace slurm nodes {name}: {e}"))?;
+            Ok(())
+        }
+        "slurm_cluster.delete" => {
+            let name = required_str(&body, "name", &head.resource_key)?;
+            let _ = db
+                .delete_slurm_cluster(name)
+                .map_err(|e| format!("delete slurm cluster {name}: {e}"))?;
+            Ok(())
+        }
         "volume.create" | "volume.attach" | "volume.detach" | "volume.update" => {
             let id = required_str(&body, "id", &head.resource_key)?;
             let name = required_str(&body, "name", &head.resource_key)?;
@@ -2405,6 +2509,21 @@ fn pci_devices_from_replication_body(body: &Value) -> Result<String, String> {
         return Err("pciDevices must be a list of PCI addresses".into());
     };
     crate::pci::join_pci_devices(&addrs).map_err(|e| format!("pciDevices: {e}"))
+}
+
+fn slurm_unhex(raw: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16);
+        let lo = (bytes[i + 1] as char).to_digit(16);
+        if let (Some(hi), Some(lo)) = (hi, lo) {
+            out.push((hi * 16 + lo) as u8);
+        }
+        i += 2;
+    }
+    out
 }
 
 fn required_str<'a>(body: &'a Value, key: &str, resource_key: &str) -> Result<&'a str, String> {

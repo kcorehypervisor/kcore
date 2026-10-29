@@ -89,6 +89,43 @@ pub fn render_ingress_targets(db: &Database) -> Result<String, String> {
         .map_err(|e| format!("serializing ingress file_sd targets: {e}"))
 }
 
+/// Targets for `prometheus-slurm-exporter` on each SlurmCluster controller.
+pub fn render_slurm_targets(db: &Database) -> Result<String, String> {
+    const SLURM_EXPORTER_PORT: u16 = 8080;
+    let nodes = db.list_nodes().map_err(|e| format!("listing nodes: {e}"))?;
+    let clusters = db
+        .list_slurm_clusters()
+        .map_err(|e| format!("listing slurm clusters: {e}"))?;
+    let mut entries: Vec<FileSdTarget> = Vec::new();
+    for row in clusters {
+        let Ok(spec) = crate::slurm_cluster_spec::spec_from_json(&row.spec_json) else {
+            continue;
+        };
+        let Some(node) = nodes.iter().find(|n| n.id == spec.controller.node_id) else {
+            continue;
+        };
+        let host = grpc_address_host(&node.address);
+        if host.is_empty() || host == "0.0.0.0" || host == "::" {
+            continue;
+        }
+        let target = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{SLURM_EXPORTER_PORT}")
+        } else {
+            format!("{host}:{SLURM_EXPORTER_PORT}")
+        };
+        let mut labels = BTreeMap::new();
+        labels.insert("node_id".to_string(), node.id.clone());
+        labels.insert("role".to_string(), "slurm-controller".to_string());
+        labels.insert("cluster".to_string(), row.name.clone());
+        entries.push(FileSdTarget {
+            targets: vec![target],
+            labels,
+        });
+    }
+    serde_json::to_string_pretty(&entries)
+        .map_err(|e| format!("serializing slurm file_sd targets: {e}"))
+}
+
 /// Atomically rewrite `cfg.file_sd_path` from the current node inventory.
 pub fn write_node_targets(db: &Database, cfg: &MetricsConfig) -> Result<(), String> {
     let body = render_node_targets(db, cfg.scrape_port)?;
@@ -97,7 +134,9 @@ pub fn write_node_targets(db: &Database, cfg: &MetricsConfig) -> Result<(), Stri
     // Gateway nodes also expose Caddy metrics; the file is always rewritten so
     // a deleted gateway's targets disappear.
     let ingress = render_ingress_targets(db)?;
-    write_atomic(&path.with_file_name("ingress.json"), &ingress)
+    write_atomic(&path.with_file_name("ingress.json"), &ingress)?;
+    let slurm = render_slurm_targets(db)?;
+    write_atomic(&path.with_file_name("slurm.json"), &slurm)
 }
 
 fn write_atomic(path: &Path, body: &str) -> Result<(), String> {

@@ -24,6 +24,7 @@ pub mod pki;
 pub mod postgresql;
 pub mod security_group;
 pub mod shared_filesystem;
+pub mod slurm;
 pub mod ssh_key;
 pub mod storage_class;
 pub mod vault;

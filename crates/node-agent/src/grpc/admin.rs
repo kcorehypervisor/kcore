@@ -59,6 +59,12 @@ const CEPH_NIX_PATH: &str = "/etc/nixos/kcore-ceph.nix";
 /// Installed copy of `modules/kcore-ceph.nix` (installer seeds it; apply keeps it current).
 const CEPH_MODULE_PATH: &str = "/etc/nixos/modules/kcore-ceph.nix";
 const BUNDLED_CEPH_MODULE: &str = include_str!("../../../../modules/kcore-ceph.nix");
+const SLURM_NIX_PATH: &str = "/etc/nixos/kcore-slurm.nix";
+const SLURM_MODULE_PATH: &str = "/etc/nixos/modules/kcore-slurm.nix";
+const BUNDLED_SLURM_MODULE: &str = include_str!("../../../../modules/kcore-slurm.nix");
+const MUNGE_KEY_PATH: &str = "/etc/munge/munge.key";
+const SLURM_DBD_PASSWORD_PATH: &str = "/etc/slurm/dbd-password";
+const SLURM_DBD_INIT_PATH: &str = "/etc/slurm/dbd-init.sql";
 /// Rebuild verdicts live on tmpfs so they survive the node-agent restart that
 /// `nixos-rebuild switch` performs, but not a reboot (after which there is
 /// nothing in flight to report on anyway).
@@ -1957,6 +1963,159 @@ async fn apply_disk_layout_impl(
     }))
 }
 
+async fn sync_bundled_slurm_module() -> Result<(), Status> {
+    if let Some(parent) = Path::new(SLURM_MODULE_PATH).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| Status::internal(format!("creating {}: {e}", parent.display())))?;
+    }
+    let current = tokio::fs::read_to_string(SLURM_MODULE_PATH)
+        .await
+        .unwrap_or_default();
+    if current != BUNDLED_SLURM_MODULE {
+        tokio::fs::write(SLURM_MODULE_PATH, BUNDLED_SLURM_MODULE)
+            .await
+            .map_err(|e| Status::internal(format!("writing {SLURM_MODULE_PATH}: {e}")))?;
+    }
+    tokio::task::spawn_blocking(crate::nixgen_slurm::install_slurm_module_sources)
+        .await
+        .map_err(|e| Status::internal(format!("installing slurm module imports: {e}")))?
+        .map_err(|e| Status::internal(format!("installing slurm module imports: {e}")))?;
+    Ok(())
+}
+
+async fn run_slurm_dry_build(slurm_nix: &str) -> Result<(), String> {
+    sync_bundled_slurm_module()
+        .await
+        .map_err(|e| e.message().to_string())?;
+    let previous = tokio::fs::read_to_string(SLURM_NIX_PATH)
+        .await
+        .unwrap_or_default();
+    tokio::fs::write(SLURM_NIX_PATH, slurm_nix.as_bytes())
+        .await
+        .map_err(|e| format!("writing {SLURM_NIX_PATH} for dry-build: {e}"))?;
+    let nixpkgs = resolve_nixpkgs_path()
+        .await
+        .ok_or_else(|| {
+            "pinned nixpkgs path unresolved (resolve_nixpkgs_path); refusing dry-build that would pull unstable"
+                .to_string()
+        })?;
+    let mut cmd = Command::new("nixos-rebuild");
+    cmd.args(["dry-build"]);
+    if std::path::Path::new("/etc/nixos/flake.nix").exists() {
+        cmd.args(["--flake", "/etc/nixos#kcore"]);
+    } else {
+        cmd.env(
+            "NIX_PATH",
+            format!("nixos-config={NIXOS_CONFIG_PATH}:nixpkgs={nixpkgs}"),
+        );
+    }
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("starting nixos-rebuild dry-build: {e}"))?;
+    let _ = tokio::fs::write(SLURM_NIX_PATH, previous.as_bytes()).await;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(format!(
+            "nixos-rebuild dry-build failed: {}",
+            stderr
+                .lines()
+                .chain(stdout.lines())
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    Ok(())
+}
+
+fn slurm_issue(
+    check: &str,
+    message: impl Into<String>,
+    blocking: bool,
+) -> proto::SlurmPreflightIssue {
+    proto::SlurmPreflightIssue {
+        check: check.into(),
+        message: message.into(),
+        blocking,
+    }
+}
+
+async fn write_secret_file(path: &str, bytes: &[u8], owner: &str, mode: u32) -> Result<(), Status> {
+    if let Some(parent) = Path::new(path).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| Status::internal(format!("creating {}: {e}", parent.display())))?;
+    }
+    tokio::fs::write(path, bytes)
+        .await
+        .map_err(|e| Status::internal(format!("writing {path}: {e}")))?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .await
+        .map_err(|e| Status::internal(format!("chmod {path}: {e}")))?;
+    let out = Command::new("chown")
+        .arg(owner)
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("chown {path}: {e}")))?;
+    if !out.status.success() {
+        return Err(Status::internal(format!(
+            "chown {owner} {path}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+async fn unit_state(unit: &str) -> String {
+    let out = Command::new("systemctl")
+        .args(["is-active", unit])
+        .output()
+        .await;
+    match out {
+        Ok(out) => {
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if state.is_empty() {
+                "unknown".to_string()
+            } else {
+                state
+            }
+        }
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn slurm_config_hash(raw: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in raw.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn parse_listen_ports(raw: &str) -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+    for line in raw.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(local) = parts.nth(3) else {
+            continue;
+        };
+        let port = local.rsplit(':').next().unwrap_or("");
+        if let Ok(port) = port.parse::<u16>() {
+            ports.insert(port);
+        }
+    }
+    ports
+}
+
 #[tonic::async_trait]
 impl proto::node_admin_server::NodeAdmin for AdminService {
     async fn list_disks(
@@ -2427,6 +2586,331 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             keyring,
             apply_id: String::new(),
             daemons_started: true,
+        }))
+    }
+
+    async fn check_slurm_preflight(
+        &self,
+        request: Request<proto::CheckSlurmPreflightRequest>,
+    ) -> Result<Response<proto::CheckSlurmPreflightResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let mut issues = Vec::new();
+        if req.slurm_nix.trim().is_empty() {
+            issues.push(slurm_issue(
+                "slurm_nix",
+                "slurm_nix fragment is empty",
+                true,
+            ));
+        }
+        match resolve_nixpkgs_path().await {
+            Some(path) if Path::new(&path).exists() => {}
+            Some(path) => issues.push(slurm_issue(
+                "nixpkgs",
+                format!("nixpkgs path does not exist: {path}"),
+                true,
+            )),
+            None => issues.push(slurm_issue(
+                "nixpkgs",
+                "pinned nixpkgs path unresolved; apply would fall back to unstable",
+                true,
+            )),
+        }
+        if !req.slurm_nix.trim().is_empty() {
+            if let Err(err) = run_slurm_dry_build(&req.slurm_nix).await {
+                issues.push(slurm_issue("dry_build", err, true));
+            }
+        }
+
+        if !req.iface.trim().is_empty() {
+            if req.iface == "br0" || req.iface.starts_with("kbr-") {
+                issues.push(slurm_issue(
+                    "iface",
+                    format!(
+                        "{} is a bridge interface; Slurm must use the management address",
+                        req.iface
+                    ),
+                    true,
+                ));
+            }
+            if !req.ceph_cluster_iface.trim().is_empty() && req.iface == req.ceph_cluster_iface {
+                issues.push(slurm_issue(
+                    "iface",
+                    format!("{} is the Ceph cluster interface", req.iface),
+                    true,
+                ));
+            }
+            let ip_json = Command::new("ip")
+                .args(["-j", "addr", "show"])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|| "[]".into());
+            if !req.address.trim().is_empty() {
+                match crate::ceph_preflight::iface_has_address(
+                    &ip_json,
+                    &req.iface,
+                    req.address.trim(),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => issues.push(slurm_issue(
+                        "address",
+                        format!(
+                            "address {} is not assigned on {}",
+                            req.address.trim(),
+                            req.iface
+                        ),
+                        true,
+                    )),
+                    Err(err) => issues.push(slurm_issue("address", err, true)),
+                }
+            }
+            let lease = Path::new(&format!("/run/systemd/netif/leases/{}", req.iface)).exists()
+                || Path::new(&format!("/var/lib/dhcpcd/dhcpcd-{}.lease", req.iface)).exists();
+            let networkctl = Command::new("networkctl")
+                .args(["status", &req.iface])
+                .output()
+                .await
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            if crate::ceph_preflight::iface_appears_dhcp(&networkctl, lease) {
+                issues.push(slurm_issue(
+                    "dhcp",
+                    format!(
+                        "{} is DHCP-managed; use a static management address",
+                        req.iface
+                    ),
+                    true,
+                ));
+            }
+        }
+
+        let ss = Command::new("ss")
+            .args(["-ltnH"])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let ports = parse_listen_ports(&ss);
+        for port in [6817u16, 6818, 6819] {
+            if ports.contains(&port) {
+                issues.push(slurm_issue(
+                    "port",
+                    format!("TCP {port} is already listening on this node"),
+                    true,
+                ));
+            }
+        }
+        if ports.iter().any(|port| (60001..=63000).contains(port)) {
+            issues.push(slurm_issue(
+                "port",
+                "a port in SrunPortRange 60001-63000 is already listening",
+                true,
+            ));
+        }
+        if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            issues.push(slurm_issue(
+                "cgroup_v2",
+                "cgroup v2 is not mounted at /sys/fs/cgroup",
+                true,
+            ));
+        }
+        if req.compute {
+            let vms = Command::new("systemctl")
+                .args([
+                    "list-units",
+                    "--type=service",
+                    "--state=running",
+                    "--no-legend",
+                    "--plain",
+                    "kcore-vm-*.service",
+                ])
+                .output()
+                .await
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            if vms.lines().any(|line| !line.trim().is_empty()) {
+                issues.push(slurm_issue(
+                    "vms",
+                    "compute member still hosts guest VMs; drain them before apply",
+                    true,
+                ));
+            }
+        }
+        let ok = !issues.iter().any(|issue| issue.blocking);
+        Ok(Response::new(proto::CheckSlurmPreflightResponse {
+            ok,
+            issues,
+        }))
+    }
+
+    async fn apply_slurm_config(
+        &self,
+        request: Request<proto::ApplySlurmConfigRequest>,
+    ) -> Result<Response<proto::ApplySlurmConfigResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if req.slurm_nix.trim().is_empty() {
+            return Err(Status::invalid_argument("slurm_nix is required"));
+        }
+        sync_bundled_slurm_module().await?;
+        tokio::fs::write(SLURM_NIX_PATH, req.slurm_nix.as_bytes())
+            .await
+            .map_err(|e| Status::internal(format!("writing {SLURM_NIX_PATH}: {e}")))?;
+
+        if !req.munge_key.is_empty() {
+            write_secret_file(MUNGE_KEY_PATH, &req.munge_key, "munge:munge", 0o400).await?;
+        }
+        if !req.dbd_password.is_empty() {
+            write_secret_file(
+                SLURM_DBD_PASSWORD_PATH,
+                &req.dbd_password,
+                "root:root",
+                0o400,
+            )
+            .await?;
+            let password = String::from_utf8_lossy(&req.dbd_password);
+            let sql = format!(
+                "CREATE DATABASE IF NOT EXISTS slurm_acct_db;\n\
+                 CREATE USER IF NOT EXISTS 'slurm'@'localhost' IDENTIFIED BY '{password}';\n\
+                 GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'localhost';\n\
+                 FLUSH PRIVILEGES;\n"
+            );
+            write_secret_file(SLURM_DBD_INIT_PATH, sql.as_bytes(), "root:root", 0o400).await?;
+        }
+
+        if req.rebuild {
+            let apply_id = format!("slurm-{}", uuid_like_suffix());
+            write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+            let apply_lock = Arc::clone(&self.apply_lock);
+            let spawned_id = apply_id.clone();
+            tokio::spawn(async move {
+                let _guard = apply_lock.lock().await;
+                run_test_then_switch(PathBuf::from(SLURM_NIX_PATH), Vec::new(), spawned_id).await;
+            });
+            return Ok(Response::new(proto::ApplySlurmConfigResponse {
+                success: true,
+                message: format!(
+                    "Slurm configuration written to {SLURM_NIX_PATH}; nixos-rebuild {apply_id} started"
+                ),
+                apply_id,
+            }));
+        }
+
+        if !req.munge_key.is_empty() {
+            let out = Command::new("systemctl")
+                .args(["restart", "munged.service"])
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("restarting munged: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "systemctl restart munged failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        Ok(Response::new(proto::ApplySlurmConfigResponse {
+            success: true,
+            message: format!("Slurm configuration written to {SLURM_NIX_PATH}"),
+            apply_id: String::new(),
+        }))
+    }
+
+    async fn get_slurm_status(
+        &self,
+        request: Request<proto::GetSlurmStatusRequest>,
+    ) -> Result<Response<proto::GetSlurmStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let munge = unit_state("munged.service").await;
+        let slurmctld = unit_state("slurmctld.service").await;
+        let slurmd = unit_state("slurmd.service").await;
+        let slurmdbd = unit_state("slurmdbd.service").await;
+        let sinfo = if slurmctld == "active" {
+            Command::new("sinfo")
+                .args(["-h", "-N", "-o", "%N %T"])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let raw = tokio::fs::read_to_string(SLURM_NIX_PATH)
+            .await
+            .unwrap_or_default();
+        Ok(Response::new(proto::GetSlurmStatusResponse {
+            munge,
+            slurmctld,
+            slurmd,
+            slurmdbd,
+            sinfo,
+            config_hash: slurm_config_hash(&raw),
+        }))
+    }
+
+    async fn slurm_control(
+        &self,
+        request: Request<proto::SlurmControlRequest>,
+    ) -> Result<Response<proto::SlurmControlResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let verb = req.verb.trim().to_ascii_lowercase();
+        if verb != "drain" && verb != "resume" {
+            return Err(Status::invalid_argument(
+                "SlurmControl accepts only drain and resume",
+            ));
+        }
+        let node_name = req.node_name.trim();
+        if node_name.is_empty()
+            || !node_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(Status::invalid_argument(
+                "node_name is required and must be a plain name",
+            ));
+        }
+        let reason = req.reason.replace(['\n', '\r'], " ");
+        let mut cmd = Command::new("scontrol");
+        cmd.arg("update").arg(format!("NodeName={node_name}"));
+        if verb == "drain" {
+            cmd.arg("State=DRAIN");
+            if !reason.trim().is_empty() {
+                cmd.arg(format!("Reason={reason}"));
+            }
+        } else {
+            cmd.arg("State=RESUME");
+        }
+        let out = cmd
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("running scontrol: {e}")))?;
+        if !out.status.success() {
+            return Err(Status::failed_precondition(format!(
+                "scontrol update failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(Response::new(proto::SlurmControlResponse {
+            success: true,
+            message: format!(
+                "{} {}",
+                if verb == "drain" {
+                    "drained"
+                } else {
+                    "resumed"
+                },
+                node_name
+            ),
         }))
     }
 

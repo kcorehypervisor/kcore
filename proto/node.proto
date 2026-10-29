@@ -185,6 +185,13 @@ service NodeAdmin {
   // before CreateCephCluster mutates anything.
   rpc CheckCephPreflight(CheckCephPreflightRequest) returns (CheckCephPreflightResponse);
   rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
+  // Slurm host services: dry-build the fragment and check the management
+  // interface before the controller writes it.
+  rpc CheckSlurmPreflight(CheckSlurmPreflightRequest) returns (CheckSlurmPreflightResponse);
+  rpc ApplySlurmConfig(ApplySlurmConfigRequest) returns (ApplySlurmConfigResponse);
+  rpc GetSlurmStatus(GetSlurmStatusRequest) returns (GetSlurmStatusResponse);
+  // Only drain and resume are accepted; scontrol runs on this node.
+  rpc SlurmControl(SlurmControlRequest) returns (SlurmControlResponse);
   rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
   // Create every OSD in osd_devices that is not already prepared, and retire
   // OSDs this node has that are not in that list. Retirement only touches
@@ -1998,4 +2005,67 @@ message ImportIngressStoreResponse {
   bool success = 1;
   int32 files = 2;
   string message = 3;
+}
+
+
+message CheckSlurmPreflightRequest {
+  string slurm_nix = 1;
+  string address = 2;
+  string iface = 3;
+  bool compute = 4;
+  repeated string member_addresses = 5;
+  repeated string gpu_pci_ids = 6;
+  string ceph_cluster_iface = 7;
+}
+
+message SlurmPreflightIssue {
+  string check = 1;
+  string message = 2;
+  bool blocking = 3;
+}
+
+message CheckSlurmPreflightResponse {
+  bool ok = 1;
+  repeated SlurmPreflightIssue issues = 2;
+}
+
+message ApplySlurmConfigRequest {
+  string slurm_nix = 1;
+  // 1024 random bytes. Written to /etc/munge/munge.key, never to the Nix store.
+  bytes munge_key = 2;
+  // Optional slurmdbd password. Written outside the Nix store when accounting
+  // is enabled.
+  bytes dbd_password = 3;
+  bool rebuild = 4;
+  bool accounting = 5;
+  repeated string gpu_pci_ids = 6;
+}
+
+message ApplySlurmConfigResponse {
+  bool success = 1;
+  string message = 2;
+  string apply_id = 3;
+}
+
+message GetSlurmStatusRequest {}
+
+message GetSlurmStatusResponse {
+  string munge = 1;
+  string slurmctld = 2;
+  string slurmd = 3;
+  string slurmdbd = 4;
+  // `sinfo -h -N -o '%N %T'` on the controller; empty elsewhere.
+  string sinfo = 5;
+  string config_hash = 6;
+}
+
+message SlurmControlRequest {
+  string verb = 1; // drain or resume
+  string node_name = 2;
+  string reason = 3;
+}
+
+message SlurmControlResponse {
+  bool success = 1;
+  string message = 2;
 }

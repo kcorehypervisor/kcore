@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 mod auth_store;
 mod ingress_store;
@@ -365,6 +365,31 @@ pub struct CephClusterStatusRow {
     pub health_message: String,
     pub ceph_status_json: String,
     pub last_transition_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlurmClusterRow {
+    pub name: String,
+    pub spec_json: String,
+    pub generation: i64,
+    /// 1024 random bytes. Never logged or returned by Get.
+    pub munge_key: Vec<u8>,
+    /// Generated when accounting is enabled. Never logged or returned by Get.
+    pub dbd_password: String,
+    pub status_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlurmClusterNodeRow {
+    pub node_id: String,
+    pub cluster_name: String,
+    pub roles: String,
+    pub applied_generation: i64,
+    pub slurm_state: String,
+    pub config_hash: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -827,7 +852,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 67;
+pub const SCHEMA_VERSION: i32 = 68;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -836,7 +861,8 @@ pub const SCHEMA_VERSION: i32 = 67;
 /// default. Version 62 adds vGPU parent and profile columns on `node_gpus`.
 /// Version 63 adds the HA tables. Version 64 adds the fence hold on `node_ha`.
 /// Version 65 adds `node_ha.host_health` for proactive cordon. Version 67 adds
-/// the ingress tables, which an older reader never selects.
+/// the ingress tables, which an older reader never selects. Version 68 adds the
+/// Slurm tables, which an older reader never selects.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2212,6 +2238,31 @@ impl Database {
 
         if version < 67 {
             conn.execute_batch(ingress_store::INGRESS_TABLES)?;
+        }
+
+        if version < 68 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS slurm_clusters (
+                    name TEXT PRIMARY KEY,
+                    spec_json TEXT NOT NULL,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    munge_key BLOB NOT NULL DEFAULT X'',
+                    dbd_password TEXT NOT NULL DEFAULT '',
+                    status_json TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS slurm_cluster_nodes (
+                    node_id TEXT PRIMARY KEY,
+                    cluster_name TEXT NOT NULL REFERENCES slurm_clusters(name) ON DELETE CASCADE,
+                    roles TEXT NOT NULL DEFAULT '',
+                    applied_generation INTEGER NOT NULL DEFAULT 0,
+                    slurm_state TEXT NOT NULL DEFAULT '',
+                    config_hash TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_slurm_cluster_nodes_cluster ON slurm_cluster_nodes(cluster_name);",
+            )?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -4656,6 +4707,258 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    pub fn upsert_slurm_cluster(&self, row: &SlurmClusterRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO slurm_clusters
+             (name, spec_json, generation, munge_key, dbd_password, status_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                     COALESCE(NULLIF(?7, ''), datetime('now')), datetime('now'))
+             ON CONFLICT(name) DO UPDATE SET
+               spec_json=excluded.spec_json,
+               generation=excluded.generation,
+               munge_key=CASE WHEN length(excluded.munge_key) > 0 THEN excluded.munge_key ELSE slurm_clusters.munge_key END,
+               dbd_password=CASE WHEN excluded.dbd_password != '' THEN excluded.dbd_password ELSE slurm_clusters.dbd_password END,
+               status_json=excluded.status_json,
+               updated_at=datetime('now')",
+            params![
+                row.name,
+                row.spec_json,
+                row.generation,
+                row.munge_key,
+                row.dbd_password,
+                row.status_json,
+                row.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_slurm_cluster(
+        &self,
+        name: &str,
+    ) -> Result<Option<SlurmClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, spec_json, generation, munge_key, dbd_password, status_json,
+                    created_at, updated_at FROM slurm_clusters WHERE name=?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |r| {
+            Ok(SlurmClusterRow {
+                name: r.get(0)?,
+                spec_json: row_text(r, 1)?,
+                generation: r.get(2)?,
+                munge_key: r.get::<_, Vec<u8>>(3)?,
+                dbd_password: row_text(r, 4)?,
+                status_json: row_text(r, 5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn list_slurm_clusters(&self) -> Result<Vec<SlurmClusterRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, spec_json, generation, munge_key, dbd_password, status_json,
+                    created_at, updated_at FROM slurm_clusters ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SlurmClusterRow {
+                name: r.get(0)?,
+                spec_json: row_text(r, 1)?,
+                generation: r.get(2)?,
+                munge_key: r.get::<_, Vec<u8>>(3)?,
+                dbd_password: row_text(r, 4)?,
+                status_json: row_text(r, 5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn list_slurm_clusters_needing_reconcile(
+        &self,
+    ) -> Result<Vec<SlurmClusterRow>, rusqlite::Error> {
+        let rows = self.list_slurm_clusters()?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                let Ok(status) = serde_json::from_str::<serde_json::Value>(&row.status_json) else {
+                    return true;
+                };
+                let observed = status
+                    .get("observedGeneration")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let phase = status
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("pending");
+                observed < row.generation
+                    || matches!(phase, "pending" | "applying" | "degraded" | "deleting")
+            })
+            .collect())
+    }
+
+    pub fn set_slurm_cluster_status(
+        &self,
+        name: &str,
+        status_json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE slurm_clusters SET status_json=?2, updated_at=datetime('now') WHERE name=?1",
+            params![name, status_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn rotate_slurm_munge_key(
+        &self,
+        name: &str,
+        key: &[u8],
+    ) -> Result<Option<i64>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let generation = conn
+            .query_row(
+                "SELECT generation FROM slurm_clusters WHERE name=?1",
+                params![name],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(generation) = generation else {
+            return Ok(None);
+        };
+        let next = generation.saturating_add(1);
+        let raw: String = conn.query_row(
+            "SELECT status_json FROM slurm_clusters WHERE name=?1",
+            params![name],
+            |r| r.get(0),
+        )?;
+        let mut status: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|_| serde_json::json!({"observedGeneration": 0}));
+        status["phase"] = serde_json::Value::String("applying".into());
+        status["observedGeneration"] = serde_json::Value::Number(0.into());
+        status["message"] = serde_json::Value::String("munge key rotation queued".into());
+        conn.execute(
+            "UPDATE slurm_clusters SET munge_key=?2, generation=?3, status_json=?4,
+               updated_at=datetime('now') WHERE name=?1",
+            params![name, key, next, status.to_string()],
+        )?;
+        Ok(Some(next))
+    }
+
+    pub fn delete_slurm_cluster(&self, name: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM slurm_cluster_nodes WHERE cluster_name=?1",
+            params![name],
+        )?;
+        Ok(conn.execute("DELETE FROM slurm_clusters WHERE name=?1", params![name])? > 0)
+    }
+
+    pub fn replace_slurm_cluster_nodes(
+        &self,
+        cluster_name: &str,
+        rows: &[SlurmClusterNodeRow],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM slurm_cluster_nodes WHERE cluster_name=?1",
+            params![cluster_name],
+        )?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO slurm_cluster_nodes
+                 (node_id, cluster_name, roles, applied_generation, slurm_state, config_hash, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+                 ON CONFLICT(node_id) DO UPDATE SET
+                   cluster_name=excluded.cluster_name,
+                   roles=excluded.roles,
+                   applied_generation=excluded.applied_generation,
+                   slurm_state=excluded.slurm_state,
+                   config_hash=excluded.config_hash,
+                   updated_at=datetime('now')",
+                params![
+                    row.node_id,
+                    row.cluster_name,
+                    row.roles,
+                    row.applied_generation,
+                    row.slurm_state,
+                    row.config_hash
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_slurm_cluster_nodes(
+        &self,
+        cluster_name: &str,
+    ) -> Result<Vec<SlurmClusterNodeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, cluster_name, roles, applied_generation, slurm_state, config_hash,
+                    updated_at FROM slurm_cluster_nodes WHERE cluster_name=?1 ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map(params![cluster_name], |r| {
+            Ok(SlurmClusterNodeRow {
+                node_id: r.get(0)?,
+                cluster_name: r.get(1)?,
+                roles: row_text(r, 2)?,
+                applied_generation: r.get(3)?,
+                slurm_state: row_text(r, 4)?,
+                config_hash: row_text(r, 5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_slurm_cluster_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<SlurmClusterNodeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, cluster_name, roles, applied_generation, slurm_state, config_hash,
+                    updated_at FROM slurm_cluster_nodes WHERE node_id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![node_id], |r| {
+            Ok(SlurmClusterNodeRow {
+                node_id: r.get(0)?,
+                cluster_name: r.get(1)?,
+                roles: row_text(r, 2)?,
+                applied_generation: r.get(3)?,
+                slurm_state: row_text(r, 4)?,
+                config_hash: row_text(r, 5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn update_slurm_cluster_node_state(
+        &self,
+        node_id: &str,
+        applied_generation: i64,
+        slurm_state: &str,
+        config_hash: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE slurm_cluster_nodes SET applied_generation=?2, slurm_state=?3,
+               config_hash=?4, updated_at=datetime('now') WHERE node_id=?1",
+            params![node_id, applied_generation, slurm_state, config_hash],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_shared_filesystem(

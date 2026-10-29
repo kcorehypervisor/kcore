@@ -50,6 +50,9 @@ mod scheduler;
 mod schema_down;
 mod shared_filesystem_reconciler;
 mod shared_filesystem_spec;
+mod slurm_cluster_reconciler;
+mod slurm_cluster_spec;
+mod slurm_render;
 mod snapshot_policy_reconciler;
 mod vm_nics;
 mod vm_operation_policy;
@@ -213,6 +216,11 @@ async fn main() -> anyhow::Result<()> {
         },
     );
     ceph_cluster_reconciler::spawn_ceph_cluster_reconciler(database.clone(), clients.clone());
+    slurm_cluster_reconciler::spawn_slurm_cluster_reconciler(
+        database.clone(),
+        clients.clone(),
+        cfg.replication.clone(),
+    );
     shared_filesystem_reconciler::spawn_shared_filesystem_reconciler(database.clone());
     object_store_reconciler::spawn_object_store_reconciler(database.clone());
     cluster_update_reconciler::spawn_cluster_update_reconciler(database.clone(), clients.clone());

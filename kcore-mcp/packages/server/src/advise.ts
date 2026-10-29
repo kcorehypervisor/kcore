@@ -33,6 +33,7 @@ const INTENT: Array<[RegExp, string]> = [
   [/\bnetworks?\b|\bvxlan\b|\bbridge\b/i, "network"],
   [/\bssh keys?\b/i, "ssh-key"],
   [/\bpostgres(?:ql)?\b/i, "postgresql"],
+  [/\bslurm\b|\bhpc\b/i, "slurm-cluster"],
   [/\bcontainers?\b/i, "container"],
   [/\bvolumes?\b/i, "volume"],
   [/\bsnapshot polic/i, "snapshot-policy"],
@@ -156,6 +157,64 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           "The controller stores the public key and can inject it into cloud-init. The private key stays with the operator.",
           missing(spec, "publicKey"),
           { example: "ssh-ed25519 AAAA... operator@host" },
+        ),
+      ].filter((item) => item.required || missing(spec, item.id));
+    case "slurm-cluster":
+      return [
+        question(
+          "controller",
+          "Which node runs slurmctld, and what are its management address and interface?",
+          "The controller host stays out of compute unless the operator explicitly opts in.",
+          !spec.controller,
+          { example: "{ nodeId: node-101, address: 10.0.0.11, iface: enp6s0 }" },
+        ),
+        question(
+          "compute",
+          "Which nodes become compute members?",
+          "Give each node id, management address, and interface. They will be cordoned and must not host guests.",
+          !Array.isArray(spec.compute) || spec.compute.length === 0,
+          { example: "[{ nodeId: node-102, address: 10.0.0.12, iface: enp6s0, partitions: [batch] }]" },
+        ),
+        question(
+          "cordon",
+          "May those compute nodes be cordoned and emptied of guests before apply?",
+          "Slurm owns the compute nodes; the VM scheduler must leave them alone.",
+          missing(spec, "cordonConfirmed"),
+        ),
+        question(
+          "partitions",
+          "Which partitions should exist?",
+          "Example: batch (default), gpu. Every compute member must reference an existing partition.",
+          !Array.isArray(spec.partitions) || spec.partitions.length === 0,
+          { example: "[{ name: batch, default: true, maxTime: INFINITE, state: UP }]" },
+        ),
+        question(
+          "users",
+          "Who are the first users?",
+          "Give name, fixed uid, and SSH public keys so uid/gid match on every member.",
+          !Array.isArray(spec.users) || spec.users.length === 0,
+        ),
+        question(
+          "storage",
+          "Should /home and /scratch use nfs, shared-filesystem, or none?",
+          "nfs is the default and is a single point of failure on the controller.",
+          missing(spec, "storage"),
+          { choices: ["nfs", "shared-filesystem", "none"] },
+        ),
+        question(
+          "accounting",
+          "Turn Slurm accounting on or off?",
+          "Accounting runs MariaDB and slurmdbd on the dbd role.",
+          spec.accounting == null,
+          { choices: ["off", "on"] },
+        ),
+        question(
+          "gres",
+          "Is gres none or auto on compute?",
+          "auto requires gpuDriver: true and a reported GPU inventory.",
+          !Array.isArray(spec.compute) ||
+            spec.compute.some((c) => !c || typeof c !== "object" || !("gres" in c)),
+          { choices: ["none", "auto"] },
         ),
       ].filter((item) => item.required || missing(spec, item.id));
     case "postgresql":
@@ -547,6 +606,11 @@ export function warningsFor(kind: ResourceKind, spec: Record<string, unknown>): 
   }
   if (kind.id === "disk-layout") {
     warnings.push("Plan this layout before apply. The node refuses a disk that still backs a VM, an LVM PV, or a ZFS pool member.");
+  }
+  if (kind.id === "slurm-cluster") {
+    warnings.push(
+      "Compute members are cordoned so the VM scheduler leaves them to slurmd. NFS exports live on the controller and are a single point of failure. Members of one Slurm cluster must be in the same cluster-update run because Slurm requires dbd >= ctld >= slurmd.",
+    );
   }
   if (kind.id === "postgresql") {
     warnings.push(

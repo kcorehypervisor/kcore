@@ -275,6 +275,16 @@ service Controller {
   rpc DeleteKubernetesCluster(DeleteKubernetesClusterRequest) returns (DeleteKubernetesClusterResponse);
   rpc ScaleKubernetesCluster(ScaleKubernetesClusterRequest) returns (ScaleKubernetesClusterResponse);
   rpc GetKubernetesClusterHealth(GetKubernetesClusterHealthRequest) returns (GetKubernetesClusterHealthResponse);
+
+  // SlurmCluster — Slurm host services on disjoint kcoreOS nodes.
+  rpc PlanSlurmCluster(PlanSlurmClusterRequest) returns (PlanSlurmClusterResponse);
+  rpc CreateSlurmCluster(CreateSlurmClusterRequest) returns (CreateSlurmClusterResponse);
+  rpc GetSlurmCluster(GetSlurmClusterRequest) returns (GetSlurmClusterResponse);
+  rpc ListSlurmClusters(ListSlurmClustersRequest) returns (ListSlurmClustersResponse);
+  rpc DeleteSlurmCluster(DeleteSlurmClusterRequest) returns (DeleteSlurmClusterResponse);
+  rpc RotateSlurmMungeKey(RotateSlurmMungeKeyRequest) returns (RotateSlurmMungeKeyResponse);
+  rpc DrainSlurmNode(DrainSlurmNodeRequest) returns (DrainSlurmNodeResponse);
+  rpc ResumeSlurmNode(ResumeSlurmNodeRequest) returns (ResumeSlurmNodeResponse);
 }
 
 message RegisterNodeRequest {
@@ -1495,6 +1505,8 @@ message CordonNodeResponse {
 
 message UncordonNodeRequest {
   string node_id = 1;
+  // A Slurm compute member stays cordoned unless force is set.
+  bool force = 2;
 }
 
 message UncordonNodeResponse {
@@ -3431,4 +3443,174 @@ message SetIngressSecretRequest {
 message SetIngressSecretResponse {
   bool success = 1;
   repeated string nodes = 2; // nodes the file was written to
+}
+
+// ============================================================================
+// Slurm Cluster Management
+// ============================================================================
+
+enum SlurmClusterPhase {
+  SLURM_CLUSTER_PHASE_UNSPECIFIED = 0;
+  SLURM_CLUSTER_PHASE_PENDING = 1;
+  SLURM_CLUSTER_PHASE_APPLYING = 2;
+  SLURM_CLUSTER_PHASE_READY = 3;
+  SLURM_CLUSTER_PHASE_DEGRADED = 4;
+  SLURM_CLUSTER_PHASE_DELETING = 5;
+  SLURM_CLUSTER_PHASE_FAILED = 6;
+}
+
+message SlurmControllerSpec {
+  string node_id = 1;
+  string address = 2;
+  string iface = 3;
+}
+
+message SlurmReserveSpec {
+  int32 cores = 1;
+  int64 memory_mb = 2;
+}
+
+message SlurmComputeSpec {
+  string node_id = 1;
+  string address = 2;
+  string iface = 3;
+  repeated string partitions = 4;
+  SlurmReserveSpec reserve = 5;
+  string gres = 6; // "none" (default) or "auto"
+}
+
+message SlurmPartitionSpec {
+  string name = 1;
+  bool default = 2;
+  string max_time = 3;
+  string state = 4;
+}
+
+message SlurmUserSpec {
+  string name = 1;
+  int32 uid = 2;
+  repeated string ssh_keys = 3;
+}
+
+message SlurmStorageSpec {
+  string mode = 1; // "nfs" (default), "shared-filesystem", "none"
+  repeated string exports = 2;
+  string filesystem = 3; // SharedFilesystem name when mode is shared-filesystem
+}
+
+message SlurmAccountingSpec {
+  bool enabled = 1;
+  string node_id = 2; // defaults to the controller node
+}
+
+message SlurmLoginSpec {
+  repeated string node_ids = 1;
+}
+
+message SlurmClusterSpec {
+  string cluster_name = 1;
+  SlurmControllerSpec controller = 2;
+  SlurmControllerSpec backup_controller = 3;
+  SlurmLoginSpec login = 4;
+  SlurmAccountingSpec accounting = 5;
+  repeated SlurmComputeSpec compute = 6;
+  repeated SlurmPartitionSpec partitions = 7;
+  repeated SlurmUserSpec users = 8;
+  SlurmStorageSpec storage = 9;
+  string extra_config = 10;
+  bool allow_controller_host = 11;
+  // Opt in to the host NVIDIA driver on compute members. gres: auto requires
+  // this; the module default is false because kcoreOS ships no host driver.
+  bool gpu_driver = 12;
+}
+
+message SlurmNodeStatus {
+  string node_id = 1;
+  repeated string roles = 2;
+  string slurm_state = 3; // idle, alloc, down, drain, unknown
+  int64 applied_generation = 4;
+  string config_hash = 5;
+}
+
+message SlurmClusterStatus {
+  int64 observed_generation = 1;
+  string phase = 2; // pending, applying, ready, degraded, deleting, failed
+  string message = 3;
+  repeated SlurmNodeStatus nodes = 4;
+}
+
+message SlurmCluster {
+  string name = 1;
+  int64 generation = 2;
+  SlurmClusterSpec spec = 3;
+  SlurmClusterStatus status = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message PlanSlurmClusterRequest {
+  string name = 1;
+  SlurmClusterSpec spec = 2;
+}
+
+message PlanSlurmClusterResponse {
+  string action = 1; // create, update, unchanged, replace
+  repeated string blocking_issues = 2;
+  repeated string warnings = 3;
+  repeated NodePlanResult node_plans = 4;
+  string rendered_nix_preview = 5;
+}
+
+message CreateSlurmClusterRequest {
+  string name = 1;
+  SlurmClusterSpec spec = 2;
+  bool confirm = 3;
+}
+
+message CreateSlurmClusterResponse {
+  bool success = 1;
+  string message = 2;
+  SlurmCluster cluster = 3;
+  ApplyAction action = 4;
+  repeated string changed_fields = 5;
+}
+
+message GetSlurmClusterRequest { string name = 1; }
+message GetSlurmClusterResponse { SlurmCluster cluster = 1; }
+message ListSlurmClustersRequest {}
+message ListSlurmClustersResponse { repeated SlurmCluster clusters = 1; }
+
+message DeleteSlurmClusterRequest {
+  string name = 1;
+  bool force = 2;
+}
+message DeleteSlurmClusterResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RotateSlurmMungeKeyRequest { string name = 1; }
+message RotateSlurmMungeKeyResponse {
+  bool success = 1;
+  string message = 2;
+  int64 generation = 3;
+}
+
+message DrainSlurmNodeRequest {
+  string name = 1;
+  string node_id = 2;
+  string reason = 3;
+}
+message DrainSlurmNodeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ResumeSlurmNodeRequest {
+  string name = 1;
+  string node_id = 2;
+}
+message ResumeSlurmNodeResponse {
+  bool success = 1;
+  string message = 2;
 }

@@ -37,8 +37,8 @@ use crate::db::{
     CephClusterRow, CephClusterStatusRow, ClusterUpdateNodeRow, ClusterUpdateRow, Database,
     DiskLayoutRow, DiskLayoutStatusRow, NetworkRow, NodeRow, ObjectStoreRow, ObjectStoreStatusRow,
     ObjectUserRow, OperatorRow, PostgresqlRow, SecurityGroupRow, SecurityGroupRuleRow,
-    SharedFilesystemRow, SharedFilesystemStatusRow, SnapshotPolicyRow, VmNicRow, VmOperationRow,
-    VmRow, VolumeRow, VolumeSnapshotRow, WorkloadRow,
+    SharedFilesystemRow, SharedFilesystemStatusRow, SlurmClusterNodeRow, SlurmClusterRow,
+    SnapshotPolicyRow, VmNicRow, VmOperationRow, VmRow, VolumeRow, VolumeSnapshotRow, WorkloadRow,
 };
 #[cfg(test)]
 use crate::db::{IssuedCertRow, CERT_STATUS_ACTIVE, CERT_STATUS_REVOKED};
@@ -367,6 +367,9 @@ const EVT_NETWORK_DELETE: &str = "network.delete";
 const EVT_POSTGRESQL_CREATE: &str = "postgresql.create";
 const EVT_POSTGRESQL_UPDATE: &str = "postgresql.update";
 const EVT_POSTGRESQL_DELETE: &str = "postgresql.delete";
+const EVT_SLURM_CLUSTER_CREATE: &str = "slurm_cluster.create";
+const EVT_SLURM_CLUSTER_UPDATE: &str = "slurm_cluster.update";
+const EVT_SLURM_CLUSTER_DELETE: &str = "slurm_cluster.delete";
 const EVT_SECURITY_GROUP_CREATE: &str = "security_group.create";
 const EVT_SECURITY_GROUP_DELETE: &str = "security_group.delete";
 const EVT_SECURITY_GROUP_ATTACH: &str = "security_group.attach";
@@ -5747,6 +5750,251 @@ fn new_object_user_credentials() -> (String, String) {
     (access_key, secret)
 }
 
+fn slurm_host_address(address: &str) -> String {
+    match address.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => {
+            host.to_string()
+        }
+        _ => address.to_string(),
+    }
+}
+
+fn slurm_spec_from_proto(
+    spec: controller_proto::SlurmClusterSpec,
+) -> crate::slurm_cluster_spec::SlurmClusterSpec {
+    use crate::slurm_cluster_spec as s;
+    s::SlurmClusterSpec {
+        cluster_name: spec.cluster_name,
+        controller: slurm_controller_from_proto(spec.controller.unwrap_or_default()),
+        backup_controller: spec.backup_controller.map(slurm_controller_from_proto),
+        login: s::SlurmLoginSpec {
+            node_ids: spec.login.map(|l| l.node_ids).unwrap_or_default(),
+        },
+        accounting: spec
+            .accounting
+            .map(|a| s::SlurmAccountingSpec {
+                enabled: a.enabled,
+                node_id: a.node_id,
+            })
+            .unwrap_or_default(),
+        compute: spec
+            .compute
+            .into_iter()
+            .map(|c| s::SlurmComputeSpec {
+                node_id: c.node_id,
+                address: c.address,
+                iface: c.iface,
+                partitions: c.partitions,
+                reserve: c
+                    .reserve
+                    .map(|r| s::SlurmReserveSpec {
+                        cores: r.cores,
+                        memory_mb: r.memory_mb,
+                    })
+                    .unwrap_or_default(),
+                gres: if c.gres.trim().is_empty() {
+                    "none".into()
+                } else {
+                    c.gres
+                },
+            })
+            .collect(),
+        partitions: spec
+            .partitions
+            .into_iter()
+            .map(|p| s::SlurmPartitionSpec {
+                name: p.name,
+                default: p.default,
+                max_time: p.max_time,
+                state: p.state,
+            })
+            .collect(),
+        users: spec
+            .users
+            .into_iter()
+            .map(|u| s::SlurmUserSpec {
+                name: u.name,
+                uid: u.uid.max(0) as u32,
+                ssh_keys: u.ssh_keys,
+            })
+            .collect(),
+        storage: spec
+            .storage
+            .map(|st| s::SlurmStorageSpec {
+                mode: if st.mode.trim().is_empty() {
+                    "nfs".into()
+                } else {
+                    st.mode
+                },
+                exports: st.exports,
+                filesystem: st.filesystem,
+            })
+            .unwrap_or_default(),
+        extra_config: spec.extra_config,
+        allow_controller_host: spec.allow_controller_host,
+        gpu_driver: spec.gpu_driver,
+    }
+}
+
+fn slurm_controller_from_proto(
+    controller: controller_proto::SlurmControllerSpec,
+) -> crate::slurm_cluster_spec::SlurmControllerSpec {
+    crate::slurm_cluster_spec::SlurmControllerSpec {
+        node_id: controller.node_id,
+        address: controller.address,
+        iface: controller.iface,
+    }
+}
+
+fn slurm_spec_to_proto(
+    spec: &crate::slurm_cluster_spec::SlurmClusterSpec,
+) -> controller_proto::SlurmClusterSpec {
+    controller_proto::SlurmClusterSpec {
+        cluster_name: spec.cluster_name.clone(),
+        controller: Some(controller_proto::SlurmControllerSpec {
+            node_id: spec.controller.node_id.clone(),
+            address: spec.controller.address.clone(),
+            iface: spec.controller.iface.clone(),
+        }),
+        backup_controller: spec.backup_controller.as_ref().map(|b| {
+            controller_proto::SlurmControllerSpec {
+                node_id: b.node_id.clone(),
+                address: b.address.clone(),
+                iface: b.iface.clone(),
+            }
+        }),
+        login: Some(controller_proto::SlurmLoginSpec {
+            node_ids: spec.login.node_ids.clone(),
+        }),
+        accounting: Some(controller_proto::SlurmAccountingSpec {
+            enabled: spec.accounting.enabled,
+            node_id: spec.accounting.node_id.clone(),
+        }),
+        compute: spec
+            .compute
+            .iter()
+            .map(|c| controller_proto::SlurmComputeSpec {
+                node_id: c.node_id.clone(),
+                address: c.address.clone(),
+                iface: c.iface.clone(),
+                partitions: c.partitions.clone(),
+                reserve: Some(controller_proto::SlurmReserveSpec {
+                    cores: c.reserve.cores,
+                    memory_mb: c.reserve.memory_mb,
+                }),
+                gres: c.gres.clone(),
+            })
+            .collect(),
+        partitions: spec
+            .partitions
+            .iter()
+            .map(|p| controller_proto::SlurmPartitionSpec {
+                name: p.name.clone(),
+                default: p.default,
+                max_time: p.max_time.clone(),
+                state: p.state.clone(),
+            })
+            .collect(),
+        users: spec
+            .users
+            .iter()
+            .map(|u| controller_proto::SlurmUserSpec {
+                name: u.name.clone(),
+                uid: u.uid as i32,
+                ssh_keys: u.ssh_keys.clone(),
+            })
+            .collect(),
+        storage: Some(controller_proto::SlurmStorageSpec {
+            mode: spec.storage.mode.clone(),
+            exports: spec.storage.exports.clone(),
+            filesystem: spec.storage.filesystem.clone(),
+        }),
+        extra_config: spec.extra_config.clone(),
+        allow_controller_host: spec.allow_controller_host,
+        gpu_driver: spec.gpu_driver,
+    }
+}
+
+fn slurm_random_bytes(len: usize) -> Result<Vec<u8>, Status> {
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    let mut buf = vec![0u8; len];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| Status::internal("generating Slurm secret"))?;
+    Ok(buf)
+}
+
+fn slurm_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn slurm_unhex(raw: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16);
+        let lo = (bytes[i + 1] as char).to_digit(16);
+        if let (Some(hi), Some(lo)) = (hi, lo) {
+            out.push((hi * 16 + lo) as u8);
+        }
+        i += 2;
+    }
+    out
+}
+
+fn slurm_cluster_to_proto(
+    row: &SlurmClusterRow,
+    nodes: &[SlurmClusterNodeRow],
+) -> Result<controller_proto::SlurmCluster, Status> {
+    let spec = crate::slurm_cluster_spec::spec_from_json(&row.spec_json)
+        .map_err(|e| Status::internal(format!("decode slurm spec: {e}")))?;
+    let status: serde_json::Value =
+        serde_json::from_str(&row.status_json).unwrap_or_else(|_| serde_json::json!({}));
+    let phase = status
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("pending")
+        .to_string();
+    let message = status
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let observed_generation = status
+        .get("observedGeneration")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let node_statuses = nodes
+        .iter()
+        .map(|n| controller_proto::SlurmNodeStatus {
+            node_id: n.node_id.clone(),
+            roles: n
+                .roles
+                .split(',')
+                .filter(|r| !r.is_empty())
+                .map(ToString::to_string)
+                .collect(),
+            slurm_state: n.slurm_state.clone(),
+            applied_generation: n.applied_generation,
+            config_hash: n.config_hash.clone(),
+        })
+        .collect();
+    Ok(controller_proto::SlurmCluster {
+        name: row.name.clone(),
+        generation: row.generation,
+        spec: Some(slurm_spec_to_proto(&spec)),
+        status: Some(controller_proto::SlurmClusterStatus {
+            observed_generation,
+            phase,
+            message,
+            nodes: node_statuses,
+        }),
+        created_at: parse_datetime_to_timestamp(&row.created_at),
+        updated_at: parse_datetime_to_timestamp(&row.updated_at),
+    })
+}
+
 fn ceph_cluster_to_proto(
     row: &CephClusterRow,
     status: Option<CephClusterStatusRow>,
@@ -7399,6 +7647,311 @@ impl ControllerService {
             .ok_or_else(|| {
                 Status::failed_precondition(format!("node '{}' is missing", vol.host_node_id))
             })
+    }
+}
+
+impl ControllerService {
+    fn slurm_members(
+        &self,
+        spec: &crate::slurm_cluster_spec::SlurmClusterSpec,
+    ) -> Result<std::collections::BTreeMap<String, crate::slurm_cluster_spec::Member>, Status> {
+        let mut login_lookup = std::collections::HashMap::new();
+        for node_id in &spec.login.node_ids {
+            if let Some(node) = self
+                .db
+                .get_node(node_id)
+                .map_err(|e| Status::internal(format!("reading node {node_id}: {e}")))?
+            {
+                login_lookup.insert(
+                    node_id.clone(),
+                    (
+                        slurm_host_address(&node.address),
+                        spec.controller.iface.clone(),
+                    ),
+                );
+            }
+        }
+        Ok(crate::slurm_cluster_spec::members(spec, |id| {
+            login_lookup.get(id).cloned()
+        }))
+    }
+
+    fn slurm_gpus(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, Vec<crate::slurm_render::GpuEntry>>, Status>
+    {
+        let mut out: std::collections::BTreeMap<String, Vec<crate::slurm_render::GpuEntry>> =
+            std::collections::BTreeMap::new();
+        for row in self
+            .db
+            .list_node_gpus(None)
+            .map_err(|e| Status::internal(format!("listing GPUs: {e}")))?
+        {
+            if !row.kind.is_empty() && row.kind != "gpu" {
+                continue;
+            }
+            if !row.parent.is_empty() {
+                continue;
+            }
+            out.entry(row.node_id)
+                .or_default()
+                .push(crate::slurm_render::GpuEntry {
+                    model: if row.model.is_empty() {
+                        row.name
+                    } else {
+                        row.model
+                    },
+                    address: row.address,
+                });
+        }
+        Ok(out)
+    }
+
+    fn slurm_self_identity(&self) -> (Option<String>, Option<String>) {
+        let id = self
+            .replication
+            .as_ref()
+            .map(|replication| replication.controller_id.clone());
+        let host = std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok());
+        (id, host)
+    }
+
+    async fn plan_slurm_cluster_spec(
+        &self,
+        name: &str,
+        spec: &crate::slurm_cluster_spec::SlurmClusterSpec,
+    ) -> Result<controller_proto::PlanSlurmClusterResponse, Status> {
+        let existing_row = self
+            .db
+            .get_slurm_cluster(name)
+            .map_err(|e| Status::internal(format!("reading slurm cluster: {e}")))?;
+        let existing_spec = existing_row
+            .as_ref()
+            .and_then(|row| crate::slurm_cluster_spec::spec_from_json(&row.spec_json).ok());
+        let (action, _changed) =
+            crate::slurm_cluster_spec::plan_action(existing_spec.as_ref(), spec);
+        let mut blocking = Vec::new();
+        let mut warnings = Vec::new();
+        let mut node_plans = Vec::new();
+
+        if let Err(err) = crate::slurm_cluster_spec::validate_spec(spec) {
+            blocking.push(err);
+            return Ok(controller_proto::PlanSlurmClusterResponse {
+                action: action.to_string(),
+                blocking_issues: blocking,
+                warnings,
+                node_plans,
+                rendered_nix_preview: String::new(),
+            });
+        }
+        if action == "replace" {
+            let field = existing_spec
+                .as_ref()
+                .and_then(|old| crate::slurm_cluster_spec::immutable_change(old, spec))
+                .unwrap_or_else(|| "spec".into());
+            blocking.push(format!(
+                "immutable field {field} changed; delete the SlurmCluster and create it again"
+            ));
+        }
+
+        let members = self.slurm_members(spec)?;
+        let gpus = self.slurm_gpus()?;
+        let (self_id, self_host) = self.slurm_self_identity();
+        for member in members.values() {
+            let mut issues = Vec::new();
+            let node = self
+                .db
+                .get_node(&member.node_id)
+                .map_err(|e| Status::internal(format!("reading node {}: {e}", member.node_id)))?;
+            match node.as_ref() {
+                None => issues.push(format!("node '{}' is not registered", member.node_id)),
+                Some(node) => {
+                    if member.has_role("compute") {
+                        let vms = self
+                            .db
+                            .list_vms_for_node(&member.node_id)
+                            .map_err(|e| Status::internal(format!("listing VMs: {e}")))?;
+                        if !vms.is_empty() {
+                            issues.push(format!(
+                                "compute member hosts {} guest VM(s); drain them before apply",
+                                vms.len()
+                            ));
+                        }
+                    }
+                    if member.has_role("compute")
+                        && !spec.allow_controller_host
+                        && (self_id.as_deref() == Some(member.node_id.as_str())
+                            || self_host.as_deref() == Some(node.hostname.as_str())
+                            || self_host.as_deref() == Some(member.node_id.as_str()))
+                    {
+                        issues.push(format!(
+                            "compute node '{}' is the kcore controller host; set allowControllerHost: true to override",
+                            member.node_id
+                        ));
+                    }
+                }
+            }
+            if let Some(other) = self
+                .db
+                .get_slurm_cluster_node(&member.node_id)
+                .map_err(|e| Status::internal(format!("reading slurm membership: {e}")))?
+            {
+                if other.cluster_name != name {
+                    issues.push(format!(
+                        "node '{}' already belongs to SlurmCluster '{}'",
+                        member.node_id, other.cluster_name
+                    ));
+                }
+            }
+            if let Some(compute) = &member.compute {
+                if compute.gres == "auto" {
+                    if !spec.gpu_driver {
+                        issues.push(format!(
+                            "compute node '{}' asks for gres: auto but the host NVIDIA driver is off; set gpuDriver: true only when the driver can be built on the node",
+                            member.node_id
+                        ));
+                    } else if gpus
+                        .get(&member.node_id)
+                        .map(|entries| entries.is_empty())
+                        .unwrap_or(true)
+                    {
+                        issues.push(format!(
+                            "compute node '{}' asks for gres: auto but no GPU inventory was reported",
+                            member.node_id
+                        ));
+                    }
+                }
+            }
+            for issue in &issues {
+                blocking.push(format!("{}: {issue}", member.node_id));
+            }
+            node_plans.push(controller_proto::NodePlanResult {
+                node_id: member.node_id.clone(),
+                preflight_passed: issues.is_empty(),
+                issues,
+                nix_action: if existing_row.is_some() {
+                    "rebuild".into()
+                } else {
+                    "build".into()
+                },
+            });
+        }
+
+        if spec.storage.mode == "shared-filesystem" {
+            match self
+                .db
+                .get_shared_filesystem(&spec.storage.filesystem)
+                .map_err(|e| Status::internal(format!("reading shared filesystem: {e}")))?
+            {
+                None => blocking.push(format!(
+                    "storage.filesystem '{}' does not exist",
+                    spec.storage.filesystem
+                )),
+                Some(_) => blocking.push(
+                    "shared-filesystem mode is refused: the SharedFilesystem reconciler cannot issue a CephFS client key yet (see docs/cephfs-rgw.md); use nfs or none"
+                        .into(),
+                ),
+            }
+        }
+        if spec.storage.mode == "nfs" {
+            warnings.push(
+                "NFS exports are served by the controller node and are a single point of failure; if it stops, every member loses /home and /scratch"
+                    .into(),
+            );
+        }
+        warnings
+            .push("compute members are cordoned so the VM scheduler leaves them to slurmd".into());
+
+        let rendered_nix_preview = members
+            .values()
+            .next()
+            .map(|member| {
+                crate::slurm_render::render_node_fragment(
+                    spec,
+                    member,
+                    &members,
+                    &gpus,
+                    spec.gpu_driver && member.has_role("compute"),
+                )
+            })
+            .unwrap_or_default();
+
+        Ok(controller_proto::PlanSlurmClusterResponse {
+            action: action.to_string(),
+            blocking_issues: blocking,
+            warnings,
+            node_plans,
+            rendered_nix_preview,
+        })
+    }
+
+    fn slurm_replication_body(
+        row: &SlurmClusterRow,
+        nodes: &[SlurmClusterNodeRow],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": row.name,
+            "generation": row.generation,
+            "specJson": row.spec_json,
+            "statusJson": row.status_json,
+            "mungeKeyHex": slurm_hex(&row.munge_key),
+            "dbdPassword": row.dbd_password,
+            "nodes": nodes.iter().map(|n| serde_json::json!({
+                "nodeId": n.node_id,
+                "roles": n.roles,
+                "appliedGeneration": n.applied_generation,
+                "slurmState": n.slurm_state,
+                "configHash": n.config_hash,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    async fn slurm_control_rpc(
+        &self,
+        cluster_name: &str,
+        node_id: &str,
+        verb: &str,
+        reason: &str,
+    ) -> Result<String, Status> {
+        let row = self
+            .db
+            .get_slurm_cluster(cluster_name)
+            .map_err(|e| Status::internal(format!("reading slurm cluster: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("SlurmCluster '{cluster_name}' not found")))?;
+        let spec = crate::slurm_cluster_spec::spec_from_json(&row.spec_json)
+            .map_err(|e| Status::internal(format!("decode slurm spec: {e}")))?;
+        let members = self.slurm_members(&spec)?;
+        let member = members
+            .get(node_id)
+            .ok_or_else(|| Status::not_found(format!("node '{node_id}' is not a member")))?;
+        if !member.has_role("compute") {
+            return Err(Status::invalid_argument(format!(
+                "node '{node_id}' is not a compute member"
+            )));
+        }
+        let controller = self
+            .db
+            .get_node(&spec.controller.node_id)
+            .map_err(|e| Status::internal(format!("reading controller node: {e}")))?
+            .ok_or_else(|| Status::not_found("controller node is not registered"))?;
+        let mut admin = self.ensure_admin_client_for_node(&controller).await?;
+        let resp = admin
+            .slurm_control(Request::new(node_proto::SlurmControlRequest {
+                verb: verb.to_string(),
+                node_name: node_id.to_string(),
+                reason: reason.to_string(),
+            }))
+            .await
+            .map_err(|e| Status::unavailable(format!("node SlurmControl: {e}")))?
+            .into_inner();
+        if !resp.success {
+            return Err(Status::failed_precondition(resp.message));
+        }
+        Ok(resp.message)
     }
 }
 
@@ -12239,6 +12792,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 node.id, node.approval_status
             )));
         }
+        if !req.force {
+            if let Some(member) = self
+                .db
+                .get_slurm_cluster_node(&node.id)
+                .map_err(|e| Status::internal(format!("reading slurm membership: {e}")))?
+            {
+                if member.roles.split(',').any(|role| role == "compute") {
+                    return Err(Status::failed_precondition(format!(
+                        "node '{}' is a compute member of SlurmCluster '{}'; pass force to uncordon it anyway",
+                        node.id, member.cluster_name
+                    )));
+                }
+            }
+        }
 
         self.db
             .update_node_status(&node.id, "ready")
@@ -16825,12 +17392,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
         }
         let viable = !target_ids.is_empty() && issues.is_empty();
+        let slurm_members = target_ids
+            .iter()
+            .any(|nid| self.db.get_slurm_cluster_node(nid).ok().flatten().is_some());
+        let detail = if slurm_members {
+            "Members of one Slurm cluster must be in the same cluster-update run because Slurm requires dbd >= ctld >= slurmd. Compute nodes are drained before their rebuild."
+        } else {
+            "MVP: assumes flake rollout may restart kcore services"
+        };
         Ok(Response::new(controller_proto::PlanClusterUpdateResponse {
             viable,
             target_node_ids: target_ids,
             issues,
             likely_requires_reboot: true,
-            detail: "MVP: assumes flake rollout may restart kcore services".into(),
+            detail: detail.into(),
         }))
     }
 
@@ -17338,6 +17913,383 @@ impl controller_proto::controller_server::Controller for ControllerService {
     // ============================================================================
     // Kubernetes Cluster Management (Phase 3 implementation)
     // ============================================================================
+
+    async fn plan_slurm_cluster(
+        &self,
+        request: Request<controller_proto::PlanSlurmClusterRequest>,
+    ) -> Result<Response<controller_proto::PlanSlurmClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        let name = validate_network_name(&req.name)?;
+        let spec = slurm_spec_from_proto(
+            req.spec
+                .ok_or_else(|| Status::invalid_argument("spec is required"))?,
+        );
+        let plan = self.plan_slurm_cluster_spec(&name, &spec).await?;
+        Ok(Response::new(plan))
+    }
+
+    async fn create_slurm_cluster(
+        &self,
+        request: Request<controller_proto::CreateSlurmClusterRequest>,
+    ) -> Result<Response<controller_proto::CreateSlurmClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = validate_network_name(&req.name)?;
+        let spec = slurm_spec_from_proto(
+            req.spec
+                .ok_or_else(|| Status::invalid_argument("spec is required"))?,
+        );
+        crate::slurm_cluster_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
+
+        let existing = self
+            .db
+            .get_slurm_cluster(&name)
+            .map_err(|e| Status::internal(format!("reading slurm cluster: {e}")))?;
+        let existing_spec = existing
+            .as_ref()
+            .and_then(|row| crate::slurm_cluster_spec::spec_from_json(&row.spec_json).ok());
+        let (action, changed_fields) =
+            crate::slurm_cluster_spec::plan_action(existing_spec.as_ref(), &spec);
+        if action == "replace" {
+            let field = existing_spec
+                .as_ref()
+                .and_then(|old| crate::slurm_cluster_spec::immutable_change(old, &spec))
+                .unwrap_or_else(|| "spec".into());
+            return Err(Status::failed_precondition(format!(
+                "cannot change immutable field {field} on SlurmCluster '{name}'; delete it and create it again"
+            )));
+        }
+        if action == "unchanged" {
+            let row = existing.expect("unchanged requires existing");
+            let nodes = self
+                .db
+                .list_slurm_cluster_nodes(&name)
+                .map_err(|e| Status::internal(format!("listing slurm nodes: {e}")))?;
+            return Ok(Response::new(
+                controller_proto::CreateSlurmClusterResponse {
+                    success: true,
+                    message: format!("SlurmCluster '{name}' unchanged"),
+                    cluster: Some(slurm_cluster_to_proto(&row, &nodes)?),
+                    action: controller_proto::ApplyAction::Unchanged as i32,
+                    changed_fields: Vec::new(),
+                },
+            ));
+        }
+
+        let plan = self.plan_slurm_cluster_spec(&name, &spec).await?;
+        if !plan.blocking_issues.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "SlurmCluster preflight failed:\n{}",
+                plan.blocking_issues.join("\n")
+            )));
+        }
+
+        let mut munge_key = existing
+            .as_ref()
+            .map(|row| row.munge_key.clone())
+            .unwrap_or_default();
+        if munge_key.is_empty() {
+            munge_key = slurm_random_bytes(1024)?;
+        }
+        let mut dbd_password = existing
+            .as_ref()
+            .map(|row| row.dbd_password.clone())
+            .unwrap_or_default();
+        if spec.accounting.enabled && dbd_password.is_empty() {
+            dbd_password = slurm_hex(&slurm_random_bytes(32)?);
+        }
+        let generation = match &existing {
+            Some(row) => row.generation.saturating_add(1),
+            None => 1,
+        };
+        let spec_json = crate::slurm_cluster_spec::spec_to_json(&spec)
+            .map_err(|e| Status::internal(format!("encode slurm spec: {e}")))?;
+        let phase = if existing.is_some() {
+            "applying"
+        } else {
+            "pending"
+        };
+        let status_json = serde_json::json!({
+            "observedGeneration": 0,
+            "phase": phase,
+            "message": if existing.is_some() { "cluster update queued" } else { "cluster creation started" },
+            "nodes": [],
+        })
+        .to_string();
+        let row = SlurmClusterRow {
+            name: name.clone(),
+            spec_json,
+            generation,
+            munge_key,
+            dbd_password,
+            status_json,
+            created_at: existing
+                .as_ref()
+                .map(|row| row.created_at.clone())
+                .unwrap_or_default(),
+            updated_at: String::new(),
+        };
+        self.db
+            .upsert_slurm_cluster(&row)
+            .map_err(|e| Status::internal(format!("storing slurm cluster: {e}")))?;
+
+        let members = self.slurm_members(&spec)?;
+        let node_rows: Vec<SlurmClusterNodeRow> = members
+            .values()
+            .map(|member| SlurmClusterNodeRow {
+                node_id: member.node_id.clone(),
+                cluster_name: name.clone(),
+                roles: member.roles.join(","),
+                applied_generation: 0,
+                slurm_state: "unknown".into(),
+                config_hash: String::new(),
+                updated_at: String::new(),
+            })
+            .collect();
+        self.db
+            .replace_slurm_cluster_nodes(&name, &node_rows)
+            .map_err(|e| Status::internal(format!("storing slurm membership: {e}")))?;
+        let stored = self
+            .db
+            .get_slurm_cluster(&name)
+            .map_err(|e| Status::internal(format!("reading slurm cluster: {e}")))?
+            .ok_or_else(|| Status::internal("slurm cluster disappeared during create"))?;
+        let nodes = self
+            .db
+            .list_slurm_cluster_nodes(&name)
+            .map_err(|e| Status::internal(format!("listing slurm nodes: {e}")))?;
+        self.log_replication_event(
+            &actor,
+            Some("CreateSlurmCluster"),
+            if existing.is_some() {
+                EVT_SLURM_CLUSTER_UPDATE
+            } else {
+                EVT_SLURM_CLUSTER_CREATE
+            },
+            &format!("slurm_cluster/{name}"),
+            Self::slurm_replication_body(&stored, &nodes),
+        );
+        Ok(Response::new(controller_proto::CreateSlurmClusterResponse {
+            success: true,
+            message: format!(
+                "SlurmCluster '{name}' {} at generation {generation}; the reconciler applies members in order dbd, controller, compute, login",
+                if existing.is_some() { "updated" } else { "created" }
+            ),
+            cluster: Some(slurm_cluster_to_proto(&stored, &nodes)?),
+            action: if existing.is_some() {
+                controller_proto::ApplyAction::Updated as i32
+            } else {
+                controller_proto::ApplyAction::Created as i32
+            },
+            changed_fields,
+        }))
+    }
+
+    async fn get_slurm_cluster(
+        &self,
+        request: Request<controller_proto::GetSlurmClusterRequest>,
+    ) -> Result<Response<controller_proto::GetSlurmClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let name = validate_network_name(&request.into_inner().name)?;
+        let row = self
+            .db
+            .get_slurm_cluster(&name)
+            .map_err(|e| Status::internal(format!("reading slurm cluster: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("SlurmCluster '{name}' not found")))?;
+        let nodes = self
+            .db
+            .list_slurm_cluster_nodes(&name)
+            .map_err(|e| Status::internal(format!("listing slurm nodes: {e}")))?;
+        Ok(Response::new(controller_proto::GetSlurmClusterResponse {
+            cluster: Some(slurm_cluster_to_proto(&row, &nodes)?),
+        }))
+    }
+
+    async fn list_slurm_clusters(
+        &self,
+        request: Request<controller_proto::ListSlurmClustersRequest>,
+    ) -> Result<Response<controller_proto::ListSlurmClustersResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let rows = self
+            .db
+            .list_slurm_clusters()
+            .map_err(|e| Status::internal(format!("listing slurm clusters: {e}")))?;
+        let mut clusters = Vec::new();
+        for row in rows {
+            let nodes = self
+                .db
+                .list_slurm_cluster_nodes(&row.name)
+                .map_err(|e| Status::internal(format!("listing slurm nodes: {e}")))?;
+            clusters.push(slurm_cluster_to_proto(&row, &nodes)?);
+        }
+        Ok(Response::new(controller_proto::ListSlurmClustersResponse {
+            clusters,
+        }))
+    }
+
+    async fn delete_slurm_cluster(
+        &self,
+        request: Request<controller_proto::DeleteSlurmClusterRequest>,
+    ) -> Result<Response<controller_proto::DeleteSlurmClusterResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = validate_network_name(&req.name)?;
+        let row = self
+            .db
+            .get_slurm_cluster(&name)
+            .map_err(|e| Status::internal(format!("reading slurm cluster: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("SlurmCluster '{name}' not found")))?;
+        let nodes = self
+            .db
+            .list_slurm_cluster_nodes(&name)
+            .map_err(|e| Status::internal(format!("listing slurm nodes: {e}")))?;
+        if req.force {
+            for node in &nodes {
+                if node.roles.split(',').any(|r| r == "compute") {
+                    if let Some(row) = self
+                        .db
+                        .get_node(&node.node_id)
+                        .map_err(|e| Status::internal(format!("reading node: {e}")))?
+                    {
+                        if matches!(row.status.as_str(), "cordoned" | "draining" | "drained") {
+                            let _ = self.db.update_node_status(&node.node_id, "ready");
+                        }
+                    }
+                }
+            }
+            self.db
+                .delete_slurm_cluster(&name)
+                .map_err(|e| Status::internal(format!("deleting slurm cluster: {e}")))?;
+            self.log_replication_event(
+                &actor,
+                Some("DeleteSlurmCluster"),
+                EVT_SLURM_CLUSTER_DELETE,
+                &format!("slurm_cluster/{name}"),
+                Self::slurm_replication_body(&row, &nodes),
+            );
+            return Ok(Response::new(controller_proto::DeleteSlurmClusterResponse {
+                success: true,
+                message: format!(
+                    "SlurmCluster '{name}' record dropped with force; unreachable members keep their units until they are rebuilt"
+                ),
+            }));
+        }
+        let mut status: serde_json::Value =
+            serde_json::from_str(&row.status_json).unwrap_or_else(|_| serde_json::json!({}));
+        status["phase"] = serde_json::Value::String("deleting".into());
+        status["observedGeneration"] = serde_json::Value::Number(0.into());
+        status["message"] = serde_json::Value::String("deletion queued".into());
+        let mut deleting = row.clone();
+        deleting.status_json = status.to_string();
+        self.db
+            .upsert_slurm_cluster(&deleting)
+            .map_err(|e| Status::internal(format!("queueing slurm delete: {e}")))?;
+        self.log_replication_event(
+            &actor,
+            Some("DeleteSlurmCluster"),
+            EVT_SLURM_CLUSTER_DELETE,
+            &format!("slurm_cluster/{name}"),
+            Self::slurm_replication_body(&deleting, &nodes),
+        );
+        Ok(Response::new(controller_proto::DeleteSlurmClusterResponse {
+            success: true,
+            message: format!(
+                "SlurmCluster '{name}' deletion queued; the reconciler disables Slurm on every member, waits for the units to stop, uncordons compute members, then drops the rows"
+            ),
+        }))
+    }
+
+    async fn rotate_slurm_munge_key(
+        &self,
+        request: Request<controller_proto::RotateSlurmMungeKeyRequest>,
+    ) -> Result<Response<controller_proto::RotateSlurmMungeKeyResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let name = validate_network_name(&request.into_inner().name)?;
+        let key = slurm_random_bytes(1024)?;
+        let generation = self
+            .db
+            .rotate_slurm_munge_key(&name, &key)
+            .map_err(|e| Status::internal(format!("rotating munge key: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("SlurmCluster '{name}' not found")))?;
+        let row = self
+            .db
+            .get_slurm_cluster(&name)
+            .map_err(|e| Status::internal(format!("reading slurm cluster: {e}")))?
+            .ok_or_else(|| Status::internal("slurm cluster disappeared during rotation"))?;
+        let nodes = self
+            .db
+            .list_slurm_cluster_nodes(&name)
+            .map_err(|e| Status::internal(format!("listing slurm nodes: {e}")))?;
+        self.log_replication_event(
+            &actor,
+            Some("RotateSlurmMungeKey"),
+            EVT_SLURM_CLUSTER_UPDATE,
+            &format!("slurm_cluster/{name}"),
+            Self::slurm_replication_body(&row, &nodes),
+        );
+        Ok(Response::new(controller_proto::RotateSlurmMungeKeyResponse {
+            success: true,
+            message: format!(
+                "munge key rotation queued for SlurmCluster '{name}'; members restart munge in order dbd, controller, compute, login"
+            ),
+            generation,
+        }))
+    }
+
+    async fn drain_slurm_node(
+        &self,
+        request: Request<controller_proto::DrainSlurmNodeRequest>,
+    ) -> Result<Response<controller_proto::DrainSlurmNodeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = validate_network_name(&req.name)?;
+        let reason = if req.reason.trim().is_empty() {
+            "drained by kcore".to_string()
+        } else {
+            req.reason.replace(['\n', '\r'], " ")
+        };
+        let message = self
+            .slurm_control_rpc(&name, &req.node_id, "drain", &reason)
+            .await?;
+        self.record_audit(
+            &actor,
+            "DrainSlurmNode",
+            &format!("slurm_cluster/{name}/{}", req.node_id),
+            &reason,
+        );
+        Ok(Response::new(controller_proto::DrainSlurmNodeResponse {
+            success: true,
+            message,
+        }))
+    }
+
+    async fn resume_slurm_node(
+        &self,
+        request: Request<controller_proto::ResumeSlurmNodeRequest>,
+    ) -> Result<Response<controller_proto::ResumeSlurmNodeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let name = validate_network_name(&req.name)?;
+        let message = self
+            .slurm_control_rpc(&name, &req.node_id, "resume", "")
+            .await?;
+        self.record_audit(
+            &actor,
+            "ResumeSlurmNode",
+            &format!("slurm_cluster/{name}/{}", req.node_id),
+            "",
+        );
+        Ok(Response::new(controller_proto::ResumeSlurmNodeResponse {
+            success: true,
+            message,
+        }))
+    }
 
     async fn plan_kubernetes_cluster(
         &self,
@@ -21671,6 +22623,7 @@ mod tests {
                 &svc,
                 Request::new(controller_proto::UncordonNodeRequest {
                     node_id: "node-1".to_string(),
+                    force: false,
                 }),
             )
             .await
@@ -22047,6 +23000,7 @@ mod tests {
                 &svc,
                 Request::new(controller_proto::UncordonNodeRequest {
                     node_id: node.id.clone(),
+                    force: false,
                 }),
             )
             .await
@@ -23369,5 +24323,58 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+    #[tokio::test]
+    async fn uncordon_refuses_slurm_compute_member_without_force() {
+        let (db, svc, node) = postgresql_service();
+        db.upsert_slurm_cluster(&SlurmClusterRow {
+            name: "hpc-a".into(),
+            spec_json: "{}".into(),
+            generation: 1,
+            munge_key: vec![1; 1024],
+            dbd_password: String::new(),
+            status_json: "{}".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        db.replace_slurm_cluster_nodes(
+            "hpc-a",
+            &[SlurmClusterNodeRow {
+                node_id: node.id.clone(),
+                cluster_name: "hpc-a".into(),
+                roles: "compute".into(),
+                applied_generation: 1,
+                slurm_state: "idle".into(),
+                config_hash: String::new(),
+                updated_at: String::new(),
+            }],
+        )
+        .unwrap();
+        db.update_node_status(&node.id, "cordoned").unwrap();
+
+        let err =
+            <ControllerService as controller_proto::controller_server::Controller>::uncordon_node(
+                &svc,
+                Request::new(controller_proto::UncordonNodeRequest {
+                    node_id: node.id.clone(),
+                    force: false,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("compute member"));
+
+        <ControllerService as controller_proto::controller_server::Controller>::uncordon_node(
+            &svc,
+            Request::new(controller_proto::UncordonNodeRequest {
+                node_id: node.id.clone(),
+                force: true,
+            }),
+        )
+        .await
+        .expect("force uncordon");
+        assert_eq!(db.get_node(&node.id).unwrap().unwrap().status, "ready");
     }
 }

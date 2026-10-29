@@ -16,5 +16,6 @@ Operator-focused guides are published on the product site:
 | kcore SAN (Ceph) | [storage-vsan.html](https://kcorehypervisor.com/docs/user/storage-vsan.html) |
 | VM migration (cold / live) | [vm-migration.html](https://kcorehypervisor.com/docs/user/vm-migration.html) |
 | Ingress gateway (HTTPS, WAF, load balancing) | [ingress.md](./ingress.md) |
+| Slurm clusters | [slurm.md](./slurm.md) |
 
 Technical and architecture documentation remains in the parent [`docs/`](../README.md) directory in this repository.

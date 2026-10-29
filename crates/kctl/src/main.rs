@@ -231,6 +231,11 @@ enum Command {
         #[command(subcommand)]
         action: KubernetesAction,
     },
+    /// Slurm cluster management
+    Slurm {
+        #[command(subcommand)]
+        action: SlurmAction,
+    },
     /// Pull a resource
     Pull {
         #[command(subcommand)]
@@ -918,6 +923,20 @@ enum DeleteResource {
         /// Instance name
         name: String,
     },
+    /// Delete a SlurmCluster
+    #[command(
+        name = "slurm-cluster",
+        alias = "slurmcluster",
+        alias = "slurm-clusters",
+        alias = "slurmclusters"
+    )]
+    SlurmCluster {
+        /// Cluster name
+        name: String,
+        /// Drop rows even when members are unreachable
+        #[arg(long)]
+        force: bool,
+    },
     /// Delete an image from a node
     Image {
         /// Image name
@@ -1302,6 +1321,17 @@ enum GetResource {
         #[arg(long = "target-node")]
         target_node: Option<String>,
     },
+    /// Get or list SlurmClusters
+    #[command(
+        name = "slurm-cluster",
+        alias = "slurmcluster",
+        alias = "slurm-clusters",
+        alias = "slurmclusters"
+    )]
+    SlurmCluster {
+        /// Cluster name (omit to list all)
+        name: Option<String>,
+    },
     /// List storage classes
     #[command(name = "storage-class", alias = "storage-classes")]
     StorageClass,
@@ -1485,6 +1515,12 @@ enum DescribeResource {
     #[command(name = "postgresql", alias = "postgres")]
     Postgresql {
         /// Instance name
+        name: String,
+    },
+    /// Describe a SlurmCluster
+    #[command(name = "slurm-cluster", alias = "slurmcluster")]
+    SlurmCluster {
+        /// Cluster name
         name: String,
     },
     /// Describe a storage class
@@ -1754,6 +1790,37 @@ enum KubernetesAction {
         /// Remove nodes (node IDs, comma-separated)
         #[arg(long = "remove")]
         remove: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SlurmAction {
+    /// Plan a SlurmCluster manifest without changing anything
+    Plan {
+        #[arg(short = 'f', long)]
+        file: String,
+    },
+    /// Drain a Slurm compute node
+    DrainNode {
+        /// SlurmCluster name
+        name: String,
+        /// Node id
+        node_id: String,
+        /// Drain reason
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Resume a Slurm compute node
+    ResumeNode {
+        /// SlurmCluster name
+        name: String,
+        /// Node id
+        node_id: String,
+    },
+    /// Rotate the cluster munge key
+    RotateMungeKey {
+        /// SlurmCluster name
+        name: String,
     },
 }
 
@@ -2404,6 +2471,13 @@ async fn main() {
         }
 
         Command::Delete {
+            resource: DeleteResource::SlurmCluster { name, force },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::slurm::delete(&info, name, *force).await
+        }
+
+        Command::Delete {
             resource: DeleteResource::Image { name, force },
         } => {
             let info = resolve_node(&cli).unwrap_or_else(|e| fatal(&e));
@@ -2729,6 +2803,17 @@ async fn main() {
                 commands::postgresql::list(&info, target_node.as_deref()).await
             }
         }
+
+        Command::Get {
+            resource: GetResource::SlurmCluster { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            if let Some(name) = name {
+                commands::slurm::get(&info, name).await
+            } else {
+                commands::slurm::list(&info).await
+            }
+        }
         Command::Get {
             resource: GetResource::Networks { target_node },
         } => {
@@ -3022,6 +3107,13 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::postgresql::get(&info, name).await
+        }
+
+        Command::Describe {
+            resource: DescribeResource::SlurmCluster { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::slurm::get(&info, name).await
         }
         Command::Describe {
             resource: DescribeResource::StorageClass { name },
@@ -3394,6 +3486,39 @@ async fn main() {
             commands::kubernetes::scale(&info, name, add_cp, add_wk, rem).await
         }
 
+        Command::Slurm {
+            action: SlurmAction::Plan { file },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::slurm::plan_from_file(&info, file).await
+        }
+
+        Command::Slurm {
+            action:
+                SlurmAction::DrainNode {
+                    name,
+                    node_id,
+                    reason,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::slurm::drain_node(&info, name, node_id, reason).await
+        }
+
+        Command::Slurm {
+            action: SlurmAction::ResumeNode { name, node_id },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::slurm::resume_node(&info, name, node_id).await
+        }
+
+        Command::Slurm {
+            action: SlurmAction::RotateMungeKey { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::slurm::rotate_munge_key(&info, name).await
+        }
+
         Command::SshKey {
             action: SshKeyAction::Create { name, public_key },
         } => {
@@ -3731,8 +3856,14 @@ async fn main() {
                     let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
                     commands::ceph_cluster::plan_from_file(&info, file).await
                 }
+                Some(ref k)
+                    if matches!(k.as_str(), "slurmcluster" | "slurm-cluster" | "slurm_cluster") =>
+                {
+                    let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+                    commands::slurm::plan_from_file(&info, file).await
+                }
                 Some(other) => fatal(&format!(
-                    "kctl diff currently supports kind: DiskLayout or CephCluster (got {other})"
+                    "kctl diff currently supports kind: DiskLayout, CephCluster, or SlurmCluster (got {other})"
                 )),
                 None => fatal("manifest has no kind: field"),
             }
