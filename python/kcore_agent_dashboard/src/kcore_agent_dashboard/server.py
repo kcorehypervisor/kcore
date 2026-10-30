@@ -19,12 +19,14 @@ def operator_console(brief: str = "") -> ToolResult:
     """Open the one-page kcore operator console.
 
     Covers overview, VMs, volumes, Ceph, networks, storage, operations,
-    audit, and compliance. Pass brief to open on a matching section or
-    resource, for example "running vms" or "ceph". Chat and the app tools
-    show_section, focus_resource, and interpret_turn change the form in
-    place. Start, stop, and migrate are recorded only, and only after
-    confirm. Nothing is sent to the controller. Use generate_prefab_ui
-    when the operator wants a different layout of the same data.
+    audit, and compliance. Cluster reads go through the kcore MCP server
+    (kcore_read and kcore_rpc) and the certificates in ~/.kcore/config.
+    Pass brief to open on a matching section or resource, for example
+    "running vms" or "ceph". Chat and the app tools show_section,
+    focus_resource, and interpret_turn change the form in place. Start,
+    stop, and migrate are recorded only, and only after confirm. Nothing
+    is sent to the controller. Use generate_prefab_ui when the operator
+    wants a different layout of the same data.
     """
     if brief.strip():
         state = service.interpret_turn(brief)

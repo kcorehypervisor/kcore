@@ -110,6 +110,8 @@ service Controller {
 
   // Volume inventory: list all provisioned VM volumes across the cluster.
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+  // Long-running VM operations (live migrate progress).
+  rpc ListVmOperations(ListVmOperationsRequest) returns (ListVmOperationsResponse);
 
   // DiskLayout resource — per-node declarative disk layout. Implemented on the
   // node via disko; the operator surface uses the plain word "disk". Each
@@ -140,6 +142,8 @@ service Controller {
   rpc GetCephCluster(GetCephClusterRequest) returns (GetCephClusterResponse);
   rpc ListCephClusters(ListCephClustersRequest) returns (ListCephClustersResponse);
   rpc DeleteCephCluster(DeleteCephClusterRequest) returns (DeleteCephClusterResponse);
+  rpc ListSharedFilesystems(ListSharedFilesystemsRequest) returns (ListSharedFilesystemsResponse);
+  rpc ListObjectStores(ListObjectStoresRequest) returns (ListObjectStoresResponse);
 
   // RBAC: operators identified by client cert CN=kctl:<name>. Legacy CN=kctl is bootstrap-only.
   rpc CreateOperator(CreateOperatorRequest) returns (CreateOperatorResponse);
@@ -1350,6 +1354,17 @@ message VolumeInfo {
   string backend_handle = 6;     // Actual path: /dev/vg_kcore/kcore-<vm> or /var/lib/...
   string image_format = 7;       // raw, qcow2
   VmState vm_state = 8;
+  string id = 9;
+  string name = 10;
+  string role = 11;              // root | data
+  string attach_state = 12;
+  string serial = 13;
+  string pool = 14;
+  string image = 15;
+  int32 slot = 16;
+  int64 guest_visible_bytes = 17;
+  string guest_checked_at = 18;
+  bool encrypted = 19;
 }
 
 // DiskLayout resource ---------------------------------------------------
@@ -1846,4 +1861,108 @@ message GetPkiStatusResponse {
   string pki_http_base_url = 16;
   // Active certificates sorted by soonest not_after (at most 20 rows).
   repeated CertificateInfo soonest_expiring = 17;
+}
+
+message VmOperation {
+  string id = 1;
+  string vm_id = 2;
+  string kind = 3;
+  string phase = 4;
+  string source_node = 5;
+  string target_node = 6;
+  bool cancel_requested = 7;
+  bool send_succeeded = 8;
+  string detail_json = 9;
+  google.protobuf.Timestamp started_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  google.protobuf.Timestamp finished_at = 12;
+}
+
+message ListVmOperationsRequest {
+  bool include_finished = 1;
+  string vm_id = 2;
+}
+
+message ListVmOperationsResponse {
+  repeated VmOperation operations = 1;
+}
+
+enum SharedFilesystemPhase {
+  SHARED_FILESYSTEM_PHASE_UNSPECIFIED = 0;
+  SHARED_FILESYSTEM_PHASE_PENDING = 1;
+  SHARED_FILESYSTEM_PHASE_BOOTSTRAPPING = 2;
+  SHARED_FILESYSTEM_PHASE_HEALTHY = 3;
+  SHARED_FILESYSTEM_PHASE_DEGRADED = 4;
+  SHARED_FILESYSTEM_PHASE_FAILED = 5;
+}
+
+message SharedFilesystemClientSpec {
+  string name = 1;
+  repeated string paths = 2;
+}
+
+message SharedFilesystemSpec {
+  string ceph_cluster = 1;
+  int64 quota_bytes = 2;
+  repeated SharedFilesystemClientSpec clients = 3;
+  string fs_name = 4;
+}
+
+message SharedFilesystemStatus {
+  int64 observed_generation = 1;
+  SharedFilesystemPhase phase = 2;
+  string health_message = 3;
+  google.protobuf.Timestamp last_transition_at = 4;
+}
+
+message SharedFilesystem {
+  string name = 1;
+  int64 generation = 2;
+  SharedFilesystemSpec spec = 3;
+  SharedFilesystemStatus status = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message ListSharedFilesystemsRequest {}
+message ListSharedFilesystemsResponse {
+  repeated SharedFilesystem shared_filesystems = 1;
+}
+
+enum ObjectStorePhase {
+  OBJECT_STORE_PHASE_UNSPECIFIED = 0;
+  OBJECT_STORE_PHASE_PENDING = 1;
+  OBJECT_STORE_PHASE_BOOTSTRAPPING = 2;
+  OBJECT_STORE_PHASE_HEALTHY = 3;
+  OBJECT_STORE_PHASE_DEGRADED = 4;
+  OBJECT_STORE_PHASE_FAILED = 5;
+}
+
+message ObjectStoreSpec {
+  string ceph_cluster = 1;
+  repeated string members = 2;
+  int32 port = 3;
+  bool tls = 4;
+  string rgw_id = 5;
+}
+
+message ObjectStoreStatus {
+  int64 observed_generation = 1;
+  ObjectStorePhase phase = 2;
+  string health_message = 3;
+  google.protobuf.Timestamp last_transition_at = 4;
+}
+
+message ObjectStore {
+  string name = 1;
+  int64 generation = 2;
+  ObjectStoreSpec spec = 3;
+  ObjectStoreStatus status = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message ListObjectStoresRequest {}
+message ListObjectStoresResponse {
+  repeated ObjectStore object_stores = 1;
 }

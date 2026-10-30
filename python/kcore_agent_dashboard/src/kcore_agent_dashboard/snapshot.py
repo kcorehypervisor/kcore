@@ -571,6 +571,12 @@ def load_snapshot() -> dict[str, Any]:
     if os.environ.get("KCORE_AGENT_OFFLINE", "").strip() == "1":
         return empty_snapshot("offline")
 
+    source = os.environ.get("KCORE_AGENT_SOURCE", "kcore").strip().lower()
+    if source != "dashboard":
+        from .kcore_mcp import load_from_kcore
+
+        return load_from_kcore()
+
     url = os.environ.get("KCORE_DASHBOARD_SNAPSHOT_URL", "").strip()
     if not url:
         url = "http://127.0.0.1:8080/api/agent-snapshot"

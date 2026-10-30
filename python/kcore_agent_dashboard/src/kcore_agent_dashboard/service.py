@@ -100,13 +100,20 @@ def refresh_snapshot(
     """Reload the dashboard snapshot and keep the current section."""
     snap = normalize(cache.get(force=True))
     section_name = normalize_section(section)
+    if snap.get("source") == "kcore":
+        reply = "Refreshed from kcore."
+    elif snap.get("source") == "dashboard":
+        reply = "Refreshed from the dashboard."
+    else:
+        warnings = snap.get("warnings") or ["Refresh failed."]
+        reply = str(warnings[0])
     scene = Scene(
         section=section_name,
         form=form or form_for(section_name),
         focus=focus,
         focus_kind=_kind_for_form(form or form_for(section_name)) if focus else "",
         filter=filter,
-        reply="Refreshed from the dashboard.",
+        reply=reply,
     )
     return project(snap, scene)
 
