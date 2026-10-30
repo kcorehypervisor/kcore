@@ -303,3 +303,23 @@ pub struct LvmPhysicalVolumeDto {
     pub free: String,
     pub attr: String,
 }
+
+/// One payload for the operator console: the same reads as the other dashboard pages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSnapshotDto {
+    pub source: String,
+    pub warnings: Vec<String>,
+    pub compliance: Option<ComplianceDto>,
+    pub vms: Vec<VmRowDto>,
+    pub volumes: Vec<VolumeRowDto>,
+    pub networks: Vec<NetworkRowDto>,
+    pub network_overview: Option<NetworkOverviewDto>,
+    pub storage: Option<StorageOverviewDto>,
+    pub ceph_clusters: Vec<CephClusterRowDto>,
+    pub shared_filesystems: Vec<SharedFilesystemRowDto>,
+    pub object_stores: Vec<ObjectStoreRowDto>,
+    pub operations: Vec<VmOperationRowDto>,
+    pub audit: Vec<AuditEventDto>,
+    pub replication: Option<ReplicationStatusDto>,
+    pub conflicts: Vec<ReplicationConflictDto>,
+}

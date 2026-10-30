@@ -56,6 +56,7 @@ pub fn App() -> impl IntoView {
                 </div>
                 <nav class="nav-links">
                     <a href="/">"Overview"</a>
+                    <a href="/agent">"Agent"</a>
                     <a href="/compliance">"Compliance"</a>
                     <a href="/vms">"Virtual machines"</a>
                     <a href="/volumes">"Volumes"</a>
@@ -70,6 +71,7 @@ pub fn App() -> impl IntoView {
                 <Router>
                     <FlatRoutes fallback=|| view! { <p class="muted">"Not found."</p> }>
                         <Route path=path!("/") view=HomePage/>
+                        <Route path=path!("/agent") view=AgentPage/>
                         <Route path=path!("/compliance") view=CompliancePage/>
                         <Route path=path!("/vms") view=VmsPage/>
                         <Route path=path!("/volumes") view=VolumesPage/>
@@ -100,6 +102,10 @@ fn HomePage() -> impl IntoView {
             </p>
         </section>
         <div class="card-grid cols-2">
+            <a href="/agent" class="card" style="text-decoration: none; color: inherit;">
+                <h2>"Agent"</h2>
+                <p class="muted">"One page for the cluster. The chat changes the form to the VM, volume, or search you asked about."</p>
+            </a>
             <a href="/compliance" class="card" style="text-decoration: none; color: inherit;">
                 <h2>"Compliance"</h2>
                 <p class="muted">"Cryptography, access control, and inventory aligned with kctl report."</p>
@@ -1535,4 +1541,35 @@ fn object_stores_table(rows: Vec<ObjectStoreRowDto>) -> impl IntoView {
         </div>
     }
     .into_any()
+}
+
+fn agent_console_url() -> String {
+    std::env::var("KCORE_AGENT_CONSOLE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8091/".to_string())
+}
+
+#[component]
+fn AgentPage() -> impl IntoView {
+    let console_url = agent_console_url();
+    let frame_url = console_url.clone();
+    view! {
+        <section class="hero">
+            <h1>"Agent"</h1>
+            <p class="muted">
+                "One page for the cluster. Ask in the chat for VMs, volumes, Ceph, networks, storage, operations, audit, or compliance, and the form changes to match. Start, stop, and migrate stay on that form until you confirm, and confirm only records the kctl line."
+            </p>
+        </section>
+        <div class="agent-shell">
+            <p class="muted">
+                "The frame is the FastMCP app at "
+                <a href=console_url.clone() target="_blank">{console_url.clone()}</a>
+                ". Start it with "
+                <code class="inline agent-cmd">"uv run --project python/kcore_agent_dashboard python -m kcore_agent_dashboard"</code>
+                ". It reads "
+                <a href="/api/agent-snapshot">"/api/agent-snapshot"</a>
+                "."
+            </p>
+            <iframe class="agent-frame" title="kcore operator console" src=frame_url></iframe>
+        </div>
+    }
 }

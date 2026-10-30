@@ -63,6 +63,7 @@ async fn all_dashboard_pages_against_mock_controller() {
     assert!(home.contains(r#"href="/operations""#));
     assert!(home.contains(r#"href="/ceph""#));
     assert!(home.contains(r#"href="/audit""#));
+    assert!(home.contains(r#"href="/agent""#));
     assert!(home.contains("kcore"));
     assert!(home.contains("Dashboard"));
     assert!(home.contains("kcorehypervisor.com"));
@@ -437,6 +438,29 @@ async fn all_dashboard_pages_against_mock_controller() {
     );
     assert!(ceph.contains("7480"), "object store must show its port");
 
+    // ── Agent console ────────────────────────────────────────────────
+    let (status, agent) = fetch(&app, "/agent").await;
+    assert_eq!(status, StatusCode::OK, "/agent status");
+    assert!(agent.contains("One page for the cluster"));
+    assert!(
+        agent.contains("http://127.0.0.1:8091/"),
+        "agent page must point at the FastMCP console"
+    );
+    assert!(agent.contains("kcore operator console"));
+    assert!(agent.contains("/api/agent-snapshot"));
+
+    let (status, snapshot) = fetch(&app, "/api/agent-snapshot").await;
+    assert_eq!(status, StatusCode::OK, "/api/agent-snapshot status");
+    assert!(
+        snapshot.contains("\"source\":\"controller\""),
+        "snapshot must come from the controller: {snapshot}"
+    );
+    assert!(snapshot.contains("mock-vm-alpha"));
+    assert!(snapshot.contains("mock-pgdata"));
+    assert!(snapshot.contains("mock-ceph"));
+    assert!(snapshot.contains("mock-net-stub"));
+    assert!(snapshot.contains("mock-controller-0.1-test"));
+
     // ── 404 for unknown path ─────────────────────────────────────────
     let (status, body404) = fetch(&app, "/nonexistent-page-xyz").await;
     assert!(
@@ -460,6 +484,7 @@ async fn all_dashboard_pages_against_mock_controller() {
         ("/operations", &operations),
         ("/audit", &audit),
         ("/ceph", &ceph),
+        ("/agent", &agent),
     ] {
         assert!(body.contains("nav"), "{page} must have navigation element");
         assert!(body.contains("kcore"), "{page} must show brand name");

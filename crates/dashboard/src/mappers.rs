@@ -62,9 +62,8 @@ pub fn compliance_from_proto(r: controller_proto::GetComplianceReportResponse) -
     }
 }
 
-pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> VmsPageDto {
-    let rows: Vec<VmRowDto> = vms
-        .into_iter()
+pub fn vm_rows_from_proto(vms: Vec<controller_proto::VmInfo>) -> Vec<VmRowDto> {
+    vms.into_iter()
         .map(|v| VmRowDto {
             id: v.id,
             name: v.name.clone(),
@@ -74,7 +73,11 @@ pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> Vms
             node_id: v.node_id,
             storage_backend: format::storage_backend_name(&v.storage_backend),
         })
-        .collect();
+        .collect()
+}
+
+pub fn vms_page_from_proto(vms: Vec<controller_proto::VmInfo>, page: u32) -> VmsPageDto {
+    let rows = vm_rows_from_proto(vms);
     let page = page.max(1);
     let pv = paginate_by_name(rows, |r| r.name.clone(), page, VM_PAGE_SIZE);
     VmsPageDto {

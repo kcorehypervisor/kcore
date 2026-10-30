@@ -383,3 +383,21 @@ code.inline {
   flex: 0;
   min-width: 6rem;
 }
+
+.agent-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.agent-frame {
+  width: 100%;
+  height: calc(100vh - 18rem);
+  min-height: 36rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #0a0c12;
+}
+.agent-cmd {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+}

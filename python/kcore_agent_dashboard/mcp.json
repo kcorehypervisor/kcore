@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "kcore-agent-dashboard": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "python/kcore_agent_dashboard",
+        "python",
+        "-m",
+        "kcore_agent_dashboard",
+        "--stdio"
+      ]
+    }
+  }
+}

@@ -12,6 +12,7 @@ pub mod controller_client;
 pub mod dto;
 pub mod format;
 pub mod mappers;
+pub mod snapshot;
 pub mod state;
 
 pub use app::shell;

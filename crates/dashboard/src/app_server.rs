@@ -34,5 +34,6 @@ pub fn dashboard_router(leptos_options: LeptosOptions) -> Router<()> {
 
     Router::new()
         .merge(console::console_routes())
+        .merge(crate::snapshot::agent_routes())
         .merge(leptos_app)
 }
