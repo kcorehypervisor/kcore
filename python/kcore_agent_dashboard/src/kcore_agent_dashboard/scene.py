@@ -140,7 +140,8 @@ def _help(section: str, focus: str) -> Scene:
         focus=focus,
         reply=(
             "I can show overview, VMs, volumes, Ceph, networks, storage, "
-            "operations, audit, or compliance. Name a VM to open its form."
+            "operations, audit, or compliance. Name a VM to open its form. "
+            "Start, stop, and migrate are sent after you tick confirm."
         ),
     )
 
@@ -183,29 +184,45 @@ def recorded_command(kind: str, target: str, argument: str) -> str | None:
     return None
 
 
+def operation_call(kind: str, target: str, argument: str) -> tuple[str, dict[str, str]] | None:
+    """kcore_operation action and spec for a command this console is allowed to send."""
+    kind = kind.strip().lower()
+    target = target.strip()
+    argument = argument.strip()
+    if recorded_command(kind, target, argument) is None:
+        return None
+    if kind == "start":
+        return "set-vm-state", {"name": target, "state": "running"}
+    if kind == "stop":
+        return "set-vm-state", {"name": target, "state": "stopped"}
+    if kind == "migrate" or (kind in {"", "none"} and argument):
+        return "migrate-vm", {"name": target, "targetNode": argument}
+    return None
+
+
 def stage_notice(kind: str, target: str, argument: str, confirm: object) -> tuple[str, str, str]:
-    """Return notice, power, migrate_to. The command is never run."""
+    """Return notice, power, migrate_to. Confirm is what allows the send."""
     kind = kind.strip().lower()
     target = target.strip()
     argument = argument.strip()
     if kind in {"", "none"} and argument:
         kind = "migrate"
     if kind in {"start", "stop"} and argument:
-        notice = "Choose start, stop, or a migrate target, not both. Nothing was recorded."
+        notice = "Choose start, stop, or a migrate target, not both. Nothing was sent."
         return notice, "", ""
     command = recorded_command(kind, target, argument)
     if command is None:
         if not target:
-            notice = "Select a VM first. Nothing was recorded."
+            notice = "Select a VM first. Nothing was sent."
         else:
-            notice = "That name cannot go on a kctl line. Nothing was recorded."
+            notice = "That name cannot go on a kctl line. Nothing was sent."
         return notice, kind if kind in {"start", "stop"} else "", argument if kind == "migrate" else ""
     if not as_bool(confirm):
-        notice = f"Ready to record `{command}`. Tick confirm. The cluster is unchanged."
+        notice = f"Ready to send `{command}`. Tick confirm. The cluster is unchanged."
         power = kind if kind in {"start", "stop"} else ""
         migrate_to = argument if kind == "migrate" else ""
         return notice, power, migrate_to
-    notice = f"Recorded `{command}`. Not sent to the controller."
+    notice = f"Sending `{command}`."
     return notice, "", ""
 
 
@@ -236,8 +253,7 @@ def interpret(
             notice = reply
         else:
             reply = (
-                f"{focus_name} can move to {node}. Confirm records `{command}` "
-                "and does not run it."
+                f"I can move {focus_name} to {node}. Tick confirm to send `{command}`."
             )
             notice = reply
         return Scene(
@@ -257,10 +273,7 @@ def interpret(
         known = _known_vm(snap, vm_name)
         if known is not None:
             command = recorded_command(verb, known, "")
-            reply = (
-                f"{verb.capitalize()} is filled in for {known}. "
-                f"Confirm records `{command}` and does not run it."
-            )
+            reply = f"I can {verb} {known}. Tick confirm to send `{command}`."
             return Scene(
                 section="vms",
                 form="vm",

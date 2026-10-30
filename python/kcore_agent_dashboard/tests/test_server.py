@@ -6,7 +6,11 @@ from kcore_agent_dashboard.server import mcp
 from kcore_agent_dashboard.web import build_asgi
 
 
-def test_agent_tools_include_the_console_and_generative_ui():
+def test_agent_tools_include_the_console_and_generative_ui(monkeypatch):
+    monkeypatch.setattr(
+        "kcore_agent_dashboard.kcore_mcp.run_operation",
+        lambda action, spec: {"applied": True, "action": action, "spec": spec},
+    )
     async def inner():
         async with Client(mcp) as client:
             names = {tool.name for tool in await client.list_tools()}
@@ -25,7 +29,7 @@ def test_agent_tools_include_the_console_and_generative_ui():
                 {"kind": "stop", "target": "alpha", "confirm": True},
             )
             staged_text = staged.content[0].text
-            assert "Not sent" in staged_text or "Nothing was recorded" in staged_text
+            assert "Sent `kctl stop vm alpha`" in staged_text
 
     asyncio.run(inner())
 

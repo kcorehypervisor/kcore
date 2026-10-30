@@ -1,4 +1,8 @@
-"""Backend tools the console and the agent both call. None of them change the cluster."""
+"""Backend tools the console and a host agent both call.
+
+Reads do not change the cluster. stage_action sends start, stop, or
+migrate only after confirm.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,8 @@ from .scene import (
     form_for,
     interpret,
     normalize_section,
+    operation_call,
+    recorded_command,
     scene_from_focus,
     scene_from_section,
     stage_notice,
@@ -127,18 +133,36 @@ def stage_action(
     focus: str = "",
     filter: str = "",
 ) -> dict[str, Any]:
-    """Record a kctl start, stop, or migrate line.
+    """Start, stop, or migrate one VM through kcore after confirm.
 
-    Does not start, stop, or migrate anything. confirm must be true, and
-    only after the operator asked to record that command. The cluster is
-    unchanged either way.
+    Without confirm the cluster is unchanged. Install, drain, delete, and
+    Ceph changes are not available here.
     """
-    notice, power, migrate_to = stage_notice(kind, target or focus, argument, as_bool(confirm))
+    vm_name = target or focus
+    confirmed = as_bool(confirm)
+    notice, power, migrate_to = stage_notice(kind, vm_name, argument, confirmed)
+    if confirmed and notice.startswith("Sending `"):
+        call = operation_call(kind, vm_name, argument)
+        command = recorded_command(kind, vm_name, argument) or ""
+        if call is None:
+            notice = "Nothing was sent."
+        else:
+            from .kcore_mcp import run_operation
+
+            action, spec = call
+            result = run_operation(action, spec)
+            if result.get("applied") is True and result.get("ok") is not False:
+                notice = f"Sent `{command}`. The controller accepted it."
+            else:
+                reason = result.get("error") or result.get("askTheUser") or "the controller did not apply it"
+                notice = f"Did not apply `{command}`. {reason}"
+        power = ""
+        migrate_to = ""
     section_name = normalize_section(section or "vms")
     scene = Scene(
         section=section_name,
         form="vm",
-        focus=target or focus,
+        focus=vm_name,
         focus_kind="vm",
         filter=filter,
         notice=notice,

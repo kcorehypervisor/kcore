@@ -1556,7 +1556,7 @@ fn AgentPage() -> impl IntoView {
         <section class="hero">
             <h1>"Agent"</h1>
             <p class="muted">
-                "One page for the cluster. Ask in the chat for VMs, volumes, Ceph, networks, storage, operations, audit, or compliance, and the form changes to match. Start, stop, and migrate stay on that form until you confirm, and confirm only records the kctl line."
+                "One page for the cluster. Ask in the chat for VMs, volumes, Ceph, networks, storage, operations, audit, or compliance, and the form changes to match. Start, stop, and migrate stay on that form until you confirm, and confirm sends them to the controller."
             </p>
         </section>
         <div class="agent-shell">

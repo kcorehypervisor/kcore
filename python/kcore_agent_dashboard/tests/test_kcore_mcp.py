@@ -126,6 +126,14 @@ def test_connection_uses_the_default_context_file(monkeypatch):
     assert "config" not in _connection()
 
 
+def test_run_operation_refuses_install_and_delete():
+    from kcore_agent_dashboard.kcore_mcp import run_operation
+
+    refused = run_operation("install-node", {"node": "192.168.40.105:9091"})
+    assert refused["applied"] is False
+    assert "start, stop, and migrate" in refused["error"]
+
+
 def test_server_script_points_at_the_kcore_mcp_build():
     script = server_script()
     assert script.name == "index.js"

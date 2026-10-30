@@ -415,9 +415,9 @@ def build_console(state: dict[str, Any], *, transport: str) -> PrefabApp:
                                     )
                                     Checkbox(
                                         name="confirm",
-                                        label="Confirm — record the kctl command, do not run it",
+                                        label="Confirm — send this start, stop, or migrate to the controller",
                                     )
-                                    Button("Record command")
+                                    Button("Send")
                             with If("form == 'volume'"):
                                 Button(
                                     "Show attached VM",

@@ -53,7 +53,7 @@ def test_console_json_has_chat_and_sections():
     blob = json.dumps(payload)
     assert "kcore operator" in blob
     assert "Chat" in blob
-    assert "Record command" in blob
+    assert "Send" in blob
     assert "sendMessage" in blob
     for label in ("VMs", "Volumes", "Ceph", "Audit", "Compliance"):
         assert label in blob
@@ -66,17 +66,26 @@ def test_http_console_does_not_send_to_the_host_chat():
     assert "/api/turn" in blob
 
 
-def test_stage_action_confirm_records_only(monkeypatch, tmp_path):
+def test_stage_action_sends_only_after_confirm(monkeypatch, tmp_path):
     path = tmp_path / "snap.json"
     path.write_text(json.dumps(SNAP), encoding="utf-8")
     monkeypatch.setenv("KCORE_AGENT_SNAPSHOT", str(path))
     monkeypatch.delenv("KCORE_AGENT_OFFLINE", raising=False)
+    sent: list[tuple[str, dict]] = []
+
+    def fake_send(action, spec):
+        sent.append((action, spec))
+        return {"applied": True}
+
+    monkeypatch.setattr("kcore_agent_dashboard.kcore_mcp.run_operation", fake_send)
     from kcore_agent_dashboard import service
 
     service.cache.clear()
     waiting = stage_action(kind="stop", target="alpha", confirm=False)
     assert "Tick confirm" in waiting["notice"]
-    recorded = stage_action(kind="stop", target="alpha", confirm=True)
-    assert "Not sent to the controller" in recorded["notice"]
-    assert recorded["form"] == "vm"
+    assert sent == []
+    sent_state = stage_action(kind="stop", target="alpha", confirm=True)
+    assert "Sent `kctl stop vm alpha`" in sent_state["notice"]
+    assert sent == [("set-vm-state", {"name": "alpha", "state": "stopped"})]
+    assert sent_state["form"] == "vm"
     assert interpret_turn("ceph")["section"] == "ceph"

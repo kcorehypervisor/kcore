@@ -58,14 +58,14 @@ def test_migrate_fills_the_form_and_does_not_run():
     assert scene.migrate_to == "node-b"
     assert scene.power == ""
     assert "kctl migrate vm alpha --target-node node-b" in scene.notice
-    assert "does not run" in scene.reply
+    assert "Tick confirm" in scene.reply
 
 
 def test_stop_fills_power():
     scene = interpret("stop alpha", SNAP)
     assert scene.power == "stop"
     assert "kctl stop vm alpha" in scene.notice
-    assert "does not run" in scene.reply
+    assert "Tick confirm" in scene.reply
 
 
 def test_unknown_keeps_the_current_section():
@@ -82,19 +82,18 @@ def test_audit_search():
     assert scene.form == "audit"
 
 
-def test_stage_requires_confirm_and_never_applies():
+def test_stage_requires_confirm_before_send():
     waiting, power, _migrate = stage_notice("stop", "alpha", "", False)
     assert power == "stop"
     assert "Tick confirm" in waiting
-    assert "Recorded" not in waiting
+    assert "Sending" not in waiting
 
-    recorded, power, _migrate = stage_notice("stop", "alpha", "", True)
+    ready, power, _migrate = stage_notice("stop", "alpha", "", True)
     assert power == ""
-    assert recorded.startswith("Recorded `kctl stop vm alpha`")
-    assert "Not sent to the controller" in recorded
+    assert ready == "Sending `kctl stop vm alpha`."
 
 
 def test_stage_rejects_shell_metacharacters():
     notice, _power, _migrate = stage_notice("stop", "alpha; rm", "", True)
-    assert "Nothing was recorded" in notice
-    assert "Recorded" not in notice
+    assert "Nothing was sent" in notice
+    assert "Sending" not in notice

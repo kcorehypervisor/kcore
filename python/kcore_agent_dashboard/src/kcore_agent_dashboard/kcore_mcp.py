@@ -171,6 +171,44 @@ async def _collect() -> dict[str, dict[str, Any]]:
     return dict(zip(names, results, strict=True))
 
 
+_CONTROL = frozenset({"set-vm-state", "migrate-vm"})
+
+
+def run_operation(action: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """Send one confirmed power or migrate call through kcore_operation.
+
+    Install, drain, delete, and Ceph changes are not sent from this console.
+    """
+    if action not in _CONTROL:
+        return {"applied": False, "error": "this agent only sends start, stop, and migrate"}
+
+    async def once() -> dict[str, Any]:
+        script = server_script()
+        transport = NodeStdioTransport(
+            script,
+            node_cmd=os.environ.get("KCORE_MCP_NODE", "node"),
+            env=_child_env(),
+        )
+        timeout = float(os.environ.get("KCORE_MCP_TIMEOUT", "15"))
+        async with Client(transport) as client:
+            return await _call(
+                client,
+                "kcore_operation",
+                {
+                    "action": action,
+                    "spec": spec,
+                    "confirm": True,
+                    "connection": _connection(),
+                },
+                timeout,
+            )
+
+    try:
+        return _run(once)
+    except Exception as err:
+        return {"applied": False, "error": f"kcore mcp: {err}"}
+
+
 async def _call(client: Client, tool: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
     try:
         result = await client.call_tool_mcp(tool, arguments, timeout=timeout)
