@@ -117,11 +117,30 @@ def snapshot_from_calls(calls: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return snap
 
 
+def _child_env() -> dict[str, str]:
+    # The MCP stdio client keeps only HOME, PATH, and a few others unless the
+    # transport passes an env. KCORE_CONFIG would otherwise be dropped.
+    return dict(os.environ)
+
+
+def _connection() -> dict[str, Any]:
+    timeout = float(os.environ.get("KCORE_MCP_TIMEOUT", "15"))
+    connection: dict[str, Any] = {"timeoutMs": int(timeout * 1000)}
+    config = os.environ.get("KCORE_CONFIG", "").strip()
+    if config:
+        connection["config"] = config
+    return connection
+
+
 async def _collect() -> dict[str, dict[str, Any]]:
     script = server_script()
-    transport = NodeStdioTransport(script, node_cmd=os.environ.get("KCORE_MCP_NODE", "node"))
+    transport = NodeStdioTransport(
+        script,
+        node_cmd=os.environ.get("KCORE_MCP_NODE", "node"),
+        env=_child_env(),
+    )
     timeout = float(os.environ.get("KCORE_MCP_TIMEOUT", "15"))
-    connection = {"timeoutMs": int(timeout * 1000)}
+    connection = _connection()
     async with Client(transport) as client:
         jobs = []
         names = []
@@ -161,7 +180,10 @@ async def _call(client: Client, tool: str, arguments: dict[str, Any], timeout: f
 
 
 def _payload(result: Any) -> dict[str, Any]:
-    if getattr(result, "isError", False):
+    failed = getattr(result, "is_error", None)
+    if failed is None:
+        failed = getattr(result, "isError", False)
+    if failed:
         return {"ok": False, "error": _text(result) or "kcore mcp tool error"}
     text = _text(result)
     if not text:

@@ -109,6 +109,23 @@ def test_load_from_kcore_can_run_inside_the_console_event_loop(monkeypatch):
     assert snap["vms"][0]["name"] == "web"
 
 
+def test_connection_forwards_kcore_config(monkeypatch):
+    monkeypatch.setenv("KCORE_CONFIG", "/tmp/kcore-config.yaml")
+    monkeypatch.setenv("KCORE_MCP_TIMEOUT", "9")
+    from kcore_agent_dashboard.kcore_mcp import _connection
+
+    connection = _connection()
+    assert connection["config"] == "/tmp/kcore-config.yaml"
+    assert connection["timeoutMs"] == 9000
+
+
+def test_connection_uses_the_default_context_file(monkeypatch):
+    monkeypatch.delenv("KCORE_CONFIG", raising=False)
+    from kcore_agent_dashboard.kcore_mcp import _connection
+
+    assert "config" not in _connection()
+
+
 def test_server_script_points_at_the_kcore_mcp_build():
     script = server_script()
     assert script.name == "index.js"
