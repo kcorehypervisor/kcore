@@ -4820,6 +4820,40 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }
     }
 
+    async fn stage_vgpu_manager(
+        &self,
+        request: Request<proto::StageVgpuManagerRequest>,
+    ) -> Result<Response<proto::StageVgpuManagerResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let file = crate::vgpu_stage::validate_manager_file(&req.file)?;
+        let sha256 = crate::vgpu_stage::validate_manager_sha256(&req.sha256)?;
+        let url = crate::vgpu_stage::validate_manager_url(&req.url)?;
+        let store_path = tokio::task::spawn_blocking(move || {
+            crate::vgpu_stage::stage_manager(&url, &sha256, &file)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("stage join: {e}")))??;
+        Ok(Response::new(proto::StageVgpuManagerResponse {
+            success: true,
+            message: format!("staged Virtual GPU Manager at {store_path}"),
+            store_path,
+        }))
+    }
+
+    async fn reboot_node(
+        &self,
+        request: Request<proto::RebootNodeRequest>,
+    ) -> Result<Response<proto::RebootNodeResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let _req = request.into_inner();
+        crate::vgpu_stage::schedule_reboot()?;
+        Ok(Response::new(proto::RebootNodeResponse {
+            success: true,
+            message: "reboot scheduled".into(),
+        }))
+    }
+
     async fn reboot_staged_system_update(
         &self,
         request: Request<proto::RebootStagedSystemUpdateRequest>,

@@ -467,10 +467,10 @@ export function createServer(): McpServer {
     {
       title: "Run a kcore day-2 operation",
       description:
-        "Power state, migrate, drain, cordon, node approval, cluster-update approve/cancel/rollback, or node install. Asks before any disk wipe or mutation.",
+        "Power state, migrate, drain, cordon, node approval, cluster-update approve/cancel/rollback, node install, or node reboot. Asks before any disk wipe or mutation.",
       inputSchema: {
         action: z.string().describe(
-          "set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, or install-node",
+          "set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, install-node, or reboot-node",
         ),
         spec: z.record(z.string(), z.unknown()),
         confirm: z.boolean(),

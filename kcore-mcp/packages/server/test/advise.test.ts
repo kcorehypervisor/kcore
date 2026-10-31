@@ -95,6 +95,15 @@ spec:
   assert.equal(advice.ready, true, advice.askTheUser);
 });
 
+test("a vGPU host asks for the card and the manager", () => {
+  const advice = advise({ kind: "node-vgpu", spec: {} });
+  assert.equal(advice.ready, false);
+  const ids = advice.blocking.map((item) => item.id);
+  assert.ok(ids.includes("nodeId"));
+  assert.ok(ids.includes("hostCards"));
+  assert.ok(ids.includes("managerFile"));
+});
+
 test("cluster advice asks for the controller address", () => {
   const advice = advise({ kind: "cluster", spec: {} });
   assert.ok(advice.blocking.some((item) => item.id === "controller"));

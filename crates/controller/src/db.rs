@@ -208,6 +208,20 @@ pub struct NodeGpuRow {
     pub profiles: String,
 }
 
+/// Operator vGPU host configuration for one node. `host_cards` is comma-separated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeVgpuRow {
+    pub node_id: String,
+    pub enabled: bool,
+    pub host_cards: String,
+    pub num_vfs: i32,
+    pub manager_file: String,
+    pub manager_sha256: String,
+    pub manager_version: String,
+    pub manager_url: String,
+    pub staged_store_path: String,
+}
+
 /// A NIC after the primary. Position 0 stays on `vms.network` / `vms.vm_ip`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmNicRow {
@@ -852,7 +866,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 68;
+pub const SCHEMA_VERSION: i32 = 69;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -862,7 +876,8 @@ pub const SCHEMA_VERSION: i32 = 68;
 /// Version 63 adds the HA tables. Version 64 adds the fence hold on `node_ha`.
 /// Version 65 adds `node_ha.host_health` for proactive cordon. Version 67 adds
 /// the ingress tables, which an older reader never selects. Version 68 adds the
-/// Slurm tables, which an older reader never selects.
+/// Slurm tables, which an older reader never selects. Version 69 adds
+/// `node_vgpu`, the operator's vGPU host configuration.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2262,6 +2277,23 @@ impl Database {
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 CREATE INDEX IF NOT EXISTS idx_slurm_cluster_nodes_cluster ON slurm_cluster_nodes(cluster_name);",
+            )?;
+        }
+
+        if version < 69 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS node_vgpu (
+                    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    host_cards TEXT NOT NULL DEFAULT '',
+                    num_vfs INTEGER NOT NULL DEFAULT 0,
+                    manager_file TEXT NOT NULL DEFAULT '',
+                    manager_sha256 TEXT NOT NULL DEFAULT '',
+                    manager_version TEXT NOT NULL DEFAULT '',
+                    manager_url TEXT NOT NULL DEFAULT '',
+                    staged_store_path TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
             )?;
         }
 
@@ -6573,6 +6605,67 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    pub fn upsert_node_vgpu(&self, row: &NodeVgpuRow) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO node_vgpu (
+                node_id, enabled, host_cards, num_vfs, manager_file, manager_sha256,
+                manager_version, manager_url, staged_store_path, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+             ON CONFLICT(node_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                host_cards = excluded.host_cards,
+                num_vfs = excluded.num_vfs,
+                manager_file = excluded.manager_file,
+                manager_sha256 = excluded.manager_sha256,
+                manager_version = excluded.manager_version,
+                manager_url = excluded.manager_url,
+                staged_store_path = excluded.staged_store_path,
+                updated_at = datetime('now')",
+            params![
+                row.node_id,
+                row.enabled as i32,
+                row.host_cards,
+                row.num_vfs,
+                row.manager_file,
+                row.manager_sha256,
+                row.manager_version,
+                row.manager_url,
+                row.staged_store_path,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_node_vgpu(&self, node_id: &str) -> Result<Option<NodeVgpuRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, enabled, host_cards, num_vfs, manager_file, manager_sha256,
+                    manager_version, manager_url, staged_store_path
+             FROM node_vgpu WHERE node_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![node_id], |row| {
+            Ok(NodeVgpuRow {
+                node_id: row.get(0)?,
+                enabled: row.get::<_, i32>(1)? != 0,
+                host_cards: row.get(2)?,
+                num_vfs: row.get(3)?,
+                manager_file: row.get(4)?,
+                manager_sha256: row.get(5)?,
+                manager_version: row.get(6)?,
+                manager_url: row.get(7)?,
+                staged_store_path: row.get(8)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn delete_node_vgpu(&self, node_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM node_vgpu WHERE node_id = ?1", params![node_id])?;
+        Ok(())
     }
 
     pub fn set_vm_node(&self, vm_id: &str, node_id: &str) -> Result<bool, rusqlite::Error> {

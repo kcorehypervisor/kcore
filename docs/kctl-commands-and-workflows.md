@@ -308,6 +308,21 @@ kctl --node 10.0.0.21:9091 node install \
 
 `--join-controller` is repeatable; the first endpoint is treated as primary and the rest are stored in node-agent config for fallback order.
 
+Enable an NVIDIA vGPU host (stages the manager, pushes Nix, reboots when the kernel needs it):
+
+```bash
+kctl node vgpu enable node-193 \
+  --host-card 0000:61:00.0 \
+  --url http://192.168.40.10:18083/manager.run \
+  --sha256 <sha256> \
+  --file NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+kctl node vgpu show node-193
+kctl node reboot node-193
+kctl update vm vgpu-01 --vgpu A2-4C
+```
+
+`kctl describe node` prints the stored vGPU host record. `kind: NodeVgpu` is applied with `kctl apply -f`. See `docs/nvidia-ai-enterprise-vgpu.md`.
+
 Apply Nix to a node:
 
 ```bash
@@ -554,6 +569,12 @@ Top-level commands:
 - `kctl node cordon <NODE_ID>` — stop placing new VMs here; VMs already on the node stay
 - `kctl node uncordon <NODE_ID>` — make a cordoned node schedulable again
 - `kctl node delete <NODE_ID>` — remove an empty node and revoke its certificates
+- `kctl node vgpu enable <NODE_ID> --host-card <bdf> --url <url> --sha256 <sha256> --file <name.run> [--num-vfs N] [--no-reboot]`
+- `kctl node vgpu show <NODE_ID>`
+- `kctl node vgpu disable <NODE_ID>`
+- `kctl node reboot <NODE_ID> [--force]`
+- `kctl update vm <name> [--cpu N] [--memory 4G] [--gpu <name>] [--vgpu <profile>]` — GPU changes require a stopped VM
+- `kctl apply -f <NodeVgpu>.yaml`
 - `kctl get cluster-health` — ready nodes, VMs still on not-ready nodes, certificate expiry, replication conflicts
 - `kctl backup -o snapshot.sqlite` — consistent copy of the controller database
 - `kctl restore controller -f snapshot.sqlite --confirm` — replace the controller database from that snapshot

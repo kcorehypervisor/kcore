@@ -106,6 +106,43 @@ test("mutable VM fields update and immutable fields replace", () => {
   assert.equal(replace.action, "replace");
 });
 
+test("a VM apply carries vGPU slices and PCI devices", () => {
+  const kind = findKind("vm");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    name: "vgpu-01",
+    imageUrl: "https://example.com/ubuntu.img",
+    imageSha256: sha,
+    network: "default",
+    storageBackend: "filesystem",
+    storageSizeBytes: "40G",
+    sshKeys: ["deploy"],
+    vgpus: ["A2-4C"],
+    pciDevices: ["0000:61:00.1"],
+  });
+  const vm = call.request.spec as { vgpus: string[]; pciDevices: string[] };
+  assert.deepEqual(vm.vgpus, ["A2-4C"]);
+  assert.deepEqual(vm.pciDevices, ["0000:61:00.1"]);
+});
+
+test("a vGPU host apply stages the manager", () => {
+  const kind = findKind("node-vgpu");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    nodeId: "node-193",
+    hostCards: ["0000:61:00.0"],
+    managerUrl: "http://192.168.40.10:18083/virtual-gpu-manager-8_v8.2/NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run",
+    managerSha256: sha,
+    managerFile: "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run",
+  });
+  assert.equal(call.method, "configureNodeVgpu");
+  assert.equal(call.request.enabled, true);
+  const migrate = buildOperation("migrate-vm", { name: "vgpu-01", targetNode: "node-193", vgpus: ["A2-4C"] });
+  assert.deepEqual(migrate.request.vgpus, ["A2-4C"]);
+  const reboot = buildOperation("reboot-node", { nodeId: "node-193" });
+  assert.equal(reboot.method, "rebootNode");
+});
+
 test("a cluster update is a CreateClusterUpdate RPC", () => {
   const kind = findKind("cluster-update");
   assert.ok(kind);

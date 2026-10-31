@@ -39,12 +39,14 @@ pub struct ModuleFeatures {
     pub image_sha256: bool,
     pub vgpu_profile: bool,
     pub cloud_init_guest_ops_keys: bool,
+    pub vgpu_manager_run: bool,
 }
 
 impl ModuleFeatures {
     pub const IMAGE_SHA256: &'static str = "imageSha256";
     pub const VGPU_PROFILE: &'static str = "vgpuProfile";
     pub const CLOUD_INIT_GUEST_OPS_KEYS: &'static str = "cloudInitGuestOpsKeys";
+    pub const VGPU_MANAGER_RUN: &'static str = "vgpuManagerRun";
 
     /// Everything on: what a node installed from this tree supports.
     pub fn all() -> Self {
@@ -52,6 +54,7 @@ impl ModuleFeatures {
             image_sha256: true,
             vgpu_profile: true,
             cloud_init_guest_ops_keys: true,
+            vgpu_manager_run: true,
         }
     }
 
@@ -63,6 +66,7 @@ impl ModuleFeatures {
             image_sha256: has(Self::IMAGE_SHA256),
             vgpu_profile: has(Self::VGPU_PROFILE),
             cloud_init_guest_ops_keys: has(Self::CLOUD_INIT_GUEST_OPS_KEYS),
+            vgpu_manager_run: has(Self::VGPU_MANAGER_RUN),
         }
     }
 }
@@ -588,6 +592,62 @@ pub struct PostgresqlNix {
     pub port: i32,
 }
 
+/// Host vGPU configuration rendered beside the per-VM slice devices.
+#[derive(Debug, Clone)]
+pub struct VgpuHostNix {
+    pub host_cards: Vec<String>,
+    pub num_vfs: i32,
+    pub file: String,
+    pub sha256: String,
+    pub version: String,
+}
+
+/// Append `ch-vm.vgpu.managerRun` (and enable/hostCards when no slice already
+/// turned the host path on). An older module that does not report
+/// `vgpuManagerRun` gets the config unchanged; the caller refuses the push.
+pub fn with_vgpu_host(
+    config: String,
+    host: Option<&VgpuHostNix>,
+    features: &ModuleFeatures,
+) -> String {
+    let Some(host) = host else {
+        return config;
+    };
+    if !features.vgpu_manager_run {
+        return config;
+    }
+    let mut block = String::new();
+    if !config.contains("ch-vm.vgpu.enable = true;") {
+        block.push_str("  ch-vm.vgpu.enable = true;\n");
+        block.push_str("  ch-vm.vgpu.hostCards = [\n");
+        for card in &host.host_cards {
+            block.push_str(&format!("    \"{}\"\n", nix_escape(card)));
+        }
+        block.push_str("  ];\n");
+    }
+    if host.num_vfs > 0 {
+        block.push_str(&format!("  ch-vm.vgpu.numVfs = {};\n", host.num_vfs));
+    }
+    if !host.file.is_empty() && !host.sha256.is_empty() {
+        block.push_str("  ch-vm.vgpu.managerRun = {\n");
+        block.push_str(&format!("    file = \"{}\";\n", nix_escape(&host.file)));
+        block.push_str(&format!("    sha256 = \"{}\";\n", nix_escape(&host.sha256)));
+        block.push_str(&format!(
+            "    version = \"{}\";\n",
+            nix_escape(&host.version)
+        ));
+        block.push_str("  };\n");
+    }
+    if block.is_empty() {
+        return config;
+    }
+    let trimmed = config.trim_end();
+    let Some(body) = trimmed.strip_suffix('}') else {
+        return format!("{config}{block}");
+    };
+    format!("{body}{block}}}\n")
+}
+
 /// Append `services.postgresql` to a generated node module.
 ///
 /// An unexpected package or database is left out of the file. Those values
@@ -1062,6 +1122,36 @@ mod tests {
         assert!(!baseline.contains("vgpuProfile"));
         assert!(!baseline.contains("ch-vm.vgpu.enable"));
         assert!(baseline.contains("address = \"0000:af:00.4\""));
+    }
+
+    #[test]
+    fn vgpu_manager_run_is_appended_only_when_the_module_reports_it() {
+        let host = VgpuHostNix {
+            host_cards: vec!["0000:61:00.0".into()],
+            num_vfs: 0,
+            file: "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run".into(),
+            sha256: "2bc7f9be263d45a92331d781df33c14af1af01fcfa45e80102e80caf1ffaa74d".into(),
+            version: "595.91.04".into(),
+        };
+        let bare = generate_node_config(
+            &[],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        let rendered = with_vgpu_host(bare.clone(), Some(&host), &ModuleFeatures::all());
+        assert!(rendered.contains("ch-vm.vgpu.enable = true;"));
+        assert!(rendered.contains("0000:61:00.0"));
+        assert!(rendered.contains("managerRun = {"));
+        assert!(rendered.contains("595.91.04-vgpu-kvm-aie.run"));
+        assert!(!rendered.contains("numVfs"));
+        let hidden = with_vgpu_host(bare, Some(&host), &ModuleFeatures::default());
+        assert!(!hidden.contains("managerRun"));
+        assert!(
+            ModuleFeatures::from_reported(&[ModuleFeatures::VGPU_MANAGER_RUN]).vgpu_manager_run
+        );
     }
 
     #[test]

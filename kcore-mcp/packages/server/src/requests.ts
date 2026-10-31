@@ -68,6 +68,10 @@ export function buildApply(kind: ResourceKind, spec: Record<string, unknown>): R
       return [{ target: "controller", method: "createObjectStore", request: { objectStore: objectStoreMessage(spec) } }];
     case "cluster-update":
       return [{ target: "controller", method: "createClusterUpdate", request: { spec: clusterUpdateMessage(spec) } }];
+    case "gpus":
+      throw new InputError("gpus is read-only; use kcore_read");
+    case "node-vgpu":
+      return [{ target: "controller", method: "configureNodeVgpu", request: nodeVgpuRequest(spec, true) }];
     default:
       throw new InputError(`unsupported kind ${kind.id}`);
   }
@@ -148,6 +152,11 @@ export function buildRead(kind: ResourceKind, name?: string): RpcCall {
         : { target: "controller", method: "listClusterUpdates", request: {} };
     case "image":
       throw new InputError("image reads are collected from each node");
+    case "gpus":
+      return { target: "controller", method: "listPciDevices", request: { nodeId: named } };
+    case "node-vgpu":
+      if (!named) throw new InputError("node id is required");
+      return { target: "controller", method: "getNodeVgpu", request: { nodeId: named } };
     default:
       throw new InputError(`unsupported kind ${kind.id}`);
   }
@@ -192,6 +201,10 @@ export function buildDelete(kind: ResourceKind, name: string): RpcCall {
       return { target: "controller", method: "deleteObjectStore", request: { name: id } };
     case "cluster-update":
       return { target: "controller", method: "cancelClusterUpdate", request: { name: id } };
+    case "gpus":
+      throw new InputError("gpus is read-only");
+    case "node-vgpu":
+      return { target: "controller", method: "configureNodeVgpu", request: nodeVgpuRequest({ nodeId: id, enabled: false }, false) };
     default:
       throw new InputError(`unsupported kind ${kind.id}`);
   }
@@ -251,6 +264,17 @@ export function buildOperation(action: string, spec: Record<string, unknown>): R
           vmId: assertName(required(spec, "name", "VM name"), "VM name"),
           targetNode: assertArg(required(spec, "targetNode", "target node"), "target node"),
           allowColdFallback: boolish(spec.allowColdFallback),
+          gpus: deviceList(spec.gpus),
+          vgpus: deviceList(spec.vgpus),
+        },
+      };
+    case "reboot-node":
+      return {
+        target: "controller",
+        method: "rebootNode",
+        request: {
+          nodeId: assertName(required(spec, "nodeId", "node id"), "node id"),
+          force: boolish(spec.force),
         },
       };
     case "drain-node":
@@ -280,7 +304,7 @@ export function buildOperation(action: string, spec: Record<string, unknown>): R
       return installCall(spec);
     default:
       throw new InputError(
-        "action must be set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, or install-node",
+        "action must be set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, install-node, or reboot-node",
       );
   }
 }
@@ -345,8 +369,50 @@ function vmRequest(spec: Record<string, unknown>): Record<string, unknown> {
       nics,
       disks: [],
       desiredState: desired(spec.desiredState),
+      gpus: deviceList(spec.gpus),
+      vgpus: deviceList(spec.vgpus),
+      pciDevices: deviceList(spec.pciDevices),
     },
   };
+}
+
+function nodeVgpuRequest(spec: Record<string, unknown>, enabling: boolean): Record<string, unknown> {
+  const rawNode = opt(spec, "nodeId") ?? opt(spec, "name");
+  if (!rawNode) throw new InputError("node id is required");
+  const nodeId = assertName(rawNode, "node id");
+  const enabled = enabling && spec.enabled !== false && spec.enabled !== "false";
+  if (!enabled) {
+    return { nodeId, enabled: false, hostCards: [], numVfs: 0, manager: { url: "", sha256: "", file: "", version: "" } };
+  }
+  const url = required(spec, "managerUrl", "manager URL");
+  if (!(url.startsWith("http://") || url.startsWith("https://")) || url.includes(" ")) {
+    throw new InputError("manager URL must be an http or https URL");
+  }
+  const file = required(spec, "managerFile", "manager file");
+  if (file.includes("/") || !file.endsWith(".run")) {
+    throw new InputError("manager file must be the NVIDIA .run installer name");
+  }
+  const hostCards = deviceList(spec.hostCards);
+  if (hostCards.length === 0) throw new InputError("hostCards must name at least one PCI address");
+  const numVfs = spec.numVfs == null || spec.numVfs === "" ? 0 : Number(spec.numVfs);
+  if (!Number.isInteger(numVfs) || numVfs < 0) throw new InputError("numVfs must be an integer >= 0");
+  return {
+    nodeId,
+    enabled: true,
+    hostCards: hostCards.map((card) => assertArg(card, "host card")),
+    numVfs,
+    manager: {
+      url,
+      sha256: assertSha256(required(spec, "managerSha256", "manager SHA256")),
+      file,
+      version: opt(spec, "managerVersion") ?? "595.91.04",
+    },
+  };
+}
+
+function deviceList(value: unknown): string[] {
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  return stringList(value);
 }
 
 function imageFields(spec: Record<string, unknown>): { imageUrl: string; imageSha256: string; imagePath: string; imageFormat: string } {

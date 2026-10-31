@@ -103,6 +103,16 @@ service NodeAdmin {
   // provided content and (optionally) triggers a nixos-rebuild.
   rpc ApplyNixConfig(ApplyNixConfigRequest) returns (ApplyNixConfigResponse);
 
+  // Ingress gateway: load Caddy JSON through the admin socket, report
+  // certificate and upstream state, and write DNS-01 style secrets.
+  rpc ApplyIngressConfig(ApplyIngressConfigRequest) returns (ApplyIngressConfigResponse);
+  rpc GetIngressStatus(GetIngressStatusRequest) returns (GetIngressStatusResponse);
+  rpc WriteIngressSecret(WriteIngressSecretRequest) returns (WriteIngressSecretResponse);
+  // Replicated certificate store: the controller reads the VIP holder's store
+  // and writes it to the standby.
+  rpc ExportIngressStore(ExportIngressStoreRequest) returns (ExportIngressStoreResponse);
+  rpc ImportIngressStore(ImportIngressStoreRequest) returns (ImportIngressStoreResponse);
+
   // GetNixApplyStatus reports whether the rebuild started by a previous
   // ApplyNixConfig has finished activating. Callers that must observe the new
   // configuration (live migration handoff, drain) poll this before continuing.
@@ -170,11 +180,24 @@ service NodeAdmin {
   // Migrate is the controller's job. This boots a generation that was already staged.
   rpc RebootStagedSystemUpdate(RebootStagedSystemUpdateRequest) returns (RebootStagedSystemUpdateResponse);
 
+  // Download the Virtual GPU Manager .run, check its sha256, and
+  // `nix-store --add-fixed sha256` it so a later nixos-rebuild can find it.
+  rpc StageVgpuManager(StageVgpuManagerRequest) returns (StageVgpuManagerResponse);
+  // Reboot this node after the RPC returns.
+  rpc RebootNode(RebootNodeRequest) returns (RebootNodeResponse);
+
   // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
   // Preflight checks (dry-build, OSD device, RAID, addresses, nixpkgs, DHCP mon)
   // before CreateCephCluster mutates anything.
   rpc CheckCephPreflight(CheckCephPreflightRequest) returns (CheckCephPreflightResponse);
   rpc ApplyCephConfig(ApplyCephConfigRequest) returns (ApplyCephConfigResponse);
+  // Slurm host services: dry-build the fragment and check the management
+  // interface before the controller writes it.
+  rpc CheckSlurmPreflight(CheckSlurmPreflightRequest) returns (CheckSlurmPreflightResponse);
+  rpc ApplySlurmConfig(ApplySlurmConfigRequest) returns (ApplySlurmConfigResponse);
+  rpc GetSlurmStatus(GetSlurmStatusRequest) returns (GetSlurmStatusResponse);
+  // Only drain and resume are accepted; scontrol runs on this node.
+  rpc SlurmControl(SlurmControlRequest) returns (SlurmControlResponse);
   rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
   // Create every OSD in osd_devices that is not already prepared, and retire
   // OSDs this node has that are not in that list. Retirement only touches
@@ -1775,6 +1798,9 @@ message KubernetesAdminRequest {
   string path = 2;
   string body = 3;
   string content_type = 4;
+  // When set, authenticate with this bearer token (a scoped ServiceAccount
+  // token) instead of the admin client certificate.
+  string bearer_token = 5;
 }
 
 message KubernetesAdminResponse {
@@ -1932,4 +1958,139 @@ message FinalizeInstantDiskResponse {
   string message = 2;
   int64 bytes_written = 3;
   string volume_path = 4;
+}
+
+// --- Ingress gateway ---------------------------------------------------------------------------
+
+message ApplyIngressConfigRequest {
+  string config_json = 1; // rendered Caddy JSON
+  string hash = 2;        // SHA-256 of config_json, echoed in status
+}
+message ApplyIngressConfigResponse {
+  bool success = 1;
+  string applied_hash = 2;
+  string message = 3;
+}
+
+message GetIngressStatusRequest {}
+message IngressCertInfo {
+  string host = 1;
+  string issuer = 2;
+  string not_after = 3;
+}
+message IngressUpstreamInfo {
+  string address = 1;
+  bool healthy = 2;
+}
+message GetIngressStatusResponse {
+  bool running = 1;
+  string applied_hash = 2;
+  string vip_holder = 3;
+  repeated IngressCertInfo certs = 4;
+  repeated IngressUpstreamInfo upstreams = 5;
+  string message = 6;
+}
+
+message WriteIngressSecretRequest {
+  string name = 1;     // file name under /etc/kcore/ingress, e.g. dns.env
+  bytes content = 2;
+}
+message WriteIngressSecretResponse { bool success = 1; string path = 2; }
+
+message ExportIngressStoreRequest {}
+message ExportIngressStoreResponse {
+  bytes archive = 1; // JSON document of files; opaque to the controller
+  string digest = 2; // SHA-256 hex of archive
+  int32 files = 3;
+}
+message ImportIngressStoreRequest {
+  bytes archive = 1;
+  string digest = 2;
+}
+message ImportIngressStoreResponse {
+  bool success = 1;
+  int32 files = 2;
+  string message = 3;
+}
+
+
+message CheckSlurmPreflightRequest {
+  string slurm_nix = 1;
+  string address = 2;
+  string iface = 3;
+  bool compute = 4;
+  repeated string member_addresses = 5;
+  repeated string gpu_pci_ids = 6;
+  string ceph_cluster_iface = 7;
+}
+
+message SlurmPreflightIssue {
+  string check = 1;
+  string message = 2;
+  bool blocking = 3;
+}
+
+message CheckSlurmPreflightResponse {
+  bool ok = 1;
+  repeated SlurmPreflightIssue issues = 2;
+}
+
+message ApplySlurmConfigRequest {
+  string slurm_nix = 1;
+  // 1024 random bytes. Written to /etc/munge/munge.key, never to the Nix store.
+  bytes munge_key = 2;
+  // Optional slurmdbd password. Written outside the Nix store when accounting
+  // is enabled.
+  bytes dbd_password = 3;
+  bool rebuild = 4;
+  bool accounting = 5;
+  repeated string gpu_pci_ids = 6;
+}
+
+message ApplySlurmConfigResponse {
+  bool success = 1;
+  string message = 2;
+  string apply_id = 3;
+}
+
+message GetSlurmStatusRequest {}
+
+message GetSlurmStatusResponse {
+  string munge = 1;
+  string slurmctld = 2;
+  string slurmd = 3;
+  string slurmdbd = 4;
+  // `sinfo -h -N -o '%N %T'` on the controller; empty elsewhere.
+  string sinfo = 5;
+  string config_hash = 6;
+}
+
+message SlurmControlRequest {
+  string verb = 1; // drain or resume
+  string node_name = 2;
+  string reason = 3;
+}
+
+message SlurmControlResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message StageVgpuManagerRequest {
+  string url = 1;
+  string sha256 = 2;
+  string file = 3;
+}
+
+message StageVgpuManagerResponse {
+  bool success = 1;
+  string message = 2;
+  string store_path = 3;
+}
+
+message RebootNodeRequest {}
+
+message RebootNodeResponse {
+  bool success = 1;
+  string message = 2;
 }

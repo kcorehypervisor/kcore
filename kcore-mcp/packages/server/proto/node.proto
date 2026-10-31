@@ -180,6 +180,12 @@ service NodeAdmin {
   // Migrate is the controller's job. This boots a generation that was already staged.
   rpc RebootStagedSystemUpdate(RebootStagedSystemUpdateRequest) returns (RebootStagedSystemUpdateResponse);
 
+  // Download the Virtual GPU Manager .run, check its sha256, and
+  // `nix-store --add-fixed sha256` it so a later nixos-rebuild can find it.
+  rpc StageVgpuManager(StageVgpuManagerRequest) returns (StageVgpuManagerResponse);
+  // Reboot this node after the RPC returns.
+  rpc RebootNode(RebootNodeRequest) returns (RebootNodeResponse);
+
   // Ceph SAN lifecycle operations. All are idempotent for reconciliation.
   // Preflight checks (dry-build, OSD device, RAID, addresses, nixpkgs, DHCP mon)
   // before CreateCephCluster mutates anything.
@@ -2066,6 +2072,25 @@ message SlurmControlRequest {
 }
 
 message SlurmControlResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message StageVgpuManagerRequest {
+  string url = 1;
+  string sha256 = 2;
+  string file = 3;
+}
+
+message StageVgpuManagerResponse {
+  bool success = 1;
+  string message = 2;
+  string store_path = 3;
+}
+
+message RebootNodeRequest {}
+
+message RebootNodeResponse {
   bool success = 1;
   string message = 2;
 }

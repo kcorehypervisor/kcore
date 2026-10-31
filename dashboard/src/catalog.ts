@@ -243,6 +243,7 @@ function vmSpec(v: Values) {
     nics: nics(v),
     pciDevices: strings(v, "pci_devices"),
     gpus: strings(v, "gpus"),
+    vgpus: strings(v, "vgpus"),
     labels: labels(v),
   };
   if (spec.cpu <= 0) throw new FormError("CPUs must be greater than 0");
@@ -517,6 +518,8 @@ const vmFields: Field[] = [
   f("anti_affinity", "Anti-affinity group"),
   f("labels", "Labels", false, "key=value, comma separated"),
   pick("desired_state", "Desired state", ["running", "stopped"]),
+  f("gpus", "Whole GPUs"),
+  f("vgpus", "vGPU slices", false, "A2-4C"),
 ];
 
 const k8sFields: Field[] = [
@@ -589,8 +592,8 @@ export const RESOURCES: Resource[] = [
       act("update", "Resize", false, [num("cpu", "CPUs"), size("memory_bytes", "Memory"), f("labels", "Labels", false, "key=value")], async (v) =>
         ok(await controller.updateVm({ vmId: required(v, "id"), targetNode: text(v, "target_node"), cpu: int(v, "cpu"), memoryBytes: bytes(v, "memory_bytes"), labels: labels(v) })),
       ),
-      act("migrate", "Migrate", true, [f("target_node", "Target node", true), bool("allow_cold_fallback", "Allow cold fallback"), f("gpus", "GPUs on target")], async (v) => {
-        const resp = await controller.migrateVm({ vmId: required(v, "id"), targetNode: required(v, "target_node"), allowColdFallback: flag(v, "allow_cold_fallback"), gpus: strings(v, "gpus") });
+      act("migrate", "Migrate", true, [f("target_node", "Target node", true), bool("allow_cold_fallback", "Allow cold fallback"), f("gpus", "GPUs on target"), f("vgpus", "vGPU slices", false, "A2-4C")], async (v) => {
+        const resp = await controller.migrateVm({ vmId: required(v, "id"), targetNode: required(v, "target_node"), allowColdFallback: flag(v, "allow_cold_fallback"), gpus: strings(v, "gpus"), vgpus: strings(v, "vgpus") });
         return ok(resp, { mode: resp.mode, operation: resp.operationId });
       }),
       act("migrate-status", "Migration status", false, [f("node_id", "Node")], async (v) => rowOf(await controller.getLiveMigrateReceiveStatus({ vmId: required(v, "id"), nodeId: text(v, "node_id") }))),

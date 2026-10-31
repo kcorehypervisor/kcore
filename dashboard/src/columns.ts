@@ -302,6 +302,8 @@ export const PRESETS: Record<string, Column[]> = {
     col("assigned_vm", "text", { label: "VM", link: "vms" }),
     col("node_id", "text", { label: "Node", link: "nodes" }),
     col("address"),
+    col("profile", "text", { label: "Profile" }),
+    col("profiles", "list", { label: "Profiles" }),
     col("family", "text", { hidden: true }),
     col("role", "text", { hidden: true }),
     col("kind", "text", { hidden: true }),

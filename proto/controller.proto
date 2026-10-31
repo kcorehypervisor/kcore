@@ -56,6 +56,11 @@ service Controller {
   rpc ListGpus(ListGpusRequest) returns (ListGpusResponse);
   // Full PCI inventory: AI GPUs, NICs, NVMe, and raw groups.
   rpc ListPciDevices(ListGpusRequest) returns (ListGpusResponse);
+  // Stage the Virtual GPU Manager on a node and render ch-vm.vgpu.
+  rpc ConfigureNodeVgpu(ConfigureNodeVgpuRequest) returns (ConfigureNodeVgpuResponse);
+  rpc GetNodeVgpu(GetNodeVgpuRequest) returns (GetNodeVgpuResponse);
+  // Reboot a node. Refused while it still has running VMs unless force is set.
+  rpc RebootNode(RebootNodeRequest) returns (RebootNodeResponse);
 
   // SSH key management
   rpc CreateSshKey(CreateSshKeyRequest) returns (CreateSshKeyResponse);
@@ -368,6 +373,57 @@ message ListGpusResponse {
   repeated GpuInfo gpus = 1;
 }
 
+message VgpuManager {
+  // HTTP(S) URL of the NVIDIA Virtual GPU Manager .run file.
+  string url = 1;
+  string sha256 = 2;
+  string file = 3;
+  string version = 4;
+}
+
+message ConfigureNodeVgpuRequest {
+  string node_id = 1;
+  bool enabled = 2;
+  // Physical functions that stay on the NVIDIA host driver, e.g. 0000:61:00.0.
+  repeated string host_cards = 3;
+  // 0 asks sriov-manage for every function the card supports.
+  int32 num_vfs = 4;
+  VgpuManager manager = 5;
+}
+
+message ConfigureNodeVgpuResponse {
+  bool success = 1;
+  string message = 2;
+  // The node's kernel has no IOMMU groups yet, or the card is still on nouveau.
+  bool reboot_required = 3;
+  string store_path = 4;
+}
+
+message GetNodeVgpuRequest {
+  string node_id = 1;
+}
+
+message GetNodeVgpuResponse {
+  bool enabled = 1;
+  repeated string host_cards = 2;
+  int32 num_vfs = 3;
+  string manager_file = 4;
+  string manager_sha256 = 5;
+  string manager_version = 6;
+  string staged_store_path = 7;
+}
+
+message RebootNodeRequest {
+  string node_id = 1;
+  // Reboot even when the node still has a VM whose desired state is running.
+  bool force = 2;
+}
+
+message RebootNodeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
 message HeartbeatResponse {
   bool success = 1;
   // VM names (the unit and socket name) the controller still places on this
@@ -528,6 +584,15 @@ message UpdateVmRequest {
   int64 memory_bytes = 4;   // New memory (0 = no change)
   // Keys merged into the stored VM label map. Empty leaves labels unchanged.
   map<string, string> labels = 5;
+  // Whole-GPU selectors. Empty leaves the stored assignment unchanged.
+  // The VM must be stopped. Mutually exclusive with vgpus.
+  repeated string gpus = 6;
+  // vGPU slice selectors (A2-4C, nvidia0=A2-4C). Empty leaves the stored
+  // list unchanged. The VM must be stopped.
+  repeated string vgpus = 7;
+  // Raw PCI functions. Empty leaves the stored list unchanged. The VM must
+  // be stopped. Mutually exclusive with gpus and vgpus.
+  repeated string pci_devices = 8;
 }
 
 message UpdateVmResponse {
@@ -904,6 +969,10 @@ message VmInfo {
   int32 replica_interval_secs = 14;
   // Unix seconds the guest last reported in. 0 when the node has no sample.
   int64 guest_heartbeat_unix = 15;
+  // Whole-GPU names assigned to this VM.
+  repeated string gpus = 16;
+  // vGPU bindings stored as name=profile.
+  repeated string vgpus = 17;
 }
 
 // Node Operations

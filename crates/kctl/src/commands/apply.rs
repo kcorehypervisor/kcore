@@ -1,6 +1,6 @@
 use crate::client::{self, controller_proto};
 use crate::commands::{
-    ceph_cluster, container, disk_layout, network, object_store, postgresql, security_group,
+    ceph_cluster, container, disk_layout, network, node, object_store, postgresql, security_group,
     shared_filesystem, slurm, ssh_key, vm,
 };
 use crate::config::ConnectionInfo;
@@ -109,6 +109,9 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
             }
             "objectstore" | "object-store" | "object_store" => {
                 return object_store::apply_from_file(info, file).await
+            }
+            "nodevgpu" | "node-vgpu" | "node_vgpu" => {
+                return node::apply_vgpu_from_file(info, file).await
             }
             _ => {}
         }

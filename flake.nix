@@ -167,6 +167,28 @@
               cargoExtraArgs = "-p kcore-disk-verify";
             }
           );
+
+          # The Virtual GPU Manager .run is unfree and is not fetched. This
+          # output exists so a workstation that already ran
+          # `nix-store --add-fixed sha256` on the file can `nix build` it.
+          nvidia-vgpu-manager =
+            let
+              unfreePkgs = import inputs.nixpkgs {
+                inherit system;
+                config.allowUnfree = true;
+              };
+            in
+            unfreePkgs.callPackage ./pkgs/nvidia-vgpu-manager {
+              kernel = unfreePkgs.linuxPackages.kernel;
+              src = unfreePkgs.requireFile {
+                name = "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run";
+                sha256 = "2bc7f9be263d45a92331d781df33c14af1af01fcfa45e80102e80caf1ffaa74d";
+                message = ''
+                  Add NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run to the Nix store:
+                    nix-store --add-fixed sha256 NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+                '';
+              };
+            };
         in
         {
           packages = {
@@ -179,6 +201,7 @@
               kcore-dashboard
               kcore-console
               kcore-disk-verify
+              nvidia-vgpu-manager
               ;
           };
 

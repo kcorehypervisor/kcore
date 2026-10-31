@@ -114,7 +114,55 @@ host driver by hand when the host should use it again.
 stays on the NVIDIA host driver. The node writes the profile onto one virtual
 function and never binds that card, or the function, to `vfio-pci`.
 
-The procedure for the A2, including the QEMU reference to run before Cloud
-Hypervisor, is `scripts/vgpu-lab/README.md`. It is a lab note, not a node
-service. `scripts/capture-vgpu-sysfs.sh` is what to run on the machine the day
-the card is installed. Neither script redeems an NVIDIA licence.
+Turn the node into a vGPU host before creating guests. The controller stages
+the NVIDIA Virtual GPU Manager, renders `ch-vm.vgpu.managerRun`, and says when
+the node still needs a reboot (no IOMMU group, or the card is still on
+`nouveau`):
+
+```bash
+kctl node vgpu enable node-193 \
+  --host-card 0000:61:00.0 \
+  --url http://192.168.40.10:18083/virtual-gpu-manager-8_v8.2/NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run \
+  --sha256 2bc7f9be263d45a92331d781df33c14af1af01fcfa45e80102e80caf1ffaa74d \
+  --file NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+kctl node vgpu show node-193
+```
+
+The same record is `kind: NodeVgpu` for `kctl apply -f`. `kctl node reboot`
+reboots through the controller and refuses while a VM is set to run unless
+`--force` is set. Change a stopped VM with `kctl update vm web-01 --vgpu A2-4C`.
+
+```yaml
+kind: NodeVgpu
+metadata:
+  name: node-193
+spec:
+  hostCards: ["0000:61:00.0"]
+  manager:
+    url: http://192.168.40.10:18083/virtual-gpu-manager-8_v8.2/NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+    sha256: 2bc7f9be263d45a92331d781df33c14af1af01fcfa45e80102e80caf1ffaa74d
+    file: NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+    version: "595.91.04"
+---
+kind: VM
+metadata:
+  name: vgpu-01
+spec:
+  cpu: 4
+  memory: 8G
+  storageBackend: filesystem
+  storageSizeBytes: 40G
+  targetNode: node-193
+  vgpus: ["A2-4C"]
+  network: default
+  imageUrl: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+  imageSha256: 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
+```
+
+Terraform uses `kcore_vgpu_host` for the node and `vgpus = ["A2-4C"]` on
+`kcore_vm`. `kcore_gpus` reads the slice inventory. A requested `A2-4C` matches
+a stored `nvidia0/0=A2-4C`.
+
+The node must already be running a kcore generation that reports
+`vgpuManagerRun`. Older nodes refuse `ConfigureNodeVgpu` until
+`kctl update cluster` rolls that generation out.
