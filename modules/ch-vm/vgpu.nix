@@ -191,6 +191,8 @@ in
       };
       script = ''
         set -eu
+        # sriov-manage calls modprobe, lspci, and setpci by name.
+        export PATH="${pkgs.kmod}/bin:${pkgs.pciutils}/bin:${pkgs.gawk}/bin:${pkgs.coreutils}/bin:$PATH"
         if grep -q '^nouveau ' /proc/modules; then
           echo "nouveau is still loaded; NVIDIA vGPU starts after reboot"
           exit 0

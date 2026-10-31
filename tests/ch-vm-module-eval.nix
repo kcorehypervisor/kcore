@@ -270,6 +270,8 @@ assert lib.any (
   pkg: lib.hasPrefix "nvidia-vgpu-manager" (pkg.name or "")
 ) managerRunEval.config.boot.extraModulePackages;
 assert lib.hasInfix "sriov-manage" sriov.script;
+assert lib.hasInfix "kmod" sriov.script;
+assert lib.hasInfix "pciutils" sriov.script;
 assert lib.hasInfix "-e" sriov.script;
 assert !(lib.hasInfix "sriov_numvfs" sriov.script);
 assert mentions "vfio-bind-whole" wholeUnit.serviceConfig.ExecStartPre;
