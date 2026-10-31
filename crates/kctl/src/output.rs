@@ -3,8 +3,8 @@ use crate::client::node_proto;
 
 pub fn print_vm_table(vms: &[controller_proto::VmInfo]) {
     println!(
-        "{:<36}  {:<20}  {:>4}  {:>10}  {:>8}  {:<10}  {:<16}  {:<12}  {:<8}",
-        "ID", "NAME", "CPU", "MEMORY", "DISK", "STATE", "NODE", "HA", "PRIORITY"
+        "{:<36}  {:<20}  {:>4}  {:>10}  {:>8}  {:<10}  {:<16}  {:<12}  {:<8}  {:<16}",
+        "ID", "NAME", "CPU", "MEMORY", "DISK", "STATE", "NODE", "HA", "PRIORITY", "GPU"
     );
     for vm in vms {
         let state = vm_state_str(vm.state);
@@ -20,9 +20,14 @@ pub fn print_vm_table(vms: &[controller_proto::VmInfo]) {
         } else {
             vm.restart_priority.as_str()
         };
+        let gpu = if !vm.vgpus.is_empty() {
+            vm.vgpus.join(",")
+        } else {
+            vm.gpus.join(",")
+        };
         println!(
-            "{:<36}  {:<20}  {:>4}  {:>10}  {:>8}  {:<10}  {:<16}  {:<12}  {:<8}",
-            vm.id, vm.name, vm.cpu, mem, disk, state, vm.node_id, ha, priority
+            "{:<36}  {:<20}  {:>4}  {:>10}  {:>8}  {:<10}  {:<16}  {:<12}  {:<8}  {:<16}",
+            vm.id, vm.name, vm.cpu, mem, disk, state, vm.node_id, ha, priority, gpu
         );
     }
 }

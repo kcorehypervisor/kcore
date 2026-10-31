@@ -299,6 +299,16 @@ pub async fn get_node(info: &ConnectionInfo, node_id: &str) -> Result<()> {
             }
         }
     }
+
+    if let Ok(vgpu) = client
+        .get_node_vgpu(controller_proto::GetNodeVgpuRequest {
+            node_id: node_id.to_string(),
+        })
+        .await
+        .map(|r| r.into_inner())
+    {
+        print_node_vgpu(&vgpu);
+    }
     Ok(())
 }
 
@@ -1020,6 +1030,209 @@ fn infer_image_format_from_name(name: &str) -> String {
     } else {
         "raw".to_string()
     }
+}
+
+fn print_node_vgpu(vgpu: &controller_proto::GetNodeVgpuResponse) {
+    println!("\nvGPU host:");
+    if !vgpu.enabled {
+        println!("  disabled");
+        return;
+    }
+    let cards = if vgpu.host_cards.is_empty() {
+        "-".to_string()
+    } else {
+        vgpu.host_cards.join(", ")
+    };
+    let vfs = if vgpu.num_vfs == 0 {
+        "all".to_string()
+    } else {
+        vgpu.num_vfs.to_string()
+    };
+    let store = if vgpu.staged_store_path.is_empty() {
+        "-".to_string()
+    } else {
+        vgpu.staged_store_path.clone()
+    };
+    println!("  enabled");
+    println!("  Host cards: {cards}");
+    println!("  VFs:        {vfs}");
+    println!(
+        "  Manager:    {} ({})",
+        vgpu.manager_file, vgpu.manager_version
+    );
+    println!("  Store path: {store}");
+}
+
+pub async fn vgpu_show(info: &ConnectionInfo, node_id: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let vgpu = client
+        .get_node_vgpu(controller_proto::GetNodeVgpuRequest {
+            node_id: node_id.to_string(),
+        })
+        .await?
+        .into_inner();
+    println!("node {node_id}");
+    print_node_vgpu(&vgpu);
+    Ok(())
+}
+
+pub async fn vgpu_enable(
+    info: &ConnectionInfo,
+    node_id: &str,
+    host_cards: &[String],
+    num_vfs: i32,
+    url: &str,
+    sha256: &str,
+    file: &str,
+    version: &str,
+    reboot: bool,
+) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .configure_node_vgpu(controller_proto::ConfigureNodeVgpuRequest {
+            node_id: node_id.to_string(),
+            enabled: true,
+            host_cards: host_cards.to_vec(),
+            num_vfs,
+            manager: Some(controller_proto::VgpuManager {
+                url: url.to_string(),
+                sha256: sha256.to_string(),
+                file: file.to_string(),
+                version: version.to_string(),
+            }),
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        anyhow::bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    if !resp.store_path.is_empty() {
+        println!("store path: {}", resp.store_path);
+    }
+    if resp.reboot_required {
+        if reboot {
+            println!("reboot required; scheduling it");
+            reboot_node(&mut client, node_id, false).await?;
+        } else {
+            println!("reboot required; run `kctl node reboot {node_id}` before creating vGPU VMs");
+        }
+    }
+    Ok(())
+}
+
+pub async fn vgpu_disable(info: &ConnectionInfo, node_id: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .configure_node_vgpu(controller_proto::ConfigureNodeVgpuRequest {
+            node_id: node_id.to_string(),
+            enabled: false,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    if resp.success {
+        println!("{}", resp.message);
+        Ok(())
+    } else {
+        anyhow::bail!("{}", resp.message)
+    }
+}
+
+pub async fn reboot(info: &ConnectionInfo, node_id: &str, force: bool) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    reboot_node(&mut client, node_id, force).await
+}
+
+async fn reboot_node(
+    client: &mut controller_proto::controller_client::ControllerClient<tonic::transport::Channel>,
+    node_id: &str,
+    force: bool,
+) -> Result<()> {
+    let resp = client
+        .reboot_node(controller_proto::RebootNodeRequest {
+            node_id: node_id.to_string(),
+            force,
+        })
+        .await?
+        .into_inner();
+    if resp.success {
+        println!("{}", resp.message);
+        Ok(())
+    } else {
+        anyhow::bail!("{}", resp.message)
+    }
+}
+
+pub async fn apply_vgpu_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
+    let content = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&content).context("invalid NodeVgpu manifest")?;
+    let node_id = doc["metadata"]["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .context("NodeVgpu metadata.name is required")?
+        .to_string();
+    let enabled = doc["spec"]["enabled"].as_bool().unwrap_or(true);
+    if !enabled {
+        return vgpu_disable(info, &node_id).await;
+    }
+    let host_cards = yaml_strings(&doc["spec"], &["hostCards", "host_cards"]);
+    if host_cards.is_empty() {
+        anyhow::bail!("spec.hostCards must name at least one PCI address");
+    }
+    let num_vfs = doc["spec"]["numVfs"]
+        .as_i64()
+        .or_else(|| doc["spec"]["num_vfs"].as_i64())
+        .unwrap_or(0) as i32;
+    let manager = &doc["spec"]["manager"];
+    let url = yaml_str(manager, &["url"]).context("spec.manager.url is required")?;
+    let sha256 = yaml_str(manager, &["sha256"]).context("spec.manager.sha256 is required")?;
+    let file_name = yaml_str(manager, &["file"]).context("spec.manager.file is required")?;
+    let version = yaml_str(manager, &["version"]).unwrap_or_else(|| "595.91.04".to_string());
+    vgpu_enable(
+        info,
+        &node_id,
+        &host_cards,
+        num_vfs,
+        &url,
+        &sha256,
+        &file_name,
+        &version,
+        true,
+    )
+    .await
+}
+
+fn yaml_str(value: &serde_yaml::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn yaml_strings(value: &serde_yaml::Value, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        if let Some(seq) = value.get(*key).and_then(|item| item.as_sequence()) {
+            return seq
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.trim().to_string()))
+                .filter(|item| !item.is_empty())
+                .collect();
+        }
+        if let Some(one) = value.get(*key).and_then(|item| item.as_str()) {
+            let one = one.trim();
+            if !one.is_empty() {
+                return vec![one.to_string()];
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(test)]

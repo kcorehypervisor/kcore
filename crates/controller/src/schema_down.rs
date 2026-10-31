@@ -420,6 +420,11 @@ DROP TABLE IF EXISTS operator_credentials;",
 DROP TABLE IF EXISTS slurm_clusters;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 69,
+        sql: "DROP TABLE IF EXISTS node_vgpu;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

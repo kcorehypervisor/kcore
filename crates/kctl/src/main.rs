@@ -1237,6 +1237,12 @@ enum UpdateResource {
         /// Target node (optional)
         #[arg(long = "target-node")]
         target_node: Option<String>,
+        /// Whole GPU, NIC, or NVMe to attach. The VM must be stopped.
+        #[arg(long = "gpu")]
+        gpu: Vec<String>,
+        /// vGPU slice, for example A2-4C or nvidia0/0=A2-4C. The VM must be stopped.
+        #[arg(long = "vgpu")]
+        vgpu: Vec<String>,
     },
     /// Cluster / host OS updates (`ClusterUpdate` resource)
     #[command(name = "cluster", alias = "os")]
@@ -1683,6 +1689,59 @@ enum NodeAction {
         /// Optional expected SHA256 checksum
         #[arg(long = "image-sha256")]
         image_sha256: Option<String>,
+    },
+    /// Enable, show, or disable the NVIDIA vGPU host on a node
+    Vgpu {
+        #[command(subcommand)]
+        action: NodeVgpuAction,
+    },
+    /// Reboot a node through the controller
+    Reboot {
+        /// Node ID
+        node_id: String,
+        /// Reboot even when a VM is still set to run
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeVgpuAction {
+    /// Stage the Virtual GPU Manager and push the host configuration
+    Enable {
+        /// Node ID
+        node_id: String,
+        /// Physical function that stays on the NVIDIA host driver. Repeat for more cards.
+        #[arg(long = "host-card", required = true)]
+        host_card: Vec<String>,
+        /// Virtual functions to create. 0 asks the card for every function it supports.
+        #[arg(long = "num-vfs", default_value_t = 0)]
+        num_vfs: i32,
+        /// HTTP(S) URL of the NVIDIA Virtual GPU Manager .run file
+        #[arg(long)]
+        url: String,
+        /// SHA256 of the .run file
+        #[arg(long)]
+        sha256: String,
+        /// Installer filename, for example NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+        #[arg(long)]
+        file: String,
+        /// Driver version recorded in the host configuration
+        #[arg(long, default_value = "595.91.04")]
+        version: String,
+        /// Leave the node running even when the kernel change needs a reboot
+        #[arg(long)]
+        no_reboot: bool,
+    },
+    /// Show the stored vGPU host configuration
+    Show {
+        /// Node ID
+        node_id: String,
+    },
+    /// Remove the vGPU host configuration and push Nix without the manager
+    Disable {
+        /// Node ID
+        node_id: String,
     },
 }
 
@@ -2710,6 +2769,8 @@ async fn main() {
                     cpu,
                     memory,
                     target_node,
+                    gpu,
+                    vgpu,
                 },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -2720,6 +2781,8 @@ async fn main() {
                 memory.clone(),
                 target_node.clone(),
                 std::collections::HashMap::new(),
+                gpu.clone(),
+                vgpu.clone(),
             )
             .await
         }
@@ -3217,6 +3280,40 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::node::delete(&info, node_id).await
+        }
+
+        Command::Node {
+            action: NodeAction::Vgpu { action },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            match action {
+                NodeVgpuAction::Enable {
+                    node_id,
+                    host_card,
+                    num_vfs,
+                    url,
+                    sha256,
+                    file,
+                    version,
+                    no_reboot,
+                } => {
+                    commands::node::vgpu_enable(
+                        &info, node_id, host_card, *num_vfs, url, sha256, file, version, !no_reboot,
+                    )
+                    .await
+                }
+                NodeVgpuAction::Show { node_id } => commands::node::vgpu_show(&info, node_id).await,
+                NodeVgpuAction::Disable { node_id } => {
+                    commands::node::vgpu_disable(&info, node_id).await
+                }
+            }
+        }
+
+        Command::Node {
+            action: NodeAction::Reboot { node_id, force },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::node::reboot(&info, node_id, *force).await
         }
 
         Command::Node {

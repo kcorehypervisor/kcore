@@ -236,6 +236,39 @@ assert lib.elem "iommu=pt" vgpuCfg.boot.kernelParams;
 assert lib.elem "nouveau" vgpuCfg.boot.blacklistedKernelModules;
 assert vgpuCfg.environment.etc."kcore/vgpu-hosts".text == "0000:af:00.0\n";
 assert lib.hasInfix "vgpuProfile" vgpuCfg.environment.etc."kcore/ch-vm-features".text;
+assert lib.hasInfix "vgpuManagerRun" vgpuCfg.environment.etc."kcore/ch-vm-features".text;
+assert !(lib.elem "nvidia" vgpuCfg.boot.kernelModules);
+assert lib.hasInfix "modprobe nvidia" vgpuCfg.systemd.services.nvidia-modprobe.script;
+assert lib.hasInfix "nouveau is still loaded" vgpuCfg.systemd.services.nvidia-vgpu-mgr.script;
+assert vgpuCfg.systemd.services ? nvidia-vgpud;
+assert vgpuCfg.systemd.services ? nvidia-vgpu-mgr;
+assert lib.elem "nvidia-vgpu-mgr.service" (asList sriov.requires);
+let
+  managerRunEval = nixosSystem {
+    system = pkgs.stdenv.hostPlatform.system;
+    modules = [
+      ../modules/ch-vm
+      (
+        { ... }:
+        {
+          imports = [ vgpuBase ];
+          ch-vm.vgpu = {
+            enable = true;
+            hostCards = [ "0000:61:00.0" ];
+            managerRun = {
+              file = "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run";
+              sha256 = "2bc7f9be263d45a92331d781df33c14af1af01fcfa45e80102e80caf1ffaa74d";
+              version = "595.91.04";
+            };
+          };
+        }
+      )
+    ];
+  };
+in
+assert lib.any (
+  pkg: lib.hasPrefix "nvidia-vgpu-manager" (pkg.name or "")
+) managerRunEval.config.boot.extraModulePackages;
 assert lib.hasInfix "sriov-manage" sriov.script;
 assert lib.hasInfix "-e" sriov.script;
 assert !(lib.hasInfix "sriov_numvfs" sriov.script);

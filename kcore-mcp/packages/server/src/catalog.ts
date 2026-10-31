@@ -22,8 +22,9 @@ export const KINDS: ResourceKind[] = [
     yamlKind: "VM",
     title: "Virtual machine",
     summary: "Declarative VM. Re-applying updates cpu, memory, and desired power state. Disk, NIC, image, and SSH key changes require a replacement.",
-    mutable: ["cpu", "memoryBytes", "desiredState"],
+    mutable: ["cpu", "memoryBytes", "desiredState", "gpus", "vgpus"],
     immutable: [
+      "pciDevices",
       "network",
       "extraNetworks",
       "imageUrl",
@@ -186,6 +187,23 @@ export const KINDS: ResourceKind[] = [
       "Rolling NixOS update. Plan resolves nodes and blockers. Apply creates the update. Destroy cancels a non-terminal update and keeps history.",
     mutable: [],
     immutable: ["version", "flakeRef", "flakeRev"],
+  },
+  {
+    id: "gpus",
+    yamlKind: "Gpus",
+    title: "GPUs and PCI devices",
+    summary: "Read-only inventory. A name filters to one node. Rows include vGPU slices, the bound profile, and the profiles the card can create.",
+    mutable: [],
+    immutable: ["nodeId"],
+  },
+  {
+    id: "node-vgpu",
+    yamlKind: "NodeVgpu",
+    title: "vGPU host",
+    summary:
+      "Turns one node into an NVIDIA vGPU host. Apply stages the Virtual GPU Manager, pushes the Nix configuration, and reports when a reboot is required. Delete disables the host.",
+    mutable: ["hostCards", "numVfs", "managerUrl", "managerSha256", "managerFile", "managerVersion"],
+    immutable: ["nodeId"],
   },
 ];
 

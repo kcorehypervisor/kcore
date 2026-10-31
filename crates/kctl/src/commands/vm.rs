@@ -561,7 +561,17 @@ pub async fn label(
         }
         labels.insert(key.to_string(), value.to_string());
     }
-    update(info, vm_id, None, None, target_node, labels).await
+    update(
+        info,
+        vm_id,
+        None,
+        None,
+        target_node,
+        labels,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
 }
 
 pub async fn update(
@@ -571,6 +581,8 @@ pub async fn update(
     memory: Option<String>,
     target_node: Option<String>,
     labels: std::collections::HashMap<String, String>,
+    gpus: Vec<String>,
+    vgpus: Vec<String>,
 ) -> Result<()> {
     let memory_bytes = match &memory {
         Some(m) => client::parse_size_bytes(m).map_err(|e| anyhow::anyhow!(e))?,
@@ -585,6 +597,9 @@ pub async fn update(
             cpu: cpu.unwrap_or(0),
             memory_bytes,
             labels,
+            gpus,
+            vgpus,
+            pci_devices: Vec::new(),
         })
         .await?
         .into_inner();

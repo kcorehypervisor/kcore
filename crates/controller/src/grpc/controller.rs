@@ -161,6 +161,43 @@ struct LiveMigrateOutcome {
 /// but an operator-supplied `target_node` used to bypass them entirely — so
 /// `MigrateVm` and `DrainNode` would happily move a guest onto a node that was
 /// itself being evacuated, or one that has not been approved into the cluster.
+fn validate_vgpu_manager_file(file: &str) -> Result<String, Status> {
+    let file = file.trim();
+    if file.is_empty()
+        || file.contains('/')
+        || file.contains('\\')
+        || !file.ends_with(".run")
+        || !file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(Status::invalid_argument(
+            "manager.file must be the NVIDIA .run file name",
+        ));
+    }
+    Ok(file.to_string())
+}
+
+fn validate_vgpu_manager_sha256(sha: &str) -> Result<String, Status> {
+    let sha = sha.trim().to_ascii_lowercase();
+    if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Status::invalid_argument(
+            "manager.sha256 must be 64 hexadecimal characters",
+        ));
+    }
+    Ok(sha)
+}
+
+fn validate_vgpu_manager_url(url: &str) -> Result<String, Status> {
+    let url = url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) || url.contains(' ') {
+        return Err(Status::invalid_argument(
+            "manager.url must be an http or https URL",
+        ));
+    }
+    Ok(url.to_string())
+}
+
 #[allow(clippy::result_large_err)]
 fn gpu_info_from_row(
     row: crate::db::NodeGpuRow,
@@ -1260,28 +1297,57 @@ impl ControllerService {
         let ingress_nix = crate::ingress_reconciler::load_state(&self.db)
             .ok()
             .and_then(|st| crate::ingress_reconciler::ingress_nix_for_node(&st, node));
-        let nix_config = nixgen::with_postgresql(
-            nixgen::generate_node_config_inner(
-                &vms,
-                iface,
-                &self.default_network,
-                &networks,
-                &vm_ssh_keys,
-                &vxlan_peers,
-                &security_group_rules,
-                &incoming_ids,
-                &self
-                    .db
-                    .list_volumes()
-                    .map_err(|e| Status::internal(format!("listing volumes for nixgen: {e}")))?,
-                &guest_ops_keys,
-                &extra_nics_by_vm(&self.db, &vms),
-                &network_policies_by_name(&self.db, &node.id)?,
-                &vm_ipv6_by_vm(&self.db, &vms)?,
-                &module_features,
-                &vgpu,
+        let vgpu_host_row = self
+            .db
+            .get_node_vgpu(&node.id)
+            .map_err(|e| Status::internal(format!("reading vGPU host config: {e}")))?;
+        let vgpu_host =
+            vgpu_host_row
+                .as_ref()
+                .filter(|row| row.enabled)
+                .map(|row| nixgen::VgpuHostNix {
+                    host_cards: row
+                        .host_cards
+                        .split(',')
+                        .filter(|card| !card.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    num_vfs: row.num_vfs,
+                    file: row.manager_file.clone(),
+                    sha256: row.manager_sha256.clone(),
+                    version: row.manager_version.clone(),
+                });
+        if vgpu_host.is_some() && !module_features.vgpu_manager_run {
+            return Err(Status::failed_precondition(format!(
+                "node {} has a vGPU host configured but its ch-vm module does not report vgpuManagerRun; update the node first",
+                node.id
+            )));
+        }
+        let nix_config = nixgen::with_vgpu_host(
+            nixgen::with_postgresql(
+                nixgen::generate_node_config_inner(
+                    &vms,
+                    iface,
+                    &self.default_network,
+                    &networks,
+                    &vm_ssh_keys,
+                    &vxlan_peers,
+                    &security_group_rules,
+                    &incoming_ids,
+                    &self.db.list_volumes().map_err(|e| {
+                        Status::internal(format!("listing volumes for nixgen: {e}"))
+                    })?,
+                    &guest_ops_keys,
+                    &extra_nics_by_vm(&self.db, &vms),
+                    &network_policies_by_name(&self.db, &node.id)?,
+                    &vm_ipv6_by_vm(&self.db, &vms)?,
+                    &module_features,
+                    &vgpu,
+                ),
+                postgresql_nix.as_ref(),
             ),
-            postgresql_nix.as_ref(),
+            vgpu_host.as_ref(),
+            &module_features,
         );
         let nix_config = nixgen::with_ingress(nix_config, ingress_nix.as_ref());
 
@@ -8640,8 +8706,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
         let requested_storage_backend = normalize_storage_backend(req.storage_backend, true)?;
         let requested_storage_size_bytes = validate_storage_size_bytes(req.storage_size_bytes)?;
-        if (!pci_devices.is_empty() || wants_gpu || wants_vgpu) && req.target_node.trim().is_empty()
-        {
+        if (!pci_devices.is_empty() || wants_gpu) && req.target_node.trim().is_empty() {
             return Err(Status::invalid_argument(
                 "a PCI assignment requires target_node; the controller does not place passthrough devices automatically",
             ));
@@ -8665,6 +8730,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
             let compatible_nodes: Vec<NodeRow> = nodes
                 .into_iter()
                 .filter(|n| self.node_supports_backend(n, &requested_storage_backend))
+                .filter(|n| {
+                    !wants_vgpu || self.assign_vgpus_on_node(&n.id, &spec.vgpus, None).is_ok()
+                })
                 .collect();
             let target_dc = req.target_dc.trim();
             self.select_scheduled_node(
@@ -8676,6 +8744,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 &anti_affinity,
             )?
             .ok_or_else(|| {
+                if wants_vgpu && req.target_node.trim().is_empty() {
+                    return Status::unavailable(
+                        "no ready node has a free vGPU slice for the requested profile",
+                    );
+                }
                 if !anti_affinity.is_empty() {
                     Status::unavailable(format!(
                         "no ready node can place another VM in anti-affinity group '{anti_affinity}'"
@@ -8878,7 +8951,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
             let image_url = validate_image_url(image_url_input)?;
             let image_sha256 = validate_image_sha256(&req.image_sha256)?;
             let image_path = derive_local_image_path(&image_url, &image_sha256);
-            let image_format = derive_image_format(&image_url);
+            let image_format = if req.image_format.trim().is_empty() {
+                derive_image_format(&image_url)
+            } else {
+                normalize_image_format(&req.image_format)?
+            };
             (image_url, image_sha256, image_path, image_format)
         } else {
             let image_path = validate_image_path(image_path_input)?;
@@ -9219,9 +9296,27 @@ impl controller_proto::controller_server::Controller for ControllerService {
             None
         };
 
-        if cpu.is_none() && mem.is_none() && req.labels.is_empty() {
+        let wants_gpu = req.gpus.iter().any(|gpu| !gpu.trim().is_empty());
+        let wants_vgpu = req.vgpus.iter().any(|gpu| !gpu.trim().is_empty());
+        let wants_pci = req.pci_devices.iter().any(|addr| !addr.trim().is_empty());
+        if cpu.is_none()
+            && mem.is_none()
+            && req.labels.is_empty()
+            && !wants_gpu
+            && !wants_vgpu
+            && !wants_pci
+        {
             return Err(Status::invalid_argument(
-                "at least one of cpu, memory_bytes, or labels must be set",
+                "at least one of cpu, memory_bytes, labels, gpus, vgpus, or pci_devices must be set",
+            ));
+        }
+        let device_changes = [wants_gpu, wants_vgpu, wants_pci]
+            .into_iter()
+            .filter(|wanted| *wanted)
+            .count();
+        if device_changes > 1 {
+            return Err(Status::invalid_argument(
+                "gpus, vgpus, and pci_devices are mutually exclusive",
             ));
         }
 
@@ -9261,6 +9356,45 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 return Err(Status::not_found(format!("VM '{}' not found", req.vm_id)));
             }
             labels_body = serde_json::json!(labels);
+        }
+
+        if wants_gpu || wants_vgpu || wants_pci {
+            let vm = self
+                .db
+                .get_vm(&req.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+                .or_else(|| {
+                    self.db
+                        .list_vms_for_node(&node.id)
+                        .ok()
+                        .and_then(|rows| rows.into_iter().find(|vm| vm.name == req.vm_id))
+                })
+                .ok_or_else(|| Status::not_found(format!("VM '{}' not found", req.vm_id)))?;
+            let running = vm.auto_start
+                || matches!(vm.runtime_state.as_str(), "running" | "starting" | "paused");
+            if running {
+                return Err(Status::failed_precondition(format!(
+                    "VM '{}' must be stopped before its GPU assignment can change",
+                    vm.name
+                )));
+            }
+            if wants_pci {
+                let joined = crate::pci::join_pci_devices(&req.pci_devices)
+                    .map_err(Status::invalid_argument)?;
+                self.db
+                    .set_vm_pci_devices(&vm.id, &joined)
+                    .map_err(|e| Status::internal(format!("storing PCI devices: {e}")))?;
+                self.db
+                    .clear_vm_gpu(&vm.id)
+                    .map_err(|e| Status::internal(format!("clearing GPU assignment: {e}")))?;
+            } else {
+                let (names, functions) = if wants_vgpu {
+                    self.assign_vgpus_on_node(&node.id, &req.vgpus, Some(&vm.id))?
+                } else {
+                    self.assign_gpus_on_node(&node.id, &req.gpus, Some(&vm.id))?
+                };
+                self.store_gpu_assignment(&vm, &names, &functions)?;
+            }
         }
 
         info!(vm_id = %req.vm_id, cpu = ?cpu, memory_bytes = ?mem, "updated VM spec, pushing config");
@@ -9966,6 +10100,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 let state = live_states[i].unwrap_or(fallback_states[i]);
                 let policy = ha_rows.iter().find(|row| row.vm_id == vm.id);
                 let replica = policy.map(|row| row.replica_node.as_str()).unwrap_or("");
+                let bindings = self.vm_gpu_names(&vm.id).unwrap_or_default();
+                let (gpus, vgpus): (Vec<String>, Vec<String>) =
+                    bindings.into_iter().partition(|name| !name.contains('='));
                 controller_proto::VmInfo {
                     id: vm.id,
                     name: vm.name,
@@ -9986,6 +10123,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
                         .map(|row| i32::try_from(row.replica_interval_secs).unwrap_or(0))
                         .unwrap_or(0),
                     guest_heartbeat_unix: policy.map(|row| row.last_guest_heartbeat).unwrap_or(0),
+                    gpus,
+                    vgpus,
                 }
             })
             .collect();
@@ -11849,6 +11988,204 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map(|row| gpu_info_from_row(row, &assigned))
             .collect();
         Ok(Response::new(controller_proto::ListGpusResponse { gpus }))
+    }
+
+    async fn configure_node_vgpu(
+        &self,
+        request: Request<controller_proto::ConfigureNodeVgpuRequest>,
+    ) -> Result<Response<controller_proto::ConfigureNodeVgpuResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        let node_id = req.node_id.trim();
+        if node_id.is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node {node_id} not found")))?;
+        if !req.enabled {
+            self.db
+                .delete_node_vgpu(&node.id)
+                .map_err(|e| Status::internal(format!("clearing vGPU host config: {e}")))?;
+            self.push_config_to_node(&node).await?;
+            return Ok(Response::new(controller_proto::ConfigureNodeVgpuResponse {
+                success: true,
+                message: format!("vGPU host disabled on {}", node.id),
+                reboot_required: false,
+                store_path: String::new(),
+            }));
+        }
+        if req.host_cards.is_empty() {
+            return Err(Status::invalid_argument(
+                "host_cards must name at least one NVIDIA physical function",
+            ));
+        }
+        let mut host_cards = Vec::with_capacity(req.host_cards.len());
+        for card in &req.host_cards {
+            host_cards.push(crate::pci::normalize_pci_bdf(card).map_err(Status::invalid_argument)?);
+        }
+        let manager = req.manager.unwrap_or_default();
+        let file = validate_vgpu_manager_file(&manager.file)?;
+        let sha256 = validate_vgpu_manager_sha256(&manager.sha256)?;
+        let url = validate_vgpu_manager_url(&manager.url)?;
+        let version = if manager.version.trim().is_empty() {
+            "595.91.04".to_string()
+        } else {
+            manager.version.trim().to_string()
+        };
+        if req.num_vfs < 0 {
+            return Err(Status::invalid_argument("num_vfs must be >= 0"));
+        }
+        let inventory = self.node_gpu_inventory(&node.id)?;
+        for card in &host_cards {
+            let found = inventory.iter().any(|dev| {
+                dev.family == "nvidia"
+                    && dev.parent.is_empty()
+                    && dev.address.eq_ignore_ascii_case(card)
+            });
+            if !found {
+                return Err(Status::failed_precondition(format!(
+                    "node {} has no NVIDIA GPU at {card}",
+                    node.id
+                )));
+            }
+        }
+        let mut admin = self.ensure_admin_client_for_node(&node).await?;
+        let features = self.ch_vm_module_features(&node, &mut admin).await;
+        if !features.vgpu_manager_run {
+            return Err(Status::failed_precondition(format!(
+                "node {} does not report vgpuManagerRun; update kcore on the node before enabling vGPU",
+                node.id
+            )));
+        }
+        let staged = admin
+            .stage_vgpu_manager(node_proto::StageVgpuManagerRequest {
+                url: url.clone(),
+                sha256: sha256.clone(),
+                file: file.clone(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("staging Virtual GPU Manager: {e}")))?
+            .into_inner();
+        if !staged.success || staged.store_path.is_empty() {
+            return Err(Status::internal(format!(
+                "node {} did not stage the Virtual GPU Manager: {}",
+                node.id, staged.message
+            )));
+        }
+        self.db
+            .upsert_node_vgpu(&crate::db::NodeVgpuRow {
+                node_id: node.id.clone(),
+                enabled: true,
+                host_cards: host_cards.join(","),
+                num_vfs: req.num_vfs,
+                manager_file: file,
+                manager_sha256: sha256,
+                manager_version: version,
+                manager_url: url,
+                staged_store_path: staged.store_path.clone(),
+            })
+            .map_err(|e| Status::internal(format!("storing vGPU host config: {e}")))?;
+        self.push_config_and_await_apply(&node).await?;
+        let reboot_required = host_cards.iter().any(|card| {
+            inventory.iter().any(|dev| {
+                dev.address.eq_ignore_ascii_case(card)
+                    && (dev.iommu_group < 0
+                        || dev.driver == "nouveau"
+                        || dev.driver.is_empty()
+                        || dev.driver != "nvidia")
+            })
+        });
+        Ok(Response::new(controller_proto::ConfigureNodeVgpuResponse {
+            success: true,
+            message: format!("vGPU host enabled on {}", node.id),
+            reboot_required,
+            store_path: staged.store_path,
+        }))
+    }
+
+    async fn get_node_vgpu(
+        &self,
+        request: Request<controller_proto::GetNodeVgpuRequest>,
+    ) -> Result<Response<controller_proto::GetNodeVgpuResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        let node_id = req.node_id.trim();
+        if node_id.is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+        let row = self
+            .db
+            .get_node_vgpu(node_id)
+            .map_err(|e| Status::internal(format!("reading vGPU host config: {e}")))?;
+        let Some(row) = row else {
+            return Ok(Response::new(controller_proto::GetNodeVgpuResponse {
+                enabled: false,
+                ..Default::default()
+            }));
+        };
+        Ok(Response::new(controller_proto::GetNodeVgpuResponse {
+            enabled: row.enabled,
+            host_cards: row
+                .host_cards
+                .split(',')
+                .filter(|card| !card.is_empty())
+                .map(str::to_string)
+                .collect(),
+            num_vfs: row.num_vfs,
+            manager_file: row.manager_file,
+            manager_sha256: row.manager_sha256,
+            manager_version: row.manager_version,
+            staged_store_path: row.staged_store_path,
+        }))
+    }
+
+    async fn reboot_node(
+        &self,
+        request: Request<controller_proto::RebootNodeRequest>,
+    ) -> Result<Response<controller_proto::RebootNodeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        let node_id = req.node_id.trim();
+        if node_id.is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+        let node = self
+            .db
+            .get_node(node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node {node_id} not found")))?;
+        let vms = self
+            .db
+            .list_vms_for_node(&node.id)
+            .map_err(|e| Status::internal(format!("listing VMs: {e}")))?;
+        let busy = vms.iter().any(|vm| {
+            vm.auto_start || matches!(vm.runtime_state.as_str(), "running" | "starting" | "paused")
+        });
+        if busy && !req.force {
+            return Err(Status::failed_precondition(format!(
+                "node {} still has a VM set to run; stop it or pass force",
+                node.id
+            )));
+        }
+        let mut admin = self.ensure_admin_client_for_node(&node).await?;
+        let reply = admin
+            .reboot_node(node_proto::RebootNodeRequest {})
+            .await
+            .map_err(|e| Status::internal(format!("rebooting {}: {e}", node.id)))?
+            .into_inner();
+        if !reply.success {
+            return Err(Status::internal(format!(
+                "node {} did not schedule a reboot: {}",
+                node.id, reply.message
+            )));
+        }
+        Ok(Response::new(controller_proto::RebootNodeResponse {
+            success: true,
+            message: format!("reboot scheduled on {}", node.id),
+        }))
     }
 
     async fn list_nodes(

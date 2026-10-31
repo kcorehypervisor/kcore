@@ -744,6 +744,7 @@ in
       imageSha256
       cloudHypervisorPatches
       vgpuProfile
+      vgpuManagerRun
       localLiveMigrate
       cloudInitGuestOpsKeys
     '';

@@ -30,6 +30,7 @@ mod registration;
 mod runtime;
 mod storage;
 mod system_update;
+mod vgpu_stage;
 mod vmm;
 mod volume_crypto;
 mod volume_mirror;

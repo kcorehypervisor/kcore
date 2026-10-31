@@ -47,6 +47,7 @@ const INTENT: Array<[RegExp, string]> = [
   [/\bingress routes?\b/i, "ingress-route"],
   [/\bingress gateways?\b|\bhttps load balancer\b/i, "ingress-gateway"],
   [/\bcluster updates?\b|\brolling update\b/i, "cluster-update"],
+  [/\bvgpu hosts?\b|\bnode vgpu\b/i, "node-vgpu"],
   [/\bclusters?\b|\bcontext\b|\bbootstrap\b/i, "cluster"],
 ];
 
@@ -107,6 +108,43 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
       ].filter((item) => item.required || missing(spec, item.id));
     case "vm":
       return vmQuestions(spec);
+    case "gpus":
+      return [
+        question(
+          "name",
+          "Which node should the GPU inventory come from?",
+          "Leave it empty to list every node. The rows include vGPU slices and the profiles each card can create.",
+          false,
+          { example: "node-193" },
+        ),
+      ].filter((item) => item.required || missing(spec, item.id));
+    case "node-vgpu":
+      return [
+        question("nodeId", "Which node should become the vGPU host?", "The node must already report the vgpuManagerRun feature.", missing(spec, "nodeId") && missing(spec, "name"), {
+          example: "node-193",
+        }),
+        question(
+          "hostCards",
+          "Which physical functions stay on the NVIDIA host driver?",
+          "Use the PCI address from kcore_read kind gpus, for example 0000:61:00.0.",
+          missing(spec, "hostCards"),
+          { example: "0000:61:00.0" },
+        ),
+        question(
+          "managerUrl",
+          "Where can the node download the Virtual GPU Manager .run file?",
+          "An http or https URL. The node checks the SHA256 before adding the file to the Nix store.",
+          missing(spec, "managerUrl"),
+        ),
+        question("managerSha256", "What is the SHA256 of that .run file?", "A mismatch refuses the stage.", missing(spec, "managerSha256")),
+        question(
+          "managerFile",
+          "What is the installer filename?",
+          "The filename must end in .run and must not contain a slash.",
+          missing(spec, "managerFile"),
+          { example: "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run" },
+        ),
+      ].filter((item) => item.required || missing(spec, item.id));
     case "network":
       return [
         question("name", "What should the network be called?", "VMs attach to this name.", missing(spec, "name"), {
@@ -570,8 +608,22 @@ function vmQuestions(spec: Record<string, unknown>): Question[] {
     question(
       "placement",
       "Pin it to a node or datacenter, or let the scheduler choose?",
-      "targetNode is immutable. Leaving it empty lets the controller place the VM.",
+      "A vGPU slice can be placed automatically. A whole GPU still needs a node that owns that card.",
       false,
+    ),
+    question(
+      "gpu",
+      "Does this VM need a whole GPU, a vGPU slice, or no accelerator?",
+      "Set gpus for a whole card, vgpus for a slice such as A2-4C, or pciDevices for a raw function. Leave them empty for no accelerator.",
+      false,
+      { example: "vgpus: [A2-4C]" },
+    ),
+    question(
+      "vgpuProfile",
+      "Which vGPU profile should the slice use?",
+      "A2-4C is one quarter of a 16 GB Tesla A2. The VM must be stopped before the slice can change.",
+      false,
+      { example: "A2-4C" },
     ),
   );
   return items.filter((item) => {
@@ -580,6 +632,9 @@ function vmQuestions(spec: Record<string, unknown>): Question[] {
     if (item.id === "memory") return missing(spec, "memory") && missing(spec, "memoryBytes");
     if (item.id === "desiredState") return missing(spec, "desiredState");
     if (item.id === "placement") return missing(spec, "targetNode") && missing(spec, "dc");
+    if (item.id === "gpu" || item.id === "vgpuProfile") {
+      return missing(spec, "gpus") && missing(spec, "vgpus") && missing(spec, "pciDevices");
+    }
     return true;
   });
 }
