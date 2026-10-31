@@ -841,7 +841,7 @@ fn vf_function(vf: &PciFn) -> u32 {
 
 fn build_slice(parent: &GpuDevice, vf: &PciFn, index: u32, devices: &[PciFn]) -> GpuDevice {
     let (mut assignable, mut blocked_reason, functions, group) = assignment(vf, devices);
-    let (profile, profiles) = slice_profile(vf);
+    let (profile, profiles) = slice_profile(vf, devices);
     if assignable && vf.mdev && vf.vgpu_types.is_empty() && vf.vgpu_current.is_none() {
         assignable = false;
         blocked_reason = "mdev vGPU is not supported; install vGPU 17 or later".into();
@@ -905,14 +905,17 @@ fn build_slice(parent: &GpuDevice, vf: &PciFn, index: u32, devices: &[PciFn]) ->
     }
 }
 
-fn slice_profile(vf: &PciFn) -> (String, Vec<String>) {
+fn slice_profile(vf: &PciFn, devices: &[PciFn]) -> (String, Vec<String>) {
     let profiles: Vec<String> = vf.vgpu_types.iter().map(|(_, name)| name.clone()).collect();
     let profile = match vf.vgpu_current {
-        Some(id) if id != 0 => vf
-            .vgpu_types
+        Some(id) if id != 0 => devices
             .iter()
-            .find(|(type_id, _)| *type_id == id)
-            .map(|(_, name)| name.clone())
+            .find_map(|dev| {
+                dev.vgpu_types
+                    .iter()
+                    .find(|(type_id, _)| *type_id == id)
+                    .map(|(_, name)| name.clone())
+            })
             .unwrap_or_else(|| id.to_string()),
         _ => String::new(),
     };
@@ -1601,6 +1604,46 @@ mod tests {
         let rows = scan_pci(root).unwrap();
         let slice = rows.iter().find(|dev| dev.role == "slice").unwrap();
         assert_eq!(slice.profile, "A2-4C");
+    }
+
+    #[test]
+    fn programmed_slice_borrows_the_type_name_from_a_free_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:af:00.0",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("42"),
+        );
+        link_driver(root, "0000:af:00.0", "nvidia");
+        for (addr, current, types) in [
+            ("0000:af:00.4", "754", "ID    : vGPU Name\n"),
+            ("0000:af:00.5", "0", "754 : NVIDIA A2-4C\n"),
+        ] {
+            write_fn(root, addr, "0x10de", "0x25b6", "0x030200", Some("43"));
+            link_driver(root, addr, "nvidia");
+            fs::create_dir_all(root.join(addr).join("nvidia")).unwrap();
+            fs::write(
+                root.join(addr).join("nvidia").join("creatable_vgpu_types"),
+                types,
+            )
+            .unwrap();
+            fs::write(
+                root.join(addr).join("nvidia").join("current_vgpu_type"),
+                current,
+            )
+            .unwrap();
+        }
+        write_sriov_card(root, "0000:af:00.0", &["0000:af:00.4", "0000:af:00.5"]);
+        let rows = scan_pci(root).unwrap();
+        let programmed = rows
+            .iter()
+            .find(|dev| dev.address == "0000:af:00.4")
+            .unwrap();
+        assert_eq!(programmed.profile, "A2-4C");
     }
 
     #[test]
