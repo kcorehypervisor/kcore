@@ -364,6 +364,19 @@ let
         else
           "--memory size=${toString vmCfg.memorySize}M";
 
+      # NVIDIA's vGPU manager scans the VMM argv for QEMU's `-uuid <uuid>`.
+      # Without that pair it logs a generated PID uuid and the guest driver
+      # cannot read the slice. The Cloud Hypervisor patch hides the pair from
+      # clap and leaves it in the real command line.
+      vgpuUuidHex = builtins.substring 0 32 (builtins.hashString "sha256" "kcore-vgpu-${vmName}");
+      vgpuUuid = "${builtins.substring 0 8 vgpuUuidHex}-${builtins.substring 8 4 vgpuUuidHex}-4${
+        builtins.substring 12 3 vgpuUuidHex
+      }-a${builtins.substring 15 3 vgpuUuidHex}-${builtins.substring 18 12 vgpuUuidHex}";
+      vgpuUuidArgs = lib.optionals (vgpuDevices != [ ]) [
+        "-uuid"
+        vgpuUuid
+      ];
+
       chArgs = lib.concatStringsSep " " (
         [
           "--api-socket ${socketPath}"
@@ -377,6 +390,7 @@ let
         ++ map (dev: "--device path=/sys/bus/pci/devices/${dev.address},iommu=on") normalizedPci
         ++ map (iface: "--net tap=${iface.tap},mac=${iface.macAddress}") ifaces
         ++ vmCfg.extraArgs
+        ++ vgpuUuidArgs
       );
 
       liveMigratedMarker = "${cfg.socketDir}/${vmName}.live-migrated";

@@ -374,11 +374,13 @@ in
       default = [
         ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch
         ./patches/cloud-hypervisor-51.1-vfio-config-identity.patch
+        ./patches/cloud-hypervisor-51.1-vgpu-qemu-uuid.patch
       ];
       defaultText = lib.literalExpression ''
         [
           ./patches/cloud-hypervisor-51.1-tolerate-tsc-khz-einval.patch
           ./patches/cloud-hypervisor-51.1-vfio-config-identity.patch
+          ./patches/cloud-hypervisor-51.1-vgpu-qemu-uuid.patch
         ]
       '';
       description = ''
@@ -388,8 +390,9 @@ in
         QEMU warns and continues, upstream Cloud Hypervisor aborts). The VFIO
         identity patch keeps a guest's vendor, class, and subsystem registers
         equal to the device config space. An NVIDIA vGPU virtual function
-        needs that, because those registers carry the physical GPU's id. Set
-        to [] to run the package unmodified.
+        needs that, because those registers carry the physical GPU's id. The
+        UUID patch leaves QEMU's `-uuid` on the VMM command line so the vGPU
+        manager can virtualize the slice. Set to [] to run the package unmodified.
       '';
     };
 
