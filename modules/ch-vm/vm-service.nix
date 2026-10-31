@@ -457,15 +457,21 @@ let
             current=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/driver")")
           fi
           if [ "$current" = "vfio-pci" ]; then
-            echo "vGPU slice $addr is bound to vfio-pci; a vGPU slice stays on nvidia-vgpu-vfio"
-            exit 1
-          fi
-          if [ "$current" != "nvidia-vgpu-vfio" ]; then
-            echo "vGPU slice $addr driver is ''${current:-unbound}; a vGPU slice must use nvidia-vgpu-vfio"
+            echo "vGPU slice $addr is bound to vfio-pci; a vGPU slice stays on nvidia or nvidia-vgpu-vfio"
             exit 1
           fi
           types="$dev/nvidia/creatable_vgpu_types"
           current_file="$dev/nvidia/current_vgpu_type"
+          # Manager 595 binds the function to nvidia and publishes types there.
+          # Older managers bind nvidia-vgpu-vfio. Both expose the same sysfs.
+          if [ "$current" = "nvidia-vgpu-vfio" ]; then
+            :
+          elif [ "$current" = "nvidia" ] && [ -s "$types" ]; then
+            :
+          else
+            echo "vGPU slice $addr driver is ''${current:-unbound}; a vGPU slice must use nvidia or nvidia-vgpu-vfio"
+            exit 1
+          fi
           id=$(${pkgs.gnugrep}/bin/grep -E '^[[:space:]]*[0-9]+[[:space:]]*:[[:space:]]*NVIDIA[[:space:]]+${dev.vgpuProfile}[[:space:]]*$' "$types" | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.coreutils}/bin/head -n1)
           if [ -z "$id" ]; then
             echo "vGPU slice $addr cannot take profile ${dev.vgpuProfile}"

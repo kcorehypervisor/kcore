@@ -47,8 +47,19 @@ pub enum VgpuSelector {
     Slice { name: String, profile: String },
 }
 
-/// NVIDIA's SR-IOV vGPU driver. A slice stays on this driver.
+/// Older Virtual GPU Managers bind each virtual function to this driver.
 pub const NVIDIA_VFIO_DRIVER: &str = "nvidia-vgpu-vfio";
+
+/// Virtual GPU Manager 595 binds each virtual function to `nvidia` and
+/// publishes `nvidia/creatable_vgpu_types`. The vfio device node is created
+/// beside that binding. A function with no types is not a slice.
+fn slice_driver_ok(vf: &PciFn) -> bool {
+    if vf.driver == NVIDIA_VFIO_DRIVER {
+        return true;
+    }
+    vf.driver == "nvidia"
+        && (!vf.vgpu_types.is_empty() || vf.vgpu_current.is_some_and(|id| id != 0))
+}
 
 /// `radeon0` picks that device. `radeon` picks the first free device of that family.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -844,15 +855,20 @@ fn build_slice(parent: &GpuDevice, vf: &PciFn, index: u32, devices: &[PciFn]) ->
         blocked_reason = format!("parent {} driver is {driver}, not nvidia", parent.address);
     } else if assignable && vf.driver == "vfio-pci" {
         assignable = false;
-        blocked_reason = "bound to vfio-pci; a vGPU slice stays on nvidia-vgpu-vfio".into();
-    } else if assignable && vf.driver != NVIDIA_VFIO_DRIVER {
+        blocked_reason =
+            "bound to vfio-pci; a vGPU slice stays on nvidia or nvidia-vgpu-vfio".into();
+    } else if assignable && !slice_driver_ok(vf) {
         assignable = false;
         let driver = if vf.driver.is_empty() {
             "unbound"
         } else {
             vf.driver.as_str()
         };
-        blocked_reason = format!("bound to {driver}; a vGPU slice must use nvidia-vgpu-vfio");
+        blocked_reason = if driver == "nvidia" {
+            "bound to nvidia but this function has no vGPU types".into()
+        } else {
+            format!("bound to {driver}; a vGPU slice must use nvidia or nvidia-vgpu-vfio")
+        };
     }
     let mut parts = vec![
         "purpose=ai".to_string(),
@@ -1630,6 +1646,84 @@ mod tests {
         assert!(!slice.assignable);
         assert!(
             slice.blocked_reason.contains("vfio-pci"),
+            "{}",
+            slice.blocked_reason
+        );
+    }
+
+    #[test]
+    fn nvidia_bound_function_with_types_is_a_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:af:00.0",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("42"),
+        );
+        link_driver(root, "0000:af:00.0", "nvidia");
+        write_fn(
+            root,
+            "0000:af:00.4",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("43"),
+        );
+        link_driver(root, "0000:af:00.4", "nvidia");
+        fs::create_dir_all(root.join("0000:af:00.4").join("nvidia")).unwrap();
+        fs::write(
+            root.join("0000:af:00.4")
+                .join("nvidia")
+                .join("creatable_vgpu_types"),
+            "754 : NVIDIA A2-4C\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("0000:af:00.4")
+                .join("nvidia")
+                .join("current_vgpu_type"),
+            "0",
+        )
+        .unwrap();
+        write_sriov_card(root, "0000:af:00.0", &["0000:af:00.4"]);
+        let rows = scan_pci(root).unwrap();
+        let slice = rows.iter().find(|dev| dev.role == "slice").unwrap();
+        assert!(slice.assignable, "{}", slice.blocked_reason);
+        assert!(slice.profiles.iter().any(|name| name == "A2-4C"));
+        assert_eq!(slice.driver, "nvidia");
+    }
+
+    #[test]
+    fn nvidia_bound_function_without_types_stays_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_fn(
+            root,
+            "0000:af:00.0",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("42"),
+        );
+        link_driver(root, "0000:af:00.0", "nvidia");
+        write_fn(
+            root,
+            "0000:af:00.4",
+            "0x10de",
+            "0x25b6",
+            "0x030200",
+            Some("43"),
+        );
+        link_driver(root, "0000:af:00.4", "nvidia");
+        write_sriov_card(root, "0000:af:00.0", &["0000:af:00.4"]);
+        let rows = scan_pci(root).unwrap();
+        let slice = rows.iter().find(|dev| dev.role == "slice").unwrap();
+        assert!(!slice.assignable);
+        assert!(
+            slice.blocked_reason.contains("no vGPU types"),
             "{}",
             slice.blocked_reason
         );

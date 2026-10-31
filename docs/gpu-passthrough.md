@@ -113,6 +113,9 @@ host driver by hand when the host should use it again.
 `--vgpu nvidia0=A2-4C`, or `--vgpu nvidia0/0=A2-4C`. The physical function
 stays on the NVIDIA host driver. The node writes the profile onto one virtual
 function and never binds that card, or the function, to `vfio-pci`.
+Virtual GPU Manager 595.91 binds each function to `nvidia` and publishes
+`nvidia/creatable_vgpu_types`. An older manager binds the function to
+`nvidia-vgpu-vfio`. Both are a slice when that file lists profiles.
 
 Turn the node into a vGPU host before creating guests. The controller stages
 the NVIDIA Virtual GPU Manager, renders `ch-vm.vgpu.managerRun`, and says when

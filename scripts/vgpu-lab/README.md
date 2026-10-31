@@ -11,8 +11,10 @@ what to bring back into the tree.
 
 Whole-device passthrough is unchanged. `--gpu nvidia0` still means the whole
 card, bound to `vfio-pci`. A vGPU host card, and every virtual function of
-that card, must stay off `vfio-pci`. The function's driver is
-`nvidia-vgpu-vfio`. The physical function stays on `nvidia`.
+that card, must stay off `vfio-pci`. Virtual GPU Manager 595.91 binds each
+function to `nvidia` and publishes `nvidia/creatable_vgpu_types`. An older
+manager binds the function to `nvidia-vgpu-vfio`. The physical function stays
+on `nvidia`.
 
 ## Before the card arrives
 
@@ -36,9 +38,11 @@ only reads.
 4. Enable SR-IOV with `sriov-manage -e PF`, or write a chosen count to
    `sriov_numvfs` once you know how many functions you want. Confirm
    `virtfn0` appears.
-5. Confirm each virtual function's driver is `nvidia-vgpu-vfio`. If a
-   function is on `vfio-pci`, unbind it and stop. A function on `vfio-pci`
-   is not a vGPU slice.
+5. Confirm each virtual function's driver is `nvidia` (manager 595) or
+   `nvidia-vgpu-vfio` (older managers), and that
+   `nvidia/creatable_vgpu_types` lists profiles. If a function is on
+   `vfio-pci`, unbind it and stop. A function on `vfio-pci` is not a vGPU
+   slice.
 6. Read `nvidia/creatable_vgpu_types` on one function. Pick one profile name
    from that file. The names used in this tree, such as `A2-4C`, are the
    request syntax; the number beside the name is what the card accepts. One
