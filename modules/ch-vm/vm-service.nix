@@ -46,6 +46,9 @@ let
       rbdImage = if vmCfg.rbdImage != "" then vmCfg.rbdImage else "kcore-${vmName}";
       rbdDevice = "/dev/rbd/${cfg.rbdPool}/${rbdImage}";
 
+      # A filesystem guest gets its own raw file. The downloaded image stays
+      # a read-only seed, so two guests can share one cloud image.
+      fsDisk = "/var/lib/kcore/disks/${vmName}.raw";
       actualDisk =
         if isLvm then
           lvDevice
@@ -54,10 +57,10 @@ let
         else if isCeph then
           rbdDevice
         else
-          toString vmCfg.image;
-      # Block backends are always seeded as raw. For an in-place image the real
-      # format is sniffed in the start script (see srcFormatFn).
-      actualFormat = if isBlockBackend then "raw" else "$ROOT_FMT";
+          fsDisk;
+      # Every backend seeds a raw disk. The source image format is sniffed
+      # only for qemu-img convert.
+      actualFormat = "raw";
 
       # LVM and ZFS guests open a stable device-mapper name so a live migration
       # can reload the table (linear → mirror) without Cloud Hypervisor seeing
@@ -118,6 +121,28 @@ let
               "true"
           }
         }
+      '';
+
+      fsProvisionScript = pkgs.writeShellScript "fs-provision-${vmName}" ''
+        set -e
+        ${srcFormatFn}
+        ${verifySourceFn}
+        DISK="${fsDisk}"
+        SIZE_BYTES="${toString vmCfg.storageSizeBytes}"
+        SEED_MARKER="${seedMarker}"
+        ${pkgs.coreutils}/bin/mkdir -p "$(dirname "$DISK")" "$(dirname "$SEED_MARKER")"
+        if [ ! -f "$SEED_MARKER" ]; then
+          verify_source ${toString vmCfg.image}
+          echo "Seeding $DISK from ${toString vmCfg.image}..."
+          ${pkgs.qemu-utils}/bin/qemu-img convert \
+            -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
+            ${toString vmCfg.image} "$DISK"
+          size="$(${pkgs.coreutils}/bin/stat -c %s "$DISK")"
+          if [ "$size" -lt "$SIZE_BYTES" ]; then
+            ${pkgs.coreutils}/bin/truncate -s "$SIZE_BYTES" "$DISK"
+          fi
+          touch "$SEED_MARKER"
+        fi
       '';
 
       lvmProvisionScript = pkgs.writeShellScript "lvm-provision-${vmName}" ''
@@ -581,7 +606,7 @@ let
           else if isCeph then
             "${cephMapScript}"
           else
-            "true"
+            "${fsProvisionScript}"
         }
       '';
 

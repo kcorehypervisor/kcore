@@ -173,6 +173,15 @@ in
           echo "nouveau is still loaded; NVIDIA vGPU starts after reboot"
           exit 0
         fi
+        # nvidia-vgpu-mgr dlopens libnvidia-vgpu.so by that name. The package
+        # ships a versioned file, and dlopen does not search the binary rpath.
+        libdir=/run/kcore/nvidia-vgpu-lib
+        ${pkgs.coreutils}/bin/mkdir -p "$libdir"
+        for base in libnvidia-vgpu libnvidia-vgxcfg libnvidia-ml; do
+          src=$(${pkgs.coreutils}/bin/ls ${manage}/lib/$base.so.[0-9]*.[0-9]*.[0-9]* | ${pkgs.coreutils}/bin/head -n1)
+          ${pkgs.coreutils}/bin/ln -sfn "$src" "$libdir/$base.so"
+        done
+        export LD_LIBRARY_PATH="$libdir:${manage}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         ${manage}/bin/nvidia-vgpu-mgr
       '';
     };

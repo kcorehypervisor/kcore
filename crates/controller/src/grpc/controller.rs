@@ -20473,7 +20473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_vm_rejects_image_path_already_in_use() {
+    async fn create_vm_shares_a_source_image_across_filesystem_disks() {
         let db = Database::open(":memory:").expect("open db");
         let node = test_node();
         db.upsert_node(&node).expect("insert node");
@@ -20521,15 +20521,15 @@ mod tests {
             ..Default::default()
         };
 
-        let err =
+        let created =
             <ControllerService as controller_proto::controller_server::Controller>::create_vm(
                 &svc,
                 Request::new(req),
             )
             .await
-            .expect_err("duplicate image path should be rejected");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("already used"));
+            .expect("filesystem guests seed a private disk from the shared image")
+            .into_inner();
+        assert!(!created.vm_id.is_empty());
     }
 
     #[tokio::test]

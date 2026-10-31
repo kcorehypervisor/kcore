@@ -62,13 +62,14 @@ pub fn derive_image_format(image_url: &str) -> String {
     }
 }
 
-/// Filesystem-backed VMs boot the image file itself, so two of them cannot
-/// share one path. LVM, ZFS and Ceph only read the image once to seed a volume.
+/// True when this backend boots the image file itself.
+///
+/// Filesystem guests seed `/var/lib/kcore/disks/<name>.raw` and leave the
+/// downloaded image as a read-only source, the same way LVM, ZFS and Ceph do.
+/// An unknown backend still counts as in-place so two guests cannot share it.
 pub fn image_used_in_place(storage_backend: &str) -> bool {
-    matches!(
-        storage_backend.trim().to_ascii_lowercase().as_str(),
-        "" | "filesystem"
-    )
+    let backend = storage_backend.trim().to_ascii_lowercase();
+    !matches!(backend.as_str(), "" | "filesystem" | "lvm" | "zfs" | "ceph")
 }
 
 pub fn validate_image_path(path: &str) -> Result<String, Status> {
@@ -326,12 +327,13 @@ mod tests {
     }
 
     #[test]
-    fn only_filesystem_backend_uses_the_image_in_place() {
-        assert!(image_used_in_place("filesystem"));
-        assert!(image_used_in_place(""));
+    fn known_backends_seed_a_private_disk() {
+        assert!(!image_used_in_place("filesystem"));
+        assert!(!image_used_in_place(""));
         assert!(!image_used_in_place("ceph"));
         assert!(!image_used_in_place("lvm"));
         assert!(!image_used_in_place("zfs"));
+        assert!(image_used_in_place("inplace"));
     }
 
     #[test]
