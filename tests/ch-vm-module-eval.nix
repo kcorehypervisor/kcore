@@ -281,6 +281,15 @@ assert !(mentions "vfio-bind-slice" sliceUnit.serviceConfig.ExecStartPre);
 assert lib.elem "kcore-vgpu-sriov.service" sliceUnit.requires;
 assert !(lib.elem "kcore-vgpu-sriov.service" wholeUnit.requires);
 assert mentions "vgpu-clear-slice" sliceUnit.serviceConfig.ExecStopPost;
+let
+  # Depending on these scripts builds them, and writeShellScript runs a shell
+  # syntax check while it builds. Evaluation alone never parses them.
+  sliceScripts = lib.filter (item: lib.hasInfix "vgpu-" (toString item)) (
+    asList sliceUnit.serviceConfig.ExecStartPre ++ asList sliceUnit.serviceConfig.ExecStopPost
+  );
+in
+assert sliceScripts != [ ];
 pkgs.runCommand "ch-vm-module-eval-ok" { } ''
+  : ${lib.concatMapStringsSep " " (item: lib.escapeShellArg (toString item)) sliceScripts}
   echo ok > "$out"
 ''
