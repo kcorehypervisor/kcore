@@ -734,11 +734,17 @@ let
       description = "kcore VM ${vmName}";
       requires =
         map (iface: "${iface.unit}.service") ifaces
-        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service"
+        ++ lib.optionals (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) [
+          "kcore-vgpu-sriov.service"
+          "nvidia-vgpu-mgr.service"
+        ]
         ++ [ "kcore-placement-confirmed.target" ];
       after =
         map (iface: "${iface.unit}.service") ifaces
-        ++ lib.optional (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) "kcore-vgpu-sriov.service"
+        ++ lib.optionals (vgpuDevices != [ ] && config.ch-vm.vgpu.enable) [
+          "kcore-vgpu-sriov.service"
+          "nvidia-vgpu-mgr.service"
+        ]
         ++ [ "kcore-placement-confirmed.target" ];
       wantedBy = lib.optionals (vmCfg.autoStart && !vmCfg.incomingMigration) [ "multi-user.target" ];
       # stopIfChanged/restartIfChanged keep their NixOS defaults so VM spec

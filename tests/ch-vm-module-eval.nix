@@ -242,7 +242,10 @@ assert lib.hasInfix "modprobe nvidia" vgpuCfg.systemd.services.nvidia-modprobe.s
 assert lib.hasInfix "nouveau is still loaded" vgpuCfg.systemd.services.nvidia-vgpu-mgr.script;
 assert vgpuCfg.systemd.services ? nvidia-vgpud;
 assert vgpuCfg.systemd.services ? nvidia-vgpu-mgr;
-assert lib.elem "nvidia-vgpu-mgr.service" (asList sriov.requires);
+assert lib.elem "nvidia-modprobe.service" (asList sriov.after);
+assert lib.elem "nvidia-vgpud.service" (asList sriov.before);
+assert !(lib.elem "nvidia-vgpu-mgr.service" (asList sriov.after));
+assert lib.elem "kcore-vgpu-sriov.service" (asList vgpuCfg.systemd.services.nvidia-vgpud.after);
 let
   managerRunEval = nixosSystem {
     system = pkgs.stdenv.hostPlatform.system;
@@ -279,6 +282,8 @@ assert !(mentions "vgpu-bind-whole" wholeUnit.serviceConfig.ExecStartPre);
 assert mentions "vgpu-bind-slice" sliceUnit.serviceConfig.ExecStartPre;
 assert !(mentions "vfio-bind-slice" sliceUnit.serviceConfig.ExecStartPre);
 assert lib.elem "kcore-vgpu-sriov.service" sliceUnit.requires;
+assert lib.elem "nvidia-vgpu-mgr.service" sliceUnit.requires;
+assert lib.elem "nvidia-vgpu-mgr.service" sliceUnit.after;
 assert !(lib.elem "kcore-vgpu-sriov.service" wholeUnit.requires);
 assert mentions "vgpu-clear-slice" sliceUnit.serviceConfig.ExecStopPost;
 let
