@@ -49,6 +49,7 @@ const BOOTSTRAP_CERT_DIR: &str = "/etc/kcore/certs";
 const INSTALL_LOG_DIR: &str = "/var/log/kcore";
 const NIXOS_CONFIG_PATH: &str = "/etc/nixos/configuration.nix";
 const IMAGE_CACHE_DIR: &str = "/var/lib/kcore/images";
+const RETIRED_VMS_PATH: &str = "/var/lib/kcore/retired-vms";
 const DISK_MANAGEMENT_MODE_PATH: &str = "/etc/kcore/disk-management-mode";
 const DISK_MANAGEMENT_MODE_PATH_LEGACY: &str = "/etc/kcore/disko-management-mode";
 const DISK_MODE_INSTALLER_ONLY: &str = "installer-only";
@@ -1145,27 +1146,68 @@ fn parse_vm_names_from_nix(configuration_nix: &str) -> Vec<String> {
         .collect()
 }
 
-/// Files to remove once a config that no longer names these VMs has switched
-/// in: the private raw disk and its seed marker. Without this a VM created
-/// again under the same name would boot the deleted guest's disk.
-fn retired_filesystem_disk_paths(previous_nix: &str, next_nix: &str) -> Vec<PathBuf> {
+/// Filesystem VMs that `next_nix` no longer names.
+fn retired_filesystem_vms(previous_nix: &str, next_nix: &str) -> Vec<String> {
     let kept: std::collections::HashSet<String> =
         parse_vm_names_from_nix(next_nix).into_iter().collect();
-    let mut paths = Vec::new();
-    for vm_name in parse_filesystem_vms_from_nix(previous_nix) {
-        if kept.contains(&vm_name) {
-            continue;
-        }
-        if crate::path_safety::validate_safe_segment(&vm_name, "vm name").is_err() {
-            continue;
-        }
-        paths.push(PathBuf::from(format!("/var/lib/kcore/disks/{vm_name}.raw")));
-        paths.push(PathBuf::from(format!(
+    parse_filesystem_vms_from_nix(previous_nix)
+        .into_iter()
+        .filter(|vm_name| !kept.contains(vm_name))
+        .filter(|vm_name| crate::path_safety::validate_safe_segment(vm_name, "vm name").is_ok())
+        .collect()
+}
+
+/// Files to remove once a config that no longer names the VM has switched
+/// in: the private raw disk and its seed marker. Without this a VM created
+/// again under the same name would boot the deleted guest's disk.
+fn retired_vm_paths(vm_name: &str) -> [PathBuf; 2] {
+    [
+        PathBuf::from(format!("/var/lib/kcore/disks/{vm_name}.raw")),
+        PathBuf::from(format!(
             "{}/{vm_name}",
             kcore_volume_mirror::SEED_MARKER_DIR
-        )));
+        )),
+    ]
+}
+
+#[cfg(test)]
+fn retired_filesystem_disk_paths(previous_nix: &str, next_nix: &str) -> Vec<PathBuf> {
+    retired_filesystem_vms(previous_nix, next_nix)
+        .iter()
+        .flat_map(|vm_name| retired_vm_paths(vm_name))
+        .collect()
+}
+
+/// Retired VMs whose files still exist, kept in `list` across applies. A
+/// newer apply stops the rebuild of an older one before its cleanup runs, so
+/// every apply removes all the files still pending, not only its own.
+fn pending_retired_paths(
+    list: &Path,
+    previous_nix: &str,
+    next_nix: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let kept: std::collections::HashSet<String> =
+        parse_vm_names_from_nix(next_nix).into_iter().collect();
+    let mut names: std::collections::BTreeSet<String> = std::fs::read_to_string(list)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|vm_name| crate::path_safety::validate_safe_segment(vm_name, "vm name").is_ok())
+        .map(str::to_string)
+        .collect();
+    names.extend(retired_filesystem_vms(previous_nix, next_nix));
+    names.retain(|vm_name| {
+        !kept.contains(vm_name) && retired_vm_paths(vm_name).iter().any(|p| exists(p))
+    });
+    let body: String = names.iter().map(|vm_name| format!("{vm_name}\n")).collect();
+    if let Err(e) = std::fs::write(list, body) {
+        warn!(path = %list.display(), error = %e, "could not record retired VMs");
     }
-    paths
+    names
+        .iter()
+        .flat_map(|vm_name| retired_vm_paths(vm_name))
+        .collect()
 }
 
 async fn run_test_then_switch(
@@ -2243,8 +2285,11 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let config_nix = req.configuration_nix.clone();
         let retired_paths = tokio::task::spawn_blocking(move || {
             let previous = std::fs::read_to_string(&write_path).unwrap_or_default();
-            std::fs::write(&write_path, &config_nix)
-                .map(|()| retired_filesystem_disk_paths(&previous, &config_nix))
+            std::fs::write(&write_path, &config_nix).map(|()| {
+                pending_retired_paths(Path::new(RETIRED_VMS_PATH), &previous, &config_nix, |p| {
+                    p.exists()
+                })
+            })
         })
         .await
         .map_err(|e| Status::internal(format!("task join: {e}")))?
@@ -5795,6 +5840,41 @@ mod tests {
     #[test]
     fn a_first_config_retires_nothing() {
         assert!(retired_filesystem_disk_paths("", TWO_FS_VMS).is_empty());
+    }
+
+    #[test]
+    fn retired_vms_carry_over_to_the_next_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("retired-vms");
+        let only_02 = r#"{ ... }: {
+  virtualMachines."vgpu-02" = {
+      storageBackend = "filesystem";
+  };
+}"#;
+        let on_disk = |p: &Path| p.to_string_lossy().contains("vgpu-0");
+
+        // The first apply retires vgpu-01. A second apply stops its rebuild
+        // before cleanup, so the second one must remove vgpu-01 as well.
+        let first = pending_retired_paths(&list, TWO_FS_VMS, only_02, on_disk);
+        assert_eq!(first, retired_vm_paths("vgpu-01").to_vec());
+        let second = pending_retired_paths(&list, only_02, "{ ... }: {}", on_disk);
+        let mut expected = retired_vm_paths("vgpu-01").to_vec();
+        expected.extend(retired_vm_paths("vgpu-02"));
+        assert_eq!(second, expected);
+
+        // Removed files leave the list.
+        assert!(pending_retired_paths(&list, "", "", |_| false).is_empty());
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), "");
+    }
+
+    #[test]
+    fn a_recreated_vm_is_not_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("retired-vms");
+        std::fs::write(&list, "vgpu-01\n../escape\n").unwrap();
+        let paths = pending_retired_paths(&list, "", TWO_FS_VMS, |_| true);
+        assert!(paths.is_empty(), "{paths:?}");
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), "");
     }
 
     #[test]
