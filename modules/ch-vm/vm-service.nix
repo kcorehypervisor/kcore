@@ -528,8 +528,6 @@ let
           current_file="$dev/nvidia/current_vgpu_type"
           # Manager 595 binds the function to nvidia and publishes types there.
           # Older managers bind nvidia-vgpu-vfio. Both expose the same sysfs.
-          if [ "$current" = "nvidia-vgpu-vfio" ]; then
-            :
           now=$(${pkgs.coreutils}/bin/cat "$current_file" 2>/dev/null || echo 0)
           if [ "$current" = "nvidia-vgpu-vfio" ]; then
             :
