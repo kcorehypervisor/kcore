@@ -15,6 +15,12 @@ let
     else
       cfg.cloudHypervisorPackage.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ cfg.cloudHypervisorPatches;
+        # The upstream test suite more than doubles the build on every node
+        # update and needs a nested KVM. nixpkgs only lists openssl for the
+        # tests, yet the build itself links it.
+        doCheck = false;
+        nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.pkg-config ];
+        buildInputs = (old.buildInputs or [ ]) ++ [ pkgs.openssl ];
         preBuild = ''
           ${old.preBuild or ""}
           vfio_src=$(find .. /build -maxdepth 3 -type d -name vfio-ioctls-0.5.1 -print -quit)
