@@ -554,6 +554,21 @@ pub struct ControllerService {
 #[derive(Clone, Default)]
 struct WebConsoles(Arc<Mutex<HashMap<String, WebConsole>>>);
 
+/// One lock per node around reading the database, rendering that node's
+/// config, and handing it to `ApplyNixConfig`. Without it two concurrent
+/// changes (Terraform deletes VMs in parallel) can render from different
+/// snapshots, and the older render may reach the node last. The map is
+/// process-wide because reconcilers build their own `ControllerService`.
+fn config_push_lock(node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Arc::clone(locks.entry(node_id.to_string()).or_default())
+}
+
 struct WebConsole {
     owner: String,
     to_node: mpsc::Sender<node_proto::ConsoleMessage>,
@@ -1128,6 +1143,8 @@ impl ControllerService {
             return hook(node);
         }
 
+        let push_lock = config_push_lock(&node.id);
+        let push_guard = push_lock.lock().await;
         let vms = self
             .db
             .list_vms_for_node(&node.id)
@@ -1437,6 +1454,7 @@ impl ControllerService {
         );
 
         info!(node = %node.id, "pushed config and triggered rebuild");
+        drop(push_guard);
 
         if await_apply {
             self.await_nix_apply(node, &apply.apply_id, &mut admin)
@@ -9180,6 +9198,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "failed to apply config after VM insert; rolling back VM row"
             );
             self.rollback_created_vm(&node, &vm).await;
+            // The node already holds the config that names this VM, and its
+            // unit keeps restarting until a config without it arrives.
+            if let Err(e) = self.push_config_to_node(&node).await {
+                warn!(
+                    vm_id = %vm_id,
+                    node_id = %node.id,
+                    error = %e,
+                    "rollback: failed to push config without the VM"
+                );
+            }
             return Err(Status::aborted(format!(
                 "failed to apply VM {} on node {}: {}",
                 vm_id,
@@ -20414,8 +20442,16 @@ mod tests {
         let node = test_node();
         db.upsert_node(&node).expect("insert node");
 
-        let hook: PushHook =
-            Arc::new(|_n: &NodeRow| Err(Status::internal("simulated push failure for test")));
+        let pushes: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let hook: PushHook = {
+            let db = db.clone();
+            let pushes = Arc::clone(&pushes);
+            Arc::new(move |_n: &NodeRow| {
+                let vm_present = db.find_node_for_vm("vm-rollback").ok().flatten().is_some();
+                pushes.lock().unwrap().push(vm_present);
+                Err(Status::internal("simulated push failure for test"))
+            })
+        };
         let svc = ControllerService::new_with_test_push_hook(
             db.clone(),
             NodeClients::new(None),
@@ -20470,6 +20506,11 @@ mod tests {
             .find_node_for_vm("vm-rollback")
             .expect("query vm by name after failed create");
         assert!(found.is_none(), "failed create should be rolled back");
+        assert_eq!(
+            *pushes.lock().unwrap(),
+            vec![true, false],
+            "the rollback pushes a config without the VM"
+        );
     }
 
     #[tokio::test]
@@ -22038,6 +22079,16 @@ mod tests {
 
     /// The drain is not finished until the source node has actually applied the
     /// configuration that removes the VM units.
+    #[tokio::test]
+    async fn config_pushes_to_one_node_take_turns() {
+        let first = config_push_lock("push-lock-node");
+        let guard = first.lock().await;
+        assert!(config_push_lock("push-lock-node").try_lock().is_err());
+        assert!(config_push_lock("push-lock-other").try_lock().is_ok());
+        drop(guard);
+        assert!(config_push_lock("push-lock-node").try_lock().is_ok());
+    }
+
     #[tokio::test]
     async fn drain_node_stays_draining_when_the_config_push_fails() {
         let (db, vm) = ceph_two_node_fixture();
