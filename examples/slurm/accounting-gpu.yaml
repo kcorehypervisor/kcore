@@ -1,0 +1,48 @@
+# Accounting on its own node, a backup controller, and GPU compute.
+# gres: auto needs gpuDriver: true and nodes that report a GPU inventory.
+kind: SlurmCluster
+metadata:
+  name: hpc-gpu
+spec:
+  clusterName: hpc-gpu
+  controller:
+    nodeId: node-101
+    address: 10.0.0.11
+    iface: enp6s0
+  backupController:
+    nodeId: node-104
+    address: 10.0.0.14
+    iface: enp6s0
+  login:
+    nodeIds: [node-104]
+  accounting:
+    enabled: true
+    nodeId: node-104
+  gpuDriver: true
+  compute:
+    - nodeId: node-102
+      address: 10.0.0.12
+      iface: enp6s0
+      partitions: [batch]
+      reserve: { cores: 2, memoryMb: 4096 }
+    - nodeId: node-103
+      address: 10.0.0.13
+      iface: enp6s0
+      partitions: [batch, gpu]
+      gres: auto
+  partitions:
+    - name: batch
+      default: true
+      maxTime: INFINITE
+      state: UP
+    - name: gpu
+      maxTime: 24:00:00
+      state: UP
+  users:
+    - name: alice
+      uid: 2001
+      sshKeys:
+        - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExample alice@example
+  storage:
+    mode: nfs
+    exports: [/home, /scratch]

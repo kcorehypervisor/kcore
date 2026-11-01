@@ -606,6 +606,31 @@ spec:
     }
 
     #[test]
+    fn shipped_examples_parse_and_cover_every_role() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/slurm");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let manifest = parse_manifest(path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+            let proto = to_proto_spec(&manifest.spec);
+            assert!(!proto.compute.is_empty(), "{}", path.display());
+            assert!(!proto.partitions.is_empty(), "{}", path.display());
+            for compute in &proto.compute {
+                for partition in &compute.partitions {
+                    assert!(
+                        proto.partitions.iter().any(|p| &p.name == partition),
+                        "{}: unknown partition {partition}",
+                        path.display()
+                    );
+                }
+            }
+            seen += 1;
+        }
+        assert!(seen >= 2);
+    }
+
+    #[test]
     fn rejects_other_kinds() {
         assert!(
             parse_manifest_str("kind: KubernetesCluster\nmetadata: {name: x}\nspec: {}\n").is_err()

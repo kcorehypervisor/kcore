@@ -1,0 +1,35 @@
+# One controller that also logs users in, and two compute nodes.
+# Compute nodes are cordoned: they must not host guest VMs.
+kind: SlurmCluster
+metadata:
+  name: hpc-a
+spec:
+  clusterName: hpc-a
+  controller:
+    nodeId: node-101
+    address: 10.0.0.11
+    iface: enp6s0
+  login:
+    nodeIds: [node-101]
+  compute:
+    - nodeId: node-102
+      address: 10.0.0.12
+      iface: enp6s0
+      partitions: [batch]
+    - nodeId: node-103
+      address: 10.0.0.13
+      iface: enp6s0
+      partitions: [batch]
+  partitions:
+    - name: batch
+      default: true
+      maxTime: INFINITE
+      state: UP
+  users:
+    - name: alice
+      uid: 2001
+      sshKeys:
+        - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExample alice@example
+  storage:
+    mode: nfs
+    exports: [/home, /scratch]

@@ -259,6 +259,14 @@ reconcile summary aggregates rule/description changes with attachment
 deltas, e.g. `updated security group 'web' (fields: rules,
 attachments(+1,-2))`.
 
+**SlurmCluster** is also a server-side upsert. `metadata.name`, `clusterName`
+and `controller.nodeId` are immutable; plan reports `replace` for those and
+the remedy is delete and create. Ready-made manifests are in `examples/slurm/`
+and the workflow is in `docs/user/slurm.md`.
+
+`kctl apply -f` takes one YAML document per file. Put each resource, such as a
+`NodeVgpu` host and the `VM` that uses its slices, in its own file.
+
 ### Terraform / Crossplane integration
 
 Because every `create*` RPC is already a declarative upsert, a Terraform
@@ -583,6 +591,9 @@ Top-level commands:
 - `kctl node reboot <NODE_ID> [--force]`
 - `kctl update vm <name> [--cpu N] [--memory 4G] [--gpu <name>] [--vgpu <profile>]` — GPU changes require a stopped VM
 - `kctl apply -f <NodeVgpu>.yaml`
+- `kctl slurm plan -f <SlurmCluster>.yaml` (or `kctl diff -f`) — action, blocking issues, and per-node roles without changing anything
+- `kctl apply -f <SlurmCluster>.yaml`, `kctl get slurm-cluster [NAME]`, `kctl delete slurm-cluster NAME [--force]`
+- `kctl slurm drain-node NAME NODE_ID [--reason TEXT]`, `kctl slurm resume-node NAME NODE_ID`, `kctl slurm rotate-munge-key NAME`
 - `kctl get cluster-health` — ready nodes, VMs still on not-ready nodes, certificate expiry, replication conflicts
 - `kctl backup -o snapshot.sqlite` — consistent copy of the controller database
 - `kctl restore controller -f snapshot.sqlite --confirm` — replace the controller database from that snapshot

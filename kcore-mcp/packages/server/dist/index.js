@@ -71929,8 +71929,9 @@ var KINDS = [
     yamlKind: "VM",
     title: "Virtual machine",
     summary: "Declarative VM. Re-applying updates cpu, memory, and desired power state. Disk, NIC, image, and SSH key changes require a replacement.",
-    mutable: ["cpu", "memoryBytes", "desiredState"],
+    mutable: ["cpu", "memoryBytes", "desiredState", "gpus", "vgpus"],
     immutable: [
+      "pciDevices",
       "network",
       "extraNetworks",
       "imageUrl",
@@ -71960,6 +71961,14 @@ var KINDS = [
     summary: "Named SSH public key the controller can inject into a VM.",
     mutable: [],
     immutable: ["publicKey"]
+  },
+  {
+    id: "slurm-cluster",
+    yamlKind: "SlurmCluster",
+    title: "Slurm cluster",
+    summary: "Slurm host services on disjoint kcoreOS nodes: slurmctld, slurmdbd, slurmd, and login roles. Compute members are cordoned so the VM scheduler leaves them to slurmd. One node belongs to at most one cluster.",
+    mutable: ["compute", "partitions", "users", "storage", "extraConfig", "accounting", "backupController", "gres", "reserve"],
+    immutable: ["clusterName", "controller.nodeId"]
   },
   {
     id: "postgresql",
@@ -72042,6 +72051,30 @@ var KINDS = [
     immutable: ["cephCluster"]
   },
   {
+    id: "ingress-gateway",
+    yamlKind: "IngressGateway",
+    title: "Ingress gateway",
+    summary: "HTTPS gateway (Caddy + Coraza WAF) on one or two nodes. Applying it enables the service on those nodes through a NixOS rebuild. Needs a public listener address, an ACME email, and port 80 for HTTP-01.",
+    mutable: ["nodes", "listeners", "highAvailability", "tls", "defaultWafPolicy", "rateLimit", "accessLog", "kubernetes"],
+    immutable: ["name"]
+  },
+  {
+    id: "ingress-route",
+    yamlKind: "IngressRoute",
+    title: "Ingress route",
+    summary: "Hostnames and paths mapped to VM, external, or Kubernetes backends, or a TCP/SNI route. Plan validates against the cluster and renders the gateway configuration. Start with the WAF in detect mode.",
+    mutable: ["hosts", "paths", "port", "backends", "proxyProtocol", "rateLimit", "waf", "headers", "redirectHttp", "tls"],
+    immutable: ["name", "gateway", "kind"]
+  },
+  {
+    id: "waf-policy",
+    yamlKind: "WafPolicy",
+    title: "WAF policy",
+    summary: "OWASP Core Rule Set through Coraza: paranoia level, thresholds, IP lists, custom rules. New policies should start with engine detect.",
+    mutable: ["engine", "crs", "requestBodyLimitBytes", "responseBodyInspection", "ipAllowList", "ipDenyList", "customRules", "audit"],
+    immutable: ["name"]
+  },
+  {
     id: "image",
     yamlKind: "Image",
     title: "Node image",
@@ -72056,6 +72089,22 @@ var KINDS = [
     summary: "Rolling NixOS update. Plan resolves nodes and blockers. Apply creates the update. Destroy cancels a non-terminal update and keeps history.",
     mutable: [],
     immutable: ["version", "flakeRef", "flakeRev"]
+  },
+  {
+    id: "gpus",
+    yamlKind: "Gpus",
+    title: "GPUs and PCI devices",
+    summary: "Read-only inventory. A name filters to one node. Rows include vGPU slices, the bound profile, and the profiles the card can create.",
+    mutable: [],
+    immutable: ["nodeId"]
+  },
+  {
+    id: "node-vgpu",
+    yamlKind: "NodeVgpu",
+    title: "vGPU host",
+    summary: "Turns one node into a vGPU host. vendor is nvidia (default), intel, or amd. NVIDIA stages the Virtual GPU Manager; Intel (xe) and AMD (GIM) split the card into numVfs SR-IOV slices named like intel-2vf or radeon-4vf. Apply pushes the Nix configuration and reports when a reboot is required. Delete disables the host.",
+    mutable: ["vendor", "hostCards", "numVfs", "managerUrl", "managerSha256", "managerFile", "managerVersion"],
+    immutable: ["nodeId"]
   }
 ];
 var BY_ID = new Map(KINDS.map((kind) => [kind.id, kind]));
@@ -72164,6 +72213,7 @@ var INTENT = [
   [/\bnetworks?\b|\bvxlan\b|\bbridge\b/i, "network"],
   [/\bssh keys?\b/i, "ssh-key"],
   [/\bpostgres(?:ql)?\b/i, "postgresql"],
+  [/\bslurm\b|\bhpc\b/i, "slurm-cluster"],
   [/\bcontainers?\b/i, "container"],
   [/\bvolumes?\b/i, "volume"],
   [/\bsnapshot polic/i, "snapshot-policy"],
@@ -72173,7 +72223,11 @@ var INTENT = [
   [/\bceph\b/i, "ceph-cluster"],
   [/\bcephfs\b|\bshared filesystems?\b/i, "shared-filesystem"],
   [/\bobject stores?\b|\brgw\b|\bs3\b/i, "object-store"],
+  [/\bwaf polic(?:y|ies)\b/i, "waf-policy"],
+  [/\bingress routes?\b/i, "ingress-route"],
+  [/\bingress gateways?\b|\bhttps load balancer\b/i, "ingress-gateway"],
   [/\bcluster updates?\b|\brolling update\b/i, "cluster-update"],
+  [/\bvgpu hosts?\b|\bnode vgpu\b/i, "node-vgpu"],
   [/\bclusters?\b|\bcontext\b|\bbootstrap\b/i, "cluster"]
 ];
 function inferKind(intent) {
@@ -72194,6 +72248,10 @@ function question(id, prompt, why, required4, extra) {
 }
 function missing(spec, key) {
   return isBlank(spec[key]);
+}
+function everyCardHasCount(spec) {
+  const cards = Array.isArray(spec.hostCards) ? spec.hostCards : typeof spec.hostCards === "string" ? [spec.hostCards] : [];
+  return cards.length > 0 && cards.every((card) => /=\s*[1-9]\d*\s*$/.test(String(card)));
 }
 function questionsFor(kind, spec) {
   switch (kind.id) {
@@ -72223,6 +72281,66 @@ function questionsFor(kind, spec) {
       ].filter((item) => item.required || missing(spec, item.id));
     case "vm":
       return vmQuestions(spec);
+    case "gpus":
+      return [
+        question(
+          "name",
+          "Which node should the GPU inventory come from?",
+          "Leave it empty to list every node. The rows include vGPU slices and the profiles each card can create.",
+          false,
+          { example: "node-193" }
+        )
+      ].filter((item) => item.required || missing(spec, item.id));
+    case "node-vgpu": {
+      const vendor = String(spec.vendor ?? "nvidia").toLowerCase();
+      const nvidia = vendor === "nvidia";
+      return [
+        question(
+          "nodeId",
+          "Which node should become the vGPU host?",
+          nvidia ? "The node must already report the vgpuManagerRun feature." : "The node must already report the vgpuVendor feature.",
+          missing(spec, "nodeId") && missing(spec, "name"),
+          { example: "node-193" }
+        ),
+        question(
+          "vendor",
+          "Which card vendor: nvidia, intel, or amd?",
+          "nvidia uses the licensed Virtual GPU Manager. intel (xe driver, for example Arc Pro B50/B70) and amd (GIM driver, for example Radeon Pro V710) split the card with SR-IOV and hand each virtual function to a VM through vfio-pci.",
+          false,
+          { example: "nvidia" }
+        ),
+        question(
+          "hostCards",
+          "Which physical functions stay on the host driver?",
+          "Use the PCI address from kcore_read kind gpus, for example 0000:61:00.0.",
+          missing(spec, "hostCards"),
+          { example: "0000:61:00.0" }
+        ),
+        question(
+          "numVfs",
+          "How many virtual functions should each card expose?",
+          "Every slice of a card gets an equal share. An Arc Pro B50 supports 2, a B70 supports 4, and a V710 supports 1 to 12. Give one card its own count as ADDRESS=N in hostCards. NVIDIA accepts 0 for every function the card supports.",
+          !nvidia && missing(spec, "numVfs") && !everyCardHasCount(spec),
+          { example: nvidia ? "0" : "2" }
+        ),
+        ...nvidia ? [
+          question(
+            "managerUrl",
+            "Where can the node download the Virtual GPU Manager .run file?",
+            "An http or https URL. The node checks the SHA256 before adding the file to the Nix store.",
+            missing(spec, "managerUrl")
+          ),
+          question("managerSha256", "What is the SHA256 of that .run file?", "A mismatch refuses the stage.", missing(spec, "managerSha256")),
+          question(
+            "managerFile",
+            "What is the installer filename?",
+            "The filename must end in .run and must not contain a slash.",
+            missing(spec, "managerFile"),
+            { example: "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run" }
+          )
+        ] : []
+      ].filter((item) => item.required || missing(spec, item.id));
+    }
     case "network":
       return [
         question("name", "What should the network be called?", "VMs attach to this name.", missing(spec, "name"), {
@@ -72273,6 +72391,63 @@ function questionsFor(kind, spec) {
           "The controller stores the public key and can inject it into cloud-init. The private key stays with the operator.",
           missing(spec, "publicKey"),
           { example: "ssh-ed25519 AAAA... operator@host" }
+        )
+      ].filter((item) => item.required || missing(spec, item.id));
+    case "slurm-cluster":
+      return [
+        question(
+          "controller",
+          "Which node runs slurmctld, and what are its management address and interface?",
+          "The controller host stays out of compute unless the operator explicitly opts in.",
+          !spec.controller,
+          { example: "{ nodeId: node-101, address: 10.0.0.11, iface: enp6s0 }" }
+        ),
+        question(
+          "compute",
+          "Which nodes become compute members?",
+          "Give each node id, management address, and interface. They will be cordoned and must not host guests.",
+          !Array.isArray(spec.compute) || spec.compute.length === 0,
+          { example: "[{ nodeId: node-102, address: 10.0.0.12, iface: enp6s0, partitions: [batch] }]" }
+        ),
+        question(
+          "cordon",
+          "May those compute nodes be cordoned and emptied of guests before apply?",
+          "Slurm owns the compute nodes; the VM scheduler must leave them alone.",
+          missing(spec, "cordonConfirmed")
+        ),
+        question(
+          "partitions",
+          "Which partitions should exist?",
+          "Example: batch (default), gpu. Every compute member must reference an existing partition.",
+          !Array.isArray(spec.partitions) || spec.partitions.length === 0,
+          { example: "[{ name: batch, default: true, maxTime: INFINITE, state: UP }]" }
+        ),
+        question(
+          "users",
+          "Who are the first users?",
+          "Give name, fixed uid, and SSH public keys so uid/gid match on every member.",
+          !Array.isArray(spec.users) || spec.users.length === 0
+        ),
+        question(
+          "storage",
+          "Should /home and /scratch use nfs, shared-filesystem, or none?",
+          "nfs is the default and is a single point of failure on the controller.",
+          missing(spec, "storage"),
+          { choices: ["nfs", "shared-filesystem", "none"] }
+        ),
+        question(
+          "accounting",
+          "Turn Slurm accounting on or off?",
+          "Accounting runs MariaDB and slurmdbd on the dbd role.",
+          spec.accounting == null,
+          { choices: ["off", "on"] }
+        ),
+        question(
+          "gres",
+          "Is gres none or auto on compute?",
+          "auto requires gpuDriver: true and a reported GPU inventory.",
+          !Array.isArray(spec.compute) || spec.compute.some((c) => !c || typeof c !== "object" || !("gres" in c)),
+          { choices: ["none", "auto"] }
         )
       ].filter((item) => item.required || missing(spec, item.id));
     case "postgresql":
@@ -72440,6 +72615,75 @@ function questionsFor(kind, spec) {
           { example: "0" }
         )
       ].filter((item) => item.required);
+    case "ingress-gateway":
+      return [
+        question("name", "What should the ingress gateway be called?", "Routes refer to the gateway by this name.", missing(spec, "name")),
+        question(
+          "nodes",
+          "Which node (or two nodes, for a shared VIP) should run it?",
+          "Applying the gateway rebuilds those nodes' NixOS configuration. Two nodes also need highAvailability.",
+          missing(spec, "nodes"),
+          { example: "node-105" }
+        ),
+        question(
+          "listeners",
+          "Which public address and ports should it listen on?",
+          "The address must exist on the node (or be the VIP). HTTP-01 certificates need port 80 reachable from the internet.",
+          missing(spec, "listeners"),
+          { example: "203.0.113.10 ports 80 and 443" }
+        ),
+        question(
+          "tls",
+          "What email should ACME use, and should it start on Let's Encrypt staging?",
+          "The email receives expiry notices. Staging has no rate limits while the setup is tested.",
+          missing(spec, "tls"),
+          { example: "ops@example.com, letsencrypt-staging" }
+        )
+      ].filter((item) => item.required);
+    case "ingress-route":
+      return [
+        question("name", "What should the route be called?", "It is the handle for status, WAF events and changes.", missing(spec, "name")),
+        question("gateway", "Which ingress gateway serves it?", "A route belongs to exactly one gateway.", missing(spec, "gateway")),
+        question(
+          "hosts",
+          "Which hostnames should it serve?",
+          "Each hostname belongs to one route. A wildcard needs a DNS-01 provider on the gateway. DNS must point at the gateway address.",
+          missing(spec, "hosts") && spec.kind !== "tcp",
+          { example: "shop.example.com" }
+        ),
+        question(
+          "backends",
+          "Where should traffic go (VM, external address, or a Kubernetes Service)?",
+          "A NAT VM must be on a gateway node. Otherwise use a vxlan network, an external address, or a Kubernetes Service.",
+          missing(spec, "paths") && missing(spec, "backends"),
+          { example: "vm shop-web-1 port 8080" }
+        ),
+        question(
+          "waf",
+          "Should the WAF start in detect mode?",
+          "detect logs what CRS would block and lets traffic through. Read kctl get waf-events, then switch to block.",
+          false,
+          { choices: ["detect", "block", "off"] }
+        )
+      ].filter((item) => item.required || item.id === "waf" && missing(spec, "waf"));
+    case "waf-policy":
+      return [
+        question("name", "What should the WAF policy be called?", "Gateways and routes refer to it by name.", missing(spec, "name")),
+        question(
+          "engine",
+          "Should it start in detect or block mode?",
+          "detect only logs. A new policy should start there so false positives show up before they block real traffic.",
+          false,
+          { choices: ["detect", "block"] }
+        ),
+        question(
+          "crs",
+          "Which CRS paranoia level (1 to 4)?",
+          "Level 1 has the fewest false positives. Higher levels block more and need more exclusions.",
+          false,
+          { choices: ["1", "2", "3", "4"] }
+        )
+      ].filter((item) => item.required || item.id !== "name" && missing(spec, item.id));
     case "object-store":
       return [
         question("name", "What should the object store be called?", "The RGW service is reconciled under this name.", missing(spec, "name")),
@@ -72557,8 +72801,22 @@ function vmQuestions(spec) {
     question(
       "placement",
       "Pin it to a node or datacenter, or let the scheduler choose?",
-      "targetNode is immutable. Leaving it empty lets the controller place the VM.",
+      "A vGPU slice can be placed automatically. A whole GPU still needs a node that owns that card.",
       false
+    ),
+    question(
+      "gpu",
+      "Does this VM need a whole GPU, a vGPU slice, or no accelerator?",
+      "Set gpus for a whole card, vgpus for a slice such as A2-4C, or pciDevices for a raw function. Leave them empty for no accelerator.",
+      false,
+      { example: "vgpus: [A2-4C]" }
+    ),
+    question(
+      "vgpuProfile",
+      "Which vGPU profile should the slice use?",
+      "A2-4C is one quarter of a 16 GB Tesla A2. The VM must be stopped before the slice can change.",
+      false,
+      { example: "A2-4C" }
     )
   );
   return items.filter((item) => {
@@ -72567,6 +72825,9 @@ function vmQuestions(spec) {
     if (item.id === "memory") return missing(spec, "memory") && missing(spec, "memoryBytes");
     if (item.id === "desiredState") return missing(spec, "desiredState");
     if (item.id === "placement") return missing(spec, "targetNode") && missing(spec, "dc");
+    if (item.id === "gpu" || item.id === "vgpuProfile") {
+      return missing(spec, "gpus") && missing(spec, "vgpus") && missing(spec, "pciDevices");
+    }
     return true;
   });
 }
@@ -72592,6 +72853,11 @@ function warningsFor(kind, spec) {
   }
   if (kind.id === "disk-layout") {
     warnings.push("Plan this layout before apply. The node refuses a disk that still backs a VM, an LVM PV, or a ZFS pool member.");
+  }
+  if (kind.id === "slurm-cluster") {
+    warnings.push(
+      "Compute members are cordoned so the VM scheduler leaves them to slurmd. NFS exports live on the controller and are a single point of failure. Members of one Slurm cluster must be in the same cluster-update run because Slurm requires dbd >= ctld >= slurmd."
+    );
   }
   if (kind.id === "postgresql") {
     warnings.push(
@@ -73271,6 +73537,10 @@ function buildApply(kind, spec) {
       return [{ target: "controller", method: "createWorkload", request: containerRequest(spec) }];
     case "postgresql":
       return [{ target: "controller", method: "createPostgresql", request: postgresqlRequest(spec) }];
+    case "slurm-cluster": {
+      const request = slurmClusterRequest(spec);
+      return [{ target: "controller", method: "createSlurmCluster", request }];
+    }
     case "volume":
       return [{ target: "controller", method: "createVolume", request: volumeRequest(spec) }];
     case "volume-snapshot":
@@ -73285,10 +73555,20 @@ function buildApply(kind, spec) {
       return [{ target: "controller", method: "createCephCluster", request: { cephCluster: cephMessage(spec) } }];
     case "shared-filesystem":
       return [{ target: "controller", method: "createSharedFilesystem", request: { sharedFilesystem: filesystemMessage(spec) } }];
+    case "ingress-gateway":
+      return [{ target: "controller", method: "createIngressGateway", request: ingressRequest(spec) }];
+    case "ingress-route":
+      return [{ target: "controller", method: "createIngressRoute", request: ingressRequest(spec) }];
+    case "waf-policy":
+      return [{ target: "controller", method: "createWafPolicy", request: ingressRequest(spec) }];
     case "object-store":
       return [{ target: "controller", method: "createObjectStore", request: { objectStore: objectStoreMessage(spec) } }];
     case "cluster-update":
       return [{ target: "controller", method: "createClusterUpdate", request: { spec: clusterUpdateMessage(spec) } }];
+    case "gpus":
+      throw new InputError("gpus is read-only; use kcore_read");
+    case "node-vgpu":
+      return [{ target: "controller", method: "configureNodeVgpu", request: nodeVgpuRequest(spec, true) }];
     default:
       throw new InputError(`unsupported kind ${kind.id}`);
   }
@@ -73308,6 +73588,8 @@ function buildRead(kind, name) {
       return named ? { target: "controller", method: "getWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: named } } : { target: "controller", method: "listWorkloads", request: { kind: "WORKLOAD_KIND_CONTAINER" } };
     case "postgresql":
       return named ? { target: "controller", method: "getPostgresql", request: { name: named } } : { target: "controller", method: "listPostgresqls", request: {} };
+    case "slurm-cluster":
+      return named ? { target: "controller", method: "getSlurmCluster", request: { name: named } } : { target: "controller", method: "listSlurmClusters", request: {} };
     case "volume":
       return named ? { target: "controller", method: "getVolume", request: { name: named } } : { target: "controller", method: "listVolumes", request: {} };
     case "volume-snapshot":
@@ -73322,12 +73604,23 @@ function buildRead(kind, name) {
       return named ? { target: "controller", method: "getCephCluster", request: { name: named } } : { target: "controller", method: "listCephClusters", request: {} };
     case "shared-filesystem":
       return named ? { target: "controller", method: "getSharedFilesystem", request: { name: named } } : { target: "controller", method: "listSharedFilesystems", request: {} };
+    case "ingress-gateway":
+      return named ? { target: "controller", method: "getIngressGateway", request: { name: named } } : { target: "controller", method: "listIngressGateways", request: {} };
+    case "ingress-route":
+      return named ? { target: "controller", method: "getIngressRoute", request: { name: named } } : { target: "controller", method: "listIngressRoutes", request: { gateway: "" } };
+    case "waf-policy":
+      return named ? { target: "controller", method: "getWafPolicy", request: { name: named } } : { target: "controller", method: "listWafPolicies", request: {} };
     case "object-store":
       return named ? { target: "controller", method: "getObjectStore", request: { name: named } } : { target: "controller", method: "listObjectStores", request: {} };
     case "cluster-update":
       return named ? { target: "controller", method: "getClusterUpdate", request: { name: named } } : { target: "controller", method: "listClusterUpdates", request: {} };
     case "image":
       throw new InputError("image reads are collected from each node");
+    case "gpus":
+      return { target: "controller", method: "listPciDevices", request: { nodeId: named } };
+    case "node-vgpu":
+      if (!named) throw new InputError("node id is required");
+      return { target: "controller", method: "getNodeVgpu", request: { nodeId: named } };
     default:
       throw new InputError(`unsupported kind ${kind.id}`);
   }
@@ -73361,23 +73654,57 @@ function buildDelete(kind, name) {
       return { target: "controller", method: "deleteCephCluster", request: { name: id } };
     case "shared-filesystem":
       return { target: "controller", method: "deleteSharedFilesystem", request: { name: id } };
+    case "ingress-gateway":
+      return { target: "controller", method: "deleteIngressGateway", request: { name: id } };
+    case "ingress-route":
+      return { target: "controller", method: "deleteIngressRoute", request: { name: id } };
+    case "waf-policy":
+      return { target: "controller", method: "deleteWafPolicy", request: { name: id } };
     case "object-store":
       return { target: "controller", method: "deleteObjectStore", request: { name: id } };
+    case "slurm-cluster":
+      return { target: "controller", method: "deleteSlurmCluster", request: { name: id, force: false } };
     case "cluster-update":
       return { target: "controller", method: "cancelClusterUpdate", request: { name: id } };
+    case "gpus":
+      throw new InputError("gpus is read-only");
+    case "node-vgpu":
+      return { target: "controller", method: "configureNodeVgpu", request: nodeVgpuRequest({ nodeId: id, enabled: false }, false) };
     default:
       throw new InputError(`unsupported kind ${kind.id}`);
   }
 }
 function buildPlanCall(kind, spec, name) {
+  if (kind.id === "ingress-gateway" || kind.id === "ingress-route" || kind.id === "waf-policy") {
+    const request = ingressRequest(spec);
+    const gateway = kind.id === "ingress-gateway" ? request.name : typeof spec.gateway === "string" ? spec.gateway : "";
+    if (kind.id !== "waf-policy" && !gateway) throw new InputError("an ingress route needs a gateway to plan against");
+    return {
+      target: "controller",
+      method: "planIngress",
+      request: {
+        gateway,
+        documents: [{ kind: kind.yamlKind, name: request.name, specJson: request.specJson }]
+      }
+    };
+  }
   if (kind.id === "disk-layout") {
     return { target: "controller", method: "classifyDiskLayout", request: { diskLayout: diskLayoutMessage(spec) } };
   }
   if (kind.id === "cluster-update") {
     return { target: "controller", method: "planClusterUpdate", request: { spec: clusterUpdateMessage(spec) } };
   }
+  if (kind.id === "slurm-cluster") {
+    const request = slurmClusterRequest(spec);
+    return {
+      target: "controller",
+      method: "planSlurmCluster",
+      request: { name: request.name, spec: request.spec }
+    };
+  }
   return buildRead(kind, name ?? (typeof spec.name === "string" ? spec.name : void 0));
 }
+var OPERATION_ACTIONS_HINT = "action must be set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, install-node, or reboot-node";
 function buildOperation(action, spec) {
   switch (action) {
     case "set-vm-state": {
@@ -73400,7 +73727,18 @@ function buildOperation(action, spec) {
         request: {
           vmId: assertName(required3(spec, "name", "VM name"), "VM name"),
           targetNode: assertArg(required3(spec, "targetNode", "target node"), "target node"),
-          allowColdFallback: boolish(spec.allowColdFallback)
+          allowColdFallback: boolish(spec.allowColdFallback),
+          gpus: deviceList(spec.gpus),
+          vgpus: deviceList(spec.vgpus)
+        }
+      };
+    case "reboot-node":
+      return {
+        target: "controller",
+        method: "rebootNode",
+        request: {
+          nodeId: assertName(required3(spec, "nodeId", "node id"), "node id"),
+          force: boolish(spec.force)
         }
       };
     case "drain-node":
@@ -73426,12 +73764,35 @@ function buildOperation(action, spec) {
       return { target: "controller", method: "cancelClusterUpdate", request: { name: assertName(required3(spec, "name", "update name"), "update name") } };
     case "rollback-update":
       return { target: "controller", method: "rollbackClusterUpdate", request: { name: assertName(required3(spec, "name", "update name"), "update name") } };
+    case "slurm-drain-node":
+      return {
+        target: "controller",
+        method: "drainSlurmNode",
+        request: {
+          name: assertName(required3(spec, "name", "Slurm cluster name"), "Slurm cluster name"),
+          nodeId: assertName(required3(spec, "nodeId", "node id"), "node id"),
+          reason: opt(spec, "reason") ?? ""
+        }
+      };
+    case "slurm-resume-node":
+      return {
+        target: "controller",
+        method: "resumeSlurmNode",
+        request: {
+          name: assertName(required3(spec, "name", "Slurm cluster name"), "Slurm cluster name"),
+          nodeId: assertName(required3(spec, "nodeId", "node id"), "node id")
+        }
+      };
+    case "slurm-rotate-munge-key":
+      return {
+        target: "controller",
+        method: "rotateSlurmMungeKey",
+        request: { name: assertName(required3(spec, "name", "Slurm cluster name"), "Slurm cluster name") }
+      };
     case "install-node":
       return installCall(spec);
     default:
-      throw new InputError(
-        "action must be set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, or install-node"
-      );
+      throw new InputError(OPERATION_ACTIONS_HINT);
   }
 }
 function bootstrapCertRequest(spec) {
@@ -73491,9 +73852,59 @@ function vmRequest(spec) {
       memoryBytes: memory ? sizeBytes(memory, "memory") : sizeBytes("2G", "memory"),
       nics,
       disks: [],
-      desiredState: desired(spec.desiredState)
+      desiredState: desired(spec.desiredState),
+      gpus: deviceList(spec.gpus),
+      vgpus: deviceList(spec.vgpus),
+      pciDevices: deviceList(spec.pciDevices)
     }
   };
+}
+function nodeVgpuRequest(spec, enabling) {
+  const rawNode = opt(spec, "nodeId") ?? opt(spec, "name");
+  if (!rawNode) throw new InputError("node id is required");
+  const nodeId = assertName(rawNode, "node id");
+  const enabled = enabling && spec.enabled !== false && spec.enabled !== "false";
+  if (!enabled) {
+    return { nodeId, enabled: false, hostCards: [], numVfs: 0, manager: { url: "", sha256: "", file: "", version: "" }, vendor: "" };
+  }
+  const vendor = (opt(spec, "vendor") ?? "nvidia").toLowerCase();
+  if (!["nvidia", "intel", "amd"].includes(vendor)) throw new InputError("vendor must be nvidia, intel, or amd");
+  const hostCards = deviceList(spec.hostCards);
+  if (hostCards.length === 0) throw new InputError("hostCards must name at least one PCI address");
+  const numVfs = spec.numVfs == null || spec.numVfs === "" ? 0 : Number(spec.numVfs);
+  if (!Number.isInteger(numVfs) || numVfs < 0) throw new InputError("numVfs must be an integer >= 0");
+  if (vendor !== "nvidia") {
+    const uncounted = hostCards.filter((card) => !/=\s*[1-9]\d*\s*$/.test(card));
+    if (uncounted.length > 0 && numVfs < 1) {
+      throw new InputError(`numVfs, or ADDRESS=N on every host card, is required for ${vendor} cards`);
+    }
+    return { nodeId, enabled: true, hostCards: hostCards.map((card) => assertArg(card, "host card")), numVfs, vendor };
+  }
+  const url = required3(spec, "managerUrl", "manager URL");
+  if (!(url.startsWith("http://") || url.startsWith("https://")) || url.includes(" ")) {
+    throw new InputError("manager URL must be an http or https URL");
+  }
+  const file = required3(spec, "managerFile", "manager file");
+  if (file.includes("/") || !file.endsWith(".run")) {
+    throw new InputError("manager file must be the NVIDIA .run installer name");
+  }
+  return {
+    nodeId,
+    enabled: true,
+    hostCards: hostCards.map((card) => assertArg(card, "host card")),
+    numVfs,
+    manager: {
+      url,
+      sha256: assertSha256(required3(spec, "managerSha256", "manager SHA256")),
+      file,
+      version: opt(spec, "managerVersion") ?? "595.91.04"
+    },
+    vendor
+  };
+}
+function deviceList(value) {
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  return stringList(value);
 }
 function imageFields(spec) {
   if (opt(spec, "imageUrl")) {
@@ -73687,6 +74098,13 @@ function cephMessage(spec) {
     }
   };
 }
+function ingressRequest(spec) {
+  const name = assertName(required3(spec, "name", "name"), "name");
+  const { name: _name, kind: _kind, ...rest } = spec;
+  void _name;
+  void _kind;
+  return { name, specJson: JSON.stringify(rest) };
+}
 function filesystemMessage(spec) {
   return {
     name: assertName(required3(spec, "name", "name"), "name"),
@@ -73766,6 +74184,61 @@ function hostOf2(address) {
 function stringList(value) {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
+}
+function slurmClusterRequest(spec) {
+  const name = assertName(required3(spec, "name", "name"), "name");
+  const controller = spec.controller;
+  if (!controller || typeof controller !== "object") {
+    throw new InputError("controller is required (nodeId, address, iface)");
+  }
+  const controllerSpec = {
+    nodeId: required3(controller, "nodeId", "controller.nodeId"),
+    address: required3(controller, "address", "controller.address"),
+    iface: required3(controller, "iface", "controller.iface")
+  };
+  const compute = Array.isArray(spec.compute) ? spec.compute : [];
+  if (compute.length === 0) {
+    throw new InputError("at least one compute node is required");
+  }
+  const computeSpec = compute.map((item, index) => {
+    if (!item || typeof item !== "object") {
+      throw new InputError(`compute[${index}] must be an object`);
+    }
+    const node = item;
+    return {
+      nodeId: required3(node, "nodeId", `compute[${index}].nodeId`),
+      address: required3(node, "address", `compute[${index}].address`),
+      iface: required3(node, "iface", `compute[${index}].iface`),
+      partitions: Array.isArray(node.partitions) ? node.partitions : [],
+      reserve: node.reserve ?? { cores: 0, memoryMb: 0 },
+      gres: opt(node, "gres") ?? "none"
+    };
+  });
+  const partitions = Array.isArray(spec.partitions) ? spec.partitions : [];
+  if (partitions.length === 0) {
+    throw new InputError("at least one partition is required");
+  }
+  const storage = spec.storage ?? {
+    mode: "nfs",
+    exports: ["/home", "/scratch"]
+  };
+  return {
+    name,
+    spec: {
+      clusterName: opt(spec, "clusterName") ?? name,
+      controller: controllerSpec,
+      backupController: spec.backupController ?? null,
+      login: spec.login ?? { nodeIds: [] },
+      accounting: spec.accounting ?? { enabled: false },
+      compute: computeSpec,
+      partitions,
+      users: Array.isArray(spec.users) ? spec.users : [],
+      storage,
+      extraConfig: opt(spec, "extraConfig") ?? "",
+      allowControllerHost: spec.allowControllerHost === true,
+      gpuDriver: spec.gpuDriver === true
+    }
+  };
 }
 var POSTGRESQL_PACKAGES = /* @__PURE__ */ new Set([
   "postgresql",
@@ -74390,11 +74863,9 @@ function createServer() {
     "kcore_operation",
     {
       title: "Run a kcore day-2 operation",
-      description: "Power state, migrate, drain, cordon, node approval, cluster-update approve/cancel/rollback, or node install. Asks before any disk wipe or mutation.",
+      description: "Power state, migrate, drain, cordon, node approval, cluster-update approve/cancel/rollback, Slurm node drain/resume and munge key rotation, node install, or node reboot. Asks before any disk wipe or mutation.",
       inputSchema: {
-        action: external_exports.string().describe(
-          "set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, or install-node"
-        ),
+        action: external_exports.string().describe(OPERATION_ACTIONS_HINT.replace("action must be ", "")),
         spec: external_exports.record(external_exports.string(), external_exports.unknown()),
         confirm: external_exports.boolean(),
         connection: external_exports.object(connectionShape).optional()

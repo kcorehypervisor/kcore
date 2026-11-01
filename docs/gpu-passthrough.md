@@ -146,20 +146,29 @@ spec:
     sha256: 2bc7f9be263d45a92331d781df33c14af1af01fcfa45e80102e80caf1ffaa74d
     file: NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
     version: "595.91.04"
----
+```
+
+`kctl apply -f` takes one document per file. Apply the VM from its own file:
+`examples/vgpu/nvidia-host.yaml` and `examples/vgpu/vm-nvidia.yaml` are the two
+halves of this example, and `examples/vgpu/` has the Intel and AMD pairs.
+
+```yaml
 kind: VM
 metadata:
   name: vgpu-01
 spec:
   cpu: 4
-  memory: 8G
+  memoryBytes: 8G
   storageBackend: filesystem
   storageSizeBytes: 40G
   targetNode: node-193
   vgpus: ["A2-4C"]
-  network: default
-  imageUrl: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
-  imageSha256: 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
+  nics:
+    - network: default
+  disks:
+    - image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+      sha256: 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
+      format: qcow2
 ```
 
 Terraform uses `kcore_vgpu_host` for the node and `vgpus = ["A2-4C"]` on
@@ -197,7 +206,7 @@ metadata:
   name: node-7
 spec:
   vendor: amd
-  hostCards: ["0000:c3:00.0"]
+  hostCards: ["0000:c3:00.0=4", "0000:c4:00.0=6"]
   numVfs: 4
 ```
 

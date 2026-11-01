@@ -17,6 +17,10 @@ kctl apply -f hpc-a.yaml
 kctl get slurm-cluster hpc-a
 ```
 
+Manifests to start from are in `examples/slurm/`: `minimal.yaml` is one
+controller and two compute nodes, and `accounting-gpu.yaml` adds a backup
+controller, a dbd node and GPU compute.
+
 `plan` returns `create`, `update`, `unchanged`, or `replace`. `replace` means an
 immutable field changed (`metadata.name`, `clusterName`, or
 `controller.nodeId`); delete the cluster and create it again.

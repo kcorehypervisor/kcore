@@ -1,0 +1,13 @@
+# NVIDIA vGPU host. The manager .run file comes from your NVIDIA AI Enterprise
+# download and stays on your own server. See docs/nvidia-ai-enterprise-vgpu.md.
+kind: NodeVgpu
+metadata:
+  name: node-193
+spec:
+  vendor: nvidia
+  hostCards: ["0000:61:00.0"]
+  manager:
+    url: http://192.168.40.10:18083/NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+    sha256: 2bc7f9be263d45a92331d781df33c14af1af01fcfa45e80102e80caf1ffaa74d
+    file: NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+    version: "595.91.04"

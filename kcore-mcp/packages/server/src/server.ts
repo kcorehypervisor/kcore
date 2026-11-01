@@ -8,7 +8,7 @@ import { resolveConnection } from "./connection.js";
 import { callApi, callController, callNode, callNodeCompute, redact, SERVICE_NAMES } from "./grpc.js";
 import { requireRpc, rpcCatalog } from "./rpc.js";
 import { createClusterContext } from "./pki.js";
-import { bootstrapCertRequest, buildApply, buildDelete, buildOperation, buildPlanCall, buildRead, type RpcCall } from "./requests.js";
+import { OPERATION_ACTIONS_HINT, bootstrapCertRequest, buildApply, buildDelete, buildOperation, buildPlanCall, buildRead, type RpcCall } from "./requests.js";
 import { diffSpec } from "./plan.js";
 import type { ConnectionOptions } from "./connection.js";
 import { applyVault, documents, operateVault, readVault, unconfirmed, vaultAddress } from "./vault.js";
@@ -467,11 +467,9 @@ export function createServer(): McpServer {
     {
       title: "Run a kcore day-2 operation",
       description:
-        "Power state, migrate, drain, cordon, node approval, cluster-update approve/cancel/rollback, node install, or node reboot. Asks before any disk wipe or mutation.",
+        "Power state, migrate, drain, cordon, node approval, cluster-update approve/cancel/rollback, Slurm node drain/resume and munge key rotation, node install, or node reboot. Asks before any disk wipe or mutation.",
       inputSchema: {
-        action: z.string().describe(
-          "set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, install-node, or reboot-node",
-        ),
+        action: z.string().describe(OPERATION_ACTIONS_HINT.replace("action must be ", "")),
         spec: z.record(z.string(), z.unknown()),
         confirm: z.boolean(),
         connection: z.object(connectionShape).optional(),

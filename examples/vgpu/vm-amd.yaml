@@ -1,0 +1,16 @@
+kind: VM
+metadata:
+  name: vgpu-amd
+spec:
+  cpu: 4
+  memoryBytes: 8G
+  storageBackend: filesystem
+  storageSizeBytes: 40G
+  targetNode: node-8
+  vgpus: ["radeon-4vf"]
+  nics:
+    - network: default
+  disks:
+    - image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+      sha256: 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
+      format: qcow2
