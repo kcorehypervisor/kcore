@@ -367,8 +367,21 @@ let
       normalizedPci = builtins.filter (dev: !(builtins.elem (lib.toLower dev.address) excludedPci)) (
         map (dev: dev // { address = lib.toLower dev.address; }) vmCfg.pciDevices
       );
-      vfioDevices = builtins.filter (dev: dev.vgpuProfile == null) normalizedPci;
-      vgpuDevices = builtins.filter (dev: dev.vgpuProfile != null) normalizedPci;
+      # Intel and AMD slices are ordinary vfio-pci virtual functions; only
+      # NVIDIA slices stay on the vendor driver with a programmed profile.
+      splitSlices = builtins.filter (
+        dev: dev.vgpuProfile != null && dev.vgpuVendor != "nvidia"
+      ) normalizedPci;
+      vfioDevices = builtins.filter (
+        dev: dev.vgpuProfile == null || dev.vgpuVendor != "nvidia"
+      ) normalizedPci;
+      vgpuDevices = builtins.filter (
+        dev: dev.vgpuProfile != null && dev.vgpuVendor == "nvidia"
+      ) normalizedPci;
+      splitHostDriver = {
+        intel = "xe";
+        amd = "gim";
+      };
       sysfs = config.ch-vm.vms.sysfsRoot;
 
       # Live migration requires MAP_SHARED guest RAM (`shared=on`). Every
@@ -410,7 +423,7 @@ let
         ++ map (
           dev:
           "--device path=/sys/bus/pci/devices/${dev.address},iommu=${
-            if dev.vgpuProfile == null then "on" else "off"
+            if dev.vgpuProfile == null || dev.vgpuVendor != "nvidia" then "on" else "off"
           }"
         ) normalizedPci
         ++ map (iface: "--net tap=${iface.tap},mac=${iface.macAddress}") ifaces
@@ -433,15 +446,40 @@ let
         ${pkgs.kmod}/bin/modprobe vfio-pci
         requested="${lib.concatStringsSep " " (map (dev: dev.address) vfioDevices)}"
         sys="${sysfs}"
+        # Intel and AMD slices: address and the driver their card must be on.
+        split_host_driver() {
+          case "$1" in
+            ${lib.concatMapStrings (dev: ''
+              ${dev.address}) echo ${splitHostDriver.${dev.vgpuVendor}} ;;
+            '') splitSlices}
+            *) ;;
+          esac
+        }
         for addr in $requested; do
           dev="$sys/bus/pci/devices/$addr"
           if [ ! -e "$dev" ]; then
             echo "PCI device $addr does not exist on this node"
             exit 1
           fi
-          if [ -e "$dev/physfn" ]; then
+          host_driver=$(split_host_driver "$addr")
+          if [ -e "$dev/physfn" ] && [ -z "$host_driver" ]; then
             echo "PCI device $addr is a virtual function; a vGPU slice is not bound to vfio-pci"
             exit 1
+          fi
+          if [ -n "$host_driver" ]; then
+            if [ ! -e "$dev/physfn" ]; then
+              echo "vGPU slice $addr is not a virtual function"
+              exit 1
+            fi
+            parent=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/physfn")")
+            parent_drv=""
+            if [ -e "$sys/bus/pci/devices/$parent/driver" ]; then
+              parent_drv=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$sys/bus/pci/devices/$parent/driver")")
+            fi
+            if [ "$parent_drv" != "$host_driver" ]; then
+              echo "vGPU slice $addr parent $parent driver is ''${parent_drv:-unbound}, not $host_driver"
+              exit 1
+            fi
           fi
           if [ -e "$dev/sriov_numvfs" ] && [ "$(cat "$dev/sriov_numvfs")" -gt 0 ] && [ -e "$dev/driver" ]; then
             drv=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/driver")")
@@ -738,6 +776,9 @@ let
           "kcore-vgpu-sriov.service"
           "nvidia-vgpu-mgr.service"
         ]
+        ++ lib.optional (
+          splitSlices != [ ] && config.ch-vm.vgpu.sriovCards != [ ]
+        ) "kcore-gpu-sriov.service"
         ++ [ "kcore-placement-confirmed.target" ];
       after =
         map (iface: "${iface.unit}.service") ifaces
@@ -745,6 +786,9 @@ let
           "kcore-vgpu-sriov.service"
           "nvidia-vgpu-mgr.service"
         ]
+        ++ lib.optional (
+          splitSlices != [ ] && config.ch-vm.vgpu.sriovCards != [ ]
+        ) "kcore-gpu-sriov.service"
         ++ [ "kcore-placement-confirmed.target" ];
       wantedBy = lib.optionals (vmCfg.autoStart && !vmCfg.incomingMigration) [ "multi-user.target" ];
       # stopIfChanged/restartIfChanged keep their NixOS defaults so VM spec
@@ -832,6 +876,7 @@ in
       cloudHypervisorPatches
       vgpuProfile
       vgpuManagerRun
+      vgpuVendor
       localLiveMigrate
       cloudInitGuestOpsKeys
     '';

@@ -294,7 +294,98 @@ let
   );
 in
 assert sliceScripts != [ ];
+let
+  splitEval =
+    cards:
+    nixosSystem {
+      system = pkgs.stdenv.hostPlatform.system;
+      modules = [
+        ../modules/ch-vm
+        (
+          { pkgs, ... }:
+          {
+            imports = [ vgpuBase ];
+            ch-vm.vgpu = {
+              sriovCards = cards;
+            };
+            ch-vm.vms = {
+              enable = true;
+              cloudHypervisorPackage = pkgs.cloud-hypervisor;
+              gatewayInterface = "eth0";
+              networks.default = {
+                externalIP = "10.0.2.15";
+                gatewayIP = "192.168.100.1";
+              };
+              virtualMachines.half = {
+                image = "/var/lib/kcore/images/guest.img";
+                cores = 1;
+                memorySize = 256;
+                network = "default";
+                pciDevices = [
+                  {
+                    address = "0000:03:00.1";
+                    vgpuProfile = "intel-2vf";
+                    vgpuVendor = "intel";
+                  }
+                ];
+                autoStart = false;
+              };
+            };
+          }
+        )
+      ];
+    };
+  intelCfg =
+    (splitEval [
+      {
+        address = "0000:03:00.0";
+        vendor = "intel";
+        numVfs = 2;
+      }
+    ]).config;
+  amdCfg =
+    (splitEval [
+      {
+        address = "0000:c3:00.0";
+        vendor = "amd";
+        numVfs = 4;
+      }
+      {
+        address = "0000:c4:00.0";
+        vendor = "amd";
+        numVfs = 6;
+      }
+    ]).config;
+  halfUnit = intelCfg.systemd.services."kcore-vm-half";
+  gpuSriov = intelCfg.systemd.services.kcore-gpu-sriov;
+  vfCountAssertion = lib.findFirst (
+    item: lib.hasInfix "the same numVfs" item.message
+  ) null amdCfg.assertions;
+  splitScripts = asList halfUnit.serviceConfig.ExecStartPre ++ [ gpuSriov.serviceConfig.ExecStart ];
+in
+assert lib.hasInfix "split_card 0000:03:00.0 intel 2 xe" gpuSriov.script;
+assert lib.hasInfix "sriov_drivers_autoprobe" gpuSriov.script;
+assert gpuSriov.restartIfChanged == false;
+assert intelCfg.environment.etc."kcore/vgpu-hosts".text == "0000:03:00.0\n";
+assert !(intelCfg.systemd.services ? kcore-vgpu-sriov);
+assert !(intelCfg.systemd.services ? nvidia-vgpu-mgr);
+assert !(lib.elem "amdgpu" intelCfg.boot.blacklistedKernelModules);
+assert lib.hasInfix "vgpuVendor" intelCfg.environment.etc."kcore/ch-vm-features".text;
+assert lib.elem "kcore-gpu-sriov.service" halfUnit.requires;
+assert lib.elem "kcore-gpu-sriov.service" halfUnit.after;
+assert !(lib.elem "nvidia-vgpu-mgr.service" halfUnit.requires);
+assert mentions "vfio-bind-half" halfUnit.serviceConfig.ExecStartPre;
+assert !(mentions "vgpu-bind-half" halfUnit.serviceConfig.ExecStartPre);
+assert !(mentions "vgpu-clear-half" halfUnit.serviceConfig.ExecStopPost);
+assert lib.elem "gim" amdCfg.boot.kernelModules;
+assert lib.elem "amdgpu" amdCfg.boot.blacklistedKernelModules;
+assert lib.hasInfix "options gim vf_num=4,6" amdCfg.boot.extraModprobeConfig;
+assert vfCountAssertion != null && vfCountAssertion.assertion == false;
 pkgs.runCommand "ch-vm-module-eval-ok" { } ''
-  : ${lib.concatMapStringsSep " " (item: lib.escapeShellArg (toString item)) sliceScripts}
+  : ${
+    lib.concatMapStringsSep " " (item: lib.escapeShellArg (toString item)) (
+      sliceScripts ++ splitScripts
+    )
+  }
   echo ok > "$out"
 ''

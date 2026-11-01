@@ -615,8 +615,8 @@ enum CreateResource {
         /// Example: --gpu radeon0. A family (`radeon`, `nvidia`, `intel`, `accel`) takes the first free one.
         #[arg(long = "gpu")]
         gpu: Vec<String>,
-        /// NVIDIA vGPU slice (repeatable). Requires --target-node.
-        /// Example: --vgpu A2-4C, --vgpu nvidia0=A2-4C, or --vgpu nvidia0/3=A2-4C.
+        /// vGPU slice (repeatable). Requires --target-node.
+        /// Example: --vgpu A2-4C, --vgpu nvidia0/3=A2-4C, --vgpu intel-2vf, or --vgpu radeon-4vf.
         #[arg(long = "vgpu")]
         vgpu: Vec<String>,
         /// Ethernet NIC to assign, by inventory name or family (repeatable).
@@ -1690,7 +1690,7 @@ enum NodeAction {
         #[arg(long = "image-sha256")]
         image_sha256: Option<String>,
     },
-    /// Enable, show, or disable the NVIDIA vGPU host on a node
+    /// Enable, show, or disable the vGPU host (NVIDIA, Intel, or AMD) on a node
     Vgpu {
         #[command(subcommand)]
         action: NodeVgpuAction,
@@ -1707,25 +1707,32 @@ enum NodeAction {
 
 #[derive(Subcommand)]
 enum NodeVgpuAction {
-    /// Stage the Virtual GPU Manager and push the host configuration
+    /// Split a card into vGPU slices and push the host configuration.
+    ///
+    /// NVIDIA stages the Virtual GPU Manager (--url, --sha256, --file).
+    /// Intel (xe) and AMD (GIM) split the card with SR-IOV and need --num-vfs.
+    /// Example: kctl node vgpu enable node-1 --vendor intel --host-card 0000:03:00.0 --num-vfs 2
     Enable {
         /// Node ID
         node_id: String,
-        /// Physical function that stays on the NVIDIA host driver. Repeat for more cards.
+        /// Card vendor: nvidia, intel, or amd
+        #[arg(long, default_value = "nvidia")]
+        vendor: String,
+        /// Physical function that stays on the host driver. Repeat for more cards.
         #[arg(long = "host-card", required = true)]
         host_card: Vec<String>,
-        /// Virtual functions to create. 0 asks the card for every function it supports.
+        /// Virtual functions to create. NVIDIA accepts 0 for every function the card supports.
         #[arg(long = "num-vfs", default_value_t = 0)]
         num_vfs: i32,
-        /// HTTP(S) URL of the NVIDIA Virtual GPU Manager .run file
+        /// HTTP(S) URL of the NVIDIA Virtual GPU Manager .run file (NVIDIA only)
         #[arg(long)]
-        url: String,
-        /// SHA256 of the .run file
+        url: Option<String>,
+        /// SHA256 of the .run file (NVIDIA only)
         #[arg(long)]
-        sha256: String,
-        /// Installer filename, for example NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run
+        sha256: Option<String>,
+        /// Installer filename, for example NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run (NVIDIA only)
         #[arg(long)]
-        file: String,
+        file: Option<String>,
         /// Driver version recorded in the host configuration
         #[arg(long, default_value = "595.91.04")]
         version: String,
@@ -3289,6 +3296,7 @@ async fn main() {
             match action {
                 NodeVgpuAction::Enable {
                     node_id,
+                    vendor,
                     host_card,
                     num_vfs,
                     url,
@@ -3297,10 +3305,17 @@ async fn main() {
                     version,
                     no_reboot,
                 } => {
-                    commands::node::vgpu_enable(
-                        &info, node_id, host_card, *num_vfs, url, sha256, file, version, !no_reboot,
-                    )
-                    .await
+                    let enable = commands::node::VgpuEnable {
+                        node_id: node_id.clone(),
+                        vendor: vendor.clone(),
+                        host_cards: host_card.clone(),
+                        num_vfs: *num_vfs,
+                        url: url.clone(),
+                        sha256: sha256.clone(),
+                        file: file.clone(),
+                        version: version.clone(),
+                    };
+                    commands::node::vgpu_enable(&info, enable, !no_reboot).await
                 }
                 NodeVgpuAction::Show { node_id } => commands::node::vgpu_show(&info, node_id).await,
                 NodeVgpuAction::Disable { node_id } => {

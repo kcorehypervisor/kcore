@@ -201,8 +201,8 @@ export const KINDS: ResourceKind[] = [
     yamlKind: "NodeVgpu",
     title: "vGPU host",
     summary:
-      "Turns one node into an NVIDIA vGPU host. Apply stages the Virtual GPU Manager, pushes the Nix configuration, and reports when a reboot is required. Delete disables the host.",
-    mutable: ["hostCards", "numVfs", "managerUrl", "managerSha256", "managerFile", "managerVersion"],
+      "Turns one node into a vGPU host. vendor is nvidia (default), intel, or amd. NVIDIA stages the Virtual GPU Manager; Intel (xe) and AMD (GIM) split the card into numVfs SR-IOV slices named like intel-2vf or radeon-4vf. Apply pushes the Nix configuration and reports when a reboot is required. Delete disables the host.",
+    mutable: ["vendor", "hostCards", "numVfs", "managerUrl", "managerSha256", "managerFile", "managerVersion"],
     immutable: ["nodeId"],
   },
 ];

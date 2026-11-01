@@ -40,6 +40,8 @@ pub struct ModuleFeatures {
     pub vgpu_profile: bool,
     pub cloud_init_guest_ops_keys: bool,
     pub vgpu_manager_run: bool,
+    /// `vgpuVendor` per device and `ch-vm.vgpu.sriovCards` (Intel and AMD).
+    pub vgpu_vendor: bool,
 }
 
 impl ModuleFeatures {
@@ -47,6 +49,7 @@ impl ModuleFeatures {
     pub const VGPU_PROFILE: &'static str = "vgpuProfile";
     pub const CLOUD_INIT_GUEST_OPS_KEYS: &'static str = "cloudInitGuestOpsKeys";
     pub const VGPU_MANAGER_RUN: &'static str = "vgpuManagerRun";
+    pub const VGPU_VENDOR: &'static str = "vgpuVendor";
 
     /// Everything on: what a node installed from this tree supports.
     pub fn all() -> Self {
@@ -55,6 +58,7 @@ impl ModuleFeatures {
             vgpu_profile: true,
             cloud_init_guest_ops_keys: true,
             vgpu_manager_run: true,
+            vgpu_vendor: true,
         }
     }
 
@@ -67,6 +71,7 @@ impl ModuleFeatures {
             vgpu_profile: has(Self::VGPU_PROFILE),
             cloud_init_guest_ops_keys: has(Self::CLOUD_INIT_GUEST_OPS_KEYS),
             vgpu_manager_run: has(Self::VGPU_MANAGER_RUN),
+            vgpu_vendor: has(Self::VGPU_VENDOR),
         }
     }
 }
@@ -78,6 +83,7 @@ pub struct VgpuSliceNix {
     pub address: String,
     pub profile: String,
     pub host_address: String,
+    pub vendor: kcore_gpu::VgpuVendor,
 }
 
 pub fn generate_node_config(
@@ -438,12 +444,23 @@ pub fn generate_node_config_inner(
                     .find(|slice| slice.vm_id == vm.id && slice.address.eq_ignore_ascii_case(addr));
                 if features.vgpu_profile {
                     if let Some(slice) = profile {
-                        out.push_str(&format!(
-                            "        {{ address = \"{}\"; vgpuProfile = \"{}\"; }}\n",
-                            nix_escape(addr),
-                            nix_escape(&slice.profile)
-                        ));
-                        continue;
+                        if slice.vendor.splits_evenly() && features.vgpu_vendor {
+                            out.push_str(&format!(
+                                "        {{ address = \"{}\"; vgpuProfile = \"{}\"; vgpuVendor = \"{}\"; }}\n",
+                                nix_escape(addr),
+                                nix_escape(&slice.profile),
+                                slice.vendor.as_str()
+                            ));
+                            continue;
+                        }
+                        if !slice.vendor.splits_evenly() {
+                            out.push_str(&format!(
+                                "        {{ address = \"{}\"; vgpuProfile = \"{}\"; }}\n",
+                                nix_escape(addr),
+                                nix_escape(&slice.profile)
+                            ));
+                            continue;
+                        }
                     }
                 }
                 out.push_str(&format!(
@@ -566,9 +583,13 @@ pub fn generate_node_config_inner(
     if needs_vfio {
         out.push_str("  ch-vm.vfio.enable = true;\n");
     }
-    if features.vgpu_profile && !vgpu.is_empty() {
+    let nvidia_slices: Vec<&VgpuSliceNix> = vgpu
+        .iter()
+        .filter(|slice| !slice.vendor.splits_evenly())
+        .collect();
+    if features.vgpu_profile && !nvidia_slices.is_empty() {
         out.push_str("  ch-vm.vgpu.enable = true;\n");
-        let mut hosts: Vec<&str> = vgpu
+        let mut hosts: Vec<&str> = nvidia_slices
             .iter()
             .map(|slice| slice.host_address.as_str())
             .collect();
@@ -595,6 +616,7 @@ pub struct PostgresqlNix {
 /// Host vGPU configuration rendered beside the per-VM slice devices.
 #[derive(Debug, Clone)]
 pub struct VgpuHostNix {
+    pub vendor: kcore_gpu::VgpuVendor,
     pub host_cards: Vec<String>,
     pub num_vfs: i32,
     pub file: String,
@@ -613,6 +635,9 @@ pub fn with_vgpu_host(
     let Some(host) = host else {
         return config;
     };
+    if host.vendor.splits_evenly() {
+        return with_sriov_cards(config, host, features);
+    }
     if !features.vgpu_manager_run {
         return config;
     }
@@ -638,6 +663,29 @@ pub fn with_vgpu_host(
         ));
         block.push_str("  };\n");
     }
+    append_block(config, &block)
+}
+
+/// Intel and AMD host cards: `ch-vm.vgpu.sriovCards`. An older module that
+/// does not report `vgpuVendor` gets the config unchanged; the caller refuses.
+fn with_sriov_cards(config: String, host: &VgpuHostNix, features: &ModuleFeatures) -> String {
+    if !features.vgpu_vendor || host.num_vfs <= 0 {
+        return config;
+    }
+    let mut block = String::from("  ch-vm.vgpu.sriovCards = [\n");
+    for card in &host.host_cards {
+        block.push_str(&format!(
+            "    {{ address = \"{}\"; vendor = \"{}\"; numVfs = {}; }}\n",
+            nix_escape(card),
+            host.vendor.as_str(),
+            host.num_vfs
+        ));
+    }
+    block.push_str("  ];\n");
+    append_block(config, &block)
+}
+
+fn append_block(config: String, block: &str) -> String {
     if block.is_empty() {
         return config;
     }
@@ -1093,6 +1141,7 @@ mod tests {
             address: "0000:af:00.4".into(),
             profile: "A2-4C".into(),
             host_address: "0000:af:00.0".into(),
+            vendor: kcore_gpu::VgpuVendor::Nvidia,
         }];
         let render = |features: &ModuleFeatures| {
             generate_node_config_inner(
@@ -1127,6 +1176,7 @@ mod tests {
     #[test]
     fn vgpu_manager_run_is_appended_only_when_the_module_reports_it() {
         let host = VgpuHostNix {
+            vendor: kcore_gpu::VgpuVendor::Nvidia,
             host_cards: vec!["0000:61:00.0".into()],
             num_vfs: 0,
             file: "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run".into(),
@@ -1152,6 +1202,72 @@ mod tests {
         assert!(
             ModuleFeatures::from_reported(&[ModuleFeatures::VGPU_MANAGER_RUN]).vgpu_manager_run
         );
+    }
+
+    #[test]
+    fn intel_slice_is_vfio_with_its_vendor_and_no_nvidia_host() {
+        let mut guest = vm(true, "intel-guest");
+        guest.pci_devices = "0000:03:00.1".into();
+        let slices = [VgpuSliceNix {
+            vm_id: guest.id.clone(),
+            address: "0000:03:00.1".into(),
+            profile: "intel-2vf".into(),
+            host_address: "0000:03:00.0".into(),
+            vendor: kcore_gpu::VgpuVendor::Intel,
+        }];
+        let rendered = generate_node_config_inner(
+            &[guest],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &ModuleFeatures::all(),
+            &slices,
+        );
+        assert!(rendered.contains(
+            "{ address = \"0000:03:00.1\"; vgpuProfile = \"intel-2vf\"; vgpuVendor = \"intel\"; }"
+        ));
+        assert!(!rendered.contains("ch-vm.vgpu.enable"));
+        assert!(!rendered.contains("hostCards"));
+    }
+
+    #[test]
+    fn split_host_renders_sriov_cards_only_when_the_module_reports_vendor() {
+        let host = VgpuHostNix {
+            vendor: kcore_gpu::VgpuVendor::Amd,
+            host_cards: vec!["0000:c3:00.0".into()],
+            num_vfs: 4,
+            file: String::new(),
+            sha256: String::new(),
+            version: String::new(),
+        };
+        let bare = generate_node_config(
+            &[],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        let rendered = with_vgpu_host(bare.clone(), Some(&host), &ModuleFeatures::all());
+        assert!(rendered.contains("{ address = \"0000:c3:00.0\"; vendor = \"amd\"; numVfs = 4; }"));
+        assert!(!rendered.contains("ch-vm.vgpu.enable"));
+        assert!(!rendered.contains("managerRun"));
+        assert!(rendered.trim_end().ends_with('}'));
+        let older = ModuleFeatures {
+            vgpu_vendor: false,
+            ..ModuleFeatures::all()
+        };
+        assert_eq!(with_vgpu_host(bare.clone(), Some(&host), &older), bare);
+        assert!(ModuleFeatures::from_reported(&[ModuleFeatures::VGPU_VENDOR]).vgpu_vendor);
     }
 
     #[test]

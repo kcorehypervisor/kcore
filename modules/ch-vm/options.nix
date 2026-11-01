@@ -311,7 +311,16 @@ let
                 type = lib.types.nullOr lib.types.str;
                 default = null;
                 example = "A2-4C";
-                description = "NVIDIA vGPU profile to program on this virtual function before the guest starts. Null means whole-device vfio-pci passthrough.";
+                description = "vGPU profile of this virtual function. NVIDIA profiles are programmed before the guest starts; intel and amd profiles (intel-2vf) name the card's split. Null means whole-device vfio-pci passthrough.";
+              };
+              vgpuVendor = lib.mkOption {
+                type = lib.types.enum [
+                  "nvidia"
+                  "intel"
+                  "amd"
+                ];
+                default = "nvidia";
+                description = "Vendor of the vGPU slice. intel and amd slices are vfio-pci virtual functions of a card in ch-vm.vgpu.sriovCards.";
               };
             };
           }

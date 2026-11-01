@@ -50,6 +50,91 @@ pub enum VgpuSelector {
 /// Older Virtual GPU Managers bind each virtual function to this driver.
 pub const NVIDIA_VFIO_DRIVER: &str = "nvidia-vgpu-vfio";
 
+/// Who splits a card into slices.
+///
+/// NVIDIA programs a profile on each virtual function, and the function stays
+/// on the NVIDIA driver. Intel (`xe`) and AMD (`gim`) split the card evenly
+/// when its virtual functions are created; each function is then plain
+/// vfio-pci passthrough, and the slice profile only records the split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VgpuVendor {
+    Nvidia,
+    Intel,
+    Amd,
+}
+
+impl VgpuVendor {
+    pub const ALL: [VgpuVendor; 3] = [VgpuVendor::Nvidia, VgpuVendor::Intel, VgpuVendor::Amd];
+
+    /// `nvidia`, `intel`, or `amd`. Empty means `nvidia`.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "nvidia" => Ok(Self::Nvidia),
+            "intel" => Ok(Self::Intel),
+            "amd" => Ok(Self::Amd),
+            other => Err(format!(
+                "vGPU vendor '{other}' should be nvidia, intel, or amd"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nvidia => "nvidia",
+            Self::Intel => "intel",
+            Self::Amd => "amd",
+        }
+    }
+
+    /// Device family, and so the card name prefix (`intel0`, `radeon0`).
+    pub fn family(self) -> &'static str {
+        match self {
+            Self::Nvidia => "nvidia",
+            Self::Intel => "intel",
+            Self::Amd => "radeon",
+        }
+    }
+
+    /// Driver that owns the physical function while its slices run.
+    pub fn host_driver(self) -> &'static str {
+        match self {
+            Self::Nvidia => "nvidia",
+            Self::Intel => "xe",
+            Self::Amd => "gim",
+        }
+    }
+
+    /// The card splits evenly into vfio-pci virtual functions.
+    pub fn splits_evenly(self) -> bool {
+        self != Self::Nvidia
+    }
+
+    fn of_pci(vendor: u16) -> Option<Self> {
+        match vendor {
+            0x10de => Some(Self::Nvidia),
+            0x8086 => Some(Self::Intel),
+            0x1002 => Some(Self::Amd),
+            _ => None,
+        }
+    }
+
+    /// Vendor of a slice profile. NVIDIA names (`A2-4C`) have no prefix.
+    pub fn of_profile(profile: &str) -> Self {
+        let lower = profile.to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .filter(|vendor| vendor.splits_evenly())
+            .find(|vendor| lower.starts_with(&format!("{}-", vendor.family())))
+            .unwrap_or(Self::Nvidia)
+    }
+}
+
+/// Profile of one slice on a card split into `num_vfs` equal virtual
+/// functions: `intel-2vf` is half of an Intel card.
+pub fn split_profile(vendor: VgpuVendor, num_vfs: u32) -> String {
+    format!("{}-{num_vfs}vf", vendor.family())
+}
+
 /// Virtual GPU Manager 595 binds each virtual function to `nvidia` and
 /// publishes `nvidia/creatable_vgpu_types`. The vfio device node is created
 /// beside that binding. A function with no types is not a slice.
@@ -249,7 +334,12 @@ fn normalize_profile(raw: &str) -> Result<String, String> {
         || !profile.chars().any(|c| c.is_ascii_alphabetic())
         || !profile.chars().any(|c| c.is_ascii_digit())
     {
-        return Err(format!("vGPU profile '{profile}' should look like A2-4C"));
+        return Err(format!(
+            "vGPU profile '{profile}' should look like A2-4C or intel-2vf"
+        ));
+    }
+    if VgpuVendor::of_profile(profile).splits_evenly() {
+        return Ok(profile.to_ascii_lowercase());
     }
     Ok(profile.to_string())
 }
@@ -423,7 +513,7 @@ fn classify(mut devices: Vec<PciFn>, vgpu_hosts: &[String]) -> Vec<GpuDevice> {
 
     let primaries: Vec<PciFn> = devices
         .iter()
-        .filter(|dev| !is_nvidia_gpu_vf(dev) && (is_gpu(dev) || is_nic(dev) || is_nvme(dev)))
+        .filter(|dev| !is_slice_vf(dev) && (is_gpu(dev) || is_nic(dev) || is_nvme(dev)))
         .cloned()
         .collect();
     for primary in primaries {
@@ -454,7 +544,7 @@ fn classify(mut devices: Vec<PciFn>, vgpu_hosts: &[String]) -> Vec<GpuDevice> {
 
     let mut raw_groups: HashMap<String, Vec<&PciFn>> = HashMap::new();
     for dev in &devices {
-        if claimed.contains(&dev.address) || is_nvidia_gpu_vf(dev) {
+        if claimed.contains(&dev.address) || is_slice_vf(dev) {
             continue;
         }
         let key = dev
@@ -730,15 +820,26 @@ fn read_hex_u32(path: &Path) -> Option<u32> {
     u32::from_str_radix(text, 16).ok()
 }
 
-fn is_nvidia_gpu_vf(dev: &PciFn) -> bool {
-    dev.physfn.is_some() && dev.vendor == 0x10de && is_gpu(dev)
+fn is_slice_vf(dev: &PciFn) -> bool {
+    dev.physfn.is_some() && VgpuVendor::of_pci(dev.vendor).is_some() && is_gpu(dev)
 }
 
 fn is_vgpu_host(pci: &PciFn, vgpu_hosts: &[String]) -> bool {
-    pci.vendor == 0x10de
-        && pci.driver == "nvidia"
+    let Some(vendor) = VgpuVendor::of_pci(pci.vendor) else {
+        return false;
+    };
+    pci.driver == vendor.host_driver()
         && (pci.sriov_numvfs.is_some_and(|count| count > 0)
             || vgpu_hosts.iter().any(|addr| addr == &pci.address))
+}
+
+/// Virtual functions the card is split into now. `None` before any exist.
+fn split_count(pci: &PciFn) -> Option<u32> {
+    pci.sriov_numvfs.filter(|count| *count > 0).or_else(|| {
+        u32::try_from(pci.virtfns.len())
+            .ok()
+            .filter(|count| *count > 0)
+    })
 }
 
 fn apply_vgpu(
@@ -749,12 +850,15 @@ fn apply_vgpu(
 ) {
     let mut slices = Vec::new();
     for dev in found.iter_mut() {
-        if dev.kind != "gpu" || dev.family != "nvidia" {
+        if dev.kind != "gpu" {
             continue;
         }
         let Some(pci) = devices.iter().find(|row| row.address == dev.address) else {
             continue;
         };
+        if VgpuVendor::of_pci(pci.vendor).map(VgpuVendor::family) != Some(dev.family.as_str()) {
+            continue;
+        }
         if !is_vgpu_host(pci, vgpu_hosts) {
             continue;
         }
@@ -768,6 +872,14 @@ fn apply_vgpu(
         });
         dev.characteristics
             .push_str(&format!(" sriov=pf vfs={vfs}"));
+        if let Some(vendor) = VgpuVendor::of_pci(pci.vendor).filter(|v| v.splits_evenly()) {
+            dev.characteristics
+                .push_str(&format!(" vgpu-vendor={}", vendor.as_str()));
+            if let Some(count) = split_count(pci) {
+                dev.characteristics
+                    .push_str(&format!(" split={}", split_profile(vendor, count)));
+            }
+        }
     }
 
     let hosts: Vec<(String, String)> = found
@@ -798,16 +910,19 @@ fn apply_vgpu(
         }
     }
 
-    for vf in devices.iter().filter(|row| is_nvidia_gpu_vf(row)) {
+    for vf in devices.iter().filter(|row| is_slice_vf(row)) {
         if claimed.contains(&vf.address) {
             continue;
         }
         let Some(parent_addr) = vf.physfn.as_deref() else {
             continue;
         };
+        let Some(family) = VgpuVendor::of_pci(vf.vendor).map(VgpuVendor::family) else {
+            continue;
+        };
         let Some(parent) = found
             .iter()
-            .find(|dev| dev.address == parent_addr && dev.family == "nvidia")
+            .find(|dev| dev.address == parent_addr && dev.family == family)
             .cloned()
         else {
             continue;
@@ -840,9 +955,48 @@ fn vf_function(vf: &PciFn) -> u32 {
 }
 
 fn build_slice(parent: &GpuDevice, vf: &PciFn, index: u32, devices: &[PciFn]) -> GpuDevice {
+    let vendor = VgpuVendor::of_pci(vf.vendor).unwrap_or(VgpuVendor::Nvidia);
     let (mut assignable, mut blocked_reason, functions, group) = assignment(vf, devices);
-    let (profile, profiles) = slice_profile(vf, devices);
-    if assignable && vf.mdev && vf.vgpu_types.is_empty() && vf.vgpu_current.is_none() {
+    let (profile, profiles) = if vendor.splits_evenly() {
+        let split = devices
+            .iter()
+            .find(|row| row.address == parent.address)
+            .and_then(split_count);
+        // The split is already in effect, so it is also the current profile.
+        let profile = split
+            .map(|count| split_profile(vendor, count))
+            .unwrap_or_default();
+        let profiles = if profile.is_empty() {
+            Vec::new()
+        } else {
+            vec![profile.clone()]
+        };
+        (profile, profiles)
+    } else {
+        slice_profile(vf, devices)
+    };
+    if vendor.splits_evenly() {
+        let host_driver = vendor.host_driver();
+        if assignable && parent.driver != host_driver {
+            assignable = false;
+            let driver = if parent.driver.is_empty() {
+                "unbound"
+            } else {
+                parent.driver.as_str()
+            };
+            blocked_reason = format!(
+                "parent {} driver is {driver}, not {host_driver}",
+                parent.address
+            );
+        } else if assignable && !vf.driver.is_empty() && vf.driver != "vfio-pci" {
+            assignable = false;
+            blocked_reason = format!(
+                "bound to {} on the host; kcore-gpu-sriov binds {} virtual functions to vfio-pci",
+                vf.driver,
+                vendor.as_str()
+            );
+        }
+    } else if assignable && vf.mdev && vf.vgpu_types.is_empty() && vf.vgpu_current.is_none() {
         assignable = false;
         blocked_reason = "mdev vGPU is not supported; install vGPU 17 or later".into();
     } else if assignable && parent.driver != "nvidia" {
@@ -887,7 +1041,7 @@ fn build_slice(parent: &GpuDevice, vf: &PciFn, index: u32, devices: &[PciFn]) ->
     }
     GpuDevice {
         name: format!("{}/{index}", parent.name),
-        family: "nvidia".into(),
+        family: vendor.family().into(),
         model: format!("{} VF", parent.model),
         address: vf.address.clone(),
         functions,
@@ -1936,5 +2090,163 @@ mod tests {
         )
         .unwrap_err();
         assert!(refused.contains("--vgpu"), "{refused}");
+    }
+
+    /// An Arc Pro B50 on xe with two virtual functions. Each function has its
+    /// own IOMMU group and shares the card's slot.
+    fn write_intel_b50(root: &std::path::Path, vf_driver: Option<&str>) {
+        write_fn(
+            root,
+            "0000:03:00.0",
+            "0x8086",
+            "0xe212",
+            "0x030000",
+            Some("20"),
+        );
+        link_driver(root, "0000:03:00.0", "xe");
+        for (index, addr) in ["0000:03:00.1", "0000:03:00.2"].iter().enumerate() {
+            write_fn(
+                root,
+                addr,
+                "0x8086",
+                "0xe212",
+                "0x030000",
+                Some(&format!("{}", 21 + index)),
+            );
+            if let Some(driver) = vf_driver {
+                link_driver(root, addr, driver);
+            }
+        }
+        write_sriov_card(root, "0000:03:00.0", &["0000:03:00.1", "0000:03:00.2"]);
+    }
+
+    #[test]
+    fn intel_xe_card_splits_into_vfio_slices() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_intel_b50(tmp.path(), Some("vfio-pci"));
+        let rows = scan_pci(tmp.path()).unwrap();
+        let host = rows.iter().find(|dev| dev.name == "intel0").unwrap();
+        assert_eq!(host.role, "vgpu-host");
+        assert!(!host.assignable);
+        assert!(host.characteristics.contains("vgpu-vendor=intel"));
+        assert!(host.characteristics.contains("split=intel-2vf"));
+        let slices: Vec<_> = rows.iter().filter(|dev| dev.kind == "vgpu").collect();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].name, "intel0/0");
+        assert_eq!(slices[0].family, "intel");
+        assert_eq!(slices[0].parent, "intel0");
+        assert_eq!(slices[0].profile, "intel-2vf");
+        assert_eq!(slices[0].functions, vec!["0000:03:00.1".to_string()]);
+        assert!(slices.iter().all(|slice| slice.assignable), "{slices:?}");
+        assert!(rows.iter().all(|dev| dev.name != "intel1"));
+
+        let picked = select_vgpus(
+            &rows,
+            &[
+                parse_vgpu_selector("Intel-2VF").unwrap(),
+                parse_vgpu_selector("intel0=intel-2vf").unwrap(),
+            ],
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(picked[0].0.name, "intel0/0");
+        assert_eq!(picked[1].0.name, "intel0/1");
+        assert_eq!(picked[1].1, "intel-2vf");
+
+        let taken: HashSet<String> = [
+            "intel0/0=intel-2vf".to_string(),
+            "intel0/1=intel-2vf".into(),
+        ]
+        .into_iter()
+        .collect();
+        let full =
+            select_vgpus(&rows, &[VgpuSelector::Profile("intel-2vf".into())], &taken).unwrap_err();
+        assert!(full.contains("no free intel-2vf"), "{full}");
+        let wrong = select_vgpus(
+            &rows,
+            &[VgpuSelector::Profile("A2-4C".into())],
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert!(wrong.contains("A2-4C"), "{wrong}");
+    }
+
+    #[test]
+    fn intel_virtual_function_on_the_host_driver_is_not_a_free_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_intel_b50(tmp.path(), Some("xe"));
+        let rows = scan_pci(tmp.path()).unwrap();
+        let slice = rows.iter().find(|dev| dev.name == "intel0/0").unwrap();
+        assert!(!slice.assignable);
+        assert!(
+            slice.blocked_reason.contains("vfio-pci"),
+            "{}",
+            slice.blocked_reason
+        );
+    }
+
+    fn write_amd_v710(root: &std::path::Path, pf_driver: &str, vfs: usize) {
+        write_fn(
+            root,
+            "0000:c3:00.0",
+            "0x1002",
+            "0x7461",
+            "0x038000",
+            Some("60"),
+        );
+        link_driver(root, "0000:c3:00.0", pf_driver);
+        let addrs: Vec<String> = (0..vfs).map(|i| format!("0000:c3:02.{i}")).collect();
+        for (index, addr) in addrs.iter().enumerate() {
+            write_fn(
+                root,
+                addr,
+                "0x1002",
+                "0x7462",
+                "0x038000",
+                Some(&format!("{}", 61 + index)),
+            );
+        }
+        let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+        write_sriov_card(root, "0000:c3:00.0", &refs);
+    }
+
+    #[test]
+    fn amd_gim_card_splits_into_unbound_slices() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_amd_v710(tmp.path(), "gim", 4);
+        let rows = scan_pci(tmp.path()).unwrap();
+        let host = rows.iter().find(|dev| dev.name == "radeon0").unwrap();
+        assert_eq!(host.role, "vgpu-host");
+        let slices: Vec<_> = rows.iter().filter(|dev| dev.kind == "vgpu").collect();
+        assert_eq!(slices.len(), 4);
+        assert!(slices.iter().all(|slice| slice.profile == "radeon-4vf"));
+        assert!(slices.iter().all(|slice| slice.assignable), "{slices:?}");
+        assert_eq!(VgpuVendor::of_profile("radeon-4vf"), VgpuVendor::Amd);
+    }
+
+    #[test]
+    fn amd_card_without_gim_offers_no_slices() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_amd_v710(tmp.path(), "amdgpu", 2);
+        let rows = scan_pci(tmp.path()).unwrap();
+        let host = rows.iter().find(|dev| dev.name == "radeon0").unwrap();
+        assert_ne!(host.role, "vgpu-host");
+        let slice = rows.iter().find(|dev| dev.name == "radeon0/0").unwrap();
+        assert!(!slice.assignable);
+        assert!(
+            slice.blocked_reason.contains("not gim"),
+            "{}",
+            slice.blocked_reason
+        );
+    }
+
+    #[test]
+    fn vendor_names_parse() {
+        assert_eq!(VgpuVendor::parse("").unwrap(), VgpuVendor::Nvidia);
+        assert_eq!(VgpuVendor::parse("Intel").unwrap(), VgpuVendor::Intel);
+        assert_eq!(VgpuVendor::parse("amd").unwrap(), VgpuVendor::Amd);
+        assert!(VgpuVendor::parse("matrox").is_err());
+        assert_eq!(VgpuVendor::of_profile("A2-4C"), VgpuVendor::Nvidia);
+        assert_eq!(split_profile(VgpuVendor::Intel, 2), "intel-2vf");
     }
 }

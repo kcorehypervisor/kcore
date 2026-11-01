@@ -321,7 +321,14 @@ kctl node reboot node-193
 kctl update vm vgpu-01 --vgpu A2-4C
 ```
 
-`kctl describe node` prints the stored vGPU host record. `kind: NodeVgpu` is applied with `kctl apply -f`. See `docs/nvidia-ai-enterprise-vgpu.md`.
+Intel (`xe`) and AMD (GIM) cards split with SR-IOV and need no manager:
+
+```bash
+kctl node vgpu enable node-7 --vendor intel --host-card 0000:03:00.0 --num-vfs 2
+kctl update vm vgpu-02 --vgpu intel-2vf
+```
+
+`kctl describe node` prints the stored vGPU host record. `kind: NodeVgpu` is applied with `kctl apply -f`. See `docs/nvidia-ai-enterprise-vgpu.md` and the Intel and AMD section of `docs/gpu-passthrough.md`.
 
 Apply Nix to a node:
 
@@ -570,6 +577,7 @@ Top-level commands:
 - `kctl node uncordon <NODE_ID>` — make a cordoned node schedulable again
 - `kctl node delete <NODE_ID>` — remove an empty node and revoke its certificates
 - `kctl node vgpu enable <NODE_ID> --host-card <bdf> --url <url> --sha256 <sha256> --file <name.run> [--num-vfs N] [--no-reboot]`
+- `kctl node vgpu enable <NODE_ID> --vendor intel|amd --host-card <bdf> --num-vfs N [--no-reboot]`
 - `kctl node vgpu show <NODE_ID>`
 - `kctl node vgpu disable <NODE_ID>`
 - `kctl node reboot <NODE_ID> [--force]`

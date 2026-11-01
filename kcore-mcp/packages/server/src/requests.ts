@@ -382,7 +382,17 @@ function nodeVgpuRequest(spec: Record<string, unknown>, enabling: boolean): Reco
   const nodeId = assertName(rawNode, "node id");
   const enabled = enabling && spec.enabled !== false && spec.enabled !== "false";
   if (!enabled) {
-    return { nodeId, enabled: false, hostCards: [], numVfs: 0, manager: { url: "", sha256: "", file: "", version: "" } };
+    return { nodeId, enabled: false, hostCards: [], numVfs: 0, manager: { url: "", sha256: "", file: "", version: "" }, vendor: "" };
+  }
+  const vendor = (opt(spec, "vendor") ?? "nvidia").toLowerCase();
+  if (!["nvidia", "intel", "amd"].includes(vendor)) throw new InputError("vendor must be nvidia, intel, or amd");
+  const hostCards = deviceList(spec.hostCards);
+  if (hostCards.length === 0) throw new InputError("hostCards must name at least one PCI address");
+  const numVfs = spec.numVfs == null || spec.numVfs === "" ? 0 : Number(spec.numVfs);
+  if (!Number.isInteger(numVfs) || numVfs < 0) throw new InputError("numVfs must be an integer >= 0");
+  if (vendor !== "nvidia") {
+    if (numVfs < 1) throw new InputError(`numVfs is required for ${vendor} cards`);
+    return { nodeId, enabled: true, hostCards: hostCards.map((card) => assertArg(card, "host card")), numVfs, vendor };
   }
   const url = required(spec, "managerUrl", "manager URL");
   if (!(url.startsWith("http://") || url.startsWith("https://")) || url.includes(" ")) {
@@ -392,10 +402,6 @@ function nodeVgpuRequest(spec: Record<string, unknown>, enabling: boolean): Reco
   if (file.includes("/") || !file.endsWith(".run")) {
     throw new InputError("manager file must be the NVIDIA .run installer name");
   }
-  const hostCards = deviceList(spec.hostCards);
-  if (hostCards.length === 0) throw new InputError("hostCards must name at least one PCI address");
-  const numVfs = spec.numVfs == null || spec.numVfs === "" ? 0 : Number(spec.numVfs);
-  if (!Number.isInteger(numVfs) || numVfs < 0) throw new InputError("numVfs must be an integer >= 0");
   return {
     nodeId,
     enabled: true,
@@ -407,6 +413,7 @@ function nodeVgpuRequest(spec: Record<string, unknown>, enabling: boolean): Reco
       file,
       version: opt(spec, "managerVersion") ?? "595.91.04",
     },
+    vendor,
   };
 }
 

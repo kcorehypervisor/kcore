@@ -213,6 +213,8 @@ pub struct NodeGpuRow {
 pub struct NodeVgpuRow {
     pub node_id: String,
     pub enabled: bool,
+    /// `nvidia`, `intel`, or `amd`.
+    pub vendor: String,
     pub host_cards: String,
     pub num_vfs: i32,
     pub manager_file: String,
@@ -866,7 +868,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 69;
+pub const SCHEMA_VERSION: i32 = 70;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -877,7 +879,8 @@ pub const SCHEMA_VERSION: i32 = 69;
 /// Version 65 adds `node_ha.host_health` for proactive cordon. Version 67 adds
 /// the ingress tables, which an older reader never selects. Version 68 adds the
 /// Slurm tables, which an older reader never selects. Version 69 adds
-/// `node_vgpu`, the operator's vGPU host configuration.
+/// `node_vgpu`, the operator's vGPU host configuration. Version 70 adds
+/// `node_vgpu.vendor` with a default.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2295,6 +2298,20 @@ impl Database {
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );",
             )?;
+        }
+
+        if version < 70 {
+            let has: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('node_vgpu') WHERE name = 'vendor'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has == 0 {
+                conn.execute(
+                    "ALTER TABLE node_vgpu ADD COLUMN vendor TEXT NOT NULL DEFAULT 'nvidia'",
+                    [],
+                )?;
+            }
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -6627,10 +6644,11 @@ impl Database {
         conn.execute(
             "INSERT INTO node_vgpu (
                 node_id, enabled, host_cards, num_vfs, manager_file, manager_sha256,
-                manager_version, manager_url, staged_store_path, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                manager_version, manager_url, staged_store_path, vendor, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
              ON CONFLICT(node_id) DO UPDATE SET
                 enabled = excluded.enabled,
+                vendor = excluded.vendor,
                 host_cards = excluded.host_cards,
                 num_vfs = excluded.num_vfs,
                 manager_file = excluded.manager_file,
@@ -6649,6 +6667,7 @@ impl Database {
                 row.manager_version,
                 row.manager_url,
                 row.staged_store_path,
+                row.vendor,
             ],
         )?;
         Ok(())
@@ -6658,7 +6677,7 @@ impl Database {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT node_id, enabled, host_cards, num_vfs, manager_file, manager_sha256,
-                    manager_version, manager_url, staged_store_path
+                    manager_version, manager_url, staged_store_path, vendor
              FROM node_vgpu WHERE node_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![node_id], |row| {
@@ -6672,6 +6691,7 @@ impl Database {
                 manager_version: row.get(6)?,
                 manager_url: row.get(7)?,
                 staged_store_path: row.get(8)?,
+                vendor: row.get(9)?,
             })
         })?;
         rows.next().transpose()
@@ -8672,6 +8692,35 @@ mod tests {
             luks_method: String::new(),
             dc_id: "DC1".to_string(),
         }
+    }
+
+    #[test]
+    fn node_vgpu_keeps_its_vendor() {
+        let db = Database::open(":memory:").unwrap();
+        let node = test_node();
+        db.upsert_node(&node).unwrap();
+        db.upsert_node_vgpu(&NodeVgpuRow {
+            node_id: node.id.clone(),
+            enabled: true,
+            vendor: "intel".into(),
+            host_cards: "0000:03:00.0".into(),
+            num_vfs: 2,
+            manager_file: String::new(),
+            manager_sha256: String::new(),
+            manager_version: String::new(),
+            manager_url: String::new(),
+            staged_store_path: String::new(),
+        })
+        .unwrap();
+        let row = db.get_node_vgpu(&node.id).unwrap().unwrap();
+        assert_eq!(row.vendor, "intel");
+        assert_eq!(row.num_vfs, 2);
+        db.migrate_down(69).unwrap();
+        db.migrate().unwrap();
+        assert_eq!(
+            db.get_node_vgpu(&node.id).unwrap().unwrap().vendor,
+            "nvidia"
+        );
     }
 
     #[test]

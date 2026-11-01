@@ -1053,14 +1053,22 @@ fn print_node_vgpu(vgpu: &controller_proto::GetNodeVgpuResponse) {
     } else {
         vgpu.staged_store_path.clone()
     };
+    let vendor = if vgpu.vendor.is_empty() {
+        "nvidia"
+    } else {
+        vgpu.vendor.as_str()
+    };
     println!("  enabled");
+    println!("  Vendor:     {vendor}");
     println!("  Host cards: {cards}");
     println!("  VFs:        {vfs}");
-    println!(
-        "  Manager:    {} ({})",
-        vgpu.manager_file, vgpu.manager_version
-    );
-    println!("  Store path: {store}");
+    if vendor == "nvidia" {
+        println!(
+            "  Manager:    {} ({})",
+            vgpu.manager_file, vgpu.manager_version
+        );
+        println!("  Store path: {store}");
+    }
 }
 
 pub async fn vgpu_show(info: &ConnectionInfo, node_id: &str) -> Result<()> {
@@ -1076,33 +1084,60 @@ pub async fn vgpu_show(info: &ConnectionInfo, node_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn vgpu_enable(
-    info: &ConnectionInfo,
-    node_id: &str,
-    host_cards: &[String],
-    num_vfs: i32,
-    url: &str,
-    sha256: &str,
-    file: &str,
-    version: &str,
-    reboot: bool,
-) -> Result<()> {
-    let mut client = client::controller_client(info).await?;
-    let resp = client
-        .configure_node_vgpu(controller_proto::ConfigureNodeVgpuRequest {
-            node_id: node_id.to_string(),
+#[derive(Debug)]
+pub struct VgpuEnable {
+    pub node_id: String,
+    pub vendor: String,
+    pub host_cards: Vec<String>,
+    pub num_vfs: i32,
+    pub url: Option<String>,
+    pub sha256: Option<String>,
+    pub file: Option<String>,
+    pub version: String,
+}
+
+impl VgpuEnable {
+    fn into_request(self) -> Result<controller_proto::ConfigureNodeVgpuRequest> {
+        let vendor = kcore_gpu::VgpuVendor::parse(&self.vendor).map_err(anyhow::Error::msg)?;
+        let manager = if vendor.splits_evenly() {
+            if self.num_vfs < 1 {
+                anyhow::bail!("--num-vfs is required for {} cards", vendor.as_str());
+            }
+            if self.url.is_some() || self.sha256.is_some() || self.file.is_some() {
+                anyhow::bail!(
+                    "--url, --sha256, and --file stage the NVIDIA manager; {} cards do not use them",
+                    vendor.as_str()
+                );
+            }
+            None
+        } else {
+            let (Some(url), Some(sha256), Some(file)) = (self.url, self.sha256, self.file) else {
+                anyhow::bail!("NVIDIA vGPU needs --url, --sha256, and --file for the manager");
+            };
+            Some(controller_proto::VgpuManager {
+                url,
+                sha256,
+                file,
+                version: self.version,
+            })
+        };
+        Ok(controller_proto::ConfigureNodeVgpuRequest {
+            node_id: self.node_id,
             enabled: true,
-            host_cards: host_cards.to_vec(),
-            num_vfs,
-            manager: Some(controller_proto::VgpuManager {
-                url: url.to_string(),
-                sha256: sha256.to_string(),
-                file: file.to_string(),
-                version: version.to_string(),
-            }),
+            host_cards: self.host_cards,
+            num_vfs: self.num_vfs,
+            manager,
+            vendor: vendor.as_str().to_string(),
         })
-        .await?
-        .into_inner();
+    }
+}
+
+pub async fn vgpu_enable(info: &ConnectionInfo, enable: VgpuEnable, reboot: bool) -> Result<()> {
+    let node_id = enable.node_id.clone();
+    let node_id = node_id.as_str();
+    let request = enable.into_request()?;
+    let mut client = client::controller_client(info).await?;
+    let resp = client.configure_node_vgpu(request).await?.into_inner();
     if !resp.success {
         anyhow::bail!("{}", resp.message);
     }
@@ -1178,31 +1213,46 @@ pub async fn apply_vgpu_from_file(info: &ConnectionInfo, file: &str) -> Result<(
     if !enabled {
         return vgpu_disable(info, &node_id).await;
     }
-    let host_cards = yaml_strings(&doc["spec"], &["hostCards", "host_cards"]);
+    vgpu_enable(info, vgpu_enable_from_manifest(node_id, &doc)?, true).await
+}
+
+fn vgpu_enable_from_manifest(node_id: String, doc: &serde_yaml::Value) -> Result<VgpuEnable> {
+    let spec = &doc["spec"];
+    let host_cards = yaml_strings(spec, &["hostCards", "host_cards"]);
     if host_cards.is_empty() {
         anyhow::bail!("spec.hostCards must name at least one PCI address");
     }
-    let num_vfs = doc["spec"]["numVfs"]
+    let num_vfs = spec["numVfs"]
         .as_i64()
-        .or_else(|| doc["spec"]["num_vfs"].as_i64())
+        .or_else(|| spec["num_vfs"].as_i64())
         .unwrap_or(0) as i32;
-    let manager = &doc["spec"]["manager"];
-    let url = yaml_str(manager, &["url"]).context("spec.manager.url is required")?;
-    let sha256 = yaml_str(manager, &["sha256"]).context("spec.manager.sha256 is required")?;
-    let file_name = yaml_str(manager, &["file"]).context("spec.manager.file is required")?;
-    let version = yaml_str(manager, &["version"]).unwrap_or_else(|| "595.91.04".to_string());
-    vgpu_enable(
-        info,
-        &node_id,
-        &host_cards,
+    let manager = &spec["manager"];
+    let manager_field = |key: &str| {
+        yaml_str(manager, &[key]).with_context(|| format!("spec.manager.{key} is required"))
+    };
+    let vendor = yaml_str(spec, &["vendor"]).unwrap_or_else(|| "nvidia".to_string());
+    let split = kcore_gpu::VgpuVendor::parse(&vendor)
+        .map_err(anyhow::Error::msg)?
+        .splits_evenly();
+    let (url, sha256, file) = if split {
+        (None, None, None)
+    } else {
+        (
+            Some(manager_field("url")?),
+            Some(manager_field("sha256")?),
+            Some(manager_field("file")?),
+        )
+    };
+    Ok(VgpuEnable {
+        node_id,
+        vendor,
+        host_cards,
         num_vfs,
-        &url,
-        &sha256,
-        &file_name,
-        &version,
-        true,
-    )
-    .await
+        url,
+        sha256,
+        file,
+        version: yaml_str(manager, &["version"]).unwrap_or_else(|| "595.91.04".to_string()),
+    })
 }
 
 fn yaml_str(value: &serde_yaml::Value, keys: &[&str]) -> Option<String> {
@@ -1237,7 +1287,50 @@ fn yaml_strings(value: &serde_yaml::Value, keys: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_install_controller_mode;
+    use super::{validate_install_controller_mode, vgpu_enable_from_manifest, VgpuEnable};
+
+    fn manifest(spec: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(&format!(
+            "kind: NodeVgpu\nmetadata:\n  name: node-1\nspec:\n{spec}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn intel_manifest_needs_no_manager() {
+        let doc = manifest("  vendor: intel\n  hostCards: [\"0000:03:00.0\"]\n  numVfs: 2\n");
+        let request = vgpu_enable_from_manifest("node-1".into(), &doc)
+            .unwrap()
+            .into_request()
+            .unwrap();
+        assert_eq!(request.vendor, "intel");
+        assert_eq!(request.num_vfs, 2);
+        assert!(request.manager.is_none());
+    }
+
+    #[test]
+    fn manifest_without_vendor_is_nvidia_and_needs_the_manager() {
+        let doc = manifest("  hostCards: [\"0000:61:00.0\"]\n");
+        let err = vgpu_enable_from_manifest("node-1".into(), &doc).unwrap_err();
+        assert!(err.to_string().contains("spec.manager.url"), "{err}");
+    }
+
+    #[test]
+    fn split_vendor_requires_a_vf_count_and_refuses_manager_flags() {
+        let enable = |num_vfs, url: Option<&str>| VgpuEnable {
+            node_id: "node-1".into(),
+            vendor: "amd".into(),
+            host_cards: vec!["0000:c3:00.0".into()],
+            num_vfs,
+            url: url.map(str::to_string),
+            sha256: None,
+            file: None,
+            version: "595.91.04".into(),
+        };
+        assert!(enable(0, None).into_request().is_err());
+        assert!(enable(4, Some("https://x/y.run")).into_request().is_err());
+        assert_eq!(enable(4, None).into_request().unwrap().vendor, "amd");
+    }
 
     #[test]
     fn validate_install_mode_rejects_neither() {
