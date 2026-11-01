@@ -118,33 +118,58 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           { example: "node-193" },
         ),
       ].filter((item) => item.required || missing(spec, item.id));
-    case "node-vgpu":
+    case "node-vgpu": {
+      const vendor = String(spec.vendor ?? "nvidia").toLowerCase();
+      const nvidia = vendor === "nvidia";
       return [
-        question("nodeId", "Which node should become the vGPU host?", "The node must already report the vgpuManagerRun feature.", missing(spec, "nodeId") && missing(spec, "name"), {
-          example: "node-193",
-        }),
+        question(
+          "nodeId",
+          "Which node should become the vGPU host?",
+          nvidia ? "The node must already report the vgpuManagerRun feature." : "The node must already report the vgpuVendor feature.",
+          missing(spec, "nodeId") && missing(spec, "name"),
+          { example: "node-193" },
+        ),
+        question(
+          "vendor",
+          "Which card vendor: nvidia, intel, or amd?",
+          "nvidia uses the licensed Virtual GPU Manager. intel (xe driver, for example Arc Pro B50/B70) and amd (GIM driver, for example Radeon Pro V710) split the card with SR-IOV and hand each virtual function to a VM through vfio-pci.",
+          false,
+          { example: "nvidia" },
+        ),
         question(
           "hostCards",
-          "Which physical functions stay on the NVIDIA host driver?",
+          "Which physical functions stay on the host driver?",
           "Use the PCI address from kcore_read kind gpus, for example 0000:61:00.0.",
           missing(spec, "hostCards"),
           { example: "0000:61:00.0" },
         ),
         question(
-          "managerUrl",
-          "Where can the node download the Virtual GPU Manager .run file?",
-          "An http or https URL. The node checks the SHA256 before adding the file to the Nix store.",
-          missing(spec, "managerUrl"),
+          "numVfs",
+          "How many virtual functions should each card expose?",
+          "Every slice gets an equal share. An Arc Pro B50 supports 2, a B70 supports 4, and a V710 supports 1 to 12. NVIDIA accepts 0 for every function the card supports.",
+          !nvidia && missing(spec, "numVfs"),
+          { example: nvidia ? "0" : "2" },
         ),
-        question("managerSha256", "What is the SHA256 of that .run file?", "A mismatch refuses the stage.", missing(spec, "managerSha256")),
-        question(
-          "managerFile",
-          "What is the installer filename?",
-          "The filename must end in .run and must not contain a slash.",
-          missing(spec, "managerFile"),
-          { example: "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run" },
-        ),
+        ...(nvidia
+          ? [
+              question(
+                "managerUrl",
+                "Where can the node download the Virtual GPU Manager .run file?",
+                "An http or https URL. The node checks the SHA256 before adding the file to the Nix store.",
+                missing(spec, "managerUrl"),
+              ),
+              question("managerSha256", "What is the SHA256 of that .run file?", "A mismatch refuses the stage.", missing(spec, "managerSha256")),
+              question(
+                "managerFile",
+                "What is the installer filename?",
+                "The filename must end in .run and must not contain a slash.",
+                missing(spec, "managerFile"),
+                { example: "NVIDIA-Linux-x86_64-595.91.04-vgpu-kvm-aie.run" },
+              ),
+            ]
+          : []),
       ].filter((item) => item.required || missing(spec, item.id));
+    }
     case "network":
       return [
         question("name", "What should the network be called?", "VMs attach to this name.", missing(spec, "name"), {

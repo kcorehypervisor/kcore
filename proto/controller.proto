@@ -384,11 +384,15 @@ message VgpuManager {
 message ConfigureNodeVgpuRequest {
   string node_id = 1;
   bool enabled = 2;
-  // Physical functions that stay on the NVIDIA host driver, e.g. 0000:61:00.0.
+  // Physical functions that stay on the vendor host driver, e.g. 0000:61:00.0.
   repeated string host_cards = 3;
-  // 0 asks sriov-manage for every function the card supports.
+  // NVIDIA: 0 asks sriov-manage for every function the card supports.
+  // Intel and AMD: required; the card is split evenly into this many slices.
   int32 num_vfs = 4;
+  // NVIDIA only. Intel (xe) and AMD (GIM) need no manager download.
   VgpuManager manager = 5;
+  // nvidia (default), intel, or amd.
+  string vendor = 6;
 }
 
 message ConfigureNodeVgpuResponse {
@@ -411,6 +415,7 @@ message GetNodeVgpuResponse {
   string manager_sha256 = 5;
   string manager_version = 6;
   string staged_store_path = 7;
+  string vendor = 8;
 }
 
 message RebootNodeRequest {

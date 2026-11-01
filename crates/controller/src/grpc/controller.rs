@@ -1324,6 +1324,12 @@ impl ControllerService {
                 node.id
             )));
         }
+        if vgpu.iter().any(|slice| slice.vendor.splits_evenly()) && !module_features.vgpu_vendor {
+            return Err(Status::failed_precondition(format!(
+                "node {} cannot start an Intel or AMD vGPU slice until its ch-vm module reports vgpuVendor",
+                node.id
+            )));
+        }
         let ingress_nix = crate::ingress_reconciler::load_state(&self.db)
             .ok()
             .and_then(|st| crate::ingress_reconciler::ingress_nix_for_node(&st, node));
@@ -1336,6 +1342,8 @@ impl ControllerService {
                 .as_ref()
                 .filter(|row| row.enabled)
                 .map(|row| nixgen::VgpuHostNix {
+                    vendor: kcore_gpu::VgpuVendor::parse(&row.vendor)
+                        .unwrap_or(kcore_gpu::VgpuVendor::Nvidia),
                     host_cards: row
                         .host_cards
                         .split(',')
@@ -1347,11 +1355,24 @@ impl ControllerService {
                     sha256: row.manager_sha256.clone(),
                     version: row.manager_version.clone(),
                 });
-        if vgpu_host.is_some() && !module_features.vgpu_manager_run {
-            return Err(Status::failed_precondition(format!(
-                "node {} has a vGPU host configured but its ch-vm module does not report vgpuManagerRun; update the node first",
-                node.id
-            )));
+        if let Some(host) = vgpu_host.as_ref() {
+            let (ready, feature) = if host.vendor.splits_evenly() {
+                (
+                    module_features.vgpu_vendor,
+                    nixgen::ModuleFeatures::VGPU_VENDOR,
+                )
+            } else {
+                (
+                    module_features.vgpu_manager_run,
+                    nixgen::ModuleFeatures::VGPU_MANAGER_RUN,
+                )
+            };
+            if !ready {
+                return Err(Status::failed_precondition(format!(
+                    "node {} has a vGPU host configured but its ch-vm module does not report {feature}; update the node first",
+                    node.id
+                )));
+            }
         }
         let nix_config = nixgen::with_vgpu_host(
             nixgen::with_postgresql(
@@ -4151,6 +4172,82 @@ impl ControllerService {
         Ok((names, pci_devices))
     }
 
+    /// Intel (xe) and AMD (GIM) hosts. The card splits into `num_vfs` equal
+    /// vfio-pci virtual functions; there is no manager to download.
+    async fn configure_split_vgpu(
+        &self,
+        node: &NodeRow,
+        vendor: kcore_gpu::VgpuVendor,
+        host_cards: Vec<String>,
+        num_vfs: i32,
+    ) -> Result<Response<controller_proto::ConfigureNodeVgpuResponse>, Status> {
+        if !(1..=63).contains(&num_vfs) {
+            return Err(Status::invalid_argument(format!(
+                "num_vfs must be between 1 and 63 for {} cards",
+                vendor.as_str()
+            )));
+        }
+        let inventory = self.node_gpu_inventory(&node.id)?;
+        for card in &host_cards {
+            let found = inventory.iter().any(|dev| {
+                dev.family == vendor.family()
+                    && dev.parent.is_empty()
+                    && dev.address.eq_ignore_ascii_case(card)
+            });
+            if !found {
+                return Err(Status::failed_precondition(format!(
+                    "node {} has no {} GPU at {card}",
+                    node.id,
+                    vendor.as_str()
+                )));
+            }
+        }
+        let mut admin = self.ensure_admin_client_for_node(node).await?;
+        let features = self.ch_vm_module_features(node, &mut admin).await;
+        if !features.vgpu_vendor {
+            return Err(Status::failed_precondition(format!(
+                "node {} does not report vgpuVendor; update kcore on the node before enabling {} vGPU",
+                node.id,
+                vendor.as_str()
+            )));
+        }
+        self.db
+            .upsert_node_vgpu(&crate::db::NodeVgpuRow {
+                node_id: node.id.clone(),
+                enabled: true,
+                vendor: vendor.as_str().to_string(),
+                host_cards: host_cards.join(","),
+                num_vfs,
+                manager_file: String::new(),
+                manager_sha256: String::new(),
+                manager_version: String::new(),
+                manager_url: String::new(),
+                staged_store_path: String::new(),
+            })
+            .map_err(|e| Status::internal(format!("storing vGPU host config: {e}")))?;
+        self.push_config_and_await_apply(node).await?;
+        // GIM loads at boot and amdgpu is blacklisted, so AMD always reboots.
+        // xe creates virtual functions live once it owns the card.
+        let reboot_required = host_cards.iter().any(|card| {
+            inventory.iter().any(|dev| {
+                dev.address.eq_ignore_ascii_case(card)
+                    && (dev.iommu_group < 0 || dev.driver != vendor.host_driver())
+            })
+        });
+        Ok(Response::new(controller_proto::ConfigureNodeVgpuResponse {
+            success: true,
+            message: format!(
+                "{} vGPU host enabled on {}: {} slices of {} per card",
+                vendor.as_str(),
+                node.id,
+                num_vfs,
+                kcore_gpu::split_profile(vendor, num_vfs as u32)
+            ),
+            reboot_required,
+            store_path: String::new(),
+        }))
+    }
+
     fn vgpu_slices_for(
         &self,
         node_id: &str,
@@ -4180,6 +4277,7 @@ impl ControllerService {
                     address: addr.clone(),
                     profile: profile.to_string(),
                     host_address,
+                    vendor: kcore_gpu::VgpuVendor::of_profile(profile),
                 });
             }
         }
@@ -12068,14 +12166,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 store_path: String::new(),
             }));
         }
+        let vendor = kcore_gpu::VgpuVendor::parse(&req.vendor).map_err(Status::invalid_argument)?;
         if req.host_cards.is_empty() {
             return Err(Status::invalid_argument(
-                "host_cards must name at least one NVIDIA physical function",
+                "host_cards must name at least one physical function",
             ));
         }
         let mut host_cards = Vec::with_capacity(req.host_cards.len());
         for card in &req.host_cards {
             host_cards.push(crate::pci::normalize_pci_bdf(card).map_err(Status::invalid_argument)?);
+        }
+        if vendor.splits_evenly() {
+            return self
+                .configure_split_vgpu(&node, vendor, host_cards, req.num_vfs)
+                .await;
         }
         let manager = req.manager.unwrap_or_default();
         let file = validate_vgpu_manager_file(&manager.file)?;
@@ -12130,6 +12234,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .upsert_node_vgpu(&crate::db::NodeVgpuRow {
                 node_id: node.id.clone(),
                 enabled: true,
+                vendor: vendor.as_str().to_string(),
                 host_cards: host_cards.join(","),
                 num_vfs: req.num_vfs,
                 manager_file: file,
@@ -12190,6 +12295,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             manager_sha256: row.manager_sha256,
             manager_version: row.manager_version,
             staged_store_path: row.staged_store_path,
+            vendor: row.vendor,
         }))
     }
 

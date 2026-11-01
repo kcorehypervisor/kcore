@@ -425,6 +425,11 @@ DROP TABLE IF EXISTS slurm_clusters;",
         sql: "DROP TABLE IF EXISTS node_vgpu;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 70,
+        sql: "ALTER TABLE node_vgpu DROP COLUMN vendor;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

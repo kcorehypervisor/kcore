@@ -204,6 +204,7 @@
               kcore-disk-verify
               nvidia-vgpu-manager
               ;
+            amd-gim = pkgs.callPackage ./pkgs/amd-gim { inherit (pkgs.linuxPackages) kernel; };
           };
 
           checks = {

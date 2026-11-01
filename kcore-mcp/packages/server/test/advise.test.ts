@@ -104,6 +104,13 @@ test("a vGPU host asks for the card and the manager", () => {
   assert.ok(ids.includes("managerFile"));
 });
 
+test("an Intel vGPU host asks for the split instead of the manager", () => {
+  const advice = advise({ kind: "node-vgpu", spec: { vendor: "intel" } });
+  const ids = advice.blocking.map((item) => item.id);
+  assert.ok(ids.includes("numVfs"));
+  assert.ok(!ids.includes("managerFile"));
+});
+
 test("cluster advice asks for the controller address", () => {
   const advice = advise({ kind: "cluster", spec: {} });
   assert.ok(advice.blocking.some((item) => item.id === "controller"));

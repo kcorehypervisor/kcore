@@ -170,6 +170,51 @@ The node must already be running a kcore generation that reports
 `vgpuManagerRun`. Older nodes refuse `ConfigureNodeVgpu` until
 `kctl update cluster` rolls that generation out.
 
+### Intel and AMD SR-IOV slices
+
+Intel and AMD cards split with plain SR-IOV. There is no licence and no
+mediated device: each virtual function is a slice, and the VM gets it through
+`vfio-pci` like any other passthrough function. `--vendor` picks the host
+driver, and `--num-vfs` splits every card evenly.
+
+| Vendor | Host driver | Example card | Virtual functions |
+|--------|-------------|--------------|-------------------|
+| `intel` | upstream `xe` | Arc Pro B50 / B70 | 2 on a B50 (8 GB each), 4 on a B70 |
+| `amd` | GIM (MxGPU), built from source | Radeon Pro V710 | 1 to 12 |
+
+```bash
+kctl node vgpu enable node-7 --vendor intel --host-card 0000:03:00.0 --num-vfs 2
+kctl create vm web-01 --target-node node-7 --vgpu intel-2vf ...
+```
+
+The slice profile names the split: `intel-2vf` is half of an Intel card and
+`radeon-4vf` is a quarter of an AMD card. `--vgpu intel0=intel-2vf` and
+`--vgpu intel0/1=intel-2vf` pin a card or a function, as with NVIDIA.
+
+```yaml
+kind: NodeVgpu
+metadata:
+  name: node-7
+spec:
+  vendor: amd
+  hostCards: ["0000:c3:00.0"]
+  numVfs: 4
+```
+
+The controller renders `ch-vm.vgpu.sriovCards`. On Intel the
+`kcore-gpu-sriov` unit turns off `sriov_drivers_autoprobe`, writes
+`sriov_numvfs` on the `xe` physical function, and binds each virtual function
+to `vfio-pci`. On AMD the node blacklists `amdgpu` and loads `gim` with
+`vf_num`, which creates the functions at load time; the unit then binds them
+to `vfio-pci`. Every AMD card on one node uses the same `numVfs`, because GIM
+takes one count per card in probe order and kcore keeps them equal.
+`ch-vm.vgpu.amd.schedulePolicy` sets GIM's `sch_policy`. Live migration of
+AMD slices (`amd-vfio-pci`) is not wired up.
+
+The node must report the `vgpuVendor` feature. The Intel and AMD paths are
+tested against fake sysfs trees and Nix evaluations, not on a B50 or a V710
+yet; treat them as preview until a real card has run a guest.
+
 A slice guest runs on the Cloud Hypervisor that kcore builds from
 `ch-vm.vms.cloudHypervisorPatches`. Those patches give the NVIDIA vendor
 driver what it gets from QEMU: guest RAM mapped before the device opens,
