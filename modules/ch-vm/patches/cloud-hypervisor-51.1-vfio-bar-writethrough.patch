@@ -1,0 +1,89 @@
+Write BAR addresses through to the VFIO device.
+
+Cloud Hypervisor sizes each BAR by writing all ones into the device's
+config space and then keeps the guest's BAR programming in a local shadow
+only. vfio-pci does not care: it virtualises BAR writes. NVIDIA's vGPU
+vendor driver emulates the virtual function's config space itself and
+takes the BAR register as the guest's BAR base. It was left at
+0xfffffff0, so every BAR0 register read reached the manager at
+0xfffffff0 + offset ("No space found for read", "Register read failed
+... Timeout") and the guest driver reported the GPU as unsupported.
+
+Write the allocated address after sizing and forward every later guest
+BAR write, which is what QEMU does with all config writes.
+
+--- a/pci/src/vfio.rs
++++ b/pci/src/vfio.rs
+@@ -888,6 +888,13 @@
+                 user_memory_regions: Vec::new(),
+             });
+ 
++            // The sizing write above left all ones in the device's BAR
++            // register. vfio-pci virtualises BAR writes, but a vendor driver
++            // that emulates its own config space (NVIDIA vGPU) takes that
++            // value as the guest's BAR base and offsets every region access
++            // by it. Tell the device where the BAR really is, as QEMU does.
++            self.write_bar_to_device(bar_id, bar_addr.raw_value(), region_type, flags);
++
+             bar_id += 1;
+             if region_type == PciBarRegionType::Memory64BitRegion {
+                 bar_id += 1;
+@@ -897,6 +904,34 @@
+         Ok(bars)
+     }
+ 
++    fn write_bar_to_device(
++        &self,
++        bar_id: u32,
++        bar_addr: u64,
++        region_type: PciBarRegionType,
++        flags: u32,
++    ) {
++        let bar_offset = if bar_id == VFIO_PCI_ROM_REGION_INDEX {
++            (PCI_ROM_EXP_BAR_INDEX * 4) as u32
++        } else {
++            PCI_CONFIG_BAR_OFFSET + bar_id * 4
++        };
++        let flag_bits = if bar_id == VFIO_PCI_ROM_REGION_INDEX {
++            flags & 0x1
++        } else if region_type == PciBarRegionType::IoRegion {
++            flags & 0b11
++        } else {
++            flags & 0b1111
++        };
++        self.vfio_wrapper
++            .write_config_dword(bar_offset, (bar_addr as u32) | flag_bits);
++        if region_type == PciBarRegionType::Memory64BitRegion {
++            let upper_offset = PCI_CONFIG_BAR_OFFSET + (bar_id + 1) * 4;
++            self.vfio_wrapper
++                .write_config_dword(upper_offset, (bar_addr >> 32) as u32);
++        }
++    }
++
+     // The `allocator` argument is unused on `aarch64`
+     #[allow(unused_variables)]
+     pub(crate) fn free_bars(
+@@ -1358,14 +1393,18 @@
+         data: &[u8],
+     ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+         // When the guest wants to write to a BAR, we trap it into
+-        // our local configuration space. We're not reprogramming
+-        // VFIO device.
++        // our local configuration space. The guest reads BARs back from
++        // that cache (see read_config_register()).
+         if (PCI_CONFIG_BAR0_INDEX..PCI_CONFIG_BAR0_INDEX + BAR_NUMS).contains(&reg_idx)
+             || reg_idx == PCI_ROM_EXP_BAR_INDEX
+         {
+-            // We keep our local cache updated with the BARs.
+-            // We'll read it back from there when the guest is asking
+-            // for BARs (see read_config_register()).
++            // The device also sees the write. vfio-pci keeps a virtual copy
++            // and never touches the hardware BAR; a vendor driver with an
++            // emulated config space (NVIDIA vGPU) needs the guest's BAR base
++            // to translate region accesses. This matches QEMU, which passes
++            // every config write to the device first.
++            let reg = (reg_idx * PCI_CONFIG_REGISTER_SIZE) as u64;
++            self.vfio_wrapper.write_config((reg + offset) as u32, data);
+             return (
+                 self.configuration
+                     .write_config_register(reg_idx, offset, data),

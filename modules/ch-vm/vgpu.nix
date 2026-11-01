@@ -14,7 +14,7 @@ let
       null
     else
       pkgs.callPackage ../../pkgs/nvidia-vgpu-manager {
-        kernel = config.boot.kernelPackages.kernel;
+        inherit (config.boot.kernelPackages) kernel;
         src = pkgs.requireFile {
           name = cfg.managerRun.file;
           inherit (cfg.managerRun) sha256;
@@ -173,6 +173,15 @@ in
           echo "nouveau is still loaded; NVIDIA vGPU starts after reboot"
           exit 0
         fi
+        # nvidia-vgpu-mgr dlopens libnvidia-vgpu.so by that name. The package
+        # ships a versioned file, and dlopen does not search the binary rpath.
+        libdir=/run/kcore/nvidia-vgpu-lib
+        ${pkgs.coreutils}/bin/mkdir -p "$libdir"
+        for base in libnvidia-vgpu libnvidia-vgxcfg libnvidia-ml; do
+          src=$(${pkgs.coreutils}/bin/ls ${manage}/lib/$base.so.[0-9]*.[0-9]*.[0-9]* | ${pkgs.coreutils}/bin/head -n1)
+          ${pkgs.coreutils}/bin/ln -sfn "$src" "$libdir/$base.so"
+        done
+        export LD_LIBRARY_PATH="$libdir:${manage}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         ${manage}/bin/nvidia-vgpu-mgr
       '';
     };
@@ -191,6 +200,8 @@ in
       };
       script = ''
         set -eu
+        # sriov-manage calls modprobe, lspci, and setpci by name.
+        export PATH="${pkgs.kmod}/bin:${pkgs.pciutils}/bin:${pkgs.gawk}/bin:${pkgs.coreutils}/bin:$PATH"
         if grep -q '^nouveau ' /proc/modules; then
           echo "nouveau is still loaded; NVIDIA vGPU starts after reboot"
           exit 0

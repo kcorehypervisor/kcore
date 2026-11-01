@@ -1105,12 +1105,91 @@ fn apply_phase_to_proto(phase: &str) -> i32 {
     }
 }
 
-async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>, apply_id: String) {
+/// VM names whose guest disk is a raw file on this node, read from the
+/// generated `virtualMachines."<name>"` blocks.
+fn parse_filesystem_vms_from_nix(configuration_nix: &str) -> Vec<String> {
+    let mut current_vm: Option<String> = None;
+    let mut names = Vec::new();
+    for raw in configuration_nix.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("virtualMachines.\"") {
+            if let Some((vm_name, _)) = rest.split_once('"') {
+                current_vm = Some(vm_name.to_string());
+            }
+            continue;
+        }
+        if line.starts_with("};") {
+            current_vm = None;
+            continue;
+        }
+        if let Some(vm_name) = current_vm.as_ref() {
+            if line == "storageBackend = \"filesystem\";" {
+                names.push(vm_name.clone());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn parse_vm_names_from_nix(configuration_nix: &str) -> Vec<String> {
+    configuration_nix
+        .lines()
+        .filter_map(|raw| {
+            raw.trim()
+                .strip_prefix("virtualMachines.\"")
+                .and_then(|rest| rest.split_once('"'))
+                .map(|(vm_name, _)| vm_name.to_string())
+        })
+        .collect()
+}
+
+/// Files to remove once a config that no longer names these VMs has switched
+/// in: the private raw disk and its seed marker. Without this a VM created
+/// again under the same name would boot the deleted guest's disk.
+fn retired_filesystem_disk_paths(previous_nix: &str, next_nix: &str) -> Vec<PathBuf> {
+    let kept: std::collections::HashSet<String> =
+        parse_vm_names_from_nix(next_nix).into_iter().collect();
+    let mut paths = Vec::new();
+    for vm_name in parse_filesystem_vms_from_nix(previous_nix) {
+        if kept.contains(&vm_name) {
+            continue;
+        }
+        if crate::path_safety::validate_safe_segment(&vm_name, "vm name").is_err() {
+            continue;
+        }
+        paths.push(PathBuf::from(format!("/var/lib/kcore/disks/{vm_name}.raw")));
+        paths.push(PathBuf::from(format!(
+            "{}/{vm_name}",
+            kcore_volume_mirror::SEED_MARKER_DIR
+        )));
+    }
+    paths
+}
+
+async fn run_test_then_switch(
+    path: PathBuf,
+    _desired_stopped_vms: Vec<String>,
+    retired_paths: Vec<PathBuf>,
+    apply_id: String,
+) {
     let nixpkgs_path = resolve_nixpkgs_path().await;
     let nix_path_val = nixpkgs_path
         .as_deref()
         .map(|p| format!("nixos-config={NIXOS_CONFIG_PATH}:nixpkgs={p}"))
         .unwrap_or_default();
+    // Only paths built from validated VM names reach here, so they contain
+    // no quotes or shell metacharacters.
+    let cleanup = if retired_paths.is_empty() {
+        String::new()
+    } else {
+        let quoted: Vec<String> = retired_paths
+            .iter()
+            .map(|p| format!("'{}'", p.display()))
+            .collect();
+        format!("rm -f {}; ", quoted.join(" "))
+    };
 
     // `nixos-rebuild switch` restarts kcore-node-agent, so the rebuild must
     // outlive this process and the *script* — not a task in this process — has
@@ -1126,7 +1205,7 @@ async fn run_test_then_switch(path: PathBuf, _desired_stopped_vms: Vec<String>, 
            export NIX_PATH='{nix_path_val}'; \
          fi; \
          if nixos-rebuild test $flake && nixos-rebuild switch $flake; then \
-           printf '{succeeded}\\nnixos-rebuild test+switch completed\\n' > '{state}.tmp'; \
+           {cleanup}printf '{succeeded}\\nnixos-rebuild test+switch completed\\n' > '{state}.tmp'; \
          else \
            printf '{failed}\\nnixos-rebuild test+switch failed (exit %s)\\n' \"$?\" > '{state}.tmp'; \
          fi; \
@@ -1935,7 +2014,7 @@ async fn apply_disk_layout_impl(
             tokio::spawn(async move {
                 let apply_id = format!("disk-layout-{}", uuid_like_suffix());
                 write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
-                run_test_then_switch(persisted_path, Vec::new(), apply_id).await;
+                run_test_then_switch(persisted_path, Vec::new(), Vec::new(), apply_id).await;
             });
             rebuild_scheduled = true;
         }
@@ -2162,13 +2241,17 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
 
         let write_path = path.clone();
         let config_nix = req.configuration_nix.clone();
-        tokio::task::spawn_blocking(move || std::fs::write(&write_path, &config_nix))
-            .await
-            .map_err(|e| Status::internal(format!("task join: {e}")))?
-            .map_err(|e| {
-                error!(path = %path.display(), error = %e, "failed to write nix config");
-                Status::internal(format!("writing {}: {e}", path.display()))
-            })?;
+        let retired_paths = tokio::task::spawn_blocking(move || {
+            let previous = std::fs::read_to_string(&write_path).unwrap_or_default();
+            std::fs::write(&write_path, &config_nix)
+                .map(|()| retired_filesystem_disk_paths(&previous, &config_nix))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))?
+        .map_err(|e| {
+            error!(path = %path.display(), error = %e, "failed to write nix config");
+            Status::internal(format!("writing {}: {e}", path.display()))
+        })?;
 
         info!(path = %path.display(), "wrote nix config");
 
@@ -2192,7 +2275,8 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let spawned_id = apply_id.clone();
         tokio::spawn(async move {
             let _guard = apply_lock.lock().await;
-            run_test_then_switch(rebuild_path, desired_stopped_vms, spawned_id).await;
+            run_test_then_switch(rebuild_path, desired_stopped_vms, retired_paths, spawned_id)
+                .await;
         });
 
         Ok(Response::new(proto::ApplyNixConfigResponse {
@@ -2546,7 +2630,13 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             let spawned_id = apply_id.clone();
             tokio::spawn(async move {
                 let _guard = apply_lock.lock().await;
-                run_test_then_switch(PathBuf::from(CEPH_NIX_PATH), Vec::new(), spawned_id).await;
+                run_test_then_switch(
+                    PathBuf::from(CEPH_NIX_PATH),
+                    Vec::new(),
+                    Vec::new(),
+                    spawned_id,
+                )
+                .await;
             });
             return Ok(Response::new(proto::ApplyCephConfigResponse {
                 success: true,
@@ -2792,7 +2882,13 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             let spawned_id = apply_id.clone();
             tokio::spawn(async move {
                 let _guard = apply_lock.lock().await;
-                run_test_then_switch(PathBuf::from(SLURM_NIX_PATH), Vec::new(), spawned_id).await;
+                run_test_then_switch(
+                    PathBuf::from(SLURM_NIX_PATH),
+                    Vec::new(),
+                    Vec::new(),
+                    spawned_id,
+                )
+                .await;
             });
             return Ok(Response::new(proto::ApplySlurmConfigResponse {
                 success: true,
@@ -3032,7 +3128,13 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let spawned_id = apply_id.clone();
         tokio::spawn(async move {
             let _guard = apply_lock.lock().await;
-            run_test_then_switch(PathBuf::from(CEPH_NIX_PATH), Vec::new(), spawned_id).await;
+            run_test_then_switch(
+                PathBuf::from(CEPH_NIX_PATH),
+                Vec::new(),
+                Vec::new(),
+                spawned_id,
+            )
+            .await;
         });
         Ok(Response::new(proto::TeardownCephNodeResponse {
             success: true,
@@ -5647,6 +5749,53 @@ fn rollback_blocking(rollback_dir: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use tonic::Request;
+
+    const TWO_FS_VMS: &str = r#"{ ... }: {
+  virtualMachines."vgpu-01" = {
+      storageBackend = "filesystem";
+      autoStart = true;
+  };
+  virtualMachines."vgpu-02" = {
+      storageBackend = "filesystem";
+  };
+  virtualMachines."db-1" = {
+      storageBackend = "lvm";
+  };
+}"#;
+
+    #[test]
+    fn deleting_a_filesystem_vm_retires_its_disk_and_seed_marker() {
+        let next = r#"{ ... }: {
+  virtualMachines."vgpu-01" = {
+      storageBackend = "filesystem";
+  };
+}"#;
+        let paths = retired_filesystem_disk_paths(TWO_FS_VMS, next);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/var/lib/kcore/disks/vgpu-02.raw"),
+                PathBuf::from("/var/lib/kcore/volume-seeded/vgpu-02"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_kept_or_block_backed_vm_keeps_its_storage() {
+        assert!(retired_filesystem_disk_paths(TWO_FS_VMS, TWO_FS_VMS).is_empty());
+        let only_db = r#"{ ... }: {
+  virtualMachines."db-1" = {
+      storageBackend = "lvm";
+  };
+}"#;
+        let paths = retired_filesystem_disk_paths(only_db, "{ ... }: {}");
+        assert!(paths.is_empty(), "{paths:?}");
+    }
+
+    #[test]
+    fn a_first_config_retires_nothing() {
+        assert!(retired_filesystem_disk_paths("", TWO_FS_VMS).is_empty());
+    }
 
     #[test]
     fn daemon_id_from_ceph_nix_reads_the_quoted_value() {

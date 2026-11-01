@@ -1,0 +1,34 @@
+Map VFIO sparse mmap areas even when the BAR holds the MSI-X tables.
+
+Cloud Hypervisor refuses to mmap any BAR that contains the MSI-X vector
+table or PBA unless the kernel advertises MSIX_MAPPABLE, and traps every
+access instead. NVIDIA's vGPU vendor driver places the tables in BAR0,
+does not advertise MSIX_MAPPABLE, and publishes a sparse mmap list that
+already skips the vector table page. It then rejects trapped reads of
+the listed bytes with EFAULT ("map-only region access"), so the guest
+driver saw 0xffffffff from every register.
+
+Accept a sparse mmap list as sufficient, like QEMU does. The areas are
+mapped exactly as published: the driver returns EINVAL for a mapping
+that does not match one of its areas, so they cannot be clipped.
+
+--- a/pci/src/vfio.rs
++++ b/pci/src/vfio.rs
+@@ -1774,10 +1774,16 @@
+ 
+                 // Don't try to mmap the region if it contains MSI-X table or
+                 // MSI-X PBA subregion, and if we couldn't find MSIX_MAPPABLE
+-                // in the list of supported capabilities.
++                // in the list of supported capabilities. A sparse mmap list
++                // is as good: the driver already left the tables out of it,
++                // and it rejects any mapping that is not one of its areas
++                // exactly, so the list is used as published.
+                 if let Some(msix) = self.common.interrupt.msix.as_ref()
+                     && (region.index == msix.cap.table_bir() || region.index == msix.cap.pba_bir())
+                     && !caps.contains(&VfioRegionInfoCap::MsixMappable)
++                    && !caps
++                        .iter()
++                        .any(|c| matches!(c, VfioRegionInfoCap::SparseMmap(_)))
+                 {
+                     continue;
+                 }

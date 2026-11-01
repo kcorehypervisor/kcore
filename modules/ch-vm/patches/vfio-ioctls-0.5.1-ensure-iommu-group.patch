@@ -1,0 +1,23 @@
+Attach an IOMMU group before VFIO_GROUP_GET_DEVICE_FD.
+
+NVIDIA's vGPU manager snapshots guest RAM when the device fd is opened.
+The caller maps that RAM first, then opens the device.
+
+--- a/src/vfio_device.rs
++++ b/src/vfio_device.rs
+@@ -210,6 +210,15 @@
+         Ok(())
+     }
+ 
++    /// Attach `group_id` and select the type1 IOMMU without opening a device fd.
++    ///
++    /// NVIDIA's vGPU plugin snapshots guest RAM when the device fd is created.
++    /// DMA maps installed after that open stay invisible (`guest_max_gpfn` 0).
++    pub fn ensure_iommu_group(&self, group_id: u32) -> Result<()> {
++        let _group = self.get_group(group_id)?;
++        Ok(())
++    }
++
+     fn set_iommu(&self, val: u32) -> Result<()> {
+         if val != VFIO_TYPE1_IOMMU && val != VFIO_TYPE1v2_IOMMU {
+             return Err(VfioError::VfioInvalidType);

@@ -1,0 +1,59 @@
+Map guest RAM before the VFIO device fd is opened.
+
+NVIDIA's vGPU manager snapshots guest RAM at VFIO_GROUP_GET_DEVICE_FD.
+Mapping afterwards leaves guest_max_gpfn at 0 and the guest driver cannot
+read the slice.
+
+--- a/vmm/src/device_manager.rs
++++ b/vmm/src/device_manager.rs
+@@ -3742,6 +3742,18 @@
+         ))
+     }
+ 
++
++    fn vfio_iommu_group_id(sysfs_path: &std::path::Path) -> result::Result<u32, vfio_ioctls::VfioError> {
++        let link = std::fs::read_link(sysfs_path.join("iommu_group"))
++            .map_err(|_| vfio_ioctls::VfioError::InvalidPath)?;
++        let name = link
++            .file_name()
++            .and_then(|item| item.to_str())
++            .ok_or(vfio_ioctls::VfioError::InvalidPath)?;
++        name.parse::<u32>()
++            .map_err(|_| vfio_ioctls::VfioError::InvalidPath)
++    }
++
+     fn add_vfio_device(
+         &mut self,
+         device_cfg: &mut DeviceConfig,
+@@ -3796,10 +3808,15 @@
+             vfio_container
+         };
+ 
+-        let vfio_device = VfioDevice::new(&device_cfg.path, Arc::clone(&vfio_container))
+-            .map_err(DeviceManagerError::VfioCreate)?;
+-
+         if needs_dma_mapping {
++            // NVIDIA's vGPU plugin snapshots guest RAM when the device fd opens.
++            // Map the guest first, then open the device.
++            let group_id = Self::vfio_iommu_group_id(&device_cfg.path)
++                .map_err(DeviceManagerError::VfioCreate)?;
++            vfio_container
++                .ensure_iommu_group(group_id)
++                .map_err(DeviceManagerError::VfioCreate)?;
++
+             // Register DMA mapping in IOMMU.
+             // Do not register virtio-mem regions, as they are handled directly by
+             // virtio-mem device itself.
+@@ -3820,7 +3837,12 @@
+                     .map_err(DeviceManagerError::VfioDmaMap)?;
+                 }
+             }
++        }
++
++        let vfio_device = VfioDevice::new(&device_cfg.path, Arc::clone(&vfio_container))
++            .map_err(DeviceManagerError::VfioCreate)?;
+ 
++        if needs_dma_mapping {
+             let vfio_mapping = Arc::new(VfioDmaMapping::new(
+                 Arc::clone(&vfio_container),
+                 Arc::new(self.memory_manager.lock().unwrap().guest_memory()),

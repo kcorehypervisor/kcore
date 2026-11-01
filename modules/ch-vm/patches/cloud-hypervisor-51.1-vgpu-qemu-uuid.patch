@@ -1,0 +1,45 @@
+Keep QEMU's `-uuid <uuid>` on the process command line.
+
+NVIDIA's vGPU manager reads `/proc/<vmm-pid>/cmdline` for that pair and
+will not finish virtualizing the function without it. It logs
+"Failed to get VM UUID from QEMU command-line" and later
+"No space found for read" when the guest driver probes the slice.
+Cloud Hypervisor's clap parser rejects `-uuid`. Drop that pair only from
+the vector clap sees. The kernel's original argv is unchanged, so the
+manager still finds it.
+
+--- a/cloud-hypervisor/src/main.rs
++++ b/cloud-hypervisor/src/main.rs
+@@ -853,6 +853,22 @@
+     Ok(())
+ }
+ 
++/// NVIDIA's vGPU manager reads this process's original argv for QEMU's
++/// `-uuid <uuid>`. That pair stays in `/proc/self/cmdline`. Clap rejects
++/// `-uuid`, so it is removed only from the vector clap parses.
++fn argv_without_qemu_uuid() -> Vec<String> {
++    let mut out = Vec::new();
++    let mut args = std::env::args();
++    while let Some(arg) = args.next() {
++        if arg == "-uuid" {
++            let _ = args.next();
++            continue;
++        }
++        out.push(arg);
++    }
++    out
++}
++
+ fn main() {
+     #[cfg(all(feature = "tdx", feature = "sev_snp"))]
+     compile_error!("Feature 'tdx' and 'sev_snp' are mutually exclusive.");
+@@ -869,7 +885,8 @@
+     let _ = unsafe { libc::umask(0o077) };
+ 
+     let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+-    let cmd_arguments = create_app(default_vcpus, default_memory, default_rng).get_matches();
++    let cmd_arguments = create_app(default_vcpus, default_memory, default_rng)
++        .get_matches_from(argv_without_qemu_uuid());
+ 
+     if cmd_arguments.get_flag("version") {
+         println!("{} {}", env!("CARGO_BIN_NAME"), env!("BUILD_VERSION"));

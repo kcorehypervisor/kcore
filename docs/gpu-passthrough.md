@@ -113,6 +113,9 @@ host driver by hand when the host should use it again.
 `--vgpu nvidia0=A2-4C`, or `--vgpu nvidia0/0=A2-4C`. The physical function
 stays on the NVIDIA host driver. The node writes the profile onto one virtual
 function and never binds that card, or the function, to `vfio-pci`.
+Virtual GPU Manager 595.91 binds each function to `nvidia` and publishes
+`nvidia/creatable_vgpu_types`. An older manager binds the function to
+`nvidia-vgpu-vfio`. Both are a slice when that file lists profiles.
 
 Turn the node into a vGPU host before creating guests. The controller stages
 the NVIDIA Virtual GPU Manager, renders `ch-vm.vgpu.managerRun`, and says when
@@ -166,3 +169,12 @@ a stored `nvidia0/0=A2-4C`.
 The node must already be running a kcore generation that reports
 `vgpuManagerRun`. Older nodes refuse `ConfigureNodeVgpu` until
 `kctl update cluster` rolls that generation out.
+
+A slice guest runs on the Cloud Hypervisor that kcore builds from
+`ch-vm.vms.cloudHypervisorPatches`. Those patches give the NVIDIA vendor
+driver what it gets from QEMU: guest RAM mapped before the device opens,
+`-uuid` on the command line, BAR addresses written through to the device,
+and the published sparse mmap areas of BAR0 mapped instead of trapped. The
+guest sees the slice behind no virtual IOMMU and its RAM is `shared=on`.
+A filesystem guest boots `/var/lib/kcore/disks/<name>.raw`, seeded once from
+the image; deleting the VM removes that file on the next config apply.
