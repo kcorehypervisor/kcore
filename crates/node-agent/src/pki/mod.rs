@@ -160,6 +160,20 @@ pub mod test_support {
         (cert.pem(), key.serialize_pem())
     }
 
+    /// Sub-CA signed by `root`, returned as `(cert_pem, key_pem)`.
+    pub fn test_sub_ca(root_cert_pem: &str, root_key_pem: &str, cn: &str) -> (String, String) {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
+        params.not_after = OffsetDateTime::now_utc() + Duration::days(3650);
+        let root_key = KeyPair::from_pem(root_key_pem).expect("root key");
+        let issuer = Issuer::from_ca_cert_pem(root_cert_pem, root_key).expect("issuer");
+        let key = KeyPair::generate().expect("sub-ca key");
+        let cert = params.signed_by(&key, &issuer).expect("sign sub-ca");
+        (cert.pem(), key.serialize_pem())
+    }
+
     /// Node leaf signed by `ca`, mirroring what the controller issues.
     /// Returns `(chain_pem, key_pem)` where the chain is `leaf + CA`.
     pub fn node_leaf(

@@ -14123,6 +14123,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 next_update: Some(prost_timestamp(crl.next_update)),
                 revoked_count: crl.revoked_count,
                 message: String::new(),
+                issuer_pem: sub_ca.cert_pem.clone(),
             })),
             None => Ok(Response::new(controller_proto::GetCrlResponse {
                 success: false,
