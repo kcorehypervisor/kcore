@@ -1,0 +1,9 @@
+# Intel Arc Pro B50: two 8 GB virtual functions through the upstream xe driver.
+# No licence and no manager download.
+kind: NodeVgpu
+metadata:
+  name: node-7
+spec:
+  vendor: intel
+  hostCards: ["0000:03:00.0"]
+  numVfs: 2

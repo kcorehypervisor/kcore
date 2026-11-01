@@ -1719,6 +1719,22 @@ mod tests {
     }
 
     #[test]
+    fn shipped_vgpu_vm_examples_request_a_slice() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/vgpu");
+        for (vendor, profile) in [
+            ("nvidia", "A2-4C"),
+            ("intel", "intel-2vf"),
+            ("amd", "radeon-4vf"),
+        ] {
+            let path = format!("{dir}/vm-{vendor}.yaml");
+            let manifest = parse_vm_manifest(&path).unwrap_or_else(|e| panic!("{path}: {e:#}"));
+            assert_eq!(manifest.vgpus, [profile], "{path}");
+            assert_eq!(manifest.memory_bytes, 8 * 1024 * 1024 * 1024, "{path}");
+            assert!(manifest.image.is_some(), "{path}");
+        }
+    }
+
+    #[test]
     fn parse_vm_manifest_parses_all_fields() {
         let path = std::env::temp_dir().join("kctl-test-vm-manifest.yaml");
         std::fs::write(

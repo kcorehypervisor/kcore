@@ -1,0 +1,11 @@
+# AMD Radeon Pro V710 with GIM (MxGPU), built from source on the node.
+# Each hostCards entry can carry its own count as ADDRESS=N; an entry without
+# =N takes numVfs. List every AMD GPU on the node: GIM numbers them in PCI
+# address order, so a missing card shifts the counts.
+kind: NodeVgpu
+metadata:
+  name: node-8
+spec:
+  vendor: amd
+  hostCards: ["0000:c3:00.0=4", "0000:c4:00.0=6"]
+  numVfs: 4

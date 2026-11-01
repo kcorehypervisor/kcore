@@ -1304,6 +1304,23 @@ mod tests {
     }
 
     #[test]
+    fn shipped_vgpu_examples_build_requests() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/vgpu");
+        let mut vendors = Vec::new();
+        for vendor in ["nvidia", "intel", "amd"] {
+            let path = format!("{dir}/{vendor}-host.yaml");
+            let doc: serde_yaml::Value =
+                serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let request = vgpu_enable_from_manifest("node-1".into(), &doc)
+                .unwrap_or_else(|e| panic!("{path}: {e:#}"))
+                .into_request()
+                .unwrap_or_else(|e| panic!("{path}: {e:#}"));
+            vendors.push(request.vendor);
+        }
+        assert_eq!(vendors, ["nvidia", "intel", "amd"]);
+    }
+
+    #[test]
     fn intel_manifest_needs_no_manager() {
         let doc = manifest("  vendor: intel\n  hostCards: [\"0000:03:00.0\"]\n  numVfs: 2\n");
         let request = vgpu_enable_from_manifest("node-1".into(), &doc)

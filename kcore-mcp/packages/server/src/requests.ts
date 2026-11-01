@@ -199,6 +199,8 @@ export function buildDelete(kind: ResourceKind, name: string): RpcCall {
       return { target: "controller", method: "deleteWafPolicy", request: { name: id } };
     case "object-store":
       return { target: "controller", method: "deleteObjectStore", request: { name: id } };
+    case "slurm-cluster":
+      return { target: "controller", method: "deleteSlurmCluster", request: { name: id, force: false } };
     case "cluster-update":
       return { target: "controller", method: "cancelClusterUpdate", request: { name: id } };
     case "gpus":
@@ -240,6 +242,9 @@ export function buildPlanCall(kind: ResourceKind, spec: Record<string, unknown>,
   }
   return buildRead(kind, name ?? (typeof spec.name === "string" ? spec.name : undefined));
 }
+
+export const OPERATION_ACTIONS_HINT =
+  "action must be set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, install-node, or reboot-node";
 
 export function buildOperation(action: string, spec: Record<string, unknown>): RpcCall {
   switch (action) {
@@ -300,12 +305,35 @@ export function buildOperation(action: string, spec: Record<string, unknown>): R
       return { target: "controller", method: "cancelClusterUpdate", request: { name: assertName(required(spec, "name", "update name"), "update name") } };
     case "rollback-update":
       return { target: "controller", method: "rollbackClusterUpdate", request: { name: assertName(required(spec, "name", "update name"), "update name") } };
+    case "slurm-drain-node":
+      return {
+        target: "controller",
+        method: "drainSlurmNode",
+        request: {
+          name: assertName(required(spec, "name", "Slurm cluster name"), "Slurm cluster name"),
+          nodeId: assertName(required(spec, "nodeId", "node id"), "node id"),
+          reason: opt(spec, "reason") ?? "",
+        },
+      };
+    case "slurm-resume-node":
+      return {
+        target: "controller",
+        method: "resumeSlurmNode",
+        request: {
+          name: assertName(required(spec, "name", "Slurm cluster name"), "Slurm cluster name"),
+          nodeId: assertName(required(spec, "nodeId", "node id"), "node id"),
+        },
+      };
+    case "slurm-rotate-munge-key":
+      return {
+        target: "controller",
+        method: "rotateSlurmMungeKey",
+        request: { name: assertName(required(spec, "name", "Slurm cluster name"), "Slurm cluster name") },
+      };
     case "install-node":
       return installCall(spec);
     default:
-      throw new InputError(
-        "action must be set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, install-node, or reboot-node",
-      );
+      throw new InputError(OPERATION_ACTIONS_HINT);
   }
 }
 

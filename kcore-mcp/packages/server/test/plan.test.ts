@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { findKind } from "../src/catalog.js";
 import { InputError } from "../src/names.js";
-import { buildApply, buildOperation } from "../src/requests.js";
+import { buildApply, buildDelete, buildOperation } from "../src/requests.js";
 import { diffSpec } from "../src/plan.js";
 
 const sha = "ab".repeat(32);
@@ -199,4 +199,18 @@ test("a complete SlurmCluster spec is accepted", () => {
   const spec = (call.request as { spec: Record<string, unknown> }).spec;
   assert.equal(spec.clusterName, "hpc-a");
   assert.equal((spec.compute as unknown[]).length, 1);
+});
+
+test("Slurm day-2 operations map to their RPCs", () => {
+  const drain = buildOperation("slurm-drain-node", { name: "hpc-a", nodeId: "node-108", reason: "maintenance" });
+  assert.equal(drain.method, "drainSlurmNode");
+  assert.deepEqual(drain.request, { name: "hpc-a", nodeId: "node-108", reason: "maintenance" });
+  const resume = buildOperation("slurm-resume-node", { name: "hpc-a", nodeId: "node-108" });
+  assert.equal(resume.method, "resumeSlurmNode");
+  const rotate = buildOperation("slurm-rotate-munge-key", { name: "hpc-a" });
+  assert.equal(rotate.method, "rotateSlurmMungeKey");
+  assert.throws(() => buildOperation("slurm-drain-node", { name: "hpc-a" }), /node id is required/);
+  const kind = findKind("slurm-cluster");
+  assert.ok(kind);
+  assert.equal(buildDelete(kind, "hpc-a").method, "deleteSlurmCluster");
 });
