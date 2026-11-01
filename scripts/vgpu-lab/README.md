@@ -2,7 +2,8 @@
 
 This directory is a lab procedure. It is not installed on a kcore node and it
 is not a NixOS module. Nothing here downloads NVIDIA software or redeems the
-90-day evaluation licence.
+90-day evaluation licence. Obtaining the Virtual GPU Manager is
+`docs/nvidia-ai-enterprise-entitlement.md`.
 
 The A2 (16 GB, HPE ProLiant ML350 Gen10) is not in the lab yet. Steps 1 to 7
 are the host procedure for the day it arrives. Step 8 is the QEMU reference.

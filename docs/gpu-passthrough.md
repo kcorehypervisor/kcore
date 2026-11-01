@@ -117,6 +117,10 @@ Virtual GPU Manager 595.91 binds each function to `nvidia` and publishes
 `nvidia/creatable_vgpu_types`. An older manager binds the function to
 `nvidia-vgpu-vfio`. Both are a slice when that file lists profiles.
 
+Getting the Virtual GPU Manager `.run` from NVIDIA (the evaluation, the NGC
+API key, the download) is
+[nvidia-ai-enterprise-entitlement.md](nvidia-ai-enterprise-entitlement.md).
+
 Turn the node into a vGPU host before creating guests. The controller stages
 the NVIDIA Virtual GPU Manager, renders `ch-vm.vgpu.managerRun`, and says when
 the node still needs a reboot (no IOMMU group, or the card is still on

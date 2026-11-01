@@ -19,3 +19,5 @@ Operator-focused guides are published on the product site:
 | Slurm clusters | [slurm.md](./slurm.md) |
 
 Technical and architecture documentation remains in the parent [`docs/`](../README.md) directory in this repository.
+
+The NVIDIA AI Enterprise signup, NGC API key, and Virtual GPU Manager download are written up in [`docs/nvidia-ai-enterprise-entitlement.md`](../nvidia-ai-enterprise-entitlement.md). That file is the source to publish on the product site. It is not on https://kcorehypervisor.com/docs/user/ yet.
