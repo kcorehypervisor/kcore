@@ -1,0 +1,9 @@
+# Roles are reconciled to this list: missing ones are granted and others are revoked.
+# Leave spec.roles out to keep the operator's roles as they are.
+# The client certificate is issued with: kctl operator issue-cert alice
+kind: Operator
+metadata:
+  name: alice
+spec:
+  roles:
+    - vm-admin

@@ -23,6 +23,7 @@ pub mod operation;
 pub mod operator;
 pub mod pki;
 pub mod postgresql;
+pub mod resource_manifests;
 pub mod security_group;
 pub mod shared_filesystem;
 pub mod slurm;

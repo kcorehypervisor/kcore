@@ -1,0 +1,8 @@
+# Volumes are immutable. Applying one that exists changes nothing.
+kind: Volume
+metadata:
+  name: data
+spec:
+  sizeBytes: 40G
+  storageClass: ceph
+  encrypt: false

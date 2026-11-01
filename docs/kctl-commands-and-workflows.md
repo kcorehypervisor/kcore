@@ -264,8 +264,14 @@ and `controller.nodeId` are immutable; plan reports `replace` for those and
 the remedy is delete and create. Ready-made manifests are in `examples/slurm/`
 and the workflow is in `docs/user/slurm.md`.
 
-`kctl apply -f` takes one YAML document per file. Put each resource, such as a
-`NodeVgpu` host and the `VM` that uses its slices, in its own file.
+`kctl apply -f` accepts several YAML documents in one file, separated by `---`.
+Every document is checked first, so a typo in the last one stops the run before
+anything is applied. The documents are then applied in order, which lets one file
+hold a `NodeVgpu` host and the `VM` that uses its slices. The first failure stops
+the run and names the document. Documents applied before it stay applied, and a
+re-run is safe because every apply is an upsert. `--dry-run` lists the documents
+and their kinds. A file that is not YAML, such as a Nix configuration, is still
+sent as a single configuration.
 
 `kctl apply -f` refuses a manifest whose `kind` it does not route, and the error
 lists the supported kinds. It no longer sends an unknown kind to the controller
@@ -273,8 +279,15 @@ as a NixOS configuration; only a manifest with no `kind:` at all is treated that
 way. The routed kinds are VM, Container, Network, SshKey, SecurityGroup,
 PostgreSQL, DiskLayout, CephCluster, SharedFilesystem, ObjectStore, ObjectUser,
 KubernetesCluster, ClusterUpdate, SlurmCluster, IngressGateway, IngressRoute,
-WafPolicy, NodeVgpu, Cluster and NodeInstall. Each has a parsed example under
+WafPolicy, NodeVgpu, Cluster, NodeInstall, Volume, SnapshotPolicy and Operator. Each has a parsed example under
 `examples/`.
+
+`Volume`, `SnapshotPolicy` and `Operator` follow the controller's own rules.
+A volume is immutable, so applying one that exists reports it and changes
+nothing. A snapshot policy is an upsert. An operator is created when missing,
+and when `spec.roles` is present its roles are reconciled: missing roles are
+granted and roles not listed are revoked. Without `spec.roles` the roles are left
+alone. `spec.sizeBytes` of a volume takes a number or a size such as `40G`.
 
 An `ObjectUser` has no stored spec to reconcile. `kctl apply -f` and
 `kctl create object-user NAME --store STORE` both create the user and print the
