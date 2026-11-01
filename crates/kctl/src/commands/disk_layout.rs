@@ -421,3 +421,19 @@ spec:
         assert!(nix.contains("/dev/nvme1n1"));
     }
 }
+
+#[cfg(test)]
+mod shipped_example_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_example_expands_to_disko() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/storage/disk-layout.yaml"
+        );
+        let manifest = parse_manifest(path).unwrap();
+        let nix = resolve_layout_nix(path, &manifest.spec).unwrap();
+        assert!(nix.contains("disko.devices"));
+    }
+}

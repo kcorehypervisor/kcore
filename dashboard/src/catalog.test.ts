@@ -20,10 +20,15 @@ function sample(desc: DescMessage, depth = 0): Message {
   return create(desc, init as never);
 }
 
-function serveUnary(router: ConnectRouter, service: DescService) {
+function serveUnary(router: ConnectRouter, service: DescService, succeed = false) {
   const impl: Record<string, () => Message> = {};
   for (const method of service.methods) {
-    if (method.methodKind === "unary") impl[method.localName] = () => sample(method.output);
+    if (method.methodKind !== "unary") continue;
+    impl[method.localName] = () => {
+      const reply = sample(method.output) as Record<string, unknown>;
+      if (succeed && method.output.fields.some((field) => field.localName === "success")) reply.success = true;
+      return reply as unknown as Message;
+    };
   }
   router.service(service, impl as never);
 }
@@ -92,5 +97,83 @@ describe("bytes", () => {
 
   it.each(["4 GB RAM", "-1", "0.5 B"])("refuses %s", (input) => {
     expect(() => bytes({ size: input }, "size")).toThrow(FormError);
+  });
+});
+
+describe("Slurm and vGPU controls", () => {
+  beforeAll(() => {
+    setTransport(createRouterTransport((router) => serveUnary(router, Controller, true)));
+  });
+
+  const resource = (id: string) => RESOURCES.find((candidate) => candidate.id === id)!;
+  const action = (id: string, name: string) => resource(id).actions.find((candidate) => candidate.name === name)!;
+
+  it("offers plan, node drain and resume on Slurm clusters", () => {
+    const names = resource("slurm-cluster").actions.map((candidate) => candidate.name);
+    expect(names).toEqual(expect.arrayContaining(["plan", "drain-node", "resume-node", "rotate-munge-key", "delete"]));
+    expect(resource("slurm-cluster").create).toBeDefined();
+    expect(resource("slurm-cluster").checks).toEqual(["plan"]);
+  });
+
+  it("creates and plans a Slurm cluster from a JSON spec", async () => {
+    const spec = JSON.stringify({
+      clusterName: "hpc-a",
+      controller: { nodeId: "node-1", address: "10.0.0.1", iface: "enp6s0" },
+      compute: [{ nodeId: "node-2", address: "10.0.0.2", iface: "enp6s0", partitions: ["batch"] }],
+      partitions: [{ name: "batch", default: true }],
+    });
+    await expect(resource("slurm-cluster").create!({ name: "hpc-a", spec })).resolves.toMatchObject({ ok: true });
+    await expect(action("slurm-cluster", "plan").run({ name: "hpc-a", spec })).resolves.toBeDefined();
+  });
+
+  it("refuses a Slurm spec that is not a Slurm cluster", async () => {
+    await expect(resource("slurm-cluster").create!({ name: "x", spec: '{"nope": 1}' })).rejects.toThrow(FormError);
+    await expect(resource("slurm-cluster").create!({ name: "x", spec: "[]" })).rejects.toThrow(FormError);
+  });
+
+  it("drains and resumes a Slurm node", async () => {
+    await expect(action("slurm-cluster", "drain-node").run({ name: "hpc-a", node_id: "node-2", reason: "maintenance" })).resolves.toEqual({ ok: true });
+    await expect(action("slurm-cluster", "resume-node").run({ name: "hpc-a", node_id: "node-2" })).resolves.toEqual({ ok: true });
+    await expect(action("slurm-cluster", "drain-node").run({ name: "hpc-a" })).rejects.toThrow(FormError);
+  });
+
+  it("enables a vGPU host from a node and demands the manager only for NVIDIA", async () => {
+    const enable = action("nodes", "vgpu-enable");
+    expect(enable.confirm).toBe(true);
+    await expect(enable.run({ node_id: "node-1", vendor: "intel", host_cards: "0000:03:00.0", num_vfs: "2" })).resolves.toMatchObject({ ok: true });
+    await expect(enable.run({ node_id: "node-1", vendor: "nvidia", host_cards: "0000:61:00.0" })).rejects.toThrow(FormError);
+    await expect(action("nodes", "vgpu-disable").run({ node_id: "node-1" })).resolves.toMatchObject({ ok: true });
+  });
+
+  it("reboots a node", async () => {
+    await expect(action("nodes", "reboot").run({ node_id: "node-1", force: "true" })).resolves.toMatchObject({ ok: true });
+  });
+
+  it("names the Terraform resources that now exist", () => {
+    expect(resource("ingress-gateways").terraform).toEqual(["kcore_ingress_gateway"]);
+    expect(resource("ingress-routes").terraform).toEqual(["kcore_ingress_route"]);
+    expect(resource("waf-policies").terraform).toEqual(["kcore_waf_policy"]);
+    expect(resource("gpus").terraform).toContain("kcore_vgpu_host");
+  });
+});
+
+describe("ingress controls", () => {
+  const resource = (id: string) => RESOURCES.find((candidate) => candidate.id === id)!;
+  const action = (id: string, name: string) => resource(id).actions.find((candidate) => candidate.name === name)!;
+
+  it("plans each ingress document before it is applied", async () => {
+    for (const id of ["ingress-gateways", "ingress-routes", "waf-policies"]) expect(resource(id).checks).toEqual(["plan"]);
+    await expect(action("ingress-gateways", "plan").run({ name: "edge", spec: '{"nodes":["node-1"]}' })).resolves.toBeDefined();
+    await expect(action("ingress-routes", "plan").run({ name: "shop", spec: '{"gateway":"edge","hosts":["a.example.com"]}' })).resolves.toBeDefined();
+    await expect(action("waf-policies", "plan").run({ name: "strict", spec: "" })).resolves.toBeDefined();
+  });
+
+  it("will not plan a route without a gateway", async () => {
+    await expect(action("ingress-routes", "plan").run({ name: "shop", spec: '{"hosts":["a.example.com"]}' })).rejects.toThrow(FormError);
+  });
+
+  it("sets a gateway secret file", async () => {
+    await expect(action("ingress-gateways", "set-secret").run({ name: "edge", secret_name: "dns.env", content: "TOKEN=x" })).resolves.toEqual({ ok: true });
+    await expect(action("ingress-gateways", "set-secret").run({ name: "edge", secret_name: "dns.env" })).rejects.toThrow(FormError);
   });
 });

@@ -34,6 +34,9 @@ const INTENT: Array<[RegExp, string]> = [
   [/\bssh keys?\b/i, "ssh-key"],
   [/\bpostgres(?:ql)?\b/i, "postgresql"],
   [/\bslurm\b|\bhpc\b/i, "slurm-cluster"],
+  [/\bkubernetes\b|\bk8s\b/i, "kubernetes-cluster"],
+  [/\bobject users?\b/i, "object-user"],
+  [/\boperators?\b/i, "operator"],
   [/\bcontainers?\b/i, "container"],
   [/\bvolumes?\b/i, "volume"],
   [/\bsnapshot polic/i, "snapshot-policy"],
@@ -57,6 +60,7 @@ export function inferKind(intent: string | undefined): string | undefined {
   for (const [pattern, id] of INTENT) {
     if (pattern.test(intent)) hits.add(id);
   }
+  if (hits.size > 1) hits.delete("cluster");
   if (hits.size !== 1) return undefined;
   return [...hits][0];
 }
@@ -531,6 +535,46 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           { example: "node-a" },
         ),
       ].filter((item) => item.required);
+    case "kubernetes-cluster":
+      return [
+        question("name", "What should the Kubernetes cluster be called?", "Scale, health, and delete use this name.", missing(spec, "name")),
+        question("clusterCidr", "Which pod CIDR?", "Must not overlap the node network or the service CIDR.", missing(spec, "clusterCidr"), {
+          example: "10.244.0.0/16",
+        }),
+        question("serviceCidr", "Which service CIDR?", "Must not overlap the pod CIDR.", missing(spec, "serviceCidr"), {
+          example: "10.96.0.0/12",
+        }),
+        question(
+          "apiServerEndpoint",
+          "Which address and port serves the Kubernetes API?",
+          "With highAvailability this is the virtual IP and port 6443.",
+          missing(spec, "apiServerEndpoint"),
+          { example: "192.168.40.200:6443" },
+        ),
+        question(
+          "controlPlaneNodes",
+          "Which nodes run the control plane, with their advertise address and interface?",
+          "One entry must set initialCluster true. Use one or three entries.",
+          missing(spec, "controlPlaneNodes"),
+          { example: "node-105 192.168.40.105 enp6s0" },
+        ),
+      ].filter((item) => item.required);
+    case "object-user":
+      return [
+        question("name", "What should the object user be called?", "It becomes the RGW uid.", missing(spec, "name")),
+        question("store", "Which object store does it belong to?", "Name of an existing ObjectStore.", missing(spec, "store")),
+      ].filter((item) => item.required);
+    case "operator":
+      return [
+        question("name", "What is the operator called?", "The client certificate CN is derived from this name.", missing(spec, "name")),
+        question(
+          "roles",
+          "Which roles should the operator hold?",
+          "read-only, vm-admin, cluster-admin, or backup-operator.",
+          missing(spec, "roles"),
+          { choices: ["read-only", "vm-admin", "cluster-admin", "backup-operator"], example: "vm-admin" },
+        ),
+      ].filter((item) => item.required);
     case "cluster-update":
       return [
         question("name", "What should the cluster update be called?", "Approve, cancel, and rollback use this name.", missing(spec, "name")),
@@ -701,6 +745,12 @@ export function warningsFor(kind: ResourceKind, spec: Record<string, unknown>): 
     warnings.push(
       "v1 is one database per node, from the NixOS postgresql package, on the local Unix socket. Deleting the resource removes it from the node config and leaves /var/lib/postgresql on disk.",
     );
+  }
+  if (kind.id === "kubernetes-cluster") {
+    warnings.push("Applying a Kubernetes cluster rebuilds the member nodes through NixOS. Read the plan's blocking issues and preflight results first.");
+  }
+  if (kind.id === "object-user") {
+    warnings.push("Creation runs through kctl create object-user, which prints the secret once. This server cannot show it.");
   }
   if (kind.id === "cluster-update") {
     warnings.push("A cluster update can reboot nodes. Plan it, read the blockers, and apply only after the operator agrees.");

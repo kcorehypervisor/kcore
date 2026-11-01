@@ -1,0 +1,10 @@
+kind: ObjectStore
+metadata:
+  name: backups
+spec:
+  cephCluster: lab-san
+  members:
+    - node-1
+    - node-2
+  port: 7480
+  tls: false

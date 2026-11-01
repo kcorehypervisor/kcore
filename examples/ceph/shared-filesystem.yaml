@@ -1,0 +1,9 @@
+kind: SharedFilesystem
+metadata:
+  name: team-data
+spec:
+  cephCluster: lab-san
+  quotaBytes: 1099511627776
+  clients:
+    - name: app-a
+      paths: ["/"]

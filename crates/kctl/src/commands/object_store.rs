@@ -149,3 +149,17 @@ pub async fn delete(info: &ConnectionInfo, name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod shipped_example_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_example_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/ceph/object-store.yaml"
+        );
+        parse_manifest(path).unwrap();
+    }
+}

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { findKind } from "../src/catalog.js";
 import { InputError } from "../src/names.js";
-import { buildApply, buildDelete, buildOperation } from "../src/requests.js";
+import { buildApply, buildDelete, buildOperation, buildPlanCall, buildRead } from "../src/requests.js";
 import { diffSpec } from "../src/plan.js";
 
 const sha = "ab".repeat(32);
@@ -213,4 +213,141 @@ test("Slurm day-2 operations map to their RPCs", () => {
   const kind = findKind("slurm-cluster");
   assert.ok(kind);
   assert.equal(buildDelete(kind, "hpc-a").method, "deleteSlurmCluster");
+});
+
+import { serviceClient } from "../src/grpc.js";
+import type { RpcCall } from "../src/requests.js";
+
+type MethodDefinition = {
+  requestSerialize: (value: unknown) => Buffer;
+  requestDeserialize: (value: Buffer) => Record<string, unknown>;
+};
+
+function wire(call: RpcCall): Record<string, unknown> {
+  const service = serviceClient("controller").service as unknown as Record<string, MethodDefinition>;
+  const definition = service[call.method[0].toUpperCase() + call.method.slice(1)];
+  assert.ok(definition, `controller has no ${call.method}`);
+  return definition.requestDeserialize(definition.requestSerialize(call.request));
+}
+
+test("a Kubernetes cluster apply carries the spec the controller reads", () => {
+  const kind = findKind("kubernetes-cluster");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    name: "prod",
+    clusterCidr: "10.244.0.0/16",
+    serviceCidr: "10.96.0.0/12",
+    apiServerEndpoint: "192.168.40.200:6443",
+    controlPlaneNodes: [
+      { nodeId: "node-105", advertiseAddress: "192.168.40.105", iface: "enp6s0", initialCluster: true },
+      { nodeId: "node-107", advertiseAddress: "192.168.40.107" },
+    ],
+    cilium: { loadBalancerIpPools: ["192.168.40.220/29"] },
+    highAvailability: { enabled: true, vipAddress: "192.168.40.200", vipInterface: "enp6s0" },
+  });
+  assert.equal(call.method, "createKubernetesCluster");
+  const decoded = wire(call) as { name: string; confirm: boolean; spec: Record<string, any> };
+  assert.equal(decoded.name, "prod");
+  assert.equal(decoded.confirm, true);
+  assert.equal(decoded.spec.clusterDns, "10.96.0.10");
+  assert.equal(decoded.spec.cni, "cilium");
+  assert.equal(decoded.spec.controlPlaneNodes.length, 2);
+  assert.equal(decoded.spec.controlPlaneNodes[0].initialCluster, true);
+  assert.equal(decoded.spec.controlPlaneNodes[1].joinExisting, true);
+  assert.equal(decoded.spec.controlPlaneNodes[1].role, "control-plane");
+  assert.deepEqual(decoded.spec.ciliumConfig.loadBalancerIpPools, ["192.168.40.220/29"]);
+  assert.equal(decoded.spec.highAvailability.vipAddress, "192.168.40.200");
+  assert.equal(buildPlanCall(kind, { name: "prod", clusterCidr: "a", serviceCidr: "b", apiServerEndpoint: "c:1", controlPlaneNodes: [{ nodeId: "n", advertiseAddress: "1.2.3.4" }] }).method, "planKubernetesCluster");
+  assert.throws(() => buildApply(kind, { name: "prod", clusterCidr: "a", serviceCidr: "b", apiServerEndpoint: "c:1" }), /controlPlaneNodes/);
+  assert.deepEqual(buildDelete(kind, "prod").request, { name: "prod", confirm: true, force: false });
+});
+
+test("object users are created through kctl, and deleted here", () => {
+  const kind = findKind("object-user");
+  assert.ok(kind);
+  assert.throws(() => buildApply(kind, { name: "app", store: "s3" }), /kctl create object-user/);
+  const call = buildOperation("delete-object-user", { name: "app", store: "s3" });
+  assert.equal(call.method, "deleteObjectUser");
+  assert.deepEqual(wire(call), { name: "app", store: "s3" });
+});
+
+test("an operator apply creates it and grants each role", () => {
+  const kind = findKind("operator");
+  assert.ok(kind);
+  const calls = buildApply(kind, { name: "alice", roles: ["vm-admin", "read-only"] });
+  assert.deepEqual(calls.map((call) => call.method), ["createOperator", "grantOperatorRole", "grantOperatorRole"]);
+  assert.equal(wire(calls[1]).role, "OPERATOR_ROLE_KIND_VM_ADMIN");
+  assert.throws(() => buildApply(kind, { name: "alice", roles: ["root"] }), /role must be/);
+  assert.equal(buildOperation("revoke-operator-role", { name: "alice", role: "vm-admin" }).method, "revokeOperatorRole");
+});
+
+test("nodes are readable and deletable but not appliable", () => {
+  const kind = findKind("node");
+  assert.ok(kind);
+  assert.equal(buildRead(kind).method, "listNodes");
+  assert.deepEqual(buildRead(kind, "node-1").request, { nodeId: "node-1" });
+  assert.equal(buildDelete(kind, "node-1").method, "deleteNode");
+  assert.throws(() => buildApply(kind, { name: "node-1" }), /read-only/);
+});
+
+test("volume operations map to their RPCs and keep the destructive guards", () => {
+  const resize = buildOperation("resize-volume", { name: "data", sizeBytes: "20G", growFilesystem: true });
+  assert.equal(resize.method, "resizeVolume");
+  const decoded = wire(resize);
+  assert.equal(decoded.sizeBytes, String(20 * 1024 ** 3));
+  assert.equal(decoded.growFilesystem, true);
+  assert.equal(decoded.allowShrink, false);
+  assert.deepEqual(wire(buildOperation("attach-volume", { name: "data", vm: "web" })), { name: "data", vm: "web" });
+  assert.equal(buildOperation("detach-volume", { name: "data" }).method, "detachVolume");
+  assert.deepEqual(wire(buildOperation("restore-volume", { volume: "data", snapshot: "nightly" })), { volume: "data", snapshot: "nightly" });
+  assert.equal(buildOperation("flatten-volume", { name: "data" }).method, "flattenVolume");
+  assert.equal(wire(buildOperation("format-volume", { name: "data" })).fsType, "ext4");
+  assert.throws(() => buildOperation("format-volume", { name: "data", fsType: "ntfs" }), /ext4 or xfs/);
+  assert.equal(wire(buildOperation("mount-volume", { name: "data", mountPoint: "/mnt/kcore/data", persistent: true })).persistent, true);
+  assert.throws(() => buildOperation("mount-volume", { name: "data", mountPoint: "/etc" }), /mount point/);
+  assert.throws(() => buildOperation("mount-volume", { name: "data", mountPoint: "/mnt/kcore/../../etc" }), /mount point/);
+  assert.equal(buildOperation("unmount-volume", { name: "data" }).method, "unmountVolume");
+  assert.throws(() => buildOperation("encrypt-volume", { name: "data" }), /destroyData/);
+  assert.equal(wire(buildOperation("encrypt-volume", { name: "data", destroyData: true })).destroyData, true);
+});
+
+test("certificate rotation, update reboot, and route WAF mode are operations", () => {
+  assert.deepEqual(wire(buildOperation("rotate-node-certs", { nodeId: "node-1" })), { nodeId: "node-1", allNodes: false });
+  assert.deepEqual(wire(buildOperation("rotate-node-certs", { allNodes: true })), { nodeId: "", allNodes: true });
+  assert.throws(() => buildOperation("rotate-node-certs", {}), /nodeId or allNodes/);
+  assert.throws(() => buildOperation("rotate-node-certs", { nodeId: "node-1", allNodes: true }), /nodeId or allNodes/);
+  assert.deepEqual(wire(buildOperation("reboot-update-node", { name: "rel", nodeId: "node-1" })), { name: "rel", nodeId: "node-1" });
+  assert.deepEqual(wire(buildOperation("set-route-waf-mode", { name: "shop", mode: "block" })), { name: "shop", mode: "block" });
+  assert.throws(() => buildOperation("set-route-waf-mode", { name: "shop", mode: "strict" }), /detect, block, or off/);
+  assert.equal(buildOperation("cancel-vm-operation", { id: "op-1" }).method, "cancelVmOperation");
+});
+
+test("a cluster update takes the shape of the release YAML", () => {
+  const kind = findKind("cluster-update");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    name: "release-0-3-0",
+    target: { version: "0.3.0", flakeRef: "github:kcorehypervisor/kcore", flakeRev: "a".repeat(40), nixpkgsRev: "b".repeat(40) },
+    selector: { allNodes: true },
+    strategy: { strategyType: "one-at-a-time", maxUnavailable: 1, batchSize: 1 },
+    drainVms: false,
+    activation: { mode: "auto" },
+    approvalPolicy: "manual",
+    updateKind: "kcore",
+    schemaVersion: 3,
+    testedOsPins: [{ nixpkgsRev: "b".repeat(40), cephRev: "c", cephSha256: "d", kubernetesVersion: "1.33" }],
+  });
+  const decoded = wire(call) as { spec: Record<string, any> };
+  assert.equal(decoded.spec.selector.allNodes, true);
+  assert.equal(decoded.spec.target.flakeRev, "a".repeat(40));
+  assert.equal(decoded.spec.target.nixpkgsRev, "b".repeat(40));
+  assert.equal(decoded.spec.strategy.type, "CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME");
+  assert.equal(decoded.spec.activationMode, "CLUSTER_UPDATE_ACTIVATION_AUTO");
+  assert.equal(decoded.spec.approvalPolicy, "CLUSTER_UPDATE_APPROVAL_MANUAL");
+  assert.equal(decoded.spec.drainVms, false);
+  assert.equal(decoded.spec.updateKind, "kcore");
+  assert.equal(decoded.spec.schemaVersion, 3);
+  assert.equal(decoded.spec.testedOsPins[0].kubernetesVersion, "1.33");
+  assert.throws(() => buildApply(kind, { name: "x", version: "1", flakeRef: "f", strategy: "canary" }), /one-at-a-time/);
+  assert.throws(() => buildApply(kind, { name: "x", version: "1", flakeRef: "f", approvalPolicy: "yolo" }), /approvalPolicy/);
 });

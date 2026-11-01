@@ -1,0 +1,20 @@
+# Shape of cluster-update-X.Y.Z.yaml from a release. Submit with:
+#   kctl update cluster apply -f release.yaml
+kind: ClusterUpdate
+metadata:
+  name: release-0-3-0
+spec:
+  target:
+    version: "0.3.0"
+    flakeRef: github:kcorehypervisor/kcore
+    flakeRev: "0123456789abcdef0123456789abcdef01234567"
+  selector:
+    allNodes: true
+  strategy:
+    strategyType: one-at-a-time
+    maxUnavailable: 1
+  drainVms: false
+  activation:
+    mode: auto
+  approvalPolicy: manual
+  updateKind: kcore

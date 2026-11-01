@@ -1,0 +1,6 @@
+# The access key and secret are printed once, when the user is created.
+kind: ObjectUser
+metadata:
+  name: backup-writer
+spec:
+  store: backups

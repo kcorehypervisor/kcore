@@ -1,0 +1,17 @@
+kind: DiskLayout
+metadata:
+  name: data-pool
+spec:
+  nodeId: node-1
+  diskLayout:
+    disks:
+      - name: data1
+        device: /dev/nvme1n1
+        gpt:
+          partitions:
+            - name: kcore0
+              size: "100%"
+              content:
+                type: filesystem
+                format: ext4
+                mountpoint: /var/lib/kcore/volumes1

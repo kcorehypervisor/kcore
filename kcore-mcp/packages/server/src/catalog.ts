@@ -189,6 +189,42 @@ export const KINDS: ResourceKind[] = [
     immutable: ["version", "flakeRef", "flakeRev"],
   },
   {
+    id: "kubernetes-cluster",
+    yamlKind: "KubernetesCluster",
+    title: "Kubernetes cluster",
+    summary:
+      "Kubernetes on kcoreOS nodes with Cilium. Apply creates the cluster, or updates it when it exists: adding or removing nodes changes membership. Plan runs node preflight checks and lists blocking issues before any node is rebuilt.",
+    mutable: ["workerNodes", "controlPlaneNodes", "cilium", "highAvailability", "localProvisioner", "scheduleOnControlPlane"],
+    immutable: ["clusterCidr", "serviceCidr", "clusterDns", "apiServerEndpoint", "cni"],
+  },
+  {
+    id: "object-user",
+    yamlKind: "ObjectUser",
+    title: "Object store user",
+    summary:
+      "RGW user on an ObjectStore. Creation is not available here: the secret is returned once and this server redacts secrets, so run kctl create object-user NAME --store STORE. Remove a user with the delete-object-user operation.",
+    mutable: [],
+    immutable: ["name", "store"],
+  },
+  {
+    id: "operator",
+    yamlKind: "Operator",
+    title: "Operator",
+    summary:
+      "Named human operator with RBAC roles (read-only, vm-admin, cluster-admin, backup-operator). Apply creates the operator and grants the listed roles. Issuing the client certificate stays in kctl so the private key never passes through the model.",
+    mutable: ["roles"],
+    immutable: ["name"],
+  },
+  {
+    id: "node",
+    yamlKind: "Node",
+    title: "Node",
+    summary:
+      "Read-only node inventory. Use the approve-node, reject-node, cordon-node, drain-node, reboot-node, and rotate-node-certs operations to act on one. Delete removes an empty node and revokes its certificates.",
+    mutable: [],
+    immutable: ["nodeId"],
+  },
+  {
     id: "gpus",
     yamlKind: "Gpus",
     title: "GPUs and PCI devices",

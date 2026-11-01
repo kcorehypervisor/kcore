@@ -181,3 +181,17 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod shipped_example_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_example_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/ceph/shared-filesystem.yaml"
+        );
+        parse_manifest(path).unwrap();
+    }
+}

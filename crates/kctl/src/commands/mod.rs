@@ -18,6 +18,7 @@ pub mod migrate_session;
 pub mod network;
 pub mod node;
 pub mod object_store;
+pub mod object_user;
 pub mod operation;
 pub mod operator;
 pub mod pki;

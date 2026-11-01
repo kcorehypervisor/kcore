@@ -423,3 +423,19 @@ spec:
         assert_eq!(m.spec.min_compatible_reader, 51);
     }
 }
+
+#[cfg(test)]
+mod shipped_example_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_example_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/cluster-update/release.yaml"
+        );
+        let manifest = parse_manifest(path).unwrap();
+        assert_eq!(manifest.spec.target.version, "0.3.0");
+        assert_eq!(manifest.spec.strategy.strategy_type, "one-at-a-time");
+    }
+}

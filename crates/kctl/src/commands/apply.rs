@@ -1,7 +1,7 @@
 use crate::client::{self, controller_proto};
 use crate::commands::{
-    ceph_cluster, container, disk_layout, network, node, object_store, postgresql, security_group,
-    shared_filesystem, slurm, ssh_key, vm,
+    ceph_cluster, cluster_update, container, disk_layout, kubernetes, network, node, object_store,
+    object_user, postgresql, security_group, shared_filesystem, slurm, ssh_key, vm,
 };
 use crate::config::ConnectionInfo;
 use anyhow::{Context, Result};
@@ -66,6 +66,31 @@ fn local_manifest_kind(kind: &str) -> Option<LocalManifestKind> {
     }
 }
 
+/// Kinds `kctl apply -f` routes. A manifest with any other `kind:` is refused
+/// rather than sent to the controller as a NixOS configuration.
+pub const SUPPORTED_KINDS: &[&str] = &[
+    "VM",
+    "Container",
+    "Network",
+    "SshKey",
+    "SecurityGroup",
+    "PostgreSQL",
+    "DiskLayout",
+    "CephCluster",
+    "SharedFilesystem",
+    "ObjectStore",
+    "ObjectUser",
+    "KubernetesCluster",
+    "ClusterUpdate",
+    "SlurmCluster",
+    "IngressGateway",
+    "IngressRoute",
+    "WafPolicy",
+    "NodeVgpu",
+    "Cluster",
+    "NodeInstall",
+];
+
 pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<()> {
     let classified = classify_manifest(file)?;
 
@@ -113,7 +138,19 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
             "nodevgpu" | "node-vgpu" | "node_vgpu" => {
                 return node::apply_vgpu_from_file(info, file).await
             }
-            _ => {}
+            "objectuser" | "object-user" | "object_user" => {
+                return object_user::apply_from_file(info, file).await
+            }
+            "kubernetescluster" | "kubernetes-cluster" | "kubernetes_cluster" => {
+                return kubernetes::apply_from_file(info, file).await
+            }
+            "clusterupdate" | "cluster-update" | "cluster_update" => {
+                return cluster_update::apply(info, file).await
+            }
+            other => anyhow::bail!(
+                "unsupported manifest kind '{other}' for kctl apply. Supported kinds: {}",
+                SUPPORTED_KINDS.join(", ")
+            ),
         }
     }
 
@@ -160,6 +197,46 @@ pub fn detect_manifest_kind(content: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_unknown_kind_is_refused_before_any_connection() {
+        let path = std::env::temp_dir().join("kctl-test-unknown-kind.yaml");
+        std::fs::write(&path, "kind: Bogus\nmetadata:\n  name: x\n").unwrap();
+        let info = ConnectionInfo {
+            address: "127.0.0.1:1".to_string(),
+            addresses: vec![],
+            insecure: true,
+            tls_server_name: None,
+            cert_pem: None,
+            key_pem: None,
+            ca_pem: None,
+            cert: None,
+            key: None,
+            ca: None,
+        };
+        let err = apply(&info, path.to_str().unwrap(), false)
+            .await
+            .expect_err("an unknown kind must not be applied");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("unsupported manifest kind 'bogus'")
+                && text.contains("KubernetesCluster"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn supported_kinds_name_every_routed_family() {
+        for kind in [
+            "ObjectUser",
+            "KubernetesCluster",
+            "ClusterUpdate",
+            "SlurmCluster",
+            "NodeVgpu",
+        ] {
+            assert!(SUPPORTED_KINDS.contains(&kind), "{kind}");
+        }
+    }
 
     fn unwrap_kind(content: &str) -> Option<String> {
         detect_manifest_kind(content).expect("YAML should parse")

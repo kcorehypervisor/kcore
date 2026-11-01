@@ -138,3 +138,19 @@ test("ingress resources are recognised and ask for what they need", () => {
   assert.equal(tcp.blocking.length, 0);
   assert.equal(advise({ kind: "waf-policy", spec: { name: "crs" } }).blocking.length, 0);
 });
+
+test("Kubernetes clusters, object users, and operators are recognised and ask for what they need", () => {
+  assert.equal(inferKind("build a kubernetes cluster on three nodes"), "kubernetes-cluster");
+  assert.equal(inferKind("add an object user"), "object-user");
+  assert.equal(inferKind("add an operator for alice"), "operator");
+  const cluster = advise({ kind: "kubernetes-cluster", spec: {} });
+  assert.deepEqual(
+    cluster.blocking.map((item) => item.id),
+    ["name", "clusterCidr", "serviceCidr", "apiServerEndpoint", "controlPlaneNodes"],
+  );
+  assert.ok(cluster.warnings.some((warning) => /rebuilds the member nodes/.test(warning)));
+  assert.deepEqual(
+    advise({ kind: "operator", spec: { name: "alice" } }).blocking.map((item) => item.id),
+    ["roles"],
+  );
+});
