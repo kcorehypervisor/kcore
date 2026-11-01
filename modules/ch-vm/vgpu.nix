@@ -140,8 +140,12 @@ in
       after = [
         "systemd-modules-load.service"
         "nvidia-modprobe.service"
+        "kcore-vgpu-sriov.service"
       ];
-      wants = [ "nvidia-modprobe.service" ];
+      wants = [
+        "nvidia-modprobe.service"
+        "kcore-vgpu-sriov.service"
+      ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
@@ -188,11 +192,17 @@ in
 
     systemd.services.kcore-vgpu-sriov = lib.mkIf (manage != null) {
       description = "Create NVIDIA vGPU virtual functions";
+      # sriov-manage unbinds the PF, which fails once vgpud or vgpu-mgr
+      # holds the device open.
       after = [
         "systemd-modules-load.service"
+        "nvidia-modprobe.service"
+      ];
+      wants = [ "nvidia-modprobe.service" ];
+      before = [
+        "nvidia-vgpud.service"
         "nvidia-vgpu-mgr.service"
       ];
-      requires = [ "nvidia-vgpu-mgr.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
