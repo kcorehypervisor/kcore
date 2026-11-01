@@ -1,0 +1,7 @@
+kind: SnapshotPolicy
+metadata:
+  name: web-nightly
+spec:
+  vm: web-01
+  schedule: "@daily"
+  keep: 7

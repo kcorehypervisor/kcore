@@ -1,7 +1,8 @@
 use crate::client::{self, controller_proto};
 use crate::commands::{
     ceph_cluster, cluster_update, container, disk_layout, kubernetes, network, node, object_store,
-    object_user, postgresql, security_group, shared_filesystem, slurm, ssh_key, vm,
+    object_user, postgresql, resource_manifests, security_group, shared_filesystem, slurm, ssh_key,
+    vm,
 };
 use crate::config::ConnectionInfo;
 use anyhow::{Context, Result};
@@ -83,6 +84,9 @@ pub const SUPPORTED_KINDS: &[&str] = &[
     "KubernetesCluster",
     "ClusterUpdate",
     "SlurmCluster",
+    "Volume",
+    "SnapshotPolicy",
+    "Operator",
     "IngressGateway",
     "IngressRoute",
     "WafPolicy",
@@ -138,6 +142,11 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
             "nodevgpu" | "node-vgpu" | "node_vgpu" => {
                 return node::apply_vgpu_from_file(info, file).await
             }
+            "volume" => return resource_manifests::apply_volume(info, file).await,
+            "snapshotpolicy" | "snapshot-policy" | "snapshot_policy" => {
+                return resource_manifests::apply_snapshot_policy(info, file).await
+            }
+            "operator" => return resource_manifests::apply_operator(info, file).await,
             "objectuser" | "object-user" | "object_user" => {
                 return object_user::apply_from_file(info, file).await
             }
@@ -169,6 +178,125 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
     } else {
         anyhow::bail!("Apply failed: {}", resp.message);
     }
+}
+
+/// Split a multi-document YAML file (`---` separators) into one string per
+/// document. Empty documents, such as a trailing `---`, are dropped. Comments
+/// are not preserved, which is fine because every handler re-parses the text.
+pub fn split_documents(content: &str) -> Result<Vec<String>> {
+    use serde::Deserialize;
+    let mut documents = Vec::new();
+    for (index, document) in serde_yaml::Deserializer::from_str(content).enumerate() {
+        let value = serde_yaml::Value::deserialize(document)
+            .with_context(|| format!("invalid YAML in document {}", index + 1))?;
+        if value.is_null() {
+            continue;
+        }
+        documents.push(serde_yaml::to_string(&value).context("re-serialising a YAML document")?);
+    }
+    Ok(documents)
+}
+
+/// What a document of a multi-document file is, checked before anything is
+/// applied so a typo in the last document does not leave the first applied.
+fn describe_document(index: usize, document: &str) -> Result<(String, String)> {
+    let number = index + 1;
+    let kind = detect_manifest_kind(document)
+        .with_context(|| format!("document {number}"))?
+        .ok_or_else(|| anyhow::anyhow!("document {number} has no kind:"))?;
+    if local_manifest_kind(&kind).is_some() {
+        anyhow::bail!(
+            "document {number} is kind {kind}, which is applied on its own. Multi-document apply takes controller resources only"
+        );
+    }
+    if !SUPPORTED_KINDS
+        .iter()
+        .any(|supported| supported.eq_ignore_ascii_case(&kind) || routed_alias(supported, &kind))
+    {
+        anyhow::bail!(
+            "document {number} has unsupported kind '{kind}'. Supported kinds: {}",
+            SUPPORTED_KINDS.join(", ")
+        );
+    }
+    let value: serde_yaml::Value = serde_yaml::from_str(document)?;
+    let name = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(|name| name.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok((kind, name))
+}
+
+/// `ssh-key`, `ceph_cluster` and the other spellings the single-file path accepts.
+fn routed_alias(supported: &str, kind: &str) -> bool {
+    let squash = |text: &str| text.to_ascii_lowercase().replace(['-', '_'], "");
+    squash(supported) == squash(kind)
+        || (squash(supported) == "postgresql" && squash(kind) == "postgres")
+}
+
+fn describe_documents(documents: &[String]) -> Result<Vec<(String, String)>> {
+    documents
+        .iter()
+        .enumerate()
+        .map(|(index, document)| describe_document(index, document))
+        .collect()
+}
+
+/// `--dry-run` for a multi-document file: validate every document, apply none.
+pub fn print_documents(documents: &[String]) -> Result<()> {
+    let described = describe_documents(documents)?;
+    for (document, (kind, name)) in documents.iter().zip(&described) {
+        println!("--- dry run: {kind} {name} ---");
+        print!("{document}");
+    }
+    println!("--- end ---");
+    Ok(())
+}
+
+/// True when `file` holds more than one YAML document. A file that does not
+/// parse as YAML, such as a Nix configuration, is not multi-document.
+pub fn is_multi_document(file: &str) -> bool {
+    read_documents(file)
+        .map(|documents| documents.len() > 1)
+        .unwrap_or(false)
+}
+
+pub fn read_documents(file: &str) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    split_documents(&content).with_context(|| format!("parsing manifest YAML in {file}"))
+}
+
+/// Apply every document of a multi-document file in order. All documents are
+/// checked first. The first failure stops the run and names the document, so
+/// the earlier ones are already applied and a re-run is safe because every
+/// apply is an upsert.
+pub async fn apply_documents(info: &ConnectionInfo, documents: &[String]) -> Result<()> {
+    let described = describe_documents(documents)?;
+    let directory = std::env::temp_dir().join(format!("kctl-apply-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).context("creating a scratch directory")?;
+    let outcome = apply_each(info, documents, &described, &directory).await;
+    let _ = std::fs::remove_dir_all(&directory);
+    outcome
+}
+
+async fn apply_each(
+    info: &ConnectionInfo,
+    documents: &[String],
+    described: &[(String, String)],
+    directory: &std::path::Path,
+) -> Result<()> {
+    let total = documents.len();
+    for (index, (document, (kind, name))) in documents.iter().zip(described).enumerate() {
+        println!("=== [{}/{total}] {kind} {name} ===", index + 1);
+        let path = directory.join(format!("{}.yaml", index + 1));
+        std::fs::write(&path, document).context("writing a scratch manifest")?;
+        let path = path.to_string_lossy().into_owned();
+        apply(info, &path, false)
+            .await
+            .with_context(|| format!("document {} of {total} ({kind} {name})", index + 1))?;
+    }
+    Ok(())
 }
 
 /// Parse `kind:` out of a YAML manifest.
@@ -235,6 +363,66 @@ mod tests {
             "NodeVgpu",
         ] {
             assert!(SUPPORTED_KINDS.contains(&kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn split_documents_keeps_order_and_drops_empty_ones() {
+        let text = "---\nkind: Network\nmetadata:\n  name: a\n---\n---\nkind: SshKey\nmetadata:\n  name: b\n---\n";
+        let documents = split_documents(text).unwrap();
+        assert_eq!(documents.len(), 2);
+        assert_eq!(unwrap_kind(&documents[0]).as_deref(), Some("Network"));
+        assert_eq!(unwrap_kind(&documents[1]).as_deref(), Some("SshKey"));
+    }
+
+    #[test]
+    fn a_nix_file_and_a_missing_file_are_not_multi_document() {
+        let dir = std::env::temp_dir().join(format!("kctl-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nix = dir.join("host.nix");
+        std::fs::write(&nix, "{ pkgs, ... }: {\n  services.foo.enable = true;\n}\n").unwrap();
+        assert!(!is_multi_document(nix.to_str().unwrap()));
+        assert!(!is_multi_document(
+            dir.join("missing.yaml").to_str().unwrap()
+        ));
+        let two = dir.join("two.yaml");
+        std::fs::write(&two, "kind: Network\n---\nkind: SshKey\n").unwrap();
+        assert!(is_multi_document(two.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn split_documents_of_a_single_manifest_is_one_document() {
+        assert_eq!(
+            split_documents("kind: VM\nmetadata:\n  name: a\n")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_document_is_checked_before_anything_is_applied() {
+        let ok = describe_document(0, "kind: NodeVgpu\nmetadata:\n  name: n1\n").unwrap();
+        assert_eq!(ok, ("NodeVgpu".to_string(), "n1".to_string()));
+        assert!(describe_document(0, "kind: ssh-key\nmetadata:\n  name: k\n").is_ok());
+        assert!(describe_document(0, "kind: postgres\nmetadata:\n  name: k\n").is_ok());
+        let missing = describe_document(1, "metadata:\n  name: x\n").unwrap_err();
+        assert!(format!("{missing:#}").contains("document 2 has no kind"));
+        let local = describe_document(0, "kind: Cluster\nmetadata:\n  name: x\n").unwrap_err();
+        assert!(format!("{local:#}").contains("applied on its own"));
+        let unknown = describe_document(2, "kind: Bogus\nmetadata:\n  name: x\n").unwrap_err();
+        assert!(format!("{unknown:#}").contains("document 3 has unsupported kind 'Bogus'"));
+    }
+
+    #[test]
+    fn every_supported_kind_passes_the_document_check() {
+        for kind in SUPPORTED_KINDS {
+            if local_manifest_kind(kind).is_some() {
+                continue;
+            }
+            let text = format!("kind: {kind}\nmetadata:\n  name: x\n");
+            assert!(describe_document(0, &text).is_ok(), "{kind}");
         }
     }
 

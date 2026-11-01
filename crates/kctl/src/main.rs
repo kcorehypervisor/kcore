@@ -3940,6 +3940,17 @@ async fn main() {
             commands::certs::rotate_sub_ca(&certs_path, &info).await
         }
 
+        Command::Apply { file, dry_run } if commands::apply::is_multi_document(file) => {
+            let documents =
+                commands::apply::read_documents(file).unwrap_or_else(|e| fatal(&format!("{e:#}")));
+            if *dry_run {
+                commands::apply::print_documents(&documents)
+            } else {
+                let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+                commands::apply::apply_documents(&info, &documents).await
+            }
+        }
+
         Command::Apply { file, dry_run } => {
             // Read + parse the manifest exactly once, then dispatch on the
             // classified kind. Cluster / NodeInstall manifests are bootstrap
