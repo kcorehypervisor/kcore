@@ -208,7 +208,7 @@ Every certificate the controller signs — node bootstrap certs, CSR-based rotat
 | `status` | `active` / `rotated` / `revoked` |
 | `revocation_reason`, `revoked_at` | RFC 5280 reason code and time; `-1` / empty when not revoked |
 
-Issuing a new certificate for an identity demotes the previous `active` row to `rotated`. A `rotated` certificate is still cryptographically valid until its `not_after` — it is superseded, not revoked. Only `revoked` rows appear on the CRL.
+Issuing a new certificate for an identity demotes the previous `active` row to `rotated`. A `rotated` certificate is still cryptographically valid until its `not_after` — it is superseded, not revoked, until the reconciler revokes a node certificate as described in §4.2. Only `revoked` rows appear on the CRL.
 
 The inventory is the single source of truth for both the CRL and the OCSP responder, so there is no second store to keep in sync.
 
@@ -225,7 +225,12 @@ The controller runs a **certificate rotation reconciler** (`crates/controller/sr
 1. refreshes the in-memory revoked-serial set used by the authorization path;
 2. regenerates and republishes the CRL if it is due;
 3. logs a warning for each active certificate inside `certRotation.warnBeforeDays`;
-4. calls `NodeAdmin.RotateNodeCert` on every node whose certificate is inside the renewal window.
+4. calls `NodeAdmin.RotateNodeCert` on every node whose certificate is inside the renewal window;
+5. revokes node certificates that rotation replaced (below).
+
+**Revoking replaced node certificates.** Rotation leaves the old certificate valid until it expires, so a stolen old key would keep working for up to a year. The reconciler closes that window. The revocation interceptor already sees the serial of every client certificate, and the controller records the first time each one reaches it (`issued_certificates.first_seen_at`, schema 71). A `rotated` node certificate is revoked with reason `superseded` once the certificate that replaced it has been in use for `certRotation.revokeSupersededAfterHours` (default 24). The CRL is regenerated in the same tick and OCSP answers `revoked` from then on.
+
+The rule waits for proof of use because the controller marks the old row `rotated` when it signs the new certificate, before the node has installed it. A node that failed to install its new certificate keeps a working old one, and the next rotation tick retries. Only node certificates are revoked this way: an operator can hold one identity on two machines. Set `revokeSupersededAfterHours: 0` to turn it off, and use `kctl revoke cert` for a manual revocation. With `revocation.enabled: false` nothing is recorded and nothing is revoked.
 
 A certificate is **due for renewal** when *either* fewer than `certRotation.renewBeforeDays` remain *or* less than `certRotation.renewAtLifetimeFraction` of its total lifetime remains. The absolute floor is what operators think in; the fraction rule is what makes short-lived certificates rotate sanely. Both the controller and the node-agent evaluate the identical rule, so a controller-driven rotation and the node's own timer never disagree.
 
@@ -374,6 +379,7 @@ certRotation:
   renewAtLifetimeFraction: 0.25  # renew once less than 25% of the lifetime remains
   warnBeforeDays: 45             # expiry warning window
   certValidityDays: 365          # lifetime of certificates the controller signs
+  revokeSupersededAfterHours: 24 # revoke a replaced node cert this long after its successor is first used; 0 = off
 
 revocation:
   enabled: true                  # enforce revocation on inbound peers

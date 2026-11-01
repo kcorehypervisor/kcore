@@ -121,6 +121,11 @@ pub struct RevocationState {
     inner: Arc<RwLock<Snapshot>>,
     fail_mode: FailMode,
     max_staleness: Duration,
+    /// Serials presented since the last [`Self::take_seen`]. The rotation
+    /// reconciler writes them to the inventory, which is how it learns that a
+    /// node really is using the certificate that replaced its old one.
+    seen: Arc<std::sync::Mutex<HashSet<String>>>,
+    track_seen: bool,
 }
 
 impl RevocationState {
@@ -129,6 +134,8 @@ impl RevocationState {
             inner: Arc::new(RwLock::new(Snapshot::default())),
             fail_mode,
             max_staleness,
+            seen: Arc::default(),
+            track_seen: true,
         }
     }
 
@@ -143,6 +150,30 @@ impl RevocationState {
             })),
             fail_mode: FailMode::SoftFail,
             max_staleness: Duration::days(36_500),
+            seen: Arc::default(),
+            track_seen: false,
+        }
+    }
+
+    /// Remember that a peer presented this serial. Does nothing when
+    /// enforcement is disabled, so nothing is ever revoked on the strength of
+    /// a connection the controller did not check.
+    pub fn note_seen(&self, serial_hex: &str) {
+        if !self.track_seen {
+            return;
+        }
+        if let Ok(mut seen) = self.seen.lock() {
+            if !seen.contains(serial_hex) {
+                seen.insert(serial_hex.to_string());
+            }
+        }
+    }
+
+    /// Serials presented since the last call.
+    pub fn take_seen(&self) -> Vec<String> {
+        match self.seen.lock() {
+            Ok(mut seen) => seen.drain().collect(),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -192,8 +223,12 @@ impl RevocationState {
     #[allow(clippy::result_large_err)]
     pub fn check_status(&self, serial_hex: &str, peer_cn: &str) -> Result<(), tonic::Status> {
         match self.check(serial_hex) {
-            Decision::Allow => Ok(()),
+            Decision::Allow => {
+                self.note_seen(serial_hex);
+                Ok(())
+            }
             Decision::AllowStale { age_secs } => {
+                self.note_seen(serial_hex);
                 warn!(
                     peer = %peer_cn,
                     age_secs,

@@ -306,6 +306,10 @@ pub struct CertRotationConfig {
     /// Lifetime of certificates the controller signs.
     #[serde(default = "default_cert_validity_days")]
     pub cert_validity_days: i64,
+    /// Revoke a node certificate this many hours after the certificate that
+    /// replaced it was first used to reach the controller. 0 turns this off.
+    #[serde(default = "default_revoke_superseded_after_hours")]
+    pub revoke_superseded_after_hours: i64,
 }
 
 impl Default for CertRotationConfig {
@@ -317,6 +321,7 @@ impl Default for CertRotationConfig {
             renew_at_lifetime_fraction: default_renew_at_lifetime_fraction(),
             warn_before_days: default_warn_before_days(),
             cert_validity_days: default_cert_validity_days(),
+            revoke_superseded_after_hours: default_revoke_superseded_after_hours(),
         }
     }
 }
@@ -421,6 +426,10 @@ fn default_warn_before_days() -> i64 {
 
 fn default_cert_validity_days() -> i64 {
     365
+}
+
+fn default_revoke_superseded_after_hours() -> i64 {
+    24
 }
 
 fn default_fail_mode() -> String {
@@ -741,6 +750,9 @@ impl Config {
         }
         if rot.renew_before_days < 0 {
             anyhow::bail!("certRotation.renewBeforeDays must not be negative");
+        }
+        if rot.revoke_superseded_after_hours < 0 {
+            anyhow::bail!("certRotation.revokeSupersededAfterHours must not be negative");
         }
         if !(0.0..1.0).contains(&rot.renew_at_lifetime_fraction) {
             anyhow::bail!(
@@ -1081,6 +1093,7 @@ defaultNetwork:
         assert_eq!(cfg.cert_rotation.renew_before_days, 30);
         assert_eq!(cfg.cert_rotation.warn_before_days, 45);
         assert_eq!(cfg.cert_rotation.cert_validity_days, 365);
+        assert_eq!(cfg.cert_rotation.revoke_superseded_after_hours, 24);
         assert!((cfg.cert_rotation.renew_at_lifetime_fraction - 0.25).abs() < f64::EPSILON);
         assert!(cfg.revocation.enabled);
         // The default must not brick a cluster on a transient fetch failure.
@@ -1158,6 +1171,25 @@ pki:
         )
         .expect_err("must fail");
         assert!(err.to_string().contains("warnBeforeDays"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_negative_superseded_revocation_delay() {
+        let err = load_with(
+            "bad-revoke-delay",
+            "certRotation:\n  revokeSupersededAfterHours: -1\n",
+        )
+        .expect_err("must fail");
+        assert!(
+            err.to_string().contains("revokeSupersededAfterHours"),
+            "{err}"
+        );
+        let off = load_with(
+            "no-revoke",
+            "certRotation:\n  revokeSupersededAfterHours: 0\n",
+        )
+        .expect("0 turns it off");
+        assert_eq!(off.cert_rotation.revoke_superseded_after_hours, 0);
     }
 
     #[test]
