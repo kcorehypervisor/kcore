@@ -3117,6 +3117,10 @@ message GetCrlResponse {
   google.protobuf.Timestamp next_update = 6;
   int32 revoked_count = 7;
   string message = 8;
+  // PEM of the sub-CA that signed the CRL. A node whose own certificate file
+  // has no chain can verify the CRL only if it can check this certificate
+  // against its root CA, which it already trusts.
+  string issuer_pem = 9;
 }
 
 message GetPkiStatusRequest {}

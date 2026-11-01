@@ -385,6 +385,54 @@ pub fn interceptor(
     }
 }
 
+/// Certificates in `issuer_pem` that the root CA in `anchor_pems` vouches for.
+///
+/// A node enrolled before certificates carried their chain has a bare leaf, so
+/// the sub-CA that signs the CRL is not among its trust anchors. The
+/// controller sends that sub-CA with the CRL, and this accepts it only when
+/// an anchor signed it, so a rogue certificate in the response gains nothing.
+pub fn issuers_vouched_for_by(issuer_pem: &str, anchor_pems: &[String]) -> Vec<String> {
+    use x509_parser::prelude::FromDer;
+
+    let anchors: Vec<Vec<u8>> = anchor_pems
+        .iter()
+        .flat_map(|bundle| pem::parse_many(bundle).unwrap_or_default())
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(|block| block.into_contents())
+        .collect();
+    let mut accepted = Vec::new();
+    for block in pem::parse_many(issuer_pem).unwrap_or_default() {
+        if block.tag() != "CERTIFICATE" {
+            continue;
+        }
+        let Ok((_, candidate)) =
+            x509_parser::certificate::X509Certificate::from_der(block.contents())
+        else {
+            continue;
+        };
+        let is_ca = candidate
+            .basic_constraints()
+            .ok()
+            .flatten()
+            .is_some_and(|bc| bc.value.ca);
+        if !is_ca || !candidate.validity().is_valid() {
+            continue;
+        }
+        let vouched = anchors.iter().any(|der| {
+            x509_parser::certificate::X509Certificate::from_der(der).is_ok_and(|(_, anchor)| {
+                anchor.subject() == candidate.issuer()
+                    && candidate
+                        .verify_signature(Some(anchor.public_key()))
+                        .is_ok()
+            })
+        });
+        if vouched {
+            accepted.push(pem::encode(&block));
+        }
+    }
+    accepted
+}
+
 /// Trust anchors the CRL signature may be checked against: the configured CA
 /// bundle plus the sub-CA that shipped with our own certificate chain.
 pub fn issuer_candidates(cfg: &Config) -> Vec<String> {
@@ -403,6 +451,12 @@ pub async fn refresh_once(cfg: &Config, state: &RevocationState) -> Result<usize
     if candidates.is_empty() {
         return Err("no CA material configured; cannot verify a CRL".to_string());
     }
+    let anchors: Vec<String> = cfg
+        .tls
+        .as_ref()
+        .and_then(|tls| std::fs::read_to_string(&tls.ca_file).ok())
+        .into_iter()
+        .collect();
 
     let mut last_err = String::from("no controller endpoints configured");
     for endpoint in crate::registration::controller_endpoints(cfg) {
@@ -425,7 +479,9 @@ pub async fn refresh_once(cfg: &Config, state: &RevocationState) -> Result<usize
             last_err = format!("controller {endpoint} has no CRL: {}", resp.message);
             continue;
         }
-        let summary = match parse_and_verify_crl(&resp.crl_der, &candidates) {
+        let mut trusted = candidates.clone();
+        trusted.extend(issuers_vouched_for_by(&resp.issuer_pem, &anchors));
+        let summary = match parse_and_verify_crl(&resp.crl_der, &trusted) {
             Ok(s) => s,
             Err(e) => {
                 // A CRL we cannot verify is discarded, not applied. Trying the
@@ -704,6 +760,54 @@ mod tests {
         let bundle = format!("{root_cert}{sub_cert}");
         let summary = parse_and_verify_crl(&der, &[bundle]).expect("verify from bundle");
         assert_eq!(summary.serials, set(&["0A"]));
+    }
+
+    #[test]
+    fn a_sub_ca_the_root_signed_is_accepted_for_a_node_with_a_bare_leaf() {
+        use crate::pki::test_support::test_sub_ca;
+        let (root, root_key) = test_ca("test-root-ca");
+        let (sub, sub_key) = test_sub_ca(&root, &root_key, "test-sub-ca");
+        let der = build_crl(&sub, &sub_key, &["0A"]);
+        let anchors = vec![root.clone()];
+
+        assert!(
+            parse_and_verify_crl(&der, &anchors).is_err(),
+            "the root alone cannot verify a CRL the sub-CA signed"
+        );
+        let mut trusted = anchors.clone();
+        trusted.extend(issuers_vouched_for_by(&sub, &anchors));
+        let summary = parse_and_verify_crl(&der, &trusted).expect("chained issuer verifies");
+        assert_eq!(summary.serials, set(&["0A"]));
+    }
+
+    #[test]
+    fn a_certificate_the_root_did_not_sign_is_not_trusted() {
+        use crate::pki::test_support::test_sub_ca;
+        let (root, _root_key) = test_ca("test-root-ca");
+        let (rogue_root, rogue_root_key) = test_ca("test-root-ca");
+        let (rogue_sub, rogue_key) = test_sub_ca(&rogue_root, &rogue_root_key, "test-sub-ca");
+        let anchors = vec![root];
+
+        assert!(issuers_vouched_for_by(&rogue_sub, &anchors).is_empty());
+        assert!(issuers_vouched_for_by(&rogue_root, &anchors).is_empty());
+        let der = build_crl(&rogue_sub, &rogue_key, &["0A"]);
+        let mut trusted = anchors.clone();
+        trusted.extend(issuers_vouched_for_by(&rogue_sub, &anchors));
+        assert!(parse_and_verify_crl(&der, &trusted).is_err());
+    }
+
+    #[test]
+    fn a_leaf_the_root_signed_is_not_accepted_as_a_crl_issuer() {
+        use crate::pki::test_support::node_leaf;
+        let (root, root_key) = test_ca("test-root-ca");
+        let (chain, _key) = node_leaf(&root, &root_key, "10.0.0.9", Duration::days(30));
+        let leaf_only = chain
+            .split("-----END CERTIFICATE-----")
+            .next()
+            .unwrap()
+            .to_string()
+            + "-----END CERTIFICATE-----\n";
+        assert!(issuers_vouched_for_by(&leaf_only, &[root]).is_empty());
     }
 
     #[test]
