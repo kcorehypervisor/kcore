@@ -560,9 +560,22 @@ struct WebConsoles(Arc<Mutex<HashMap<String, WebConsole>>>);
 /// snapshots, and the older render may reach the node last. The map is
 /// process-wide because reconcilers build their own `ControllerService`.
 fn config_push_lock(node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-        std::sync::OnceLock::new();
-    let mut locks = LOCKS
+    static LOCKS: NodeLocks = std::sync::OnceLock::new();
+    node_lock(&LOCKS, node_id)
+}
+
+/// One lock per node from choosing free GPUs or vGPU slices until the VM row
+/// that claims them is stored. Concurrent creates (Terraform applies VMs in
+/// parallel) otherwise see the same free slice and both take it.
+fn device_claim_lock(node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: NodeLocks = std::sync::OnceLock::new();
+    node_lock(&LOCKS, node_id)
+}
+
+type NodeLocks = std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
+fn node_lock(locks: &'static NodeLocks, node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = locks
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -4317,6 +4330,7 @@ impl ControllerService {
         }
         let previous_pci = vm.pci_devices.clone();
         let previous_names = self.vm_gpu_names(&vm.id)?.join(",");
+        let claim = device_claim_lock(&target.id).lock_owned().await;
         let names = self.retarget_vm_gpus(&vm, &target, gpus, vgpus)?;
         if let Err(e) = self.cold_release_ceph_vm(&vm, &source_node).await {
             self.restore_vm_gpu(&vm.id, &previous_pci, &previous_names);
@@ -4326,6 +4340,7 @@ impl ControllerService {
             self.restore_vm_gpu(&vm.id, &previous_pci, &previous_names);
             return Err(e);
         }
+        drop(claim);
         if let Err(e) = self.push_config_to_node(&source_node).await {
             warn!(node = %source_node.id, error = %e, "push after GPU migrate (source)");
         }
@@ -6312,6 +6327,7 @@ impl ControllerService {
                 let mut moved_gpu = false;
                 let mut gpu_error = String::new();
                 for target in &gpu_targets {
+                    let _claim = device_claim_lock(&target.id).lock_owned().await;
                     let previous_pci = vm.pci_devices.clone();
                     let previous_gpu = self.vm_gpu_names(&vm.id).unwrap_or_default().join(",");
                     if let Err(e) = self.retarget_vm_gpus(vm, target, &[], &[]) {
@@ -8874,6 +8890,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
             &format!("vm/{}", spec.name),
         )?;
 
+        let device_claim = if wants_gpu || wants_vgpu || !pci_devices.is_empty() {
+            Some(device_claim_lock(&node.id).lock_owned().await)
+        } else {
+            None
+        };
         let mut assigned_gpus = String::new();
         if wants_gpu {
             let (names, functions) = self.assign_gpus_on_node(&node.id, &spec.gpus, None)?;
@@ -9115,6 +9136,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 return Err(Status::internal(format!("storing GPU assignment: {e}")));
             }
         }
+        drop(device_claim);
         if let Err(e) = self.assign_ipv6_if_configured(&node.id, &vm.network, &vm_id, 0) {
             self.rollback_created_vm(&node, &vm).await;
             return Err(e);
@@ -9416,6 +9438,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     .clear_vm_gpu(&vm.id)
                     .map_err(|e| Status::internal(format!("clearing GPU assignment: {e}")))?;
             } else {
+                let _claim = device_claim_lock(&node.id).lock_owned().await;
                 let (names, functions) = if wants_vgpu {
                     self.assign_vgpus_on_node(&node.id, &req.vgpus, Some(&vm.id))?
                 } else {
@@ -21468,6 +21491,76 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
         assert!(err.message().contains("0000:03:00.1"));
         assert!(err.message().contains("gpu-a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_vgpu_creates_take_distinct_slices() {
+        let db = Database::open(":memory:").expect("open db");
+        let node = test_node();
+        db.upsert_node(&node).unwrap();
+        let mut rows = vec![vgpu_host(&node.id, "nvidia0", "0000:61:00.0")];
+        for slot in 0..4 {
+            rows.push(vgpu_slice(
+                &node.id,
+                &format!("nvidia0/{slot}"),
+                &format!("0000:61:00.{}", slot + 4),
+                "nvidia0",
+                "",
+                "A2-4C,A2-8C",
+            ));
+        }
+        db.replace_node_gpus(&node.id, &rows).unwrap();
+        let hook: PushHook = Arc::new(|_: &NodeRow| Ok(()));
+        let svc = ControllerService::new_with_test_push_hook(
+            db.clone(),
+            NodeClients::new(None),
+            test_network(),
+            None,
+            false,
+            hook,
+        );
+        let creates = (0..6).map(|i| {
+            let svc = svc.clone();
+            let target_node = node.id.clone();
+            tokio::spawn(async move {
+                let req = controller_proto::CreateVmRequest {
+                    target_node,
+                    spec: Some(controller_proto::VmSpec {
+                        name: format!("vgpu-{i}"),
+                        cpu: 1,
+                        memory_bytes: 512 * 1024 * 1024,
+                        vgpus: vec!["A2-4C".into()],
+                        ..Default::default()
+                    }),
+                    image_path: format!("/var/lib/kcore/images/vgpu-{i}.raw"),
+                    image_format: "raw".into(),
+                    storage_backend: controller_proto::StorageBackendType::Filesystem as i32,
+                    storage_size_bytes: 8 * 1024 * 1024 * 1024,
+                    ..Default::default()
+                };
+                <ControllerService as controller_proto::controller_server::Controller>::create_vm(
+                    &svc,
+                    Request::new(req),
+                )
+                .await
+            })
+        });
+        let mut created = 0;
+        for create in creates.collect::<Vec<_>>() {
+            if create.await.unwrap().is_ok() {
+                created += 1;
+            }
+        }
+        assert_eq!(created, 4, "four slices fit four VMs");
+        let mut functions = db
+            .list_vms_for_node(&node.id)
+            .unwrap()
+            .into_iter()
+            .map(|vm| vm.pci_devices)
+            .collect::<Vec<_>>();
+        functions.sort();
+        functions.dedup();
+        assert_eq!(functions.len(), 4, "each VM owns its own slice");
     }
 
     fn mark_ceph_cluster_healthy(db: &Database, name: &str) {
