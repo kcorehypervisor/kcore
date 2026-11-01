@@ -142,6 +142,9 @@ test("a vGPU host apply stages the manager", () => {
   assert.equal(amd.request.vendor, "amd");
   assert.equal(amd.request.manager, undefined);
   assert.throws(() => buildApply(kind, { nodeId: "node-7", vendor: "intel", hostCards: ["0000:03:00.0"] }), /numVfs/);
+  const [mixed] = buildApply(kind, { nodeId: "node-7", vendor: "amd", hostCards: ["0000:c3:00.0=4", "0000:c4:00.0=6"] });
+  assert.deepEqual(mixed.request.hostCards, ["0000:c3:00.0=4", "0000:c4:00.0=6"]);
+  assert.throws(() => buildApply(kind, { nodeId: "node-7", vendor: "amd", hostCards: ["0000:c3:00.0=4", "0000:c4:00.0"] }), /numVfs/);
   const migrate = buildOperation("migrate-vm", { name: "vgpu-01", targetNode: "node-193", vgpus: ["A2-4C"] });
   assert.deepEqual(migrate.request.vgpus, ["A2-4C"]);
   const reboot = buildOperation("reboot-node", { nodeId: "node-193" });

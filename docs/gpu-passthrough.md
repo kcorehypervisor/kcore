@@ -206,10 +206,19 @@ The controller renders `ch-vm.vgpu.sriovCards`. On Intel the
 `sriov_numvfs` on the `xe` physical function, and binds each virtual function
 to `vfio-pci`. On AMD the node blacklists `amdgpu` and loads `gim` with
 `vf_num`, which creates the functions at load time; the unit then binds them
-to `vfio-pci`. Every AMD card on one node uses the same `numVfs`, because GIM
-takes one count per card in probe order and kcore keeps them equal.
-`ch-vm.vgpu.amd.schedulePolicy` sets GIM's `sch_policy`. Live migration of
-AMD slices (`amd-vfio-pci`) is not wired up.
+to `vfio-pci`. Each card can have its own count: `--host-card 0000:c3:00.0=4
+--host-card 0000:c4:00.0=6`, or `numVfs` per entry in `sriovCards`. A card
+without `=N` takes `--num-vfs`. GIM reads `vf_num` by the number it gives
+each AMD GPU in PCI address order, so kcore writes the list in address order.
+Every AMD GPU on the node needs an entry: one that is missing shifts the
+counts, and `kcore-gpu-sriov` then fails with "GIM created N virtual
+functions" instead of leaving slices of the wrong size.
+`ch-vm.vgpu.amd.schedulePolicy` sets GIM's `sch_policy`.
+
+A VM with a slice of any vendor moves cold: `kctl migrate vm` stops it,
+attaches a free slice of the same profile on the target, and starts it. Cloud
+Hypervisor live migration does not carry `vfio-pci` devices for NVIDIA, Intel
+or AMD, so `amd-vfio-pci` is not needed.
 
 The node must report the `vgpuVendor` feature. The Intel and AMD paths are
 tested against fake sysfs trees and Nix evaluations, not on a B50 or a V710

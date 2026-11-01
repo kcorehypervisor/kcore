@@ -80,6 +80,11 @@ function missing(spec: Record<string, unknown>, key: string): boolean {
   return isBlank(spec[key]);
 }
 
+function everyCardHasCount(spec: Record<string, unknown>): boolean {
+  const cards = Array.isArray(spec.hostCards) ? spec.hostCards : typeof spec.hostCards === "string" ? [spec.hostCards] : [];
+  return cards.length > 0 && cards.every((card) => /=\s*[1-9]\d*\s*$/.test(String(card)));
+}
+
 export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>): Question[] {
   switch (kind.id) {
     case "cluster":
@@ -146,8 +151,8 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
         question(
           "numVfs",
           "How many virtual functions should each card expose?",
-          "Every slice gets an equal share. An Arc Pro B50 supports 2, a B70 supports 4, and a V710 supports 1 to 12. NVIDIA accepts 0 for every function the card supports.",
-          !nvidia && missing(spec, "numVfs"),
+          "Every slice of a card gets an equal share. An Arc Pro B50 supports 2, a B70 supports 4, and a V710 supports 1 to 12. Give one card its own count as ADDRESS=N in hostCards. NVIDIA accepts 0 for every function the card supports.",
+          !nvidia && missing(spec, "numVfs") && !everyCardHasCount(spec),
           { example: nvidia ? "0" : "2" },
         ),
         ...(nvidia

@@ -1043,11 +1043,6 @@ fn print_node_vgpu(vgpu: &controller_proto::GetNodeVgpuResponse) {
     } else {
         vgpu.host_cards.join(", ")
     };
-    let vfs = if vgpu.num_vfs == 0 {
-        "all".to_string()
-    } else {
-        vgpu.num_vfs.to_string()
-    };
     let store = if vgpu.staged_store_path.is_empty() {
         "-".to_string()
     } else {
@@ -1057,6 +1052,11 @@ fn print_node_vgpu(vgpu: &controller_proto::GetNodeVgpuResponse) {
         "nvidia"
     } else {
         vgpu.vendor.as_str()
+    };
+    let vfs = match (vgpu.num_vfs, vendor) {
+        (0, "nvidia") => "all".to_string(),
+        (0, _) => "per card".to_string(),
+        (count, _) => count.to_string(),
     };
     println!("  enabled");
     println!("  Vendor:     {vendor}");
@@ -1100,8 +1100,15 @@ impl VgpuEnable {
     fn into_request(self) -> Result<controller_proto::ConfigureNodeVgpuRequest> {
         let vendor = kcore_gpu::VgpuVendor::parse(&self.vendor).map_err(anyhow::Error::msg)?;
         let manager = if vendor.splits_evenly() {
-            if self.num_vfs < 1 {
-                anyhow::bail!("--num-vfs is required for {} cards", vendor.as_str());
+            for card in &self.host_cards {
+                let (address, count) =
+                    kcore_gpu::parse_split_card(card).map_err(anyhow::Error::msg)?;
+                if count.unwrap_or(self.num_vfs) < 1 {
+                    anyhow::bail!(
+                        "{address}: give {} cards a count with --num-vfs or {address}=N",
+                        vendor.as_str()
+                    );
+                }
             }
             if self.url.is_some() || self.sha256.is_some() || self.file.is_some() {
                 anyhow::bail!(
@@ -1328,6 +1335,12 @@ mod tests {
             version: "595.91.04".into(),
         };
         assert!(enable(0, None).into_request().is_err());
+        let mut per_card = enable(0, None);
+        per_card.host_cards = vec!["0000:c3:00.0=4".into(), "0000:c4:00.0=6".into()];
+        assert!(per_card.into_request().is_ok());
+        let mut partly = enable(0, None);
+        partly.host_cards = vec!["0000:c3:00.0=4".into(), "0000:c4:00.0".into()];
+        assert!(partly.into_request().is_err());
         assert!(enable(4, Some("https://x/y.run")).into_request().is_err());
         assert_eq!(enable(4, None).into_request().unwrap().vendor, "amd");
     }

@@ -29,8 +29,11 @@ let
     intel = "xe";
     amd = "gim";
   };
-  amdCards = builtins.filter (card: card.vendor == "amd") cfg.sriovCards;
-  amdVfCounts = lib.unique (map (card: card.numVfs) amdCards);
+  # GIM numbers the cards it probes in PCI address order and reads vf_num by
+  # that number, so the list follows the address order, not the option order.
+  amdCards = lib.sort (a: b: lib.toLower a.address < lib.toLower b.address) (
+    builtins.filter (card: card.vendor == "amd") cfg.sriovCards
+  );
 in
 {
   options.ch-vm.vgpu = {
@@ -160,11 +163,6 @@ in
           message = "ch-vm.vgpu.sriovCards has an amd card; ch-vm.vgpu.amd.gimPackage must not be null";
         }
         {
-          assertion = builtins.length amdVfCounts <= 1;
-          # vf_num is per GPU in GIM's probe order, which kcore cannot predict.
-          message = "give each amd entry in ch-vm.vgpu.sriovCards the same numVfs; GIM assigns vf_num in its own probe order";
-        }
-        {
           assertion =
             !cfg.enable
             ||
@@ -245,7 +243,7 @@ in
                 echo "$want" > "$dev/sriov_numvfs"
               fi
             elif [ "$have" != "$want" ]; then
-              echo "GIM created $have virtual functions on $card, not $want; reboot after changing vf_num"
+              echo "GIM created $have virtual functions on $card, not $want; reboot after changing vf_num. GIM numbers every AMD GPU on the node in PCI address order, so an AMD GPU missing from ch-vm.vgpu.sriovCards shifts the counts."
               exit 1
             fi
             last=$((want - 1))

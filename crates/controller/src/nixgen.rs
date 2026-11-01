@@ -669,16 +669,28 @@ pub fn with_vgpu_host(
 /// Intel and AMD host cards: `ch-vm.vgpu.sriovCards`. An older module that
 /// does not report `vgpuVendor` gets the config unchanged; the caller refuses.
 fn with_sriov_cards(config: String, host: &VgpuHostNix, features: &ModuleFeatures) -> String {
-    if !features.vgpu_vendor || host.num_vfs <= 0 {
+    if !features.vgpu_vendor {
         return config;
     }
+    // A stored entry is `address=count`; rows written before per-card counts
+    // hold a bare address and use the host-wide count.
+    let mut entries = Vec::with_capacity(host.host_cards.len());
+    for raw in &host.host_cards {
+        let Ok((address, count)) = kcore_gpu::parse_split_card(raw) else {
+            return config;
+        };
+        match count.unwrap_or(host.num_vfs) {
+            count if count > 0 => entries.push((address, count)),
+            _ => return config,
+        }
+    }
     let mut block = String::from("  ch-vm.vgpu.sriovCards = [\n");
-    for card in &host.host_cards {
+    for (address, count) in entries {
         block.push_str(&format!(
             "    {{ address = \"{}\"; vendor = \"{}\"; numVfs = {}; }}\n",
-            nix_escape(card),
+            nix_escape(address),
             host.vendor.as_str(),
-            host.num_vfs
+            count
         ));
     }
     block.push_str("  ];\n");
@@ -1268,6 +1280,43 @@ mod tests {
         };
         assert_eq!(with_vgpu_host(bare.clone(), Some(&host), &older), bare);
         assert!(ModuleFeatures::from_reported(&[ModuleFeatures::VGPU_VENDOR]).vgpu_vendor);
+    }
+
+    #[test]
+    fn split_cards_keep_their_own_virtual_function_counts() {
+        let host = VgpuHostNix {
+            vendor: kcore_gpu::VgpuVendor::Amd,
+            host_cards: vec![
+                "0000:c3:00.0=4".into(),
+                "0000:c4:00.0=6".into(),
+                "0000:c5:00.0".into(),
+            ],
+            num_vfs: 2,
+            file: String::new(),
+            sha256: String::new(),
+            version: String::new(),
+        };
+        let bare = generate_node_config(
+            &[],
+            "eno1",
+            &default_net(),
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        let rendered = with_vgpu_host(bare.clone(), Some(&host), &ModuleFeatures::all());
+        assert!(rendered.contains("address = \"0000:c3:00.0\"; vendor = \"amd\"; numVfs = 4;"));
+        assert!(rendered.contains("address = \"0000:c4:00.0\"; vendor = \"amd\"; numVfs = 6;"));
+        assert!(rendered.contains("address = \"0000:c5:00.0\"; vendor = \"amd\"; numVfs = 2;"));
+        let unresolved = VgpuHostNix {
+            host_cards: vec!["0000:c3:00.0".into()],
+            num_vfs: 0,
+            ..host
+        };
+        assert_eq!(
+            with_vgpu_host(bare.clone(), Some(&unresolved), &ModuleFeatures::all()),
+            bare
+        );
     }
 
     #[test]

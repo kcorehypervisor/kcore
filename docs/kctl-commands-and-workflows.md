@@ -577,7 +577,7 @@ Top-level commands:
 - `kctl node uncordon <NODE_ID>` — make a cordoned node schedulable again
 - `kctl node delete <NODE_ID>` — remove an empty node and revoke its certificates
 - `kctl node vgpu enable <NODE_ID> --host-card <bdf> --url <url> --sha256 <sha256> --file <name.run> [--num-vfs N] [--no-reboot]`
-- `kctl node vgpu enable <NODE_ID> --vendor intel|amd --host-card <bdf> --num-vfs N [--no-reboot]`
+- `kctl node vgpu enable <NODE_ID> --vendor intel|amd --host-card <bdf>[=N] [--num-vfs N] [--no-reboot]` — `=N` gives one card its own virtual function count
 - `kctl node vgpu show <NODE_ID>`
 - `kctl node vgpu disable <NODE_ID>`
 - `kctl node reboot <NODE_ID> [--force]`
