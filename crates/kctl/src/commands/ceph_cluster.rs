@@ -442,3 +442,20 @@ spec:
         assert_eq!(proto.min_size, 8);
     }
 }
+
+#[cfg(test)]
+mod shipped_example_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_example_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/ceph/cluster.yaml"
+        );
+        let manifest = parse_manifest(path).unwrap();
+        let spec = to_proto_spec(&manifest.spec);
+        assert_eq!(spec.nodes.len(), 3);
+        assert_eq!((spec.size, spec.min_size), (3, 2));
+    }
+}

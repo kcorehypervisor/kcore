@@ -1,0 +1,31 @@
+# Three-node Ceph fabric. Mon addresses must be static or DHCP reservations.
+# Preview with: kctl diff -f cluster.yaml
+kind: CephCluster
+metadata:
+  name: lab-san
+spec:
+  fsid: "2f3f204e-65ca-4b69-a86c-bf8408f5c792"
+  publicNetwork: "10.10.0.0/24"
+  clusterNetwork: "10.20.0.0/24"
+  replication:
+    size: 3
+    minSize: 2
+  nodes:
+    - nodeId: node-1
+      monAddr: "10.10.0.11:6789"
+      clusterAddr: "10.20.0.11"
+      publicIface: eth1
+      clusterIface: eth2
+      osdDevice: /dev/disk/by-id/ata-EXAMPLE_SERIAL_1
+    - nodeId: node-2
+      monAddr: "10.10.0.12:6789"
+      clusterAddr: "10.20.0.12"
+      publicIface: eth1
+      clusterIface: eth2
+      osdDevice: /dev/disk/by-id/ata-EXAMPLE_SERIAL_2
+    - nodeId: node-3
+      monAddr: "10.10.0.13:6789"
+      clusterAddr: "10.20.0.13"
+      publicIface: eth1
+      clusterIface: eth2
+      osdDevice: /dev/disk/by-id/ata-EXAMPLE_SERIAL_3

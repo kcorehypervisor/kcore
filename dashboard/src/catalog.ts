@@ -1,6 +1,6 @@
 import { admin, auth, controller } from "./rpc";
 import { flatten, lift, rowOf, rowsOf, enumValue, type Row } from "./rows";
-import type { MessageInitShape as Init } from "@bufbuild/protobuf";
+import { fromJson, type JsonObject, type MessageInitShape as Init } from "@bufbuild/protobuf";
 import {
   CephClusterNodeSpecSchema,
   CephClusterSchema,
@@ -14,6 +14,7 @@ import {
   SecurityGroupRuleSchema,
   VmSpecSchema,
   OperatorRoleKindSchema,
+  SlurmClusterSpecSchema,
   RevocationReason,
   SecurityGroupTargetKind,
   StorageBackendType,
@@ -183,6 +184,24 @@ function slurmClusterRow(row: Row): Row {
     alloc_nodes: state("alloc"),
     down_nodes: state("down"),
   };
+}
+
+/** Dry-run an ingress document against the cluster, as `kctl diff -f` does. */
+async function planIngressDocument(kind: "IngressGateway" | "IngressRoute" | "WafPolicy", v: Values) {
+  const raw = specJson(v, kind === "WafPolicy");
+  const spec = JSON.parse(raw) as Record<string, unknown>;
+  const gateway = kind === "IngressGateway" ? required(v, "name") : typeof spec.gateway === "string" ? spec.gateway : "";
+  if (kind === "IngressRoute" && !gateway) throw new FormError("The spec needs a gateway to plan against");
+  return rowOf(await controller.planIngress({ gateway, documents: [{ kind, name: required(v, "name"), specJson: raw }] }));
+}
+
+function slurmSpec(v: Values) {
+  const parsed = JSON.parse(specJson(v)) as JsonObject;
+  try {
+    return fromJson(SlurmClusterSpecSchema, parsed);
+  } catch (error) {
+    throw new FormError(`Spec is not a valid Slurm cluster: ${(error as Error).message}`);
+  }
 }
 
 function wafPolicyRow(row: Row): Row {
@@ -644,7 +663,7 @@ export const RESOURCES: Resource[] = [
     noun: "container",
     title: "Containers",
     group: "Compute",
-    terraform: [],
+    terraform: ["kcore_workload"],
     kctl: "get containers",
     idField: "id",
     fields: [
@@ -1089,11 +1108,12 @@ export const RESOURCES: Resource[] = [
     noun: "ingress gateway",
     title: "Ingress gateways",
     group: "Ingress",
-    terraform: [],
+    terraform: ["kcore_ingress_gateway"],
     kctl: "get ingress-gateways",
     idField: "name",
     refreshMs: 10000,
     fields: [f("name", "Name", true), specField("Spec (JSON)")],
+    checks: ["plan"],
     list: async () => rowsOf(await controller.listIngressGateways({}), "gateways").map(ingressGatewayRow),
     create: async (v) => {
       const resp = await controller.createIngressGateway({ name: required(v, "name"), specJson: specJson(v) });
@@ -1104,6 +1124,17 @@ export const RESOURCES: Resource[] = [
       return { detail: { ...gateway, spec_json: parsedSpec(gateway) } };
     },
     actions: [
+      act("plan", "Plan", false, [], (v) => planIngressDocument("IngressGateway", v)),
+      act(
+        "set-secret",
+        "Set secret file",
+        true,
+        [f("secret_name", "File name", true, "dns.env"), secret("content", "Content")],
+        async (v) => {
+          await controller.setIngressSecret({ gateway: ident(v), name: required(v, "secret_name"), content: new TextEncoder().encode(required(v, "content")) });
+          return { ok: true };
+        },
+      ),
       act("delete", "Delete", true, [], async (v) => {
         await controller.deleteIngressGateway({ name: ident(v) });
         return { ok: true };
@@ -1115,12 +1146,13 @@ export const RESOURCES: Resource[] = [
     noun: "ingress route",
     title: "Ingress routes",
     group: "Ingress",
-    terraform: [],
+    terraform: ["kcore_ingress_route"],
     kctl: "get ingress-routes",
     idField: "name",
     refreshMs: 10000,
     fields: [f("name", "Name", true), specField("Spec (JSON)")],
     filters: [f("gateway", "Gateway")],
+    checks: ["plan"],
     list: async (filters) => rowsOf(await controller.listIngressRoutes({ gateway: text(filters, "gateway") }), "routes").map(ingressRouteRow),
     create: async (v) => {
       const resp = await controller.createIngressRoute({ name: required(v, "name"), specJson: specJson(v) });
@@ -1134,6 +1166,7 @@ export const RESOURCES: Resource[] = [
       return { detail: { ...route, spec_json: parsedSpec(route), waf_events_24h: events } };
     },
     actions: [
+      act("plan", "Plan", false, [], (v) => planIngressDocument("IngressRoute", v)),
       act(
         "waf-mode",
         "Set WAF mode",
@@ -1152,10 +1185,11 @@ export const RESOURCES: Resource[] = [
     noun: "WAF policy",
     title: "WAF policies",
     group: "Ingress",
-    terraform: [],
+    terraform: ["kcore_waf_policy"],
     kctl: "get waf-policies",
     idField: "name",
     fields: [f("name", "Name", true), specField("Spec (JSON)")],
+    checks: ["plan"],
     list: async () => rowsOf(await controller.listWafPolicies({}), "policies").map(wafPolicyRow),
     create: async (v) => {
       const resp = await controller.createWafPolicy({ name: required(v, "name"), specJson: specJson(v, true) });
@@ -1166,6 +1200,7 @@ export const RESOURCES: Resource[] = [
       return { detail: { ...policy, spec_json: parsedSpec(policy) } };
     },
     actions: [
+      act("plan", "Plan", false, [], (v) => planIngressDocument("WafPolicy", v)),
       act("delete", "Delete", true, [], async (v) => {
         await controller.deleteWafPolicy({ name: ident(v) });
         return { ok: true };
@@ -1259,6 +1294,12 @@ export const RESOURCES: Resource[] = [
       } catch {
         /* HA history is optional */
       }
+      try {
+        const vgpu = rowOf(await controller.getNodeVgpu({ nodeId: key }));
+        if (vgpu.enabled) detail.vgpu = vgpu;
+      } catch {
+        /* a node without a vGPU record has nothing to show */
+      }
       return { detail };
     },
     actions: [
@@ -1269,6 +1310,44 @@ export const RESOURCES: Resource[] = [
       act("drain", "Drain", true, [f("target_node", "Target node")], async (v) => {
         const resp = await controller.drainNode({ nodeId: first(v, "node_id", "id"), targetNode: text(v, "target_node") });
         return ok(resp, { migrated: resp.vmsMigrated });
+      }),
+      act("reboot", "Reboot", true, [bool("force", "Force")], async (v) => {
+        const resp = await controller.rebootNode({ nodeId: first(v, "node_id", "id"), force: flag(v, "force") });
+        return ok(resp);
+      }),
+      act(
+        "vgpu-enable",
+        "Enable vGPU host",
+        true,
+        [
+          pick("vendor", "Vendor", ["nvidia", "intel", "amd"], true),
+          f("host_cards", "Host cards", true, "0000:61:00.0, comma separated; ADDRESS=N sets slices per card"),
+          num("num_vfs", "Slices per card", false, "required for Intel and AMD"),
+          f("manager_url", "Manager URL", false, "NVIDIA only"),
+          f("manager_sha256", "Manager SHA-256", false, "NVIDIA only"),
+          f("manager_file", "Manager file", false, "NVIDIA only, the .run name"),
+          f("manager_version", "Manager version", false, "NVIDIA only"),
+        ],
+        async (v) => {
+          const vendor = text(v, "vendor") || "nvidia";
+          const manager =
+            vendor === "nvidia"
+              ? { url: required(v, "manager_url"), sha256: required(v, "manager_sha256"), file: required(v, "manager_file"), version: text(v, "manager_version") }
+              : undefined;
+          const resp = await controller.configureNodeVgpu({
+            nodeId: first(v, "node_id", "id"),
+            enabled: true,
+            hostCards: strings(v, "host_cards"),
+            numVfs: int(v, "num_vfs"),
+            vendor,
+            manager,
+          });
+          return ok(resp, { reboot_required: resp.rebootRequired });
+        },
+      ),
+      act("vgpu-disable", "Disable vGPU host", true, [], async (v) => {
+        const resp = await controller.configureNodeVgpu({ nodeId: first(v, "node_id", "id"), enabled: false, hostCards: [], numVfs: 0, vendor: "" });
+        return ok(resp, { reboot_required: resp.rebootRequired });
       }),
       act("renew-cert", "Renew certificate", true, [], async (v): Promise<Reveal> => {
         const resp = await controller.renewNodeCert({ nodeId: first(v, "node_id", "id") });
@@ -1643,16 +1722,36 @@ export const RESOURCES: Resource[] = [
     terraform: ["kcore_slurm_cluster"],
     kctl: "get slurm-cluster",
     idField: "name",
-    fields: [f("name", "Name", true), f("cluster_name", "Cluster name"), f("controller_node", "Controller node"), num("compute_count", "Compute nodes")],
+    fields: [f("name", "Name", true), specField("Spec (JSON)")],
+    checks: ["plan"],
     list: async () => rowsOf(await controller.listSlurmClusters({}), "clusters").map(slurmClusterRow),
+    create: async (v) => {
+      const resp = await controller.createSlurmCluster({ name: required(v, "name"), spec: slurmSpec(v), confirm: true });
+      return ok(resp, { action: resp.action });
+    },
     inspect: async (key) => ({ detail: rowOf(await controller.getSlurmCluster({ name: key })).cluster }),
     actions: [
-      act("delete", "Delete", true, [], async (v) => {
-        await controller.deleteSlurmCluster({ name: ident(v), force: false });
+      act("plan", "Plan", false, [], async (v) => {
+        const name = ident(v);
+        if (text(v, "spec")) return rowOf(await controller.planSlurmCluster({ name, spec: slurmSpec(v) }));
+        const stored = (await controller.getSlurmCluster({ name })).cluster?.spec;
+        if (!stored) throw new Error(`Slurm cluster ${name} has no spec`);
+        return rowOf(await controller.planSlurmCluster({ name, spec: stored }));
+      }),
+      act("drain-node", "Drain node", true, [f("node_id", "Node", true), f("reason", "Reason")], async (v) => {
+        await controller.drainSlurmNode({ name: ident(v), nodeId: required(v, "node_id"), reason: text(v, "reason") });
+        return { ok: true };
+      }),
+      act("resume-node", "Resume node", true, [f("node_id", "Node", true)], async (v) => {
+        await controller.resumeSlurmNode({ name: ident(v), nodeId: required(v, "node_id") });
         return { ok: true };
       }),
       act("rotate-munge-key", "Rotate munge key", true, [], async (v) => {
         await controller.rotateSlurmMungeKey({ name: ident(v) });
+        return { ok: true };
+      }),
+      act("delete", "Delete", true, [bool("force", "Force")], async (v) => {
+        await controller.deleteSlurmCluster({ name: ident(v), force: flag(v, "force") });
         return { ok: true };
       }),
     ],
@@ -1662,7 +1761,7 @@ export const RESOURCES: Resource[] = [
     noun: "PostgreSQL instance",
     title: "PostgreSQL",
     group: "Services",
-    terraform: [],
+    terraform: ["kcore_postgresql"],
     kctl: "get postgresql",
     idField: "name",
     fields: [f("name", "Name", true), f("database", "Database"), f("package", "Package"), num("port", "Port"), f("target_node", "Target node")],
@@ -1684,7 +1783,7 @@ export const RESOURCES: Resource[] = [
     noun: "device",
     title: "GPUs and devices",
     group: "Observe",
-    terraform: [],
+    terraform: ["kcore_vgpu_host", "kcore_gpus"],
     kctl: "gpu list",
     idField: "name",
     fields: [],

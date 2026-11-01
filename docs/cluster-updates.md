@@ -159,19 +159,18 @@ spec:
   selector:
     datacenters: ["DC1"]
   strategy:
-    type: one-at-a-time
+    strategyType: one-at-a-time
     maxUnavailable: 1
-  drainPolicy:
-    enabled: true
-    timeoutSeconds: 900
+  drainVms: true
+  drainTimeoutSeconds: 900
   activation:
     mode: auto
     rebootPolicy: if-required
   approvalPolicy: manual
-  rollbackPolicy:
-    automatic: true
-    onHealthGateFailure: true
+  automaticRollback: true
 ```
+
+`kctl` ignores unknown keys, so a misspelled field is dropped without an error. A runnable copy is in `examples/cluster-update/release.yaml`.
 
 ### NodeUpdateStatus
 

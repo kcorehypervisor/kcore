@@ -116,6 +116,27 @@ async function execute(call: RpcCall, options: ConnectionOptions): Promise<unkno
   return callController(options, call.method, call.request);
 }
 
+/**
+ * Kubernetes clusters have separate create and update RPCs and operators have
+ * no update, so an apply looks the resource up first to behave as an upsert.
+ */
+async function resolveUpsert(call: RpcCall, options: ConnectionOptions): Promise<RpcCall | null> {
+  const probes: Record<string, { method: string; swap: string | null }> = {
+    createKubernetesCluster: { method: "getKubernetesCluster", swap: "updateKubernetesCluster" },
+    createOperator: { method: "getOperator", swap: null },
+  };
+  const probe = probes[call.method];
+  if (!probe) return call;
+  try {
+    await execute({ target: "controller", method: probe.method, request: { name: call.request.name } }, options);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/not found|not_found/i.test(message)) return call;
+    throw error;
+  }
+  return probe.swap ? { ...call, method: probe.swap } : null;
+}
+
 function text(payload: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(redact(payload), null, 2) }] };
 }
@@ -367,7 +388,9 @@ export function createServer(): McpServer {
         }
         const options = dial(input.connection, prepared.desired.spec);
         const responses = [];
-        for (const call of buildApply(prepared.desired.kind, prepared.desired.spec)) {
+        for (const planned of buildApply(prepared.desired.kind, prepared.desired.spec)) {
+          const call = await resolveUpsert(planned, options);
+          if (!call) continue;
           responses.push({ method: call.method, response: await execute(call, options) });
         }
         return text({
@@ -467,7 +490,7 @@ export function createServer(): McpServer {
     {
       title: "Run a kcore day-2 operation",
       description:
-        "Power state, migrate, drain, cordon, node approval, cluster-update approve/cancel/rollback, Slurm node drain/resume and munge key rotation, node install, or node reboot. Asks before any disk wipe or mutation.",
+        "Power state, migrate, drain, cordon, node approval, node reboot and certificate rotation, cluster-update approve/cancel/rollback/reboot, volume attach/detach/resize/restore/flatten/format/mount/unmount/encrypt, ingress route WAF mode, object user delete, operator roles, Slurm node drain/resume and munge key rotation, or node install. Asks before any disk wipe or mutation.",
       inputSchema: {
         action: z.string().describe(OPERATION_ACTIONS_HINT.replace("action must be ", "")),
         spec: z.record(z.string(), z.unknown()),

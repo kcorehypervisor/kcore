@@ -267,6 +267,19 @@ and the workflow is in `docs/user/slurm.md`.
 `kctl apply -f` takes one YAML document per file. Put each resource, such as a
 `NodeVgpu` host and the `VM` that uses its slices, in its own file.
 
+`kctl apply -f` refuses a manifest whose `kind` it does not route, and the error
+lists the supported kinds. It no longer sends an unknown kind to the controller
+as a NixOS configuration; only a manifest with no `kind:` at all is treated that
+way. The routed kinds are VM, Container, Network, SshKey, SecurityGroup,
+PostgreSQL, DiskLayout, CephCluster, SharedFilesystem, ObjectStore, ObjectUser,
+KubernetesCluster, ClusterUpdate, SlurmCluster, IngressGateway, IngressRoute,
+WafPolicy, NodeVgpu, Cluster and NodeInstall. Each has a parsed example under
+`examples/`.
+
+An `ObjectUser` has no stored spec to reconcile. `kctl apply -f` and
+`kctl create object-user NAME --store STORE` both create the user and print the
+access key and secret once. `kctl delete object-user NAME --store STORE` removes it.
+
 ### Terraform / Crossplane integration
 
 Because every `create*` RPC is already a declarative upsert, a Terraform
@@ -591,6 +604,7 @@ Top-level commands:
 - `kctl node reboot <NODE_ID> [--force]`
 - `kctl update vm <name> [--cpu N] [--memory 4G] [--gpu <name>] [--vgpu <profile>]` — GPU changes require a stopped VM
 - `kctl apply -f <NodeVgpu>.yaml`
+- `kctl create object-user NAME --store STORE` (or `-f <ObjectUser>.yaml`), `kctl delete object-user NAME --store STORE`
 - `kctl slurm plan -f <SlurmCluster>.yaml` (or `kctl diff -f`) — action, blocking issues, and per-node roles without changing anything
 - `kctl apply -f <SlurmCluster>.yaml`, `kctl get slurm-cluster [NAME]`, `kctl delete slurm-cluster NAME [--force]`
 - `kctl slurm drain-node NAME NODE_ID [--reason TEXT]`, `kctl slurm resume-node NAME NODE_ID`, `kctl slurm rotate-munge-key NAME`

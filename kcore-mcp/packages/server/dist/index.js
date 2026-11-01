@@ -28686,7 +28686,7 @@ var require_channelz = __commonJS({
       if (addressChunk === "") {
         return [];
       }
-      const bytePairs = addressChunk.split(":").map((section) => parseIPv6Section(section));
+      const bytePairs = addressChunk.split(":").map((section2) => parseIPv6Section(section2));
       const result = [];
       return result.concat(...bytePairs);
     }
@@ -72091,6 +72091,38 @@ var KINDS = [
     immutable: ["version", "flakeRef", "flakeRev"]
   },
   {
+    id: "kubernetes-cluster",
+    yamlKind: "KubernetesCluster",
+    title: "Kubernetes cluster",
+    summary: "Kubernetes on kcoreOS nodes with Cilium. Apply creates the cluster, or updates it when it exists: adding or removing nodes changes membership. Plan runs node preflight checks and lists blocking issues before any node is rebuilt.",
+    mutable: ["workerNodes", "controlPlaneNodes", "cilium", "highAvailability", "localProvisioner", "scheduleOnControlPlane"],
+    immutable: ["clusterCidr", "serviceCidr", "clusterDns", "apiServerEndpoint", "cni"]
+  },
+  {
+    id: "object-user",
+    yamlKind: "ObjectUser",
+    title: "Object store user",
+    summary: "RGW user on an ObjectStore. Creation is not available here: the secret is returned once and this server redacts secrets, so run kctl create object-user NAME --store STORE. Remove a user with the delete-object-user operation.",
+    mutable: [],
+    immutable: ["name", "store"]
+  },
+  {
+    id: "operator",
+    yamlKind: "Operator",
+    title: "Operator",
+    summary: "Named human operator with RBAC roles (read-only, vm-admin, cluster-admin, backup-operator). Apply creates the operator and grants the listed roles. Issuing the client certificate stays in kctl so the private key never passes through the model.",
+    mutable: ["roles"],
+    immutable: ["name"]
+  },
+  {
+    id: "node",
+    yamlKind: "Node",
+    title: "Node",
+    summary: "Read-only node inventory. Use the approve-node, reject-node, cordon-node, drain-node, reboot-node, and rotate-node-certs operations to act on one. Delete removes an empty node and revokes its certificates.",
+    mutable: [],
+    immutable: ["nodeId"]
+  },
+  {
     id: "gpus",
     yamlKind: "Gpus",
     title: "GPUs and PCI devices",
@@ -72214,6 +72246,9 @@ var INTENT = [
   [/\bssh keys?\b/i, "ssh-key"],
   [/\bpostgres(?:ql)?\b/i, "postgresql"],
   [/\bslurm\b|\bhpc\b/i, "slurm-cluster"],
+  [/\bkubernetes\b|\bk8s\b/i, "kubernetes-cluster"],
+  [/\bobject users?\b/i, "object-user"],
+  [/\boperators?\b/i, "operator"],
   [/\bcontainers?\b/i, "container"],
   [/\bvolumes?\b/i, "volume"],
   [/\bsnapshot polic/i, "snapshot-policy"],
@@ -72236,6 +72271,7 @@ function inferKind(intent) {
   for (const [pattern, id] of INTENT) {
     if (pattern.test(intent)) hits.add(id);
   }
+  if (hits.size > 1) hits.delete("cluster");
   if (hits.size !== 1) return void 0;
   return [...hits][0];
 }
@@ -72696,6 +72732,46 @@ function questionsFor(kind, spec) {
           { example: "node-a" }
         )
       ].filter((item) => item.required);
+    case "kubernetes-cluster":
+      return [
+        question("name", "What should the Kubernetes cluster be called?", "Scale, health, and delete use this name.", missing(spec, "name")),
+        question("clusterCidr", "Which pod CIDR?", "Must not overlap the node network or the service CIDR.", missing(spec, "clusterCidr"), {
+          example: "10.244.0.0/16"
+        }),
+        question("serviceCidr", "Which service CIDR?", "Must not overlap the pod CIDR.", missing(spec, "serviceCidr"), {
+          example: "10.96.0.0/12"
+        }),
+        question(
+          "apiServerEndpoint",
+          "Which address and port serves the Kubernetes API?",
+          "With highAvailability this is the virtual IP and port 6443.",
+          missing(spec, "apiServerEndpoint"),
+          { example: "192.168.40.200:6443" }
+        ),
+        question(
+          "controlPlaneNodes",
+          "Which nodes run the control plane, with their advertise address and interface?",
+          "One entry must set initialCluster true. Use one or three entries.",
+          missing(spec, "controlPlaneNodes"),
+          { example: "node-105 192.168.40.105 enp6s0" }
+        )
+      ].filter((item) => item.required);
+    case "object-user":
+      return [
+        question("name", "What should the object user be called?", "It becomes the RGW uid.", missing(spec, "name")),
+        question("store", "Which object store does it belong to?", "Name of an existing ObjectStore.", missing(spec, "store"))
+      ].filter((item) => item.required);
+    case "operator":
+      return [
+        question("name", "What is the operator called?", "The client certificate CN is derived from this name.", missing(spec, "name")),
+        question(
+          "roles",
+          "Which roles should the operator hold?",
+          "read-only, vm-admin, cluster-admin, or backup-operator.",
+          missing(spec, "roles"),
+          { choices: ["read-only", "vm-admin", "cluster-admin", "backup-operator"], example: "vm-admin" }
+        )
+      ].filter((item) => item.required);
     case "cluster-update":
       return [
         question("name", "What should the cluster update be called?", "Approve, cancel, and rollback use this name.", missing(spec, "name")),
@@ -72863,6 +72939,12 @@ function warningsFor(kind, spec) {
     warnings.push(
       "v1 is one database per node, from the NixOS postgresql package, on the local Unix socket. Deleting the resource removes it from the node config and leaves /var/lib/postgresql on disk."
     );
+  }
+  if (kind.id === "kubernetes-cluster") {
+    warnings.push("Applying a Kubernetes cluster rebuilds the member nodes through NixOS. Read the plan's blocking issues and preflight results first.");
+  }
+  if (kind.id === "object-user") {
+    warnings.push("Creation runs through kctl create object-user, which prints the secret once. This server cannot show it.");
   }
   if (kind.id === "cluster-update") {
     warnings.push("A cluster update can reboot nodes. Plan it, read the blockers, and apply only after the operator agrees.");
@@ -73541,6 +73623,32 @@ function buildApply(kind, spec) {
       const request = slurmClusterRequest(spec);
       return [{ target: "controller", method: "createSlurmCluster", request }];
     }
+    case "kubernetes-cluster": {
+      const request = kubernetesRequest(spec);
+      return [{ target: "controller", method: "createKubernetesCluster", request: { ...request, confirm: true } }];
+    }
+    case "object-user":
+      throw new InputError(
+        "An object user's secret is returned once and this server redacts secrets, so it would be lost. Run kctl create object-user NAME --store STORE instead."
+      );
+    case "operator":
+      return [
+        {
+          target: "controller",
+          method: "createOperator",
+          request: { name: assertName(required3(spec, "name", "operator name"), "operator name") }
+        },
+        ...stringList(spec.roles).map((role) => ({
+          target: "controller",
+          method: "grantOperatorRole",
+          request: {
+            operatorName: assertName(required3(spec, "name", "operator name"), "operator name"),
+            role: operatorRole(role)
+          }
+        }))
+      ];
+    case "node":
+      throw new InputError("node is read-only; use kcore_read, or the approve-node and delete-node operations");
     case "volume":
       return [{ target: "controller", method: "createVolume", request: volumeRequest(spec) }];
     case "volume-snapshot":
@@ -73590,6 +73698,14 @@ function buildRead(kind, name) {
       return named ? { target: "controller", method: "getPostgresql", request: { name: named } } : { target: "controller", method: "listPostgresqls", request: {} };
     case "slurm-cluster":
       return named ? { target: "controller", method: "getSlurmCluster", request: { name: named } } : { target: "controller", method: "listSlurmClusters", request: {} };
+    case "kubernetes-cluster":
+      return named ? { target: "controller", method: "getKubernetesCluster", request: { name: named } } : { target: "controller", method: "listKubernetesClusters", request: {} };
+    case "operator":
+      return named ? { target: "controller", method: "getOperator", request: { name: named } } : { target: "controller", method: "listOperators", request: {} };
+    case "node":
+      return named ? { target: "controller", method: "getNode", request: { nodeId: named } } : { target: "controller", method: "listNodes", request: {} };
+    case "object-user":
+      throw new InputError("object users are not stored for readback; the secret is shown once at creation");
     case "volume":
       return named ? { target: "controller", method: "getVolume", request: { name: named } } : { target: "controller", method: "listVolumes", request: {} };
     case "volume-snapshot":
@@ -73640,6 +73756,14 @@ function buildDelete(kind, name) {
       return { target: "controller", method: "deleteWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: id } };
     case "postgresql":
       return { target: "controller", method: "deletePostgresql", request: { name: id } };
+    case "kubernetes-cluster":
+      return { target: "controller", method: "deleteKubernetesCluster", request: { name: id, confirm: true, force: false } };
+    case "operator":
+      return { target: "controller", method: "deleteOperator", request: { name: id } };
+    case "node":
+      return { target: "controller", method: "deleteNode", request: { nodeId: id } };
+    case "object-user":
+      throw new InputError("deleting an object user needs its store; use the delete-object-user operation");
     case "volume":
       return { target: "controller", method: "deleteVolume", request: { name: id } };
     case "volume-snapshot":
@@ -73694,6 +73818,10 @@ function buildPlanCall(kind, spec, name) {
   if (kind.id === "cluster-update") {
     return { target: "controller", method: "planClusterUpdate", request: { spec: clusterUpdateMessage(spec) } };
   }
+  if (kind.id === "kubernetes-cluster") {
+    const request = kubernetesRequest(spec);
+    return { target: "controller", method: "planKubernetesCluster", request };
+  }
   if (kind.id === "slurm-cluster") {
     const request = slurmClusterRequest(spec);
     return {
@@ -73704,7 +73832,7 @@ function buildPlanCall(kind, spec, name) {
   }
   return buildRead(kind, name ?? (typeof spec.name === "string" ? spec.name : void 0));
 }
-var OPERATION_ACTIONS_HINT = "action must be set-vm-state, migrate-vm, drain-node, cordon-node, uncordon-node, approve-node, reject-node, approve-update, cancel-update, rollback-update, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, install-node, or reboot-node";
+var OPERATION_ACTIONS_HINT = "action must be set-vm-state, migrate-vm, cancel-vm-operation, drain-node, cordon-node, uncordon-node, approve-node, reject-node, reboot-node, rotate-node-certs, approve-update, cancel-update, rollback-update, reboot-update-node, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, attach-volume, detach-volume, resize-volume, restore-volume, flatten-volume, format-volume, mount-volume, unmount-volume, encrypt-volume, set-route-waf-mode, delete-object-user, grant-operator-role, revoke-operator-role, or install-node";
 function buildOperation(action, spec) {
   switch (action) {
     case "set-vm-state": {
@@ -73788,6 +73916,150 @@ function buildOperation(action, spec) {
         target: "controller",
         method: "rotateSlurmMungeKey",
         request: { name: assertName(required3(spec, "name", "Slurm cluster name"), "Slurm cluster name") }
+      };
+    case "cancel-vm-operation":
+      return {
+        target: "controller",
+        method: "cancelVmOperation",
+        request: { id: assertName(required3(spec, "id", "operation id"), "operation id") }
+      };
+    case "rotate-node-certs": {
+      const allNodes = boolish(spec.allNodes);
+      const nodeId = opt(spec, "nodeId");
+      if (allNodes === Boolean(nodeId)) throw new InputError("pass either nodeId or allNodes true");
+      return {
+        target: "controller",
+        method: "rotateNodeCerts",
+        request: { nodeId: nodeId ? assertName(nodeId, "node id") : "", allNodes }
+      };
+    }
+    case "reboot-update-node":
+      return {
+        target: "controller",
+        method: "rebootClusterUpdateNode",
+        request: {
+          name: assertName(required3(spec, "name", "update name"), "update name"),
+          nodeId: assertName(required3(spec, "nodeId", "node id"), "node id")
+        }
+      };
+    case "attach-volume":
+      return {
+        target: "controller",
+        method: "attachVolume",
+        request: {
+          name: assertName(required3(spec, "name", "volume name"), "volume name"),
+          vm: assertName(required3(spec, "vm", "VM name"), "VM name")
+        }
+      };
+    case "detach-volume":
+      return {
+        target: "controller",
+        method: "detachVolume",
+        request: { name: assertName(required3(spec, "name", "volume name"), "volume name") }
+      };
+    case "resize-volume":
+      return {
+        target: "controller",
+        method: "resizeVolume",
+        request: {
+          name: assertName(required3(spec, "name", "volume name"), "volume name"),
+          sizeBytes: sizeBytes(required3(spec, "sizeBytes", "size"), "size"),
+          growFilesystem: boolish(spec.growFilesystem),
+          allowShrink: boolish(spec.allowShrink)
+        }
+      };
+    case "restore-volume":
+      return {
+        target: "controller",
+        method: "restoreVolume",
+        request: {
+          volume: assertName(required3(spec, "volume", "volume name"), "volume name"),
+          snapshot: assertName(required3(spec, "snapshot", "snapshot name"), "snapshot name")
+        }
+      };
+    case "flatten-volume":
+      return {
+        target: "controller",
+        method: "flattenVolume",
+        request: { name: assertName(required3(spec, "name", "volume name"), "volume name") }
+      };
+    case "format-volume": {
+      const fsType = opt(spec, "fsType") ?? "ext4";
+      if (fsType !== "ext4" && fsType !== "xfs") throw new InputError("fsType must be ext4 or xfs");
+      return {
+        target: "controller",
+        method: "formatVolume",
+        request: {
+          name: assertName(required3(spec, "name", "volume name"), "volume name"),
+          fsType,
+          force: boolish(spec.force)
+        }
+      };
+    }
+    case "mount-volume": {
+      const mountPoint = assertArg(required3(spec, "mountPoint", "mount point"), "mount point");
+      if (!/^\/(var\/lib|mnt)\/kcore(\/|$)/.test(mountPoint) || mountPoint.includes("..")) {
+        throw new InputError("mount point must be under /var/lib/kcore or /mnt/kcore");
+      }
+      return {
+        target: "controller",
+        method: "mountVolume",
+        request: {
+          name: assertName(required3(spec, "name", "volume name"), "volume name"),
+          mountPoint,
+          fsType: opt(spec, "fsType") ?? "",
+          persistent: boolish(spec.persistent)
+        }
+      };
+    }
+    case "unmount-volume":
+      return {
+        target: "controller",
+        method: "unmountVolume",
+        request: {
+          name: assertName(required3(spec, "name", "volume name"), "volume name"),
+          persistent: boolish(spec.persistent)
+        }
+      };
+    case "encrypt-volume":
+      if (!boolish(spec.destroyData)) {
+        throw new InputError("encrypting formats LUKS2 on the device and destroys its data; set destroyData true to acknowledge");
+      }
+      return {
+        target: "controller",
+        method: "encryptVolume",
+        request: {
+          name: assertName(required3(spec, "name", "volume name"), "volume name"),
+          destroyData: true
+        }
+      };
+    case "set-route-waf-mode": {
+      const mode = required3(spec, "mode", "mode");
+      if (!["detect", "block", "off"].includes(mode)) throw new InputError("mode must be detect, block, or off");
+      return {
+        target: "controller",
+        method: "setIngressRouteWafMode",
+        request: { name: assertName(required3(spec, "name", "route name"), "route name"), mode }
+      };
+    }
+    case "delete-object-user":
+      return {
+        target: "controller",
+        method: "deleteObjectUser",
+        request: {
+          name: assertName(required3(spec, "name", "user name"), "user name"),
+          store: assertName(required3(spec, "store", "object store"), "object store")
+        }
+      };
+    case "grant-operator-role":
+    case "revoke-operator-role":
+      return {
+        target: "controller",
+        method: action === "grant-operator-role" ? "grantOperatorRole" : "revokeOperatorRole",
+        request: {
+          operatorName: assertName(required3(spec, "name", "operator name"), "operator name"),
+          role: operatorRole(required3(spec, "role", "role"))
+        }
       };
     case "install-node":
       return installCall(spec);
@@ -74129,20 +74401,76 @@ function objectStoreMessage(spec) {
     }
   };
 }
+function section(spec, key) {
+  const value = spec[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+var APPROVAL = {
+  manual: "CLUSTER_UPDATE_APPROVAL_MANUAL",
+  "auto-non-disruptive": "CLUSTER_UPDATE_APPROVAL_AUTO_NON_DISRUPTIVE",
+  auto: "CLUSTER_UPDATE_APPROVAL_AUTO"
+};
+var ACTIVATION = {
+  test: "CLUSTER_UPDATE_ACTIVATION_TEST",
+  switch: "CLUSTER_UPDATE_ACTIVATION_SWITCH",
+  boot: "CLUSTER_UPDATE_ACTIVATION_BOOT",
+  auto: "CLUSTER_UPDATE_ACTIVATION_AUTO"
+};
 function clusterUpdateMessage(spec) {
-  const strategy = opt(spec, "strategy") ?? "one-at-a-time";
+  const target = section(spec, "target");
+  const selector = section(spec, "selector");
+  const activation = section(spec, "activation");
+  const strategyBlock = typeof spec.strategy === "object" ? section(spec, "strategy") : {};
+  const strategy = (typeof spec.strategy === "string" ? opt(spec, "strategy") : void 0) ?? opt(strategyBlock, "strategyType") ?? opt(strategyBlock, "type") ?? "one-at-a-time";
+  if (strategy !== "one-at-a-time") throw new InputError("strategy must be one-at-a-time; canary, batch, and per-dc are not available in this channel");
+  const maxUnavailable = strategyBlock.maxUnavailable === void 0 ? 1 : Number(strategyBlock.maxUnavailable);
+  if (maxUnavailable !== 1) throw new InputError("maxUnavailable must be 1");
+  const approval = opt(spec, "approvalPolicy");
+  if (approval && !APPROVAL[approval]) throw new InputError("approvalPolicy must be manual, auto-non-disruptive, or auto");
+  const mode = opt(activation, "mode") ?? opt(spec, "activationMode");
+  if (mode && !ACTIVATION[mode]) throw new InputError("activation mode must be test, switch, boot, or auto");
+  const pins = Array.isArray(spec.testedOsPins) ? spec.testedOsPins : [];
   return {
     name: assertName(required3(spec, "name", "name"), "name"),
     target: {
-      version: assertArg(required3(spec, "version", "version"), "version"),
-      flakeRef: assertArg(required3(spec, "flakeRef", "flake ref"), "flake ref"),
-      flakeRev: opt(spec, "flakeRev") ?? ""
+      version: assertArg(opt(target, "version") ?? required3(spec, "version", "version"), "version"),
+      flakeRef: assertArg(opt(target, "flakeRef") ?? required3(spec, "flakeRef", "flake ref"), "flake ref"),
+      flakeRev: opt(target, "flakeRev") ?? opt(spec, "flakeRev") ?? "",
+      nixpkgsRev: opt(target, "nixpkgsRev") ?? opt(spec, "nixpkgsRev") ?? "",
+      systemProfile: opt(target, "systemProfile") ?? ""
+    },
+    selector: {
+      nodeIds: stringList(selector.nodeIds),
+      labels: stringList(selector.labels),
+      datacenters: stringList(selector.datacenters),
+      allNodes: boolish(selector.allNodes),
+      controllersOnly: boolish(selector.controllersOnly)
     },
     strategy: {
-      type: strategy === "one-at-a-time" ? "CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME" : "CLUSTER_UPDATE_STRATEGY_UNSPECIFIED",
-      maxUnavailable: 1
+      type: "CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME",
+      maxUnavailable: 1,
+      batchSize: Number(strategyBlock.batchSize ?? 0)
     },
-    drainVms: spec.drainVms === void 0 ? true : boolish(spec.drainVms)
+    drainVms: spec.drainVms === void 0 ? true : boolish(spec.drainVms),
+    drainTimeoutSeconds: spec.drainTimeoutSeconds === void 0 ? 0 : Number(spec.drainTimeoutSeconds),
+    activationMode: mode ? ACTIVATION[mode] : "CLUSTER_UPDATE_ACTIVATION_UNSPECIFIED",
+    rebootPolicy: opt(activation, "rebootPolicy") ?? opt(spec, "rebootPolicy") ?? "",
+    approvalPolicy: approval ? APPROVAL[approval] : "CLUSTER_UPDATE_APPROVAL_UNSPECIFIED",
+    automaticRollback: boolish(spec.automaticRollback),
+    updateKind: opt(spec, "updateKind") ?? "",
+    requiresNixpkgs: boolish(spec.requiresNixpkgs),
+    testedOsPins: pins.map((pin) => {
+      const row = pin && typeof pin === "object" ? pin : {};
+      return {
+        nixpkgsRev: opt(row, "nixpkgsRev") ?? "",
+        cephRev: opt(row, "cephRev") ?? "",
+        cephSha256: opt(row, "cephSha256") ?? "",
+        kubernetesVersion: opt(row, "kubernetesVersion") ?? ""
+      };
+    }),
+    schemaVersion: Number(spec.schemaVersion ?? 0),
+    previousSchemaVersion: Number(spec.previousSchemaVersion ?? 0),
+    minCompatibleReader: Number(spec.minCompatibleReader ?? 0)
   };
 }
 function backendEnum(value) {
@@ -74239,6 +74567,90 @@ function slurmClusterRequest(spec) {
       gpuDriver: spec.gpuDriver === true
     }
   };
+}
+var OPERATOR_ROLES = {
+  "read-only": "OPERATOR_ROLE_KIND_READ_ONLY",
+  "vm-admin": "OPERATOR_ROLE_KIND_VM_ADMIN",
+  "cluster-admin": "OPERATOR_ROLE_KIND_CLUSTER_ADMIN",
+  "backup-operator": "OPERATOR_ROLE_KIND_BACKUP_OPERATOR"
+};
+function operatorRole(value) {
+  const mapped = OPERATOR_ROLES[value.trim().toLowerCase().replaceAll("_", "-")];
+  if (!mapped) throw new InputError("role must be read-only, vm-admin, cluster-admin, or backup-operator");
+  return mapped;
+}
+function kubernetesNodes(value, role, label) {
+  if (value === void 0) return [];
+  if (!Array.isArray(value)) throw new InputError(`${label} must be a list`);
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object") throw new InputError(`${label}[${index}] must be an object`);
+    const node = item;
+    const initial = role === "control-plane" && boolish(node.initialCluster);
+    return {
+      nodeId: assertName(required3(node, "nodeId", `${label}[${index}].nodeId`), `${label}[${index}].nodeId`),
+      role,
+      advertiseAddress: assertArg(required3(node, "advertiseAddress", `${label}[${index}].advertiseAddress`), "advertise address"),
+      iface: opt(node, "iface") ?? "enp6s0",
+      initialCluster: initial,
+      joinExisting: role === "worker" || !initial
+    };
+  });
+}
+function kubernetesRequest(spec) {
+  const name = assertName(required3(spec, "name", "cluster name"), "cluster name");
+  const controlPlane = kubernetesNodes(spec.controlPlaneNodes, "control-plane", "controlPlaneNodes");
+  if (controlPlane.length === 0) throw new InputError("controlPlaneNodes must list at least one node");
+  const cilium = spec.cilium && typeof spec.cilium === "object" ? spec.cilium : {};
+  const ha = spec.highAvailability && typeof spec.highAvailability === "object" ? spec.highAvailability : {};
+  const local = spec.localProvisioner && typeof spec.localProvisioner === "object" ? spec.localProvisioner : {};
+  const volumes = Array.isArray(local.volumes) ? local.volumes : [];
+  const result = {
+    clusterCidr: assertArg(required3(spec, "clusterCidr", "cluster CIDR"), "cluster CIDR"),
+    serviceCidr: assertArg(required3(spec, "serviceCidr", "service CIDR"), "service CIDR"),
+    clusterDns: opt(spec, "clusterDns") ?? "10.96.0.10",
+    apiServerEndpoint: assertArg(required3(spec, "apiServerEndpoint", "API server endpoint"), "API server endpoint"),
+    cni: opt(spec, "cni") ?? "cilium",
+    ciliumConfig: {
+      mode: opt(cilium, "mode") ?? "native-routing",
+      mtu: cilium.mtu === void 0 ? 1500 : Number(cilium.mtu),
+      tunnel: opt(cilium, "tunnel") ?? "disabled",
+      autoDirectNodeRoutes: cilium.autoDirectNodeRoutes === void 0 ? true : boolish(cilium.autoDirectNodeRoutes),
+      loadBalancerIpPools: stringList(cilium.loadBalancerIpPools)
+    },
+    controlPlaneNodes: controlPlane,
+    workerNodes: kubernetesNodes(spec.workerNodes, "worker", "workerNodes"),
+    scheduleOnControlPlane: boolish(spec.scheduleOnControlPlane)
+  };
+  if (boolish(ha.enabled)) {
+    result.highAvailability = {
+      enabled: true,
+      vipAddress: assertArg(required3(ha, "vipAddress", "highAvailability.vipAddress"), "VIP address"),
+      vipInterface: assertArg(required3(ha, "vipInterface", "highAvailability.vipInterface"), "VIP interface"),
+      method: "keepalived"
+    };
+  }
+  if (boolish(local.enabled) || volumes.length > 0) {
+    result.localProvisioner = {
+      enabled: boolish(local.enabled),
+      storageClassName: opt(local, "storageClassName") ?? "",
+      mode: opt(local, "mode") ?? "",
+      volumes: volumes.map((item, index) => {
+        if (!item || typeof item !== "object") throw new InputError(`localProvisioner.volumes[${index}] must be an object`);
+        const row = item;
+        return {
+          name: assertName(required3(row, "name", "volume name"), "volume name"),
+          nodeId: assertName(required3(row, "nodeId", "node id"), "node id"),
+          storageClass: opt(row, "storageClass") ?? "",
+          sizeBytes: row.sizeBytes === void 0 ? "0" : sizeBytes(row.sizeBytes, "size"),
+          fsType: opt(row, "fsType") ?? "",
+          mountPath: opt(row, "mountPath") ?? "",
+          role: opt(row, "role") ?? "",
+          volumeGroup: opt(row, "volumeGroup") ?? ""
+        };
+      })
+    };
+  }
+  return { name, spec: result };
 }
 var POSTGRESQL_PACKAGES = /* @__PURE__ */ new Set([
   "postgresql",
@@ -74536,6 +74948,22 @@ async function execute(call2, options) {
   }
   return callController(options, call2.method, call2.request);
 }
+async function resolveUpsert(call2, options) {
+  const probes = {
+    createKubernetesCluster: { method: "getKubernetesCluster", swap: "updateKubernetesCluster" },
+    createOperator: { method: "getOperator", swap: null }
+  };
+  const probe = probes[call2.method];
+  if (!probe) return call2;
+  try {
+    await execute({ target: "controller", method: probe.method, request: { name: call2.request.name } }, options);
+  } catch (error2) {
+    const message = error2 instanceof Error ? error2.message : String(error2);
+    if (/not found|not_found/i.test(message)) return call2;
+    throw error2;
+  }
+  return probe.swap ? { ...call2, method: probe.swap } : null;
+}
 function text(payload) {
   return { content: [{ type: "text", text: JSON.stringify(redact(payload), null, 2) }] };
 }
@@ -74769,7 +75197,9 @@ function createServer() {
         }
         const options = dial(input.connection, prepared.desired.spec);
         const responses = [];
-        for (const call2 of buildApply(prepared.desired.kind, prepared.desired.spec)) {
+        for (const planned of buildApply(prepared.desired.kind, prepared.desired.spec)) {
+          const call2 = await resolveUpsert(planned, options);
+          if (!call2) continue;
           responses.push({ method: call2.method, response: await execute(call2, options) });
         }
         return text({
@@ -74863,7 +75293,7 @@ function createServer() {
     "kcore_operation",
     {
       title: "Run a kcore day-2 operation",
-      description: "Power state, migrate, drain, cordon, node approval, cluster-update approve/cancel/rollback, Slurm node drain/resume and munge key rotation, node install, or node reboot. Asks before any disk wipe or mutation.",
+      description: "Power state, migrate, drain, cordon, node approval, node reboot and certificate rotation, cluster-update approve/cancel/rollback/reboot, volume attach/detach/resize/restore/flatten/format/mount/unmount/encrypt, ingress route WAF mode, object user delete, operator roles, Slurm node drain/resume and munge key rotation, or node install. Asks before any disk wipe or mutation.",
       inputSchema: {
         action: external_exports.string().describe(OPERATION_ACTIONS_HINT.replace("action must be ", "")),
         spec: external_exports.record(external_exports.string(), external_exports.unknown()),

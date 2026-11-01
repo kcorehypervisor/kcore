@@ -746,3 +746,17 @@ spec:
         assert!(to_proto_spec(&plain.spec).local_provisioner.is_none());
     }
 }
+
+#[cfg(test)]
+mod shipped_example_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_example_parses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/kubernetes/prod.yaml"
+        );
+        parse_manifest(path).unwrap();
+    }
+}

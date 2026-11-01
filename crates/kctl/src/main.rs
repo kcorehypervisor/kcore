@@ -779,6 +779,18 @@ enum CreateResource {
         #[arg(short = 'f', long = "filename")]
         file: String,
     },
+    /// Create an RGW user on an ObjectStore. The secret key is shown once.
+    #[command(name = "object-user", alias = "objectuser")]
+    ObjectUser {
+        /// User name (optional when using -f)
+        name: Option<String>,
+        /// ObjectStore the user belongs to
+        #[arg(long)]
+        store: Option<String>,
+        /// Create from a YAML manifest (kind: ObjectUser)
+        #[arg(short = 'f', long = "filename")]
+        file: Option<String>,
+    },
     /// Create one PostgreSQL database from the NixOS postgresql package
     #[command(alias = "postgres")]
     Postgresql {
@@ -973,6 +985,14 @@ enum DeleteResource {
     /// Delete an ObjectStore (RGW) resource
     #[command(name = "object-store", alias = "objectstore")]
     ObjectStore { name: String },
+    /// Delete an RGW user from an ObjectStore
+    #[command(name = "object-user", alias = "objectuser")]
+    ObjectUser {
+        name: String,
+        /// ObjectStore the user belongs to
+        #[arg(long)]
+        store: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2470,6 +2490,20 @@ async fn main() {
             commands::object_store::apply_from_file(&info, file).await
         }
         Command::Create {
+            resource: CreateResource::ObjectUser { name, store, file },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            match (file, name, store) {
+                (Some(file), None, None) => {
+                    commands::object_user::apply_from_file(&info, file).await
+                }
+                (None, Some(name), Some(store)) => {
+                    commands::object_user::create(&info, name, store).await
+                }
+                _ => fatal("pass either -f FILE or NAME --store STORE"),
+            }
+        }
+        Command::Create {
             resource:
                 CreateResource::Cluster {
                     controller,
@@ -2580,6 +2614,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::object_store::delete(&info, name).await
+        }
+        Command::Delete {
+            resource: DeleteResource::ObjectUser { name, store },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::object_user::delete(&info, name, store).await
         }
 
         Command::Start {
