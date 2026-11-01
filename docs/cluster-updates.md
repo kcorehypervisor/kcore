@@ -214,6 +214,13 @@ Node phases:
 | `RolledBack` | Previous generation is restored and verified. |
 | `Cancelled` | Work was cancelled before irreversible activation. |
 
+A switch that restarts the node agent also stops the `nixos-rebuild` the agent
+waits on, so the agent reports a failed activation. The switch itself runs in a
+transient unit and finishes. The controller then waits up to five minutes for
+the node's heartbeat to report the target generation. If it does, the node is
+`Succeeded`. Otherwise it is `Failed` with the agent's error. During that wait
+the node is reported as `Prepared`.
+
 ### ControllerUpdateStatus
 
 For controller nodes, use the same lifecycle with stricter gates:
