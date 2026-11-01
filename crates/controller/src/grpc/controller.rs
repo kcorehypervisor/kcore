@@ -1121,6 +1121,21 @@ impl ControllerService {
         )
     }
 
+    /// A nested controller call builds a fresh request. Copy the caller's
+    /// extensions, including the web session, or the inner check sees no
+    /// certificate and treats a signed-in operator as anonymous.
+    fn caller_shell<T>(from: &Request<T>) -> Request<()> {
+        let mut shell = Request::new(());
+        *shell.extensions_mut() = from.extensions().clone();
+        shell
+    }
+
+    fn with_caller<T, U>(from: &Request<T>, body: U) -> Request<U> {
+        let mut inner = Request::new(body);
+        *inner.extensions_mut() = from.extensions().clone();
+        inner
+    }
+
     /// Generate and push this node's Nix configuration, returning as soon as
     /// the node has accepted it. The `nixos-rebuild` it triggers is still
     /// running; use [`Self::push_config_and_await_apply`] when the next step
@@ -10294,6 +10309,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
     ) -> Result<Response<controller_proto::CreateWorkloadResponse>, Status> {
         self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
+        let caller = Self::caller_shell(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
@@ -10304,22 +10320,25 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     Status::invalid_argument("vm_spec is required for VM workload")
                 })?;
                 let vm_resp = self
-                    .create_vm(Request::new(controller_proto::CreateVmRequest {
-                        target_node: req.target_node.clone(),
-                        spec: Some(vm_spec),
-                        image_url: req.image_url.clone(),
-                        image_sha256: req.image_sha256.clone(),
-                        cloud_init_user_data: req.cloud_init_user_data.clone(),
-                        image_path: req.image_path.clone(),
-                        image_format: req.image_format.clone(),
-                        ssh_key_names: req.ssh_key_names.clone(),
-                        storage_backend: req.storage_backend,
-                        storage_size_bytes: req.storage_size_bytes,
-                        target_dc: String::new(),
-                        node_labels: Vec::new(),
-                        anti_affinity: String::new(),
-                        ..Default::default()
-                    }))
+                    .create_vm(Self::with_caller(
+                        &caller,
+                        controller_proto::CreateVmRequest {
+                            target_node: req.target_node.clone(),
+                            spec: Some(vm_spec),
+                            image_url: req.image_url.clone(),
+                            image_sha256: req.image_sha256.clone(),
+                            cloud_init_user_data: req.cloud_init_user_data.clone(),
+                            image_path: req.image_path.clone(),
+                            image_format: req.image_format.clone(),
+                            ssh_key_names: req.ssh_key_names.clone(),
+                            storage_backend: req.storage_backend,
+                            storage_size_bytes: req.storage_size_bytes,
+                            target_dc: String::new(),
+                            node_labels: Vec::new(),
+                            anti_affinity: String::new(),
+                            ..Default::default()
+                        },
+                    ))
                     .await?
                     .into_inner();
 
@@ -10432,7 +10451,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
                             controller_proto::WorkloadDesiredState::Running,
                         );
                         let resp = self
-                            .set_workload_desired_state(Request::new(
+                            .set_workload_desired_state(Self::with_caller(
+                                &caller,
                                 controller_proto::SetWorkloadDesiredStateRequest {
                                     kind: controller_proto::WorkloadKind::Container as i32,
                                     workload_id: existing.id.clone(),
@@ -10596,6 +10616,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
     ) -> Result<Response<controller_proto::DeleteWorkloadResponse>, Status> {
         self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
+        let caller = Self::caller_shell(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
@@ -10603,11 +10624,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
         match kind {
             controller_proto::WorkloadKind::Vm => {
                 let _ = self
-                    .delete_vm(Request::new(controller_proto::DeleteVmRequest {
-                        vm_id: req.workload_id.clone(),
-                        target_node: req.target_node.clone(),
-                        delete_data_volumes: false,
-                    }))
+                    .delete_vm(Self::with_caller(
+                        &caller,
+                        controller_proto::DeleteVmRequest {
+                            vm_id: req.workload_id.clone(),
+                            target_node: req.target_node.clone(),
+                            delete_data_volumes: false,
+                        },
+                    ))
                     .await?;
                 let _ = self.db.delete_workload_by_id_or_name(&req.workload_id);
                 Ok(Response::new(controller_proto::DeleteWorkloadResponse {
@@ -10674,6 +10698,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
     ) -> Result<Response<controller_proto::SetWorkloadDesiredStateResponse>, Status> {
         self.require_operator(&request, OperatorRole::VmAdmin)?;
         let actor = Self::audit_actor(&request);
+        let caller = Self::caller_shell(&request);
         let _audit_guard = Self::push_audit_actor(&actor);
         let req = request.into_inner();
         let desired = controller_proto::WorkloadDesiredState::try_from(req.desired_state)
@@ -10694,7 +10719,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     }
                 };
                 let resp = self
-                    .set_vm_desired_state(Request::new(
+                    .set_vm_desired_state(Self::with_caller(
+                        &caller,
                         controller_proto::SetVmDesiredStateRequest {
                             vm_id: req.workload_id.clone(),
                             desired_state: vm_desired,
@@ -10793,16 +10819,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::GetWorkloadRequest>,
     ) -> Result<Response<controller_proto::GetWorkloadResponse>, Status> {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let caller = Self::caller_shell(&request);
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
         match kind {
             controller_proto::WorkloadKind::Vm => {
                 let vm = self
-                    .get_vm(Request::new(controller_proto::GetVmRequest {
-                        vm_id: req.workload_id,
-                        target_node: req.target_node,
-                    }))
+                    .get_vm(Self::with_caller(
+                        &caller,
+                        controller_proto::GetVmRequest {
+                            vm_id: req.workload_id,
+                            target_node: req.target_node,
+                        },
+                    ))
                     .await?
                     .into_inner();
                 Ok(Response::new(controller_proto::GetWorkloadResponse {
@@ -10884,6 +10914,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::ListWorkloadsRequest>,
     ) -> Result<Response<controller_proto::ListWorkloadsResponse>, Status> {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let caller = Self::caller_shell(&request);
         let req = request.into_inner();
         let kind = controller_proto::WorkloadKind::try_from(req.kind)
             .unwrap_or(controller_proto::WorkloadKind::Unspecified);
@@ -10895,9 +10926,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
             || kind == controller_proto::WorkloadKind::Vm
         {
             vms = self
-                .list_vms(Request::new(controller_proto::ListVmsRequest {
-                    target_node: req.target_node.clone(),
-                }))
+                .list_vms(Self::with_caller(
+                    &caller,
+                    controller_proto::ListVmsRequest {
+                        target_node: req.target_node.clone(),
+                    },
+                ))
                 .await?
                 .into_inner()
                 .vms;
@@ -24870,6 +24904,23 @@ mod tests {
             expires_at: i64::MAX,
         });
         req
+    }
+
+    #[test]
+    fn a_nested_call_keeps_the_callers_web_session() {
+        let outer = web_request("alice", controller_proto::ListWorkloadsRequest::default());
+        let caller = ControllerService::caller_shell(&outer);
+        let inner =
+            ControllerService::with_caller(&caller, controller_proto::ListVmsRequest::default());
+        let identity = auth::web_identity(&inner).expect("web session survives the nested call");
+        assert_eq!(identity.operator, "alice");
+        assert_eq!(identity.token_id, "tok-alice");
+
+        let anonymous = ControllerService::with_caller(
+            &ControllerService::caller_shell(&Request::new(())),
+            controller_proto::ListVmsRequest::default(),
+        );
+        assert!(auth::web_identity(&anonymous).is_none());
     }
 
     #[tokio::test]
