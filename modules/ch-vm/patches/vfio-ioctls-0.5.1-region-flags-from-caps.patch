@@ -1,0 +1,25 @@
+Take a region's flags from the capability-sized VFIO_DEVICE_GET_REGION_INFO.
+
+vfio-ioctls asks for region info twice: once with a bare struct to learn
+the size, then again with room for the capability chain. It keeps the
+flags from the first answer. NVIDIA's vGPU vendor driver reports BAR0 as
+READ|WRITE|CAPS there and only adds MMAP in the second answer, so Cloud
+Hypervisor never mapped the sparse areas and trapped every BAR0 access,
+which the driver rejects with EFAULT. QEMU reads the flags from the
+final, full-size answer; do the same.
+
+Applies after vfio-ioctls-0.5.1-ensure-iommu-group.patch.
+
+--- a/src/vfio_device.rs
++++ b/src/vfio_device.rs
+@@ -678,6 +678,10 @@
+         // VFIO_DEVICE_GET_REGION_INFO with a vfio_region_with_cap structure and the hinted size.
+         let mut region_with_cap = vfio_region_info_with_cap::from_region_info(region_info);
+         vfio_syscall::get_device_region_info_cap(self, &mut region_with_cap)?;
++        // The driver may complete the flags only when the buffer can hold its
++        // capabilities. The second answer is the authoritative one.
++        region.flags = region_with_cap[0].region_info.flags;
++        region.size = region_with_cap[0].region_info.size;
+ 
+         // region_with_cap[0] may contain different types of structure depending on the capability
+         // type, but all of them begin with vfio_info_cap_header in order to identify the capability

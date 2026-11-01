@@ -15,6 +15,16 @@ let
     else
       cfg.cloudHypervisorPackage.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ cfg.cloudHypervisorPatches;
+        preBuild = ''
+          ${old.preBuild or ""}
+          vfio_src=$(find .. /build -maxdepth 3 -type d -name vfio-ioctls-0.5.1 -print -quit)
+          if [ -z "$vfio_src" ]; then
+            echo "cloud-hypervisor cargo vendor is missing vfio-ioctls-0.5.1" >&2
+            exit 1
+          fi
+          patch -d "$vfio_src" -p1 < ${./patches/vfio-ioctls-0.5.1-ensure-iommu-group.patch}
+          patch -d "$vfio_src" -p1 < ${./patches/vfio-ioctls-0.5.1-region-flags-from-caps.patch}
+        '';
       });
   chBin = "${chPkg}/bin/cloud-hypervisor";
 
@@ -46,6 +56,9 @@ let
       rbdImage = if vmCfg.rbdImage != "" then vmCfg.rbdImage else "kcore-${vmName}";
       rbdDevice = "/dev/rbd/${cfg.rbdPool}/${rbdImage}";
 
+      # A filesystem guest gets its own raw file. The downloaded image stays
+      # a read-only seed, so two guests can share one cloud image.
+      fsDisk = "/var/lib/kcore/disks/${vmName}.raw";
       actualDisk =
         if isLvm then
           lvDevice
@@ -54,10 +67,10 @@ let
         else if isCeph then
           rbdDevice
         else
-          toString vmCfg.image;
-      # Block backends are always seeded as raw. For an in-place image the real
-      # format is sniffed in the start script (see srcFormatFn).
-      actualFormat = if isBlockBackend then "raw" else "$ROOT_FMT";
+          fsDisk;
+      # Every backend seeds a raw disk. The source image format is sniffed
+      # only for qemu-img convert.
+      actualFormat = "raw";
 
       # LVM and ZFS guests open a stable device-mapper name so a live migration
       # can reload the table (linear → mirror) without Cloud Hypervisor seeing
@@ -118,6 +131,28 @@ let
               "true"
           }
         }
+      '';
+
+      fsProvisionScript = pkgs.writeShellScript "fs-provision-${vmName}" ''
+        set -e
+        ${srcFormatFn}
+        ${verifySourceFn}
+        DISK="${fsDisk}"
+        SIZE_BYTES="${toString vmCfg.storageSizeBytes}"
+        SEED_MARKER="${seedMarker}"
+        ${pkgs.coreutils}/bin/mkdir -p "$(dirname "$DISK")" "$(dirname "$SEED_MARKER")"
+        if [ ! -f "$SEED_MARKER" ]; then
+          verify_source ${toString vmCfg.image}
+          echo "Seeding $DISK from ${toString vmCfg.image}..."
+          ${pkgs.qemu-utils}/bin/qemu-img convert \
+            -f "$(src_format ${toString vmCfg.image} ${vmCfg.imageFormat})" -O raw \
+            ${toString vmCfg.image} "$DISK"
+          size="$(${pkgs.coreutils}/bin/stat -c %s "$DISK")"
+          if [ "$size" -lt "$SIZE_BYTES" ]; then
+            ${pkgs.coreutils}/bin/truncate -s "$SIZE_BYTES" "$DISK"
+          fi
+          touch "$SEED_MARKER"
+        fi
       '';
 
       lvmProvisionScript = pkgs.writeShellScript "lvm-provision-${vmName}" ''
@@ -333,11 +368,25 @@ let
       # Live migration requires MAP_SHARED guest RAM (`shared=on`). Every
       # block backend can move: Ceph because the disk is shared, LVM and ZFS
       # because the disk is mirrored onto the destination first.
+      # vGPU uses the same shared mapping so the manager can read guest RAM.
       memoryArg =
-        if isBlockBackend then
+        if isBlockBackend || vgpuDevices != [ ] then
           "--memory size=${toString vmCfg.memorySize}M,shared=on"
         else
           "--memory size=${toString vmCfg.memorySize}M";
+
+      # NVIDIA's vGPU manager scans the VMM argv for QEMU's `-uuid <uuid>`.
+      # Without that pair it logs a generated PID uuid and the guest driver
+      # cannot read the slice. The Cloud Hypervisor patch hides the pair from
+      # clap and leaves it in the real command line.
+      vgpuUuidHex = builtins.substring 0 32 (builtins.hashString "sha256" "kcore-vgpu-${vmName}");
+      vgpuUuid = "${builtins.substring 0 8 vgpuUuidHex}-${builtins.substring 8 4 vgpuUuidHex}-4${
+        builtins.substring 12 3 vgpuUuidHex
+      }-a${builtins.substring 15 3 vgpuUuidHex}-${builtins.substring 18 12 vgpuUuidHex}";
+      vgpuUuidArgs = lib.optionals (vgpuDevices != [ ]) [
+        "-uuid"
+        vgpuUuid
+      ];
 
       chArgs = lib.concatStringsSep " " (
         [
@@ -349,9 +398,18 @@ let
           "--serial socket=${serialSocket}"
           "--disk ${vmDiskArg} ${seedDiskArg}${lib.optionalString (dataDiskArgs != "") " ${dataDiskArgs}"}"
         ]
-        ++ map (dev: "--device path=/sys/bus/pci/devices/${dev.address},iommu=on") normalizedPci
+        # A vGPU slice must not sit behind the virtual IOMMU. The manager
+        # reads guest physical addresses, which only exist when the VFIO
+        # container maps the whole guest before the device fd opens.
+        ++ map (
+          dev:
+          "--device path=/sys/bus/pci/devices/${dev.address},iommu=${
+            if dev.vgpuProfile == null then "on" else "off"
+          }"
+        ) normalizedPci
         ++ map (iface: "--net tap=${iface.tap},mac=${iface.macAddress}") ifaces
         ++ vmCfg.extraArgs
+        ++ vgpuUuidArgs
       );
 
       liveMigratedMarker = "${cfg.socketDir}/${vmName}.live-migrated";
@@ -457,22 +515,41 @@ let
             current=$(${pkgs.coreutils}/bin/basename "$(${pkgs.coreutils}/bin/readlink "$dev/driver")")
           fi
           if [ "$current" = "vfio-pci" ]; then
-            echo "vGPU slice $addr is bound to vfio-pci; a vGPU slice stays on nvidia-vgpu-vfio"
-            exit 1
-          fi
-          if [ "$current" != "nvidia-vgpu-vfio" ]; then
-            echo "vGPU slice $addr driver is ''${current:-unbound}; a vGPU slice must use nvidia-vgpu-vfio"
+            echo "vGPU slice $addr is bound to vfio-pci; a vGPU slice stays on nvidia or nvidia-vgpu-vfio"
             exit 1
           fi
           types="$dev/nvidia/creatable_vgpu_types"
           current_file="$dev/nvidia/current_vgpu_type"
-          id=$(${pkgs.gnugrep}/bin/grep -E '^[[:space:]]*[0-9]+[[:space:]]*:[[:space:]]*NVIDIA[[:space:]]+${dev.vgpuProfile}[[:space:]]*$' "$types" | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.coreutils}/bin/head -n1)
-          if [ -z "$id" ]; then
-            echo "vGPU slice $addr cannot take profile ${dev.vgpuProfile}"
+          # Manager 595 binds the function to nvidia and publishes types there.
+          # Older managers bind nvidia-vgpu-vfio. Both expose the same sysfs.
+          if [ "$current" = "nvidia-vgpu-vfio" ]; then
+            :
+          now=$(${pkgs.coreutils}/bin/cat "$current_file" 2>/dev/null || echo 0)
+          if [ "$current" = "nvidia-vgpu-vfio" ]; then
+            :
+          elif [ "$current" = "nvidia" ] && { [ -s "$types" ] || [ "$now" != "0" ]; }; then
+            :
+          else
+            echo "vGPU slice $addr driver is ''${current:-unbound}; a vGPU slice must use nvidia or nvidia-vgpu-vfio"
             exit 1
           fi
-          now=$(${pkgs.coreutils}/bin/cat "$current_file")
-          if [ "$now" = "$id" ]; then
+          id=$(${pkgs.gnugrep}/bin/grep -E '^[[:space:]]*[0-9]+[[:space:]]*:[[:space:]]*NVIDIA[[:space:]]+${dev.vgpuProfile}[[:space:]]*$' "$types" | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.coreutils}/bin/head -n1 || true)
+          # A programmed function drops its name from creatable_vgpu_types.
+          # A free sibling on the same card still lists the id with its name.
+          if [ -z "$id" ] && [ "$now" != "0" ]; then
+            sibling_name=$(${pkgs.coreutils}/bin/cat "$sys/bus/pci/devices/$parent"/virtfn*/nvidia/creatable_vgpu_types 2>/dev/null \
+              | ${pkgs.gnugrep}/bin/grep -E "^[[:space:]]*$now[[:space:]]*:[[:space:]]*NVIDIA[[:space:]]+" \
+              | ${pkgs.coreutils}/bin/head -n1 \
+              | ${pkgs.gnused}/bin/sed -e 's/.*NVIDIA[[:space:]]*//' -e 's/[[:space:]]*$//' || true)
+            if [ -n "$sibling_name" ] && [ "$sibling_name" != "${dev.vgpuProfile}" ]; then
+              echo "vGPU slice $addr is already profile $sibling_name ($now), not ${dev.vgpuProfile}"
+              exit 1
+            fi
+            echo "vGPU slice $addr keeps profile id $now"
+          elif [ -z "$id" ]; then
+            echo "vGPU slice $addr cannot take profile ${dev.vgpuProfile}"
+            exit 1
+          elif [ "$now" = "$id" ]; then
             :
           elif [ "$now" != "0" ]; then
             echo "vGPU slice $addr is already profile id $now, not ${dev.vgpuProfile} ($id)"
@@ -575,7 +652,7 @@ let
           else if isCeph then
             "${cephMapScript}"
           else
-            "true"
+            "${fsProvisionScript}"
         }
       '';
 
