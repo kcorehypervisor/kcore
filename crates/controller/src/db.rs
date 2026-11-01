@@ -868,7 +868,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 70;
+pub const SCHEMA_VERSION: i32 = 71;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -880,7 +880,9 @@ pub const SCHEMA_VERSION: i32 = 70;
 /// the ingress tables, which an older reader never selects. Version 68 adds the
 /// Slurm tables, which an older reader never selects. Version 69 adds
 /// `node_vgpu`, the operator's vGPU host configuration. Version 70 adds
-/// `node_vgpu.vendor` with a default.
+/// `node_vgpu.vendor` with a default. Version 71 adds
+/// `issued_certificates.first_seen_at`, empty until the certificate is first
+/// presented to the controller.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2309,6 +2311,20 @@ impl Database {
             if has == 0 {
                 conn.execute(
                     "ALTER TABLE node_vgpu ADD COLUMN vendor TEXT NOT NULL DEFAULT 'nvidia'",
+                    [],
+                )?;
+            }
+        }
+
+        if version < 71 {
+            let has: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('issued_certificates') WHERE name = 'first_seen_at'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has == 0 {
+                conn.execute(
+                    "ALTER TABLE issued_certificates ADD COLUMN first_seen_at TEXT NOT NULL DEFAULT ''",
                     [],
                 )?;
             }
@@ -7668,6 +7684,64 @@ impl Database {
         ))?;
         let rows = stmt.query_map(
             params![threshold, now, CERT_STATUS_ACTIVE],
+            map_issued_cert_row,
+        )?;
+        rows.collect()
+    }
+
+    /// Record the first time each certificate was presented to the controller.
+    /// A serial that is not in the inventory, or already has a time, is left
+    /// alone.
+    pub fn mark_certificates_seen(
+        &self,
+        serials: &[String],
+        seen_at: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut changed = 0;
+        for serial in serials {
+            changed += conn.execute(
+                "UPDATE issued_certificates SET first_seen_at = ?1
+                 WHERE serial_hex = ?2 AND first_seen_at = ''",
+                params![seen_at, serial],
+            )?;
+        }
+        Ok(changed)
+    }
+
+    /// Superseded certificates of `identity_kind` that are safe to revoke:
+    /// still unexpired at `now`, and replaced by an active certificate for the
+    /// same subject that was first presented at or before `seen_before`. A
+    /// successor that has never been presented might not be installed yet, so
+    /// its predecessor stays valid.
+    pub fn list_superseded_certificates_to_revoke(
+        &self,
+        identity_kind: &str,
+        seen_before: &str,
+        now: &str,
+    ) -> Result<Vec<IssuedCertRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT serial_hex, subject_cn, identity_kind, node_id, issuer_cn,
+                    fingerprint_sha256, not_before, not_after, issued_at, status,
+                    revocation_reason, revoked_at
+             FROM issued_certificates old
+             WHERE old.status = ?1 AND old.identity_kind = ?2 AND old.not_after > ?3
+               AND EXISTS (
+                 SELECT 1 FROM issued_certificates new
+                 WHERE new.subject_cn = old.subject_cn AND new.status = ?4
+                   AND new.serial_hex <> old.serial_hex
+                   AND new.first_seen_at <> '' AND new.first_seen_at <= ?5)
+             ORDER BY old.not_after ASC, old.serial_hex ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                CERT_STATUS_ROTATED,
+                identity_kind,
+                now,
+                CERT_STATUS_ACTIVE,
+                seen_before
+            ],
             map_issued_cert_row,
         )?;
         rows.collect()

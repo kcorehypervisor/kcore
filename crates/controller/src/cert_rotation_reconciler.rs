@@ -6,7 +6,9 @@
 //! 1. refreshes the in-memory revoked-serial set used by the auth path,
 //! 2. regenerates and republishes the CRL when it is due,
 //! 3. warns about certificates approaching expiry,
-//! 4. asks nodes whose certificate is inside the renewal window to rotate.
+//! 4. asks nodes whose certificate is inside the renewal window to rotate,
+//! 5. revokes node certificates that rotation replaced, once the replacement
+//!    has been in use for `revokeSupersededAfterHours`.
 //!
 //! The controller never signs a replacement behind the node's back: it calls
 //! `NodeAdmin.RotateNodeCert`, and the node then generates a keypair, submits
@@ -31,7 +33,7 @@ use crate::node_proto;
 use crate::pki::crl::{self, CrlCache};
 use crate::pki::inventory::KIND_NODE;
 use crate::pki::revocation::RevocationState;
-use crate::pki::{format_ts, parse_ts};
+use crate::pki::{format_ts, parse_ts, REASON_SUPERSEDED};
 
 /// Everything the loop needs, bundled so `main.rs` stays readable.
 pub struct CertRotationContext {
@@ -109,6 +111,10 @@ async fn reconcile_once(
     ctx: &CertRotationContext,
     cert_warnings: &mut crate::webhooks::WarningDedup,
 ) {
+    let now = OffsetDateTime::now_utc();
+    record_seen_certificates(&ctx.db, &ctx.revocation, now);
+    revoke_superseded_certificates(&ctx.db, &ctx.revocation, &ctx.rotation, now);
+
     if let Err(error) = ctx.revocation.refresh(&ctx.db) {
         warn!(%error, "failed to refresh revoked serial set");
     }
@@ -163,6 +169,70 @@ async fn reconcile_once(
             }
         }
     }
+}
+
+/// Write the serials peers presented since the last tick to the inventory.
+fn record_seen_certificates(db: &Database, revocation: &RevocationState, now: OffsetDateTime) {
+    let seen = revocation.take_seen();
+    if seen.is_empty() {
+        return;
+    }
+    if let Err(error) = db.mark_certificates_seen(&seen, &format_ts(now)) {
+        warn!(%error, "failed to record which certificates were presented");
+    }
+}
+
+/// Revoke node certificates that rotation replaced.
+///
+/// Rotation marks the old certificate `rotated` when the controller signs the
+/// new one, before the node has installed it, so a `rotated` row alone is not
+/// proof that the node moved on. The old certificate is revoked only after
+/// the new one was presented to the controller and
+/// `revoke_superseded_after_hours` have passed. A node that never installed
+/// its new certificate keeps the old one working, and the next rotation tick
+/// tries again.
+///
+/// Returns the revoked serials.
+pub fn revoke_superseded_certificates(
+    db: &Database,
+    revocation: &RevocationState,
+    cfg: &CertRotationConfig,
+    now: OffsetDateTime,
+) -> Vec<String> {
+    if cfg.revoke_superseded_after_hours <= 0 {
+        return Vec::new();
+    }
+    let seen_before = format_ts(now - Duration::hours(cfg.revoke_superseded_after_hours));
+    let rows =
+        match db.list_superseded_certificates_to_revoke(KIND_NODE, &seen_before, &format_ts(now)) {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(%error, "failed to list superseded certificates");
+                return Vec::new();
+            }
+        };
+    let mut revoked = Vec::new();
+    for row in rows {
+        match db.revoke_certificate_by_serial(&row.serial_hex, REASON_SUPERSEDED, &format_ts(now)) {
+            Ok(Some(_)) => {
+                revocation.insert_revoked(&row.serial_hex);
+                info!(
+                    serial = %row.serial_hex,
+                    subject = %row.subject_cn,
+                    node_id = %row.node_id,
+                    "revoked a node certificate that rotation replaced"
+                );
+                revoked.push(row.serial_hex);
+            }
+            Ok(None) => {}
+            Err(error) => warn!(
+                serial = %row.serial_hex,
+                %error,
+                "failed to revoke a superseded certificate"
+            ),
+        }
+    }
+    revoked
 }
 
 /// Log a warning for every active certificate inside the warning window, so
@@ -367,6 +437,7 @@ mod tests {
             renew_at_lifetime_fraction: fraction,
             warn_before_days: renew_before_days.max(45),
             cert_validity_days: 365,
+            revoke_superseded_after_hours: 24,
         }
     }
 
@@ -385,6 +456,152 @@ mod tests {
             revocation_reason: REASON_NONE,
             revoked_at: String::new(),
         }
+    }
+
+    fn superseded_pair(
+        db: &Database,
+        now: OffsetDateTime,
+        kind: &str,
+        old_not_after: OffsetDateTime,
+    ) -> (String, String) {
+        let mut old = row("n1", now - Duration::days(300), old_not_after);
+        old.serial_hex = "0A01".into();
+        old.identity_kind = kind.into();
+        old.status = crate::db::CERT_STATUS_ROTATED.into();
+        let mut new = row("n1", now - Duration::days(2), now + Duration::days(363));
+        new.serial_hex = "0B02".into();
+        new.identity_kind = kind.into();
+        db.record_issued_certificate(&old).unwrap();
+        db.record_issued_certificate(&new).unwrap();
+        (old.serial_hex, new.serial_hex)
+    }
+
+    fn revocation() -> RevocationState {
+        RevocationState::new(
+            crate::pki::revocation::FailMode::SoftFail,
+            Duration::hours(1),
+        )
+    }
+
+    #[test]
+    fn a_superseded_certificate_waits_for_proof_the_replacement_is_in_use() {
+        let db = Database::open(":memory:").expect("db");
+        let now = OffsetDateTime::now_utc();
+        let (_, new) = superseded_pair(&db, now, KIND_NODE, now + Duration::days(60));
+        let state = revocation();
+        let cfg = cfg(30, 0.25);
+
+        assert!(revoke_superseded_certificates(&db, &state, &cfg, now).is_empty());
+
+        db.mark_certificates_seen(
+            std::slice::from_ref(&new),
+            &format_ts(now - Duration::hours(2)),
+        )
+        .unwrap();
+        assert!(
+            revoke_superseded_certificates(&db, &state, &cfg, now).is_empty(),
+            "the replacement has been used for less than the grace period"
+        );
+
+        db.mark_certificates_seen(
+            std::slice::from_ref(&new),
+            &format_ts(now - Duration::hours(30)),
+        )
+        .unwrap();
+        assert!(
+            revoke_superseded_certificates(&db, &state, &cfg, now).is_empty(),
+            "a first-seen time is never overwritten"
+        );
+    }
+
+    #[test]
+    fn the_old_certificate_is_revoked_once_the_replacement_has_been_in_use() {
+        let db = Database::open(":memory:").expect("db");
+        let now = OffsetDateTime::now_utc();
+        let (old, new) = superseded_pair(&db, now, KIND_NODE, now + Duration::days(60));
+        let state = revocation();
+        let cfg = cfg(30, 0.25);
+        db.mark_certificates_seen(
+            std::slice::from_ref(&new),
+            &format_ts(now - Duration::hours(30)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            revoke_superseded_certificates(&db, &state, &cfg, now),
+            vec![old.clone()]
+        );
+        let row = db.get_issued_certificate(&old).unwrap().unwrap();
+        assert_eq!(row.status, crate::db::CERT_STATUS_REVOKED);
+        assert_eq!(row.revocation_reason, REASON_SUPERSEDED);
+        assert!(matches!(
+            state.check(&old),
+            crate::pki::revocation::Decision::Revoked { .. }
+        ));
+        let current = db.get_issued_certificate(&new).unwrap().unwrap();
+        assert_eq!(current.status, crate::db::CERT_STATUS_ACTIVE);
+        assert!(revoke_superseded_certificates(&db, &state, &cfg, now).is_empty());
+    }
+
+    #[test]
+    fn automatic_revocation_can_be_turned_off_and_skips_other_identities() {
+        let now = OffsetDateTime::now_utc();
+        let state = revocation();
+
+        let db = Database::open(":memory:").expect("db");
+        let (_, new) = superseded_pair(&db, now, KIND_NODE, now + Duration::days(60));
+        db.mark_certificates_seen(&[new], &format_ts(now - Duration::hours(30)))
+            .unwrap();
+        let mut off = cfg(30, 0.25);
+        off.revoke_superseded_after_hours = 0;
+        assert!(revoke_superseded_certificates(&db, &state, &off, now).is_empty());
+
+        let db = Database::open(":memory:").expect("db");
+        let (_, new) = superseded_pair(
+            &db,
+            now,
+            crate::pki::inventory::KIND_OPERATOR,
+            now + Duration::days(60),
+        );
+        db.mark_certificates_seen(&[new], &format_ts(now - Duration::hours(30)))
+            .unwrap();
+        assert!(
+            revoke_superseded_certificates(&db, &state, &cfg(30, 0.25), now).is_empty(),
+            "an operator may use the same identity from two machines"
+        );
+
+        let db = Database::open(":memory:").expect("db");
+        let (_, new) = superseded_pair(&db, now, KIND_NODE, now - Duration::days(1));
+        db.mark_certificates_seen(&[new], &format_ts(now - Duration::hours(30)))
+            .unwrap();
+        assert!(
+            revoke_superseded_certificates(&db, &state, &cfg(30, 0.25), now).is_empty(),
+            "an expired certificate needs no CRL entry"
+        );
+    }
+
+    #[test]
+    fn presented_certificates_reach_the_inventory_only_when_enforcement_is_on() {
+        let db = Database::open(":memory:").expect("db");
+        let now = OffsetDateTime::now_utc();
+        let (_, new) = superseded_pair(&db, now, KIND_NODE, now + Duration::days(60));
+
+        let off = RevocationState::disabled();
+        off.note_seen(&new);
+        record_seen_certificates(&db, &off, now);
+        assert!(
+            revoke_superseded_certificates(&db, &off, &cfg(30, 0.25), now + Duration::days(2))
+                .is_empty()
+        );
+
+        let on = revocation();
+        assert!(on.check_status(&new, "kcore-node-n1").is_ok());
+        record_seen_certificates(&db, &on, now - Duration::hours(30));
+        assert!(on.take_seen().is_empty());
+        assert_eq!(
+            revoke_superseded_certificates(&db, &on, &cfg(30, 0.25), now).len(),
+            1
+        );
     }
 
     #[test]

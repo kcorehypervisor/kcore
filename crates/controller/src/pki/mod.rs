@@ -15,6 +15,9 @@ use time::OffsetDateTime;
 /// are not revoked. RFC 5280 reason codes are all >= 0.
 pub const REASON_NONE: i32 = -1;
 
+/// RFC 5280 `superseded`: a newer certificate replaced this one.
+pub const REASON_SUPERSEDED: i32 = 4;
+
 /// Format an instant the way the `issued_certificates` and `crl_state` tables
 /// store timestamps: RFC3339, UTC, second precision, `Z` suffix.
 ///
