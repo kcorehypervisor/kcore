@@ -18,6 +18,41 @@ Before opening any of them:
   kcore builds the patched package without its test suite (see
   `modules/ch-vm/`), so none of the patches has been through upstream CI.
 
+## Status against upstream `main` (1 November 2026)
+
+Checked with `git apply --check` on `cloud-hypervisor/cloud-hypervisor` at
+`901b91f` and `rust-vmm/vfio` at `93bcf25`.
+
+| Patch | Applies to upstream `main` |
+|-------|----------------------------|
+| CH `tolerate-tsc-khz-einval` | yes |
+| CH `vfio-sparse-mmap-msix` | yes |
+| CH `vfio-bar-writethrough` | no, `pci/src/vfio.rs` has moved |
+| CH `vfio-config-identity` | no, `pci/src/vfio.rs` has moved |
+| CH `vgpu-dma-before-open` | no, `vmm/src/device_manager.rs` has moved |
+| vfio-ioctls `ensure-iommu-group` | yes, with `git apply --directory=vfio-ioctls` |
+| vfio-ioctls `region-flags-from-caps` | yes, with `git apply --directory=vfio-ioctls` |
+
+"Applies" is textual only. Upstream `vfio-ioctls` is now 0.10.0 and Cloud
+Hypervisor `main` depends on it; the kcore patches target 0.5.1. 0.10 adds
+iommufd support (`iommufd_ioctls`, `IommufdIoas`) next to `VfioContainer`, so
+`ensure_iommu_group` and `vgpu-dma-before-open` need a design check against
+the iommufd path, not only a rebase. The two that apply cleanly still need the
+upstream test suite and a read of the surrounding code.
+
+## Who submits
+
+Cloud Hypervisor's `CONTRIBUTING.md` says every contribution must be submitted
+by a human, that automated or bot-driven pull requests are not accepted, and
+that the submitter must understand the design and every line. It asks for the
+use of an LLM to be disclosed in the description. A new feature or enhancement
+also needs an issue and the maintainers' agreement before the pull request.
+These patches were drafted with an assistant, so an agent must not open the
+Cloud Hypervisor pull requests or issues; the person who signs the
+`Signed-off-by` line submits them. Start with an issue per patch, using the
+text below as the description. `rust-vmm/vfio` states no such policy, but the
+same rule is the safe one.
+
 ## What was tested, and what was not
 
 | Patch | Verified on | Not verified |
