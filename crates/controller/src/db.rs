@@ -6097,6 +6097,21 @@ impl Database {
         Ok(())
     }
 
+    /// Seconds since the node's row in `update_name` last changed.
+    pub fn cluster_update_node_age_secs(
+        &self,
+        update_name: &str,
+        node_id: &str,
+    ) -> Result<i64, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COALESCE(CAST((julianday('now') - julianday(last_transition_at)) * 86400 AS INTEGER), 0)
+             FROM cluster_update_nodes WHERE update_name = ?1 AND node_id = ?2",
+            params![update_name, node_id],
+            |row| row.get(0),
+        )
+    }
+
     pub fn list_cluster_update_nodes(
         &self,
         update_name: &str,
@@ -8657,6 +8672,45 @@ mod tests {
             luks_method: String::new(),
             dc_id: "DC1".to_string(),
         }
+    }
+
+    #[test]
+    fn cluster_update_node_age_counts_from_the_last_change() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_node(&test_node()).unwrap();
+        db.upsert_cluster_update(&ClusterUpdateRow {
+            name: "u".into(),
+            generation: 1,
+            target_version: String::new(),
+            flake_ref: String::new(),
+            flake_rev: String::new(),
+            spec_json: "{}".into(),
+            phase: "rolling_out".into(),
+            approval_status: "approved".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        let mut row = ClusterUpdateNodeRow {
+            update_name: "u".into(),
+            node_id: "n1".into(),
+            observed_generation: 1,
+            phase: "prepared".into(),
+            current_version: String::new(),
+            target_version: String::new(),
+            prepared_closure: String::new(),
+            current_generation: String::new(),
+            target_generation: "/nix/store/new".into(),
+            requires_reboot: false,
+            last_error: String::new(),
+            last_transition_at: String::new(),
+        };
+        db.upsert_cluster_update_node(&row).unwrap();
+        row.phase = "confirming".into();
+        db.upsert_cluster_update_node(&row).unwrap();
+
+        let age = db.cluster_update_node_age_secs("u", "n1").unwrap();
+        assert!((0..5).contains(&age), "age {age}");
     }
 
     fn test_vm(node_id: &str) -> VmRow {

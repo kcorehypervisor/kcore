@@ -6138,7 +6138,7 @@ fn cluster_update_approval_to_proto(s: &str) -> i32 {
 fn node_update_phase_to_proto(s: &str) -> i32 {
     match s {
         "pending" => controller_proto::NodeUpdatePhase::Pending as i32,
-        "prepared" => controller_proto::NodeUpdatePhase::Prepared as i32,
+        "prepared" | "confirming" => controller_proto::NodeUpdatePhase::Prepared as i32,
         "succeeded" => controller_proto::NodeUpdatePhase::Succeeded as i32,
         "failed" => controller_proto::NodeUpdatePhase::Failed as i32,
         "cancelled" => controller_proto::NodeUpdatePhase::Cancelled as i32,

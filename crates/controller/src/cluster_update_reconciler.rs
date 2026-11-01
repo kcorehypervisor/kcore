@@ -17,6 +17,7 @@ use crate::node_proto;
 const RECONCILE_TICK: Duration = Duration::from_secs(12);
 const NODE_PREPARE_TIMEOUT_SECS: i32 = 3600;
 const NODE_ACTIVATE_TIMEOUT_SECS: i32 = 900;
+const ACTIVATE_CONFIRM_SECS: i64 = 300;
 
 pub fn spawn_cluster_update_reconciler(db: Database, clients: NodeClients) {
     tokio::spawn(async move {
@@ -293,6 +294,11 @@ async fn reconcile_update(
                     prepared_closure: closure,
                 };
                 let result = activate_on_node(clients, &address, req).await;
+                let failed_phase = if may_confirm_activation(node_row, &activation) {
+                    "confirming"
+                } else {
+                    "failed"
+                };
                 match result {
                     Ok(resp) if resp.success => {
                         let has_generation = db
@@ -332,7 +338,7 @@ async fn reconcile_update(
                             update_name: update.name.clone(),
                             node_id: node_row.node_id.clone(),
                             observed_generation: update.generation,
-                            phase: "failed".into(),
+                            phase: failed_phase.into(),
                             current_version: String::new(),
                             target_version: update.target_version.clone(),
                             prepared_closure: node_row.prepared_closure.clone(),
@@ -349,7 +355,7 @@ async fn reconcile_update(
                             update_name: update.name.clone(),
                             node_id: node_row.node_id.clone(),
                             observed_generation: update.generation,
-                            phase: "failed".into(),
+                            phase: failed_phase.into(),
                             current_version: String::new(),
                             target_version: update.target_version.clone(),
                             prepared_closure: node_row.prepared_closure.clone(),
@@ -450,6 +456,41 @@ async fn reconcile_update(
                     .map_err(|e| format!("generation follow-up: {e}"))?;
                 }
             }
+            "confirming" => {
+                let host = db.get_node_host_status(&node_row.node_id).ok().flatten();
+                let age_secs = db
+                    .cluster_update_node_age_secs(&update.name, &node_row.node_id)
+                    .map_err(|e| format!("read confirming age: {e}"))?;
+                let outcome = confirm_activation(
+                    host.as_ref()
+                        .map(|row| row.nixos_generation.as_str())
+                        .unwrap_or(""),
+                    host.as_ref()
+                        .map(|row| row.booted_generation.as_str())
+                        .unwrap_or(""),
+                    &node_row.target_generation,
+                    age_secs,
+                );
+                match outcome {
+                    Some(true) => {
+                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                            phase: "succeeded".into(),
+                            last_error: String::new(),
+                            ..node_row.clone()
+                        })
+                        .map_err(|e| format!("mark confirmed node succeeded: {e}"))?;
+                    }
+                    Some(false) => {
+                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                            phase: "failed".into(),
+                            ..node_row.clone()
+                        })
+                        .map_err(|e| format!("mark unconfirmed node failed: {e}"))?;
+                    }
+                    None => {}
+                }
+                return Ok(());
+            }
             "reboot_required" => {}
             "rolling_back" => {
                 let schema_owner = db
@@ -496,6 +537,37 @@ async fn reconcile_update(
         }
     }
     Ok(())
+}
+
+/// A switch that restarts the node agent kills the `nixos-rebuild` the agent
+/// waits on, so the agent reports a failure for a switch that went through.
+/// Such a failure is confirmed against the generation the node reports next.
+fn may_confirm_activation(node_row: &ClusterUpdateNodeRow, activation: &str) -> bool {
+    !node_row.target_generation.is_empty() && !node_row.requires_reboot && activation != "boot"
+}
+
+/// `Some(true)` once the node runs the target generation, `Some(false)` after
+/// [`ACTIVATE_CONFIRM_SECS`] without it, `None` while still waiting.
+fn confirm_activation(
+    nixos_generation: &str,
+    booted_generation: &str,
+    target_generation: &str,
+    age_secs: i64,
+) -> Option<bool> {
+    if !target_generation.is_empty()
+        && crate::kubernetes_lifecycle::generation_is_current(
+            nixos_generation,
+            booted_generation,
+            target_generation,
+            false,
+        )
+    {
+        Some(true)
+    } else if age_secs >= ACTIVATE_CONFIRM_SECS {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn kubernetes_host_action(
@@ -821,6 +893,68 @@ mod tests {
             pending_removal: false,
             k8s_node_name: String::new(),
         }
+    }
+
+    fn update_node(target_generation: &str, requires_reboot: bool) -> ClusterUpdateNodeRow {
+        ClusterUpdateNodeRow {
+            update_name: "u".into(),
+            node_id: "node-107".into(),
+            observed_generation: 1,
+            phase: "prepared".into(),
+            current_version: String::new(),
+            target_version: String::new(),
+            prepared_closure: String::new(),
+            current_generation: "/nix/store/old".into(),
+            target_generation: target_generation.into(),
+            requires_reboot,
+            last_error: String::new(),
+            last_transition_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_switch_activations_with_a_target_are_confirmed() {
+        assert!(may_confirm_activation(
+            &update_node("/nix/store/new", false),
+            "auto"
+        ));
+        assert!(may_confirm_activation(
+            &update_node("/nix/store/new", false),
+            "switch"
+        ));
+        assert!(!may_confirm_activation(
+            &update_node("/nix/store/new", false),
+            "boot"
+        ));
+        assert!(!may_confirm_activation(
+            &update_node("/nix/store/new", true),
+            "auto"
+        ));
+        assert!(!may_confirm_activation(&update_node("", false), "auto"));
+    }
+
+    #[test]
+    fn a_failed_switch_succeeds_once_the_node_runs_the_target() {
+        let target = "/nix/store/new";
+        assert_eq!(
+            confirm_activation(target, "/nix/store/old", target, 20),
+            Some(true)
+        );
+        assert_eq!(
+            confirm_activation("/nix/store/old", "/nix/store/old", target, 20),
+            None
+        );
+        assert_eq!(confirm_activation("", "", target, 20), None);
+        assert_eq!(
+            confirm_activation(
+                "/nix/store/old",
+                "/nix/store/old",
+                target,
+                ACTIVATE_CONFIRM_SECS
+            ),
+            Some(false)
+        );
+        assert_eq!(confirm_activation("", "", "", 20), None);
     }
 
     #[test]
