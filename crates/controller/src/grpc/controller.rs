@@ -4178,15 +4178,10 @@ impl ControllerService {
         &self,
         node: &NodeRow,
         vendor: kcore_gpu::VgpuVendor,
-        host_cards: Vec<String>,
-        num_vfs: i32,
+        cards: Vec<(String, i32)>,
+        default_vfs: i32,
     ) -> Result<Response<controller_proto::ConfigureNodeVgpuResponse>, Status> {
-        if !(1..=63).contains(&num_vfs) {
-            return Err(Status::invalid_argument(format!(
-                "num_vfs must be between 1 and 63 for {} cards",
-                vendor.as_str()
-            )));
-        }
+        let host_cards: Vec<String> = cards.iter().map(|(card, _)| card.clone()).collect();
         let inventory = self.node_gpu_inventory(&node.id)?;
         for card in &host_cards {
             let found = inventory.iter().any(|dev| {
@@ -4216,8 +4211,12 @@ impl ControllerService {
                 node_id: node.id.clone(),
                 enabled: true,
                 vendor: vendor.as_str().to_string(),
-                host_cards: host_cards.join(","),
-                num_vfs,
+                host_cards: cards
+                    .iter()
+                    .map(|(card, count)| format!("{card}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                num_vfs: default_vfs,
                 manager_file: String::new(),
                 manager_sha256: String::new(),
                 manager_version: String::new(),
@@ -4237,11 +4236,17 @@ impl ControllerService {
         Ok(Response::new(controller_proto::ConfigureNodeVgpuResponse {
             success: true,
             message: format!(
-                "{} vGPU host enabled on {}: {} slices of {} per card",
+                "{} vGPU host enabled on {}: {}",
                 vendor.as_str(),
                 node.id,
-                num_vfs,
-                kcore_gpu::split_profile(vendor, num_vfs as u32)
+                cards
+                    .iter()
+                    .map(|(card, count)| format!(
+                        "{card} in {count} slices of {}",
+                        kcore_gpu::split_profile(vendor, *count as u32)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             reboot_required,
             store_path: String::new(),
@@ -12172,14 +12177,29 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "host_cards must name at least one physical function",
             ));
         }
+        if vendor.splits_evenly() {
+            let mut cards = Vec::with_capacity(req.host_cards.len());
+            for raw in &req.host_cards {
+                let (address, count) =
+                    kcore_gpu::parse_split_card(raw).map_err(Status::invalid_argument)?;
+                let address =
+                    crate::pci::normalize_pci_bdf(address).map_err(Status::invalid_argument)?;
+                let count = count.unwrap_or(req.num_vfs);
+                if !(1..=63).contains(&count) {
+                    return Err(Status::invalid_argument(format!(
+                        "{address}: give {} cards 1 to 63 virtual functions, with --num-vfs or {address}=N",
+                        vendor.as_str()
+                    )));
+                }
+                cards.push((address, count));
+            }
+            return self
+                .configure_split_vgpu(&node, vendor, cards, req.num_vfs)
+                .await;
+        }
         let mut host_cards = Vec::with_capacity(req.host_cards.len());
         for card in &req.host_cards {
             host_cards.push(crate::pci::normalize_pci_bdf(card).map_err(Status::invalid_argument)?);
-        }
-        if vendor.splits_evenly() {
-            return self
-                .configure_split_vgpu(&node, vendor, host_cards, req.num_vfs)
-                .await;
         }
         let manager = req.manager.unwrap_or_default();
         let file = validate_vgpu_manager_file(&manager.file)?;

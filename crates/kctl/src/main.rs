@@ -1719,9 +1719,11 @@ enum NodeVgpuAction {
         #[arg(long, default_value = "nvidia")]
         vendor: String,
         /// Physical function that stays on the host driver. Repeat for more cards.
+        /// Intel and AMD cards take their own count: --host-card 0000:c3:00.0=4
         #[arg(long = "host-card", required = true)]
         host_card: Vec<String>,
-        /// Virtual functions to create. NVIDIA accepts 0 for every function the card supports.
+        /// Virtual functions to create, or the default for cards without =N.
+        /// NVIDIA accepts 0 for every function the card supports.
         #[arg(long = "num-vfs", default_value_t = 0)]
         num_vfs: i32,
         /// HTTP(S) URL of the NVIDIA Virtual GPU Manager .run file (NVIDIA only)

@@ -346,21 +346,18 @@ let
   amdCfg =
     (splitEval [
       {
-        address = "0000:c3:00.0";
-        vendor = "amd";
-        numVfs = 4;
-      }
-      {
         address = "0000:c4:00.0";
         vendor = "amd";
         numVfs = 6;
       }
+      {
+        address = "0000:c3:00.0";
+        vendor = "amd";
+        numVfs = 4;
+      }
     ]).config;
   halfUnit = intelCfg.systemd.services."kcore-vm-half";
   gpuSriov = intelCfg.systemd.services.kcore-gpu-sriov;
-  vfCountAssertion = lib.findFirst (
-    item: lib.hasInfix "the same numVfs" item.message
-  ) null amdCfg.assertions;
   splitScripts = asList halfUnit.serviceConfig.ExecStartPre ++ [ gpuSriov.serviceConfig.ExecStart ];
 in
 assert lib.hasInfix "split_card 0000:03:00.0 intel 2 xe" gpuSriov.script;
@@ -380,7 +377,9 @@ assert !(mentions "vgpu-clear-half" halfUnit.serviceConfig.ExecStopPost);
 assert lib.elem "gim" amdCfg.boot.kernelModules;
 assert lib.elem "amdgpu" amdCfg.boot.blacklistedKernelModules;
 assert lib.hasInfix "options gim vf_num=4,6" amdCfg.boot.extraModprobeConfig;
-assert vfCountAssertion != null && vfCountAssertion.assertion == false;
+assert lib.all (item: item.assertion) amdCfg.assertions;
+assert lib.hasInfix "split_card 0000:c4:00.0 amd 6 gim"
+  amdCfg.systemd.services.kcore-gpu-sriov.script;
 pkgs.runCommand "ch-vm-module-eval-ok" { } ''
   : ${
     lib.concatMapStringsSep " " (item: lib.escapeShellArg (toString item)) (

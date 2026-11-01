@@ -135,6 +135,19 @@ pub fn split_profile(vendor: VgpuVendor, num_vfs: u32) -> String {
     format!("{}-{num_vfs}vf", vendor.family())
 }
 
+/// Split a host card entry. `0000:c3:00.0=4` asks for four virtual functions on
+/// that card; a bare address leaves the count to the caller's default.
+pub fn parse_split_card(raw: &str) -> Result<(&str, Option<i32>), String> {
+    let Some((address, count)) = raw.split_once('=') else {
+        return Ok((raw.trim(), None));
+    };
+    let count = count
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| format!("host card '{raw}': the count after '=' must be a number"))?;
+    Ok((address.trim(), Some(count)))
+}
+
 /// Virtual GPU Manager 595 binds each virtual function to `nvidia` and
 /// publishes `nvidia/creatable_vgpu_types`. The vfio device node is created
 /// beside that binding. A function with no types is not a slice.
@@ -2248,5 +2261,18 @@ mod tests {
         assert!(VgpuVendor::parse("matrox").is_err());
         assert_eq!(VgpuVendor::of_profile("A2-4C"), VgpuVendor::Nvidia);
         assert_eq!(split_profile(VgpuVendor::Intel, 2), "intel-2vf");
+    }
+
+    #[test]
+    fn split_card_entries_carry_an_optional_count() {
+        assert_eq!(
+            parse_split_card("0000:c3:00.0").unwrap(),
+            ("0000:c3:00.0", None)
+        );
+        assert_eq!(
+            parse_split_card(" 0000:c3:00.0 = 4 ").unwrap(),
+            ("0000:c3:00.0", Some(4))
+        );
+        assert!(parse_split_card("0000:c3:00.0=many").is_err());
     }
 }

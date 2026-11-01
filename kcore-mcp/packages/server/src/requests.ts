@@ -391,7 +391,10 @@ function nodeVgpuRequest(spec: Record<string, unknown>, enabling: boolean): Reco
   const numVfs = spec.numVfs == null || spec.numVfs === "" ? 0 : Number(spec.numVfs);
   if (!Number.isInteger(numVfs) || numVfs < 0) throw new InputError("numVfs must be an integer >= 0");
   if (vendor !== "nvidia") {
-    if (numVfs < 1) throw new InputError(`numVfs is required for ${vendor} cards`);
+    const uncounted = hostCards.filter((card) => !/=\s*[1-9]\d*\s*$/.test(card));
+    if (uncounted.length > 0 && numVfs < 1) {
+      throw new InputError(`numVfs, or ADDRESS=N on every host card, is required for ${vendor} cards`);
+    }
     return { nodeId, enabled: true, hostCards: hostCards.map((card) => assertArg(card, "host card")), numVfs, vendor };
   }
   const url = required(spec, "managerUrl", "manager URL");
