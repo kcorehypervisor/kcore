@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package kcore.network.v1;
+
+// NetworkProvisioner is the automation API for PowerDNS and Kea.
+// One process can serve several L3 networks. Each network has its own subnet,
+// interface, pool, and DNS zone. The home deployment starts with one.
+service NetworkProvisioner {
+  rpc PutNetwork(PutNetworkRequest) returns (Network);
+  rpc GetNetwork(GetNetworkRequest) returns (Network);
+  rpc ListNetworks(ListNetworksRequest) returns (ListNetworksResponse);
+  rpc DeleteNetwork(DeleteNetworkRequest) returns (DeleteNetworkResponse);
+
+  rpc PutReservation(Reservation) returns (Reservation);
+  rpc ListReservations(ListReservationsRequest) returns (ListReservationsResponse);
+  rpc DeleteReservation(DeleteReservationRequest) returns (DeleteReservationResponse);
+
+  rpc PutRecord(DnsRecord) returns (DnsRecord);
+  rpc ListRecords(ListRecordsRequest) returns (ListRecordsResponse);
+  rpc DeleteRecord(DeleteRecordRequest) returns (DeleteRecordResponse);
+
+  rpc ImportRouterOs(ImportRouterOsRequest) returns (ImportRouterOsResponse);
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  rpc GetStatus(GetStatusRequest) returns (Status);
+}
+
+message Network {
+  string name = 1;
+  string interface = 2;
+  string cidr = 3;
+  string gateway = 4;
+  string domain = 5;
+  repeated string dns_servers = 6;
+  repeated AddressPool pools = 7;
+  bool dhcp_enabled = 8;
+  uint32 valid_lifetime = 9;
+  string next_server = 10;
+  string boot_file_name = 11;
+}
+
+message AddressPool {
+  string start = 1;
+  string end = 2;
+}
+
+message PutNetworkRequest {
+  Network network = 1;
+}
+
+message GetNetworkRequest {
+  string name = 1;
+}
+
+message ListNetworksRequest {}
+
+message ListNetworksResponse {
+  repeated Network networks = 1;
+}
+
+message DeleteNetworkRequest {
+  string name = 1;
+}
+
+message DeleteNetworkResponse {
+  bool deleted = 1;
+}
+
+message Reservation {
+  string network = 1;
+  string mac_address = 2;
+  string ip_address = 3;
+  string hostname = 4;
+  string comment = 5;
+  bool static_lease = 6;
+}
+
+message ListReservationsRequest {
+  string network = 1;
+}
+
+message ListReservationsResponse {
+  repeated Reservation reservations = 1;
+}
+
+message DeleteReservationRequest {
+  string network = 1;
+  string mac_address = 2;
+}
+
+message DeleteReservationResponse {
+  bool deleted = 1;
+}
+
+message DnsRecord {
+  string zone = 1;
+  string name = 2;
+  string rrtype = 3;
+  string content = 4;
+  uint32 ttl = 5;
+}
+
+message ListRecordsRequest {
+  string zone = 1;
+}
+
+message ListRecordsResponse {
+  repeated DnsRecord records = 1;
+}
+
+message DeleteRecordRequest {
+  string zone = 1;
+  string name = 2;
+  string rrtype = 3;
+  string content = 4;
+}
+
+message DeleteRecordResponse {
+  bool deleted = 1;
+}
+
+message ImportRouterOsRequest {
+  // RouterOS export text, a REST lease array, or the API dump object.
+  string document = 1;
+  // Existing network that receives the active DHCP subnet.
+  string network = 2;
+  bool replace_reservations = 3;
+}
+
+message ImportRouterOsResponse {
+  uint32 reservations = 1;
+  uint32 skipped = 2;
+  repeated string warnings = 3;
+  repeated string networks = 4;
+}
+
+message ApplyRequest {}
+
+message ApplyResponse {
+  string kea_config_path = 1;
+  repeated string zones = 2;
+  string message = 3;
+}
+
+message GetStatusRequest {}
+
+message Status {
+  repeated Network networks = 1;
+  uint32 reservation_count = 2;
+  repeated string zones = 3;
+  repeated string upstream = 4;
+  string authoritative = 5;
+}
