@@ -6,6 +6,7 @@
 
 pub mod apply;
 pub mod grpc;
+pub mod leases;
 pub mod model;
 pub mod pdns;
 pub mod render;

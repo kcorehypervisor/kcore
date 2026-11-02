@@ -10,6 +10,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Kea memfile lease database.
+pub const LEASE_FILE: &str = "/var/lib/kea/dhcp4.leases";
+
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub state_dir: PathBuf,
@@ -64,11 +67,7 @@ pub fn render(layout: &Layout, catalog: &Catalog) -> Result<Rendered> {
     let key = ensure_secret(&layout.pdns_key())?;
     let _ = ensure_secret(&layout.token())?;
     let zones = render::zone_plan(catalog);
-    let kea = render::kea_dhcp4(
-        catalog,
-        "/var/lib/kea/dhcp4.leases",
-        "/run/kea/kea-dhcp4.sock",
-    );
+    let kea = render::kea_dhcp4(catalog, LEASE_FILE, "/run/kea/kea-dhcp4.sock");
     write_text(&layout.kea(), &serde_json::to_string_pretty(&kea)?)?;
     write_text(&layout.forward(), &render::forward_zones(catalog))?;
     write_text(&layout.lua(), &render::recursor_lua(catalog))?;
