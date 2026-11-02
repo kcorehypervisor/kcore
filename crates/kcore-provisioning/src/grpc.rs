@@ -4,15 +4,17 @@
 #![allow(clippy::result_large_err)]
 
 use crate::apply::{self, Layout};
+use crate::leases;
 use crate::model::{AddressPool, Catalog, DnsRecord, Network, Reservation};
 use crate::proto::network_provisioner_server::{NetworkProvisioner, NetworkProvisionerServer};
 use crate::proto::{
     ApplyRequest, ApplyResponse, DeleteNetworkRequest, DeleteNetworkResponse, DeleteRecordRequest,
     DeleteRecordResponse, DeleteReservationRequest, DeleteReservationResponse,
     DnsRecord as ProtoRecord, GetNetworkRequest, GetStatusRequest, ImportRouterOsRequest,
-    ImportRouterOsResponse, ListNetworksRequest, ListNetworksResponse, ListRecordsRequest,
-    ListRecordsResponse, ListReservationsRequest, ListReservationsResponse,
-    Network as ProtoNetwork, PutNetworkRequest, Reservation as ProtoReservation, Status,
+    ImportRouterOsResponse, Lease as ProtoLease, ListLeasesRequest, ListLeasesResponse,
+    ListNetworksRequest, ListNetworksResponse, ListRecordsRequest, ListRecordsResponse,
+    ListReservationsRequest, ListReservationsResponse, Network as ProtoNetwork, PutNetworkRequest,
+    Reservation as ProtoReservation, Status,
 };
 use crate::routeros;
 use crate::store::Store;
@@ -249,6 +251,48 @@ impl NetworkProvisioner for Service {
         Ok(Response::new(DeleteReservationResponse { deleted }))
     }
 
+    async fn list_leases(
+        &self,
+        request: Request<ListLeasesRequest>,
+    ) -> Result<Response<ListLeasesResponse>, RpcStatus> {
+        self.auth(&request)?;
+        let req = request.into_inner();
+        let catalog = {
+            let engine = self.lock()?;
+            load(&engine)?
+        };
+        let text = match std::fs::read_to_string(apply::LEASE_FILE) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(RpcStatus::internal(format!(
+                    "reading {}: {err}",
+                    apply::LEASE_FILE
+                )))
+            }
+        };
+        let now = unix_now();
+        let leases = leases::classify(&catalog, leases::parse(&text), now)
+            .into_iter()
+            .filter(|l| req.network.is_empty() || l.network == req.network)
+            .filter(|l| req.include_inactive || l.status == "active")
+            .map(|l| ProtoLease {
+                network: l.network,
+                ip_address: l.row.address.to_string(),
+                mac_address: l.row.mac_address,
+                hostname: l.row.hostname,
+                state: l.status.into(),
+                expires_at: l.row.expires_at,
+                valid_lifetime: l.row.valid_lifetime,
+                reserved: l.reserved,
+            })
+            .collect();
+        Ok(Response::new(ListLeasesResponse {
+            leases,
+            read_at: now,
+        }))
+    }
+
     async fn put_record(
         &self,
         request: Request<ProtoRecord>,
@@ -354,6 +398,13 @@ impl NetworkProvisioner for Service {
             zones,
         }))
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn load(engine: &Engine) -> Result<Catalog, RpcStatus> {

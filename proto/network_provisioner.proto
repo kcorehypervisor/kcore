@@ -15,6 +15,9 @@ service NetworkProvisioner {
   rpc ListReservations(ListReservationsRequest) returns (ListReservationsResponse);
   rpc DeleteReservation(DeleteReservationRequest) returns (DeleteReservationResponse);
 
+  // ListLeases reads the leases Kea currently holds, newest state per address.
+  rpc ListLeases(ListLeasesRequest) returns (ListLeasesResponse);
+
   rpc PutRecord(DnsRecord) returns (DnsRecord);
   rpc ListRecords(ListRecordsRequest) returns (ListRecordsResponse);
   rpc DeleteRecord(DeleteRecordRequest) returns (DeleteRecordResponse);
@@ -89,6 +92,33 @@ message DeleteReservationRequest {
 
 message DeleteReservationResponse {
   bool deleted = 1;
+}
+
+message ListLeasesRequest {
+  // Empty means every network.
+  string network = 1;
+  // Include expired and declined leases that Kea has not reclaimed yet.
+  bool include_inactive = 2;
+}
+
+message Lease {
+  string network = 1;
+  string ip_address = 2;
+  string mac_address = 3;
+  string hostname = 4;
+  // active, expired, declined, or reclaimed
+  string state = 5;
+  // Unix seconds.
+  int64 expires_at = 6;
+  uint32 valid_lifetime = 7;
+  // True when a reservation for this MAC exists in the same network.
+  bool reserved = 8;
+}
+
+message ListLeasesResponse {
+  repeated Lease leases = 1;
+  // Unix seconds of the lease file read.
+  int64 read_at = 2;
 }
 
 message DnsRecord {
