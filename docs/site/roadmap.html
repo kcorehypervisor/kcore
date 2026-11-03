@@ -1106,9 +1106,9 @@
                     <div class="timeline-card">
                         <h3><span class="card-icon in-progress">&#128421;</span> Bare-Metal</h3>
                         <p>
-                            PostgreSQL and Kubernetes run on kcoreOS itself, declared through kcore
-                            and applied on the node. They do not run inside a VM. MySQL and ClickHouse
-                            are the same shape and are not built yet.
+                            PostgreSQL, Kubernetes, and ClickHouse run on kcoreOS itself, declared
+                            through kcore and applied on the node. They do not run inside a VM.
+                            MySQL is the same shape and is not built yet.
                         </p>
                         <ul class="detail-list">
                             <li>
@@ -1124,8 +1124,8 @@
                                 <span>MySQL from the NixOS package, declared and applied on the node the same way</span>
                             </li>
                             <li>
-                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
-                                <span>ClickHouse as a host service. Design only: no module or API yet</span>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>ClickHouse on kcoreOS (<code>kind: ClickhouseCluster</code>): shards, replicas, and ClickHouse Keeper. <code>kctl clickhouse</code> plans, applies, scales, replaces a replica, upgrades, and deletes. A rollout keeps one healthy replica of each shard and Keeper quorum. MCP and the dashboard cover the same resource</span>
                             </li>
                         </ul>
                     </div>
