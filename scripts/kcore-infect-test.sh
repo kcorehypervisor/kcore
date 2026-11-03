@@ -44,9 +44,8 @@ grep -q 'inputs.kcore.url = "github:kcorehypervisor/kcore"' "$tmp/stdin/flake.ni
 
 bash "$INFECT" "${base[@]}" --out "$tmp/controller" >"$tmp/controller.out"
 grep -q 'inputs.kcore.url = "github:kcorehypervisor/kcore"' "$tmp/controller/flake.nix"
-grep -q 'kcore.nixosModules.kcore-host' "$tmp/controller/flake.nix"
-grep -q 'kcore.packages.${system}.kcore-node-agent' "$tmp/controller/flake.nix"
-grep -q 'system = "x86_64-linux"' "$tmp/controller/flake.nix"
+grep -q 'kcore.lib.mkNode { root = ./.; }' "$tmp/controller/flake.nix"
+grep -q 'nixpkgs.hostPlatform = "x86_64-linux"' "$tmp/controller/hardware-configuration.nix"
 grep -q 'device = "/dev/vda"' "$tmp/controller/hardware-configuration.nix"
 grep -q 'systemd-boot.enable = false' "$tmp/controller/hardware-configuration.nix"
 if grep -q 'qemu-guest.nix' "$tmp/controller/hardware-configuration.nix"; then

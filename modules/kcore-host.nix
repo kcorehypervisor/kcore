@@ -9,51 +9,119 @@
 }:
 let
   cfg = config.services.kcore;
-  confirmScript = pkgs.writeShellScript "kcore-boot-confirm" ''
-    set -eu
+  candidateFiles = "flake.nix flake.lock legacy-configuration.nix";
+  systemctl = "${pkgs.systemd}/bin/systemctl";
+  bootctl = "${pkgs.systemd}/bin/bootctl";
+
+  # boot-pending is written by the node agent when it stages a generation:
+  # toplevel, previous (the generation that was running), staging (the host
+  # flake copy with the target pins), and boot_id (the boot that staged it).
+  pendingLib = ''
     pending=/var/lib/kcore/updates/boot-pending
-    if [ ! -f "$pending" ]; then
-      exit 0
-    fi
-    expected_toplevel=$(sed -n 's/^toplevel=//p' "$pending" | head -n 1)
-    expected_version=$(sed -n 's/^version=//p' "$pending" | head -n 1)
-    booted=$(readlink -f /run/booted-system || true)
-    if [ -z "$expected_toplevel" ] || [ "$booted" != "$expected_toplevel" ]; then
-      exit 0
-    fi
-    if [ -n "$expected_version" ] && [ -f /etc/kcore/version ]; then
-      running=$(tr -d '\n' < /etc/kcore/version)
-      if [ "$running" != "$expected_version" ]; then
-        exit 0
+    field() { sed -n "s/^$1=//p" "$pending" | head -n 1; }
+    staged_this_boot() {
+      [ "$(field boot_id)" = "$(cat /proc/sys/kernel/random/boot_id)" ]
+    }
+    # Boot the generation that ran before the update and record why.
+    revert() {
+      expected=$(field toplevel)
+      previous=$(field previous)
+      printf 'toplevel=%s\nreason=%s\n' "$expected" "$1" > /var/lib/kcore/updates/boot-failed
+      rm -f "$pending"
+      if [ -n "$previous" ] && [ -x "$previous/bin/switch-to-configuration" ]; then
+        ${config.nix.package}/bin/nix-env -p /nix/var/nix/profiles/system --set "$previous"
+        "$previous/bin/switch-to-configuration" boot
       fi
-    fi
-    if ! ${pkgs.systemd}/bin/systemctl is-active --quiet kcore-node-agent.service; then
+      ${systemctl} reboot
+      exit 0
+    }
+  '';
+
+  healthy = ''
+    healthy() {
+      ${systemctl} is-active --quiet kcore-node-agent.service || return 1
+      restarts=$(${systemctl} show -p NRestarts --value kcore-node-agent.service)
+      [ "''${restarts:-0}" -lt 3 ] || return 1
+      if ${systemctl} is-enabled --quiet kcore-controller.service 2>/dev/null; then
+        ${systemctl} is-active --quiet kcore-controller.service || return 1
+      fi
+      return 0
+    }
+  '';
+
+  confirmScript = pkgs.writeShellScript "kcore-boot-confirm" ''
+    set -u
+    ${pendingLib}
+    ${healthy}
+    if [ ! -f "$pending" ] || staged_this_boot; then
       exit 0
     fi
-    entry=$(${pkgs.systemd}/bin/bootctl status --json=short 2>/dev/null | ${pkgs.jq}/bin/jq -r '.entry // empty' || true)
+    expected=$(field toplevel)
+    booted=$(readlink -f /run/booted-system || true)
+    if [ "$booted" != "$expected" ]; then
+      # systemd-boot fell back after the one-shot boot failed (panic, hang
+      # reset), or someone picked another entry.
+      printf 'toplevel=%s\nreason=%s\n' "$expected" "booted $booted instead of the staged generation" \
+        > /var/lib/kcore/updates/boot-failed
+      rm -f "$pending"
+      exit 0
+    fi
+    deadline=$(( $(date +%s) + ${toString cfg.bootConfirm.timeoutSeconds} ))
+    ok=0
+    while [ "$ok" -lt 3 ]; do
+      if healthy; then
+        ok=$((ok + 1))
+      else
+        ok=0
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+          revert "kcore services were not healthy within ${toString cfg.bootConfirm.timeoutSeconds}s"
+        fi
+      fi
+      sleep 10
+    done
+    entry=$(${bootctl} status --json=short 2>/dev/null | ${pkgs.jq}/bin/jq -r '.entry // empty' || true)
     if [ -z "$entry" ]; then
-      entry=$(${pkgs.systemd}/bin/bootctl status 2>/dev/null | sed -n 's/^.*id: //p' | head -n 1 || true)
+      entry=$(${bootctl} status 2>/dev/null | sed -n 's/^.*id: //p' | head -n 1 || true)
     fi
     if [ -n "$entry" ]; then
-      ${pkgs.systemd}/bin/bootctl set-default "$entry"
+      ${bootctl} set-default "$entry" || true
+    fi
+    # The host flake moves to the update's pins only once its generation has
+    # proven itself. Same file list and backup layout as system_update.rs.
+    staging=$(field staging)
+    if [ -n "$staging" ] && [ -f "$staging/flake.nix" ]; then
+      previous="$(dirname "$staging")/previous"
+      if [ ! -d "$previous" ]; then
+        mkdir -p "$previous"
+        for f in ${candidateFiles}; do
+          if [ -f "/etc/nixos/$f" ]; then
+            cp "/etc/nixos/$f" "$previous/$f"
+          else
+            touch "$previous/$f.absent"
+          fi
+        done
+      fi
+      for f in ${candidateFiles}; do
+        if [ -f "$staging/$f" ]; then
+          cp "$staging/$f" "/etc/nixos/.$f.kcore-tmp"
+          mv -f "/etc/nixos/.$f.kcore-tmp" "/etc/nixos/$f"
+        fi
+      done
     fi
     mkdir -p /run/kcore
     touch /run/kcore/boot-blessed
     rm -f "$pending"
   '';
+
+  # Safety net when kcore-boot-confirm itself never finishes.
   timeoutScript = pkgs.writeShellScript "kcore-boot-confirm-timeout" ''
-    set -eu
-    pending=/var/lib/kcore/updates/boot-pending
-    if [ ! -f "$pending" ]; then
+    set -u
+    ${pendingLib}
+    if [ ! -f "$pending" ] || [ -f /run/kcore/boot-blessed ] || staged_this_boot; then
       exit 0
     fi
-    if [ -f /run/kcore/boot-blessed ]; then
-      exit 0
-    fi
-    expected_toplevel=$(sed -n 's/^toplevel=//p' "$pending" | head -n 1)
-    booted=$(readlink -f /run/booted-system || true)
-    if [ -n "$expected_toplevel" ] && [ "$booted" = "$expected_toplevel" ]; then
-      ${pkgs.systemd}/bin/systemctl reboot
+    if [ "$(readlink -f /run/booted-system || true)" = "$(field toplevel)" ]; then
+      revert "the staged generation was not confirmed in time"
     fi
   '';
 in
@@ -147,11 +215,16 @@ in
       enable = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Bless a one-shot boot only after the node agent is up on the staged generation.";
+        description = ''
+          After a staged update boots, wait for the node agent (and the controller
+          when enabled) to stay up. Keep the generation when they do; otherwise make
+          the previous generation the boot default and reboot into it.
+        '';
       };
       timeoutSeconds = lib.mkOption {
         type = lib.types.ints.positive;
         default = 600;
+        description = "How long the staged generation has to become healthy.";
       };
     };
   };
@@ -247,6 +320,11 @@ in
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
+        # Version updates resolve a release tag with `nix flake metadata`.
+        path = [
+          config.nix.package
+          pkgs.git
+        ];
         serviceConfig = {
           Type = "simple";
           ExecStart = "${cfg.controller.package}/bin/kcore-controller --config ${cfg.controller.configFile}";
@@ -287,12 +365,14 @@ in
     }
     (lib.mkIf cfg.bootConfirm.enable {
       systemd.services.kcore-boot-confirm = {
-        description = "Bless the booted kcore generation";
+        description = "Confirm a staged kcore generation or boot the previous one";
         wantedBy = [ "multi-user.target" ];
         after = [
           "kcore-node-agent.service"
-          "network-online.target"
+          "kcore-controller.service"
         ];
+        # Only boots matter. A switch that changes this unit must not re-run it.
+        restartIfChanged = false;
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -300,15 +380,15 @@ in
         script = "${confirmScript}";
       };
       systemd.timers.kcore-boot-confirm-timeout = {
-        description = "Reboot an unblessed staged generation";
+        description = "Boot the previous generation when a staged one was never confirmed";
         wantedBy = [ "timers.target" ];
         timerConfig = {
-          OnBootSec = "${toString cfg.bootConfirm.timeoutSeconds}s";
+          OnBootSec = "${toString (cfg.bootConfirm.timeoutSeconds + 300)}s";
           Unit = "kcore-boot-confirm-timeout.service";
         };
       };
       systemd.services.kcore-boot-confirm-timeout = {
-        description = "Reboot when the staged generation was not blessed";
+        description = "Boot the previous generation when a staged one was never confirmed";
         serviceConfig.Type = "oneshot";
         script = "${timeoutScript}";
       };

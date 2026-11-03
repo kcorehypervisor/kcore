@@ -31,6 +31,7 @@ use uuid::Uuid;
 use crate::auth::{self, OperatorRole, CN_NODE_PREFIX};
 use crate::ceph_cluster_spec;
 use crate::cluster_update_spec;
+use crate::cluster_version;
 use crate::config::{NetworkConfig, ReplicationConfig};
 use crate::controller_proto;
 use crate::db::{
@@ -6277,6 +6278,7 @@ fn node_update_phase_to_proto(s: &str) -> i32 {
         "cancelled" => controller_proto::NodeUpdatePhase::Cancelled as i32,
         "rolling_back" => controller_proto::NodeUpdatePhase::RollingBack as i32,
         "reboot_required" => controller_proto::NodeUpdatePhase::RebootRequired as i32,
+        "rebooting" => controller_proto::NodeUpdatePhase::Rebooting as i32,
         _ => controller_proto::NodeUpdatePhase::Unspecified as i32,
     }
 }
@@ -6361,6 +6363,79 @@ fn postgresql_replication_body(row: &PostgresqlRow) -> serde_json::Value {
 }
 
 impl ControllerService {
+    /// Migrate guests off the node when the update allows it, mark it
+    /// `rebooting`, and boot its staged generation. The row is written before
+    /// the reboot because the node may be this controller's own host.
+    pub async fn reboot_update_node(
+        &self,
+        node_row: &ClusterUpdateNodeRow,
+        drain_vms: bool,
+        drain: NodeDrainOptions,
+    ) -> Result<String, Status> {
+        let vms = self
+            .db
+            .list_vms_for_node(&node_row.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !vms.is_empty() {
+            if !drain_vms {
+                return Err(Status::failed_precondition(
+                    "guests are still on this node; migrate them or set drainVms before reboot",
+                ));
+            }
+            let outcome = self.drain_node_vms(&node_row.node_id, "", drain).await?;
+            if !outcome.errors.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "drain failed: {}",
+                    outcome.errors.join("; ")
+                )));
+            }
+        }
+        let node = self
+            .db
+            .get_node(&node_row.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("node not registered"))?;
+        if self.clients.get_admin(&node.address).is_none() {
+            self.clients
+                .connect(&node.address)
+                .await
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+        }
+        let mut admin = self
+            .clients
+            .get_admin(&node.address)
+            .ok_or_else(|| Status::unavailable("node admin client unavailable"))?;
+        self.db
+            .upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                phase: "rebooting".into(),
+                last_error: String::new(),
+                ..node_row.clone()
+            })
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let resp = admin
+            .reboot_staged_system_update(Request::new(
+                crate::node_proto::RebootStagedSystemUpdateRequest {
+                    update_name: node_row.update_name.clone(),
+                },
+            ))
+            .await;
+        match resp {
+            Ok(resp) if resp.get_ref().success => Ok(resp.into_inner().message),
+            Ok(resp) => {
+                let message = resp.into_inner().message;
+                self.db
+                    .upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                        last_error: message.clone(),
+                        ..node_row.clone()
+                    })
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                Err(Status::failed_precondition(message))
+            }
+            // A node that reboots quickly drops the call before answering.
+            Err(e) => Ok(format!("rebooting; the node did not answer: {e}")),
+        }
+    }
+
     /// Move every VM off `node_id` using the same live-then-cold paths as
     /// [`Controller::drain_node`]. Used by DiskLayout evacuate reconciliation.
     pub async fn drain_node_vms(
@@ -18096,6 +18171,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 || n.phase == "prepared"
                 || n.phase == "pending"
                 || n.phase == "reboot_required"
+                || n.phase == "rebooting"
                 || n.phase == "bootstrapping"
             {
                 self.db
@@ -18157,56 +18233,221 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 "node has no staged reboot; apply finishes userspace switches without one",
             ));
         }
-        let vms = self
-            .db
-            .list_vms_for_node(&req.node_id)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        if !vms.is_empty() {
-            if !spec.drain_vms {
-                return Err(Status::failed_precondition(
-                    "guests are still on this node; migrate them or set drainVms before reboot",
-                ));
-            }
-            let outcome = self
-                .drain_node_vms(&req.node_id, "", NodeDrainOptions::default())
-                .await?;
-            if !outcome.errors.is_empty() {
-                return Err(Status::failed_precondition(format!(
-                    "drain failed: {}",
-                    outcome.errors.join("; ")
-                )));
-            }
-        }
-        let node = self
-            .db
-            .get_node(&req.node_id)
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("node not registered"))?;
-        if self.clients.get_admin(&node.address).is_none() {
-            self.clients
-                .connect(&node.address)
-                .await
-                .map_err(|e| Status::unavailable(e.to_string()))?;
-        }
-        let mut admin = self
-            .clients
-            .get_admin(&node.address)
-            .ok_or_else(|| Status::unavailable("node admin client unavailable"))?;
-        let resp = admin
-            .reboot_staged_system_update(Request::new(
-                crate::node_proto::RebootStagedSystemUpdateRequest {
-                    update_name: req.name,
-                },
-            ))
-            .await
-            .map_err(|e| Status::unavailable(format!("reboot: {e}")))?
-            .into_inner();
+        let message = self
+            .reboot_update_node(&node_row, spec.drain_vms, NodeDrainOptions::default())
+            .await?;
         Ok(Response::new(
             controller_proto::RebootClusterUpdateNodeResponse {
-                success: resp.success,
-                message: resp.message,
+                success: true,
+                message,
             },
         ))
+    }
+
+    async fn set_cluster_version(
+        &self,
+        request: Request<controller_proto::SetClusterVersionRequest>,
+    ) -> Result<Response<controller_proto::SetClusterVersionResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let tag = cluster_version::normalize_tag(&req.version).map_err(Status::invalid_argument)?;
+        let flake_ref = match req.flake_ref.trim() {
+            "" => cluster_version::DEFAULT_FLAKE_REF.to_string(),
+            other => other.to_string(),
+        };
+        let name = cluster_version::update_name(&tag);
+        let updates = self.db.list_cluster_updates().map_err(internal_db)?;
+        if let Some(active) = updates.iter().find(|u| {
+            matches!(
+                u.phase.as_str(),
+                "pending" | "ready" | "rolling_out" | "rolling_back"
+            )
+        }) {
+            if active.name != name || active.phase == "rolling_back" {
+                return Err(Status::failed_precondition(format!(
+                    "cluster update {} is {}; wait for it to finish or cancel it",
+                    active.name, active.phase
+                )));
+            }
+            let spec = cluster_update_spec::spec_from_json(&active.spec_json)
+                .map_err(|e| Status::internal(format!("decode spec: {e}")))?;
+            return Ok(Response::new(controller_proto::SetClusterVersionResponse {
+                direction: String::new(),
+                version: tag,
+                flake_rev: active.flake_rev.clone(),
+                target_node_ids: spec
+                    .selector
+                    .as_ref()
+                    .map(|s| s.node_ids.clone())
+                    .unwrap_or_default(),
+                update_name: active.name.clone(),
+                cluster_update: Some(cluster_update_row_to_proto(active, spec)),
+                message: "this version is already rolling out".into(),
+            }));
+        }
+
+        let release = cluster_version::resolve_release(&flake_ref, &tag)
+            .await
+            .map_err(Status::failed_precondition)?;
+        cluster_version::check_schema(&release, crate::db::MIN_COMPATIBLE_SCHEMA_READER)
+            .map_err(Status::failed_precondition)?;
+        let versions: Vec<(String, String)> = self
+            .db
+            .list_nodes()
+            .map_err(internal_db)?
+            .into_iter()
+            .map(|node| {
+                let version = self
+                    .db
+                    .get_node_host_status(&node.id)
+                    .ok()
+                    .flatten()
+                    .map(|host| host.kcore_version)
+                    .unwrap_or_default();
+                (node.id, version)
+            })
+            .collect();
+        let (direction, target_ids) = cluster_version::plan(&release.version, &versions);
+        let mut resp = controller_proto::SetClusterVersionResponse {
+            direction: direction.to_string(),
+            version: tag.clone(),
+            flake_rev: release.flake_rev.clone(),
+            target_node_ids: target_ids.clone(),
+            ..Default::default()
+        };
+        if target_ids.is_empty() {
+            resp.message = format!("every node runs {tag}");
+            return Ok(Response::new(resp));
+        }
+        if req.dry_run {
+            resp.message = format!("dry run: would {direction} {} node(s)", target_ids.len());
+            return Ok(Response::new(resp));
+        }
+
+        let spec =
+            cluster_version::update_spec(&name, &flake_ref, &release, target_ids, req.drain_vms);
+        cluster_update_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
+        let spec_json = cluster_update_spec::spec_to_json(&spec)
+            .map_err(|e| Status::internal(format!("encode spec: {e}")))?;
+        let existing = self.db.get_cluster_update(&name).map_err(internal_db)?;
+        let generation = existing
+            .as_ref()
+            .map(|row| row.generation.saturating_add(1))
+            .unwrap_or(1);
+        self.db
+            .upsert_cluster_update(&ClusterUpdateRow {
+                name: name.clone(),
+                generation,
+                target_version: release.version.clone(),
+                flake_ref: flake_ref.clone(),
+                flake_rev: release.flake_rev.clone(),
+                spec_json,
+                phase: "ready".into(),
+                approval_status: "approved".into(),
+                created_at: existing.map(|row| row.created_at).unwrap_or_default(),
+                updated_at: String::new(),
+            })
+            .map_err(internal_db)?;
+        let node_rows: Vec<ClusterUpdateNodeRow> = resp
+            .target_node_ids
+            .iter()
+            .map(|node_id| ClusterUpdateNodeRow {
+                update_name: name.clone(),
+                node_id: node_id.clone(),
+                observed_generation: generation,
+                phase: "pending".into(),
+                current_version: String::new(),
+                target_version: release.version.clone(),
+                prepared_closure: String::new(),
+                current_generation: String::new(),
+                target_generation: String::new(),
+                requires_reboot: false,
+                last_error: String::new(),
+                last_transition_at: String::new(),
+            })
+            .collect();
+        self.db
+            .replace_cluster_update_nodes(&name, &node_rows)
+            .map_err(internal_db)?;
+        let stored = self
+            .db
+            .get_cluster_update(&name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::internal("cluster update vanished"))?;
+        let _ = self.log_replication_event_required(
+            &actor,
+            Some("SetClusterVersion"),
+            EVT_CLUSTER_UPDATE_CREATE,
+            &name,
+            serde_json::json!({ "generation": generation, "tag": tag, "direction": direction }),
+        );
+        resp.update_name = name;
+        resp.cluster_update = Some(cluster_update_row_to_proto(&stored, spec));
+        resp.message = format!("{direction} to {tag} started");
+        Ok(Response::new(resp))
+    }
+
+    async fn get_cluster_version(
+        &self,
+        request: Request<controller_proto::GetClusterVersionRequest>,
+    ) -> Result<Response<controller_proto::GetClusterVersionResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let latest = self
+            .db
+            .list_cluster_updates()
+            .map_err(internal_db)?
+            .into_iter()
+            .filter(|row| row.name.starts_with(cluster_version::UPDATE_PREFIX))
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let update_nodes = match latest.as_ref() {
+            Some(row) => self
+                .db
+                .list_cluster_update_nodes(&row.name)
+                .map_err(internal_db)?,
+            None => Vec::new(),
+        };
+        let nodes = self
+            .db
+            .list_nodes()
+            .map_err(internal_db)?
+            .into_iter()
+            .map(|node| {
+                let host = self.db.get_node_host_status(&node.id).ok().flatten();
+                let row = update_nodes.iter().find(|row| row.node_id == node.id);
+                controller_proto::NodeVersion {
+                    version: host
+                        .as_ref()
+                        .map(|h| h.kcore_version.clone())
+                        .unwrap_or_default(),
+                    booted_generation: host
+                        .as_ref()
+                        .map(|h| h.booted_generation.clone())
+                        .unwrap_or_default(),
+                    current_generation: host
+                        .as_ref()
+                        .map(|h| h.nixos_generation.clone())
+                        .unwrap_or_default(),
+                    phase: row
+                        .map(|r| node_update_phase_to_proto(&r.phase))
+                        .unwrap_or_default(),
+                    last_error: row.map(|r| r.last_error.clone()).unwrap_or_default(),
+                    node_id: node.id,
+                }
+            })
+            .collect();
+        let mut resp = controller_proto::GetClusterVersionResponse {
+            nodes,
+            ..Default::default()
+        };
+        if let Some(row) = latest {
+            resp.version = format!("v{}", row.target_version);
+            resp.flake_ref = row.flake_ref;
+            resp.flake_rev = row.flake_rev;
+            resp.phase = cluster_update_phase_to_proto(&row.phase);
+            resp.update_name = row.name;
+        }
+        Ok(Response::new(resp))
     }
 
     async fn create_operator(
@@ -24141,6 +24382,7 @@ mod tests {
                 flake_rev: "0123456789abcdef0123456789abcdef01234567".into(),
                 nixpkgs_rev: String::new(),
                 system_profile: String::new(),
+                tag: String::new(),
             }),
             selector: Some(controller_proto::ClusterUpdateSelector {
                 all_nodes: true,
@@ -24363,6 +24605,41 @@ mod tests {
             "succeeded nodes must not be cancelled"
         );
         assert_eq!(by_id["node-2"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn set_cluster_version_waits_for_the_active_update() {
+        let (_db, svc) = cluster_svc();
+        let set = |version: &str| {
+            <ControllerService as controller_proto::controller_server::Controller>::set_cluster_version(
+                &svc,
+                Request::new(controller_proto::SetClusterVersionRequest {
+                    version: version.into(),
+                    ..Default::default()
+                }),
+            )
+        };
+        let bad = set("main").await.expect_err("not a tag");
+        assert_eq!(bad.code(), tonic::Code::InvalidArgument);
+
+        let mut spec = make_cluster_update_spec();
+        spec.approval_policy =
+            controller_proto::ClusterUpdateApprovalPolicy::ClusterUpdateApprovalAuto as i32;
+        <ControllerService as controller_proto::controller_server::Controller>::create_cluster_update(
+            &svc,
+            Request::new(controller_proto::CreateClusterUpdateRequest { spec: Some(spec) }),
+        )
+        .await
+        .expect("create");
+        let busy = set("v0.7.0")
+            .await
+            .expect_err("another update is rolling out");
+        assert_eq!(busy.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            busy.message().contains("release-0-3-0"),
+            "{}",
+            busy.message()
+        );
     }
 
     #[tokio::test]

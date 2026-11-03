@@ -64,6 +64,8 @@ struct Target {
     nixpkgs_rev: String,
     #[serde(default, alias = "system_profile")]
     system_profile: String,
+    #[serde(default)]
+    tag: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -179,6 +181,7 @@ fn to_proto(m: ClusterUpdateManifest) -> controller_proto::ClusterUpdateSpec {
             flake_rev: m.spec.target.flake_rev,
             nixpkgs_rev: m.spec.target.nixpkgs_rev,
             system_profile: m.spec.target.system_profile,
+            tag: m.spec.target.tag,
         }),
         selector: Some(controller_proto::ClusterUpdateSelector {
             node_ids: m.spec.selector.node_ids,
@@ -324,6 +327,70 @@ pub async fn rollback(info: &ConnectionInfo, name: &str) -> Result<()> {
         .await
         .context("rollback_cluster_update rpc")?;
     println!("rollback requested for {name}");
+    Ok(())
+}
+
+pub async fn set_version(
+    info: &ConnectionInfo,
+    version: &str,
+    flake_ref: &str,
+    drain_vms: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .set_cluster_version(controller_proto::SetClusterVersionRequest {
+            version: version.into(),
+            flake_ref: flake_ref.into(),
+            drain_vms,
+            dry_run,
+        })
+        .await
+        .context("set_cluster_version rpc")?
+        .into_inner();
+    println!("{}", resp.message);
+    if !resp.direction.is_empty() {
+        println!("direction: {}", resp.direction);
+    }
+    println!("version: {}  commit: {}", resp.version, resp.flake_rev);
+    for id in &resp.target_node_ids {
+        println!("  - {id}");
+    }
+    if !resp.update_name.is_empty() {
+        println!(
+            "follow it with: kctl update cluster get {}",
+            resp.update_name
+        );
+    }
+    Ok(())
+}
+
+pub async fn get_version(info: &ConnectionInfo) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .get_cluster_version(controller_proto::GetClusterVersionRequest {})
+        .await
+        .context("get_cluster_version rpc")?
+        .into_inner();
+    if resp.version.is_empty() {
+        println!("version: (never set)");
+    } else {
+        let phase = controller_proto::ClusterUpdatePhase::try_from(resp.phase)
+            .map(|p| p.as_str_name())
+            .unwrap_or("UNKNOWN");
+        println!("version: {}  commit: {}", resp.version, resp.flake_rev);
+        println!("update: {}  phase: {phase}", resp.update_name);
+    }
+    for n in &resp.nodes {
+        let phase = controller_proto::NodeUpdatePhase::try_from(n.phase)
+            .map(|p| p.as_str_name())
+            .unwrap_or("UNKNOWN");
+        print!("  {}  {}  {phase}", n.node_id, n.version);
+        if !n.last_error.is_empty() {
+            print!("  {}", n.last_error);
+        }
+        println!();
+    }
     Ok(())
 }
 

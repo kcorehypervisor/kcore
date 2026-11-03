@@ -157,6 +157,12 @@ async fn main() -> anyhow::Result<()> {
     // fresh state would strand the receive session of a migration in progress.
     let live_migrate_state = live_migrate::LiveMigrateState::new();
 
+    // An agent that crashes right after a switch must not confirm it.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let _ = tokio::task::spawn_blocking(system_update::confirm_switch).await;
+    });
+
     if !cfg.controller_endpoints().is_empty() {
         let reg_cfg = cfg.clone();
         let registered = registration::register_with_controller_tracked(reg_cfg);

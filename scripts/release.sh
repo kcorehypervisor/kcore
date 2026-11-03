@@ -199,38 +199,6 @@ cmd_dist() {
   ]
 }
 EOF
-	echo "==> Writing dist/cluster-update-${VERSION}.yaml..."
-	cat >"dist/cluster-update-${VERSION}.yaml" <<EOF
-kind: ClusterUpdate
-metadata:
-  name: release-${VERSION//./-}
-spec:
-  target:
-    version: "${VERSION}"
-    flakeRef: github:kcorehypervisor/kcore
-    flakeRev: "${kcore_rev}"
-    nixpkgsRev: "${nixpkgs_rev}"
-  selector:
-    allNodes: true
-  strategy:
-    strategyType: one-at-a-time
-    maxUnavailable: 1
-    batchSize: 1
-  drainVms: false
-  activation:
-    mode: auto
-  approvalPolicy: manual
-  updateKind: kcore
-  schemaVersion: ${schema_version:-0}
-  previousSchemaVersion: ${min_reader:-0}
-  minCompatibleReader: ${min_reader:-0}
-  testedOsPins:
-    - nixpkgsRev: "${nixpkgs_rev}"
-      cephRev: "${ceph_rev}"
-      cephSha256: "${ceph_sha}"
-      kubernetesVersion: "${k8s_version}"
-EOF
-
 	# Generated here, before SHA256SUMS, so the SBOMs are covered by the
 	# checksums file and therefore by the single signature over it.
 	echo "==> Generating SBOMs..."
@@ -242,7 +210,7 @@ EOF
 	echo "==> Writing dist/SHA256SUMS..."
 	(
 		cd dist
-		sha256sum "${ISO_NAME}" "${KCTL_ARCHIVES[@]}" "${SBOM_FILES[@]}" "kcore-${VERSION}-release.json" "cluster-update-${VERSION}.yaml" >SHA256SUMS
+		sha256sum "${ISO_NAME}" "${KCTL_ARCHIVES[@]}" "${SBOM_FILES[@]}" "kcore-${VERSION}-release.json" >SHA256SUMS
 	)
 	echo "==> dist layout:"
 	ls -lh dist/
@@ -306,7 +274,6 @@ cmd_publish() {
 	done
 	[[ -f dist/SHA256SUMS ]] || die "run '${0} dist' first"
 	[[ -f "dist/kcore-${VERSION}-release.json" ]] || die "run '${0} dist' first (missing release.json)"
-	[[ -f "dist/cluster-update-${VERSION}.yaml" ]] || die "run '${0} dist' first (missing cluster-update yaml)"
 
 	cmd_sign
 
@@ -327,7 +294,6 @@ cmd_publish() {
 		assets+=("dist/${sbom}")
 	done
 	assets+=("dist/kcore-${VERSION}-release.json")
-	assets+=("dist/cluster-update-${VERSION}.yaml")
 	assets+=(dist/SHA256SUMS)
 	# Absent only under --no-sign, which cmd_sign already warned about.
 	if [[ -f "dist/${SIGSTORE_BUNDLE}" ]]; then

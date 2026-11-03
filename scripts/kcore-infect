@@ -674,44 +674,20 @@ fs_options_nix() {
   fi
 }
 
+# The same host flake the ISO installs and a version update writes
+# (nix/host-flake.nix in the kcore tree).
 render_flake() {
   local dir=$1
   cat >"$dir/flake.nix" <<EOF
 {
-  description = "kcore node installed by kcore-infect";
+  description = "kcore node";
 
   inputs.kcore.url = "$FLAKE_URL";
 
   outputs =
     { kcore, ... }:
-    let
-      system = "$SYSTEM";
-    in
     {
-      nixosConfigurations.kcore = kcore.inputs.nixpkgs.lib.nixosSystem {
-        inherit system;
-        specialArgs = {
-          inherit kcore;
-        };
-        modules = [
-          kcore.nixosModules.kcore-host
-          (
-            { kcore, ... }:
-            {
-              services.kcore.version = kcore.packages.\${system}.kcore-node-agent.version;
-              services.kcore.nodeAgent.package = kcore.packages.\${system}.kcore-node-agent;
-              services.kcore.controller.package = kcore.packages.\${system}.kcore-controller;
-              services.kcore.dashboard.package = kcore.packages.\${system}.kcore-dashboard;
-              services.kcore.console.package = kcore.packages.\${system}.kcore-console;
-              services.kcore.kctl.package = kcore.packages.\${system}.kctl;
-            }
-          )
-          ./hardware-configuration.nix
-          ./node.nix
-          ./kcore-vms.nix
-          ./kcore-ceph.nix
-        ];
-      };
+      nixosConfigurations.kcore = kcore.lib.mkNode { root = ./.; };
     };
 }
 EOF
@@ -750,6 +726,7 @@ render_hardware() {
   boot.initrd.kernelModules = [ "nvme" ];
   boot.loader.systemd-boot.enable = false;
 EOF
+    printf '  nixpkgs.hostPlatform = "%s";\n' "$SYSTEM"
     if [[ $USE_LVM == true ]]; then
       printf '%s\n' '  boot.initrd.services.lvm.enable = true;'
     fi

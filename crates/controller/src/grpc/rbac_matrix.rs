@@ -161,6 +161,8 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_AFTER_RENEW: &[(&str, &str)] = &[
     ("CancelClusterUpdate", "cluster-admin"),
     ("RollbackClusterUpdate", "cluster-admin"),
     ("RebootClusterUpdateNode", "cluster-admin"),
+    ("SetClusterVersion", "cluster-admin"),
+    ("GetClusterVersion", "read-only"),
     ("CreateOperator", "cluster-admin"),
     ("DeleteOperator", "cluster-admin"),
     ("ListOperators", "cluster-admin"),
