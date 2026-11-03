@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="A failed host update boots the previous generation. Windows guests run. One physical GPU goes to one VM. Live migration needs Ceph.">
+    <title>Features - kcore hypervisor</title>
+    <link rel="canonical" href="https://kcorehypervisor.com/features.html">
+    <meta name="robots" content="index, follow">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="kcore hypervisor">
+    <meta property="og:title" content="Features - kcore hypervisor">
+    <meta property="og:description" content="A failed host update boots the previous generation. Windows guests run. One physical GPU goes to one VM. Live migration needs Ceph.">
+    <meta property="og:url" content="https://kcorehypervisor.com/features.html">
+    <meta property="og:image" content="https://raw.githubusercontent.com/kcorehypervisor/kcore/main/assets/kcore-logo.png">
+    <meta property="og:image:alt" content="kcore hypervisor logo">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:image" content="https://raw.githubusercontent.com/kcorehypervisor/kcore/main/assets/kcore-logo.png">
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/code-color.css">
+    <style>
+        .features-hero {
+            padding: 8rem 0 4rem;
+            margin-top: 60px;
+            text-align: center;
+            background: linear-gradient(180deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+        }
+
+        .features-hero h1 {
+            margin-bottom: 1rem;
+        }
+
+        .features-hero p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 700px;
+            margin: 0 auto;
+        }
+
+        .lead-facts {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .lead-facts li {
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        .complete-features .lede {
+            color: var(--text-secondary);
+            max-width: 720px;
+            margin: 0 auto 2.5rem;
+            text-align: center;
+        }
+
+        .complete-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem 3rem;
+            text-align: left;
+        }
+
+        .complete-grid h3 {
+            margin-bottom: 0.75rem;
+            font-size: 1.15rem;
+        }
+
+        .complete-grid ul {
+            list-style: none;
+        }
+
+        .complete-grid li {
+            position: relative;
+            padding: 0.35rem 0 0.35rem 1.35rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        .complete-grid li::before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: var(--success);
+        }
+
+        @media (max-width: 800px) {
+            .complete-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .feature-section {
+            padding: 4rem 0;
+        }
+
+        .feature-section:nth-child(even) {
+            background: var(--bg-secondary);
+        }
+
+        .feature-detail {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4rem;
+            align-items: center;
+            margin-bottom: 4rem;
+        }
+
+        .feature-detail:nth-child(even) .feature-detail-text {
+            order: 2;
+        }
+
+        .feature-detail-text h2 {
+            margin-bottom: 1rem;
+        }
+
+        .feature-detail-text p {
+            color: var(--text-secondary);
+            line-height: 1.8;
+            margin-bottom: 1.5rem;
+        }
+
+        .feature-list-items {
+            list-style: none;
+            margin: 1.5rem 0;
+        }
+
+        .feature-list-items li {
+            display: flex;
+            align-items: start;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            padding: 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-primary);
+            border-radius: 0.5rem;
+        }
+
+        .feature-list-items .icon {
+            flex-shrink: 0;
+            width: 2rem;
+            height: 2rem;
+            background: var(--accent-gradient);
+            border-radius: 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
+
+        .feature-visual {
+            background: var(--bg-card);
+            border: 1px solid var(--border-primary);
+            border-radius: 0.75rem;
+            padding: 2rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .feature-visual::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 200px;
+            background: radial-gradient(circle at 50% 0%, rgba(99, 102, 241, 0.1), transparent);
+        }
+
+        .feature-diagram {
+            position: relative;
+            z-index: 1;
+        }
+
+        .diagram-box {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-secondary);
+            border-radius: 0.5rem;
+            padding: 1rem;
+            margin: 0.5rem 0;
+            text-align: center;
+        }
+
+        .diagram-arrow {
+            text-align: center;
+            color: var(--accent-primary);
+            font-size: 1.5rem;
+            margin: 0.5rem 0;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 2rem;
+            margin: 3rem 0;
+        }
+
+        .stat-card {
+            text-align: center;
+            padding: 2rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-primary);
+            border-radius: 0.75rem;
+        }
+
+        .stat-number {
+            font-size: 3rem;
+            font-weight: 700;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 2rem 0;
+            background: var(--bg-card);
+            border: 1px solid var(--border-primary);
+            border-radius: 0.75rem;
+            overflow: hidden;
+        }
+
+        .comparison-table th,
+        .comparison-table td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border-primary);
+        }
+
+        .comparison-table th {
+            background: var(--bg-tertiary);
+            font-weight: 600;
+        }
+
+        .comparison-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .check-mark {
+            color: var(--success);
+            font-size: 1.2rem;
+        }
+
+        .cross-mark {
+            color: var(--text-tertiary);
+            font-size: 1.2rem;
+        }
+
+        @media (max-width: 968px) {
+            .feature-detail {
+                grid-template-columns: 1fr;
+            }
+
+            .feature-detail:nth-child(even) .feature-detail-text {
+                order: 1;
+            }
+
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="container">
+            <div class="nav-brand">
+                <a href="index.html" style="color: inherit; text-decoration: none;">
+                    <span class="logo">kcore</span>
+                    <span class="logo-tag">hypervisor</span>
+                </a>
+            </div>
+            <ul class="nav-menu">
+                <li><a href="features.html" data-i18n="nav.features">Features</a></li>
+                <li><a href="pricing.html" data-i18n="nav.pricing">Pricing</a></li>
+                <li><a href="docs.html" data-i18n="nav.docs">Docs</a></li>
+                <li><a href="roadmap.html">Roadmap</a></li>
+                <li><a href="blog.html" data-i18n="footer.blog">Blog</a></li>
+                <li><a href="index.html#get-started" class="btn-primary" data-i18n="nav.getStarted">Get Started</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <!-- Hero -->
+    <section class="features-hero">
+        <div class="container">
+            <h1 data-i18n="fp.title">What kcore does</h1>
+            <p data-i18n="fp.subtitle">
+                A failed host update boots the previous generation. Windows guests run. The evaluation ISO is free.
+            </p>
+        </div>
+    </section>
+
+    <section class="feature-section">
+        <div class="container">
+            <div class="lead-facts">
+                <h2 data-i18n="fp.lead.title">Read this first</h2>
+                <ul class="feature-list-items">
+                    <li data-i18n="fp.lead.updates">A failed host update boots the previous generation.</li>
+                    <li data-i18n="fp.lead.windows">Windows Server and Windows desktop guests run.</li>
+                    <li data-i18n="fp.lead.gpu">One physical GPU can be assigned to one VM. NVIDIA vGPU, many VMs on one card, is not available.</li>
+                    <li data-i18n="fp.lead.live">Live migration needs shared Ceph storage. Control-plane replication across datacenters is not vSphere HA.</li>
+                    <li data-i18n-html="fp.lead.import">kcore-migrate inventories vCenter or Proxmox and converts exported disks to qcow2 or raw. It does not read disks straight from vCenter. Cutover is a project. See the <a href="docs/user/import.html">import guide</a> and <a href="https://github.com/kcorehypervisor/kcore-migrate">kcore-migrate</a>.</li>
+                    <li data-i18n-html="fp.lead.price">Price is per CPU socket per year. The evaluation ISO is free. Download it from <a href="https://github.com/kcorehypervisor/kcore/releases">GitHub Releases</a>.</li>
+                </ul>
+            </div>
+        </div>
+    </section>
+
+    <section class="feature-section">
+        <div class="container">
+            <div class="lead-facts">
+                <h2 data-i18n="fp.provision.title">Bare-metal install</h2>
+                <p data-i18n="fp.provision.desc">A provisioner configures servers over IPMI and Redfish. It netboots kcore with UEFI HTTP boot.</p>
+            </div>
+        </div>
+    </section>
+
+    <section class="feature-section">
+        <div class="container">
+            <div class="feature-detail">
+                <div class="feature-detail-text">
+                    <h2 data-i18n="fp.atomic.title">A failed update boots the previous generation</h2>
+                    <p data-i18n="fp.atomic.desc">
+                        Host updates are one transaction. If an update fails, the machine boots the previous generation.
+                    </p>
+                    <ul class="feature-list-items">
+                        <li>
+                            <span class="icon">✓</span>
+                            <div>
+                                <strong data-i18n="fp.atomic.f1.title">Immutable Base System</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.atomic.f1.desc">
+                                    The host OS is read-only. Configuration lives in Nix, not scattered across /etc.
+                                </span>
+                            </div>
+                        </li>
+                        <li>
+                            <span class="icon">✓</span>
+                            <div>
+                                <strong data-i18n="fp.atomic.f2.title">Boot into Previous Generation</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.atomic.f2.desc">
+                                    Every NixOS generation is kept. Select a previous one at boot or switch remotely.
+                                </span>
+                            </div>
+                        </li>
+                        <li>
+                            <span class="icon">✓</span>
+                            <div>
+                                <strong data-i18n="fp.atomic.f3.title">Download the ISO</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.atomic.f3.desc">
+                                    Official ISOs are produced from flake.nix. Download the evaluation ISO. You do not build it.
+                                </span>
+                            </div>
+                        </li>
+                    </ul>
+                </div>
+                <div class="feature-visual">
+                    <div class="feature-diagram">
+                        <div class="diagram-box" style="background: rgba(99, 102, 241, 0.1);" data-i18n="fp.diagram.current">
+                            Current generation
+                        </div>
+                        <div class="diagram-arrow">↓</div>
+                        <div class="diagram-box" style="background: rgba(139, 92, 246, 0.1);" data-i18n="fp.diagram.apply">
+                            Apply update
+                        </div>
+                        <div class="diagram-arrow">↓</div>
+                        <div class="diagram-box" style="background: rgba(239, 68, 68, 0.1);" data-i18n="fp.diagram.fails">
+                            Update fails
+                        </div>
+                        <div class="diagram-arrow">↓</div>
+                        <div class="diagram-box" style="background: rgba(99, 102, 241, 0.1);" data-i18n="fp.diagram.previous">
+                            Boot the previous generation
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="feature-section">
+        <div class="container">
+            <div class="lead-facts">
+                <h2 data-i18n="fp.platform.title">For platform teams</h2>
+                <p data-i18n="fp.platform.desc">Terraform, the API, and MCP come after the limits above. They do not remove those limits.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Declarative Infrastructure -->
+    <section class="feature-section">
+        <div class="container">
+            <div class="feature-detail">
+                <div class="feature-detail-text">
+                    <h2 data-i18n="fp.iac.title">Infrastructure as Code</h2>
+                    <p data-i18n-html="fp.iac.desc">
+                        VMs are resources in Terraform. You write HCL, run <code>terraform apply</code>,
+                        and the provider talks to the kcore API over gRPC. Standard workflow, no special tooling.
+                    </p>
+                    <ul class="feature-list-items">
+                        <li>
+                            <span class="icon">📝</span>
+                            <div>
+                                <strong data-i18n="fp.iac.f1.title">Real Terraform Provider</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.iac.f1.desc">
+                                    Written in Go using the Terraform Plugin SDK. Not a shell wrapper.
+                                </span>
+                            </div>
+                        </li>
+                        <li>
+                            <span class="icon">🔄</span>
+                            <div>
+                                <strong data-i18n="fp.iac.f2.title">Git-friendly</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.iac.f2.desc">
+                                    HCL and YAML are text files. Diff them, review them, track changes over time.
+                                </span>
+                            </div>
+                        </li>
+                        <li>
+                            <span class="icon">📊</span>
+                            <div>
+                                <strong data-i18n="fp.iac.f3.title">Desired State</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.iac.f3.desc">
+                                    The controller stores desired state. Node agents reconcile. Standard controller pattern.
+                                </span>
+                            </div>
+                        </li>
+                    </ul>
+                </div>
+                <div class="feature-visual">
+                    <pre style="margin: 0; font-family: var(--font-mono); font-size: 0.875rem; line-height: 1.6;"><code><span class="code-comment"># Provider kcorehypervisor/kcore 0.5.0</span>
+<span class="code-keyword">resource</span> <span class="code-string">"kcore_vm"</span> <span class="code-string">"web"</span> {
+  <span class="code-property">name</span>               = <span class="code-string">"web"</span>
+  <span class="code-property">cpu</span>                = <span class="code-number">2</span>
+  <span class="code-property">memory_bytes</span>       = <span class="code-number">4294967296</span>
+  <span class="code-property">storage_backend</span>    = <span class="code-string">"filesystem"</span>
+  <span class="code-property">storage_size_bytes</span> = <span class="code-number">53687091200</span>
+  <span class="code-property">image_url</span>          = <span class="code-string">"https://example.com/debian.qcow2"</span>
+  <span class="code-property">image_sha256</span>       = <span class="code-string">"&lt;sha256&gt;"</span>
+
+  <span class="code-keyword">nic</span> {
+    <span class="code-property">network</span> = <span class="code-string">"production"</span>
+  }
+}
+
+<span class="code-keyword">resource</span> <span class="code-string">"kcore_vm"</span> <span class="code-string">"db"</span> {
+  <span class="code-property">name</span>               = <span class="code-string">"db"</span>
+  <span class="code-property">cpu</span>                = <span class="code-number">4</span>
+  <span class="code-property">memory_bytes</span>       = <span class="code-number">8589934592</span>
+  <span class="code-property">storage_backend</span>    = <span class="code-string">"lvm"</span>
+  <span class="code-property">storage_size_bytes</span> = <span class="code-number">214748364800</span>
+  <span class="code-property">image_url</span>          = <span class="code-string">"https://example.com/debian.qcow2"</span>
+  <span class="code-property">image_sha256</span>       = <span class="code-string">"&lt;sha256&gt;"</span>
+
+  <span class="code-keyword">nic</span> {
+    <span class="code-property">network</span> = <span class="code-string">"production"</span>
+  }
+}</code></pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- AI Integration -->
+    <section class="feature-section">
+        <div class="container">
+            <div class="feature-detail">
+                <div class="feature-detail-text">
+                    <h2 data-i18n="fp.ai.title">AI Agent Integration</h2>
+                    <p data-i18n="fp.ai.desc">
+                        kcore includes an MCP (Model Context Protocol) server. Any MCP-compatible AI agent
+                        can list nodes, create VMs, check status, and generate Terraform configs through it.
+                    </p>
+                    <ul class="feature-list-items">
+                        <li>
+                            <span class="icon">🤖</span>
+                            <div>
+                                <strong data-i18n="fp.ai.f1.title">MCP Server</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.ai.f1.desc">
+                                    Runs alongside the controller. Exposes tools for VM and node management over MCP.
+                                </span>
+                            </div>
+                        </li>
+                        <li>
+                            <span class="icon">💡</span>
+                            <div>
+                                <strong data-i18n="fp.ai.f2.title">Terraform Output</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.ai.f2.desc">
+                                    Agents generate HCL you can read and modify. No black-box deployments.
+                                </span>
+                            </div>
+                        </li>
+                        <li>
+                            <span class="icon">📈</span>
+                            <div>
+                                <strong data-i18n="fp.ai.f3.title">Query Infrastructure</strong><br>
+                                <span style="color: var(--text-tertiary);" data-i18n="fp.ai.f3.desc">
+                                    Agents can check VM status, node health, and resource usage to help you troubleshoot.
+                                </span>
+                            </div>
+                        </li>
+                    </ul>
+                </div>
+                <div class="feature-visual">
+                    <div style="background: var(--bg-tertiary); border: 1px solid var(--border-primary); border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem;">
+                        <div style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 0.5rem;">User:</div>
+                        <div>"Create a web cluster with 3 servers, load balanced, with a PostgreSQL database"</div>
+                    </div>
+                    <div style="text-align: center; color: var(--accent-primary); margin: 1rem 0;">
+                        ⚡ AI Processing
+                    </div>
+                    <div style="background: var(--bg-tertiary); border: 1px solid var(--border-primary); border-radius: 0.5rem; padding: 1rem;">
+                        <div style="color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 0.5rem;">AI Agent:</div>
+                        <div style="margin-bottom: 1rem;">"I'll create that infrastructure for you:"</div>
+                        <pre style="margin: 0; font-size: 0.75rem; line-height: 1.4;"><code>✓ 3x web servers (4GB RAM each)
+✓ 1x PostgreSQL (8GB RAM)
+✓ Load balancer configured
+✓ Network policies applied</code></pre>
+                        <div style="margin-top: 1rem; padding: 0.5rem; background: rgba(16, 185, 129, 0.1); border-radius: 0.25rem; font-size: 0.875rem;">
+                            ✓ All resources deployed successfully
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Comparison Table -->
+    <section class="feature-section">
+        <div class="container">
+            <h2 style="text-align: center; margin-bottom: 3rem;" data-i18n="fp.compare">How kcore Compares</h2>
+            <table class="comparison-table">
+                <thead>
+                    <tr>
+                        <th data-i18n="fp.compare.feature">Feature</th>
+                        <th>kcore</th>
+                        <th data-i18n="fp.compare.traditional">Traditional VMs</th>
+                        <th data-i18n="fp.compare.containers">Container Orchestration</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td data-i18n="fp.compare.atomic">Atomic Updates</td>
+                        <td><span class="check-mark">✓</span></td>
+                        <td><span class="cross-mark">✗</span></td>
+                        <td><span class="check-mark">✓</span></td>
+                    </tr>
+                    <tr>
+                        <td data-i18n="fp.compare.rollback">Boots the previous generation</td>
+                        <td><span class="check-mark">✓</span></td>
+                        <td><span class="cross-mark">✗</span></td>
+                        <td><span class="cross-mark">✗</span></td>
+                    </tr>
+                    <tr>
+                        <td data-i18n="fp.compare.iac">Infrastructure as Code</td>
+                        <td><span class="check-mark">✓</span></td>
+                        <td><span style="color: var(--warning);" data-i18n="fp.compare.partial">Partial</span></td>
+                        <td><span class="check-mark">✓</span></td>
+                    </tr>
+                    <tr>
+                        <td data-i18n="fp.compare.isolation">Full OS Isolation</td>
+                        <td><span class="check-mark">✓</span></td>
+                        <td><span class="check-mark">✓</span></td>
+                        <td><span class="cross-mark">✗</span></td>
+                    </tr>
+                    <tr>
+                        <td data-i18n="fp.compare.legacy">Legacy App Support</td>
+                        <td><span class="check-mark">✓</span></td>
+                        <td><span class="check-mark">✓</span></td>
+                        <td><span style="color: var(--warning);" data-i18n="fp.compare.limited">Limited</span></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- Complete features -->
+    <section class="feature-section complete-features">
+        <div class="container">
+            <h2 id="complete-features">Complete features</h2>
+            <p class="lede">
+                In the product as of kcore 0.6.1. Work that is still planned stays on the
+                <a href="roadmap.html">roadmap</a>.
+            </p>
+            <div class="complete-grid">
+                <div>
+                    <h3>Virtual machines</h3>
+                    <ul>
+                        <li>Create, update, start, stop, and delete. YAML and Terraform.</li>
+                        <li>Cloud-init, SSH keys, labels, and a wait for boot or SSH.</li>
+                        <li>Windows Server and Windows desktop guests.</li>
+                        <li>Serial console in the browser and from <code>kctl console</code>.</li>
+                        <li>One physical GPU passed through to one VM.</li>
+                        <li>NVIDIA vGPU slices. The host needs an AI Enterprise vGPU manager package.</li>
+                        <li>NAT, bridge, and VXLAN networks, extra NICs, IPv6, and VLANs.</li>
+                        <li>Security groups, DNAT, and an east-west filter on a bridge.</li>
+                        <li>Live and cold migration on Ceph, LVM, and ZFS. A filesystem disk stays put.</li>
+                        <li>Ceph VMs restart on another node after a missed heartbeat.</li>
+                    </ul>
+                </div>
+                <div>
+                    <h3>Containers and ingress</h3>
+                    <ul>
+                        <li>OCI containers on containerd, beside VMs, on one workload API.</li>
+                        <li>Ingress on Caddy with Coraza, automatic certificates, and a keepalived VIP.</li>
+                        <li>Routes to a VM, an external address, or a Kubernetes Service.</li>
+                        <li>WAF detect and block, rate limits, and IP allow and deny lists.</li>
+                    </ul>
+                </div>
+                <div>
+                    <h3>Storage</h3>
+                    <ul>
+                        <li>Filesystem, LVM, ZFS, and Ceph RBD volumes, including resize.</li>
+                        <li>Snapshots, schedules, clone, restore, and flatten on Ceph, ZFS, and LVM.</li>
+                        <li>New Ceph clusters encrypt OSD disks. An RBD volume can be LUKS-encrypted.</li>
+                        <li>Ceph RBD volumes for VM disks, replicated across nodes.</li>
+                        <li>Declarative disk layouts from the installer through day-2.</li>
+                        <li>Changed-block export and import for a backup tool.</li>
+                        <li>kcore Vault: retain-until backups, a ZFS repository, and S3 Object Lock.</li>
+                    </ul>
+                </div>
+                <div>
+                    <h3>Cluster and host services</h3>
+                    <ul>
+                        <li>mTLS, RBAC, an audit log, certificate rotation, CRL, and OCSP.</li>
+                        <li>Dashboard sign-in with a password and TOTP.</li>
+                        <li>Multi-controller replication, including across datacenters.</li>
+                        <li>Scheduler: most free memory, required labels, anti-affinity, overcommit.</li>
+                        <li>ISO install, <code>kcore-infect</code>, approve, cordon, drain, and delete.</li>
+                        <li>Host update as one transaction. A failed boot uses the previous generation.</li>
+                        <li>IPMI and Redfish provisioner, UEFI HTTP boot, PowerDNS, and Kea.</li>
+                        <li>Appliance console on the node.</li>
+                        <li><code>node_exporter</code> and VictoriaMetrics.</li>
+                        <li>Webhooks, an MCP server, and the Terraform provider.</li>
+                        <li>PostgreSQL on the node, one database per node.</li>
+                        <li>Kubernetes on kcoreOS with Cilium.</li>
+                        <li>Slurm on kcoreOS. Compute nodes are left to <code>slurmd</code>.</li>
+                        <li><code>kcore-migrate</code> inventories vCenter or Proxmox and converts exported disks.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta" style="margin-top: 0;">
+        <div class="container">
+            <div class="cta-content">
+                <h2 data-i18n="fp.cta.title">Download the evaluation ISO</h2>
+                <p data-i18n="fp.cta.desc">The evaluation ISO is on GitHub Releases. You do not build it.</p>
+                <div class="cta-buttons">
+                    <a href="https://github.com/kcorehypervisor/kcore/releases" class="btn btn-primary btn-large" data-i18n="fp.cta.download">Download the evaluation ISO</a>
+                    <a href="docs.html" class="btn btn-secondary btn-large" data-i18n="fp.cta.docs">Read the Docs</a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h4>kcore</h4>
+                    <p data-i18n="footer.tagline">Declarative virtualization for edge and datacenters</p>
+                </div>
+                <div class="footer-section">
+                    <h4 data-i18n="footer.product">Product</h4>
+                    <ul>
+                        <li><a href="features.html" data-i18n="nav.features">Features</a></li>
+                        <li><a href="pricing.html" data-i18n="nav.pricing">Pricing</a></li>
+                        <li><a href="roadmap.html">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4 data-i18n="footer.resources">Resources</h4>
+                    <ul>
+                        <li><a href="docs.html" data-i18n="footer.documentation">Documentation</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4 data-i18n="footer.company">Company</h4>
+                    <ul>
+                        <li><a href="about.html" data-i18n="footer.about">About</a></li>
+                        <li><a href="blog.html" data-i18n="footer.blog">Blog</a></li>
+                        <li><a href="https://github.com/kcorehypervisor/kcore">GitHub</a></li>
+                        <li><a href="partners.html" data-i18n="footer.partners">Partners</a></li>
+                        <li><a href="trademark.html" data-i18n="footer.trademark">Trademark</a></li>
+                        <li><a href="mailto:team@tacconiconsulting.com" data-i18n="footer.contact">Contact</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; 2026 Tacconi Consulting Ltd. Registered in England and Wales #16750820.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="js/i18n.js"></script>
+    <script src="js/main.js"></script>
+    <script src="js/code-color.js"></script>
+    <!-- Cloudflare Web Analytics --><script type='module' src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "2bd37d513ccf45fbac6c3f92fa8f3348"}'></script><!-- End Cloudflare Web Analytics -->
+</body>
+</html>
+
+
