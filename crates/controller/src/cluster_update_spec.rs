@@ -58,6 +58,8 @@ pub struct StoredTarget {
     pub nixpkgs_rev: String,
     #[serde(default)]
     pub system_profile: String,
+    #[serde(default)]
+    pub tag: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -105,6 +107,7 @@ fn stored_from_proto(spec: &ClusterUpdateSpec) -> StoredClusterUpdateSpec {
             flake_rev: target.flake_rev,
             nixpkgs_rev: target.nixpkgs_rev,
             system_profile: target.system_profile,
+            tag: target.tag,
         },
         selector: StoredSelector {
             node_ids: selector.node_ids.clone(),
@@ -151,6 +154,7 @@ fn proto_from_stored(s: StoredClusterUpdateSpec) -> ClusterUpdateSpec {
             flake_rev: s.target.flake_rev,
             nixpkgs_rev: s.target.nixpkgs_rev,
             system_profile: s.target.system_profile,
+            tag: s.target.tag,
         }),
         selector: Some(ClusterUpdateSelector {
             node_ids: s.selector.node_ids,
@@ -255,6 +259,9 @@ pub fn validate_spec(spec: &ClusterUpdateSpec) -> Result<(), String> {
     if t.flake_rev.trim().is_empty() {
         return Err("spec.target.flake_rev is required before rollout".into());
     }
+    if !t.tag.trim().is_empty() {
+        crate::cluster_version::normalize_tag(&t.tag)?;
+    }
     let sel = spec
         .selector
         .as_ref()
@@ -309,8 +316,8 @@ pub fn activation_mode_string(spec: &ClusterUpdateSpec) -> &'static str {
         x if x == ClusterUpdateActivationMode::ClusterUpdateActivationTest as i32 => "test",
         x if x == ClusterUpdateActivationMode::ClusterUpdateActivationSwitch as i32 => "switch",
         x if x == ClusterUpdateActivationMode::ClusterUpdateActivationBoot as i32 => "boot",
-        x if x == ClusterUpdateActivationMode::ClusterUpdateActivationAuto as i32 => "switch",
-        _ => "switch",
+        // The node picks switch or boot from the closure it built.
+        _ => "auto",
     }
 }
 
@@ -333,6 +340,7 @@ mod tests {
                 flake_rev: "abc".into(),
                 nixpkgs_rev: "".into(),
                 system_profile: "".into(),
+                tag: "".into(),
             }),
             selector: Some(ClusterUpdateSelector {
                 all_nodes: true,
@@ -391,17 +399,19 @@ mod tests {
     }
 
     #[test]
-    fn activation_mode_string_defaults_to_switch() {
+    fn activation_mode_string_lets_the_node_decide_by_default() {
         let mut spec = one_at_a_time_spec();
         spec.activation_mode =
             ClusterUpdateActivationMode::ClusterUpdateActivationUnspecified as i32;
+        assert_eq!(activation_mode_string(&spec), "auto");
+        spec.activation_mode = ClusterUpdateActivationMode::ClusterUpdateActivationSwitch as i32;
         assert_eq!(activation_mode_string(&spec), "switch");
         spec.activation_mode = ClusterUpdateActivationMode::ClusterUpdateActivationTest as i32;
         assert_eq!(activation_mode_string(&spec), "test");
         spec.activation_mode = ClusterUpdateActivationMode::ClusterUpdateActivationBoot as i32;
         assert_eq!(activation_mode_string(&spec), "boot");
         spec.activation_mode = ClusterUpdateActivationMode::ClusterUpdateActivationAuto as i32;
-        assert_eq!(activation_mode_string(&spec), "switch");
+        assert_eq!(activation_mode_string(&spec), "auto");
     }
 
     fn make_node(id: &str, dc: &str) -> NodeRow {

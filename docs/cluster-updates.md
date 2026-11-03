@@ -1,20 +1,95 @@
 # NixOS-Native Cluster Updates
 
-An installed node keeps its identity in `/etc/nixos/node.nix` and takes packages
-from a host flake, `/etc/nixos#kcore`. `kctl update apply` moves the kcore pin.
-A separate ClusterUpdate with `updateKind: nixpkgs` moves a published OS pin;
-its `nixpkgs` rev must be one of `testedOsPins`. A userspace switch does not reboot. A kernel or
-`kcore-vm-*` unit change is staged with `nixos-rebuild boot` and
-`bootctl set-oneshot`; `kctl update reboot` migrates guests when `drainVms` is
-set, then boots that generation. Schema changes run inside the controller
-binary. `Database::migrate_down` runs before a controlled rollback when the
-step is reversible. A panic reboot relies on the previous schema still opening
-the expanded file.
+An installed node keeps its identity in `/etc/nixos/node.nix` and builds its
+system from a host flake, `/etc/nixos#kcore`. That flake is the same file on
+every node, [`nix/host-flake.nix`](../nix/host-flake.nix): one kcore input
+and `kcore.lib.mkNode { root = ./.; }`. Its `flake.lock` pins the kcore commit
+and every input behind it, so the controller, node agent, dashboard, console,
+`kctl`, and the nixpkgs they were tested with all move together. Updating
+kcore moves that pin and rebuilds the node; it never reinstalls the OS.
 
-The operator-facing intent is declarative: `kctl`, Terraform, and
-Crossplane all submit the same desired update object to the controller. The
-controller coordinates node-agent work, NixOS activation, workload draining,
-health checks, and rollback.
+## Installing a release
+
+A release is a git tag, `vX.Y.Z`. The ISO built from that tag installs
+`inputs.kcore.url = "github:kcorehypervisor/kcore/vX.Y.Z"` with the lock
+generated from the tag's own `flake.lock`. Updating a running node to the
+same tag writes the same `flake.nix` and lets `nix` lock it, which yields the
+same lock. An ISO install and an update to the same tag build the same system.
+
+```bash
+kctl update version set v0.7.0            # upgrade, or downgrade to a lower tag
+kctl update version set v0.7.0 --dry-run   # resolve and compare only
+kctl update version get                    # the version set last and each node's
+```
+
+`SetClusterVersion` (what `kctl` and the Terraform provider call):
+
+1. Resolves the tag with `nix flake metadata` in `--flake-ref` (default
+   `github:kcorehypervisor/kcore`). An unknown tag is refused.
+2. Reads `lib.kcore` from that commit: the version, which must match the tag,
+   and the controller schema. A tag whose controller cannot read this
+   database (`schemaVersion` below `MIN_COMPATIBLE_SCHEMA_READER`) is refused.
+   Tags cut before this change have no `lib.kcore` and are refused too.
+3. Compares the tag with the version each node reports. Nodes already on it
+   are left alone. The answer is `upgrade`, `downgrade`, `mixed`, or
+   `unchanged`.
+4. Starts a ClusterUpdate named `version-vX-Y-Z`: one node at a time,
+   approved, `activation: auto`, and rebooted by the controller when needed.
+   Setting the same tag again while it rolls out returns that update; setting
+   another tag is refused until it finishes or is cancelled.
+
+An air-gapped site resolves tags against a mirror:
+`--flake-ref git+https://git.example/kcore` or `git+file:///srv/kcore`.
+
+## One node, one transaction
+
+The rollout stops at the first node that fails. Nodes not started yet are
+cancelled, nodes already updated stay on the new version, and the failed node
+is left on, or put back on, the generation it ran before. Set the previous tag
+to move the updated nodes back.
+
+On each node:
+
+- **Prepare** copies `/etc/nixos` to `/var/lib/kcore/updates/<name>/host`,
+  writes the release flake there, and builds it. The node checks that the
+  lock pins the commit the controller resolved. A failed build changes
+  nothing.
+- **Switch** (kernel and every `kcore-vm-*` unit unchanged). The new
+  `flake.nix` and `flake.lock` go into `/etc/nixos` (the old ones to
+  `previous/`), a transient `kcore-update-guard` timer is armed, and the node
+  switches. A failed switch restores the old files and switches back at once.
+  The agent on the new generation confirms the switch after 30 seconds; if it
+  never does (it crashed, or the controller unit failed), the guard switches
+  back after 15 minutes.
+- **Boot** (kernel or guest units changed). The generation is staged with
+  `nixos-rebuild boot` and a systemd-boot one-shot entry; `/etc/nixos` keeps
+  the running pins. With `drainVms` the controller migrates guests off the
+  node, then reboots it.
+- **After the reboot** `kcore-boot-confirm` waits for the node agent (and the
+  controller, where it runs) to stay up. Healthy: the entry becomes the
+  default and the new pins go into `/etc/nixos`. Unhealthy within
+  `bootConfirm.timeoutSeconds`: it records why in
+  `/var/lib/kcore/updates/boot-failed`, makes the previous generation the
+  default, and reboots into it. A kernel that panics or hangs never reaches
+  the check; systemd-boot then falls back to the previous entry because the
+  new one was only a one-shot. GRUB nodes (`kcore-infect` on BIOS hosts) have
+  no one-shot, so only the health check protects them.
+
+The node reports `failed` with the reason through `GetSystemUpdateStatus`; the
+controller marks it failed and stops. The controller also gives up on a node
+that does not come back on the staged generation within 30 minutes and asks
+it to roll back. None of this needs the controller to be reachable during the
+reboot, which is what edge and air-gapped nodes need.
+
+Rollback restores the files in `previous/` and rebuilds from them.
+`/etc/kcore/version` comes from the kcore input, so it follows the pin.
+
+Schema changes run inside the controller binary. `Database::migrate_down` runs
+before a controlled rollback when the step is reversible. A panic reboot
+relies on the previous schema still opening the expanded file.
+
+`kctl update cluster apply -f` still takes a hand-written ClusterUpdate
+(`updateKind: nixpkgs` moves a tested OS pin), but releases no longer ship one.
 
 ## Scope
 
@@ -216,9 +291,11 @@ Node phases:
 A switch that restarts the node agent also stops the `nixos-rebuild` the agent
 waits on, so the agent reports a failed activation. The switch itself runs in a
 transient unit and finishes. The controller then waits up to five minutes for
-the node's heartbeat to report the target generation. If it does, the node is
-`Succeeded`. Otherwise it is `Failed` with the agent's error. During that wait
-the node is reported as `Prepared`.
+the node's heartbeat to report the target generation, and fails the node at
+once when the node reports that its guard switched it back. A node that never
+reports the target is rolled back and fails. During that wait the node is
+reported as `Prepared`. A node in `RebootRequired` or `Rebooting` succeeds
+once it has booted the target and `kcore-boot-confirm` has kept it.
 
 ### ControllerUpdateStatus
 

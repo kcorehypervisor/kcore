@@ -4794,6 +4794,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         };
         let update_kind = req.update_kind.clone();
         let nixpkgs_rev = req.nixpkgs_rev.clone();
+        let flake_tag = req.flake_tag.trim().to_string();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_sec),
@@ -4806,6 +4807,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                     nixpkgs_rev,
                     version: flake_rev,
                     had_flake: false,
+                    flake_tag,
                 })
             }),
         )
@@ -4888,6 +4890,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                 message: outcome.message,
                 requires_reboot: outcome.requires_reboot,
                 phase: outcome.phase,
+                target_generation: outcome.target_generation,
             })),
             Err(e) => Ok(Response::new(proto::ActivateSystemUpdateResponse {
                 success: false,
@@ -4912,21 +4915,20 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             .await
             .map_err(|e| Status::internal(format!("join: {e}")))?;
 
-        let phase = if manifest_path.exists() {
-            "prepared"
-        } else {
-            "unknown"
-        };
+        let (phase, target_generation, reason) =
+            crate::system_update::update_status(&manifest_path);
+        let (booted_generation, current_generation) = crate::system_update::current_generations();
         let closure = manifest_path.display().to_string();
 
         Ok(Response::new(proto::GetSystemUpdateStatusResponse {
             success: true,
-            message: String::new(),
-            phase: phase.into(),
+            message: reason,
+            phase,
             prepared_closure: closure,
             systemctl_failed_summary: summary,
-            booted_generation: String::new(),
-            current_generation: String::new(),
+            booted_generation,
+            current_generation,
+            target_generation,
         }))
     }
 

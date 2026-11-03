@@ -14,6 +14,7 @@ mod cert_rotation_reconciler;
 mod cluster_health;
 mod cluster_update_reconciler;
 mod cluster_update_spec;
+mod cluster_version;
 mod config;
 mod crypto_profile;
 mod db;
@@ -223,7 +224,14 @@ async fn main() -> anyhow::Result<()> {
     );
     shared_filesystem_reconciler::spawn_shared_filesystem_reconciler(database.clone());
     object_store_reconciler::spawn_object_store_reconciler(database.clone());
-    cluster_update_reconciler::spawn_cluster_update_reconciler(database.clone(), clients.clone());
+    cluster_update_reconciler::spawn_cluster_update_reconciler(
+        database.clone(),
+        clients.clone(),
+        cluster_update_reconciler::ClusterUpdateReconcilerConfig {
+            default_network: cfg.default_network.clone(),
+            sub_ca: sub_ca.clone(),
+        },
+    );
     snapshot_policy_reconciler::spawn_snapshot_policy_reconciler(database.clone(), clients.clone());
     vm_operation_reconciler::spawn_vm_operation_reconciler(database.clone(), clients.clone());
 

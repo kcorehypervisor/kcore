@@ -480,6 +480,26 @@ enum UpdateClusterCmd {
 }
 
 #[derive(Subcommand)]
+enum UpdateVersionCmd {
+    /// Move every node to a release tag, upgrading or downgrading
+    Set {
+        /// Release tag, for example v0.7.0
+        version: String,
+        /// Repository the tag is resolved in (default github:kcorehypervisor/kcore)
+        #[arg(long)]
+        flake_ref: Option<String>,
+        /// Migrate guests off a node before it reboots into a new kernel
+        #[arg(long)]
+        drain_vms: bool,
+        /// Resolve the tag and show which nodes would change
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the version set last and what each node runs
+    Get,
+}
+
+#[derive(Subcommand)]
 enum RotateResource {
     /// Rotate controller TLS certificate with a new address SAN
     Certs {
@@ -1269,6 +1289,11 @@ enum UpdateResource {
     Cluster {
         #[command(subcommand)]
         action: UpdateClusterCmd,
+    },
+    /// kcore release of the whole cluster
+    Version {
+        #[command(subcommand)]
+        action: UpdateVersionCmd,
     },
 }
 
@@ -2871,6 +2896,29 @@ async fn main() {
                 UpdateClusterCmd::Reboot { name, node } => {
                     commands::cluster_update::reboot(&info, name, node).await
                 }
+            }
+        }
+        Command::Update {
+            resource: UpdateResource::Version { action },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            match action {
+                UpdateVersionCmd::Set {
+                    version,
+                    flake_ref,
+                    drain_vms,
+                    dry_run,
+                } => {
+                    commands::cluster_update::set_version(
+                        &info,
+                        version,
+                        flake_ref.as_deref().unwrap_or(""),
+                        *drain_vms,
+                        *dry_run,
+                    )
+                    .await
+                }
+                UpdateVersionCmd::Get => commands::cluster_update::get_version(&info).await,
             }
         }
 

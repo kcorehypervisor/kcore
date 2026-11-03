@@ -1,8 +1,11 @@
 //! Reconciles [`ClusterUpdate`](crate::controller_proto::ClusterUpdate) rows by
 //! calling [`PrepareSystemUpdate`](crate::node_proto::node_admin_client::NodeAdminClient::prepare_system_update)
 //! then [`ActivateSystemUpdate`](crate::node_proto::node_admin_client::NodeAdminClient::activate_system_update)
-//! on each target node (serial one-at-a-time MVP).
+//! on each target node, one at a time. The first node that fails stops the
+//! rollout: nodes not yet started are cancelled and the failed node is left
+//! on (or put back on) the generation it ran before.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time;
@@ -10,7 +13,9 @@ use tonic::Request;
 use tracing::{debug, warn};
 
 use crate::cluster_update_spec::{activation_mode_string, spec_from_json};
+use crate::config::NetworkConfig;
 use crate::db::{ClusterUpdateNodeRow, ClusterUpdateRow, Database};
+use crate::grpc::{ControllerService, NodeDrainOptions, SubCaState};
 use crate::node_client::NodeClients;
 use crate::node_proto;
 
@@ -18,21 +23,38 @@ const RECONCILE_TICK: Duration = Duration::from_secs(12);
 const NODE_PREPARE_TIMEOUT_SECS: i32 = 3600;
 const NODE_ACTIVATE_TIMEOUT_SECS: i32 = 900;
 const ACTIVATE_CONFIRM_SECS: i64 = 300;
+/// From the reboot until the node confirms the staged generation. Covers the
+/// boot, kcore-boot-confirm's own timeout, and a reboot back.
+const REBOOT_CONFIRM_SECS: i64 = 1800;
 
-pub fn spawn_cluster_update_reconciler(db: Database, clients: NodeClients) {
+/// What the reconciler needs to migrate guests before a reboot.
+pub struct ClusterUpdateReconcilerConfig {
+    pub default_network: NetworkConfig,
+    pub sub_ca: Arc<Mutex<SubCaState>>,
+}
+
+pub fn spawn_cluster_update_reconciler(
+    db: Database,
+    clients: NodeClients,
+    cfg: ClusterUpdateReconcilerConfig,
+) {
     tokio::spawn(async move {
         let mut ticker = time::interval(RECONCILE_TICK);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Err(e) = reconcile_once(&db, &clients).await {
+            if let Err(e) = reconcile_once(&db, &clients, &cfg).await {
                 warn!(error = %e, "cluster update reconcile tick failed");
             }
         }
     });
 }
 
-async fn reconcile_once(db: &Database, clients: &NodeClients) -> Result<(), String> {
+async fn reconcile_once(
+    db: &Database,
+    clients: &NodeClients,
+    cfg: &ClusterUpdateReconcilerConfig,
+) -> Result<(), String> {
     let updates: Vec<ClusterUpdateRow> = db
         .list_cluster_updates_for_reconcile()
         .map_err(|e| format!("list cluster updates: {e}"))?;
@@ -41,7 +63,7 @@ async fn reconcile_once(db: &Database, clients: &NodeClients) -> Result<(), Stri
     }
     debug!(count = updates.len(), "cluster update reconcile");
     for u in updates {
-        if let Err(e) = reconcile_update(db, clients, &u).await {
+        if let Err(e) = reconcile_update(db, clients, cfg, &u).await {
             warn!(
                 error = %e,
                 name = %u.name,
@@ -55,6 +77,7 @@ async fn reconcile_once(db: &Database, clients: &NodeClients) -> Result<(), Stri
 async fn reconcile_update(
     db: &Database,
     clients: &NodeClients,
+    cfg: &ClusterUpdateReconcilerConfig,
     update: &ClusterUpdateRow,
 ) -> Result<(), String> {
     let mut nodes = db
@@ -67,6 +90,17 @@ async fn reconcile_update(
     if update.phase == "ready" {
         db.patch_cluster_update_phase(&update.name, "rolling_out")
             .map_err(|e| format!("patch phase rolling_out: {e}"))?;
+    }
+
+    if update.phase != "rolling_back" {
+        if let Some(failed) = first_failed(&nodes) {
+            for node_row in nodes.iter_mut().filter(|n| not_started(&n.phase)) {
+                node_row.phase = "cancelled".into();
+                node_row.last_error = format!("not started: {failed} failed");
+                db.upsert_cluster_update_node(node_row)
+                    .map_err(|e| format!("cancel node after failure: {e}"))?;
+            }
+        }
     }
 
     // Terminal cluster phases handled below when all nodes settle.
@@ -176,6 +210,14 @@ async fn reconcile_update(
                         .as_ref()
                         .map(|t| t.nixpkgs_rev.clone())
                         .unwrap_or_default(),
+                    flake_tag: if has_generation {
+                        spec.target
+                            .as_ref()
+                            .map(|t| t.tag.clone())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
                     ..Default::default()
                 };
                 let result = prepare_on_node(clients, &address, req).await;
@@ -326,7 +368,7 @@ async fn reconcile_update(
                             target_version: update.target_version.clone(),
                             prepared_closure: node_row.prepared_closure.clone(),
                             current_generation: node_row.current_generation.clone(),
-                            target_generation: node_row.target_generation.clone(),
+                            target_generation: activated_generation(node_row, &resp),
                             requires_reboot: resp.requires_reboot,
                             last_error: String::new(),
                             last_transition_at: String::new(),
@@ -381,6 +423,7 @@ async fn reconcile_update(
                     Ok(resp) if resp.success => {
                         db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
                             phase: "waiting_ready".into(),
+                            target_generation: activated_generation(node_row, &resp),
                             requires_reboot: resp.requires_reboot,
                             last_error: node_row.last_error.clone(),
                             ..node_row.clone()
@@ -457,7 +500,21 @@ async fn reconcile_update(
                 }
             }
             "confirming" => {
+                if let Some(reason) = node_reports_failure(clients, &address, node_row).await {
+                    db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                        phase: "failed".into(),
+                        last_error: reason,
+                        ..node_row.clone()
+                    })
+                    .map_err(|e| format!("mark reverted node failed: {e}"))?;
+                    return Ok(());
+                }
                 let host = db.get_node_host_status(&node_row.node_id).ok().flatten();
+                let running = host
+                    .as_ref()
+                    .map(|row| row.nixos_generation.clone())
+                    .unwrap_or_default();
+                refresh_target_generation(db, clients, &address, node_row, &running).await?;
                 let age_secs = db
                     .cluster_update_node_age_secs(&update.name, &node_row.node_id)
                     .map_err(|e| format!("read confirming age: {e}"))?;
@@ -481,17 +538,101 @@ async fn reconcile_update(
                         .map_err(|e| format!("mark confirmed node succeeded: {e}"))?;
                     }
                     Some(false) => {
-                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
-                            phase: "failed".into(),
-                            ..node_row.clone()
-                        })
-                        .map_err(|e| format!("mark unconfirmed node failed: {e}"))?;
+                        let reason = format!(
+                            "the node did not run the target generation within {ACTIVATE_CONFIRM_SECS}s"
+                        );
+                        fail_and_revert(db, clients, &address, node_row, reason).await?;
                     }
                     None => {}
                 }
                 return Ok(());
             }
-            "reboot_required" => {}
+            "reboot_required" | "rebooting" => {
+                let status = status_on_node(
+                    clients,
+                    &address,
+                    node_proto::GetSystemUpdateStatusRequest {
+                        update_name: node_row.update_name.clone(),
+                    },
+                )
+                .await;
+                let age_secs = db
+                    .cluster_update_node_age_secs(&update.name, &node_row.node_id)
+                    .map_err(|e| format!("read reboot age: {e}"))?;
+                let timed_out = node_row.phase == "rebooting" && age_secs >= REBOOT_CONFIRM_SECS;
+                let Ok(status) = status else {
+                    if timed_out {
+                        let reason = format!(
+                            "the node did not come back on the staged generation within {REBOOT_CONFIRM_SECS}s"
+                        );
+                        fail_and_revert(db, clients, &address, node_row, reason).await?;
+                    }
+                    return Ok(());
+                };
+                if status.phase == "failed" {
+                    db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                        phase: "failed".into(),
+                        last_error: format!(
+                            "{}; the node booted its previous generation",
+                            status.message
+                        ),
+                        ..node_row.clone()
+                    })
+                    .map_err(|e| format!("mark reverted node failed: {e}"))?;
+                    return Ok(());
+                }
+                if !status.target_generation.is_empty()
+                    && status.target_generation != node_row.target_generation
+                {
+                    node_row.target_generation = status.target_generation.clone();
+                }
+                match reboot_step(node_row, &status, &spec.reboot_policy, timed_out) {
+                    RebootStep::Succeeded => {
+                        db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                            phase: "succeeded".into(),
+                            requires_reboot: false,
+                            last_error: String::new(),
+                            ..node_row.clone()
+                        })
+                        .map_err(|e| format!("mark rebooted node succeeded: {e}"))?;
+                    }
+                    RebootStep::Reboot => {
+                        let svc = ControllerService::new(
+                            db.clone(),
+                            clients.clone(),
+                            cfg.default_network.clone(),
+                            cfg.sub_ca.clone(),
+                            None,
+                            false,
+                            false,
+                        );
+                        let drain = NodeDrainOptions {
+                            mark_draining_at_start: false,
+                            update_final_node_status: false,
+                        };
+                        match svc
+                            .reboot_update_node(node_row, spec.drain_vms, drain)
+                            .await
+                        {
+                            Ok(message) => {
+                                debug!(node_id = %node_row.node_id, %message, "cluster update reboot");
+                            }
+                            Err(err) => {
+                                let reason = format!("reboot: {}", err.message());
+                                fail_and_revert(db, clients, &address, node_row, reason).await?;
+                            }
+                        }
+                    }
+                    RebootStep::TimedOut => {
+                        let reason = format!(
+                            "the staged generation was not confirmed within {REBOOT_CONFIRM_SECS}s"
+                        );
+                        fail_and_revert(db, clients, &address, node_row, reason).await?;
+                    }
+                    RebootStep::Wait => {}
+                }
+                return Ok(());
+            }
             "rolling_back" => {
                 let schema_owner = db
                     .get_node_host_status(&node_row.node_id)
@@ -537,6 +678,147 @@ async fn reconcile_update(
         }
     }
     Ok(())
+}
+
+fn first_failed(nodes: &[ClusterUpdateNodeRow]) -> Option<String> {
+    nodes
+        .iter()
+        .find(|n| n.phase == "failed")
+        .map(|n| n.node_id.clone())
+}
+
+/// Nothing was activated on these nodes yet.
+fn not_started(phase: &str) -> bool {
+    matches!(phase, "pending" | "prepared")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RebootStep {
+    Succeeded,
+    Reboot,
+    TimedOut,
+    Wait,
+}
+
+/// A staged boot succeeds once the node booted the target and
+/// kcore-boot-confirm has blessed it. `auto` reboots a node that has not
+/// booted it yet; any other policy waits for `kctl update cluster reboot`.
+fn reboot_step(
+    node_row: &ClusterUpdateNodeRow,
+    status: &node_proto::GetSystemUpdateStatusResponse,
+    reboot_policy: &str,
+    timed_out: bool,
+) -> RebootStep {
+    let booted_target = !node_row.target_generation.is_empty()
+        && crate::kubernetes_lifecycle::generation_is_current(
+            "",
+            &status.booted_generation,
+            &node_row.target_generation,
+            true,
+        );
+    if booted_target && status.phase == "activated" {
+        RebootStep::Succeeded
+    } else if timed_out {
+        RebootStep::TimedOut
+    } else if node_row.phase == "reboot_required" && reboot_policy == "auto" && !booted_target {
+        RebootStep::Reboot
+    } else {
+        RebootStep::Wait
+    }
+}
+
+/// The node's own account of a failed update. It has already gone back to
+/// the previous generation when it reports one.
+async fn node_reports_failure(
+    clients: &NodeClients,
+    address: &str,
+    node_row: &ClusterUpdateNodeRow,
+) -> Option<String> {
+    let status = status_on_node(
+        clients,
+        address,
+        node_proto::GetSystemUpdateStatusRequest {
+            update_name: node_row.update_name.clone(),
+        },
+    )
+    .await
+    .ok()?;
+    (status.phase == "failed").then_some(status.message)
+}
+
+/// Put the node back on the generation it ran before the update, then mark
+/// it failed, which stops the rollout.
+async fn fail_and_revert(
+    db: &Database,
+    clients: &NodeClients,
+    address: &str,
+    node_row: &ClusterUpdateNodeRow,
+    reason: String,
+) -> Result<(), String> {
+    let undo = rollback_on_node(
+        clients,
+        address,
+        node_proto::RollbackSystemUpdateRequest {
+            update_name: node_row.update_name.clone(),
+        },
+    )
+    .await;
+    let last_error = match undo {
+        Ok(resp) if resp.success => format!("{reason}; {}", resp.message),
+        Ok(resp) => format!("{reason}; rollback failed: {}", resp.message),
+        Err(e) => format!("{reason}; rollback failed: {e}"),
+    };
+    db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+        phase: "failed".into(),
+        last_error,
+        ..node_row.clone()
+    })
+    .map_err(|e| format!("mark node failed: {e}"))
+}
+
+/// The agent rebuilds with the node config current at activation, so the
+/// activated closure replaces the one recorded at prepare.
+fn activated_generation(
+    node_row: &ClusterUpdateNodeRow,
+    resp: &node_proto::ActivateSystemUpdateResponse,
+) -> String {
+    if resp.target_generation.is_empty() {
+        node_row.target_generation.clone()
+    } else {
+        resp.target_generation.clone()
+    }
+}
+
+/// When the node does not run the recorded target, ask it which closure it
+/// activated. A switch that restarted the agent never returned that closure.
+async fn refresh_target_generation(
+    db: &Database,
+    clients: &NodeClients,
+    address: &str,
+    node_row: &mut ClusterUpdateNodeRow,
+    running: &str,
+) -> Result<(), String> {
+    if running.is_empty() || running == node_row.target_generation {
+        return Ok(());
+    }
+    let Ok(status) = status_on_node(
+        clients,
+        address,
+        node_proto::GetSystemUpdateStatusRequest {
+            update_name: node_row.update_name.clone(),
+        },
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    if status.target_generation.is_empty() || status.target_generation == node_row.target_generation
+    {
+        return Ok(());
+    }
+    node_row.target_generation = status.target_generation;
+    db.upsert_cluster_update_node(node_row)
+        .map_err(|e| format!("record activated generation: {e}"))
 }
 
 /// A switch that restarts the node agent kills the `nixos-rebuild` the agent
@@ -853,6 +1135,27 @@ async fn activate_on_node(
         .into_inner())
 }
 
+async fn status_on_node(
+    clients: &NodeClients,
+    address: &str,
+    req: node_proto::GetSystemUpdateStatusRequest,
+) -> Result<node_proto::GetSystemUpdateStatusResponse, String> {
+    if clients.get_admin(address).is_none() {
+        clients
+            .connect(address)
+            .await
+            .map_err(|e| format!("connect node {address}: {e}"))?;
+    }
+    let mut admin = clients
+        .get_admin(address)
+        .ok_or_else(|| format!("no admin client for {address}"))?;
+    Ok(admin
+        .get_system_update_status(Request::new(req))
+        .await
+        .map_err(|e| format!("get_system_update_status: {e}"))?
+        .into_inner())
+}
+
 async fn rollback_on_node(
     clients: &NodeClients,
     address: &str,
@@ -974,5 +1277,81 @@ mod tests {
             vec!["node-105", "node-107", "node-119"]
         );
         assert!(peer_candidates(&[member("node-200", "worker")], "node-200").is_empty());
+    }
+
+    fn node_status(booted: &str, phase: &str) -> node_proto::GetSystemUpdateStatusResponse {
+        node_proto::GetSystemUpdateStatusResponse {
+            success: true,
+            phase: phase.into(),
+            booted_generation: booted.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_staged_boot_succeeds_only_once_the_node_kept_it() {
+        let mut row = update_node("/nix/store/new", true);
+        row.phase = "rebooting".into();
+        let step = |booted, phase, timed_out| {
+            reboot_step(&row, &node_status(booted, phase), "auto", timed_out)
+        };
+        assert_eq!(
+            step("/nix/store/new", "activated", false),
+            RebootStep::Succeeded
+        );
+        assert_eq!(
+            step("/nix/store/new", "boot_pending", false),
+            RebootStep::Wait
+        );
+        assert_eq!(
+            step("/nix/store/old", "boot_pending", false),
+            RebootStep::Wait
+        );
+        assert_eq!(
+            step("/nix/store/new", "boot_pending", true),
+            RebootStep::TimedOut
+        );
+    }
+
+    #[test]
+    fn only_the_auto_policy_reboots_a_staged_node() {
+        let mut row = update_node("/nix/store/new", true);
+        row.phase = "reboot_required".into();
+        let pending = node_status("/nix/store/old", "boot_pending");
+        assert_eq!(
+            reboot_step(&row, &pending, "auto", false),
+            RebootStep::Reboot
+        );
+        assert_eq!(
+            reboot_step(&row, &pending, "if-required", false),
+            RebootStep::Wait
+        );
+        let rebooted = node_status("/nix/store/new", "activated");
+        assert_eq!(
+            reboot_step(&row, &rebooted, "if-required", false),
+            RebootStep::Succeeded
+        );
+    }
+
+    #[test]
+    fn a_failure_cancels_only_nodes_that_have_not_started() {
+        let mut failed = update_node("", false);
+        failed.phase = "failed".into();
+        failed.node_id = "node-1".into();
+        let mut done = update_node("", false);
+        done.phase = "succeeded".into();
+        assert_eq!(first_failed(&[done.clone(), failed]), Some("node-1".into()));
+        assert_eq!(first_failed(&[done]), None);
+        assert!(not_started("pending"));
+        assert!(not_started("prepared"));
+        for phase in [
+            "succeeded",
+            "confirming",
+            "reboot_required",
+            "rebooting",
+            "drained",
+        ] {
+            assert!(!not_started(phase), "{phase}");
+        }
     }
 }

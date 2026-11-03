@@ -1271,6 +1271,9 @@ message PrepareSystemUpdateRequest {
   string ceph_sha256 = 10;
   string kubernetes_version = 11;
   bool requires_nixpkgs = 12;
+  // Release tag (vX.Y.Z). The node stages the release host flake for this
+  // tag and checks that its lock pins flake_rev.
+  string flake_tag = 13;
 }
 
 message PrepareSystemUpdateResponse {
@@ -1294,6 +1297,9 @@ message ActivateSystemUpdateResponse {
   string message = 2;
   bool requires_reboot = 3;
   string phase = 4;
+  // System closure that was activated. Differs from the prepared one when
+  // node config (VMs, Ceph) changed between prepare and activate.
+  string target_generation = 5;
 }
 
 message GetSystemUpdateStatusRequest {
@@ -1308,6 +1314,7 @@ message GetSystemUpdateStatusResponse {
   string systemctl_failed_summary = 5;
   string booted_generation = 6;
   string current_generation = 7;
+  string target_generation = 8;
 }
 
 message RollbackSystemUpdateRequest {

@@ -209,6 +209,10 @@ service Controller {
   rpc RollbackClusterUpdate(RollbackClusterUpdateRequest) returns (RollbackClusterUpdateResponse);
   // Migrate guests off one node, then boot a staged kernel. Not part of apply.
   rpc RebootClusterUpdateNode(RebootClusterUpdateNodeRequest) returns (RebootClusterUpdateNodeResponse);
+  // Move every node to a release tag. Upgrades and downgrades alike start a
+  // one-at-a-time ClusterUpdate that stops at the first failing node.
+  rpc SetClusterVersion(SetClusterVersionRequest) returns (SetClusterVersionResponse);
+  rpc GetClusterVersion(GetClusterVersionRequest) returns (GetClusterVersionResponse);
 
   // CephCluster — declarative cluster-scoped Ceph SAN configuration.
   rpc PlanCephCluster(PlanCephClusterRequest) returns (PlanCephClusterResponse);
@@ -2529,6 +2533,9 @@ message ClusterUpdateTarget {
   string flake_rev = 3;
   string nixpkgs_rev = 4;
   string system_profile = 5;
+  // Release tag (vX.Y.Z). Nodes install the release host flake for this tag,
+  // the same flake.nix and flake.lock the tag's ISO installs.
+  string tag = 6;
 }
 
 message ClusterUpdateSelector {
@@ -2630,6 +2637,8 @@ enum NodeUpdatePhase {
   NODE_UPDATE_PHASE_CANCELLED = 5;
   NODE_UPDATE_PHASE_ROLLING_BACK = 6;
   NODE_UPDATE_PHASE_REBOOT_REQUIRED = 7;
+  // Rebooted into the staged generation; waiting for the node to confirm it.
+  NODE_UPDATE_PHASE_REBOOTING = 8;
 }
 
 message NodeUpdateStatus {
@@ -2725,6 +2734,53 @@ message RebootClusterUpdateNodeRequest {
 message RebootClusterUpdateNodeResponse {
   bool success = 1;
   string message = 2;
+}
+
+message SetClusterVersionRequest {
+  // Release tag, vX.Y.Z.
+  string version = 1;
+  // Repository the tag is resolved in. Empty means github:kcorehypervisor/kcore.
+  // An air-gapped site names its mirror, for example git+https://git.example/kcore.
+  string flake_ref = 2;
+  // Migrate guests off a node before it reboots into a new kernel.
+  bool drain_vms = 3;
+  // Resolve and compare only.
+  bool dry_run = 4;
+}
+
+message SetClusterVersionResponse {
+  // "upgrade", "downgrade", "mixed" (nodes on both sides), or "unchanged".
+  string direction = 1;
+  string version = 2;
+  // Commit the tag resolved to.
+  string flake_rev = 3;
+  repeated string target_node_ids = 4;
+  // Empty when nothing changes or on a dry run.
+  string update_name = 5;
+  ClusterUpdate cluster_update = 6;
+  string message = 7;
+}
+
+message GetClusterVersionRequest {}
+
+message NodeVersion {
+  string node_id = 1;
+  string version = 2;
+  string booted_generation = 3;
+  string current_generation = 4;
+  // Node phase in the latest version update, empty when it was not part of it.
+  NodeUpdatePhase phase = 5;
+  string last_error = 6;
+}
+
+message GetClusterVersionResponse {
+  // Last version set with SetClusterVersion, empty when none was.
+  string version = 1;
+  string flake_ref = 2;
+  string flake_rev = 3;
+  string update_name = 4;
+  ClusterUpdatePhase phase = 5;
+  repeated NodeVersion nodes = 6;
 }
 
 // --- CephCluster ----------------------------------------------------------------------------

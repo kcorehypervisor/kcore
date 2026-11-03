@@ -88,7 +88,6 @@ The release packaging step produces:
 - `dist/kcore-$(VERSION)-crates.cdx.json` (CycloneDX SBOM of the Rust dependency graph)
 - `dist/kcore-$(VERSION)-iso-closure.cdx.json` and `.spdx.json` (the ISO's Nix closure, both formats)
 - `dist/kcore-$(VERSION)-release.json` (the version contract: commit, schema, tested OS pins, docs URL, Terraform provider coordinate)
-- `dist/cluster-update-$(VERSION).yaml` (the `ClusterUpdate` manifest for that commit)
 - `dist/SHA256SUMS` for all assets
 - `dist/SHA256SUMS.sigstore.json` from the publish step (absent under `--no-sign`)
 
@@ -119,7 +118,7 @@ committed, so nothing about them runs in pull-request CI.
    KCORE_SIGNER_IDENTITY='you@example.org' make verify-release V=vX.Y.Z
    ```
 
-2. **Check the release page** lists the ISO, the three `kctl` archives, both SBOMs, `kcore-$(VERSION)-release.json`, `cluster-update-$(VERSION).yaml`, and `SHA256SUMS.sigstore.json`.
+2. **Check the release page** lists the ISO, the three `kctl` archives, both SBOMs, `kcore-$(VERSION)-release.json`, and `SHA256SUMS.sigstore.json`.
 
 3. **Spot-check an SBOM.** `make sbom` is fast and deterministic enough that a
    mismatch means something went wrong in packaging rather than in the tool.
@@ -138,14 +137,15 @@ RELEASE_NOTES=path/to/notes.md GH_TOKEN=... make release-publish
 
 ## What one version ships
 
-`VERSION` names the ISO, the git tag, the docs tree, and the Terraform provider. `dist/kcore-$(VERSION)-release.json` is the contract those artifacts copy. `dist/cluster-update-$(VERSION).yaml` is the manifest an operator applies:
+`VERSION` names the ISO, the git tag, the docs tree, and the Terraform provider. `dist/kcore-$(VERSION)-release.json` is the contract those artifacts copy. The tag is what an operator installs:
 
 ```bash
-kctl update cluster plan -f cluster-update-X.Y.Z.yaml
-kctl update cluster apply -f cluster-update-X.Y.Z.yaml
+kctl update version set vX.Y.Z
 ```
 
-`kctl` submits that file to the controller. It does not download a package. The node rewrites `/etc/nixos/flake.nix` so `inputs.kcore.url` is `github:kcorehypervisor/kcore/<commit>` and runs `nix build`. On the Community Edition that build compiles the Rust packages on the node. Nixpkgs still comes from `cache.nixos.org`.
+The controller resolves the tag to its commit, reads `lib.kcore` from that commit's flake (version and schema), and rolls every node that runs another version to it, one node at a time. A lower tag is a downgrade. Each node writes the tag's host flake (`nix/host-flake.nix`, with `inputs.kcore.url = "github:kcorehypervisor/kcore/vX.Y.Z"`) and lets `nix` lock it, so its `/etc/nixos/flake.nix` and `flake.lock` match what the vX.Y.Z ISO installs. On the Community Edition the build compiles the Rust packages on the node. Nixpkgs still comes from `cache.nixos.org`.
+
+The ISO built from the tag checkout ships that flake and its lock, so an air-gapped install needs no network. Tag updates on an air-gapped site resolve against a mirror: `kctl update version set vX.Y.Z --flake-ref git+https://mirror.example/kcore`.
 
 A later private channel will serve prebuilt closures of newer versions, plus the kcore provisioner and the backup service. That channel is not part of this Community release. Community nodes keep compiling the public git commit.
 
@@ -159,7 +159,7 @@ After the GitHub Release is up:
 
    `/docs/user/` stays the latest stable pages. `/docs/X.Y.Z/` is the frozen copy. The schema version is `SCHEMA_VERSION` in `crates/controller/src/db.rs`.
 
-2. Cut `terraform-provider-kcore` at the same `X.Y.Z`. The `kcore_slurm_cluster` resource is cut with the same `VERSION`. Its `kcore_cluster_update` resource must accept the same target, strategy, `update_kind`, tested pins, and schema fields as the YAML. Publish it to the Terraform Registry. Reboot stays `kctl update cluster reboot`.
+2. Cut `terraform-provider-kcore` at the same `X.Y.Z`. The `kcore_slurm_cluster` resource is cut with the same `VERSION`. Its cluster version resource takes the release tag and calls `SetClusterVersion`; changing the tag starts the upgrade or downgrade. Publish it to the Terraform Registry.
 
 3. `make verify-release` checks the signature. It does not deploy the site or the provider.
 

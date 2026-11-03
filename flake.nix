@@ -56,6 +56,7 @@
               path: type:
               (craneLib.filterCargoSources path type)
               || pkgs.lib.hasPrefix "${toString ./.}/proto/" (toString path)
+              || (toString path) == "${toString ./.}/nix/host-flake.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/ingress/" (toString path)
               || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/slurm/" (toString path)
               || pkgs.lib.hasPrefix "${toString ./.}/examples/ingress/" (toString path)
@@ -345,8 +346,131 @@
           cephModule = ./modules/kcore-ceph.nix;
           slurmModule = ./modules/kcore-slurm.nix;
           metricsModule = ./modules/kcore-metrics.nix;
+          inherit (inputs.nixpkgs) lib;
+
+          # `pub const NAME: i32 = N;` from the controller, read line by line:
+          # a regex over the whole file overflows the evaluator's stack.
+          controllerConst =
+            name:
+            let
+              prefix = "pub const ${name}: i32 = ";
+              line = lib.findFirst (lib.hasPrefix prefix) "" (
+                lib.splitString "\n" (builtins.readFile ./crates/controller/src/db.rs)
+              );
+            in
+            lib.toInt (lib.removeSuffix ";" (lib.removePrefix prefix line));
+
+          # Node-local files a host flake directory may hold. mkNode imports
+          # the ones that exist.
+          hostFiles = [
+            "hardware-configuration.nix"
+            "node.nix"
+            "kcore-vms.nix"
+            "kcore-ceph.nix"
+            "kcore-slurm.nix"
+            "legacy-configuration.nix"
+          ];
+
+          # Sources of every flake input. An installed node evaluates its host
+          # flake on each rebuild and must find them without network access.
+          flakeInputPaths =
+            let
+              go = flake: [ flake.outPath ] ++ lib.concatMap go (builtins.attrValues (flake.inputs or { }));
+            in
+            lib.unique (lib.concatMap go (builtins.attrValues (removeAttrs inputs [ "self" ])));
+
+          releaseTag = "v${kcoreVersion}";
+          hostFlakeText =
+            url: builtins.replaceStrings [ "@KCORE_URL@" ] [ url ] (builtins.readFile ./nix/host-flake.nix);
+
+          # flake.lock for a host flake that names this release by tag. Built
+          # from this checkout, so the ISO installs it without fetching: the
+          # GitHub archive of the tag has the same NAR hash as this tree. Only
+          # a clean checkout has a rev.
+          kcoreLock = builtins.fromJSON (builtins.readFile ./flake.lock);
+          underKcore = lib.mapAttrs (_: v: if builtins.isList v then [ "kcore" ] ++ v else v);
+          hostFlakeLock = builtins.toJSON {
+            version = 7;
+            root = "root";
+            nodes =
+              lib.mapAttrs (
+                _: node: node // lib.optionalAttrs (node ? inputs) { inputs = underKcore node.inputs; }
+              ) (removeAttrs kcoreLock.nodes [ kcoreLock.root ])
+              // {
+                root.inputs.kcore = "kcore";
+                kcore = {
+                  inputs = underKcore kcoreLock.nodes.${kcoreLock.root}.inputs;
+                  locked = {
+                    type = "github";
+                    owner = "kcorehypervisor";
+                    repo = "kcore";
+                    inherit (inputs.self) rev narHash lastModified;
+                  };
+                  original = {
+                    type = "github";
+                    owner = "kcorehypervisor";
+                    repo = "kcore";
+                    ref = releaseTag;
+                  };
+                };
+              };
+          };
         in
         {
+          lib = {
+            # Read by the controller before it accepts a version update.
+            kcore = {
+              version = kcoreVersion;
+              tag = releaseTag;
+              schemaVersion = controllerConst "SCHEMA_VERSION";
+              minCompatibleSchemaReader = controllerConst "MIN_COMPATIBLE_SCHEMA_READER";
+            };
+            inherit hostFiles;
+            hostFlake = hostFlakeText;
+
+            # The NixOS system of an installed node. `root` is the host flake
+            # directory; its node-local files are imported when present. The
+            # OS comes from the nixpkgs this kcore commit locks. The platform
+            # is the hardware configuration's nixpkgs.hostPlatform; `system`
+            # only applies when that file does not set one.
+            mkNode =
+              {
+                root,
+                system ? "x86_64-linux",
+                modules ? [ ],
+              }:
+              inputs.nixpkgs.lib.nixosSystem {
+                specialArgs.kcore = inputs.self;
+                modules = [
+                  inputs.self.nixosModules.kcore-host
+                  { nixpkgs.hostPlatform = lib.mkOverride 1500 system; }
+                  (
+                    { lib, pkgs, ... }:
+                    let
+                      pkgs' = inputs.self.packages.${pkgs.stdenv.hostPlatform.system};
+                    in
+                    {
+                      services.kcore = {
+                        nodeAgent = {
+                          enable = lib.mkDefault true;
+                          package = pkgs'.kcore-node-agent;
+                        };
+                        controller.package = pkgs'.kcore-controller;
+                        dashboard.package = pkgs'.kcore-dashboard;
+                        console = {
+                          enable = lib.mkDefault true;
+                          package = pkgs'.kcore-console;
+                        };
+                        kctl.package = pkgs'.kctl;
+                      };
+                    }
+                  )
+                ]
+                ++ builtins.filter builtins.pathExists (map (name: root + "/${name}") hostFiles)
+                ++ modules;
+              };
+          };
+
           nixosModules = {
             ch-vm = chVmModule;
             default = chVmModule;
@@ -354,7 +478,14 @@
             kcore-ceph = cephModule;
             kcore-slurm = slurmModule;
             kcore-metrics = metricsModule;
-            kcore-host = ./modules/kcore-host.nix;
+            # The version follows the kcore input, so moving that pin updates
+            # /etc/kcore/version without editing the host flake.
+            kcore-host =
+              { lib, ... }:
+              {
+                imports = [ ./modules/kcore-host.nix ];
+                services.kcore.version = lib.mkDefault kcoreVersion;
+              };
             kcore-provisioning = ./modules/kcore-provisioning.nix;
           };
 
@@ -1400,6 +1531,9 @@
                       NIXEOF
 
                                                                 cp /etc/kcore/installed-flake.nix /mnt/etc/nixos/flake.nix
+                                                                if [ -f /etc/kcore/installed-flake.lock ]; then
+                                                                  cp /etc/kcore/installed-flake.lock /mnt/etc/nixos/flake.lock
+                                                                fi
                                                                 echo "Building kcoreOS on the installer store (this will take 10-20 minutes)..."
                                                                 export NIX_CONFIG="experimental-features = nix-command flakes"
                                                                 # Build in this store, copy the closure onto the target, then install
@@ -1412,9 +1546,12 @@
                                                                   '/mnt/etc/nixos#nixosConfigurations.kcore.config.system.build.toplevel')
                                                                 nix copy --no-check-sigs --to /mnt \
                                                                   "$SYSTEM" \
-                                                                  "${inputs.nixpkgs.outPath}" \
-                                                                  "${./.}"
+                                                                  "${./.}" \
+                                                                  ${lib.concatStringsSep " " flakeInputPaths}
                                                                 nixos-install --system "$SYSTEM" --root /mnt --no-root-passwd
+                                                                # The host flake's nixpkgs is a path: input, which has no rev to report.
+                                                                install -d -m 0755 /mnt/etc/kcore
+                                                                echo "${inputs.nixpkgs.rev or ""}" > /mnt/etc/kcore/nixpkgs-rev
 
                                                                 # Enroll TPM2 and add recovery key
                                                                 if [ "$LUKS_METHOD" = "tpm2" ]; then
@@ -1499,44 +1636,15 @@
                     '')
                   ];
 
-                  environment.etc."kcore/installed-flake.nix".text = ''
-                    {
-                      description = "kcore node";
-                      inputs = {
-                        nixpkgs.url = "path:${inputs.nixpkgs.outPath}";
-                        kcore.url = "path:${./.}";
-                      };
-                      outputs =
-                        { nixpkgs, kcore, ... }:
-                        {
-                          nixosConfigurations.kcore = nixpkgs.lib.nixosSystem {
-                            system = "x86_64-linux";
-                            specialArgs = {
-                              inherit kcore;
-                            };
-                            modules = [
-                              kcore.nixosModules.kcore-host
-                              (
-                                { kcore, ... }:
-                                {
-                                  services.kcore.version = "${kcoreVersion}";
-                                  services.kcore.nodeAgent.package = kcore.packages.x86_64-linux.kcore-node-agent;
-                                  services.kcore.controller.package = kcore.packages.x86_64-linux.kcore-controller;
-                                  services.kcore.dashboard.package = kcore.packages.x86_64-linux.kcore-dashboard;
-                                  services.kcore.console.package = kcore.packages.x86_64-linux.kcore-console;
-                                  services.kcore.kctl.package = kcore.packages.x86_64-linux.kctl;
-                                }
-                              )
-                              ./hardware-configuration.nix
-                              ./node.nix
-                              ./kcore-vms.nix
-                              ./kcore-ceph.nix
-                              ./kcore-slurm.nix
-                            ];
-                          };
-                        };
-                    }
-                  '';
+                  # A release ISO (clean checkout of the tag) installs the same host
+                  # flake and lock a node gets when it is updated to that tag. A
+                  # development build has no rev and names this source by path.
+                  environment.etc."kcore/installed-flake.nix".text = hostFlakeText (
+                    if inputs.self ? rev then "github:kcorehypervisor/kcore/${releaseTag}" else "path:${./.}"
+                  );
+                  environment.etc."kcore/installed-flake.lock" = lib.mkIf (inputs.self ? rev) {
+                    text = hostFlakeLock;
+                  };
 
                   environment.etc."kcore/node-agent.yaml" = {
                     text = builtins.concatStringsSep "\n" [
