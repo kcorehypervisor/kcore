@@ -119,8 +119,14 @@ function failure(error: unknown) {
 }
 
 type ToolExtra = {
-  sendRequest: (request: { method: string; params: Record<string, unknown> }, resultSchema: typeof ElicitResultSchema) => Promise<unknown>;
+  sendRequest: (
+    request: { method: string; params: Record<string, unknown> },
+    resultSchema: typeof ElicitResultSchema,
+    options?: { timeout?: number },
+  ) => Promise<unknown>;
 };
+
+const ELICIT_TIMEOUT_MS = 30 * 60 * 1000;
 
 async function elicit(extra: ToolExtra, message: string, questions: Question[]): Promise<Record<string, unknown> | undefined> {
   if (questions.length === 0) return undefined;
@@ -146,6 +152,7 @@ async function elicit(extra: ToolExtra, message: string, questions: Question[]):
           },
         },
         ElicitResultSchema,
+        { timeout: ELICIT_TIMEOUT_MS },
       ),
     );
     if (result.action !== "accept" || !result.content) return undefined;

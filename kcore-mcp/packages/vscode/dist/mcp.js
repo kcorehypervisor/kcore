@@ -73909,6 +73909,7 @@ function failure(error2) {
   const message = error2 instanceof Error ? error2.message : String(error2);
   return text({ ok: false, error: message });
 }
+var ELICIT_TIMEOUT_MS = 30 * 60 * 1e3;
 async function elicit(extra, message, questions) {
   if (questions.length === 0) return void 0;
   const properties = {};
@@ -73932,7 +73933,8 @@ async function elicit(extra, message, questions) {
             requestedSchema: { type: "object", properties, required: required4 }
           }
         },
-        ElicitResultSchema
+        ElicitResultSchema,
+        { timeout: ELICIT_TIMEOUT_MS }
       )
     );
     if (result.action !== "accept" || !result.content) return void 0;
