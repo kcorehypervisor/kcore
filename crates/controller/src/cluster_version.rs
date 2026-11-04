@@ -25,6 +25,8 @@ pub struct Release {
     pub flake_rev: String,
     pub schema_version: i32,
     pub min_compatible_reader: i32,
+    /// `26.05` for example. Empty for tags cut before releases reported it.
+    pub nixos_release: String,
 }
 
 type Semver = (u64, u64, u64);
@@ -132,6 +134,7 @@ pub fn parse_release(tag: &str, rev: &str, info: &serde_json::Value) -> Result<R
         flake_rev: rev.to_string(),
         schema_version,
         min_compatible_reader: int("minCompatibleSchemaReader"),
+        nixos_release: text("nixosRelease").to_string(),
     })
 }
 
@@ -174,14 +177,34 @@ pub fn plan(target: &str, nodes: &[(String, String)]) -> (&'static str, Vec<Stri
     (direction, ids)
 }
 
-/// One node at a time, approved, and rebooted by the controller when the
-/// node staged a new kernel.
+/// A canary soaked for `soak_secs`, then one node at a time. `None` updates
+/// one node at a time from the start.
+pub fn strategy(canary: Option<(i32, &str)>) -> ClusterUpdateStrategy {
+    match canary {
+        Some((soak_secs, node_id)) => ClusterUpdateStrategy {
+            r#type: ClusterUpdateStrategyType::ClusterUpdateStrategyCanary as i32,
+            max_unavailable: 1,
+            canary_soak_seconds: soak_secs,
+            canary_node_id: node_id.to_string(),
+            ..Default::default()
+        },
+        None => ClusterUpdateStrategy {
+            r#type: ClusterUpdateStrategyType::ClusterUpdateStrategyOneAtATime as i32,
+            max_unavailable: 1,
+            ..Default::default()
+        },
+    }
+}
+
+/// Approved, and rebooted by the controller when the node staged a new
+/// kernel.
 pub fn update_spec(
     name: &str,
     flake_ref: &str,
     release: &Release,
     node_ids: Vec<String>,
     drain_vms: bool,
+    strategy: ClusterUpdateStrategy,
 ) -> ClusterUpdateSpec {
     ClusterUpdateSpec {
         name: name.to_string(),
@@ -196,11 +219,7 @@ pub fn update_spec(
             node_ids,
             ..Default::default()
         }),
-        strategy: Some(ClusterUpdateStrategy {
-            r#type: ClusterUpdateStrategyType::ClusterUpdateStrategyOneAtATime as i32,
-            max_unavailable: 1,
-            batch_size: 0,
-        }),
+        strategy: Some(strategy),
         drain_vms,
         activation_mode: ClusterUpdateActivationMode::ClusterUpdateActivationAuto as i32,
         reboot_policy: "auto".into(),
@@ -289,10 +308,12 @@ mod tests {
             "tag": "v0.7.0",
             "schemaVersion": 72,
             "minCompatibleSchemaReader": 56,
+            "nixosRelease": "26.11",
         });
         let release = parse_release("v0.7.0", &rev, &info).unwrap();
         assert_eq!(release.schema_version, 72);
         assert_eq!(release.min_compatible_reader, 56);
+        assert_eq!(release.nixos_release, "26.11");
         assert!(parse_release("v0.7.1", &rev, &info).is_err());
         let no_schema = serde_json::json!({ "version": "0.7.0" });
         assert!(parse_release("v0.7.0", &rev, &no_schema).is_err());
@@ -306,6 +327,7 @@ mod tests {
             flake_rev: "a".repeat(40),
             schema_version: 55,
             min_compatible_reader: 40,
+            nixos_release: String::new(),
         };
         assert!(check_schema(&release, 56).is_err());
         assert!(check_schema(&release, 55).is_ok());

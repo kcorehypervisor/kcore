@@ -33,10 +33,11 @@ kctl update version get                    # the version set last and each node'
 3. Compares the tag with the version each node reports. Nodes already on it
    are left alone. The answer is `upgrade`, `downgrade`, `mixed`, or
    `unchanged`.
-4. Starts a ClusterUpdate named `version-vX-Y-Z`: one node at a time,
-   approved, `activation: auto`, and rebooted by the controller when needed.
-   Setting the same tag again while it rolls out returns that update; setting
-   another tag is refused until it finishes or is cancelled.
+4. Starts a ClusterUpdate named `version-vX-Y-Z`: a canary first, then one
+   node at a time, approved, `activation: auto`, and rebooted by the
+   controller when needed. Setting the same tag again while it rolls out
+   returns that update; setting another tag is refused until it finishes or is
+   cancelled.
 
 An air-gapped site resolves tags against a mirror:
 `--flake-ref git+https://git.example/kcore` or `git+file:///srv/kcore`.
@@ -87,6 +88,77 @@ Rollback restores the files in `previous/` and rebuilds from them.
 Schema changes run inside the controller binary. `Database::migrate_down` runs
 before a controlled rollback when the step is reversible. A panic reboot
 relies on the previous schema still opening the expanded file.
+
+## Canary
+
+The first node of a rollout is the canary. It updates like any other node,
+then soaks: it stays on the new version while the rest of the cluster waits.
+The controllers judge it from the old version. The canary is never a node that
+runs a controller, unless every node in the rollout runs one; controllers
+update last.
+
+During the soak the controller compares the canary with the other nodes on
+every reconcile:
+
+- The canary must still run the target version. A node that went back, or
+  rebooted into the old generation, fails.
+- It must keep sending heartbeats while other nodes do.
+- Its share of `autoStart` guests that are not running must not exceed the
+  other nodes' share by more than 10 percentage points.
+- Its node agent must not fail more of the controller's calls than the other
+  agents do, by more than 10 percentage points and at least 5 failures. A
+  failure is a transport error or an `Internal`, `Unknown`, `Unavailable`,
+  `DeadlineExceeded`, or `DataLoss` answer. A refused request is not one.
+- When the canary hosts Ceph OSDs, their median commit latency over the last
+  15 minutes (one `ceph osd perf` sample a minute, five at least) must stay
+  below twice that of the other OSDs, or 20 ms above it, whichever is larger.
+
+The first five minutes of the soak are not judged, so guests can start and
+Ceph can settle after a reboot. Agent calls and Ceph samples are counted from
+then on, in the controller's memory: a controller restart starts them again.
+
+A failed comparison fails the canary and rolls it back; nodes not started are
+cancelled, as with any failed node. A canary that had rebooted into the update
+still runs it after the rollback, so the controller reboots it into the
+previous generation. With `drainVms` it migrates the guests off first; without
+it, a node that still has guests is left for the operator to reboot, and
+`last_error` says so. The same applies to any node rolled back after a reboot.
+
+When the soak ends with the canary healthy, the rest of the cluster updates one
+node at a time. When there is nothing to compare with (no other node sends
+heartbeats), the canary waits in `awaiting_promotion` and the operator decides:
+
+```bash
+kctl update cluster get version-v0-7-0       # shows the canary and the reason
+kctl update cluster promote version-v0-7-0   # continue with the other nodes
+kctl update cluster cancel version-v0-7-0    # stop; the canary keeps the update
+kctl update cluster rollback version-v0-7-0  # roll the canary back
+```
+
+`promote` also ends a soak early. It needs the `cluster-admin` role.
+
+The canary is, in order: the node named with `--canary`, a node labelled
+`kcore.io/update-canary=true`, or the first node of the rollout order (Slurm
+nodes first, controllers last). `--canary` with a node that runs a controller
+is refused, and the label is ignored on one, unless every node runs a
+controller. A rollout of a single node has no canary.
+
+The soak lasts one hour, or 24 hours when the release moves NixOS to a new
+release (for example 26.05 to 26.11; the controller compares its own
+`/etc/os-release` with `lib.kcore.nixosRelease` of the tag). Override it with
+`--soak` (`90s`, `45m`, `2h`, `1d`; at most 7 days), or skip the canary:
+
+```bash
+kctl update version set v0.7.0 --soak 4h --canary node-b
+kctl update version set v0.7.0 --no-canary
+```
+
+Terraform sets the same with `kcore_cluster_version` (`version`,
+`canary_soak_seconds`, `canary_node`, `no_canary`).
+
+A hand-written ClusterUpdate asks for a canary with `strategyType: canary`,
+and optionally `canarySoakSeconds` and `canaryNode`. `batch` and `per-dc` are
+refused.
 
 `kctl update cluster apply -f` still takes a hand-written ClusterUpdate
 (`updateKind: nixpkgs` moves a tested OS pin), but releases no longer ship one.
@@ -207,9 +279,10 @@ Suggested fields:
 | `target.nixpkgs_rev` | Optional nixpkgs pin override or resolved input rev. |
 | `target.system_profile` | NixOS profile/attribute to build for nodes. |
 | `selector` | Node selector: all nodes, node IDs, labels, DCs, or controller-only. |
-| `strategy` | `canary`, `one-at-a-time`, `batch`, or `per-dc`. |
-| `strategy.max_unavailable` | Maximum unavailable worker nodes during rollout. |
-| `strategy.batch_size` | Batch size for non-canary rollouts. |
+| `strategy` | `canary` or `one-at-a-time`. `batch` and `per-dc` are refused. |
+| `strategy.max_unavailable` | Maximum unavailable worker nodes during rollout. Must be 1. |
+| `strategy.canary_soak_seconds` | How long the canary soaks. 0 means one hour. |
+| `strategy.canary_node_id` | The canary. Empty picks it (see [Canary](#canary)). |
 | `drain_policy` | Whether to drain VMs/workloads before activation. |
 | `activation_mode` | `test`, `switch`, `boot`, or `auto`. |
 | `reboot_policy` | `never`, `if-required`, or `always`. |
@@ -282,6 +355,8 @@ Node phases:
 | `Activating` | Node-agent runs the requested NixOS activation mode. |
 | `Rebooting` | Node reboot is requested or observed. |
 | `Verifying` | Controller waits for heartbeat, services, controller replication, and workload health. |
+| `Soaking` | The canary is on the desired generation and is compared with the other nodes. |
+| `AwaitingPromotion` | The soak ended without a verdict; `kctl update cluster promote` continues. |
 | `Succeeded` | Node is on the desired generation and passed health gates. |
 | `Failed` | Node failed and rollout is blocked or rolling back. |
 | `RollingBack` | Node-agent is activating the previous known-good generation. |
@@ -551,10 +626,10 @@ Loop behavior:
 
 | Strategy | Behavior |
 |----------|----------|
-| `canary` | Update one selected node first, require manual or automatic promotion before the rest. |
+| `canary` | Update one node first, soak it, then the rest one at a time. Promotion is automatic when the comparison passes and manual when it has no verdict. |
 | `one-at-a-time` | Update one node at a time across the selected set. |
-| `batch` | Update up to `batch_size`, respecting `max_unavailable`. |
-| `per-dc` | Complete one datacenter before moving to the next. |
+| `batch` | Refused. |
+| `per-dc` | Refused. |
 
 Scheduler integration:
 

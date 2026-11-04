@@ -296,7 +296,7 @@ export function buildPlanCall(kind: ResourceKind, spec: Record<string, unknown>,
 }
 
 export const OPERATION_ACTIONS_HINT =
-  "action must be set-vm-state, migrate-vm, cancel-vm-operation, drain-node, cordon-node, uncordon-node, approve-node, reject-node, reboot-node, rotate-node-certs, approve-update, cancel-update, rollback-update, reboot-update-node, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, attach-volume, detach-volume, resize-volume, restore-volume, flatten-volume, format-volume, mount-volume, unmount-volume, encrypt-volume, set-route-waf-mode, delete-object-user, grant-operator-role, revoke-operator-role, or install-node";
+  "action must be set-vm-state, migrate-vm, cancel-vm-operation, drain-node, cordon-node, uncordon-node, approve-node, reject-node, reboot-node, rotate-node-certs, approve-update, promote-update, cancel-update, rollback-update, reboot-update-node, set-version, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, attach-volume, detach-volume, resize-volume, restore-volume, flatten-volume, format-volume, mount-volume, unmount-volume, encrypt-volume, set-route-waf-mode, delete-object-user, grant-operator-role, revoke-operator-role, or install-node";
 
 export function buildOperation(action: string, spec: Record<string, unknown>): RpcCall {
   switch (action) {
@@ -353,8 +353,29 @@ export function buildOperation(action: string, spec: Record<string, unknown>): R
       return { target: "controller", method: "rejectNode", request: { nodeId: assertName(required(spec, "nodeId", "node id"), "node id") } };
     case "approve-update":
       return { target: "controller", method: "approveClusterUpdate", request: { name: assertName(required(spec, "name", "update name"), "update name") } };
+    case "promote-update":
+      return { target: "controller", method: "promoteClusterUpdate", request: { name: assertName(required(spec, "name", "update name"), "update name") } };
     case "cancel-update":
       return { target: "controller", method: "cancelClusterUpdate", request: { name: assertName(required(spec, "name", "update name"), "update name") } };
+    case "set-version": {
+      const noCanary = boolish(spec.noCanary);
+      const canaryNode = opt(spec, "canaryNode") ?? opt(spec, "canaryNodeId");
+      const soak = spec.soak ?? spec.canarySoakSeconds;
+      if (noCanary && (canaryNode || soak !== undefined)) throw new InputError("noCanary cannot be combined with canaryNode or soak");
+      return {
+        target: "controller",
+        method: "setClusterVersion",
+        request: {
+          version: releaseTag(assertArg(required(spec, "version", "version"), "version")),
+          flakeRef: opt(spec, "flakeRef") ?? "",
+          drainVms: boolish(spec.drainVms),
+          dryRun: boolish(spec.dryRun),
+          canarySoakSeconds: soak === undefined ? 0 : soakSeconds(soak),
+          noCanary,
+          canaryNodeId: canaryNode ? assertName(canaryNode, "canary node") : "",
+        },
+      };
+    }
     case "rollback-update":
       return { target: "controller", method: "rollbackClusterUpdate", request: { name: assertName(required(spec, "name", "update name"), "update name") } };
     case "slurm-drain-node":
@@ -920,7 +941,11 @@ function clusterUpdateMessage(spec: Record<string, unknown>): Record<string, unk
   const activation = section(spec, "activation");
   const strategyBlock = typeof spec.strategy === "object" ? section(spec, "strategy") : {};
   const strategy = (typeof spec.strategy === "string" ? opt(spec, "strategy") : undefined) ?? opt(strategyBlock, "strategyType") ?? opt(strategyBlock, "type") ?? "one-at-a-time";
-  if (strategy !== "one-at-a-time") throw new InputError("strategy must be one-at-a-time; canary, batch, and per-dc are not available in this channel");
+  if (strategy !== "one-at-a-time" && strategy !== "canary") throw new InputError("strategy must be one-at-a-time or canary; batch and per-dc are refused");
+  const canary = strategy === "canary";
+  const soak = strategyBlock.canarySoakSeconds ?? strategyBlock.canary_soak_seconds;
+  const canaryNode = opt(strategyBlock, "canaryNode") ?? opt(strategyBlock, "canary_node") ?? opt(strategyBlock, "canaryNodeId") ?? opt(strategyBlock, "canary_node_id");
+  if (!canary && (soak !== undefined || canaryNode)) throw new InputError("canarySoakSeconds and canaryNode need strategyType canary");
   const maxUnavailable = strategyBlock.maxUnavailable === undefined ? 1 : Number(strategyBlock.maxUnavailable);
   if (maxUnavailable !== 1) throw new InputError("maxUnavailable must be 1");
   const approval = opt(spec, "approvalPolicy");
@@ -945,9 +970,11 @@ function clusterUpdateMessage(spec: Record<string, unknown>): Record<string, unk
       controllersOnly: boolish(selector.controllersOnly),
     },
     strategy: {
-      type: "CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME",
+      type: canary ? "CLUSTER_UPDATE_STRATEGY_CANARY" : "CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME",
       maxUnavailable: 1,
       batchSize: Number(strategyBlock.batchSize ?? 0),
+      canarySoakSeconds: soak === undefined ? 0 : soakSeconds(soak),
+      canaryNodeId: canaryNode ? assertName(canaryNode, "canary node") : "",
     },
     drainVms: spec.drainVms === undefined ? true : boolish(spec.drainVms),
     drainTimeoutSeconds: spec.drainTimeoutSeconds === undefined ? 0 : Number(spec.drainTimeoutSeconds),
@@ -1198,6 +1225,24 @@ function postgresqlRequest(spec: Record<string, unknown>): Record<string, unknow
     port,
     targetNode: opt(spec, "targetNode") ?? "",
   };
+}
+
+/** The controller's limit on a canary soak. */
+const MAX_SOAK_SECONDS = 7 * 86400;
+
+/** Seconds, or a duration with a unit as kctl takes it: 90s, 45m, 2h, 1d. */
+export function soakSeconds(value: unknown): number {
+  const raw = typeof value === "number" ? String(value) : typeof value === "string" ? value.trim() : "";
+  const match = /^(\d+)\s*([smhd]?)$/i.exec(raw);
+  if (!match) throw new InputError("soak must be seconds or a duration such as 90s, 45m, 2h, or 1d");
+  const unit = { "": 1, s: 1, m: 60, h: 3600, d: 86400 }[match[2].toLowerCase() as "" | "s" | "m" | "h" | "d"];
+  const seconds = Number(match[1]) * unit;
+  if (seconds < 1 || seconds > MAX_SOAK_SECONDS) throw new InputError(`soak must be between 1 second and ${MAX_SOAK_SECONDS / 86400} days`);
+  return seconds;
+}
+
+function releaseTag(version: string): string {
+  return version.startsWith("v") ? version : `v${version}`;
 }
 
 function opt(spec: Record<string, unknown>, key: string): string | undefined {

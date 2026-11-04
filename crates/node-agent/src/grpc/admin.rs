@@ -3358,6 +3358,43 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn get_ceph_osd_latency(
+        &self,
+        request: Request<proto::GetCephOsdLatencyRequest>,
+    ) -> Result<Response<proto::GetCephOsdLatencyResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let mut json = Vec::new();
+        for args in [["osd", "perf"], ["osd", "tree"]] {
+            let what = args.join(" ");
+            let out = run_ceph_cmd(&[args[0], args[1], "--format", "json"])
+                .await
+                .map_err(|e| Status::internal(format!("starting ceph {what}: {e}")))?;
+            if out.status.code() == Some(124) {
+                return Err(Status::deadline_exceeded(format!("ceph {what} timed out")));
+            }
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "ceph {what} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            json.push(
+                serde_json::from_slice::<JsonValue>(&out.stdout)
+                    .map_err(|e| Status::internal(format!("invalid ceph {what} JSON: {e}")))?,
+            );
+        }
+        let osds = crate::ceph_bootstrap::parse_osd_latency(&json[0], &json[1])
+            .into_iter()
+            .map(|o| proto::CephOsdLatency {
+                osd_id: o.osd_id,
+                host: o.host,
+                commit_latency_ms: o.commit_latency_ms,
+                apply_latency_ms: o.apply_latency_ms,
+            })
+            .collect();
+        Ok(Response::new(proto::GetCephOsdLatencyResponse { osds }))
+    }
+
     async fn get_ceph_df(
         &self,
         request: Request<proto::GetCephDfRequest>,
@@ -4960,11 +4997,13 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         match res {
             Ok(msg) => Ok(Response::new(proto::RollbackSystemUpdateResponse {
                 success: true,
+                reboot_required: msg == crate::system_update::ROLLED_BACK_REBOOT,
                 message: msg,
             })),
             Err(e) => Ok(Response::new(proto::RollbackSystemUpdateResponse {
                 success: false,
                 message: e,
+                reboot_required: false,
             })),
         }
     }

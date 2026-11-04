@@ -24,7 +24,7 @@ npm run build
 | `kcore_apply` | Declarative apply after `confirm: true`. Cluster apply writes the CA, controller certificate, and client certificate into `~/.kcore`. |
 | `kcore_read` | Controller get and describe RPCs. |
 | `kcore_delete` | Delete, or cancel a non-terminal cluster update. |
-| `kcore_operation` | Power state, migrate, drain, cordon, node approval, update approve/rollback, node install. |
+| `kcore_operation` | Power state, migrate, drain, cordon, node approval, release version set (canary by default, `soak`, `canaryNode`, `noCanary`), update approve/promote/cancel/rollback, node install. |
 | `kcore_catalog` | Resource kinds and which fields are mutable. |
 | `kcore_rpc` | Any implemented unary controller, node, kcore-provisioning, vault, or vault-install RPC. Omit `method` to list them. Provisioning needs `connection.provisioning`. Vault defaults to `127.0.0.1:9191`. Mutations need `confirm: true`. |
 

@@ -63,8 +63,10 @@ impl RealSlurmNodeOps {
     async fn admin(
         &self,
         address: &str,
-    ) -> Result<node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>, String>
-    {
+    ) -> Result<
+        node_proto::node_admin_client::NodeAdminClient<crate::node_client::NodeChannel>,
+        String,
+    > {
         if self.clients.get_admin(address).is_none() {
             self.clients
                 .connect(address)

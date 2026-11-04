@@ -477,6 +477,8 @@ enum UpdateClusterCmd {
     Rollback { name: String },
     /// Boot a generation that was staged because the kernel or guest units changed.
     Reboot { name: String, node: String },
+    /// End the canary's soak now, or accept a canary that had no verdict
+    Promote { name: String },
 }
 
 #[derive(Subcommand)]
@@ -494,6 +496,17 @@ enum UpdateVersionCmd {
         /// Resolve the tag and show which nodes would change
         #[arg(long)]
         dry_run: bool,
+        /// How long the canary runs the release before the other nodes, for
+        /// example 30m or 2h (default 24h for a new NixOS release, else 1h)
+        #[arg(long)]
+        soak: Option<String>,
+        /// Node to update first as the canary (default: a node labelled
+        /// kcore.io/update-canary, else the first node in rollout order)
+        #[arg(long)]
+        canary: Option<String>,
+        /// Update every node one at a time with no canary
+        #[arg(long)]
+        no_canary: bool,
     },
     /// Show the version set last and what each node runs
     Get,
@@ -2896,6 +2909,9 @@ async fn main() {
                 UpdateClusterCmd::Reboot { name, node } => {
                     commands::cluster_update::reboot(&info, name, node).await
                 }
+                UpdateClusterCmd::Promote { name } => {
+                    commands::cluster_update::promote(&info, name).await
+                }
             }
         }
         Command::Update {
@@ -2908,6 +2924,9 @@ async fn main() {
                     flake_ref,
                     drain_vms,
                     dry_run,
+                    soak,
+                    canary,
+                    no_canary,
                 } => {
                     commands::cluster_update::set_version(
                         &info,
@@ -2915,6 +2934,11 @@ async fn main() {
                         flake_ref.as_deref().unwrap_or(""),
                         *drain_vms,
                         *dry_run,
+                        commands::cluster_update::CanaryArgs {
+                            soak: soak.as_deref(),
+                            node: canary.as_deref(),
+                            disabled: *no_canary,
+                        },
                     )
                     .await
                 }

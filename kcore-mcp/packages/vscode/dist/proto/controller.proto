@@ -209,8 +209,12 @@ service Controller {
   rpc RollbackClusterUpdate(RollbackClusterUpdateRequest) returns (RollbackClusterUpdateResponse);
   // Migrate guests off one node, then boot a staged kernel. Not part of apply.
   rpc RebootClusterUpdateNode(RebootClusterUpdateNodeRequest) returns (RebootClusterUpdateNodeResponse);
+  // End a canary's soak early, or accept a canary the controller could not
+  // judge, and let the rollout continue.
+  rpc PromoteClusterUpdate(PromoteClusterUpdateRequest) returns (PromoteClusterUpdateResponse);
   // Move every node to a release tag. Upgrades and downgrades alike start a
-  // one-at-a-time ClusterUpdate that stops at the first failing node.
+  // ClusterUpdate that updates a canary, soaks it, then updates the other
+  // nodes one at a time, and stops at the first failing node.
   rpc SetClusterVersion(SetClusterVersionRequest) returns (SetClusterVersionResponse);
   rpc GetClusterVersion(GetClusterVersionRequest) returns (GetClusterVersionResponse);
 
@@ -2558,6 +2562,13 @@ message ClusterUpdateStrategy {
   ClusterUpdateStrategyType type = 1;
   int32 max_unavailable = 2;
   int32 batch_size = 3;
+  // CANARY only. How long the canary runs the target before the other nodes
+  // start. 0 means one hour.
+  int32 canary_soak_seconds = 4;
+  // CANARY only. Empty picks a node labelled kcore.io/update-canary, else the
+  // first node in rollout order. A node that runs a controller is the canary
+  // only when every node does, so a controller on the old version judges it.
+  string canary_node_id = 5;
 }
 
 enum ClusterUpdateApprovalPolicy {
@@ -2639,6 +2650,10 @@ enum NodeUpdatePhase {
   NODE_UPDATE_PHASE_REBOOT_REQUIRED = 7;
   // Rebooted into the staged generation; waiting for the node to confirm it.
   NODE_UPDATE_PHASE_REBOOTING = 8;
+  // The canary runs the target; the other nodes wait for its soak to end.
+  NODE_UPDATE_PHASE_SOAKING = 9;
+  // The soak ended without a verdict; PromoteClusterUpdate or cancel.
+  NODE_UPDATE_PHASE_AWAITING_PROMOTION = 10;
 }
 
 message NodeUpdateStatus {
@@ -2736,6 +2751,16 @@ message RebootClusterUpdateNodeResponse {
   string message = 2;
 }
 
+message PromoteClusterUpdateRequest {
+  string name = 1;
+}
+
+message PromoteClusterUpdateResponse {
+  bool success = 1;
+  string node_id = 2;
+  string message = 3;
+}
+
 message SetClusterVersionRequest {
   // Release tag, vX.Y.Z.
   string version = 1;
@@ -2746,6 +2771,15 @@ message SetClusterVersionRequest {
   bool drain_vms = 3;
   // Resolve and compare only.
   bool dry_run = 4;
+  // How long the canary soaks. 0 means 24 hours when the release moves to
+  // another NixOS release and one hour otherwise.
+  int32 canary_soak_seconds = 5;
+  // Update every node one at a time with no canary and no soak.
+  bool no_canary = 6;
+  // The canary. Empty picks a node labelled kcore.io/update-canary, else the
+  // first node in rollout order. A node that runs a controller is refused
+  // unless every node does.
+  string canary_node_id = 7;
 }
 
 message SetClusterVersionResponse {
@@ -2759,6 +2793,9 @@ message SetClusterVersionResponse {
   string update_name = 5;
   ClusterUpdate cluster_update = 6;
   string message = 7;
+  // Empty without a canary, which includes a single target node.
+  string canary_node_id = 8;
+  int32 canary_soak_seconds = 9;
 }
 
 message GetClusterVersionRequest {}

@@ -92,6 +92,10 @@ struct Strategy {
     max_unavailable: i32,
     #[serde(default, alias = "batch_size")]
     batch_size: i32,
+    #[serde(default, alias = "canary_soak_seconds")]
+    canary_soak_seconds: i32,
+    #[serde(default, alias = "canary_node", alias = "canary_node_id")]
+    canary_node: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -194,6 +198,8 @@ fn to_proto(m: ClusterUpdateManifest) -> controller_proto::ClusterUpdateSpec {
             r#type: strategy_type_from_str(&m.spec.strategy.strategy_type),
             max_unavailable: m.spec.strategy.max_unavailable,
             batch_size: m.spec.strategy.batch_size,
+            canary_soak_seconds: m.spec.strategy.canary_soak_seconds,
+            canary_node_id: m.spec.strategy.canary_node,
         }),
         drain_vms: m.spec.drain_vms,
         drain_timeout_seconds: m.spec.drain_timeout_seconds,
@@ -273,12 +279,25 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
     let spec = u.spec.context("empty spec")?;
     println!("name: {}", spec.name);
     println!("generation: {}", u.generation);
-    println!("phase: {}", u.phase);
-    println!("approval: {}", u.approval_status);
+    println!(
+        "phase: {}",
+        controller_proto::ClusterUpdatePhase::try_from(u.phase)
+            .map(|p| p.as_str_name())
+            .unwrap_or("UNKNOWN")
+    );
+    println!(
+        "approval: {}",
+        controller_proto::ClusterUpdateApprovalStatus::try_from(u.approval_status)
+            .map(|p| p.as_str_name())
+            .unwrap_or("UNKNOWN")
+    );
     for n in &resp.node_statuses {
+        let phase = controller_proto::NodeUpdatePhase::try_from(n.phase)
+            .map(|p| p.as_str_name())
+            .unwrap_or("UNKNOWN");
         println!(
-            "  node {}  phase={}  gen={}  err={}",
-            n.node_id, n.phase, n.observed_generation, n.last_error
+            "  node {}  phase={phase}  gen={}  err={}",
+            n.node_id, n.observed_generation, n.last_error
         );
     }
     Ok(())
@@ -330,13 +349,49 @@ pub async fn rollback(info: &ConnectionInfo, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// How a canary is chosen and how long it soaks.
+pub struct CanaryArgs<'a> {
+    pub soak: Option<&'a str>,
+    pub node: Option<&'a str>,
+    pub disabled: bool,
+}
+
+/// `90`, `90s`, `45m`, `2h`, or `1d`, in seconds.
+pub fn parse_soak(text: &str) -> Result<i32> {
+    let text = text.trim();
+    let (digits, unit) = match text.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((at, _)) => text.split_at(at),
+        None => (text, "s"),
+    };
+    let scale: i64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => bail!("soak {text:?}: use a number with s, m, h, or d, for example 2h"),
+    };
+    let value: i64 = digits
+        .parse()
+        .with_context(|| format!("soak {text:?}: not a duration"))?;
+    let secs = value
+        .checked_mul(scale)
+        .filter(|secs| (1..=i64::from(i32::MAX)).contains(secs))
+        .with_context(|| format!("soak {text:?} is out of range"))?;
+    Ok(i32::try_from(secs)?)
+}
+
 pub async fn set_version(
     info: &ConnectionInfo,
     version: &str,
     flake_ref: &str,
     drain_vms: bool,
     dry_run: bool,
+    canary: CanaryArgs<'_>,
 ) -> Result<()> {
+    if canary.disabled && (canary.soak.is_some() || canary.node.is_some()) {
+        bail!("--no-canary cannot be combined with --soak or --canary");
+    }
+    let canary_soak_seconds = canary.soak.map(parse_soak).transpose()?.unwrap_or(0);
     let mut client = client::controller_client(info).await?;
     let resp = client
         .set_cluster_version(controller_proto::SetClusterVersionRequest {
@@ -344,6 +399,9 @@ pub async fn set_version(
             flake_ref: flake_ref.into(),
             drain_vms,
             dry_run,
+            canary_soak_seconds,
+            no_canary: canary.disabled,
+            canary_node_id: canary.node.unwrap_or("").into(),
         })
         .await
         .context("set_cluster_version rpc")?
@@ -355,6 +413,12 @@ pub async fn set_version(
     println!("version: {}  commit: {}", resp.version, resp.flake_rev);
     for id in &resp.target_node_ids {
         println!("  - {id}");
+    }
+    if !resp.canary_node_id.is_empty() {
+        println!(
+            "canary: {}  soak: {}s",
+            resp.canary_node_id, resp.canary_soak_seconds
+        );
     }
     if !resp.update_name.is_empty() {
         println!(
@@ -394,6 +458,17 @@ pub async fn get_version(info: &ConnectionInfo) -> Result<()> {
     Ok(())
 }
 
+pub async fn promote(info: &ConnectionInfo, name: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .promote_cluster_update(controller_proto::PromoteClusterUpdateRequest { name: name.into() })
+        .await
+        .context("promote_cluster_update rpc")?
+        .into_inner();
+    println!("{}", resp.message);
+    Ok(())
+}
+
 pub async fn reboot(info: &ConnectionInfo, name: &str, node: &str) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let resp = client
@@ -413,7 +488,47 @@ pub async fn reboot(info: &ConnectionInfo, name: &str, node: &str) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::parse_manifest_yaml;
+    use super::{parse_manifest_yaml, parse_soak};
+
+    #[test]
+    fn soak_durations_parse_to_seconds() {
+        assert_eq!(parse_soak("90").unwrap(), 90);
+        assert_eq!(parse_soak("90s").unwrap(), 90);
+        assert_eq!(parse_soak("45m").unwrap(), 2700);
+        assert_eq!(parse_soak("2h").unwrap(), 7200);
+        assert_eq!(parse_soak("1d").unwrap(), 86_400);
+        assert!(parse_soak("0").is_err());
+        assert!(parse_soak("2w").is_err());
+        assert!(parse_soak("h").is_err());
+        assert!(parse_soak("99999999d").is_err());
+    }
+
+    #[test]
+    fn canary_strategy_parses() {
+        let m = parse_manifest_yaml(
+            r#"
+kind: ClusterUpdate
+metadata:
+  name: canary
+spec:
+  target:
+    version: "0.7.0"
+    flakeRef: github:kcorehypervisor/kcore
+    flakeRev: "0123456789abcdef0123456789abcdef01234567"
+  selector:
+    allNodes: true
+  strategy:
+    strategyType: canary
+    maxUnavailable: 1
+    canarySoakSeconds: 1800
+    canaryNode: node-b
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.spec.strategy.strategy_type, "canary");
+        assert_eq!(m.spec.strategy.canary_soak_seconds, 1800);
+        assert_eq!(m.spec.strategy.canary_node, "node-b");
+    }
 
     const CAMEL: &str = r#"
 kind: ClusterUpdate

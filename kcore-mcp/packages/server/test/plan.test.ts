@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { findKind } from "../src/catalog.js";
 import { InputError } from "../src/names.js";
-import { buildApply, buildDelete, buildOperation, buildPlanCall, buildRead } from "../src/requests.js";
+import { buildApply, buildDelete, buildOperation, buildPlanCall, buildRead, soakSeconds } from "../src/requests.js";
 import { diffSpec } from "../src/plan.js";
 
 const sha = "ab".repeat(32);
@@ -348,6 +348,54 @@ test("a cluster update takes the shape of the release YAML", () => {
   assert.equal(decoded.spec.updateKind, "kcore");
   assert.equal(decoded.spec.schemaVersion, 3);
   assert.equal(decoded.spec.testedOsPins[0].kubernetesVersion, "1.33");
-  assert.throws(() => buildApply(kind, { name: "x", version: "1", flakeRef: "f", strategy: "canary" }), /one-at-a-time/);
+  assert.throws(() => buildApply(kind, { name: "x", version: "1", flakeRef: "f", strategy: "batch" }), /one-at-a-time or canary/);
+  assert.throws(
+    () => buildApply(kind, { name: "x", version: "1", flakeRef: "f", strategy: { strategyType: "one-at-a-time", canaryNode: "n" } }),
+    /need strategyType canary/,
+  );
   assert.throws(() => buildApply(kind, { name: "x", version: "1", flakeRef: "f", approvalPolicy: "yolo" }), /approvalPolicy/);
+});
+
+test("a canary cluster update carries its soak and node", () => {
+  const kind = findKind("cluster-update");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    name: "release-0-7-0",
+    target: { version: "0.7.0", flakeRef: "github:kcorehypervisor/kcore" },
+    selector: { allNodes: true },
+    strategy: { strategyType: "canary", maxUnavailable: 1, canarySoakSeconds: 1800, canaryNode: "node-b" },
+  });
+  const decoded = wire(call) as { spec: Record<string, any> };
+  assert.equal(decoded.spec.strategy.type, "CLUSTER_UPDATE_STRATEGY_CANARY");
+  assert.equal(decoded.spec.strategy.canarySoakSeconds, 1800);
+  assert.equal(decoded.spec.strategy.canaryNodeId, "node-b");
+});
+
+test("set-version and promote-update reach the release RPCs", () => {
+  const set = buildOperation("set-version", { version: "0.7.0", soak: "4h", canaryNode: "node-b", drainVms: true });
+  assert.equal(set.method, "setClusterVersion");
+  assert.deepEqual(wire(set), {
+    version: "v0.7.0",
+    flakeRef: "",
+    drainVms: true,
+    dryRun: false,
+    canarySoakSeconds: 14400,
+    noCanary: false,
+    canaryNodeId: "node-b",
+  });
+  const plain = buildOperation("set-version", { version: "v0.7.0", noCanary: true, dryRun: true });
+  const decoded = wire(plain);
+  assert.equal(decoded.version, "v0.7.0");
+  assert.equal(decoded.dryRun, true);
+  assert.equal(decoded.noCanary, true);
+  assert.equal(decoded.canarySoakSeconds, 0);
+  assert.throws(() => buildOperation("set-version", { version: "0.7.0", noCanary: true, soak: 60 }), /noCanary/);
+  assert.throws(() => buildOperation("set-version", { version: "0.7.0", soak: "8d" }), /between/);
+  assert.throws(() => buildOperation("set-version", { version: "0.7.0", soak: "soon" }), /duration/);
+  assert.equal(soakSeconds(90), 90);
+  assert.equal(soakSeconds("45m"), 2700);
+  assert.equal(soakSeconds("1d"), 86400);
+  const promote = buildOperation("promote-update", { name: "version-v0-7-0" });
+  assert.equal(promote.method, "promoteClusterUpdate");
+  assert.equal(wire(promote).name, "version-v0-7-0");
 });

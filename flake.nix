@@ -424,6 +424,8 @@
               tag = releaseTag;
               schemaVersion = controllerConst "SCHEMA_VERSION";
               minCompatibleSchemaReader = controllerConst "MIN_COMPATIBLE_SCHEMA_READER";
+              # Sets how long the canary of an update to this release soaks.
+              nixosRelease = lib.trivial.release;
             };
             inherit hostFiles;
             hostFlake = hostFlakeText;

@@ -589,10 +589,10 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
         ),
         question(
           "strategy",
-          "One node at a time, or a wider batch?",
-          "one-at-a-time keeps a quorum while a node reboots.",
+          "Soak a canary node first, or update one node at a time without one?",
+          "canary updates one worker first and soaks it while the controllers, still on the old version, compare it with the other nodes; the rest then follow one at a time.",
           missing(spec, "strategy"),
-          { choices: ["one-at-a-time"], example: "one-at-a-time" },
+          { choices: ["canary", "one-at-a-time"], example: "canary" },
         ),
       ].filter((item) => item.required || missing(spec, item.id));
     default:
@@ -754,6 +754,9 @@ export function warningsFor(kind: ResourceKind, spec: Record<string, unknown>): 
   }
   if (kind.id === "cluster-update") {
     warnings.push("A cluster update can reboot nodes. Plan it, read the blockers, and apply only after the operator agrees.");
+    warnings.push(
+      "To move every node to a release tag, prefer kcore_operation set-version (kctl update version set): it soaks a canary by default. A canary held in awaiting_promotion continues with kcore_operation promote-update.",
+    );
   }
   if (kind.immutable.length > 0) {
     warnings.push(

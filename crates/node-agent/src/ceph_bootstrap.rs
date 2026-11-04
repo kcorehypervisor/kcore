@@ -653,6 +653,64 @@ pub struct ParsedPoolUsage {
     pub max_avail_bytes: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsdLatency {
+    pub osd_id: i32,
+    pub host: String,
+    pub commit_latency_ms: u32,
+    pub apply_latency_ms: u32,
+}
+
+/// Join `ceph osd perf -f json` with the CRUSH hosts in `ceph osd tree -f json`.
+/// Reef and later nest the list under `osdstats`; older releases do not.
+pub fn parse_osd_latency(perf: &serde_json::Value, tree: &serde_json::Value) -> Vec<OsdLatency> {
+    let mut host_of = std::collections::HashMap::new();
+    for node in tree
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|n| n.get("type").and_then(|v| v.as_str()) == Some("host"))
+    {
+        let host = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        for child in node
+            .get("children")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_i64())
+        {
+            host_of.insert(child, host.to_string());
+        }
+    }
+    let ms = |stats: &serde_json::Value, key: &str| {
+        stats
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX))
+    };
+    let infos = perf
+        .pointer("/osdstats/osd_perf_infos")
+        .or_else(|| perf.get("osd_perf_infos"))
+        .and_then(|v| v.as_array());
+    let mut out: Vec<OsdLatency> = infos
+        .into_iter()
+        .flatten()
+        .filter_map(|info| {
+            let id = info.get("id")?.as_i64()?;
+            let stats = info.get("perf_stats")?;
+            Some(OsdLatency {
+                osd_id: i32::try_from(id).ok()?,
+                host: host_of.get(&id).cloned().unwrap_or_default(),
+                commit_latency_ms: ms(stats, "commit_latency_ms"),
+                apply_latency_ms: ms(stats, "apply_latency_ms"),
+            })
+        })
+        .collect();
+    out.sort_by_key(|o| o.osd_id);
+    out
+}
+
 /// Typed reading of `ceph df --format json` (cluster totals, device classes, pools).
 pub fn parse_ceph_df(json: &serde_json::Value) -> ParsedCephDf {
     let total_bytes = json
@@ -1020,6 +1078,41 @@ mod tests {
         assert_eq!(parse_osd_counters(&modern), (3, 3));
         let nested = serde_json::json!({"osdmap":{"osdmap":{"num_up_osds":2,"num_in_osds":1}}});
         assert_eq!(parse_osd_counters(&nested), (2, 1));
+    }
+
+    #[test]
+    fn osd_latency_joins_perf_with_crush_hosts() {
+        let tree = serde_json::json!({"nodes": [
+            {"id": -1, "name": "default", "type": "root", "children": [-2, -3]},
+            {"id": -2, "name": "node-a", "type": "host", "children": [0, 1]},
+            {"id": -3, "name": "node-b", "type": "host", "children": [2]},
+        ]});
+        let reef = serde_json::json!({"osdstats": {"osd_perf_infos": [
+            {"id": 2, "perf_stats": {"commit_latency_ms": 7, "apply_latency_ms": 8}},
+            {"id": 0, "perf_stats": {"commit_latency_ms": 3, "apply_latency_ms": 4}},
+        ]}});
+        let got = parse_osd_latency(&reef, &tree);
+        assert_eq!(
+            got,
+            vec![
+                OsdLatency {
+                    osd_id: 0,
+                    host: "node-a".into(),
+                    commit_latency_ms: 3,
+                    apply_latency_ms: 4
+                },
+                OsdLatency {
+                    osd_id: 2,
+                    host: "node-b".into(),
+                    commit_latency_ms: 7,
+                    apply_latency_ms: 8
+                },
+            ]
+        );
+        let older = serde_json::json!({"osd_perf_infos": [
+            {"id": 1, "perf_stats": {"commit_latency_ms": 5, "apply_latency_ms": 5}},
+        ]});
+        assert_eq!(parse_osd_latency(&older, &tree)[0].host, "node-a");
     }
 
     #[test]

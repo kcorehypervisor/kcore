@@ -59,12 +59,14 @@ async fn reconcile_once(db: &Database, clients: &NodeClients) -> Result<(), Stri
     Ok(())
 }
 
-async fn admin_for(
+pub(crate) async fn admin_for(
     db: &Database,
     clients: &NodeClients,
     node_id: &str,
-) -> Result<crate::node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>, String>
-{
+) -> Result<
+    crate::node_proto::node_admin_client::NodeAdminClient<crate::node_client::NodeChannel>,
+    String,
+> {
     let node = db
         .get_node(node_id)
         .map_err(|e| e.to_string())?
@@ -385,7 +387,9 @@ async fn drain_member(
 }
 
 async fn wait_for_nix_apply(
-    admin: &mut crate::node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>,
+    admin: &mut crate::node_proto::node_admin_client::NodeAdminClient<
+        crate::node_client::NodeChannel,
+    >,
     apply_id: &str,
 ) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + NIX_APPLY_WAIT;

@@ -490,7 +490,7 @@ export function createServer(): McpServer {
     {
       title: "Run a kcore day-2 operation",
       description:
-        "Power state, migrate, drain, cordon, node approval, node reboot and certificate rotation, cluster-update approve/cancel/rollback/reboot, volume attach/detach/resize/restore/flatten/format/mount/unmount/encrypt, ingress route WAF mode, object user delete, operator roles, Slurm node drain/resume and munge key rotation, or node install. Asks before any disk wipe or mutation.",
+        "Power state, migrate, drain, cordon, node approval, node reboot and certificate rotation, cluster-update approve/promote/cancel/rollback/reboot, release version set (canary, soak, or no canary), volume attach/detach/resize/restore/flatten/format/mount/unmount/encrypt, ingress route WAF mode, object user delete, operator roles, Slurm node drain/resume and munge key rotation, or node install. Asks before any disk wipe or mutation.",
       inputSchema: {
         action: z.string().describe(OPERATION_ACTIONS_HINT.replace("action must be ", "")),
         spec: z.record(z.string(), z.unknown()),

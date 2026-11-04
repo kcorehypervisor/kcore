@@ -184,7 +184,7 @@ export const KINDS: ResourceKind[] = [
     yamlKind: "ClusterUpdate",
     title: "Cluster update",
     summary:
-      "Rolling NixOS update. Plan resolves nodes and blockers. Apply creates the update. Destroy cancels a non-terminal update and keeps history.",
+      "Rolling NixOS update. Plan resolves nodes and blockers. Apply creates the update. Destroy cancels a non-terminal update and keeps history. Strategy canary updates one worker first and soaks it (canarySoakSeconds, canaryNode) while the controllers compare it with its peers; kcore_operation promote-update ends the soak early. To move the whole cluster to a release, use kcore_operation set-version.",
     mutable: [],
     immutable: ["version", "flakeRef", "flakeRev"],
   },

@@ -3,7 +3,7 @@ import { createRouterTransport, type ConnectRouter } from "@connectrpc/connect";
 import { beforeAll, describe, expect, it } from "vitest";
 import { RESOURCES } from "./catalog";
 import { PRESETS } from "./columns";
-import { bytes, FormError } from "./forms";
+import { bytes, FormError, soak } from "./forms";
 import { Auth, Controller, ControllerAdmin } from "./gen/controller_pb";
 import { setTransport } from "./rpc";
 
@@ -154,6 +154,53 @@ describe("Slurm and vGPU controls", () => {
     expect(resource("ingress-routes").terraform).toEqual(["kcore_ingress_route"]);
     expect(resource("waf-policies").terraform).toEqual(["kcore_waf_policy"]);
     expect(resource("gpus").terraform).toContain("kcore_vgpu_host");
+  });
+});
+
+describe("release controls", () => {
+  beforeAll(() => {
+    setTransport(createRouterTransport((router) => serveUnary(router, Controller, true)));
+  });
+
+  const resource = (id: string) => RESOURCES.find((candidate) => candidate.id === id)!;
+  const action = (id: string, name: string) => resource(id).actions.find((candidate) => candidate.name === name)!;
+
+  it("sets a version with a canary soak, or with no canary", async () => {
+    const set = action("release", "set-version");
+    expect(set.confirm).toBe(true);
+    await expect(set.run({ version: "0.7.0", soak: "4h", canary_node: "node-2" })).resolves.toMatchObject({ ok: true });
+    await expect(set.run({ version: "v0.7.0", no_canary: "true" })).resolves.toMatchObject({ ok: true });
+    await expect(set.run({ version: "v0.7.0", no_canary: "true", soak: "1h" })).rejects.toThrow(FormError);
+    await expect(set.run({ version: "v0.7.0", soak: "8d" })).rejects.toThrow(FormError);
+    expect(resource("release").terraform).toEqual(["kcore_cluster_version"]);
+  });
+
+  it("promotes the canary of a cluster update, and refuses with no rollout", async () => {
+    await expect(action("release", "promote").run({})).rejects.toThrow(/No version update/);
+    await expect(action("cluster-updates", "promote").run({ name: "version-v0-7-0" })).resolves.toMatchObject({ ok: true });
+  });
+
+  it("creates a canary cluster update and refuses canary fields without it", async () => {
+    const base = { name: "release-0-7-0", version: "0.7.0", flake_ref: "github:kcorehypervisor/kcore", all_nodes: "true" };
+    await expect(resource("cluster-updates").create!({ ...base, strategy: "canary", canary_soak: "30m", canary_node: "node-2" })).resolves.toMatchObject({ ok: true });
+    await expect(resource("cluster-updates").create!({ ...base, canary_node: "node-2" })).rejects.toThrow(FormError);
+  });
+});
+
+describe("soak", () => {
+  it.each([
+    ["", 0],
+    ["5400", 5400],
+    ["90s", 90],
+    ["45m", 2700],
+    ["2h", 7200],
+    ["1d", 86400],
+  ])("reads %s", (input, expected) => {
+    expect(soak({ soak: input }, "soak")).toBe(expected);
+  });
+
+  it.each(["0", "soon", "8d", "-1h"])("refuses %s", (input) => {
+    expect(() => soak({ soak: input }, "soak")).toThrow(FormError);
   });
 });
 
