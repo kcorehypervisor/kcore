@@ -206,6 +206,9 @@ service NodeAdmin {
   rpc GetCephHealth(GetCephHealthRequest) returns (GetCephHealthResponse);
   // Cluster capacity from `ceph df --format json` (device classes + pools).
   rpc GetCephDf(GetCephDfRequest) returns (GetCephDfResponse);
+  // Commit and apply latency of every OSD with its CRUSH host, from
+  // `ceph osd perf` and `ceph osd tree`.
+  rpc GetCephOsdLatency(GetCephOsdLatencyRequest) returns (GetCephOsdLatencyResponse);
   rpc EnsureCephPool(EnsureCephPoolRequest) returns (EnsureCephPoolResponse);
   // Stop this node's mon/mgr, purge its OSDs, and queue a rebuild that drops
   // kcore.ceph from the system configuration.
@@ -1324,6 +1327,9 @@ message RollbackSystemUpdateRequest {
 message RollbackSystemUpdateResponse {
   bool success = 1;
   string message = 2;
+  // The node runs the update generation it rolled back from; the previous
+  // one starts at the next boot.
+  bool reboot_required = 3;
 }
 
 message RebootStagedSystemUpdateRequest {
@@ -1412,6 +1418,19 @@ message GetCephHealthResponse {
   string raw_status = 2;
   int32 osd_up = 3;
   int32 osd_in = 4;
+}
+
+message GetCephOsdLatencyRequest {}
+
+message CephOsdLatency {
+  int32 osd_id = 1;
+  string host = 2;
+  uint32 commit_latency_ms = 3;
+  uint32 apply_latency_ms = 4;
+}
+
+message GetCephOsdLatencyResponse {
+  repeated CephOsdLatency osds = 1;
 }
 
 message GetCephDfRequest { string cluster_name = 1; }

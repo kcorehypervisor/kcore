@@ -143,7 +143,7 @@ RELEASE_NOTES=path/to/notes.md GH_TOKEN=... make release-publish
 kctl update version set vX.Y.Z
 ```
 
-The controller resolves the tag to its commit, reads `lib.kcore` from that commit's flake (version and schema), and rolls every node that runs another version to it, one node at a time. A lower tag is a downgrade. Each node writes the tag's host flake (`nix/host-flake.nix`, with `inputs.kcore.url = "github:kcorehypervisor/kcore/vX.Y.Z"`) and lets `nix` lock it, so its `/etc/nixos/flake.nix` and `flake.lock` match what the vX.Y.Z ISO installs. On the Community Edition the build compiles the Rust packages on the node. Nixpkgs still comes from `cache.nixos.org`.
+The controller resolves the tag to its commit, reads `lib.kcore` from that commit's flake (version and schema), and rolls every node that runs another version to it: a canary first, which soaks for an hour (a day when the NixOS release changes), then the other nodes one at a time. See [Canary](cluster-updates.md#canary). A lower tag is a downgrade. Each node writes the tag's host flake (`nix/host-flake.nix`, with `inputs.kcore.url = "github:kcorehypervisor/kcore/vX.Y.Z"`) and lets `nix` lock it, so its `/etc/nixos/flake.nix` and `flake.lock` match what the vX.Y.Z ISO installs. On the Community Edition the build compiles the Rust packages on the node. Nixpkgs still comes from `cache.nixos.org`.
 
 The ISO built from the tag checkout ships that flake and its lock, so an air-gapped install needs no network. Tag updates on an air-gapped site resolve against a mirror: `kctl update version set vX.Y.Z --flake-ref git+https://mirror.example/kcore`.
 

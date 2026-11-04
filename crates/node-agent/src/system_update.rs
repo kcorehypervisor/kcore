@@ -1004,6 +1004,10 @@ pub fn activate_staged(manifest_path: &Path, mode: &str) -> Result<ActivateOutco
     }
 }
 
+/// What [`rollback_staged`] answers when the node still runs the update
+/// generation and only leaves it at the next boot.
+pub const ROLLED_BACK_REBOOT: &str = "rolled back; reboot the node to leave the update generation";
+
 /// Put the host flake back on the pins it had before the update and rebuild
 /// from it. Generations are not deleted.
 pub fn rollback_staged(manifest_path: &Path) -> Result<String, String> {
@@ -1044,7 +1048,7 @@ pub fn rollback_staged(manifest_path: &Path) -> Result<String, String> {
         }
         nixos_rebuild("boot", flake)?;
         if booted_target {
-            return Ok("rolled back; reboot the node to leave the update generation".into());
+            return Ok(ROLLED_BACK_REBOOT.into());
         }
         return Ok("rolled back; the staged generation will not boot".into());
     }

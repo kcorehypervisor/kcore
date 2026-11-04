@@ -7,6 +7,7 @@
 )]
 
 mod auth;
+mod canary;
 mod ceph_cli;
 mod ceph_cluster_reconciler;
 mod ceph_cluster_spec;

@@ -235,6 +235,16 @@ export const PRESETS: Record<string, Column[]> = {
     col("drain_vms", "bool", { label: "Drain VMs", hidden: true }),
     col("created_at", "date", { label: "Created", hidden: true }),
   ],
+  release: [
+    col("version"),
+    col("phase", "status"),
+    col("update_name", "text", { label: "Update" }),
+    col("canary"),
+    col("canary_phase", "status", { label: "Canary phase" }),
+    col("canary_message", "text", { label: "Canary", hidden: true }),
+    col("flake_rev", "id", { label: "Revision" }),
+    col("flake_ref", "text", { label: "Flake ref", hidden: true }),
+  ],
   conflicts: [
     col("resource_key", "text", { label: "Resource" }),
     col("reason"),

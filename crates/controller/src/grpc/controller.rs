@@ -433,6 +433,7 @@ const EVT_CLUSTER_UPDATE_CREATE: &str = "cluster_update.create";
 const EVT_CLUSTER_UPDATE_APPROVE: &str = "cluster_update.approve";
 const EVT_CLUSTER_UPDATE_CANCEL: &str = "cluster_update.cancel";
 const EVT_CLUSTER_UPDATE_ROLLBACK: &str = "cluster_update.rollback";
+const EVT_CLUSTER_UPDATE_PROMOTE: &str = "cluster_update.promote";
 const EVT_OPERATOR_UPSERT: &str = "operator.upsert";
 const EVT_OPERATOR_DELETE: &str = "operator.delete";
 const EVT_OPERATOR_ROLE_GRANT: &str = "operator_role.grant";
@@ -1523,7 +1524,7 @@ impl ControllerService {
         &self,
         node: &NodeRow,
         apply_id: &str,
-        admin: &mut node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>,
+        admin: &mut node_proto::node_admin_client::NodeAdminClient<crate::node_client::NodeChannel>,
     ) -> Result<(), Status> {
         if apply_id.is_empty() {
             warn!(
@@ -2525,9 +2526,11 @@ impl ControllerService {
     async fn ensure_live_migrate_cpu(
         &self,
         source_admin: &mut node_proto::node_admin_client::NodeAdminClient<
-            tonic::transport::Channel,
+            crate::node_client::NodeChannel,
         >,
-        dest_admin: &mut node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>,
+        dest_admin: &mut node_proto::node_admin_client::NodeAdminClient<
+            crate::node_client::NodeChannel,
+        >,
         source: &NodeRow,
         target: &NodeRow,
     ) -> Result<(), Status> {
@@ -5115,7 +5118,7 @@ impl ControllerService {
     async fn ch_vm_module_features(
         &self,
         node: &NodeRow,
-        admin: &mut node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>,
+        admin: &mut node_proto::node_admin_client::NodeAdminClient<crate::node_client::NodeChannel>,
     ) -> nixgen::ModuleFeatures {
         match admin
             .get_ch_vm_module_features(node_proto::GetChVmModuleFeaturesRequest {})
@@ -5140,8 +5143,10 @@ impl ControllerService {
     async fn ensure_admin_client_for_node(
         &self,
         node: &NodeRow,
-    ) -> Result<node_proto::node_admin_client::NodeAdminClient<tonic::transport::Channel>, Status>
-    {
+    ) -> Result<
+        node_proto::node_admin_client::NodeAdminClient<crate::node_client::NodeChannel>,
+        Status,
+    > {
         if let Some(client) = self.clients.get_admin(&node.address) {
             return Ok(client);
         }
@@ -5347,8 +5352,10 @@ impl ControllerService {
     async fn ensure_compute_client_for_address(
         &self,
         address: &str,
-    ) -> Result<node_proto::node_compute_client::NodeComputeClient<tonic::transport::Channel>, Status>
-    {
+    ) -> Result<
+        node_proto::node_compute_client::NodeComputeClient<crate::node_client::NodeChannel>,
+        Status,
+    > {
         if let Some(client) = self.clients.get_compute(address) {
             return Ok(client);
         }
@@ -5365,7 +5372,7 @@ impl ControllerService {
         &self,
         address: &str,
     ) -> Result<
-        node_proto::node_container_client::NodeContainerClient<tonic::transport::Channel>,
+        node_proto::node_container_client::NodeContainerClient<crate::node_client::NodeChannel>,
         Status,
     > {
         if let Some(client) = self.clients.get_container(address) {
@@ -6279,6 +6286,8 @@ fn node_update_phase_to_proto(s: &str) -> i32 {
         "rolling_back" => controller_proto::NodeUpdatePhase::RollingBack as i32,
         "reboot_required" => controller_proto::NodeUpdatePhase::RebootRequired as i32,
         "rebooting" => controller_proto::NodeUpdatePhase::Rebooting as i32,
+        "soaking" => controller_proto::NodeUpdatePhase::Soaking as i32,
+        "awaiting_promotion" => controller_proto::NodeUpdatePhase::AwaitingPromotion as i32,
         _ => controller_proto::NodeUpdatePhase::Unspecified as i32,
     }
 }
@@ -7703,8 +7712,10 @@ impl ControllerService {
     async fn connect_node_storage(
         &self,
         node: &NodeRow,
-    ) -> Result<node_proto::node_storage_client::NodeStorageClient<tonic::transport::Channel>, Status>
-    {
+    ) -> Result<
+        node_proto::node_storage_client::NodeStorageClient<crate::node_client::NodeChannel>,
+        Status,
+    > {
         if self.clients.get_storage(&node.address).is_none() {
             self.clients
                 .connect(&node.address)
@@ -17799,6 +17810,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
         if target_ids.is_empty() {
             return Err(Status::invalid_argument("selector matched no nodes"));
         }
+        if crate::canary::is_canary(&spec) {
+            let named = spec
+                .strategy
+                .as_ref()
+                .map(|s| s.canary_node_id.as_str())
+                .unwrap_or("");
+            crate::canary::check_named(&self.db, &target_ids, named)
+                .map_err(Status::invalid_argument)?;
+        }
         let spec_json = cluster_update_spec::spec_to_json(&spec)
             .map_err(|e| Status::internal(format!("encode spec: {e}")))?;
         let name = spec.name.trim().to_string();
@@ -18173,6 +18193,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 || n.phase == "reboot_required"
                 || n.phase == "rebooting"
                 || n.phase == "bootstrapping"
+                || n.phase == "soaking"
+                || n.phase == "awaiting_promotion"
             {
                 self.db
                     .upsert_cluster_update_node(&ClusterUpdateNodeRow {
@@ -18244,6 +18266,62 @@ impl controller_proto::controller_server::Controller for ControllerService {
         ))
     }
 
+    async fn promote_cluster_update(
+        &self,
+        request: Request<controller_proto::PromoteClusterUpdateRequest>,
+    ) -> Result<Response<controller_proto::PromoteClusterUpdateResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let name = request.into_inner().name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let update = self
+            .db
+            .get_cluster_update(&name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found(format!("cluster update '{name}' not found")))?;
+        if update.phase != "rolling_out" {
+            return Err(Status::failed_precondition(format!(
+                "cluster update {name} is {}, not rolling out",
+                update.phase
+            )));
+        }
+        let canary = self
+            .db
+            .list_cluster_update_nodes(&name)
+            .map_err(internal_db)?
+            .into_iter()
+            .find(|row| matches!(row.phase.as_str(), "soaking" | "awaiting_promotion"))
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "cluster update {name} has no canary soaking or awaiting promotion"
+                ))
+            })?;
+        let node_id = canary.node_id.clone();
+        self.db
+            .upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                phase: "succeeded".into(),
+                last_error: format!("promoted by {actor}"),
+                ..canary
+            })
+            .map_err(internal_db)?;
+        let _ = self.log_replication_event_required(
+            &actor,
+            Some("PromoteClusterUpdate"),
+            EVT_CLUSTER_UPDATE_PROMOTE,
+            &name,
+            serde_json::json!({ "nodeId": node_id }),
+        );
+        Ok(Response::new(
+            controller_proto::PromoteClusterUpdateResponse {
+                success: true,
+                message: format!("canary {node_id} promoted; the other nodes update next"),
+                node_id,
+            },
+        ))
+    }
+
     async fn set_cluster_version(
         &self,
         request: Request<controller_proto::SetClusterVersionRequest>,
@@ -18272,7 +18350,24 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
             let spec = cluster_update_spec::spec_from_json(&active.spec_json)
                 .map_err(|e| Status::internal(format!("decode spec: {e}")))?;
+            let mut rows = self
+                .db
+                .list_cluster_update_nodes(&active.name)
+                .map_err(internal_db)?;
+            crate::cluster_update_reconciler::rollout_order(&self.db, &mut rows);
+            let ordered: Vec<String> = rows.into_iter().map(|row| row.node_id).collect();
+            let canary = crate::canary::pick(&self.db, &spec, &ordered).unwrap_or_default();
+            let canary_soak_seconds = if canary.is_empty() {
+                0
+            } else {
+                spec.strategy
+                    .as_ref()
+                    .map(|s| s.canary_soak_seconds)
+                    .unwrap_or_default()
+            };
             return Ok(Response::new(controller_proto::SetClusterVersionResponse {
+                canary_node_id: canary,
+                canary_soak_seconds,
                 direction: String::new(),
                 version: tag,
                 flake_rev: active.flake_rev.clone(),
@@ -18320,14 +18415,63 @@ impl controller_proto::controller_server::Controller for ControllerService {
             resp.message = format!("every node runs {tag}");
             return Ok(Response::new(resp));
         }
+
+        let canary_node = req.canary_node_id.trim();
+        if !(0..=crate::canary::MAX_SOAK_SECS).contains(&req.canary_soak_seconds) {
+            return Err(Status::invalid_argument(format!(
+                "canary_soak_seconds must be between 0 and {}",
+                crate::canary::MAX_SOAK_SECS
+            )));
+        }
+        let soak_secs = match req.canary_soak_seconds {
+            0 => crate::canary::default_soak_secs(
+                &release.nixos_release,
+                &crate::canary::running_nixos_release(),
+            ),
+            secs => secs,
+        };
+        let strategy =
+            cluster_version::strategy((!req.no_canary).then_some((soak_secs, canary_node)));
+        let spec = cluster_version::update_spec(
+            &name,
+            &flake_ref,
+            &release,
+            target_ids.clone(),
+            req.drain_vms,
+            strategy,
+        );
+        cluster_update_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
+        let mut ordered: Vec<ClusterUpdateNodeRow> = target_ids
+            .iter()
+            .map(|node_id| ClusterUpdateNodeRow {
+                update_name: name.clone(),
+                node_id: node_id.clone(),
+                observed_generation: 0,
+                phase: "pending".into(),
+                current_version: String::new(),
+                target_version: release.version.clone(),
+                prepared_closure: String::new(),
+                current_generation: String::new(),
+                target_generation: String::new(),
+                requires_reboot: false,
+                last_error: String::new(),
+                last_transition_at: String::new(),
+            })
+            .collect();
+        crate::cluster_update_reconciler::rollout_order(&self.db, &mut ordered);
+        let ordered: Vec<String> = ordered.into_iter().map(|row| row.node_id).collect();
+        if !req.no_canary {
+            crate::canary::check_named(&self.db, &ordered, canary_node)
+                .map_err(Status::invalid_argument)?;
+        }
+        if let Some(canary) = crate::canary::pick(&self.db, &spec, &ordered) {
+            resp.canary_node_id = canary;
+            resp.canary_soak_seconds = soak_secs;
+        }
         if req.dry_run {
             resp.message = format!("dry run: would {direction} {} node(s)", target_ids.len());
             return Ok(Response::new(resp));
         }
-
-        let spec =
-            cluster_version::update_spec(&name, &flake_ref, &release, target_ids, req.drain_vms);
-        cluster_update_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
         let spec_json = cluster_update_spec::spec_to_json(&spec)
             .map_err(|e| Status::internal(format!("encode spec: {e}")))?;
         let existing = self.db.get_cluster_update(&name).map_err(internal_db)?;
@@ -18384,7 +18528,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
         );
         resp.update_name = name;
         resp.cluster_update = Some(cluster_update_row_to_proto(&stored, spec));
-        resp.message = format!("{direction} to {tag} started");
+        resp.message = if resp.canary_node_id.is_empty() {
+            format!("{direction} to {tag} started")
+        } else {
+            format!(
+                "{direction} to {tag} started; canary {} soaks for {}s before the other nodes",
+                resp.canary_node_id, resp.canary_soak_seconds
+            )
+        };
         Ok(Response::new(resp))
     }
 
@@ -24392,7 +24543,7 @@ mod tests {
                 r#type: controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyOneAtATime
                     as i32,
                 max_unavailable: 1,
-                batch_size: 0,
+                ..Default::default()
             }),
             drain_vms: false,
             drain_timeout_seconds: 0,

@@ -34,6 +34,21 @@ export function int(v: Values, key: string): number {
   return parsed;
 }
 
+/** The controller's limit on a canary soak. */
+export const MAX_SOAK_SECONDS = 7 * 86400;
+
+/** A canary soak as kctl takes it: 5400, 90s, 45m, 2h, or 1d. Empty is 0, the controller's default. */
+export function soak(v: Values, key: string): number {
+  const raw = text(v, key);
+  if (!raw) return 0;
+  const match = /^(\d+)\s*([smhd]?)$/i.exec(raw);
+  if (!match) throw new FormError(`${key} must be seconds or a duration such as 90s, 45m, 2h, or 1d`);
+  const unit = { "": 1, s: 1, m: 60, h: 3600, d: 86400 }[match[2].toLowerCase() as "" | "s" | "m" | "h" | "d"];
+  const seconds = Number(match[1]) * unit;
+  if (seconds < 1 || seconds > MAX_SOAK_SECONDS) throw new FormError(`${key} must be between 1 second and 7 days`);
+  return seconds;
+}
+
 export function i64(v: Values, key: string): bigint {
   const raw = text(v, key);
   if (!raw) return 0n;

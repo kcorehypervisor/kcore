@@ -72086,7 +72086,7 @@ var KINDS = [
     id: "cluster-update",
     yamlKind: "ClusterUpdate",
     title: "Cluster update",
-    summary: "Rolling NixOS update. Plan resolves nodes and blockers. Apply creates the update. Destroy cancels a non-terminal update and keeps history.",
+    summary: "Rolling NixOS update. Plan resolves nodes and blockers. Apply creates the update. Destroy cancels a non-terminal update and keeps history. Strategy canary updates one worker first and soaks it (canarySoakSeconds, canaryNode) while the controllers compare it with its peers; kcore_operation promote-update ends the soak early. To move the whole cluster to a release, use kcore_operation set-version.",
     mutable: [],
     immutable: ["version", "flakeRef", "flakeRev"]
   },
@@ -72786,10 +72786,10 @@ function questionsFor(kind, spec) {
         ),
         question(
           "strategy",
-          "One node at a time, or a wider batch?",
-          "one-at-a-time keeps a quorum while a node reboots.",
+          "Soak a canary node first, or update one node at a time without one?",
+          "canary updates one worker first and soaks it while the controllers, still on the old version, compare it with the other nodes; the rest then follow one at a time.",
           missing(spec, "strategy"),
-          { choices: ["one-at-a-time"], example: "one-at-a-time" }
+          { choices: ["canary", "one-at-a-time"], example: "canary" }
         )
       ].filter((item) => item.required || missing(spec, item.id));
     default:
@@ -72948,6 +72948,9 @@ function warningsFor(kind, spec) {
   }
   if (kind.id === "cluster-update") {
     warnings.push("A cluster update can reboot nodes. Plan it, read the blockers, and apply only after the operator agrees.");
+    warnings.push(
+      "To move every node to a release tag, prefer kcore_operation set-version (kctl update version set): it soaks a canary by default. A canary held in awaiting_promotion continues with kcore_operation promote-update."
+    );
   }
   if (kind.immutable.length > 0) {
     warnings.push(
@@ -73832,7 +73835,7 @@ function buildPlanCall(kind, spec, name) {
   }
   return buildRead(kind, name ?? (typeof spec.name === "string" ? spec.name : void 0));
 }
-var OPERATION_ACTIONS_HINT = "action must be set-vm-state, migrate-vm, cancel-vm-operation, drain-node, cordon-node, uncordon-node, approve-node, reject-node, reboot-node, rotate-node-certs, approve-update, cancel-update, rollback-update, reboot-update-node, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, attach-volume, detach-volume, resize-volume, restore-volume, flatten-volume, format-volume, mount-volume, unmount-volume, encrypt-volume, set-route-waf-mode, delete-object-user, grant-operator-role, revoke-operator-role, or install-node";
+var OPERATION_ACTIONS_HINT = "action must be set-vm-state, migrate-vm, cancel-vm-operation, drain-node, cordon-node, uncordon-node, approve-node, reject-node, reboot-node, rotate-node-certs, approve-update, promote-update, cancel-update, rollback-update, reboot-update-node, set-version, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, attach-volume, detach-volume, resize-volume, restore-volume, flatten-volume, format-volume, mount-volume, unmount-volume, encrypt-volume, set-route-waf-mode, delete-object-user, grant-operator-role, revoke-operator-role, or install-node";
 function buildOperation(action, spec) {
   switch (action) {
     case "set-vm-state": {
@@ -73888,8 +73891,29 @@ function buildOperation(action, spec) {
       return { target: "controller", method: "rejectNode", request: { nodeId: assertName(required3(spec, "nodeId", "node id"), "node id") } };
     case "approve-update":
       return { target: "controller", method: "approveClusterUpdate", request: { name: assertName(required3(spec, "name", "update name"), "update name") } };
+    case "promote-update":
+      return { target: "controller", method: "promoteClusterUpdate", request: { name: assertName(required3(spec, "name", "update name"), "update name") } };
     case "cancel-update":
       return { target: "controller", method: "cancelClusterUpdate", request: { name: assertName(required3(spec, "name", "update name"), "update name") } };
+    case "set-version": {
+      const noCanary = boolish(spec.noCanary);
+      const canaryNode = opt(spec, "canaryNode") ?? opt(spec, "canaryNodeId");
+      const soak = spec.soak ?? spec.canarySoakSeconds;
+      if (noCanary && (canaryNode || soak !== void 0)) throw new InputError("noCanary cannot be combined with canaryNode or soak");
+      return {
+        target: "controller",
+        method: "setClusterVersion",
+        request: {
+          version: releaseTag(assertArg(required3(spec, "version", "version"), "version")),
+          flakeRef: opt(spec, "flakeRef") ?? "",
+          drainVms: boolish(spec.drainVms),
+          dryRun: boolish(spec.dryRun),
+          canarySoakSeconds: soak === void 0 ? 0 : soakSeconds(soak),
+          noCanary,
+          canaryNodeId: canaryNode ? assertName(canaryNode, "canary node") : ""
+        }
+      };
+    }
     case "rollback-update":
       return { target: "controller", method: "rollbackClusterUpdate", request: { name: assertName(required3(spec, "name", "update name"), "update name") } };
     case "slurm-drain-node":
@@ -74422,7 +74446,11 @@ function clusterUpdateMessage(spec) {
   const activation = section(spec, "activation");
   const strategyBlock = typeof spec.strategy === "object" ? section(spec, "strategy") : {};
   const strategy = (typeof spec.strategy === "string" ? opt(spec, "strategy") : void 0) ?? opt(strategyBlock, "strategyType") ?? opt(strategyBlock, "type") ?? "one-at-a-time";
-  if (strategy !== "one-at-a-time") throw new InputError("strategy must be one-at-a-time; canary, batch, and per-dc are not available in this channel");
+  if (strategy !== "one-at-a-time" && strategy !== "canary") throw new InputError("strategy must be one-at-a-time or canary; batch and per-dc are refused");
+  const canary = strategy === "canary";
+  const soak = strategyBlock.canarySoakSeconds ?? strategyBlock.canary_soak_seconds;
+  const canaryNode = opt(strategyBlock, "canaryNode") ?? opt(strategyBlock, "canary_node") ?? opt(strategyBlock, "canaryNodeId") ?? opt(strategyBlock, "canary_node_id");
+  if (!canary && (soak !== void 0 || canaryNode)) throw new InputError("canarySoakSeconds and canaryNode need strategyType canary");
   const maxUnavailable = strategyBlock.maxUnavailable === void 0 ? 1 : Number(strategyBlock.maxUnavailable);
   if (maxUnavailable !== 1) throw new InputError("maxUnavailable must be 1");
   const approval = opt(spec, "approvalPolicy");
@@ -74447,9 +74475,11 @@ function clusterUpdateMessage(spec) {
       controllersOnly: boolish(selector.controllersOnly)
     },
     strategy: {
-      type: "CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME",
+      type: canary ? "CLUSTER_UPDATE_STRATEGY_CANARY" : "CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME",
       maxUnavailable: 1,
-      batchSize: Number(strategyBlock.batchSize ?? 0)
+      batchSize: Number(strategyBlock.batchSize ?? 0),
+      canarySoakSeconds: soak === void 0 ? 0 : soakSeconds(soak),
+      canaryNodeId: canaryNode ? assertName(canaryNode, "canary node") : ""
     },
     drainVms: spec.drainVms === void 0 ? true : boolish(spec.drainVms),
     drainTimeoutSeconds: spec.drainTimeoutSeconds === void 0 ? 0 : Number(spec.drainTimeoutSeconds),
@@ -74684,6 +74714,19 @@ function postgresqlRequest(spec) {
     port,
     targetNode: opt(spec, "targetNode") ?? ""
   };
+}
+var MAX_SOAK_SECONDS = 7 * 86400;
+function soakSeconds(value) {
+  const raw = typeof value === "number" ? String(value) : typeof value === "string" ? value.trim() : "";
+  const match = /^(\d+)\s*([smhd]?)$/i.exec(raw);
+  if (!match) throw new InputError("soak must be seconds or a duration such as 90s, 45m, 2h, or 1d");
+  const unit = { "": 1, s: 1, m: 60, h: 3600, d: 86400 }[match[2].toLowerCase()];
+  const seconds = Number(match[1]) * unit;
+  if (seconds < 1 || seconds > MAX_SOAK_SECONDS) throw new InputError(`soak must be between 1 second and ${MAX_SOAK_SECONDS / 86400} days`);
+  return seconds;
+}
+function releaseTag(version2) {
+  return version2.startsWith("v") ? version2 : `v${version2}`;
 }
 function opt(spec, key) {
   const value = spec[key];
@@ -75293,7 +75336,7 @@ function createServer() {
     "kcore_operation",
     {
       title: "Run a kcore day-2 operation",
-      description: "Power state, migrate, drain, cordon, node approval, node reboot and certificate rotation, cluster-update approve/cancel/rollback/reboot, volume attach/detach/resize/restore/flatten/format/mount/unmount/encrypt, ingress route WAF mode, object user delete, operator roles, Slurm node drain/resume and munge key rotation, or node install. Asks before any disk wipe or mutation.",
+      description: "Power state, migrate, drain, cordon, node approval, node reboot and certificate rotation, cluster-update approve/promote/cancel/rollback/reboot, release version set (canary, soak, or no canary), volume attach/detach/resize/restore/flatten/format/mount/unmount/encrypt, ingress route WAF mode, object user delete, operator roles, Slurm node drain/resume and munge key rotation, or node install. Asks before any disk wipe or mutation.",
       inputSchema: {
         action: external_exports.string().describe(OPERATION_ACTIONS_HINT.replace("action must be ", "")),
         spec: external_exports.record(external_exports.string(), external_exports.unknown()),

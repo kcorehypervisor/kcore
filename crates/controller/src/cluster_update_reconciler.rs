@@ -4,6 +4,9 @@
 //! on each target node, one at a time. The first node that fails stops the
 //! rollout: nodes not yet started are cancelled and the failed node is left
 //! on (or put back on) the generation it ran before.
+//!
+//! A canary update soaks its first node on the target and compares it with
+//! the other nodes before any other node starts.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -119,53 +122,25 @@ async fn reconcile_update(
         };
         db.patch_cluster_update_phase(&update.name, final_phase)
             .map_err(|e| format!("finalize cluster update: {e}"))?;
+        crate::canary::forget(&update.name);
         return Ok(());
     }
 
     let spec = spec_from_json(&update.spec_json).map_err(|e| format!("parse spec_json: {e}"))?;
     let activation = activation_mode_string(&spec).to_string();
-    let peers = db.list_controller_peers().unwrap_or_default();
-    nodes.sort_by(|left, right| {
-        let slurm_rank = |node_id: &str| {
-            let member = db.get_slurm_cluster_node(node_id).ok().flatten()?;
-            let roles: Vec<&str> = member.roles.split(',').collect();
-            if roles.contains(&"dbd") {
-                Some(0u8)
-            } else if roles.contains(&"controller") {
-                Some(1u8)
-            } else if roles.contains(&"compute") {
-                Some(2u8)
-            } else {
-                Some(3u8)
-            }
-        };
-        match (slurm_rank(&left.node_id), slurm_rank(&right.node_id)) {
-            (Some(left_rank), Some(right_rank)) => {
-                (left_rank, left.node_id.clone()).cmp(&(right_rank, right.node_id.clone()))
-            }
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => {
-                let rank = |node_id: &str| {
-                    let address = db
-                        .get_node(node_id)
-                        .ok()
-                        .flatten()
-                        .map(|node| node.address)
-                        .unwrap_or_default();
-                    let host = address.split(':').next().unwrap_or("").to_string();
-                    let controller = peers.iter().any(|peer| {
-                        peer.address == address
-                            || peer.address.split(':').next() == Some(host.as_str())
-                    });
-                    (u8::from(controller), node_id.to_string())
-                };
-                rank(&left.node_id).cmp(&rank(&right.node_id))
-            }
-        }
-    });
+    rollout_order(db, &mut nodes);
+    let ordered: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
+    let canary = crate::canary::pick(db, &spec, &ordered);
+    if let Some(pos) = canary
+        .as_deref()
+        .and_then(|id| nodes.iter().position(|n| n.node_id == id))
+    {
+        let row = nodes.remove(pos);
+        nodes.insert(0, row);
+    }
 
-    // Pick the first node still needing work. Controllers sort last.
+    // Pick the first node still needing work. The canary goes first and
+    // controllers last.
     for node_row in &mut nodes {
         let node = db
             .get_node(&node_row.node_id)
@@ -357,7 +332,7 @@ async fn reconcile_update(
                         } else if !has_generation {
                             "bootstrapping"
                         } else {
-                            "succeeded"
+                            finished_phase(canary.as_deref(), &node_row.node_id)
                         };
                         db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
                             update_name: update.name.clone(),
@@ -463,7 +438,7 @@ async fn reconcile_update(
                             return Ok(());
                         }
                         db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
-                            phase: "succeeded".into(),
+                            phase: finished_phase(canary.as_deref(), &node_row.node_id).into(),
                             last_error: String::new(),
                             ..node_row.clone()
                         })
@@ -531,7 +506,7 @@ async fn reconcile_update(
                 match outcome {
                     Some(true) => {
                         db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
-                            phase: "succeeded".into(),
+                            phase: finished_phase(canary.as_deref(), &node_row.node_id).into(),
                             last_error: String::new(),
                             ..node_row.clone()
                         })
@@ -541,7 +516,16 @@ async fn reconcile_update(
                         let reason = format!(
                             "the node did not run the target generation within {ACTIVATE_CONFIRM_SECS}s"
                         );
-                        fail_and_revert(db, clients, &address, node_row, reason).await?;
+                        fail_and_revert(
+                            db,
+                            clients,
+                            cfg,
+                            &address,
+                            node_row,
+                            spec.drain_vms,
+                            reason,
+                        )
+                        .await?;
                     }
                     None => {}
                 }
@@ -565,7 +549,16 @@ async fn reconcile_update(
                         let reason = format!(
                             "the node did not come back on the staged generation within {REBOOT_CONFIRM_SECS}s"
                         );
-                        fail_and_revert(db, clients, &address, node_row, reason).await?;
+                        fail_and_revert(
+                            db,
+                            clients,
+                            cfg,
+                            &address,
+                            node_row,
+                            spec.drain_vms,
+                            reason,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 };
@@ -589,7 +582,7 @@ async fn reconcile_update(
                 match reboot_step(node_row, &status, &spec.reboot_policy, timed_out) {
                     RebootStep::Succeeded => {
                         db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
-                            phase: "succeeded".into(),
+                            phase: finished_phase(canary.as_deref(), &node_row.node_id).into(),
                             requires_reboot: false,
                             last_error: String::new(),
                             ..node_row.clone()
@@ -619,7 +612,16 @@ async fn reconcile_update(
                             }
                             Err(err) => {
                                 let reason = format!("reboot: {}", err.message());
-                                fail_and_revert(db, clients, &address, node_row, reason).await?;
+                                fail_and_revert(
+                                    db,
+                                    clients,
+                                    cfg,
+                                    &address,
+                                    node_row,
+                                    spec.drain_vms,
+                                    reason,
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -627,10 +629,23 @@ async fn reconcile_update(
                         let reason = format!(
                             "the staged generation was not confirmed within {REBOOT_CONFIRM_SECS}s"
                         );
-                        fail_and_revert(db, clients, &address, node_row, reason).await?;
+                        fail_and_revert(
+                            db,
+                            clients,
+                            cfg,
+                            &address,
+                            node_row,
+                            spec.drain_vms,
+                            reason,
+                        )
+                        .await?;
                     }
                     RebootStep::Wait => {}
                 }
+                return Ok(());
+            }
+            "soaking" | "awaiting_promotion" => {
+                soak_step(db, clients, cfg, &address, update, &spec, node_row).await?;
                 return Ok(());
             }
             "rolling_back" => {
@@ -656,7 +671,21 @@ async fn reconcile_update(
                 let req = node_proto::RollbackSystemUpdateRequest {
                     update_name: update.name.clone(),
                 };
-                let _ = rollback_on_node(clients, &address, req).await;
+                let last_error = match rollback_on_node(clients, &address, req).await {
+                    Ok(resp) if resp.success && resp.reboot_required => {
+                        let rebooted = reboot_into_previous(
+                            db,
+                            clients,
+                            cfg,
+                            &address,
+                            node_row,
+                            spec.drain_vms,
+                        )
+                        .await;
+                        format!("rolled back; {rebooted}")
+                    }
+                    _ => "rolled back (MVP)".into(),
+                };
                 db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
                     update_name: update.name.clone(),
                     node_id: node_row.node_id.clone(),
@@ -668,7 +697,7 @@ async fn reconcile_update(
                     current_generation: String::new(),
                     target_generation: String::new(),
                     requires_reboot: false,
-                    last_error: "rolled back (MVP)".into(),
+                    last_error,
                     last_transition_at: String::new(),
                 })
                 .map_err(|e| format!("mark rollback: {e}"))?;
@@ -678,6 +707,193 @@ async fn reconcile_update(
         }
     }
     Ok(())
+}
+
+/// Slurm members by role, then other nodes, then controllers.
+/// True when a controller in `peers` listens on the node's host.
+pub(crate) fn runs_controller(
+    db: &Database,
+    peers: &[crate::db::ControllerPeerRow],
+    node_id: &str,
+) -> bool {
+    let address = db
+        .get_node(node_id)
+        .ok()
+        .flatten()
+        .map(|node| node.address)
+        .unwrap_or_default();
+    let host = address.split(':').next().unwrap_or("");
+    peers
+        .iter()
+        .any(|peer| peer.address == address || peer.address.split(':').next() == Some(host))
+}
+
+pub(crate) fn rollout_order(db: &Database, nodes: &mut [ClusterUpdateNodeRow]) {
+    let peers = db.list_controller_peers().unwrap_or_default();
+    nodes.sort_by(|left, right| {
+        let slurm_rank = |node_id: &str| {
+            let member = db.get_slurm_cluster_node(node_id).ok().flatten()?;
+            let roles: Vec<&str> = member.roles.split(',').collect();
+            if roles.contains(&"dbd") {
+                Some(0u8)
+            } else if roles.contains(&"controller") {
+                Some(1u8)
+            } else if roles.contains(&"compute") {
+                Some(2u8)
+            } else {
+                Some(3u8)
+            }
+        };
+        match (slurm_rank(&left.node_id), slurm_rank(&right.node_id)) {
+            (Some(left_rank), Some(right_rank)) => {
+                (left_rank, left.node_id.clone()).cmp(&(right_rank, right.node_id.clone()))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                let rank = |node_id: &str| {
+                    (
+                        u8::from(runs_controller(db, &peers, node_id)),
+                        node_id.to_string(),
+                    )
+                };
+                rank(&left.node_id).cmp(&rank(&right.node_id))
+            }
+        }
+    });
+}
+
+/// A node that finished its update. The canary soaks before the rollout
+/// moves on.
+fn finished_phase(canary: Option<&str>, node_id: &str) -> &'static str {
+    if canary == Some(node_id) {
+        "soaking"
+    } else {
+        "succeeded"
+    }
+}
+
+/// Judge the canary against every other node. A failure after the grace
+/// period puts it back on its previous generation and stops the rollout. At
+/// the end of the soak a pass lets the other nodes start, and no verdict
+/// waits for `kctl update cluster promote`.
+async fn soak_step(
+    db: &Database,
+    clients: &NodeClients,
+    cfg: &ClusterUpdateReconcilerConfig,
+    address: &str,
+    update: &ClusterUpdateRow,
+    spec: &crate::controller_proto::ClusterUpdateSpec,
+    node_row: &ClusterUpdateNodeRow,
+) -> Result<(), String> {
+    use crate::canary::{self, Verdict};
+    let running = db
+        .get_node_host_status(&node_row.node_id)
+        .ok()
+        .flatten()
+        .map(|row| row.kcore_version)
+        .unwrap_or_default();
+    let on_target = crate::cluster_version::parse_version(&running).is_some()
+        && crate::cluster_version::parse_version(&running)
+            == crate::cluster_version::parse_version(&update.target_version);
+    let age_secs = db
+        .cluster_update_node_age_secs(&update.name, &node_row.node_id)
+        .map_err(|e| format!("read soak age: {e}"))?;
+    let soak_secs = canary::soak_secs(spec);
+    // Agent calls and Ceph latency right after the update are the update's
+    // own noise; both count from the end of the grace period.
+    let judged_secs = age_secs - canary::GRACE_SECS.min(soak_secs);
+    let calls_since = (judged_secs >= 0)
+        .then(|| {
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(u64::try_from(judged_secs).unwrap_or(0)))
+        })
+        .flatten();
+    let peers: Vec<canary::NodeSample> = db
+        .list_nodes()
+        .map_err(|e| format!("list nodes: {e}"))?
+        .iter()
+        .filter(|n| n.id != node_row.node_id)
+        .map(|n| canary::sample(db, clients, &n.id, calls_since))
+        .collect();
+    let ceph = if calls_since.is_some() {
+        canary::ceph_latency(db, clients, &update.name, &node_row.node_id).await
+    } else {
+        None
+    };
+    let verdict = canary::judge(
+        &canary::sample(db, clients, &node_row.node_id, calls_since),
+        on_target,
+        &peers,
+        ceph.as_ref(),
+    );
+    match soak_progress(&verdict, &node_row.phase, age_secs, soak_secs) {
+        SoakStep::Revert => {
+            let Verdict::Fail(reason) = verdict else {
+                unreachable!("only a failure reverts");
+            };
+            canary::forget(&update.name);
+            fail_and_revert(
+                db,
+                clients,
+                cfg,
+                address,
+                node_row,
+                spec.drain_vms,
+                format!("canary: {reason}"),
+            )
+            .await
+        }
+        SoakStep::Promote => {
+            canary::forget(&update.name);
+            db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                phase: "succeeded".into(),
+                last_error: String::new(),
+                ..node_row.clone()
+            })
+            .map_err(|e| format!("promote canary: {e}"))
+        }
+        SoakStep::AwaitOperator => {
+            let Verdict::Unknown(reason) = verdict else {
+                unreachable!("only no verdict waits for the operator");
+            };
+            db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                phase: "awaiting_promotion".into(),
+                last_error: format!(
+                    "canary soaked {soak_secs}s with no verdict: {reason}; run `kctl update cluster promote {}` or cancel the update",
+                    update.name
+                ),
+                ..node_row.clone()
+            })
+            .map_err(|e| format!("hold canary: {e}"))
+        }
+        SoakStep::Wait => Ok(()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SoakStep {
+    Revert,
+    Promote,
+    AwaitOperator,
+    Wait,
+}
+
+fn soak_progress(
+    verdict: &crate::canary::Verdict,
+    phase: &str,
+    age_secs: i64,
+    soak_secs: i64,
+) -> SoakStep {
+    use crate::canary::{Verdict, GRACE_SECS};
+    let past_grace = age_secs >= GRACE_SECS.min(soak_secs);
+    match verdict {
+        Verdict::Fail(_) if past_grace => SoakStep::Revert,
+        _ if phase != "soaking" || age_secs < soak_secs => SoakStep::Wait,
+        Verdict::Pass => SoakStep::Promote,
+        Verdict::Unknown(_) => SoakStep::AwaitOperator,
+        Verdict::Fail(_) => SoakStep::Wait,
+    }
 }
 
 fn first_failed(nodes: &[ClusterUpdateNodeRow]) -> Option<String> {
@@ -751,8 +967,10 @@ async fn node_reports_failure(
 async fn fail_and_revert(
     db: &Database,
     clients: &NodeClients,
+    cfg: &ClusterUpdateReconcilerConfig,
     address: &str,
     node_row: &ClusterUpdateNodeRow,
+    drain_vms: bool,
     reason: String,
 ) -> Result<(), String> {
     let undo = rollback_on_node(
@@ -764,6 +982,11 @@ async fn fail_and_revert(
     )
     .await;
     let last_error = match undo {
+        Ok(resp) if resp.success && resp.reboot_required => {
+            let rebooted =
+                reboot_into_previous(db, clients, cfg, address, node_row, drain_vms).await;
+            format!("{reason}; {}; {rebooted}", resp.message)
+        }
         Ok(resp) if resp.success => format!("{reason}; {}", resp.message),
         Ok(resp) => format!("{reason}; rollback failed: {}", resp.message),
         Err(e) => format!("{reason}; rollback failed: {e}"),
@@ -774,6 +997,62 @@ async fn fail_and_revert(
         ..node_row.clone()
     })
     .map_err(|e| format!("mark node failed: {e}"))
+}
+
+/// A node rolled back while it ran the update generation stays on it until
+/// it reboots. Move its guests off when the update drains, then reboot it
+/// into the previous generation. Returns what happened, for `last_error`.
+async fn reboot_into_previous(
+    db: &Database,
+    clients: &NodeClients,
+    cfg: &ClusterUpdateReconcilerConfig,
+    address: &str,
+    node_row: &ClusterUpdateNodeRow,
+    drain_vms: bool,
+) -> String {
+    let guests = db.list_vms_for_node(&node_row.node_id).unwrap_or_default();
+    if !guests.is_empty() {
+        if !drain_vms {
+            return "not rebooted: guests are still on the node and the update does not drain them"
+                .into();
+        }
+        let svc = ControllerService::new(
+            db.clone(),
+            clients.clone(),
+            cfg.default_network.clone(),
+            cfg.sub_ca.clone(),
+            None,
+            false,
+            false,
+        );
+        let drain = NodeDrainOptions {
+            mark_draining_at_start: false,
+            update_final_node_status: false,
+        };
+        match svc.drain_node_vms(&node_row.node_id, "", drain).await {
+            Ok(outcome) if outcome.errors.is_empty() => {}
+            Ok(outcome) => {
+                return format!("not rebooted: drain failed: {}", outcome.errors.join("; "));
+            }
+            Err(e) => return format!("not rebooted: drain failed: {}", e.message()),
+        }
+    }
+    if clients.get_admin(address).is_none() {
+        if let Err(e) = clients.connect(address).await {
+            return format!("not rebooted: connect: {e}");
+        }
+    }
+    let Some(mut admin) = clients.get_admin(address) else {
+        return "not rebooted: no admin client".into();
+    };
+    match admin
+        .reboot_node(Request::new(node_proto::RebootNodeRequest {}))
+        .await
+    {
+        Ok(resp) if resp.get_ref().success => "rebooting into the previous generation".into(),
+        Ok(resp) => format!("not rebooted: {}", resp.into_inner().message),
+        Err(e) => format!("not rebooted: {e}"),
+    }
 }
 
 /// The agent rebuilds with the node config current at activation, so the
@@ -1353,5 +1632,198 @@ mod tests {
         ] {
             assert!(!not_started(phase), "{phase}");
         }
+    }
+
+    #[test]
+    fn the_canary_soaks_then_passes_waits_or_reverts() {
+        use crate::canary::Verdict;
+        let pass = Verdict::Pass;
+        let fail = Verdict::Fail("guests down".into());
+        let unknown = Verdict::Unknown("no peers".into());
+        assert_eq!(soak_progress(&pass, "soaking", 10, 3600), SoakStep::Wait);
+        assert_eq!(
+            soak_progress(&pass, "soaking", 3600, 3600),
+            SoakStep::Promote
+        );
+        assert_eq!(
+            soak_progress(&unknown, "soaking", 3600, 3600),
+            SoakStep::AwaitOperator
+        );
+        assert_eq!(
+            soak_progress(&pass, "awaiting_promotion", 9999, 3600),
+            SoakStep::Wait,
+            "only the operator ends a held canary"
+        );
+        assert_eq!(
+            soak_progress(&fail, "soaking", 60, 3600),
+            SoakStep::Wait,
+            "guests may still be starting"
+        );
+        assert_eq!(soak_progress(&fail, "soaking", 300, 3600), SoakStep::Revert);
+        assert_eq!(
+            soak_progress(&fail, "awaiting_promotion", 300, 3600),
+            SoakStep::Revert
+        );
+        assert_eq!(
+            soak_progress(&fail, "soaking", 60, 60),
+            SoakStep::Revert,
+            "a short soak is still judged at its end"
+        );
+        assert_eq!(finished_phase(Some("a"), "a"), "soaking");
+        assert_eq!(finished_phase(Some("a"), "b"), "succeeded");
+        assert_eq!(finished_phase(None, "a"), "succeeded");
+    }
+
+    fn test_cfg() -> ClusterUpdateReconcilerConfig {
+        ClusterUpdateReconcilerConfig {
+            default_network: NetworkConfig {
+                gateway_interface: "eno1".into(),
+                external_ip: "203.0.113.10".into(),
+                gateway_ip: "10.0.0.1".into(),
+                internal_netmask: "255.255.255.0".into(),
+            },
+            sub_ca: Arc::new(Mutex::new(SubCaState::default())),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reverted_node_with_guests_and_no_drain_is_not_rebooted() {
+        let db = Database::open(":memory:").unwrap();
+        db.upsert_node(&ready_node("a")).unwrap();
+        db.upsert_vm(&crate::db::VmRow {
+            id: "vm-1".into(),
+            name: "web-1".into(),
+            cpu: 1,
+            memory_bytes: 1 << 30,
+            image_path: String::new(),
+            image_url: String::new(),
+            image_sha256: String::new(),
+            image_format: "raw".into(),
+            image_size: 0,
+            network: "default".into(),
+            auto_start: true,
+            node_id: "a".into(),
+            created_at: String::new(),
+            runtime_state: "running".into(),
+            cloud_init_user_data: String::new(),
+            storage_backend: "filesystem".into(),
+            storage_size_bytes: 0,
+            vm_ip: String::new(),
+            pci_devices: String::new(),
+            labels: String::new(),
+        })
+        .unwrap();
+        let mut row = update_node("", false);
+        row.node_id = "a".into();
+        let clients = NodeClients::new(None);
+        let said = reboot_into_previous(&db, &clients, &test_cfg(), "a:9091", &row, false).await;
+        assert!(said.starts_with("not rebooted: guests"), "{said}");
+        let unreachable = reboot_into_previous(
+            &Database::open(":memory:").unwrap(),
+            &clients,
+            &test_cfg(),
+            "127.0.0.1:1",
+            &row,
+            false,
+        )
+        .await;
+        assert!(unreachable.starts_with("not rebooted"), "{unreachable}");
+    }
+
+    fn ready_node(id: &str) -> crate::db::NodeRow {
+        crate::db::NodeRow {
+            id: id.into(),
+            hostname: id.into(),
+            address: format!("{id}:9091"),
+            cpu_cores: 0,
+            memory_bytes: 0,
+            status: "ready".into(),
+            last_heartbeat: String::new(),
+            gateway_interface: String::new(),
+            cpu_used: 0,
+            memory_used: 0,
+            storage_backend: "filesystem".into(),
+            disable_vxlan: false,
+            approval_status: "approved".into(),
+            cert_expiry_days: 0,
+            luks_method: String::new(),
+            dc_id: "DC1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_soaked_canary_is_promoted_or_held_for_the_operator() {
+        use crate::controller_proto::{
+            ClusterUpdateSpec, ClusterUpdateStrategy, ClusterUpdateStrategyType,
+        };
+        let db = Database::open(":memory:").unwrap();
+        for id in ["a", "b"] {
+            db.upsert_node(&ready_node(id)).unwrap();
+            db.update_heartbeat(id, 0, 0, 0, "").unwrap();
+        }
+        db.upsert_node_host_status("a", "0.7.0", "", "", "nixos-generation", 0, "")
+            .unwrap();
+        let spec = ClusterUpdateSpec {
+            name: "u".into(),
+            strategy: Some(ClusterUpdateStrategy {
+                r#type: ClusterUpdateStrategyType::ClusterUpdateStrategyCanary as i32,
+                max_unavailable: 1,
+                canary_soak_seconds: 60,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let clients = NodeClients::new(None);
+        let soak = |name: &str, since: &str| {
+            let update = ClusterUpdateRow {
+                name: name.into(),
+                generation: 1,
+                target_version: "0.7.0".into(),
+                flake_ref: "github:kcorehypervisor/kcore".into(),
+                flake_rev: "a".repeat(40),
+                spec_json: crate::cluster_update_spec::spec_to_json(&spec).unwrap(),
+                phase: "rolling_out".into(),
+                approval_status: "approved".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            db.upsert_cluster_update(&update).unwrap();
+            let mut row = update_node("", false);
+            row.update_name = name.into();
+            row.node_id = "a".into();
+            row.phase = "soaking".into();
+            row.last_transition_at = since.into();
+            db.upsert_cluster_update_node(&row).unwrap();
+            (update, row)
+        };
+        let phase = |name: &str| db.list_cluster_update_nodes(name).unwrap()[0].clone();
+        let long_ago = "2000-01-01 00:00:00";
+
+        let (update, row) = soak("fresh", "");
+        db.upsert_cluster_update_node(&row).unwrap();
+        soak_step(&db, &clients, &test_cfg(), "a:9091", &update, &spec, &row)
+            .await
+            .unwrap();
+        assert_eq!(phase("fresh").phase, "soaking", "the soak has not ended");
+
+        let (update, row) = soak("soaked", long_ago);
+        soak_step(&db, &clients, &test_cfg(), "a:9091", &update, &spec, &row)
+            .await
+            .unwrap();
+        assert_eq!(phase("soaked").phase, "succeeded");
+
+        db.update_node_status("b", "not-ready").unwrap();
+        let (update, row) = soak("alone", long_ago);
+        soak_step(&db, &clients, &test_cfg(), "a:9091", &update, &spec, &row)
+            .await
+            .unwrap();
+        let held = phase("alone");
+        assert_eq!(held.phase, "awaiting_promotion");
+        assert!(
+            held.last_error
+                .contains("kctl update cluster promote alone"),
+            "{}",
+            held.last_error
+        );
     }
 }

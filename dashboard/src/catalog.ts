@@ -38,6 +38,7 @@ import {
   positiveBytes,
   records,
   required,
+  soak,
   strings,
   text,
   type Values,
@@ -412,14 +413,37 @@ function postedK8s(v: Values): boolean {
   return !fromRow(v) && (Boolean(text(v, "cluster_cidr")) || records(v, "control_plane_nodes").length > 0);
 }
 
+function updateStrategy(v: Values) {
+  const canary = text(v, "strategy") === "canary";
+  if (!canary && (text(v, "canary_soak") || text(v, "canary_node"))) throw new FormError("Canary soak and canary node need the canary strategy");
+  return {
+    type: canary ? ClusterUpdateStrategyType.CLUSTER_UPDATE_STRATEGY_CANARY : ClusterUpdateStrategyType.CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME,
+    maxUnavailable: 1,
+    canarySoakSeconds: canary ? soak(v, "canary_soak") : 0,
+    canaryNodeId: canary ? text(v, "canary_node") : "",
+  };
+}
+
 function updateSpec(v: Values): Init<typeof ClusterUpdateSpecSchema> {
   return {
     name: required(v, "name"),
     target: { version: text(v, "version"), flakeRef: text(v, "flake_ref"), flakeRev: text(v, "flake_rev") },
     selector: { allNodes: flag(v, "all_nodes"), nodeIds: strings(v, "node_ids") },
-    strategy: { type: ClusterUpdateStrategyType.CLUSTER_UPDATE_STRATEGY_ONE_AT_A_TIME, maxUnavailable: 1 },
+    strategy: updateStrategy(v),
     updateKind: text(v, "update_kind") || "kcore",
     drainVms: flag(v, "drain_vms"),
+  };
+}
+
+/** GetClusterVersion with the canary and its soak state lifted out of the node list. */
+function releaseRow(row: Row): Row {
+  const nodes = (Array.isArray(row.nodes) ? row.nodes : []) as Row[];
+  const canary = nodes.find((node) => ["soaking", "awaiting-promotion"].includes(String(node.phase)));
+  return {
+    ...row,
+    canary: canary?.node_id ?? "",
+    canary_phase: canary?.phase ?? "",
+    canary_message: canary?.last_error ?? "",
   };
 }
 
@@ -1440,6 +1464,9 @@ export const RESOURCES: Resource[] = [
       bool("all_nodes", "All nodes"),
       f("node_ids", "Node ids", false, "comma separated"),
       bool("drain_vms", "Drain VMs first"),
+      pick("strategy", "Strategy", ["canary", "one-at-a-time"]),
+      f("canary_soak", "Canary soak", false, "1h (canary only)"),
+      f("canary_node", "Canary node", false, "a worker; empty picks one"),
     ],
     checks: ["plan"],
     list: async () =>
@@ -1460,6 +1487,7 @@ export const RESOURCES: Resource[] = [
         await controller.approveClusterUpdate({ name: ident(v) });
         return { ok: true };
       }),
+      act("promote", "Promote canary", true, [], async (v) => ok(await controller.promoteClusterUpdate({ name: ident(v) }))),
       act("reboot", "Reboot node", true, [f("node_id", "Node", true)], async (v) => ok(await controller.rebootClusterUpdateNode({ name: ident(v), nodeId: required(v, "node_id") }))),
       act("rollback", "Roll back", true, [], async (v) => {
         await controller.rollbackClusterUpdate({ name: ident(v) });
@@ -1468,6 +1496,54 @@ export const RESOURCES: Resource[] = [
       act("cancel", "Cancel", true, [], async (v) => {
         await controller.cancelClusterUpdate({ name: ident(v) });
         return { ok: true };
+      }),
+    ],
+  },
+  {
+    id: "release",
+    noun: "release",
+    single: true,
+    title: "Release",
+    group: "Cluster",
+    terraform: ["kcore_cluster_version"],
+    kctl: "update version get",
+    idField: "version",
+    fields: [],
+    list: async () => [releaseRow(rowOf(await controller.getClusterVersion({})))],
+    actions: [
+      act(
+        "set-version",
+        "Set version",
+        true,
+        [
+          f("version", "Release tag", true, "v0.7.0"),
+          f("flake_ref", "Flake ref", false, "github:kcorehypervisor/kcore"),
+          bool("drain_vms", "Drain VMs before a reboot"),
+          f("soak", "Canary soak", false, "1h, or 1d for a new NixOS release"),
+          f("canary_node", "Canary node", false, "a worker; empty picks one"),
+          bool("no_canary", "No canary"),
+          bool("dry_run", "Dry run"),
+        ],
+        async (v) => {
+          const noCanary = flag(v, "no_canary");
+          if (noCanary && (text(v, "soak") || text(v, "canary_node"))) throw new FormError("No canary cannot be combined with a soak or a canary node");
+          const tag = required(v, "version");
+          const resp = await controller.setClusterVersion({
+            version: tag.startsWith("v") ? tag : `v${tag}`,
+            flakeRef: text(v, "flake_ref"),
+            drainVms: flag(v, "drain_vms"),
+            dryRun: flag(v, "dry_run"),
+            canarySoakSeconds: noCanary ? 0 : soak(v, "soak"),
+            noCanary,
+            canaryNodeId: noCanary ? "" : text(v, "canary_node"),
+          });
+          return { ok: true, message: resp.message };
+        },
+      ),
+      act("promote", "Promote canary", true, [], async () => {
+        const current = await controller.getClusterVersion({});
+        if (!current.updateName) throw new FormError("No version update is rolling out");
+        return ok(await controller.promoteClusterUpdate({ name: current.updateName }));
       }),
     ],
   },

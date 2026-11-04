@@ -83,6 +83,10 @@ pub struct StoredStrategy {
     pub max_unavailable: i32,
     #[serde(default)]
     pub batch_size: i32,
+    #[serde(default)]
+    pub canary_soak_seconds: i32,
+    #[serde(default)]
+    pub canary_node_id: String,
 }
 
 pub fn spec_to_json(spec: &ClusterUpdateSpec) -> Result<String, serde_json::Error> {
@@ -98,7 +102,7 @@ pub fn spec_from_json(s: &str) -> Result<ClusterUpdateSpec, serde_json::Error> {
 fn stored_from_proto(spec: &ClusterUpdateSpec) -> StoredClusterUpdateSpec {
     let target = spec.target.clone().unwrap_or_default();
     let selector = spec.selector.clone().unwrap_or_default();
-    let strategy = spec.strategy.unwrap_or_default();
+    let strategy = spec.strategy.clone().unwrap_or_default();
     StoredClusterUpdateSpec {
         name: spec.name.clone(),
         target: StoredTarget {
@@ -120,6 +124,8 @@ fn stored_from_proto(spec: &ClusterUpdateSpec) -> StoredClusterUpdateSpec {
             strategy_type: strategy.r#type,
             max_unavailable: strategy.max_unavailable,
             batch_size: strategy.batch_size,
+            canary_soak_seconds: strategy.canary_soak_seconds,
+            canary_node_id: strategy.canary_node_id.clone(),
         },
         drain_vms: spec.drain_vms,
         drain_timeout_seconds: spec.drain_timeout_seconds,
@@ -167,6 +173,8 @@ fn proto_from_stored(s: StoredClusterUpdateSpec) -> ClusterUpdateSpec {
             r#type: s.strategy.strategy_type,
             max_unavailable: s.strategy.max_unavailable,
             batch_size: s.strategy.batch_size,
+            canary_soak_seconds: s.strategy.canary_soak_seconds,
+            canary_node_id: s.strategy.canary_node_id,
         }),
         drain_vms: s.drain_vms,
         drain_timeout_seconds: s.drain_timeout_seconds,
@@ -277,18 +285,16 @@ pub fn validate_spec(spec: &ClusterUpdateSpec) -> Result<(), String> {
                 .into(),
         );
     }
-    let strategy = spec.strategy.unwrap_or_default();
+    let strategy = spec.strategy.clone().unwrap_or_default();
     match strategy.r#type {
         t if t
-            == crate::controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyCanary
-                as i32
-            || t == crate::controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyBatch
+            == crate::controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyBatch
                 as i32
             || t == crate::controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyPerDc
                 as i32 =>
         {
             return Err(
-                "canary, batch, and per-datacenter strategies are refused until a node has rebooted and rolled back on this path"
+                "batch and per-datacenter strategies are refused; use canary or one-at-a-time"
                     .into(),
             );
         }
@@ -296,6 +302,17 @@ pub fn validate_spec(spec: &ClusterUpdateSpec) -> Result<(), String> {
     }
     if strategy.max_unavailable > 1 {
         return Err("maxUnavailable must be 1".into());
+    }
+    let canary = strategy.r#type
+        == crate::controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyCanary as i32;
+    if !canary && (strategy.canary_soak_seconds != 0 || !strategy.canary_node_id.is_empty()) {
+        return Err("canarySoakSeconds and canaryNode need strategyType canary".into());
+    }
+    if !(0..=crate::canary::MAX_SOAK_SECS).contains(&strategy.canary_soak_seconds) {
+        return Err(format!(
+            "canarySoakSeconds must be between 0 and {}",
+            crate::canary::MAX_SOAK_SECS
+        ));
     }
     let kind = spec.update_kind.trim();
     if kind == "nixpkgs" {
@@ -349,7 +366,7 @@ mod tests {
             strategy: Some(ClusterUpdateStrategy {
                 r#type: ClusterUpdateStrategyType::ClusterUpdateStrategyOneAtATime as i32,
                 max_unavailable: 1,
-                batch_size: 0,
+                ..Default::default()
             }),
             drain_vms: false,
             drain_timeout_seconds: 0,
@@ -389,6 +406,35 @@ mod tests {
         let mut spec = one_at_a_time_spec();
         spec.selector = Some(ClusterUpdateSelector::default());
         assert!(validate_spec(&spec).is_err(), "empty selector must fail");
+    }
+
+    #[test]
+    fn validate_accepts_canary_and_refuses_batch() {
+        let mut spec = one_at_a_time_spec();
+        spec.strategy = Some(ClusterUpdateStrategy {
+            r#type: ClusterUpdateStrategyType::ClusterUpdateStrategyCanary as i32,
+            max_unavailable: 1,
+            canary_soak_seconds: 600,
+            canary_node_id: "a".into(),
+            ..Default::default()
+        });
+        validate_spec(&spec).unwrap();
+        let back = spec_from_json(&spec_to_json(&spec).unwrap()).unwrap();
+        let strategy = back.strategy.unwrap();
+        assert_eq!(strategy.canary_soak_seconds, 600);
+        assert_eq!(strategy.canary_node_id, "a");
+
+        spec.strategy.as_mut().unwrap().canary_soak_seconds = crate::canary::MAX_SOAK_SECS + 1;
+        assert!(validate_spec(&spec).is_err(), "soak above the cap");
+
+        let mut spec = one_at_a_time_spec();
+        spec.strategy.as_mut().unwrap().canary_soak_seconds = 60;
+        assert!(validate_spec(&spec).is_err(), "soak without a canary");
+
+        let mut spec = one_at_a_time_spec();
+        spec.strategy.as_mut().unwrap().r#type =
+            ClusterUpdateStrategyType::ClusterUpdateStrategyBatch as i32;
+        assert!(validate_spec(&spec).is_err());
     }
 
     #[test]

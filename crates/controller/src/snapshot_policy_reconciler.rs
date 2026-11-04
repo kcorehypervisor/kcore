@@ -125,7 +125,9 @@ async fn reconcile_policy(
 
 async fn prune_volume(
     db: &Database,
-    storage: &mut node_proto::node_storage_client::NodeStorageClient<tonic::transport::Channel>,
+    storage: &mut node_proto::node_storage_client::NodeStorageClient<
+        crate::node_client::NodeChannel,
+    >,
     vol: &VolumeRow,
     keep: i32,
 ) -> Result<usize, String> {
