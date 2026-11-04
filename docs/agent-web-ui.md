@@ -13,7 +13,7 @@ An operator runs `kctl agent`. A browser tab opens on `http://127.0.0.1:<port>/?
 | Piece | State |
 |---|---|
 | `kctl agent` (`--port`, `--no-browser`, `--agent-bin`, `--provisioning`, plus the global `-c`, `-s`, `-k`, `--tls-server-name`, `--as`) | Done. Writes a 0600 one-context file in a 0700 runtime directory, passes it and a 256-bit token to the agent, prints the URL, stops the agent on Ctrl-C and removes the directory. |
-| Agent HTTP server, session loop, SSE | Done. Loopback only; bearer token on every `/api` call; Host and Origin checks against DNS rebinding; CSP with no inline script or style. |
+| Agent HTTP server, session loop, SSE | Done. Loopback by default, or one LAN address with `kctl agent --listen <ipv4>` (plain HTTP; see Security); bearer token on every `/api` call; Host and Origin checks against DNS rebinding; CSP with no inline script or style. |
 | In-process MCP client with elicitation | Done. One `kcore-mcp` server instance per session over `InMemoryTransport`. |
 | Approval gate | Done, see [Approval](#approval). |
 | Elicitation forms | Done. `Question`s carry a type (`integer`, `number`), a minimum, and pick lists. The server fills the pick lists from the cluster, see [Forms](#forms). The UI shows labelled options (`enumNames`, `oneOf`) and number fields. |
@@ -203,7 +203,7 @@ Not built: form views (`ui://kcore/<kind>-form`). The schema forms cover that pa
 
 ## Security
 
-- Loopback only. Bind `127.0.0.1`, refuse `KCORE_AGENT_BIND` values that are not loopback unless `--unsafe-bind` is also set, and document that remote use goes through an SSH tunnel.
+- Loopback by default. `kctl agent --listen <ipv4>` serves one specific LAN address (a wildcard is refused); the agent only accepts it with `KCORE_AGENT_ALLOW_REMOTE=1`, which `kctl` sets. The page is plain HTTP and the token is in the link, so use it on a trusted network, with `--role`. Host and Origin checks accept only that address plus loopback. Sign in with ChatGPT does not work in this mode, because its callback is a loopback URL and nothing listens there; use an API key or an SSH tunnel for that. No browser is opened. The safer remote route is still an SSH tunnel.
 - Session token in every request. The token is 256 bits, printed once by `kctl`, and rotates per run.
 - The browser never holds cluster certificates, provider refresh tokens, or the agent's `auth.json`.
 - Human approval for every mutation, enforced in the loop, with the exact arguments displayed. The model cannot set `confirm`.
