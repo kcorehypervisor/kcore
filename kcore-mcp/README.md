@@ -36,7 +36,7 @@ Cluster context, VM, network, SSH key, container, volume, volume snapshot, snaps
 
 ## Agent chat UI
 
-`packages/agent` is `kcore-agent`, a local chat UI that uses this server as its tool set. Start it with `kctl agent`: `kctl` hands it the current context's certificates through a private runtime file and a one-time token, and the browser never sees the key. Questions the server asks become forms in the page, and every change waits for an Approve click. See [docs/agent-web-ui.md](../docs/agent-web-ui.md).
+`packages/agent` is `kcore-agent`, a local chat UI that uses this server as its tool set. Start it with `kctl agent`: `kctl` hands it the current context's certificates through a private runtime file and a one-time token, and the browser never sees the key. Questions the server asks become forms in the page (networks, SSH keys and nodes are pick lists filled from the cluster), `kcore_plan` results show as a plan view, and every change waits for an Approve click. `kctl agent --role vm-admin` runs it as its own limited operator. See [docs/agent-web-ui.md](../docs/agent-web-ui.md).
 
 ```bash
 npm install && npm run build

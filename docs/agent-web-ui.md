@@ -1,6 +1,6 @@
 # `kctl agent`: a local chat UI that drives kcore through the MCP
 
-Status: **phase 1 built**. `kctl agent` and `kcore-mcp/packages/agent` exist and run end to end against a model endpoint. Sign in with ChatGPT, Anthropic, catalog forms with cluster-sourced pickers, MCP Apps, and `--role` are not built yet. See [What is built](#what-is-built).
+Status: **built**. `kctl agent` and `kcore-mcp/packages/agent` run end to end against a model endpoint. Sign in with ChatGPT, the Anthropic adapter, cluster-filled pick lists, the MCP Apps host, `--role`, session reload, npm metadata and the Nix package are in. Two things are not tested against live services: the ChatGPT sign-in (it follows OpenAI's published flow and is covered with a fake token endpoint) and a real model driving a full VM create. Release tarballs do not ship `kcore-agent` yet. See [What is built](#what-is-built).
 
 The working tree for this work is `/mnt/data/dev/kcore/kcore-rust-agent-ui`, branched from `cursor/ceph-p0-safety-64a3` at `5d2caa8`.
 
@@ -16,9 +16,13 @@ An operator runs `kctl agent`. A browser tab opens on `http://127.0.0.1:<port>/?
 | Agent HTTP server, session loop, SSE | Done. Loopback only; bearer token on every `/api` call; Host and Origin checks against DNS rebinding; CSP with no inline script or style. |
 | In-process MCP client with elicitation | Done. One `kcore-mcp` server instance per session over `InMemoryTransport`. |
 | Approval gate | Done, see [Approval](#approval). |
-| Elicitation forms (layer 1) | Done for the schema the server sends today: text, enum, number, boolean. Typed `Question`s and `_meta.kcore.source` pickers are not. |
-| Providers | OpenAI API key and DeepSeek API key, over Chat Completions streaming. `OPENAI_BASE_URL` / `DEEPSEEK_BASE_URL` redirect them (vLLM, Ollama and similar). Keys live in `~/.kcore/agent/auth.json` (0600) or in `OPENAI_API_KEY` / `DEEPSEEK_API_KEY`. |
-| Transcripts | Appended to `~/.kcore/agent/sessions/<id>.jsonl`. Sessions are not reloaded after the agent restarts. |
+| Elicitation forms | Done. `Question`s carry a type (`integer`, `number`), a minimum, and pick lists. The server fills the pick lists from the cluster, see [Forms](#forms). The UI shows labelled options (`enumNames`, `oneOf`) and number fields. |
+| Providers | OpenAI API key, Anthropic API key and DeepSeek API key, and Sign in with ChatGPT. OpenAI and DeepSeek use Chat Completions streaming; Anthropic uses the Messages API; ChatGPT uses the Responses API. `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL` and `DEEPSEEK_BASE_URL` redirect them. Keys live in `~/.kcore/agent/auth.json` (0600) or in `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY`. |
+| Sign in with ChatGPT | Built to OpenAI's open-source flow: dynamic registration, PKCE S256, `state` and `nonce`, ID token checked against OpenAI's JWKS, `chatgpt.tokens.use.direct` required, 0600 credential file written atomically, refresh three minutes before expiry with refreshes serialized, revocation on sign out. Tested against a fake token endpoint only. See [Providers](#providers). |
+| Transcripts | Each session is a jsonl file under `~/.kcore/agent/sessions/`. After a restart the agent loads them: events, title, and the model's message history. A turn or form the old process left open is closed, and a tool call with no result gets a note that its outcome is unknown. |
+| MCP Apps | `kcore_plan` points at `ui://kcore/plan`. The agent is an Apps host: it serves the view in a sandboxed iframe with no network and forwards only read-only tool calls. See [Layer 3](#layer-3-mcp-apps). |
+| `kctl agent --role` | `read-only` or `vm-admin`. Creates `agent-<login>`, grants the role, issues a certificate if there is none, and runs as it. Refuses an operator that already holds a stronger role. |
+| Packaging | `kcore-agent` has npm metadata and `npm pack` works; the bundle carries the UI and the proto files. `flake.nix` has `kcore-agent` and `kctl-with-agent`. `kctl` also finds `kcore-agent` on `PATH`. |
 | `kcore-mcp` change | Elicitation requests now wait up to 30 minutes for an answer. The SDK default is 60 seconds, which cut a human off mid-form. |
 
 Run it from a checkout:
@@ -28,7 +32,15 @@ cd kcore-mcp && npm install && npm run build
 kctl agent
 ```
 
-`kctl` finds the agent next to its own binary, then in `kcore-mcp/packages/agent/dist/index.js` above the binary or the working directory. `--agent-bin` or `KCORE_AGENT_BIN` override that.
+`kctl` finds the agent next to its own binary, then on `PATH` (so `npm install -g kcore-agent` works), then in `kcore-mcp/packages/agent/dist/index.js` above the binary or the working directory. `--agent-bin` or `KCORE_AGENT_BIN` override that.
+
+To run as a limited identity without setting one up by hand:
+
+```bash
+kctl agent --role vm-admin
+```
+
+That needs a cluster-admin connection and mTLS on the first run.
 
 ## Why this shape
 
@@ -97,13 +109,16 @@ Routes:
 |---|---|
 | `GET /` and `/assets/*` | The built UI |
 | `GET /api/providers` | Which providers are configured, which models they offer |
-| `POST /api/providers/openai/signin` | Start Sign in with ChatGPT; returns the URL to open |
+| `POST /api/providers/chatgpt/signin` | Start Sign in with ChatGPT; returns the URL to open. `DELETE` signs out and revokes the refresh token |
+| `GET /auth/callback` | The loopback return from OpenAI. No bearer token, because a browser redirect cannot carry one; the one-time `state` is the check |
 | `POST /api/providers/:id/key` | Store an API key |
 | `GET/POST /api/sessions`, `GET /api/sessions/:id` | Session list and transcript |
 | `POST /api/sessions/:id/messages` | Send a user turn |
 | `GET /api/sessions/:id/events` | SSE: tokens, tool calls, tool results, form requests, approval requests |
 | `POST /api/sessions/:id/forms/:formId` | Submit or cancel a form |
 | `POST /api/sessions/:id/approvals/:approvalId` | Approve or reject a mutation |
+| `POST /api/sessions/:id/apps`, `GET /apps/:key` | Fetch an MCP App view a tool of this session offers, and serve it sandboxed |
+| `POST /api/sessions/:id/call` | A tool call made by an app view. Read-only tools only |
 | `GET /api/cluster/summary` | Context name, controller, operator CN (from the certificate), node count, for the header |
 
 Agent loop, one implementation for all providers:
@@ -147,9 +162,9 @@ No marketing surface. Dashboard CSS (`crates/dashboard/assets/dashboard.css`) is
 
 | Provider | Auth | Endpoint | Notes |
 |---|---|---|---|
-| OpenAI, ChatGPT plan | Sign in with ChatGPT, open-source flow | Responses API, `https://api.openai.com/v1` | PKCE S256. First sign-in uses `client_id=dynamic_agent_client`, `agent_name_hint=kcore`, a persistent `ext_agent_host_id` per machine. The callback must be a loopback URL on `127.0.0.1`, same path every time, port may vary: `http://127.0.0.1:<port>/auth/openai/callback`. The issued `client_id` is saved per ChatGPT account and reused. Scopes: `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`; refuse to use the token for inference unless `chatgpt.tokens.use.direct` was granted. Requests set `store: false`, `stream: true`. Plan usage needs a Go/Plus/Pro plan; the help page lists OpenCode as an approved integration, and the open-source flow is self-service. |
-| OpenAI, API key | Key | Responses API | Fallback for Team/Enterprise accounts and CI. |
-| Anthropic | API key only | Messages API | Anthropic's Claude Code legal page says third-party apps may not offer Claude.ai login or route requests through Free/Pro/Max credentials, and enforces it server-side (OpenCode removed its Anthropic OAuth plugin in 1.3.0, March 2026). Offer Console API key, and Bedrock / Vertex through the SDK's provider options. Do not ship a Claude subscription login. |
+| OpenAI, ChatGPT plan | Sign in with ChatGPT, open-source flow | Responses API, `https://api.openai.com/v1` | PKCE S256. First sign-in uses `client_id=dynamic_agent_client`, `agent_name_hint=kcore`, a persistent `ext_agent_host_id` per machine. The callback must be a loopback URL on `127.0.0.1`, same path every time, port may vary: `http://127.0.0.1:<port>/auth/callback`. The issued `client_id` is saved per ChatGPT account and reused. Scopes: `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`; refuse to use the token for inference unless `chatgpt.tokens.use.direct` was granted. Requests set `store: false`, `stream: true`, send the whole history in `input`, put the system prompt in `instructions`, and group the tools in one `kcore` namespace; replayed `function_call` items carry the namespace. Fields the plan route rejects (`temperature`, `max_output_tokens`, `previous_response_id` and the rest) are never sent. A 401 triggers one refresh and retry. `subscription_sharing_usage_limit_exceeded` is shown as a usage-limit message. Plan usage needs a Go/Plus/Pro plan; the help page lists OpenCode as an approved integration, and the open-source flow is self-service. |
+| OpenAI, API key | Key | Chat Completions (built) | Fallback for Team/Enterprise accounts and CI. |
+| Anthropic | API key only | Messages API (built) | Anthropic's Claude Code legal page says third-party apps may not offer Claude.ai login or route requests through Free/Pro/Max credentials, and enforces it server-side (OpenCode removed its Anthropic OAuth plugin in 1.3.0, March 2026). Offer Console API key, and Bedrock / Vertex through the SDK's provider options. Do not ship a Claude subscription login. |
 | DeepSeek | API key only | `https://api.deepseek.com`, OpenAI-compatible | `deepseek-chat` supports function calling. Check `deepseek-reasoner` tool support before listing it. |
 
 Credential storage: `~/.kcore/agent/auth.json`, mode 0600, same shape as OpenCode's `auth.json` (`{ provider: { type: "oauth" | "api", ... } }`). Refresh tokens stay in that file; the browser never sees them. The agent sends only `{ provider, account, expiresAt }` to the UI.
@@ -160,34 +175,29 @@ The OpenAI sign-in runs on the agent's own HTTP server, not a separate listener,
 
 The point of forms is to stop the model from guessing image URLs, checksums, network names and SSH keys out of free text, and to stop the operator from typing them wrong.
 
-### Layer 1: elicitation forms (first slice)
+### Pick lists from the cluster (built)
 
-`kcore-mcp` already sends `elicitation/create` with a JSON schema built from `Question[]` (`elicit` in `server.ts`). Today every property is a string. Two changes make these useful as forms:
+The first plan put the lookups in the agent (a host tool, `kcore_catalog_form`, and `_meta.kcore.source` hints the host resolved). That was dropped. The lookup now happens in `kcore-mcp`, in the same place it builds the `elicitation/create` schema, so every MCP host gets the lists, not just this one.
 
-- Give `Question` a `type` (`string`, `number`, `boolean`, `enum`) and a `format` (`uri`, `sha256`, `ipv4`, `cidr`, `bytes`) and emit them in `requestedSchema`. The host validates before it answers; other MCP hosts fall back to text.
-- Add `source` hints in `_meta` (`{ "kcore": { "source": "networks" } }`) for questions whose answers exist in the cluster. The agent host resolves them with `kcore_read` and renders a select. Hosts that do not understand `_meta` still see an ordinary string field.
+- Each `Question` can name a `source`: `networks`, `ssh-keys`, `nodes`, `vms` or `node-images`. A question marked `restrict` becomes an enum: the VM `network`, the container `network`, the PostgreSQL `targetNode`, the volume `vm`, the disk-layout `nodeId`. Options carry labels (`enumNames`), for example a node shows as `node-103 (host-a, ready)`.
+- A source without `restrict` keeps a free-text field and lists what exists in the explanation: the VM `auth` field lists stored SSH key names (a pasted public key still works), the VM `image` field lists images on the nodes, `placement` lists nodes.
+- `type: "integer"` and `min` come through as a number field with a minimum (`cpu`, `keep`).
+- If the controller cannot be read, or the list is empty, the question stays as it was and says so. Each source is read once per ask, with an 8 second limit.
 
-The UI renders `requestedSchema` with one component per property type. Required fields block submit. Decline returns `action: "decline"`, which the server already treats as “question still open”.
+What was not built: forms for `ceph-cluster` members and node disks, and `cluster-update` windows. They still use text fields.
 
-### Layer 2: host-native catalog forms (first slice)
+### Layer 3: MCP Apps
 
-One form definition per resource kind in `kcore_catalog`, kept in `packages/agent/src/forms/<kind>.ts`. Each field says where its options come from:
+MCP Apps is the `io.modelcontextprotocol/ui` extension (spec `2026-01-26`): a tool points at a `ui://` resource through `_meta.ui.resourceUri`, the host renders that HTML in a sandboxed iframe, and the iframe talks to the host over JSON-RPC `postMessage`.
 
-| Kind | Fields with cluster-sourced options |
-|---|---|
-| `vm` | `network` and `extraNetworks` from `listNetworks`; `sshKeys` from `listSshKeys`; `targetNode` from `listNodes`; `imagePath` from the node image list (`readImages` in `server.ts`); `storageBackend` from the `storage_backend` of the nodes returned by `listNodes` (what `kctl get storage-class` derives) |
-| `volume` | `vm` from `listVms` filtered to stopped VMs; storage class from the same node list |
-| `network` | `targetNode` |
-| `ceph-cluster` | members from `listNodes`; disks from each node's disk inventory |
-| `cluster-update` | nodes, maintenance window |
+Built:
 
-The model calls `kcore_catalog_form({ kind, prefill })`. The agent renders the form, prefilled from the conversation, and returns the submitted spec as the tool result. The model then calls `kcore_advise` with that spec, which is normally already `ready: true`, then `kcore_plan`, then asks for approval. Immutable fields from `KINDS` are shown read-only when the form is an update of an existing resource.
+- `kcore-mcp` serves `ui://kcore/plan` (`text/html;profile=mcp-app`) and `kcore_plan` points at it. The view shows the action (create, update, replace, unchanged), the field changes with immutable ones marked, the spec for a create, warnings, the controller calls, and the cluster state. Fields that look like secrets are masked. Hosts that do not know Apps ignore it and still get the JSON.
+- The agent is a host for it. After a tool result, if the tool names a view, the agent fetches it and shows it under the tool card. It answers `ui/initialize`, sends `tool-input` and `tool-result`, resizes the frame on `size-changed`, and handles `tools/call`, `ui/open-link` (https only, with a confirm), and `ping`.
+- The frame is `sandbox="allow-scripts"` with no `allow-same-origin`, so it has an opaque origin and cannot read the page or its token. Its own response carries `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; sandbox allow-scripts`: no network, no frames, no storage. The URL is a random 48-hex key that the authenticated API hands out and that expires after an hour. The `csp` and `permissions` a resource declares in `_meta.ui` are ignored, so a view can never be given network access.
+- A view's `tools/call` goes through the host and is limited to `kcore_advise`, `kcore_plan`, `kcore_read` and `kcore_catalog`, with `connection` removed. Apply, delete, operation and `kcore_rpc` are refused, so a view cannot approve or change anything.
 
-### Layer 3: MCP Apps (later)
-
-MCP Apps is the official `io.modelcontextprotocol/ui` extension (spec `2026-01-26`): a tool points at a `ui://` resource through `_meta.ui.resourceUri`, the host renders that HTML in a sandboxed iframe, and the iframe talks to the host over JSON-RPC `postMessage`. Move the layer-2 forms and the plan diff into `ui://kcore/<kind>-form` and `ui://kcore/plan` resources served by `kcore-mcp`, and make the agent an Apps host with `@modelcontextprotocol/ext-apps`. The same forms then show up in ChatGPT, Claude and Cursor hosts that support Apps, and the agent keeps the layer-2 components as the fallback for hosts that do not.
-
-App-rendered elicitation (an elicitation request that names a `ui://` resource) is still a draft tied to protocol revision `2026-07-28`. Do not depend on it. The layer-1 schema forms cover the blocking path until it lands.
+Not built: form views (`ui://kcore/<kind>-form`). The schema forms cover that path, and app-rendered elicitation is still a draft tied to protocol revision `2026-07-28`, so nothing depends on it. The host also does not use `@modelcontextprotocol/ext-apps`; it implements the handful of messages above directly, and it has been tried in a browser against the `kcore` plan view only, not in ChatGPT, Claude or Cursor.
 
 ## Security
 
@@ -202,26 +212,26 @@ App-rendered elicitation (an elicitation request that names a `ui://` resource) 
 
 ## Distribution
 
-- `kcore-mcp/packages/agent` publishes to npm as `kcore-agent`, bundled with esbuild like the server, UI built into `dist/ui`.
-- `flake.nix`: a `kcore-agent` package (`buildNpmPackage`) and a `kctl` wrapper that puts it on `PATH`, so the appliance and the dev shell have it.
-- Release tarballs ship `kcore-agent` next to `kctl`; `kctl agent` looks there first.
-- `npx -y kcore-agent@<version>` is the fallback for a bare `kctl` binary.
+- `kcore-mcp/packages/agent` is `kcore-agent`: bundled with esbuild into one `dist/index.js`, with the UI in `dist/ui` and the proto files in `dist/proto`. Everything is bundled, so it has no runtime dependencies. `npm pack -w kcore-agent` builds and packs it. Publishing is not done.
+- `flake.nix`: `packages.kcore-agent` (`buildNpmPackage` from `kcore-mcp/package-lock.json`) and `packages.kctl-with-agent`, a `kctl` wrapper that sets `KCORE_AGENT_BIN`. Update `npmDepsHash` when the lock file changes (`nix run nixpkgs#prefetch-npm-deps -- kcore-mcp/package-lock.json`).
+- `kctl agent` looks next to `kctl`, then on `PATH`.
+- Not done: release tarballs do not ship `kcore-agent`. `scripts/release.sh`, `get-kctl.sh` and `verify-release.sh` handle signed, checksummed `kctl` archives, and adding an asset means changing that chain, so it is left for a release.
 
 ## Phases
 
-1. **Spike** (built): `packages/agent` with OpenAI and DeepSeek keys, in-process MCP client, SSE chat, elicitation rendered as a schema form, approval gate. `kctl agent` with context handoff and browser open. Still to do for this phase: create a VM in the lab end to end with a real model, every question answered through a form.
-2. **Providers**: Sign in with ChatGPT, Anthropic key, DeepSeek key, `auth.json`, model picker, usage display.
-3. **Forms**: typed `Question`s and `_meta.kcore.source` in `kcore-mcp`; catalog forms with cluster-sourced pickers; plan diff card; advise questions rendered as one form.
-4. **Operator identity**: `--role`, agent operator auto-provisioning, audit view in the UI (`kctl audit` data filtered by the agent's CN).
-5. **MCP Apps**: `ui://` resources in `kcore-mcp`, Apps host in the agent, verify in ChatGPT and Cursor.
-6. **Packaging**: npm publish, Nix package, release tarball, docs on `kcorehypervisor.com`.
+1. **Spike** (built): `packages/agent` with an in-process MCP client, SSE chat, elicitation rendered as a schema form, approval gate. `kctl agent` with context handoff and browser open. Still to do: create a VM in the lab end to end with a real model.
+2. **Providers** (built): Sign in with ChatGPT, Anthropic key, DeepSeek key, OpenAI key, `auth.json`, model picker. The ChatGPT flow is untested against OpenAI. No usage display yet beyond the link to ChatGPT Settings.
+3. **Forms** (mostly built): typed questions and cluster pick lists in `kcore-mcp`. Not built: Ceph member and disk pickers, advise questions as one form.
+4. **Operator identity** (partly built): `--role` and auto-provisioning. Not built: an audit view in the UI.
+5. **MCP Apps** (partly built): the plan view and the host. Not built: form views, and checking it in other Apps hosts.
+6. **Packaging** (partly built): npm metadata, Nix packages, `PATH` lookup. Not built: release tarballs, publishing, docs on `kcorehypervisor.com`.
 
 ## Open questions
 
 - Should `kctl agent` default to the current context identity or refuse to run as `kctl` (cluster admin) without `--as`? Refusing is safer; defaulting is friendlier for a single-operator lab. Proposal: default to the context identity, print a one-line warning when the certificate CN is `kctl`.
-- Does the Sign in with ChatGPT open-source flow accept `agent_name_hint=kcore` without prior registration? The docs say registration is dynamic; confirm in the spike before building the UI around it.
+- Does the Sign in with ChatGPT open-source flow accept `agent_name_hint=kcore` without prior registration? The docs say registration is dynamic; the code follows them, but nobody has signed in with it yet. Try it with a Plus or Pro account before relying on it. The credential file is not locked across processes, so two `kctl agent` runs on one machine can race a rotating refresh token.
 - One agent per `kctl agent` run, or a long-lived agent the dashboard can embed? This plan is the per-run tool. Embedding in the dashboard needs a different credential story (dashboard identity, not operator identity) and is not covered here.
-- Vercel AI SDK versus direct provider SDKs. Phase 1 uses plain `fetch` against Chat Completions, which covers OpenAI keys, DeepSeek, and any OpenAI-compatible server. Anthropic and the ChatGPT plan flow (Responses API) need their own adapters in phase 2.
+- Vercel AI SDK versus direct provider SDKs. Phase 1 uses plain `fetch` against Chat Completions, which covers OpenAI keys, DeepSeek, and any OpenAI-compatible server. Anthropic and the ChatGPT plan flow (Responses API) have their own adapters, also on plain `fetch`.
 
 ## Related
 
