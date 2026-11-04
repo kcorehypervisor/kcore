@@ -61,6 +61,8 @@ struct State {
 
 pub struct Session {
     pub id: String,
+    /// The cluster this session drives. `None` for sessions saved before clusters could be chosen.
+    pub cluster: Option<String>,
     toolbox: Arc<Toolbox>,
     log_dir: Option<PathBuf>,
     tools: Vec<ToolSpec>,
@@ -72,6 +74,7 @@ pub struct Session {
 pub struct SessionInfo {
     pub id: String,
     pub title: String,
+    pub cluster: Option<String>,
     pub created_at: i64,
     pub busy: bool,
 }
@@ -135,6 +138,7 @@ impl Ask for CallAsk {
 impl Session {
     pub fn new(
         id: String,
+        cluster: Option<String>,
         toolbox: Arc<Toolbox>,
         log_dir: Option<PathBuf>,
         restore: Option<Restored>,
@@ -149,6 +153,7 @@ impl Session {
         let instructions = [INSTRUCTIONS, HOST_PROMPT].join("\n\n");
         let session = Arc::new(Self {
             id,
+            cluster,
             toolbox,
             log_dir,
             tools: model_tools(),
@@ -171,7 +176,11 @@ impl Session {
                     let state = session.state.lock().unwrap();
                     (state.created_at, state.title.clone())
                 };
-                session.persist(&TranscriptRecord::Meta { created_at, title });
+                session.persist(&TranscriptRecord::Meta {
+                    created_at,
+                    title,
+                    cluster: session.cluster.clone(),
+                });
             }
         }
         session
@@ -279,6 +288,7 @@ impl Session {
         SessionInfo {
             id: self.id.clone(),
             title: state.title.clone(),
+            cluster: self.cluster.clone(),
             created_at: state.created_at,
             busy: state.busy.is_some(),
         }
@@ -463,6 +473,7 @@ impl Session {
                 self.persist(&TranscriptRecord::Meta {
                     created_at: state.created_at,
                     title: state.title.clone(),
+                    cluster: self.cluster.clone(),
                 });
             }
         }
@@ -710,6 +721,7 @@ mod tests {
     fn session(dir: Option<PathBuf>, restore: Option<Restored>) -> Arc<Session> {
         Session::new(
             ID.to_string(),
+            None,
             Arc::new(Toolbox::unreachable()),
             dir,
             restore,

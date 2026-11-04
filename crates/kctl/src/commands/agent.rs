@@ -3,19 +3,20 @@
 //! Everything runs inside this process: the HTTP server on 127.0.0.1, the model providers, and
 //! the tools. The private key never leaves it and the browser only ever sees a random session token.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use clap::Args;
 
 use crate::agent::auth::{AuthOptions, AuthStore};
+use crate::agent::clusters::{Clusters, Resolver};
 use crate::agent::http::{self, AppOptions};
-use crate::agent::summary::{cluster_summary, default_home};
+use crate::agent::summary::default_home;
 use crate::agent::tools::rpc::Endpoints;
-use crate::agent::tools::Toolbox;
 use crate::agent::util::random_token;
 use crate::client::{self, controller_proto as proto};
 use crate::config::{self, ConnectionInfo};
@@ -245,34 +246,79 @@ fn provisioning_address(flag: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub async fn run(info: &ConnectionInfo, args: &AgentArgs, config_path: &Path) -> Result<()> {
-    let scoped;
-    let info = match args.role {
-        Some(role) => {
-            scoped = provision_agent_identity(info, role).await?;
-            &scoped
-        }
-        None => info,
-    };
+/// What the agent needs to know about how kctl was started, beyond the config file.
+pub struct Startup<'a> {
+    pub info: &'a ConnectionInfo,
+    pub config_path: &'a Path,
+    pub operator_as: Option<String>,
+    /// `--controller` or `-k` was given: use exactly that connection, not the config's contexts.
+    pub pinned: bool,
+}
 
+pub async fn run(startup: Startup<'_>, args: &AgentArgs) -> Result<()> {
     let home = default_home();
     let token = random_token(32).context("creating the session token")?;
-    let toolbox = Arc::new(Toolbox::new(
-        Endpoints {
-            controller: info.clone(),
-            provisioning: provisioning_address(args.provisioning.as_deref()),
-            provisioning_tls: false,
-            timeout: RPC_TIMEOUT,
-        },
-        config_path.to_path_buf(),
-    ));
+    let provisioning = provisioning_address(args.provisioning.as_deref());
+    let role = args.role;
+    let config_path = startup.config_path.to_path_buf();
+    let operator_as = startup.operator_as.clone();
+    let default_info = startup.info.clone();
+    let scoped: Arc<Mutex<HashMap<Option<String>, ConnectionInfo>>> = Arc::default();
+
+    let resolver: Resolver = {
+        let config_path = config_path.clone();
+        Arc::new(move |name: Option<String>| {
+            let (config_path, operator_as, default_info, provisioning, scoped) = (
+                config_path.clone(),
+                operator_as.clone(),
+                default_info.clone(),
+                provisioning.clone(),
+                scoped.clone(),
+            );
+            Box::pin(async move {
+                let info = match &name {
+                    Some(context) => {
+                        config::resolve_context(&config_path, context, operator_as.as_deref())?
+                    }
+                    None => default_info,
+                };
+                let info = match role {
+                    Some(role) => {
+                        let cached = scoped.lock().unwrap().get(&name).cloned();
+                        match cached {
+                            Some(info) => info,
+                            None => {
+                                let made = provision_agent_identity(&info, role)
+                                    .await
+                                    .map_err(|e| format!("{e:#}"))?;
+                                scoped.lock().unwrap().insert(name.clone(), made.clone());
+                                made
+                            }
+                        }
+                    }
+                    None => info,
+                };
+                Ok(Endpoints {
+                    controller: info,
+                    provisioning,
+                    provisioning_tls: false,
+                    timeout: RPC_TIMEOUT,
+                })
+            })
+        })
+    };
+    let mut clusters = Clusters::new(config_path, Some(&home), resolver);
+    if startup.pinned {
+        clusters = clusters.pinned();
+    }
+    let clusters = Arc::new(clusters);
+    let active = clusters.active();
     let running = http::start(
         AppOptions {
             token: token.clone(),
             auth: Arc::new(AuthStore::new(home.clone(), AuthOptions::from_process())),
-            toolbox,
+            clusters,
             log_dir: Some(home.join("sessions")),
-            summary: cluster_summary(info),
         },
         args.port,
     )
@@ -284,6 +330,9 @@ pub async fn run(info: &ConnectionInfo, args: &AgentArgs, config_path: &Path) ->
         running.port
     );
     println!("Open this link once; it carries the session token: {url}");
+    if let Some(active) = active {
+        println!("Cluster: {active} (change it in the page; the choice is remembered)");
+    }
     println!("Press Ctrl-C to stop.");
     if !args.no_browser {
         open_browser(&url);

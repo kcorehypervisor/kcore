@@ -10,6 +10,10 @@
   <div id="app">
     <aside id="sidebar">
       <div class="brand">kcore agent</div>
+      <label id="cluster-picker" class="cluster-picker" hidden>
+        <span>Cluster</span>
+        <select id="cluster-select" title="The cluster new sessions control. Remembered for next time."></select>
+      </label>
       <button id="new-session" class="primary">New session</button>
       <ul id="session-list"></ul>
       <div id="cluster" class="cluster"></div>

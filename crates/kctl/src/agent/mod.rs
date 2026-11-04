@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod chatgpt;
+pub mod clusters;
 pub mod forms;
 pub mod gate;
 pub mod http;

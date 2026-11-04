@@ -366,6 +366,37 @@ pub fn resolve_controller(
     }
 
     let config = load_config(config_path).map_err(|e| format!("loading config: {e}"))?;
+    resolve_from_config(
+        &config,
+        config_path,
+        insecure_flag,
+        tls_from_cli,
+        operator_as,
+    )
+}
+
+/// Resolve the connection for a named context, whatever `current-context` says.
+pub fn resolve_context(
+    config_path: &Path,
+    context: &str,
+    operator_as: Option<&str>,
+) -> Result<ConnectionInfo, String> {
+    let mut config = load_config(config_path)
+        .map_err(|e| format!("loading config at {}: {e:#}", config_path.display()))?;
+    if !config.contexts.contains_key(context) {
+        return Err(format!("context '{context}' not found in config"));
+    }
+    config.current_context = Some(context.to_string());
+    resolve_from_config(&config, config_path, false, None, operator_as)
+}
+
+fn resolve_from_config(
+    config: &Config,
+    config_path: &Path,
+    insecure_flag: bool,
+    tls_from_cli: Option<String>,
+    operator_as: Option<&str>,
+) -> Result<ConnectionInfo, String> {
     let context_name = config
         .current_context
         .as_deref()
@@ -574,6 +605,26 @@ mod tests {
         assert!(info.cert_pem.is_none());
         assert!(info.key_pem.is_none());
         assert!(info.ca_pem.is_none());
+    }
+
+    #[test]
+    fn resolve_context_picks_the_named_context_regardless_of_current_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("config");
+        std::fs::write(
+            &path,
+            "current-context: a\ncontexts:\n  a:\n    controller: 10.0.0.1:9090\n    insecure: true\n  b:\n    controllers:\n    - 10.0.0.2\n    - 10.0.0.3:9099\n    insecure: true\n",
+        )
+        .unwrap();
+        let b = resolve_context(&path, "b", None).unwrap();
+        assert_eq!(b.address, "10.0.0.2:9090");
+        assert_eq!(b.addresses, vec!["10.0.0.2:9090", "10.0.0.3:9099"]);
+        assert_eq!(
+            resolve_context(&path, "a", None).unwrap().address,
+            "10.0.0.1:9090"
+        );
+        let missing = resolve_context(&path, "c", None).unwrap_err();
+        assert!(missing.contains("'c' not found"), "{missing}");
     }
 
     #[test]

@@ -30,6 +30,7 @@ function el(tag, props = {}, ...children) {
 }
 
 const state = {
+  clusters: { active: null, clusters: [] },
   providers: [],
   sessions: [],
   current: null,
@@ -301,6 +302,7 @@ async function selectSession(id) {
   resetTranscript();
   const session = state.sessions.find((s) => s.id === id);
   $("session-title").textContent = session ? session.title : "";
+  if (session && session.cluster && showCluster(session.cluster)) loadCluster().catch(() => {});
   renderSessionList();
   updateComposer();
   openStream(id);
@@ -310,7 +312,15 @@ function renderSessionList() {
   const list = $("session-list");
   list.replaceChildren();
   for (const session of state.sessions) {
-    list.append(el("li", { class: session.id === state.current ? "active" : "", text: session.title, title: session.title, onclick: () => selectSession(session.id) }));
+    const many = state.clusters.clusters.length > 1;
+    list.append(
+      el(
+        "li",
+        { class: session.id === state.current ? "active" : "", title: many && session.cluster ? `${session.title} (${session.cluster})` : session.title, onclick: () => selectSession(session.id) },
+        session.title,
+        many && session.cluster ? el("span", { class: "tag", text: session.cluster }) : null,
+      ),
+    );
   }
 }
 
@@ -322,7 +332,8 @@ async function loadSessions() {
 }
 
 async function newSession() {
-  const { id } = await api("/api/sessions", { method: "POST", body: "{}" });
+  const cluster = $("cluster-select").value;
+  const { id } = await api("/api/sessions", { method: "POST", body: JSON.stringify(cluster ? { cluster } : {}) });
   await loadSessions();
   await selectSession(id);
   $("input").focus();
@@ -586,8 +597,24 @@ function renderProviderRows() {
   }
 }
 
+function showCluster(name) {
+  const select = $("cluster-select");
+  if (![...select.options].some((o) => o.value === name)) return false;
+  select.value = name;
+  return true;
+}
+
+async function loadClusters() {
+  state.clusters = await api("/api/clusters");
+  const select = $("cluster-select");
+  select.replaceChildren(...state.clusters.clusters.map((c) => el("option", { value: c.name, text: c.name, title: c.controller })));
+  $("cluster-picker").hidden = state.clusters.clusters.length === 0;
+  if (state.clusters.active) showCluster(state.clusters.active);
+}
+
 async function loadCluster() {
-  const summary = await api("/api/cluster/summary");
+  const chosen = $("cluster-select").value;
+  const summary = await api(`/api/cluster/summary${chosen ? `?cluster=${encodeURIComponent(chosen)}` : ""}`);
   const box = $("cluster");
   box.replaceChildren();
   if (summary.error) {
@@ -599,6 +626,15 @@ async function loadCluster() {
 }
 
 $("new-session").addEventListener("click", () => newSession());
+$("cluster-select").addEventListener("change", async () => {
+  try {
+    await api("/api/clusters/active", { method: "PUT", body: JSON.stringify({ name: $("cluster-select").value }) });
+    await loadCluster();
+    await newSession();
+  } catch (e) {
+    $("transcript").append(el("div", { class: "err-line", text: e.message }));
+  }
+});
 $("open-settings").addEventListener("click", () => $("settings").showModal());
 $("close-settings").addEventListener("click", () => $("settings").close());
 $("provider").addEventListener("change", () => {
@@ -634,6 +670,7 @@ async function start() {
     $("transcript").append(el("div", { class: "err-line", text: "No session token. Start this page from `kctl agent`." }));
     return;
   }
+  await loadClusters();
   await Promise.all([loadProviders(), loadCluster(), loadSessions()]);
   if (state.providers.every((p) => !p.connected)) $("settings").showModal();
   if (state.sessions.length > 0) await selectSession(state.sessions[0].id);

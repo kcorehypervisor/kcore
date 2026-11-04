@@ -2738,7 +2738,16 @@ async fn main() {
                 .config
                 .clone()
                 .unwrap_or_else(config::default_config_path);
-            commands::agent::run(&info, args, &config_path).await
+            commands::agent::run(
+                commands::agent::Startup {
+                    info: &info,
+                    config_path: &config_path,
+                    operator_as: cli.operator_as.clone(),
+                    pinned: !cli.controller.is_empty() || cli.insecure,
+                },
+                args,
+            )
+            .await
         }
         Command::Console { name } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));

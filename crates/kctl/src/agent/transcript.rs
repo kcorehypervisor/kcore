@@ -73,15 +73,25 @@ pub struct AgentEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "k", rename_all = "lowercase", rename_all_fields = "camelCase")]
 pub enum TranscriptRecord {
-    Meta { created_at: i64, title: String },
-    Event { e: AgentEvent },
-    Message { m: ChatMessage },
+    Meta {
+        created_at: i64,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster: Option<String>,
+    },
+    Event {
+        e: AgentEvent,
+    },
+    Message {
+        m: ChatMessage,
+    },
 }
 
 pub struct Restored {
     pub id: String,
     pub created_at: i64,
     pub title: String,
+    pub cluster: Option<String>,
     pub events: Vec<AgentEvent>,
     pub messages: Vec<ChatMessage>,
 }
@@ -94,6 +104,7 @@ pub fn read_transcript(dir: &Path, id: &str) -> Option<Restored> {
     let text = std::fs::read_to_string(dir.join(format!("{id}.jsonl"))).ok()?;
     let mut created_at = 0;
     let mut title = "New session".to_string();
+    let mut cluster = None;
     let mut events = Vec::new();
     let mut messages = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -104,9 +115,11 @@ pub fn read_transcript(dir: &Path, id: &str) -> Option<Restored> {
             TranscriptRecord::Meta {
                 created_at: at,
                 title: t,
+                cluster: c,
             } => {
                 created_at = at;
                 title = t;
+                cluster = c;
             }
             TranscriptRecord::Event { e } => events.push(e),
             TranscriptRecord::Message { m } => messages.push(m),
@@ -124,6 +137,7 @@ pub fn read_transcript(dir: &Path, id: &str) -> Option<Restored> {
         id: id.to_string(),
         created_at,
         title,
+        cluster,
         events,
         messages: repair_messages(messages),
     })

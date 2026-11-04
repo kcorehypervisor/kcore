@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::auth::AuthStore;
 use super::chatgpt::CALLBACK_PATH;
+use super::clusters::Clusters;
 use super::session::{Live, Session};
-use super::tools::Toolbox;
 use super::transcript::{list_transcripts, read_transcript};
 use super::util::{constant_time_eq, random_bytes};
 
@@ -56,17 +56,15 @@ static SESSION_ROUTE: LazyLock<Regex> = LazyLock::new(|| {
 pub struct AppOptions {
     pub token: String,
     pub auth: Arc<AuthStore>,
-    pub toolbox: Arc<Toolbox>,
+    pub clusters: Arc<Clusters>,
     pub log_dir: Option<PathBuf>,
-    pub summary: Value,
 }
 
 pub struct AppState {
     token: String,
     auth: Arc<AuthStore>,
-    toolbox: Arc<Toolbox>,
+    clusters: Arc<Clusters>,
     log_dir: Option<PathBuf>,
-    summary: Value,
     port: u16,
     pub sessions: Mutex<HashMap<String, Arc<Session>>>,
     frames: Mutex<HashMap<String, (String, Instant)>>,
@@ -108,9 +106,12 @@ pub async fn start(options: AppOptions, port: u16) -> Result<Running> {
     if let Some(dir) = &options.log_dir {
         for id in list_transcripts(dir) {
             if let Some(restore) = read_transcript(dir, &id) {
+                let cluster = restore.cluster.clone();
+                let toolbox = options.clusters.toolbox(cluster.as_deref()).await;
                 let session = Session::new(
                     id.clone(),
-                    options.toolbox.clone(),
+                    cluster,
+                    toolbox,
                     Some(dir.clone()),
                     Some(restore),
                 );
@@ -121,9 +122,8 @@ pub async fn start(options: AppOptions, port: u16) -> Result<Running> {
     let state = Arc::new(AppState {
         token: options.token,
         auth: options.auth,
-        toolbox: options.toolbox,
+        clusters: options.clusters,
         log_dir: options.log_dir,
-        summary: options.summary,
         port,
         sessions: Mutex::new(sessions),
         frames: Mutex::new(HashMap::new()),
@@ -247,6 +247,13 @@ async fn read_json(body: Body) -> Result<Map<String, Value>, Response> {
     }
 }
 
+fn query_param(query: &str, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
+}
+
 fn str_field<'a>(body: &'a Map<String, Value>, name: &str) -> &'a str {
     body.get(name).and_then(Value::as_str).unwrap_or("")
 }
@@ -332,7 +339,21 @@ fn providers_reply(app: &AppState, extra: Value) -> Response {
 
 async fn api(app: &Arc<AppState>, method: Method, path: &str, query: &str, body: Body) -> Response {
     match (method.as_str(), path) {
-        ("GET", "/api/cluster/summary") => return json_reply(200, &app.summary),
+        ("GET", "/api/cluster/summary") => {
+            let cluster = query_param(query, "cluster");
+            return json_reply(200, &app.clusters.summary(cluster.as_deref()).await);
+        }
+        ("GET", "/api/clusters") => return json_reply(200, &app.clusters.describe()),
+        ("PUT", "/api/clusters/active") => {
+            let body = match read_json(body).await {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            return match app.clusters.select(str_field(&body, "name")) {
+                Ok(()) => json_reply(200, &app.clusters.describe()),
+                Err(message) => error_reply(400, message),
+            };
+        }
         ("GET", "/api/providers") => return providers_reply(app, json!({})),
         ("GET", "/api/import/opencode") => {
             return json_reply(
@@ -373,15 +394,37 @@ async fn api(app: &Arc<AppState>, method: Method, path: &str, query: &str, body:
             infos.sort_by_key(|info| std::cmp::Reverse(info.created_at));
             let sessions: Vec<Value> = infos
                 .into_iter()
-                .map(|i| json!({ "id": i.id, "title": i.title, "createdAt": i.created_at, "busy": i.busy }))
+                .map(|i| json!({ "id": i.id, "title": i.title, "cluster": i.cluster, "createdAt": i.created_at, "busy": i.busy }))
                 .collect();
             return json_reply(200, &json!({ "sessions": sessions }));
         }
         ("POST", "/api/sessions") => {
+            let body = match read_json(body).await {
+                Ok(body) => body,
+                Err(response) => return response,
+            };
+            let names = app.clusters.names();
+            let cluster = match str_field(&body, "cluster") {
+                "" => app.clusters.active(),
+                wanted if names.iter().any(|n| n == wanted) => Some(wanted.to_string()),
+                wanted => {
+                    return error_reply(
+                        400,
+                        format!("There is no cluster named {wanted} in the kctl config."),
+                    )
+                }
+            };
+            let toolbox = app.clusters.toolbox(cluster.as_deref()).await;
             let id = uuid::Uuid::new_v4().to_string();
-            let session = Session::new(id.clone(), app.toolbox.clone(), app.log_dir.clone(), None);
+            let session = Session::new(
+                id.clone(),
+                cluster.clone(),
+                toolbox,
+                app.log_dir.clone(),
+                None,
+            );
             app.sessions.lock().unwrap().insert(id.clone(), session);
-            return json_reply(201, &json!({ "id": id }));
+            return json_reply(201, &json!({ "id": id, "cluster": cluster }));
         }
         _ => {}
     }
@@ -592,6 +635,7 @@ mod tests {
     use super::*;
     use crate::agent::auth::AuthOptions;
     use crate::agent::providers::{ModelEvent, Provider, Scripted, ToolCall};
+    use crate::agent::tools::Toolbox;
     use crate::agent::transcript::EventBody;
     use crate::agent::util::testutil::{mock, Reply};
     use reqwest::Method as ReqMethod;
@@ -654,13 +698,30 @@ mod tests {
             chatgpt_base_url: None,
         };
         let auth = Arc::new(AuthStore::new(home.path().to_path_buf(), options));
+        let config = home.path().join("kctl-config");
+        std::fs::write(
+            &config,
+            "current-context: lab\ncontexts:\n  lab:\n    controller: 10.0.0.1:9090\n  home:\n    controller: 10.0.0.2:9090\n",
+        )
+        .unwrap();
+        let clusters = Arc::new(Clusters::new(
+            config,
+            Some(home.path()),
+            Arc::new(|name| {
+                Box::pin(async move {
+                    match name.as_deref() {
+                        Some("home") => Err("no certificates for home".to_string()),
+                        _ => Ok(Toolbox::unreachable().endpoints),
+                    }
+                })
+            }),
+        ));
         let running = start(
             AppOptions {
                 token: TOKEN.to_string(),
                 auth,
-                toolbox: Arc::new(Toolbox::unreachable()),
+                clusters,
                 log_dir,
-                summary: json!({ "controller": "127.0.0.1:9090", "operator": "kctl" }),
             },
             0,
         )
@@ -1221,6 +1282,7 @@ mod tests {
         let id = "11111111-2222-3333-4444-555555555555";
         let first = Session::new(
             id.to_string(),
+            Some("lab".to_string()),
             Arc::new(Toolbox::unreachable()),
             Some(logs.path().to_path_buf()),
             None,
@@ -1275,5 +1337,152 @@ mod tests {
             .unwrap();
         assert_eq!(bad.status(), 400);
         h.running.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_clusters_are_listed_and_the_choice_is_remembered() {
+        let h = harness(&[], None).await;
+        let listed: Value = h
+            .api(ReqMethod::GET, "/api/clusters")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["active"], "lab");
+        assert_eq!(listed["clusters"][0]["name"], "home");
+        assert_eq!(listed["clusters"][1]["controller"], "10.0.0.1:9090");
+
+        let refused = h
+            .api(ReqMethod::PUT, "/api/clusters/active")
+            .body(r#"{"name":"nowhere"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400);
+
+        let chosen: Value = h
+            .api(ReqMethod::PUT, "/api/clusters/active")
+            .body(r#"{"name":"home"}"#)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(chosen["active"], "home");
+        let saved = std::fs::read_to_string(h.home.path().join("settings.json")).unwrap();
+        assert!(saved.contains("\"home\""));
+        h.running.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_is_bound_to_the_cluster_chosen_when_it_starts() {
+        let h = harness(&[], None).await;
+        let default: Value = h
+            .api(ReqMethod::POST, "/api/sessions")
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(default["cluster"], "lab");
+        let other: Value = h
+            .api(ReqMethod::POST, "/api/sessions")
+            .body(r#"{"cluster":"home"}"#)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(other["cluster"], "home");
+        let bad = h
+            .api(ReqMethod::POST, "/api/sessions")
+            .body(r#"{"cluster":"nowhere"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
+
+        let listed: Value = h
+            .api(ReqMethod::GET, "/api/sessions")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let clusters: Vec<&str> = listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["cluster"].as_str())
+            .collect();
+        assert_eq!(clusters.len(), 2);
+        assert!(clusters.contains(&"lab") && clusters.contains(&"home"));
+        h.running.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_summary_follows_the_cluster_asked_for_and_reports_one_that_cannot_connect() {
+        let h = harness(&[], None).await;
+        let lab: Value = h
+            .api(ReqMethod::GET, "/api/cluster/summary?cluster=lab")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(lab["controller"], "127.0.0.1:1");
+        let home: Value = h
+            .api(ReqMethod::GET, "/api/cluster/summary?cluster=home")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(home["error"], "no certificates for home");
+        h.running.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_restored_session_keeps_its_cluster() {
+        let logs = tempfile::tempdir().unwrap();
+        let h = harness(&[], Some(logs.path().to_path_buf())).await;
+        let made: Value = h
+            .api(ReqMethod::POST, "/api/sessions")
+            .body(r#"{"cluster":"home"}"#)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(made["cluster"], "home");
+        let session = h.session(made["id"].as_str().unwrap());
+        let scripted = Scripted::new(|_| vec![ModelEvent::Text("hi".into())]);
+        session
+            .send("hello", &Provider::Scripted(scripted), "m")
+            .await
+            .unwrap();
+        h.running.close().await;
+
+        let again = harness(&[], Some(logs.path().to_path_buf())).await;
+        let listed: Value = again
+            .api(ReqMethod::GET, "/api/sessions")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["sessions"][0]["cluster"], "home");
+        again.running.close().await;
     }
 }

@@ -47,7 +47,8 @@ Every `/api` request carries `Authorization: Bearer <token>`. The UI reads the t
 | Route | Role |
 |---|---|
 | `GET /`, `/app.js`, `/style.css` | The UI |
-| `GET /api/cluster/summary` | Controller, operator CN from the certificate |
+| `GET /api/cluster/summary?cluster=NAME` | Controller and operator CN for a cluster (the active one if no name) |
+| `GET /api/clusters`, `PUT /api/clusters/active` | The kctl contexts, and remember which one new sessions use |
 | `GET /api/providers`, `GET /api/providers/:id/models`, `PUT/DELETE /api/providers/:id/key` | Provider setup |
 | `POST/DELETE /api/providers/chatgpt/signin` | Start or end the ChatGPT sign-in. `DELETE` revokes the refresh token |
 | `GET /auth/callback` | The loopback return from OpenAI. No bearer token, because a browser redirect cannot carry one; the one-time `state` is the check |
@@ -67,6 +68,14 @@ Every `/api` request carries `Authorization: Bearer <token>`. The UI reads the t
 - Decline, cancel, Stop and closing the tab all mean "not approved". The tool result tells the model nothing changed.
 - The model cannot choose where the call goes. `connection` is reduced to `node`; the controller, TLS settings and operator come from the context `kctl` resolved.
 - Answers from a form come back to the model in the tool result as `Operator form answers`.
+
+## Clusters
+
+The contexts in `~/.kcore/config` are the clusters the agent can drive. The page has a cluster picker above "New session". A session is bound to one cluster when it starts, and that cluster is saved in its transcript, so a restored session goes back to the same cluster and a chat never mixes two. Changing the picker starts a new session on the chosen cluster.
+
+The choice is remembered in `~/.kcore/agent/settings.json` (mode 0600). At startup the active cluster is that choice if the context still exists, otherwise the config's `current-context`, otherwise the first context by name. `kctl agent` prints it. With `--controller` or `-k` the agent uses exactly that connection and the picker is hidden.
+
+Each new session reads the config and certificates again, so a re-issued certificate or CA is picked up by the next session. A running session keeps what it started with. With `--role`, the dedicated `agent-<user>` operator is created on each cluster the first time it is used. A cluster that cannot be connected to still shows up in the picker. Its tools answer with the reason.
 
 ## Providers
 

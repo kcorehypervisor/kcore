@@ -13,6 +13,7 @@ pub mod schema;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::config::ConnectionInfo;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 
@@ -53,6 +54,9 @@ pub struct ToolOutput {
 pub struct Toolbox {
     pub endpoints: Endpoints,
     pub config_path: PathBuf,
+    /// Why this cluster cannot be reached at all (bad config, missing certificates). Every call that
+    /// needs the cluster answers with it.
+    pub unavailable: Option<String>,
 }
 
 fn pretty(payload: &Value) -> ToolOutput {
@@ -196,10 +200,43 @@ impl Toolbox {
         Self {
             endpoints,
             config_path,
+            unavailable: None,
         }
     }
 
+    /// A cluster whose connection could not even be built.
+    pub fn unavailable(reason: String, config_path: PathBuf) -> Self {
+        let controller = ConnectionInfo {
+            address: String::new(),
+            addresses: Vec::new(),
+            insecure: true,
+            tls_server_name: None,
+            cert_pem: None,
+            key_pem: None,
+            ca_pem: None,
+            cert: None,
+            key: None,
+            ca: None,
+        };
+        let mut toolbox = Self::new(
+            Endpoints {
+                controller,
+                provisioning: None,
+                provisioning_tls: false,
+                timeout: Duration::from_secs(1),
+            },
+            config_path,
+        );
+        toolbox.unavailable = Some(reason);
+        toolbox
+    }
+
     pub async fn call(&self, name: &str, args: &Value, ask: &dyn Ask) -> ToolOutput {
+        if let Some(reason) = &self.unavailable {
+            if !matches!(name, "kcore_advise" | "kcore_catalog") {
+                return failure(format!("This cluster cannot be reached: {reason}"));
+            }
+        }
         let result = match name {
             "kcore_catalog" => Ok(self.catalog()),
             "kcore_rpc" => self.rpc_tool(args).await,
@@ -825,7 +862,6 @@ pub fn needs_host_approval(method: &str) -> bool {
 impl Toolbox {
     /// A toolbox whose controller refuses connections, for tests that never need one.
     pub fn unreachable() -> Self {
-        use crate::config::ConnectionInfo;
         let info = ConnectionInfo {
             address: "127.0.0.1:1".to_string(),
             addresses: vec!["127.0.0.1:1".to_string()],
