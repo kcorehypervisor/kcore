@@ -495,6 +495,9 @@ pub fn qemu_img_convert_argv(
     } else {
         host.to_string()
     };
+    // The guest writes through the kcore-vm-* mapper, not the LV or zvol, so
+    // the backing device's page cache can hold blocks older than the disk
+    // (udev's blkid probe caches the first ones). Read it with O_DIRECT.
     Ok(vec![
         "qemu-img".into(),
         "convert".into(),
@@ -502,6 +505,8 @@ pub fn qemu_img_convert_argv(
         "raw".into(),
         "-O".into(),
         "raw".into(),
+        "-T".into(),
+        "none".into(),
         "-t".into(),
         "none".into(),
         "-n".into(),
@@ -1281,6 +1286,20 @@ mod tests {
             argv.last().map(String::as_str),
             Some("nbd://[2001:db8::5]:18130/kcore-web-aabbccdd")
         );
+    }
+
+    #[test]
+    fn qemu_img_reads_and_writes_with_direct_io() {
+        let argv = qemu_img_convert_argv(
+            "/dev/vg_kcore/kcore-web",
+            "10.0.0.5",
+            18128,
+            "kcore-web-aabbccdd",
+        )
+        .unwrap();
+        let cache = |flag: &str| argv.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+        assert_eq!(cache("-T").as_deref(), Some("none"));
+        assert_eq!(cache("-t").as_deref(), Some("none"));
     }
 
     #[test]
