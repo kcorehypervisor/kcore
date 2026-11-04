@@ -22,7 +22,9 @@ use crate::node_proto;
 const RECONCILE_TICK: Duration = Duration::from_secs(12);
 const NODE_PREPARE_TIMEOUT_SECS: i32 = 3600;
 const NODE_ACTIVATE_TIMEOUT_SECS: i32 = 900;
-const ACTIVATE_CONFIRM_SECS: i64 = 300;
+/// Longer than the node's own switch guard (900s), so a node that reverts a
+/// switch reports why before the controller gives up on it.
+const ACTIVATE_CONFIRM_SECS: i64 = 1200;
 /// From the reboot until the node confirms the staged generation. Covers the
 /// boot, kcore-boot-confirm's own timeout, and a reboot back.
 const REBOOT_CONFIRM_SECS: i64 = 1800;
@@ -335,12 +337,19 @@ async fn reconcile_update(
                     activation_mode: activation.clone(),
                     prepared_closure: closure,
                 };
-                let result = activate_on_node(clients, &address, req).await;
                 let failed_phase = if may_confirm_activation(node_row, &activation) {
+                    // The switch can restart this controller before the call
+                    // returns. Its successor must confirm, not switch again.
+                    db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                        phase: "confirming".into(),
+                        ..node_row.clone()
+                    })
+                    .map_err(|e| format!("mark node confirming: {e}"))?;
                     "confirming"
                 } else {
                     "failed"
                 };
+                let result = activate_on_node(clients, &address, req).await;
                 match result {
                     Ok(resp) if resp.success => {
                         let has_generation = db
@@ -500,15 +509,25 @@ async fn reconcile_update(
                 }
             }
             "confirming" => {
-                if let Some(reason) = node_reports_failure(clients, &address, node_row).await {
+                let status = status_on_node(
+                    clients,
+                    &address,
+                    node_proto::GetSystemUpdateStatusRequest {
+                        update_name: node_row.update_name.clone(),
+                    },
+                )
+                .await
+                .ok();
+                if let Some(status) = status.as_ref().filter(|s| s.phase == "failed") {
                     db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
                         phase: "failed".into(),
-                        last_error: reason,
+                        last_error: status.message.clone(),
                         ..node_row.clone()
                     })
                     .map_err(|e| format!("mark reverted node failed: {e}"))?;
                     return Ok(());
                 }
+                let node_confirmed = status.as_ref().is_some_and(|s| s.phase != "switch_pending");
                 let host = db.get_node_host_status(&node_row.node_id).ok().flatten();
                 let running = host
                     .as_ref()
@@ -526,6 +545,7 @@ async fn reconcile_update(
                         .map(|row| row.booted_generation.as_str())
                         .unwrap_or(""),
                     &node_row.target_generation,
+                    node_confirmed,
                     age_secs,
                 );
                 match outcome {
@@ -539,7 +559,7 @@ async fn reconcile_update(
                     }
                     Some(false) => {
                         let reason = format!(
-                            "the node did not run the target generation within {ACTIVATE_CONFIRM_SECS}s"
+                            "the node did not confirm the target generation within {ACTIVATE_CONFIRM_SECS}s"
                         );
                         fail_and_revert(db, clients, &address, node_row, reason).await?;
                     }
@@ -727,25 +747,6 @@ fn reboot_step(
     }
 }
 
-/// The node's own account of a failed update. It has already gone back to
-/// the previous generation when it reports one.
-async fn node_reports_failure(
-    clients: &NodeClients,
-    address: &str,
-    node_row: &ClusterUpdateNodeRow,
-) -> Option<String> {
-    let status = status_on_node(
-        clients,
-        address,
-        node_proto::GetSystemUpdateStatusRequest {
-            update_name: node_row.update_name.clone(),
-        },
-    )
-    .await
-    .ok()?;
-    (status.phase == "failed").then_some(status.message)
-}
-
 /// Put the node back on the generation it ran before the update, then mark
 /// it failed, which stops the rollout.
 async fn fail_and_revert(
@@ -828,15 +829,18 @@ fn may_confirm_activation(node_row: &ClusterUpdateNodeRow, activation: &str) -> 
     !node_row.target_generation.is_empty() && !node_row.requires_reboot && activation != "boot"
 }
 
-/// `Some(true)` once the node runs the target generation, `Some(false)` after
-/// [`ACTIVATE_CONFIRM_SECS`] without it, `None` while still waiting.
+/// `Some(true)` once the node runs the target generation and no longer
+/// reports the switch pending, `Some(false)` after [`ACTIVATE_CONFIRM_SECS`]
+/// without that, `None` while still waiting.
 fn confirm_activation(
     nixos_generation: &str,
     booted_generation: &str,
     target_generation: &str,
+    node_confirmed: bool,
     age_secs: i64,
 ) -> Option<bool> {
-    if !target_generation.is_empty()
+    if node_confirmed
+        && !target_generation.is_empty()
         && crate::kubernetes_lifecycle::generation_is_current(
             nixos_generation,
             booted_generation,
@@ -1240,24 +1244,44 @@ mod tests {
     fn a_failed_switch_succeeds_once_the_node_runs_the_target() {
         let target = "/nix/store/new";
         assert_eq!(
-            confirm_activation(target, "/nix/store/old", target, 20),
+            confirm_activation(target, "/nix/store/old", target, true, 20),
             Some(true)
         );
         assert_eq!(
-            confirm_activation("/nix/store/old", "/nix/store/old", target, 20),
+            confirm_activation("/nix/store/old", "/nix/store/old", target, true, 20),
             None
         );
-        assert_eq!(confirm_activation("", "", target, 20), None);
+        assert_eq!(confirm_activation("", "", target, true, 20), None);
         assert_eq!(
             confirm_activation(
                 "/nix/store/old",
                 "/nix/store/old",
                 target,
+                true,
                 ACTIVATE_CONFIRM_SECS
             ),
             Some(false)
         );
-        assert_eq!(confirm_activation("", "", "", 20), None);
+        assert_eq!(confirm_activation("", "", "", true, 20), None);
+    }
+
+    #[test]
+    fn a_switch_the_node_has_not_confirmed_is_not_a_success() {
+        let target = "/nix/store/new";
+        assert_eq!(
+            confirm_activation(target, "/nix/store/old", target, false, 20),
+            None
+        );
+        assert_eq!(
+            confirm_activation(
+                target,
+                "/nix/store/old",
+                target,
+                false,
+                ACTIVATE_CONFIRM_SECS
+            ),
+            Some(false)
+        );
     }
 
     #[test]

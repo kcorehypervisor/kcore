@@ -57,17 +57,22 @@ On each node:
 - **Switch** (kernel and every `kcore-vm-*` unit unchanged). The new
   `flake.nix` and `flake.lock` go into `/etc/nixos` (the old ones to
   `previous/`), a transient `kcore-update-guard` timer is armed, and the node
-  switches. A failed switch restores the old files and switches back at once.
-  The agent on the new generation confirms the switch after 30 seconds; if it
-  never does (it crashed, or the controller unit failed), the guard switches
-  back after 15 minutes.
+  switches in a transient `kcore-update-switch` unit, so the switch finishes
+  when it restarts the agent. A failed switch runs the guard at once: it
+  restores the old files and switches back. The agent on the new generation
+  confirms the switch once the agent and the controller unit stay healthy for
+  three checks, starting 30 seconds after it starts; if it never does (it
+  crashed, or the controller unit failed), the guard switches back after 15
+  minutes. `journalctl -u kcore-update-switch` shows the switch output.
 - **Boot** (kernel or guest units changed). The generation is staged with
-  `nixos-rebuild boot` and a systemd-boot one-shot entry; `/etc/nixos` keeps
-  the running pins. With `drainVms` the controller migrates guests off the
+  `nixos-rebuild boot` and a systemd-boot one-shot entry, with the running
+  generation pinned as the default until the new one is confirmed;
+  `/etc/nixos` keeps the running pins. With `drainVms` the controller migrates guests off the
   node, then reboots it.
 - **After the reboot** `kcore-boot-confirm` waits for the node agent (and the
-  controller, where it runs) to stay up. Healthy: the entry becomes the
-  default and the new pins go into `/etc/nixos`. Unhealthy within
+  controller, where it runs) to stay up. Healthy: the pin is removed, so the
+  newest generation is the default again, and the new pins go into
+  `/etc/nixos`. Unhealthy within
   `bootConfirm.timeoutSeconds`: it records why in
   `/var/lib/kcore/updates/boot-failed`, makes the previous generation the
   default, and reboots into it. A kernel that panics or hangs never reaches
