@@ -222,30 +222,3 @@ test("a plan result carries its app, which is served sandboxed, and apps can onl
     await app.close();
   }
 });
-
-test("a LAN host name is accepted only when the app was told about it", async () => {
-  const make = (allowedHosts?: string[]) =>
-    createApp({
-      token: TOKEN,
-      auth: new AuthStore(mkdtempSync(join(tmpdir(), "kcore-agent-")), { env: {} }),
-      createServer,
-      uiDir: new URL("../ui", import.meta.url).pathname,
-      summary: () => ({ controller: "127.0.0.1:9090", operator: "kctl" }),
-      allowedHosts,
-    });
-  const closed = make();
-  const open = make(["192.168.40.10"]);
-  await Promise.all([closed, open].map((a) => new Promise<void>((r) => a.server.listen(0, "127.0.0.1", r))));
-  try {
-    const auth = { authorization: `Bearer ${TOKEN}` };
-    const portOf = (a: typeof open) => (a.server.address() as AddressInfo).port;
-    const lan = (a: typeof open) => ({ ...auth, host: `192.168.40.10:${portOf(a)}` });
-    assert.equal(await raw(portOf(closed), "/api/providers", lan(closed)), 403);
-    assert.equal(await raw(portOf(open), "/api/providers", lan(open)), 200);
-    assert.equal(await raw(portOf(open), "/api/providers", { ...lan(open), origin: "https://evil.example" }), 403);
-    assert.equal(await raw(portOf(open), "/api/providers", { ...auth, host: `192.168.40.11:${portOf(open)}` }), 403);
-  } finally {
-    closed.server.close();
-    open.server.close();
-  }
-});

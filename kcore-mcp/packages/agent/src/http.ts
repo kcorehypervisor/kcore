@@ -17,8 +17,6 @@ export type AppOptions = {
   uiDir: string;
   logDir?: string;
   summary: () => ClusterSummary;
-  /** Extra host names the page may be served under, besides loopback. Set only when bound to a LAN address on purpose. */
-  allowedHosts?: string[];
 };
 
 const STATIC: Record<string, { file: string; type: string }> = {
@@ -60,15 +58,11 @@ export function createApp(options: AppOptions): App {
     });
   });
 
-  function hostNames(): string[] {
-    return ["127.0.0.1", "localhost", ...(options.allowedHosts ?? [])];
-  }
-
   function hostAllowed(req: IncomingMessage): boolean {
     const address = server.address() as AddressInfo | null;
     if (!address) return false;
     const host = req.headers.host ?? "";
-    return hostNames().some((name) => host === `${name}:${address.port}`);
+    return host === `127.0.0.1:${address.port}` || host === `localhost:${address.port}`;
   }
 
   function originAllowed(req: IncomingMessage): boolean {
@@ -76,7 +70,7 @@ export function createApp(options: AppOptions): App {
     if (!origin) return true;
     const address = server.address() as AddressInfo | null;
     if (!address) return false;
-    return hostNames().some((name) => origin === `http://${name}:${address.port}`);
+    return origin === `http://127.0.0.1:${address.port}` || origin === `http://localhost:${address.port}`;
   }
 
   function authorized(req: IncomingMessage): boolean {
