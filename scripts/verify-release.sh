@@ -26,10 +26,10 @@ set -euo pipefail
 DEFAULT_REPO="kcorehypervisor/kcore"
 REPO="${KCORE_GITHUB_REPO:-${DEFAULT_REPO}}"
 
-# Fulcio records the GitHub OIDC issuer when the maintainer signs in with
-# GitHub. The identity is the email chosen at that prompt.
-SIGNER_ISSUER="${KCORE_SIGNER_ISSUER:-https://github.com/login/oauth}"
-SIGNER_IDENTITY="${KCORE_SIGNER_IDENTITY:-82217+rtacconi@users.noreply.github.com}"
+# Fulcio records the OIDC issuer the maintainer signs in with and the email
+# of that account. Empty values take the default for the tag (signer_for).
+SIGNER_ISSUER="${KCORE_SIGNER_ISSUER:-}"
+SIGNER_IDENTITY="${KCORE_SIGNER_IDENTITY:-}"
 SIGNER_IDENTITY_REGEXP="${KCORE_SIGNER_IDENTITY_REGEXP:-}"
 
 # cosign 3.0.0-3.0.4 fails to verify Rekor v2 bundles unless called with
@@ -75,6 +75,16 @@ version_ge() {
 	}'
 }
 
+# "identity issuer" that signed release $1 (a version without the v).
+# Releases are signed through GitHub; v0.6.1 alone was signed through Google.
+signer_for() {
+	if [[ "${1}" == "0.6.1" ]]; then
+		echo "team@tacconiconsulting.com https://accounts.google.com"
+	else
+		echo "82217+rtacconi@users.noreply.github.com https://github.com/login/oauth"
+	fi
+}
+
 check_cosign_version() {
 	local have
 	have="$(cosign version 2>/dev/null | awk '/^GitVersion:/ {print $2}')"
@@ -99,6 +109,13 @@ main() {
 	require_cmd cosign
 	require_cmd sha256sum
 	check_cosign_version
+
+	local default_identity default_issuer
+	read -r default_identity default_issuer <<<"$(signer_for "${TAG#v}")"
+	if [[ -z "${SIGNER_IDENTITY_REGEXP}" ]]; then
+		SIGNER_IDENTITY="${SIGNER_IDENTITY:-${default_identity}}"
+	fi
+	SIGNER_ISSUER="${SIGNER_ISSUER:-${default_issuer}}"
 
 	# A Sigstore signature is only meaningful against an identity you
 	# expect: verifying that "somebody" signed the bytes proves nothing.

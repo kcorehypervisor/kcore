@@ -25,7 +25,9 @@ packages `dist/`, then creates or updates the GitHub Release assets.
   `make release`.
 - `cosign` signs `dist/SHA256SUMS` during the publish step, using Sigstore
   keyless signing. This opens a **browser window for OIDC login**, so
-  `make release` is not fully unattended. A maintainer without `cosign`
+  `make release` is not fully unattended. Choose GitHub and sign in as
+  `82217+rtacconi@users.noreply.github.com`. The step checks the bundle
+  against that identity and stops if another account signed it. A maintainer without `cosign`
   configured must opt out explicitly with `RELEASE_FLAGS=--no-sign`; the
   release is then unsigned and
   [`scripts/verify-release.sh`](../scripts/verify-release.sh) will reject it.

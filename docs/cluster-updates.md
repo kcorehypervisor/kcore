@@ -40,6 +40,9 @@ kctl update version get                    # the version set last and each node'
 
 An air-gapped site resolves tags against a mirror:
 `--flake-ref git+https://git.example/kcore` or `git+file:///srv/kcore`.
+The mirror only replaces GitHub. Nodes still fetch build inputs from
+`cache.nixos.org` and crates.io; [airgap-updates.md](airgap-updates.md)
+describes the signed bundle (planned) that removes that need.
 
 ## One node, one transaction
 
