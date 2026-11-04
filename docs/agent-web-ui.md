@@ -1,12 +1,34 @@
 # `kctl agent`: a local chat UI that drives kcore through the MCP
 
-Status: **plan**. No package, command, or UI yet.
+Status: **phase 1 built**. `kctl agent` and `kcore-mcp/packages/agent` exist and run end to end against a model endpoint. Sign in with ChatGPT, Anthropic, catalog forms with cluster-sourced pickers, MCP Apps, and `--role` are not built yet. See [What is built](#what-is-built).
 
 The working tree for this work is `/mnt/data/dev/kcore/kcore-rust-agent-ui`, branched from `cursor/ceph-p0-safety-64a3` at `5d2caa8`.
 
 ## What “done” means
 
 An operator runs `kctl agent`. A browser tab opens on `http://127.0.0.1:<port>/?token=…`. The page is a chat, in the shape of the OpenCode web UI: sessions on the left, the conversation in the middle, tool calls shown as cards. The operator picks a model (ChatGPT plan, OpenAI key, Anthropic key, DeepSeek key) and types “create a VM for the build runner”. The model calls the existing `kcore_advise` / `kcore_plan` / `kcore_apply` tools from [`kcore-mcp`](../kcore-mcp/README.md). When the MCP server needs an answer it asks with `elicitation/create`; the UI renders that as a form with real inputs (pickers filled from the cluster, not free text). Nothing is applied until the operator clicks a confirm button the model cannot click. Every call reaches the controller over mTLS with a certificate `kctl` chose, so the controller audit log shows who did it.
+
+## What is built
+
+| Piece | State |
+|---|---|
+| `kctl agent` (`--port`, `--no-browser`, `--agent-bin`, `--provisioning`, plus the global `-c`, `-s`, `-k`, `--tls-server-name`, `--as`) | Done. Writes a 0600 one-context file in a 0700 runtime directory, passes it and a 256-bit token to the agent, prints the URL, stops the agent on Ctrl-C and removes the directory. |
+| Agent HTTP server, session loop, SSE | Done. Loopback only; bearer token on every `/api` call; Host and Origin checks against DNS rebinding; CSP with no inline script or style. |
+| In-process MCP client with elicitation | Done. One `kcore-mcp` server instance per session over `InMemoryTransport`. |
+| Approval gate | Done, see [Approval](#approval). |
+| Elicitation forms (layer 1) | Done for the schema the server sends today: text, enum, number, boolean. Typed `Question`s and `_meta.kcore.source` pickers are not. |
+| Providers | OpenAI API key and DeepSeek API key, over Chat Completions streaming. `OPENAI_BASE_URL` / `DEEPSEEK_BASE_URL` redirect them (vLLM, Ollama and similar). Keys live in `~/.kcore/agent/auth.json` (0600) or in `OPENAI_API_KEY` / `DEEPSEEK_API_KEY`. |
+| Transcripts | Appended to `~/.kcore/agent/sessions/<id>.jsonl`. Sessions are not reloaded after the agent restarts. |
+| `kcore-mcp` change | Elicitation requests now wait up to 30 minutes for an answer. The SDK default is 60 seconds, which cut a human off mid-form. |
+
+Run it from a checkout:
+
+```bash
+cd kcore-mcp && npm install && npm run build
+kctl agent
+```
+
+`kctl` finds the agent next to its own binary, then in `kcore-mcp/packages/agent/dist/index.js` above the binary or the working directory. `--agent-bin` or `KCORE_AGENT_BIN` override that.
 
 ## Why this shape
 
@@ -20,7 +42,7 @@ Decisions this plan makes:
 | What `kctl agent` does | Resolves the context, writes a short-lived context file, spawns the agent, opens the browser, cleans up | `kctl` already owns `~/.kcore/config`, `--as`, `--controller`, `--tls-server-name`. The agent reads one standard context file and never reimplements that logic. |
 | Model access | OpenAI: Sign in with ChatGPT (open-source flow) or API key. Anthropic: API key only. DeepSeek: API key only. | See [Providers](#providers). Claude.ai login in third-party apps is forbidden by Anthropic; DeepSeek has no consumer OAuth. |
 | Forms | Three layers: elicitation forms, host-native catalog forms, MCP Apps | Elicitation works today with no server change. Catalog forms give contextual pickers. MCP Apps make the same forms render in other hosts later. |
-| Approval | The host, not the model, sets `confirm: true` | A prompt-injected model must not be able to apply. The gate lives in the agent loop and the UI. |
+| Approval | The host, not the model, decides `confirm` | A prompt-injected model must not be able to apply. The gate lives in the agent loop and the UI. |
 
 Rejected for now: a pure Rust agent inside `kctl` (`rmcp` client, three LLM clients, embedded assets). It would avoid Node but duplicate `kcore-mcp` logic or still spawn it. Revisit if Node on the operator workstation becomes a problem.
 
@@ -52,9 +74,9 @@ kctl agent [--port N] [--no-browser] [--as OPERATOR] [--role read-only|vm-admin]
 
 1. Resolve the connection with `resolve_controller` (`crates/kctl/src/config.rs`), so `-c`, `-s`, `-k`, `--tls-server-name`, `--as` behave as they do for every other command.
 2. Write a one-context file under `$XDG_RUNTIME_DIR/kcore-agent/<pid>/config` (mode 0600, directory 0700) with inline `ca-data` / `cert-data` / `key-data`, `tls-server-name`, `controllers`, and `provisioning`. The agent reads it through the existing `resolveConnection` in `kcore-mcp/packages/server/src/connection.ts`. Nothing new to parse on either side.
-3. Generate a 32-byte session token. Pass `KCORE_CONFIG`, `KCORE_AGENT_TOKEN`, `KCORE_AGENT_PORT`, `KCORE_AGENT_HOME=~/.kcore/agent` to the child.
-4. Spawn the agent. Resolution order for the binary: `--agent-bin`, `$KCORE_AGENT_BIN`, `kcore-agent` next to the `kctl` binary (release tarballs and the Nix package put it there), then `npx -y kcore-agent@<kctl version>`. Fail fast with the three paths it tried.
-5. Wait for the child to print `listening http://127.0.0.1:<port>` on stdout, open the browser on `/?token=<token>` unless `--no-browser`, then forward signals and wait.
+3. Generate a 32-byte session token. Pass `KCORE_CONFIG`, `KCORE_AGENT_TOKEN` and `KCORE_AGENT_PORT` to the child. The agent keeps its own state under `KCORE_AGENT_HOME` (default `~/.kcore/agent`).
+4. Spawn the agent. Resolution order for the binary: `--agent-bin`, `$KCORE_AGENT_BIN`, `kcore-agent` next to the `kctl` binary (release tarballs and the Nix package put it there), then `kcore-mcp/packages/agent/dist/index.js` above the binary or the working directory. An npm fallback comes with publishing. Fail fast with what it tried.
+5. Wait for the child to print `listening http://127.0.0.1:<port>` on stdout, open the browser on `/#token=<token>` unless `--no-browser`, then forward signals and wait. The token sits in the URL fragment so it never reaches a server log or a `Referer` header; the page moves it to `sessionStorage` and clears the address bar.
 6. On exit, remove the runtime directory. On `SIGINT`, stop the child first.
 
 Which certificate the agent gets:
@@ -67,7 +89,7 @@ The private key never reaches the browser. The browser talks to the agent on loo
 
 ### `kcore-agent` (TypeScript, `kcore-mcp/packages/agent`)
 
-Server: `node:http` or Hono, bound to `127.0.0.1` only. Every request carries `Authorization: Bearer <KCORE_AGENT_TOKEN>` (the UI reads it once from the URL and stores it in `sessionStorage`). `Origin` must be the agent's own origin. No CORS, no cookies.
+Server: `node:http`, bound to `127.0.0.1` only. Every `/api` request carries `Authorization: Bearer <KCORE_AGENT_TOKEN>` (the UI reads it once from the URL fragment and stores it in `sessionStorage`). `Origin` must be the agent's own origin. No CORS, no cookies.
 
 Routes:
 
@@ -98,7 +120,18 @@ The approval gate is independent of `kcore-mcp`'s own `confirm` check and of the
 
 Provider adapters: start with the Vercel AI SDK (`ai`, `@ai-sdk/openai`, `@ai-sdk/anthropic`, `@ai-sdk/deepseek`) for the streaming and tool-call loop. If the ChatGPT plan token does not fit its OpenAI adapter (the plan flow needs the Responses API with `store: false`, `stream: true`, and a bearer token on `https://api.openai.com/v1`), write that one adapter on the `openai` SDK directly. Decide in the first spike.
 
-### UI (`kcore-mcp/packages/agent/ui`, Vite + Preact or React)
+### Approval
+
+Three tools change the cluster themselves and already ask the operator through `elicitation/create` when `confirm` is not true: `kcore_apply`, `kcore_delete`, `kcore_operation`. The host uses that instead of adding a second prompt:
+
+- The model never sees a `confirm` argument. The host sends `confirm: false` on those three tools whatever the model wrote, so the server's own yes/no elicitation fires and the UI shows it as an approval card with Approve and Reject.
+- `kcore_rpc` with a method that is not a get, list, classify, check, or plan, and `kcore_operation` with `install-node`, do not ask on the server side (or ask only after the model has typed the acknowledgement phrase). For those the host shows its own approval card with the exact request, and sets `confirm: true` only after Approve. The `acknowledge` phrase is hidden from that card; the operator reads the device list and approves.
+- Reject, Skip, Stop, and closing the tab all end up as "not approved". The tool result tells the model nothing changed.
+- The model also cannot choose where the call goes. `connection` is reduced to `node`; controller, TLS, config path and operator come from the context `kctl agent` wrote.
+
+Answers from a form come back to the model in the tool result as `Operator form answers`, because the server merges them into its own copy of the spec and does not echo them.
+
+### UI (`kcore-mcp/packages/agent/ui`, plain HTML, CSS and JS for now)
 
 Layout copied from the OpenCode web client:
 
@@ -176,7 +209,7 @@ App-rendered elicitation (an elicitation request that names a `ui://` resource) 
 
 ## Phases
 
-1. **Spike**: `packages/agent` with one provider (OpenAI API key), in-process MCP client, SSE chat, elicitation rendered as a schema form, approval gate. `kctl agent` with context handoff and browser open. Target: create a VM in the lab end to end with every question answered through a form.
+1. **Spike** (built): `packages/agent` with OpenAI and DeepSeek keys, in-process MCP client, SSE chat, elicitation rendered as a schema form, approval gate. `kctl agent` with context handoff and browser open. Still to do for this phase: create a VM in the lab end to end with a real model, every question answered through a form.
 2. **Providers**: Sign in with ChatGPT, Anthropic key, DeepSeek key, `auth.json`, model picker, usage display.
 3. **Forms**: typed `Question`s and `_meta.kcore.source` in `kcore-mcp`; catalog forms with cluster-sourced pickers; plan diff card; advise questions rendered as one form.
 4. **Operator identity**: `--role`, agent operator auto-provisioning, audit view in the UI (`kctl audit` data filtered by the agent's CN).
@@ -188,7 +221,7 @@ App-rendered elicitation (an elicitation request that names a `ui://` resource) 
 - Should `kctl agent` default to the current context identity or refuse to run as `kctl` (cluster admin) without `--as`? Refusing is safer; defaulting is friendlier for a single-operator lab. Proposal: default to the context identity, print a one-line warning when the certificate CN is `kctl`.
 - Does the Sign in with ChatGPT open-source flow accept `agent_name_hint=kcore` without prior registration? The docs say registration is dynamic; confirm in the spike before building the UI around it.
 - One agent per `kctl agent` run, or a long-lived agent the dashboard can embed? This plan is the per-run tool. Embedding in the dashboard needs a different credential story (dashboard identity, not operator identity) and is not covered here.
-- Vercel AI SDK versus direct provider SDKs. Decided in phase 1.
+- Vercel AI SDK versus direct provider SDKs. Phase 1 uses plain `fetch` against Chat Completions, which covers OpenAI keys, DeepSeek, and any OpenAI-compatible server. Anthropic and the ChatGPT plan flow (Responses API) need their own adapters in phase 2.
 
 ## Related
 
