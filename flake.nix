@@ -116,7 +116,7 @@
 
           kcore-agent = pkgs.buildNpmPackage {
             pname = "kcore-agent";
-            version = (builtins.fromJSON (builtins.readFile ./kcore-mcp/packages/agent/package.json)).version;
+            inherit (builtins.fromJSON (builtins.readFile ./kcore-mcp/packages/agent/package.json)) version;
             src = ./kcore-mcp;
             npmDepsHash = "sha256-EgqCF0Mk0UJ0SQ+dvlGuNE0PAmf63PpnjXNwmu/ocEs=";
             nodejs = pkgs.nodejs_22;
