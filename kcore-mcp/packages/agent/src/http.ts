@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -26,6 +26,13 @@ const STATIC: Record<string, { file: string; type: string }> = {
 };
 
 const MAX_BODY = 1_000_000;
+const MAX_APP_FRAMES = 200;
+const APP_FRAME_TTL_MS = 60 * 60 * 1000;
+
+// An app view gets script and style of its own and nothing else: no network, no frames, no storage.
+// `sandbox` here also makes it an opaque origin if someone opens the URL directly.
+const APP_CSP =
+  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts";
 
 export type App = {
   server: Server;
@@ -35,6 +42,7 @@ export type App = {
 
 export function createApp(options: AppOptions): App {
   const sessions = new Map<string, Session>();
+  const appFrames = new Map<string, { html: string; createdAt: number }>();
   const expected = Buffer.from(options.token);
   if (options.logDir) {
     for (const id of listTranscripts(options.logDir)) {
@@ -79,7 +87,7 @@ export function createApp(options: AppOptions): App {
     res.setHeader("x-frame-options", "DENY");
     res.setHeader(
       "content-security-policy",
-      "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     );
 
     if (!hostAllowed(req) || !originAllowed(req)) return json(res, 403, { error: "forbidden host or origin" });
@@ -99,6 +107,17 @@ export function createApp(options: AppOptions): App {
     if (method === "GET" && path === "/favicon.ico") {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    const frame = /^\/apps\/([0-9a-f]{48})$/.exec(path);
+    if (method === "GET" && frame) {
+      const entry = appFrames.get(frame[1]);
+      if (!entry || Date.now() - entry.createdAt > APP_FRAME_TTL_MS) return json(res, 404, { error: "not found" });
+      res.removeHeader("x-frame-options");
+      res.setHeader("content-security-policy", APP_CSP);
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(entry.html);
       return;
     }
 
@@ -160,7 +179,7 @@ export function createApp(options: AppOptions): App {
       return json(res, 201, { id });
     }
 
-    match = /^\/api\/sessions\/([0-9a-f-]{36})(?:\/(messages|events|cancel|forms\/f\d+))?$/.exec(path);
+    match = /^\/api\/sessions\/([0-9a-f-]{36})(?:\/(messages|events|cancel|apps|call|forms\/f\d+))?$/.exec(path);
     if (!match) return json(res, 404, { error: "not found" });
     const session = sessions.get(match[1]);
     if (!session) return json(res, 404, { error: "no such session" });
@@ -204,6 +223,33 @@ export function createApp(options: AppOptions): App {
     if (sub === "cancel" && method === "POST") {
       session.cancel();
       return json(res, 200, { ok: true });
+    }
+
+    if (sub === "apps" && method === "POST") {
+      const body = await readJson(req);
+      const uri = typeof body.uri === "string" ? body.uri : "";
+      let html: string;
+      try {
+        html = await session.readApp(uri);
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+      for (const [key, entry] of appFrames) {
+        if (Date.now() - entry.createdAt > APP_FRAME_TTL_MS) appFrames.delete(key);
+      }
+      while (appFrames.size >= MAX_APP_FRAMES) appFrames.delete(appFrames.keys().next().value as string);
+      const key = randomBytes(24).toString("hex");
+      appFrames.set(key, { html, createdAt: Date.now() });
+      return json(res, 200, { url: `/apps/${key}` });
+    }
+
+    if (sub === "call" && method === "POST") {
+      const body = await readJson(req);
+      try {
+        return json(res, 200, await session.callFromApp(typeof body.name === "string" ? body.name : "", body.arguments));
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
     }
 
     if (sub?.startsWith("forms/") && method === "POST") {

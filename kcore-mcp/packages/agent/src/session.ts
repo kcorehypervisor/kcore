@@ -12,6 +12,10 @@ import type { Restored, TranscriptRecord } from "./transcript.js";
 const MAX_STEPS = 25;
 const TOOL_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_RESULT_CHARS = 100_000;
+const MAX_APP_BYTES = 1_000_000;
+const MCP_APP_MIME = "text/html;profile=mcp-app";
+/** What an app may ask the host to call: reads and plans. Nothing that changes the cluster. */
+const APP_CALLABLE = new Set(["kcore_advise", "kcore_plan", "kcore_read", "kcore_catalog"]);
 
 const HOST_PROMPT = `You are running inside kctl agent, a local chat UI. The operator sees every tool call you make.
 
@@ -25,7 +29,7 @@ export type EventBody =
   | { type: "user"; text: string }
   | { type: "assistant"; text: string }
   | { type: "tool_call"; callId: string; name: string; args: unknown }
-  | { type: "tool_result"; callId: string; ok: boolean; text: string; ms: number }
+  | { type: "tool_result"; callId: string; ok: boolean; text: string; ms: number; app?: { uri: string } }
   | { type: "form"; formId: string; kind: "form" | "approval"; message: string; schema: FormSchema; callId?: string }
   | { type: "form_done"; formId: string; action: "accept" | "decline" | "cancel" }
   | { type: "error"; message: string }
@@ -60,6 +64,7 @@ export class Session {
   private client: Client | undefined;
   private server: McpServer | undefined;
   private tools: ToolSpec[] = [];
+  private appByTool = new Map<string, string>();
   private instructions = "";
   private busy: AbortController | undefined;
   private formSeq = 0;
@@ -157,6 +162,12 @@ export class Session {
     await client.connect(clientTransport);
     const listed = await client.listTools();
     this.tools = listed.tools.map(modelFacingTool);
+    this.appByTool = new Map(
+      listed.tools.flatMap((tool) => {
+        const uri = (tool._meta as { ui?: { resourceUri?: unknown } } | undefined)?.ui?.resourceUri;
+        return typeof uri === "string" && uri.startsWith("ui://") ? [[tool.name, uri] as [string, string]] : [];
+      }),
+    );
     this.instructions = client.getInstructions() ?? "";
     this.client = client;
     this.server = server;
@@ -192,6 +203,30 @@ export class Session {
     this.emit({ type: "form_done", formId, action });
     form.resolve({ action, content: checked });
     return { ok: true };
+  }
+
+  /** HTML for an MCP App a tool of this session advertised. Anything else is refused. */
+  async readApp(uri: string): Promise<string> {
+    const client = await this.connect();
+    if (![...this.appByTool.values()].includes(uri)) throw new Error("that is not an app this session's tools offer");
+    const read = await client.readResource({ uri });
+    const content = read.contents[0] as { mimeType?: string; text?: string } | undefined;
+    if (!content?.text || content.mimeType !== MCP_APP_MIME) throw new Error("the resource is not an MCP App");
+    if (Buffer.byteLength(content.text) > MAX_APP_BYTES) throw new Error("the app is too large");
+    return content.text;
+  }
+
+  /** A tool call made by an app view, not by the model. Read-only tools only, and never with a connection override. */
+  async callFromApp(name: string, args: unknown): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }> {
+    if (!APP_CALLABLE.has(name)) throw new Error(`apps may not call ${name}`);
+    const client = await this.connect();
+    const gated = gate(name, args);
+    const { connection: _node, ...safe } = gated.arguments;
+    const result = await client.callTool({ name, arguments: safe }, undefined, { timeout: TOOL_TIMEOUT_MS });
+    const content = ((result.content as Array<{ type: string; text?: string }> | undefined) ?? []).map((part) =>
+      part.type === "text" ? { type: "text", text: (part.text ?? "").slice(0, MAX_RESULT_CHARS) } : { type: part.type },
+    );
+    return { content, ...(result.isError ? { isError: true } : {}) };
   }
 
   cancel(): void {
@@ -322,7 +357,8 @@ export class Session {
         text += `\n\nOperator form answers: ${JSON.stringify(Object.assign({}, ...this.answersForCall))}`;
       }
       if (text.length > MAX_RESULT_CHARS) text = text.slice(0, MAX_RESULT_CHARS) + "\n[truncated]";
-      this.emit({ type: "tool_result", callId: call.id, ok: !result.isError, text, ms: Date.now() - started });
+      const app = this.appByTool.get(call.name);
+      this.emit({ type: "tool_result", callId: call.id, ok: !result.isError, text, ms: Date.now() - started, ...(app && !result.isError ? { app: { uri: app } } : {}) });
       return text;
     } catch (error) {
       const text = `Tool call failed: ${error instanceof Error ? error.message : String(error)}`;

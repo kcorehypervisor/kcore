@@ -113,7 +113,7 @@ function renderEvent(event) {
         el("summary", {}, el("strong", { text: event.name }), status),
         el("div", { class: "body" }, el("div", { class: "label", text: "Arguments" }), el("pre", {}, el("code", { text: argsText })), resultLabel, result),
       );
-      state.tools.set(event.callId, { status, result, resultLabel, card });
+      state.tools.set(event.callId, { status, result, resultLabel, card, name: event.name, args: event.args });
       transcript.append(card);
       break;
     }
@@ -125,6 +125,7 @@ function renderEvent(event) {
       tool.result.textContent = prettyJson(event.text);
       tool.result.hidden = false;
       tool.resultLabel.hidden = false;
+      if (event.app) mountApp(tool, event);
       break;
     }
     case "form": {
@@ -358,6 +359,87 @@ async function loadModels() {
   const saved = localStorage.getItem(`kcore-agent-model-${id}`);
   if (saved && models.includes(saved)) select.value = saved;
   else if (fallback && models.includes(fallback)) select.value = fallback;
+}
+
+const APP_PROTOCOL = "2026-01-26";
+const APP_MAX_HEIGHT = 700;
+
+// An MCP App view runs in a sandboxed iframe with an opaque origin and no network. It can only
+// talk to this page over postMessage, and this page only forwards read-only tool calls for it.
+async function mountApp(tool, event) {
+  const sessionId = state.current;
+  let url;
+  try {
+    ({ url } = await api(`/api/sessions/${sessionId}/apps`, { method: "POST", body: JSON.stringify({ uri: event.app.uri }) }));
+  } catch {
+    return;
+  }
+  const frame = el("iframe", { class: "app-frame", sandbox: "allow-scripts", src: url, title: `${tool.name} view`, loading: "eager" });
+  const box = el("div", { class: "app" }, frame);
+  tool.card.after(box);
+
+  const post = (message) => frame.contentWindow && frame.contentWindow.postMessage({ jsonrpc: "2.0", ...message }, "*");
+  const reply = (id, result) => post({ id, result });
+  const refuse = (id, code, message) => post({ id, error: { code, message } });
+  const result = { content: [{ type: "text", text: event.text }], isError: !event.ok };
+
+  const onMessage = async (message) => {
+    if (!frame.isConnected) {
+      window.removeEventListener("message", onMessage);
+      return;
+    }
+    if (message.source !== frame.contentWindow) return;
+    const data = message.data;
+    if (!data || data.jsonrpc !== "2.0" || typeof data.method !== "string") return;
+    const { id, method, params } = data;
+    switch (method) {
+      case "ui/initialize":
+        reply(id, {
+          protocolVersion: APP_PROTOCOL,
+          hostInfo: { name: "kcore-agent", version: "0.1.0" },
+          hostCapabilities: { serverTools: {} },
+          hostContext: {
+            theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+            displayMode: "inline",
+            availableDisplayModes: ["inline"],
+            platform: "web",
+            locale: navigator.language,
+            toolInfo: { id: event.callId, tool: { name: tool.name } },
+          },
+        });
+        break;
+      case "ui/notifications/initialized":
+        post({ method: "ui/notifications/tool-input", params: { arguments: tool.args && typeof tool.args === "object" ? tool.args : {} } });
+        post({ method: "ui/notifications/tool-result", params: result });
+        break;
+      case "ui/notifications/size-changed":
+        if (params && Number.isFinite(params.height)) frame.style.height = `${Math.min(Math.max(Math.ceil(params.height) + 2, 40), APP_MAX_HEIGHT)}px`;
+        break;
+      case "tools/call":
+        try {
+          reply(id, await api(`/api/sessions/${sessionId}/call`, { method: "POST", body: JSON.stringify({ name: params && params.name, arguments: params && params.arguments }) }));
+        } catch (error) {
+          refuse(id, -32000, error instanceof Error ? error.message : String(error));
+        }
+        break;
+      case "ui/open-link":
+        if (params && typeof params.url === "string" && /^https:\/\//.test(params.url) && confirm(`Open ${params.url} in a new tab?`)) {
+          window.open(params.url, "_blank", "noopener,noreferrer");
+          reply(id, {});
+        } else if (id !== undefined) {
+          refuse(id, -32000, "link refused");
+        }
+        break;
+      case "ping":
+      case "ui/message":
+      case "notifications/message":
+        if (id !== undefined) reply(id, {});
+        break;
+      default:
+        if (id !== undefined) refuse(id, -32601, `method not supported: ${method}`);
+    }
+  };
+  window.addEventListener("message", onMessage);
 }
 
 let signInPoll = null;

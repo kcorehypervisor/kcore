@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ElicitResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { advise, mergeAnswers, normalizeDesired, type OptionSourceId, type Question } from "./advise.js";
+import { MCP_APP_MIME, PLAN_APP_HTML, PLAN_APP_URI } from "./apps.js";
 import { resolveQuestions, type ClusterOption, type LoadOptions } from "./options.js";
 import { KINDS, findKind } from "./catalog.js";
 import { InputError } from "./names.js";
@@ -292,6 +293,15 @@ export function createServer(deps: ServerDeps = {}): McpServer {
     async (input) => text(advise(input)),
   );
 
+  server.registerResource(
+    "kcore-plan-app",
+    PLAN_APP_URI,
+    { title: "kcore plan", description: "Shows a kcore plan: the action, field changes, warnings and controller calls.", mimeType: MCP_APP_MIME },
+    async (uri) => ({
+      contents: [{ uri: uri.href, mimeType: MCP_APP_MIME, text: PLAN_APP_HTML, _meta: { ui: { prefersBorder: true } } }],
+    }),
+  );
+
   server.registerTool(
     "kcore_plan",
     {
@@ -309,6 +319,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
         connection: z.object(connectionShape).optional(),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
+      _meta: { ui: { resourceUri: PLAN_APP_URI }, "ui/resourceUri": PLAN_APP_URI },
     },
     async (input, extra) => {
       try {

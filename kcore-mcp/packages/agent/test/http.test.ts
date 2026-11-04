@@ -174,3 +174,51 @@ test("the ChatGPT sign-in starts behind the token, and the callback is open to t
     await app.close();
   }
 });
+
+test("a plan result carries its app, which is served sandboxed, and apps can only make read-only calls", async () => {
+  const { app, base, api } = await start();
+  try {
+    const { id } = (await (await api("/api/sessions", { method: "POST", body: "{}" })).json()) as { id: string };
+    const session = app.sessions.get(id)!;
+    await session.send(
+      "plan a cluster",
+      {
+        id: "s",
+        models: async () => [],
+        async *stream(r) {
+          if (r.messages.some((m) => m.role === "tool")) {
+            yield { type: "done" };
+            return;
+          }
+          yield { type: "tool_call", call: { id: "p1", name: "kcore_plan", arguments: JSON.stringify({ kind: "cluster", spec: { name: "lab", controller: "10.0.0.1" } }) } };
+          yield { type: "done" };
+        },
+      },
+      "m",
+    );
+    const result = session.history().find((e) => e.type === "tool_result") as { app?: { uri: string }; ok: boolean };
+    assert.deepEqual(result.app, { uri: "ui://kcore/plan" });
+
+    const refused = await api(`/api/sessions/${id}/apps`, { method: "POST", body: JSON.stringify({ uri: "ui://evil/app" }) });
+    assert.equal(refused.status, 400);
+    const made = (await (await api(`/api/sessions/${id}/apps`, { method: "POST", body: JSON.stringify({ uri: "ui://kcore/plan" }) })).json()) as { url: string };
+    assert.match(made.url, /^\/apps\/[0-9a-f]{48}$/);
+
+    const page = await fetch(base + made.url);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get("content-security-policy") ?? "", /sandbox allow-scripts/);
+    assert.match(page.headers.get("content-security-policy") ?? "", /default-src 'none'/);
+    assert.equal(page.headers.get("x-frame-options"), null);
+    assert.match(await page.text(), /ui\/initialize/);
+    assert.equal((await fetch(`${base}/apps/${"0".repeat(48)}`)).status, 404);
+    assert.match((await fetch(`${base}/`)).headers.get("content-security-policy") ?? "", /frame-src 'self'/);
+
+    const read = await api(`/api/sessions/${id}/call`, { method: "POST", body: JSON.stringify({ name: "kcore_catalog", arguments: {} }) });
+    assert.equal(read.status, 200);
+    const blocked = await api(`/api/sessions/${id}/call`, { method: "POST", body: JSON.stringify({ name: "kcore_apply", arguments: { kind: "vm", confirm: true } }) });
+    assert.equal(blocked.status, 400);
+    assert.match(((await blocked.json()) as { error: string }).error, /may not call kcore_apply/);
+  } finally {
+    await app.close();
+  }
+});

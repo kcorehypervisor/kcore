@@ -53,7 +53,7 @@ pub struct Context {
 }
 
 /// Resolved TLS material: either decoded inline PEM or a file path to read at connect time.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConnectionInfo {
     pub address: String,
     pub addresses: Vec<String>,
