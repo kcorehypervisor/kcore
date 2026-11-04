@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>kcore data</title>
+<style>
+:root { --fg: #1c1f24; --muted: #667085; --line: #e1e5ea; --bg: #ffffff; --soft: #f4f6f8; --hover: #eef2f6; --ok: #067647; --okbg: #e7f6ee; --bad: #b42318; --badbg: #fdecea; --warn: #a15c07; --warnbg: #fdf3e1; --idle: #475467; --idlebg: #eef0f3; --accent: #1d4ed8; }
+:root[data-theme="dark"] { --fg: #e6e8eb; --muted: #98a2b3; --line: #2b3038; --bg: #16191d; --soft: #1f2329; --hover: #252a31; --ok: #47cd89; --okbg: #12301f; --bad: #f97066; --badbg: #3a1815; --warn: #fdb022; --warnbg: #3a2a0c; --idle: #b2bac6; --idlebg: #262b32; --accent: #84adff; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --fg: #e6e8eb; --muted: #98a2b3; --line: #2b3038; --bg: #16191d; --soft: #1f2329; --hover: #252a31; --ok: #47cd89; --okbg: #12301f; --bad: #f97066; --badbg: #3a1815; --warn: #fdb022; --warnbg: #3a2a0c; --idle: #b2bac6; --idlebg: #262b32; --accent: #84adff; } }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 12px 14px 14px; font: 13px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+h1 { font-size: 14px; margin: 0; font-weight: 600; }
+h2 { font-size: 12px; margin: 14px 0 6px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.muted { color: var(--muted); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.pill { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.pill.ok { color: var(--ok); background: var(--okbg); }
+.pill.bad { color: var(--bad); background: var(--badbg); }
+.pill.warn { color: var(--warn); background: var(--warnbg); }
+.pill.idle { color: var(--idle); background: var(--idlebg); }
+.pill.plain { color: var(--fg); background: var(--soft); font-weight: 500; }
+.wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-weight: 600; font-size: 11.5px; color: var(--muted); padding: 7px 10px; background: var(--soft); border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
+tr.row { cursor: pointer; }
+tr.row:hover td { background: var(--hover); }
+tbody tr:last-child td { border-bottom: 0; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.name { font-weight: 600; white-space: nowrap; }
+.mono { font: 12px ui-monospace, monospace; }
+tr.detail td { background: var(--soft); padding: 8px 12px 10px; white-space: normal; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; word-break: break-word; }
+.kv { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+.err { color: var(--bad); background: var(--badbg); border-radius: 8px; padding: 8px 12px; }
+details.raw { margin-top: 12px; }
+details.raw summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+pre { margin: 6px 0 0; background: var(--soft); padding: 8px; border-radius: 6px; overflow: auto; max-height: 240px; font: 12px ui-monospace, monospace; }
+.empty { padding: 14px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="root"><p class="muted">Waiting for the result.</p></div>
+<script>
+(function () {
+  var seq = 0, pending = {}, result = null, input = null;
+  var SECRET = /pass(word)?$|secret|token|private|keyPem|keyData|credential/i;
+  var STATUS_KEY = /(^|\.)(status|state|phase|desiredState|actualState|approvalStatus|health|readiness|role)$/i;
+  var NAME_KEYS = ["name", "hostname", "nodeId", "id", "vmId", "volumeId", "networkId", "title"];
+  var FIRST_KEYS = NAME_KEYS.concat(["status", "state", "phase", "desiredState", "approvalStatus", "address", "ip", "type", "lastHeartbeat", "cpuCores", "memoryBytes"]);
+  var HIDE_KEYS = /(^|\.)(uuid|etag|generation|disableVxlan)$/i;
+  var GOOD = /^(ready|approved|running|active|ok|healthy|true|succeeded|success|complete|completed|done|available|bound|present|in-sync|synced|up|online|enabled)$/i;
+  var BAD = /^(not-ready|notready|failed|error|rejected|down|unhealthy|false|crashed|lost|offline|denied|unavailable|degraded-error|cancelled|canceled)$/i;
+  var WARN = /^(pending|degraded|starting|stopping|provisioning|migrating|draining|unknown|paused|waiting|running-degraded|creating|deleting)$/i;
+  var IDLE = /^(stopped|off|disabled|none|idle|unspecified|shutdown|suspended)$/i;
+  var MAX_COLS = 9;
+
+  function send(message) { parent.postMessage(message, "*"); }
+  function request(method, params) {
+    return new Promise(function (resolve, reject) {
+      var id = ++seq;
+      pending[id] = { resolve: resolve, reject: reject };
+      send({ jsonrpc: "2.0", id: id, method: method, params: params });
+    });
+  }
+  function notify(method, params) { send({ jsonrpc: "2.0", method: method, params: params }); }
+  function applyContext(ctx) { if (ctx && ctx.theme) document.documentElement.setAttribute("data-theme", ctx.theme); }
+
+  function node(tag, props, children) {
+    var el = document.createElement(tag);
+    if (props) for (var k in props) { if (k === "text") el.textContent = props[k]; else if (k === "class") el.className = props[k]; else el.setAttribute(k, props[k]); }
+    (children || []).forEach(function (c) { if (c) el.appendChild(c); });
+    return el;
+  }
+
+  function words(key) {
+    var last = String(key).split(".").pop();
+    var spaced = last.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").toLowerCase();
+    return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+  }
+  function snake(key) { return String(key).split(".").pop().replace(/([a-z0-9])([A-Z])/g, "$1_$2").toUpperCase(); }
+
+  function isPlainObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+  function isRecordList(v) { return Array.isArray(v) && v.length > 0 && v.every(isPlainObject); }
+
+  function flatten(obj, prefix, out, depth) {
+    Object.keys(obj).forEach(function (k) {
+      var key = prefix ? prefix + "." + k : k;
+      var v = obj[k];
+      if (isPlainObject(v) && depth < 2) flatten(v, key, out, depth + 1);
+      else out[key] = v;
+    });
+    return out;
+  }
+
+  function humanBytes(raw) {
+    var n = Number(raw);
+    if (!isFinite(n)) return String(raw);
+    var units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"], i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return (i === 0 || n >= 100 ? Math.round(n) : Math.round(n * 10) / 10) + " " + units[i];
+  }
+  function ago(iso) {
+    var t = Date.parse(iso);
+    if (!isFinite(t)) return null;
+    var s = Math.round((Date.now() - t) / 1000), future = s < 0;
+    s = Math.abs(s);
+    var text;
+    if (s < 45) text = "just now";
+    else if (s < 3600) text = Math.round(s / 60) + " min";
+    else if (s < 86400) text = Math.round(s / 3600) + " h";
+    else if (s < 86400 * 60) text = Math.round(s / 86400) + " d";
+    else text = Math.round(s / 86400 / 30) + " mo";
+    if (text === "just now") return text;
+    return future ? "in " + text : text + " ago";
+  }
+
+  function cleanEnum(key, value) {
+    if (typeof value !== "string" || !/^[A-Z0-9]+(_[A-Z0-9]+)+$/.test(value)) return value;
+    var prefix = snake(key);
+    var v = value;
+    [prefix + "_TYPE_", prefix + "_"].some(function (p) { if (v.indexOf(p) === 0) { v = v.slice(p.length); return true; } return false; });
+    var parts = value.split("_");
+    if (v === value && parts.length > 2) v = parts.slice(-1)[0];
+    return v.toLowerCase().replace(/_/g, " ");
+  }
+
+  function tone(value) {
+    var s = String(value).trim();
+    if (GOOD.test(s)) return "ok";
+    if (BAD.test(s)) return "bad";
+    if (WARN.test(s)) return "warn";
+    if (IDLE.test(s)) return "idle";
+    return "plain";
+  }
+
+  function scalarText(key, value) {
+    if (value === null || value === undefined || value === "") return "";
+    if (SECRET.test(key)) return "(hidden)";
+    if (typeof value === "string" && /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(value)) return "(hidden)";
+    if (Array.isArray(value)) {
+      if (value.every(function (x) { return x === null || typeof x !== "object"; })) return value.map(function (x) { return cleanEnum(key, String(x)); }).join(", ");
+      return value.length + (value.length === 1 ? " item" : " items");
+    }
+    if (typeof value === "object") return JSON.stringify(value);
+    if (/bytes$/i.test(key) && /^-?\d+(\.\d+)?$/.test(String(value))) return humanBytes(value);
+    return String(cleanEnum(key, value));
+  }
+
+  function cell(key, value) {
+    var td = node("td");
+    var text = scalarText(key, value);
+    var last = key.split(".").pop();
+    if (text === "") { td.className = "muted"; td.textContent = "-"; return td; }
+    if (NAME_KEYS.indexOf(last) !== -1 && key.indexOf(".") === -1) { td.className = "name"; td.textContent = text; return td; }
+    if (STATUS_KEY.test(key) && typeof value !== "object") { td.appendChild(node("span", { class: "pill " + tone(text), text: text })); return td; }
+    if (typeof value === "boolean") { td.appendChild(node("span", { class: "pill " + (value ? "ok" : "idle"), text: value ? "yes" : "no" })); return td; }
+    if (typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(value) && ago(value)) {
+      td.textContent = ago(value);
+      td.title = value;
+      td.className = "muted";
+      return td;
+    }
+    if (typeof value === "number" || (/bytes$/i.test(key) && /^-?\d+$/.test(String(value)))) td.className = "num";
+    if (/(address|ip|id|hash|sha|uri|url|path)$/i.test(last)) td.className = (td.className ? td.className + " " : "") + "mono";
+    td.textContent = text;
+    return td;
+  }
+
+  function orderColumns(rows) {
+    var keys = {};
+    rows.forEach(function (r) { Object.keys(r).forEach(function (k) { if (!HIDE_KEYS.test(k)) keys[k] = keys[k] || (r[k] !== null && r[k] !== undefined && r[k] !== "" && !(Array.isArray(r[k]) && r[k].length === 0)); }); });
+    var present = Object.keys(keys).filter(function (k) { return keys[k]; });
+    present = present.filter(function (k, i) {
+      return !present.slice(0, i).some(function (other) {
+        return rows.every(function (r) { return JSON.stringify(r[other]) === JSON.stringify(r[k]); });
+      });
+    });
+    function rank(k) { var i = FIRST_KEYS.indexOf(k.split(".").pop()); return i === -1 ? 100 : i; }
+    present.sort(function (a, b) { return rank(a) - rank(b) || a.localeCompare(b); });
+    var shown = present.slice(0, MAX_COLS);
+    var hidden = present.slice(MAX_COLS);
+    return { shown: shown, all: present, hidden: hidden };
+  }
+
+  function headers(cols) {
+    var count = {};
+    cols.forEach(function (c) { var l = c.split(".").pop(); count[l] = (count[l] || 0) + 1; });
+    return cols.map(function (c) {
+      var h = count[c.split(".").pop()] > 1 ? words(c.replace(/\./g, " ")).replace(/\s+/g, " ") : words(c);
+      return h.replace(/\bcpu\b/i, "CPU").replace(/ bytes$/i, "").replace(/ days$/i, " (days)").replace(/\bid$/i, "ID").replace(/\bdc\b/i, "DC");
+    });
+  }
+
+  function statusChips(rows, cols) {
+    var key = cols.filter(function (c) { return STATUS_KEY.test(c) && !/role$/i.test(c); })[0];
+    if (!key) return null;
+    var counts = {}, order = [];
+    rows.forEach(function (r) {
+      var v = scalarText(key, r[key]);
+      if (v === "") return;
+      if (!(v in counts)) { counts[v] = 0; order.push(v); }
+      counts[v]++;
+    });
+    if (order.length === 0) return null;
+    return node("div", { class: "chips" }, order.map(function (v) { return node("span", { class: "pill " + tone(v), text: counts[v] + " " + v }); }));
+  }
+
+  function table(rows) {
+    var flat = rows.map(function (r) { return flatten(r, "", {}, 0); });
+    var cols = orderColumns(flat);
+    var head = node("tr", {}, headers(cols.shown).map(function (h, i) {
+      var numeric = flat.some(function (r) { return typeof r[cols.shown[i]] === "number"; });
+      var th = node("th", { text: h });
+      if (numeric) th.style.textAlign = "right";
+      return th;
+    }));
+    var body = node("tbody");
+    flat.forEach(function (r) {
+      var tr = node("tr", { class: "row", title: "Show all fields" });
+      cols.shown.forEach(function (c) { tr.appendChild(cell(c, r[c])); });
+      var detail = null;
+      tr.addEventListener("click", function () {
+        if (detail) { detail.remove(); detail = null; resize(); return; }
+        var dl = node("dl");
+        cols.all.concat(Object.keys(r).filter(function (k) { return cols.all.indexOf(k) === -1 && !HIDE_KEYS.test(k) && r[k] !== null && r[k] !== undefined && r[k] !== ""; })).forEach(function (k) {
+          var v = r[k];
+          dl.appendChild(node("dt", { text: words(k.replace(/\./g, " ")) }));
+          dl.appendChild(node("dd", { text: typeof v === "object" && v !== null && !Array.isArray(v) ? JSON.stringify(v) : scalarText(k, v) }));
+        });
+        detail = node("tr", { class: "detail" }, [node("td", { colspan: String(cols.shown.length) }, [dl])]);
+        tr.after(detail);
+        resize();
+      });
+      body.appendChild(tr);
+    });
+    return { el: node("div", { class: "wrap" }, [node("table", {}, [node("thead", {}, [head]), body])]), flat: flat, cols: cols.all };
+  }
+
+  function keyValues(obj) {
+    var flat = flatten(obj, "", {}, 0);
+    var dl = node("dl");
+    var any = false;
+    Object.keys(flat).forEach(function (k) {
+      var v = flat[k];
+      if (v === null || v === undefined || v === "" || (Array.isArray(v) && v.length === 0) || HIDE_KEYS.test(k)) return;
+      any = true;
+      dl.appendChild(node("dt", { text: words(k.replace(/\./g, " ")) }));
+      var dd = node("dd");
+      var text = scalarText(k, v);
+      if (STATUS_KEY.test(k) && typeof v !== "object") dd.appendChild(node("span", { class: "pill " + tone(text), text: text }));
+      else if (typeof v === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(v) && ago(v)) { dd.textContent = ago(v); dd.title = v; }
+      else dd.textContent = text;
+      dl.appendChild(dd);
+    });
+    return any ? node("div", { class: "kv" }, [dl]) : null;
+  }
+
+  function parseResult() {
+    if (!result || !result.content) return null;
+    var part = result.content.filter(function (c) { return c.type === "text"; })[0];
+    if (!part) return null;
+    try { return { value: JSON.parse(part.text), text: part.text }; } catch (e) { return { raw: part.text, text: part.text }; }
+  }
+
+  function render() {
+    var root = document.getElementById("root");
+    root.textContent = "";
+    var parsed = parseResult();
+    if (!parsed) { root.appendChild(node("p", { class: "muted", text: "Waiting for the result." })); return resize(); }
+    if (parsed.raw !== undefined) { root.appendChild(node("pre", { text: parsed.raw })); return resize(); }
+
+    var top = parsed.value, title = null, data = top;
+    if (isPlainObject(top) && top.ok === false) {
+      root.appendChild(node("div", { class: "err", text: String(top.error || top.message || "The call failed.") }));
+      return resize();
+    }
+    if (isPlainObject(top) && "response" in top && ("method" in top || "ok" in top)) { title = top.method || null; data = top.response; }
+    else if (input && typeof input.kind === "string") title = input.kind;
+
+    var collections = [], scalars = {};
+    if (isRecordList(data)) collections.push({ key: title || "items", rows: data });
+    else if (isPlainObject(data)) {
+      Object.keys(data).forEach(function (k) {
+        if (isRecordList(data[k])) collections.push({ key: k, rows: data[k] });
+        else scalars[k] = data[k];
+      });
+    }
+
+    var header = node("header");
+    if (title) header.appendChild(node("h1", { text: title.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/^./, function (c) { return c.toUpperCase(); }) }));
+    var first = null;
+
+    if (collections.length > 0) {
+      collections.forEach(function (c, i) {
+        var t = table(c.rows);
+        if (i === 0) first = statusChips(t.flat, t.cols);
+        if (collections.length > 1 || !title) root.appendChild(node("h2", { text: words(c.key) + " (" + c.rows.length + ")" }));
+        else header.appendChild(node("span", { class: "muted", text: c.rows.length + (c.rows.length === 1 ? " item" : " items") }));
+        if (i === 0 && first) header.appendChild(first);
+        root.appendChild(t.el);
+      });
+      var rest = keyValues(scalars);
+      if (rest) { root.appendChild(node("h2", { text: "Details" })); root.appendChild(rest); }
+    } else if (isPlainObject(data)) {
+      var kv = keyValues(data);
+      if (kv) root.appendChild(kv); else root.appendChild(node("p", { class: "empty muted", text: "Nothing to show." }));
+    } else if (Array.isArray(data) && data.length === 0) {
+      root.appendChild(node("p", { class: "empty muted", text: "Nothing found." }));
+    } else {
+      root.appendChild(node("pre", { text: JSON.stringify(data, null, 2) }));
+    }
+    if (isPlainObject(data) && collections.length > 0 && Object.keys(scalars).length === Object.keys(data).length - collections.length && collections.every(function (c) { return c.rows.length === 0; })) {
+      root.appendChild(node("p", { class: "empty muted", text: "Nothing found." }));
+    }
+    if (header.childNodes.length > 0) root.insertBefore(header, root.firstChild);
+    root.appendChild(node("details", { class: "raw" }, [node("summary", { text: "Raw response" }), node("pre", { text: JSON.stringify(top, null, 2) })]));
+    resize();
+  }
+
+  function resize() {
+    notify("ui/notifications/size-changed", { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight });
+  }
+
+  window.addEventListener("message", function (event) {
+    if (event.source !== parent) return;
+    var m = event.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id !== undefined && !m.method) {
+      var p = pending[m.id];
+      delete pending[m.id];
+      if (p) { if (m.error) p.reject(new Error(m.error.message)); else p.resolve(m.result); }
+      return;
+    }
+    if (m.method === "ui/notifications/tool-input") { input = m.params && m.params.arguments; render(); }
+    else if (m.method === "ui/notifications/tool-result") { result = m.params; render(); }
+    else if (m.method === "ui/notifications/host-context-changed") { applyContext(m.params); }
+    else if (m.method === "ui/resource-teardown" && m.id !== undefined) { send({ jsonrpc: "2.0", id: m.id, result: {} }); }
+  });
+
+  request("ui/initialize", { protocolVersion: "2026-01-26", appInfo: { name: "kcore-data", version: "0.1.0" }, appCapabilities: {} })
+    .then(function (init) {
+      applyContext(init && init.hostContext);
+      notify("ui/notifications/initialized", {});
+    })
+    .catch(function () {});
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(document.body);
+})();
+</script>
+</body>
+</html>
