@@ -1,7 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ElicitResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { advise, mergeAnswers, normalizeDesired, type Question } from "./advise.js";
+import { advise, mergeAnswers, normalizeDesired, type OptionSourceId, type Question } from "./advise.js";
+import { MCP_APP_MIME, PLAN_APP_HTML, PLAN_APP_URI } from "./apps.js";
+import { resolveQuestions, type ClusterOption, type LoadOptions } from "./options.js";
 import { KINDS, findKind } from "./catalog.js";
 import { InputError } from "./names.js";
 import { resolveConnection } from "./connection.js";
@@ -101,6 +103,34 @@ function nodeAgentAddress(address: string): string {
   return address;
 }
 
+async function defaultLoadOptions(options: ConnectionOptions, source: OptionSourceId): Promise<ClusterOption[]> {
+  switch (source) {
+    case "networks": {
+      const response = (await callController(options, "listNetworks", {})) as { networks?: Array<{ name?: string; externalIp?: string }> };
+      return (response.networks ?? []).map((n) => ({ value: n.name ?? "", label: n.externalIp ? `${n.name} (${n.externalIp})` : n.name }));
+    }
+    case "ssh-keys": {
+      const response = (await callController(options, "listSshKeys", {})) as { keys?: Array<{ name?: string }> };
+      return (response.keys ?? []).map((k) => ({ value: k.name ?? "" }));
+    }
+    case "nodes": {
+      const response = (await callController(options, "listNodes", {})) as { nodes?: Array<{ nodeId?: string; hostname?: string; status?: string }> };
+      return (response.nodes ?? []).map((n) => {
+        const parts = [n.hostname, n.status].filter(Boolean);
+        return { value: n.nodeId ?? "", label: parts.length > 0 ? `${n.nodeId} (${parts.join(", ")})` : n.nodeId };
+      });
+    }
+    case "vms": {
+      const response = (await callController(options, "listVms", {})) as { vms?: Array<{ name?: string; state?: string }> };
+      return (response.vms ?? []).map((v) => ({ value: v.name ?? "", label: v.state ? `${v.name} (${String(v.state).toLowerCase().replace("vm_state_", "")})` : v.name }));
+    }
+    case "node-images": {
+      const listed = (await readImages(options, undefined, undefined)) as { nodes?: Array<{ images?: Array<{ path?: string }> }> };
+      return (listed.nodes ?? []).flatMap((n) => (n.images ?? []).map((image) => ({ value: image.path ?? "" })));
+    }
+  }
+}
+
 async function execute(call: RpcCall, options: ConnectionOptions): Promise<unknown> {
   if (call.target === "node") {
     if (!call.address) throw new InputError("node address is required");
@@ -119,20 +149,33 @@ function failure(error: unknown) {
 }
 
 type ToolExtra = {
-  sendRequest: (request: { method: string; params: Record<string, unknown> }, resultSchema: typeof ElicitResultSchema) => Promise<unknown>;
+  sendRequest: (
+    request: { method: string; params: Record<string, unknown> },
+    resultSchema: typeof ElicitResultSchema,
+    options?: { timeout?: number },
+  ) => Promise<unknown>;
 };
+
+const ELICIT_TIMEOUT_MS = 30 * 60 * 1000;
 
 async function elicit(extra: ToolExtra, message: string, questions: Question[]): Promise<Record<string, unknown> | undefined> {
   if (questions.length === 0) return undefined;
   const properties: Record<string, unknown> = {};
   const required: string[] = [];
   for (const item of questions) {
-    properties[item.id] = {
-      type: "string",
-      title: item.prompt,
-      description: item.why,
-      ...(item.choices ? { enum: item.choices } : {}),
-    };
+    const base = { title: item.prompt, description: item.why };
+    if (item.choices) {
+      properties[item.id] = {
+        type: "string",
+        ...base,
+        enum: item.choices,
+        ...(item.choiceLabels && item.choiceLabels.length === item.choices.length ? { enumNames: item.choiceLabels } : {}),
+      };
+    } else if (item.type === "integer" || item.type === "number") {
+      properties[item.id] = { type: item.type, ...base, ...(item.min !== undefined ? { minimum: item.min } : {}) };
+    } else {
+      properties[item.id] = { type: "string", ...base };
+    }
     if (item.required) required.push(item.id);
   }
   try {
@@ -146,6 +189,7 @@ async function elicit(extra: ToolExtra, message: string, questions: Question[]):
           },
         },
         ElicitResultSchema,
+        { timeout: ELICIT_TIMEOUT_MS },
       ),
     );
     if (result.action !== "accept" || !result.content) return undefined;
@@ -155,11 +199,20 @@ async function elicit(extra: ToolExtra, message: string, questions: Question[]):
   }
 }
 
-export function createServer(): McpServer {
+export type ServerDeps = {
+  /** Reads existing networks, keys, nodes, and VMs for pick lists. Defaults to the controller. */
+  loadOptions?: (connection: ConnectionOptions, source: OptionSourceId) => Promise<ClusterOption[]>;
+};
+
+export function createServer(deps: ServerDeps = {}): McpServer {
   const server = new McpServer(
     { name: "kcore", version: "0.1.0" },
     { instructions: INSTRUCTIONS },
   );
+
+  const loadOptions = deps.loadOptions ?? defaultLoadOptions;
+  const askable = (connection: ConnectionInput | undefined) => (questions: Question[]) =>
+    resolveQuestions(questions, (source) => loadOptions({ ...connectionOf(connection), timeoutMs: 8000 }, source));
 
   server.registerTool(
     "kcore_catalog",
@@ -240,6 +293,15 @@ export function createServer(): McpServer {
     async (input) => text(advise(input)),
   );
 
+  server.registerResource(
+    "kcore-plan-app",
+    PLAN_APP_URI,
+    { title: "kcore plan", description: "Shows a kcore plan: the action, field changes, warnings and controller calls.", mimeType: MCP_APP_MIME },
+    async (uri) => ({
+      contents: [{ uri: uri.href, mimeType: MCP_APP_MIME, text: PLAN_APP_HTML, _meta: { ui: { prefersBorder: true } } }],
+    }),
+  );
+
   server.registerTool(
     "kcore_plan",
     {
@@ -257,10 +319,11 @@ export function createServer(): McpServer {
         connection: z.object(connectionShape).optional(),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
+      _meta: { ui: { resourceUri: PLAN_APP_URI }, "ui/resourceUri": PLAN_APP_URI },
     },
     async (input, extra) => {
       try {
-        const prepared = await prepare(input, extra as ToolExtra);
+        const prepared = await prepare(input, extra as ToolExtra, askable(input.connection));
         if (!prepared.ready || !prepared.desired) return text(prepared.advice);
         if (prepared.desired.kind.id === "cluster") {
           return text({
@@ -325,7 +388,7 @@ export function createServer(): McpServer {
     },
     async (input, extra) => {
       try {
-        const prepared = await prepare(input, extra as ToolExtra);
+        const prepared = await prepare(input, extra as ToolExtra, askable(input.connection));
         if (!prepared.ready || !prepared.desired) return text({ applied: false, ...prepared.advice });
         const local = diffSpec(prepared.desired.kind, prepared.desired.spec, input.current);
         if (local.action === "replace" && input.confirmReplace !== true) {
@@ -634,6 +697,7 @@ async function prepare(
     acceptDefaults?: boolean;
   },
   extra: ToolExtra,
+  fillFromCluster: (questions: Question[]) => Promise<Question[]>,
 ): Promise<{ ready: boolean; desired?: ReturnType<typeof normalizeDesired>["desired"]; advice: ReturnType<typeof advise> }> {
   let spec = { ...(input.spec ?? {}) };
   let adviceResult = advise({ ...input, spec });
@@ -641,7 +705,7 @@ async function prepare(
     const answers = await elicit(
       extra,
       "kcore needs a few answers before it will plan or apply this change.",
-      adviceResult.blocking,
+      await fillFromCluster(adviceResult.blocking),
     );
     if (answers) {
       spec = mergeAnswers(spec, answers);

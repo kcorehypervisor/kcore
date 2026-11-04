@@ -9,11 +9,12 @@
   },
   "workspaces": [
     "packages/server",
+    "packages/agent",
     "packages/vscode"
   ],
   "scripts": {
-    "build": "npm run build -w kcore-mcp && npm run build -w kcore-vscode",
-    "test": "npm test -w kcore-mcp",
+    "build": "npm run build -w kcore-mcp && npm run build -w kcore-agent && npm run build -w kcore-vscode",
+    "test": "npm test -w kcore-mcp && npm test -w kcore-agent",
     "start": "npm start -w kcore-mcp"
   }
 }

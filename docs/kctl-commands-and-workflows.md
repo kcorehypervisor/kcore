@@ -518,6 +518,7 @@ kctl apply -f ./controller-config.nix --dry-run
 
 Top-level commands:
 
+- `kctl agent [--port N] [--no-browser] [--agent-bin PATH] [--provisioning HOST:PORT] [--role read-only|vm-admin]` opens a local chat UI that drives the cluster through kcore-mcp with this context's certificates (use `--as <operator>` to give it a limited identity); see [agent-web-ui.md](./agent-web-ui.md)
 - `kctl create vm ... --storage-backend <filesystem|lvm|zfs|ceph> --storage-size-bytes <bytes>`
 - `kctl create cluster ...`
 - `kctl create vm ... [--extra-network <name>]... [--label key=value]... [--anti-affinity <group>]`
@@ -603,6 +604,27 @@ Day-2 operations:
 9. revoke a compromised identity with `kctl revoke cert --node <id> --reason
    key-compromise` (or `--serial` / `--subject`), then confirm it landed on the
    CRL with `kctl get crl`
+
+### Run the chat agent as a limited operator
+
+`kctl agent` dials the controller with whatever identity the context resolves to, so the agent can do anything that identity can. For day-to-day use give it its own operator:
+
+```bash
+kctl operator create agent
+kctl operator grant-role agent --role vm-admin
+kctl operator issue-cert agent
+kctl --as agent agent
+```
+
+The controller enforces the role and the audit log names `agent`.
+
+`--role` does those steps for you:
+
+```bash
+kctl agent --role vm-admin
+```
+
+It creates `agent-<your login>` if it is missing, grants the role, issues a certificate if `~/.kcore/operators/agent-<login>/` has none, and runs the agent as that operator. It needs a cluster-admin connection and mTLS, and it refuses an `agent-<login>` operator that already holds a stronger role than the one you asked for (revoke it with `kctl operator revoke-role`). `cluster-admin` is not offered; use `--as <operator>` for that.
 
 ## 12) Storage backend examples
 

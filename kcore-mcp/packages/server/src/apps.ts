@@ -1,0 +1,176 @@
+/** MCP Apps (`io.modelcontextprotocol/ui`, spec 2026-01-26): HTML a host can show next to a tool result. */
+export const MCP_APP_MIME = "text/html;profile=mcp-app";
+export const PLAN_APP_URI = "ui://kcore/plan";
+
+/**
+ * The plan view. It makes no network requests and loads nothing from outside: the host serves it with a CSP that
+ * blocks everything but inline script and style, so the only way in or out is postMessage to the host.
+ * Every value from the plan is put on the page with textContent.
+ */
+export const PLAN_APP_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>kcore plan</title>
+<style>
+:root { --fg: #1c1f24; --muted: #667085; --line: #d7dbe0; --bg: #ffffff; --soft: #f4f6f8; --create: #067647; --update: #1d4ed8; --replace: #b42318; --same: #667085; }
+:root[data-theme="dark"] { --fg: #e6e8eb; --muted: #98a2b3; --line: #343a43; --bg: #16191d; --soft: #1f2329; --create: #47cd89; --update: #84adff; --replace: #f97066; --same: #98a2b3; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --fg: #e6e8eb; --muted: #98a2b3; --line: #343a43; --bg: #16191d; --soft: #1f2329; --create: #47cd89; --update: #84adff; --replace: #f97066; --same: #98a2b3; } }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 12px 14px; font: 13.5px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+h1 { font-size: 15px; margin: 0 0 6px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.badge { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: 2px 7px; border-radius: 999px; border: 1px solid currentColor; }
+.create { color: var(--create); } .update { color: var(--update); } .replace { color: var(--replace); } .unchanged { color: var(--same); }
+.muted { color: var(--muted); }
+p { margin: 6px 0; }
+table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+th, td { text-align: left; vertical-align: top; padding: 4px 8px; border-bottom: 1px solid var(--line); word-break: break-word; }
+th { font-weight: 500; color: var(--muted); width: 28%; }
+code { font: 12px ui-monospace, monospace; background: var(--soft); padding: 1px 4px; border-radius: 4px; }
+.from { text-decoration: line-through; color: var(--muted); }
+ul { margin: 6px 0; padding-left: 18px; }
+.warn { color: var(--replace); }
+details { margin-top: 8px; }
+pre { background: var(--soft); padding: 8px; border-radius: 6px; overflow: auto; max-height: 220px; font: 12px ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<div id="root"><p class="muted">Waiting for the plan.</p></div>
+<script>
+(function () {
+  var seq = 0, pending = {}, input = null, result = null;
+  var SECRET = /pass|secret|token|private|key/i;
+
+  function send(message) { parent.postMessage(message, "*"); }
+  function request(method, params) {
+    return new Promise(function (resolve, reject) {
+      var id = ++seq;
+      pending[id] = { resolve: resolve, reject: reject };
+      send({ jsonrpc: "2.0", id: id, method: method, params: params });
+    });
+  }
+  function notify(method, params) { send({ jsonrpc: "2.0", method: method, params: params }); }
+
+  function applyContext(ctx) {
+    if (ctx && ctx.theme) document.documentElement.setAttribute("data-theme", ctx.theme);
+  }
+
+  function node(tag, props, children) {
+    var el = document.createElement(tag);
+    if (props) for (var k in props) { if (k === "text") el.textContent = props[k]; else if (k === "class") el.className = props[k]; else el.setAttribute(k, props[k]); }
+    (children || []).forEach(function (c) { if (c) el.appendChild(c); });
+    return el;
+  }
+
+  function show(value) {
+    if (value === null || value === undefined) return "none";
+    if (typeof value === "string") return value;
+    return JSON.stringify(value);
+  }
+
+  function mask(key, value) { return SECRET.test(key) && value ? "(hidden)" : show(value); }
+
+  function parsePlan() {
+    if (!result || !result.content) return null;
+    var part = result.content.filter(function (c) { return c.type === "text"; })[0];
+    if (!part) return null;
+    try { return JSON.parse(part.text); } catch (e) { return { raw: part.text }; }
+  }
+
+  function render() {
+    var root = document.getElementById("root");
+    root.textContent = "";
+    var plan = parsePlan();
+    if (!plan) { root.appendChild(node("p", { class: "muted", text: "Waiting for the plan." })); return resize(); }
+    if (plan.raw) { root.appendChild(node("pre", { text: plan.raw })); return resize(); }
+
+    if (Array.isArray(plan.blocking) && plan.blocking.length > 0) {
+      root.appendChild(node("h1", {}, [node("span", { text: "Needs answers before it can be planned" })]));
+      var list = node("ul");
+      plan.blocking.forEach(function (q) { list.appendChild(node("li", { text: q.prompt + (q.why ? " - " + q.why : "") })); });
+      root.appendChild(list);
+      return resize();
+    }
+    if (plan.ok === false) {
+      root.appendChild(node("h1", {}, [node("span", { class: "warn", text: "Plan failed" })]));
+      root.appendChild(node("p", { text: show(plan.error) }));
+      return resize();
+    }
+
+    var change = plan.plan || {};
+    var action = change.action || "plan";
+    root.appendChild(node("h1", {}, [
+      node("span", { class: "badge " + action, text: action }),
+      node("span", { text: (plan.kind || "change") + (input && input.spec && input.spec.name ? " " + input.spec.name : "") })
+    ]));
+    if (change.summary) root.appendChild(node("p", { text: change.summary }));
+
+    if (Array.isArray(change.changes) && change.changes.length > 0) {
+      var head = node("tr", {}, [node("th", { text: "Field" }), node("th", { text: "Change" })]);
+      var table = node("table", {}, [head]);
+      change.changes.forEach(function (c) {
+        var cell = node("td", {}, [
+          node("span", { class: "from", text: mask(c.field, c.from) }),
+          node("span", { text: " -> " }),
+          node("strong", { text: mask(c.field, c.to) }),
+          c.mutable === false ? node("span", { class: "badge replace", text: " immutable" }) : null
+        ]);
+        table.appendChild(node("tr", {}, [node("th", { text: c.field }), cell]));
+      });
+      root.appendChild(table);
+    } else if (input && input.spec && action === "create") {
+      var spec = node("table");
+      Object.keys(input.spec).forEach(function (key) {
+        spec.appendChild(node("tr", {}, [node("th", { text: key }), node("td", { text: mask(key, input.spec[key]) })]));
+      });
+      root.appendChild(spec);
+    }
+
+    if (Array.isArray(plan.warnings) && plan.warnings.length > 0) {
+      var warnings = node("ul", { class: "warn" });
+      plan.warnings.forEach(function (w) { warnings.appendChild(node("li", { text: typeof w === "string" ? w : show(w) })); });
+      root.appendChild(warnings);
+    }
+    if (Array.isArray(plan.rpc) && plan.rpc.length > 0) {
+      root.appendChild(node("p", { class: "muted" }, [node("span", { text: "Controller calls: " }), node("code", { text: plan.rpc.join(", ") })]));
+    }
+    if (plan.cluster) {
+      root.appendChild(node("details", {}, [node("summary", { text: "Cluster state" }), node("pre", { text: JSON.stringify(plan.cluster, null, 2) })]));
+    }
+    root.appendChild(node("p", { class: "muted", text: "Nothing is applied until you approve it in the chat." }));
+    resize();
+  }
+
+  function resize() {
+    notify("ui/notifications/size-changed", { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight });
+  }
+
+  window.addEventListener("message", function (event) {
+    if (event.source !== parent) return;
+    var m = event.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id !== undefined && !m.method) {
+      var p = pending[m.id];
+      delete pending[m.id];
+      if (p) { if (m.error) p.reject(new Error(m.error.message)); else p.resolve(m.result); }
+      return;
+    }
+    if (m.method === "ui/notifications/tool-input") { input = m.params && m.params.arguments; render(); }
+    else if (m.method === "ui/notifications/tool-result") { result = m.params; render(); }
+    else if (m.method === "ui/notifications/host-context-changed") { applyContext(m.params); }
+    else if (m.method === "ui/resource-teardown" && m.id !== undefined) { send({ jsonrpc: "2.0", id: m.id, result: {} }); }
+  });
+
+  request("ui/initialize", { protocolVersion: "2026-01-26", appInfo: { name: "kcore-plan", version: "0.1.0" }, appCapabilities: {} })
+    .then(function (init) {
+      applyContext(init && init.hostContext);
+      notify("ui/notifications/initialized", {});
+    })
+    .catch(function () {});
+  if (window.ResizeObserver) new ResizeObserver(resize).observe(document.body);
+})();
+</script>
+</body>
+</html>
+`;

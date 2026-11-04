@@ -1,0 +1,44 @@
+{
+  "name": "kcore-agent",
+  "version": "0.1.0",
+  "description": "Local chat UI that drives kcore through kcore-mcp. Started by `kctl agent`.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "kcore-agent": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && tsx --test test/**/*.test.ts",
+    "start": "node dist/index.js",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "@modelcontextprotocol/sdk": "^1.20.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kcorehypervisor/kcore.git",
+    "directory": "kcore-mcp/packages/agent"
+  },
+  "keywords": [
+    "kcore",
+    "mcp",
+    "agent",
+    "hypervisor"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

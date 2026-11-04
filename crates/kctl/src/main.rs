@@ -236,6 +236,8 @@ enum Command {
     },
     /// Show version
     Version,
+    /// Open a local chat UI that drives this cluster through kcore-mcp, using this context's certificates
+    Agent(commands::agent::AgentArgs),
     /// Attach to a VM serial console (Ctrl-] to detach)
     Console {
         /// VM name or id
@@ -2728,6 +2730,10 @@ async fn main() {
         Command::Version => {
             println!("kctl {VERSION}");
             Ok(())
+        }
+        Command::Agent(args) => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::agent::run(&info, args).await
         }
         Command::Console { name } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
