@@ -151,3 +151,26 @@ test("OPENAI_BASE_URL redirects the provider", async () => {
   assert.deepEqual(seen, ["http://llm.internal:8000/v1/models"]);
   assert.equal(auth.describe().find((p) => p.id === "openai")?.source, "env");
 });
+
+test("the ChatGPT sign-in starts behind the token, and the callback is open to the browser but needs a known state", async () => {
+  const { app, base, port, api } = await start();
+  try {
+    assert.equal((await fetch(`${base}/api/providers/chatgpt/signin`, { method: "POST" })).status, 401);
+    const started = (await (await api("/api/providers/chatgpt/signin", { method: "POST", body: "{}" })).json()) as { url: string };
+    const url = new URL(started.url);
+    assert.equal(url.searchParams.get("redirect_uri"), `http://127.0.0.1:${port}/auth/callback`);
+    const providers = (await (await api("/api/providers")).json()) as { providers: Array<{ id: string; pending?: boolean; connected: boolean }> };
+    const chatgpt = providers.providers.find((p) => p.id === "chatgpt");
+    assert.equal(chatgpt?.pending, true);
+    assert.equal(chatgpt?.connected, false);
+    assert.deepEqual(providers.providers.map((p) => p.id), ["chatgpt", "openai", "anthropic", "deepseek"]);
+
+    assert.equal((await fetch(`${base}/auth/callback?code=x&state=unknown`)).status, 400);
+    const denied = await fetch(`${base}/auth/callback?error=access_denied&state=${url.searchParams.get("state")}`);
+    assert.equal(denied.status, 400);
+    assert.match(await denied.text(), /declined/);
+    assert.equal(await raw(port, "/auth/callback?state=x", { host: `evil.example:${port}` }), 403);
+  } finally {
+    await app.close();
+  }
+});

@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthStore } from "./auth.js";
+import { CALLBACK_PATH } from "./chatgpt.js";
 import { Session, type AgentEvent, type LiveEvent } from "./session.js";
 import type { ClusterSummary } from "./summary.js";
 
@@ -94,11 +95,28 @@ export function createApp(options: AppOptions): App {
       return;
     }
 
+    if (method === "GET" && path === CALLBACK_PATH) {
+      const outcome = await options.auth.chatgpt.handleCallback(url.searchParams);
+      res.writeHead(outcome.ok ? 200 : 400, { "content-type": "text/html; charset=utf-8" });
+      res.end(callbackPage(outcome.ok, outcome.message));
+      return;
+    }
+
     if (!path.startsWith("/api/")) return json(res, 404, { error: "not found" });
     if (!authorized(req)) return json(res, 401, { error: "missing or wrong session token" });
 
     if (method === "GET" && path === "/api/cluster/summary") return json(res, 200, options.summary());
     if (method === "GET" && path === "/api/providers") return json(res, 200, { providers: options.auth.describe() });
+
+    if (path === "/api/providers/chatgpt/signin" && method === "POST") {
+      const body = await readJson(req);
+      const address = server.address() as AddressInfo;
+      return json(res, 200, { url: options.auth.chatgpt.start(address.port, { newAccount: body.newAccount === true }) });
+    }
+    if (path === "/api/providers/chatgpt/signin" && method === "DELETE") {
+      const { revoked } = await options.auth.chatgpt.signOut();
+      return json(res, 200, { providers: options.auth.describe(), revoked });
+    }
 
     let match = /^\/api\/providers\/([a-z0-9-]+)\/models$/.exec(path);
     if (match && method === "GET") {
@@ -201,6 +219,11 @@ export function createApp(options: AppOptions): App {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
+}
+
+function callbackPage(ok: boolean, message: string): string {
+  const safe = message.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c] as string);
+  return `<!doctype html><meta charset="utf-8"><title>kcore agent</title><body style="font:16px system-ui;max-width:32rem;margin:4rem auto;padding:0 1rem"><h1>${ok ? "Signed in" : "Not signed in"}</h1><p>${safe}</p>`;
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {

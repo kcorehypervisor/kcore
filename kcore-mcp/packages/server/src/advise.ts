@@ -2,13 +2,23 @@ import { parse as parseYaml } from "yaml";
 import { findKind, kindIds, type ResourceKind } from "./catalog.js";
 import { isBlank } from "./names.js";
 
+export type OptionSourceId = "networks" | "ssh-keys" | "nodes" | "vms" | "node-images";
+
 export type Question = {
   id: string;
   prompt: string;
   why: string;
   required: boolean;
   choices?: string[];
+  /** Display text for each entry in `choices`, same order. */
+  choiceLabels?: string[];
   example?: string;
+  /** Where the answer comes from in the cluster. The server fills `choices` from it when it asks. */
+  source?: OptionSourceId;
+  /** True when the answer must be one of the cluster's entries. False lists them as a hint only. */
+  restrict?: boolean;
+  type?: "integer" | "number";
+  min?: number;
 };
 
 export type Advice = {
@@ -66,7 +76,7 @@ function question(
   prompt: string,
   why: string,
   required: boolean,
-  extra?: Pick<Question, "choices" | "example">,
+  extra?: Pick<Question, "choices" | "example" | "source" | "restrict" | "type" | "min">,
 ): Question {
   return { id, prompt, why, required, ...extra };
 }
@@ -152,7 +162,7 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           "Paste the SSH public key.",
           "The controller stores the public key and can inject it into cloud-init. The private key stays with the operator.",
           missing(spec, "publicKey"),
-          { example: "ssh-ed25519 AAAA... operator@host" },
+          { example: "ssh-ed25519 AAAA... operator@host", source: "ssh-keys" },
         ),
       ].filter((item) => item.required || missing(spec, item.id));
     case "postgresql":
@@ -190,6 +200,7 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           "Pin it to a node, or let the scheduler choose a free one?",
           "v1 runs one PostgreSQL database on a node. targetNode is immutable.",
           false,
+          { source: "nodes", restrict: true },
         ),
       ].filter((item) => item.required || missing(spec, item.id));
     case "container":
@@ -207,6 +218,7 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           "Which kcore network should it join?",
           "Optional. Leave empty only if the container should use the runtime default.",
           false,
+          { source: "networks", restrict: true },
         ),
       ].filter((item) => item.required || missing(spec, item.id));
     case "volume":
@@ -231,6 +243,7 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           "Attach it to a stopped VM now, or leave it detached?",
           "Attach only works while that VM is stopped.",
           false,
+          { source: "vms", restrict: true },
         ),
       ].filter((item) => item.required || missing(spec, item.id));
     case "volume-snapshot":
@@ -260,7 +273,7 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           "How many snapshots should each volume retain?",
           "Older snapshots beyond this count are removed.",
           missing(spec, "keep"),
-          { example: "7" },
+          { example: "7", type: "integer", min: 1 },
         ),
       ].filter((item) => item.required);
     case "security-group":
@@ -277,7 +290,13 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
     case "disk-layout":
       return [
         question("name", "What should the disk layout be called?", "The controller stores the layout under this name.", missing(spec, "name")),
-        question("nodeId", "Which node id should receive this layout?", "The reconciler pushes the layout only to that node.", missing(spec, "nodeId")),
+        question(
+          "nodeId",
+          "Which node id should receive this layout?",
+          "The reconciler pushes the layout only to that node.",
+          missing(spec, "nodeId"),
+          { source: "nodes", restrict: true },
+        ),
         question(
           "layout",
           "Paste the layout: layoutNix, layoutNixFile, or diskLayout.",
@@ -376,7 +395,7 @@ function vmQuestions(spec: Record<string, unknown>): Question[] {
       "Which boot image should it use: an https URL plus SHA256, or a qcow2/raw path already on the node?",
       "kcore checks the SHA256 for URL images. ISO uploads are unsupported.",
       !hasUrl && !hasPath,
-      { example: "https://cloud.debian.org/.../debian-12-genericcloud-amd64.qcow2" },
+      { example: "https://cloud.debian.org/.../debian-12-genericcloud-amd64.qcow2", source: "node-images" },
     ),
   ];
   if (hasUrl && missing(spec, "imageSha256")) {
@@ -402,7 +421,7 @@ function vmQuestions(spec: Record<string, unknown>): Question[] {
       "Which network should the first NIC join?",
       "Create the network first if it does not exist yet.",
       missing(spec, "network"),
-      { example: "default" },
+      { example: "default", source: "networks", restrict: true },
     ),
     question(
       "storageBackend",
@@ -423,10 +442,12 @@ function vmQuestions(spec: Record<string, unknown>): Question[] {
       "Which SSH public key should log in, or which stored ssh-key name should the VM use?",
       "Key login is the compliant default. Password login requires an explicit acknowledgement that it is non-compliant.",
       !authed,
-      { example: "ssh-ed25519 AAAA... operator@host" },
+      { example: "ssh-ed25519 AAAA... operator@host", source: "ssh-keys" },
     ),
     question("cpu", "How many vCPUs?", "Mutable later. 2 is a reasonable lab default if you accept defaults.", false, {
       example: "2",
+      type: "integer",
+      min: 1,
     }),
     question("memory", "How much memory?", "Mutable later. A size such as 4G.", false, { example: "4G" }),
     question(
@@ -441,6 +462,7 @@ function vmQuestions(spec: Record<string, unknown>): Question[] {
       "Pin it to a node or datacenter, or let the scheduler choose?",
       "targetNode is immutable. Leaving it empty lets the controller place the VM.",
       false,
+      { source: "nodes" },
     ),
   );
   return items.filter((item) => {

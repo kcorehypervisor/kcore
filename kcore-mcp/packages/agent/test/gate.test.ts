@@ -64,3 +64,11 @@ test("form validation enforces required, enum, and number rules", () => {
   assert.equal(isApproval({ properties: { confirm: { enum: ["yes", "no"] } } }), true);
   assert.equal(isApproval({ properties: { confirm: { enum: ["yes", "no"] }, other: {} } }), false);
 });
+
+test("labelled choices validate against their values", () => {
+  const schema = { properties: { net: { type: "string", enum: ["lan", "dmz"], enumNames: ["lan (10.0.0.1)", "dmz"] }, node: { type: "string", oneOf: [{ const: "n1", title: "n1 (host-a)" }] } } };
+  assert.equal(validateForm(schema, { net: "lan" }).ok, true);
+  assert.equal(validateForm(schema, { net: "lan (10.0.0.1)" }).ok, false);
+  assert.equal(validateForm(schema, { node: "n1" }).ok, true);
+  assert.equal(validateForm(schema, { node: "n2" }).ok, false);
+});

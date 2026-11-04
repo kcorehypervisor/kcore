@@ -200,10 +200,15 @@ function renderForm(event) {
     const required = (event.schema.required || []).includes(name);
     const id = `${event.formId}-${name}`;
     let input;
-    if (Array.isArray(property.enum)) {
+    const choices = Array.isArray(property.oneOf)
+      ? property.oneOf.map((o) => ({ value: String(o.const), label: o.title || String(o.const) }))
+      : Array.isArray(property.enum)
+        ? property.enum.map((v, i) => ({ value: String(v), label: (property.enumNames && property.enumNames[i]) || String(v) }))
+        : null;
+    if (choices) {
       input = el("select", { id });
       input.append(el("option", { value: "", text: required ? "Choose" : "(none)" }));
-      for (const choice of property.enum) input.append(el("option", { value: String(choice), text: String(choice) }));
+      for (const choice of choices) input.append(el("option", { value: choice.value, text: choice.label }));
     } else if (property.type === "boolean") {
       input = el("input", { id, type: "checkbox" });
     } else if (property.type === "number" || property.type === "integer") {
@@ -330,7 +335,7 @@ async function loadProviders() {
   state.providers = (await api("/api/providers")).providers;
   const select = $("provider");
   const saved = localStorage.getItem("kcore-agent-provider");
-  select.replaceChildren(...state.providers.filter((p) => p.connected).map((p) => el("option", { value: p.id, text: p.id })));
+  select.replaceChildren(...state.providers.filter((p) => p.connected).map((p) => el("option", { value: p.id, text: p.id === "chatgpt" ? "ChatGPT plan" : p.id })));
   if (saved && [...select.options].some((o) => o.value === saved)) select.value = saved;
   if (select.options.length === 0) select.append(el("option", { value: "", text: "no provider" }));
   await loadModels();
@@ -355,10 +360,79 @@ async function loadModels() {
   else if (fallback && models.includes(fallback)) select.value = fallback;
 }
 
+let signInPoll = null;
+
+function stopSignInPoll() {
+  if (signInPoll) clearInterval(signInPoll);
+  signInPoll = null;
+}
+
+function watchSignIn() {
+  stopSignInPoll();
+  const deadline = Date.now() + 10 * 60 * 1000;
+  signInPoll = setInterval(async () => {
+    const chatgpt = (await api("/api/providers").catch(() => ({ providers: [] }))).providers.find((p) => p.id === "chatgpt");
+    if (!chatgpt || Date.now() > deadline || chatgpt.connected || !chatgpt.pending) {
+      stopSignInPoll();
+      state.signInUrl = null;
+      await loadProviders();
+    }
+  }, 2000);
+}
+
+function chatgptRow(provider) {
+  const status = provider.connected
+    ? `Signed in${provider.account ? ` as ${provider.account}` : ""}`
+    : provider.pending
+      ? "Waiting for the browser to finish sign-in"
+      : "Not signed in";
+  const start = (newAccount) => async () => {
+    const { url } = await api("/api/providers/chatgpt/signin", { method: "POST", body: JSON.stringify({ newAccount }) });
+    state.signInUrl = url;
+    window.open(url, "_blank", "noopener");
+    watchSignIn();
+    await loadProviders();
+  };
+  const buttons = [];
+  if (!provider.connected) buttons.push(el("button", { text: provider.pending ? "Open sign-in again" : "Continue with ChatGPT", onclick: start(false) }));
+  if (provider.connected) {
+    buttons.push(el("button", { text: "Use another account", onclick: start(true) }));
+    buttons.push(
+      el("button", {
+        text: "Sign out",
+        class: "danger",
+        onclick: async () => {
+          const result = await api("/api/providers/chatgpt/signin", { method: "DELETE" });
+          if (!result.revoked) alert("Signed out here, but ChatGPT did not confirm the revocation. You can disconnect the app in ChatGPT Settings.");
+          await loadProviders();
+        },
+      }),
+    );
+  }
+  return el(
+    "div",
+    { class: "prow" },
+    el(
+      "div",
+      {},
+      el("div", { class: "name", text: provider.label }),
+      el("div", { class: "muted", text: status }),
+      provider.error ? el("div", { class: "error", text: provider.error }) : null,
+      provider.pending && state.signInUrl ? el("a", { href: state.signInUrl, target: "_blank", rel: "noopener", text: "Sign-in page didn't open? Click here." }) : null,
+      el("div", { class: "muted", text: provider.note || "" }),
+    ),
+    ...buttons,
+  );
+}
+
 function renderProviderRows() {
   const rows = $("provider-rows");
   rows.replaceChildren();
   for (const provider of state.providers) {
+    if (provider.kind === "oauth") {
+      rows.append(chatgptRow(provider));
+      continue;
+    }
     const keyInput = el("input", { type: "password", placeholder: "Paste API key", autocomplete: "off" });
     const form = el(
       "form",
@@ -378,7 +452,13 @@ function renderProviderRows() {
       el(
         "div",
         { class: "prow" },
-        el("div", {}, el("div", { class: "name", text: provider.label }), el("div", { class: "muted", text: provider.connected ? `Connected (${provider.source === "env" ? "environment variable" : "stored key"})` : "Not connected" })),
+        el(
+          "div",
+          {},
+          el("div", { class: "name", text: provider.label }),
+          el("div", { class: "muted", text: provider.connected ? `Connected (${provider.source === "env" ? "environment variable" : "stored key"})` : "Not connected" }),
+          provider.note ? el("div", { class: "muted", text: provider.note }) : null,
+        ),
         provider.connected && provider.source === "file"
           ? el("button", {
               text: "Remove",
