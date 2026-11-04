@@ -325,11 +325,13 @@ fn resolve_agent(flag: Option<&Path>) -> Result<AgentCommand> {
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
     let cwd = std::env::current_dir().ok();
+    let path_var = std::env::var_os("PATH");
     resolve_agent_from(
         flag,
         env_value.as_deref(),
         exe_dir.as_deref(),
         cwd.as_deref(),
+        path_var.as_deref(),
     )
 }
 
@@ -338,6 +340,7 @@ fn resolve_agent_from(
     env_value: Option<&Path>,
     exe_dir: Option<&Path>,
     cwd: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
 ) -> Result<AgentCommand> {
     let mut tried: Vec<String> = Vec::new();
 
@@ -358,6 +361,15 @@ fn resolve_agent_from(
         tried.push(sibling.display().to_string());
     }
 
+    if let Some(found) = path_var.and_then(|paths| {
+        std::env::split_paths(paths)
+            .map(|dir| dir.join("kcore-agent"))
+            .find(|candidate| candidate.is_file())
+    }) {
+        return Ok(command_for(&found));
+    }
+    tried.push("kcore-agent on PATH".to_string());
+
     for dir in exe_dir.into_iter().chain(cwd) {
         for ancestor in dir.ancestors().take(6) {
             let built = ancestor.join("kcore-mcp/packages/agent/dist/index.js");
@@ -372,8 +384,8 @@ fn resolve_agent_from(
     }
 
     bail!(
-        "could not find kcore-agent. Tried: {}. Build it with `npm run build` in kcore-mcp, \
-         or pass --agent-bin / set KCORE_AGENT_BIN.",
+        "could not find kcore-agent. Tried: {}. Install it with `npm install -g kcore-agent`, \
+         build it with `npm run build` in kcore-mcp, or pass --agent-bin / set KCORE_AGENT_BIN.",
         tried.join(", ")
     )
 }
@@ -764,11 +776,14 @@ mod tests {
         fs::write(&flag, "").unwrap();
         fs::write(sibling_dir.join("kcore-agent"), "").unwrap();
 
-        let by_flag = resolve_agent_from(Some(&flag), None, Some(&sibling_dir), None).unwrap();
+        let by_flag =
+            resolve_agent_from(Some(&flag), None, Some(&sibling_dir), None, None).unwrap();
         assert_eq!(by_flag.program, flag);
-        let by_sibling = resolve_agent_from(None, None, Some(&sibling_dir), None).unwrap();
+        let by_sibling = resolve_agent_from(None, None, Some(&sibling_dir), None, None).unwrap();
         assert_eq!(by_sibling.program, sibling_dir.join("kcore-agent"));
-        assert!(resolve_agent_from(Some(&dir.path().join("nope")), None, None, None).is_err());
+        assert!(
+            resolve_agent_from(Some(&dir.path().join("nope")), None, None, None, None).is_err()
+        );
 
         let repo = dir.path().join("repo");
         let built = repo.join("kcore-mcp/packages/agent/dist");
@@ -776,17 +791,25 @@ mod tests {
         fs::write(built.join("index.js"), "").unwrap();
         let target = repo.join("target/debug");
         fs::create_dir_all(&target).unwrap();
-        let by_repo = resolve_agent_from(None, None, Some(&target), None).unwrap();
+        let by_repo = resolve_agent_from(None, None, Some(&target), None, None).unwrap();
         assert_eq!(by_repo.program, PathBuf::from("node"));
         assert_eq!(by_repo.args, vec![built.join("index.js")]);
 
         let empty = dir.path().join("empty/bin");
         fs::create_dir_all(&empty).unwrap();
         let from_cwd =
-            resolve_agent_from(None, None, None, Some(&repo.join("crates/kctl"))).unwrap();
+            resolve_agent_from(None, None, None, Some(&repo.join("crates/kctl")), None).unwrap();
         assert_eq!(from_cwd.args, vec![built.join("index.js")]);
 
-        let err = resolve_agent_from(None, None, Some(&empty), None)
+        let on_path = dir.path().join("npm-bin");
+        fs::create_dir_all(&on_path).unwrap();
+        fs::write(on_path.join("kcore-agent"), "").unwrap();
+        let search = std::env::join_paths([dir.path().join("elsewhere"), on_path.clone()]).unwrap();
+        let by_path =
+            resolve_agent_from(None, None, Some(&empty), None, Some(search.as_os_str())).unwrap();
+        assert_eq!(by_path.program, on_path.join("kcore-agent"));
+
+        let err = resolve_agent_from(None, None, Some(&empty), None, None)
             .err()
             .unwrap()
             .to_string();

@@ -15,3 +15,4 @@ await build({
 });
 chmodSync("dist/index.js", 0o755);
 cpSync("ui", "dist/ui", { recursive: true });
+cpSync("../server/proto", "dist/proto", { recursive: true });
