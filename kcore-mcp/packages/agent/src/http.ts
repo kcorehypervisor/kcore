@@ -134,6 +134,12 @@ export function createApp(options: AppOptions): App {
     if (method === "GET" && path === "/api/cluster/summary") return json(res, 200, options.summary());
     if (method === "GET" && path === "/api/providers") return json(res, 200, { providers: options.auth.describe() });
 
+    if (method === "GET" && path === "/api/import/opencode") return json(res, 200, options.auth.scanOpenCode());
+    if (method === "POST" && path === "/api/import/opencode") {
+      const imported = options.auth.importOpenCode();
+      return json(res, 200, { imported, providers: options.auth.describe(), scan: options.auth.scanOpenCode() });
+    }
+
     if (path === "/api/providers/chatgpt/signin" && method === "POST") {
       const body = await readJson(req);
       const address = server.address() as AddressInfo;

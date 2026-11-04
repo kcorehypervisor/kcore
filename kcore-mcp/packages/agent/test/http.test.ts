@@ -163,7 +163,7 @@ test("the ChatGPT sign-in starts behind the token, and the callback is open to t
     const chatgpt = providers.providers.find((p) => p.id === "chatgpt");
     assert.equal(chatgpt?.pending, true);
     assert.equal(chatgpt?.connected, false);
-    assert.deepEqual(providers.providers.map((p) => p.id), ["chatgpt", "openai", "anthropic", "deepseek"]);
+    assert.deepEqual(providers.providers.map((p) => p.id), ["chatgpt", "openai", "anthropic", "deepseek", "opencode", "opencode-go"]);
 
     assert.equal((await fetch(`${base}/auth/callback?code=x&state=unknown`)).status, 400);
     const denied = await fetch(`${base}/auth/callback?error=access_denied&state=${url.searchParams.get("state")}`);

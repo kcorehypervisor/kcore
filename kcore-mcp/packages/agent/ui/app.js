@@ -336,10 +336,11 @@ async function loadProviders() {
   state.providers = (await api("/api/providers")).providers;
   const select = $("provider");
   const saved = localStorage.getItem("kcore-agent-provider");
-  select.replaceChildren(...state.providers.filter((p) => p.connected).map((p) => el("option", { value: p.id, text: p.id === "chatgpt" ? "ChatGPT plan" : p.id })));
+  select.replaceChildren(...state.providers.filter((p) => p.connected).map((p) => el("option", { value: p.id, text: p.label })));
   if (saved && [...select.options].some((o) => o.value === saved)) select.value = saved;
   if (select.options.length === 0) select.append(el("option", { value: "", text: "no provider" }));
   await loadModels();
+  state.openCode = await api("/api/import/opencode").catch(() => ({ found: false, importable: [], skipped: [] }));
   renderProviderRows();
 }
 
@@ -507,9 +508,36 @@ function chatgptRow(provider) {
   );
 }
 
+function openCodeImportRow() {
+  const scan = state.openCode;
+  if (!scan || !scan.found) return null;
+  const fresh = scan.importable.filter((item) => !item.stored);
+  const lines = [];
+  if (fresh.length > 0) lines.push(`Keys found: ${fresh.map((item) => item.label).join(", ")}.`);
+  else if (scan.importable.length > 0) lines.push("Every OpenCode key is already stored here.");
+  if (scan.skipped.length > 0) lines.push(`Not copied: ${scan.skipped.map((item) => item.openCodeId).join(", ")} (account logins stay with OpenCode).`);
+  if (lines.length === 0) return null;
+  return el(
+    "div",
+    { class: "prow" },
+    el("div", {}, el("div", { class: "name", text: "OpenCode on this machine" }), ...lines.map((text) => el("div", { class: "muted", text }))),
+    fresh.length > 0
+      ? el("button", {
+          text: "Import keys",
+          onclick: async () => {
+            await api("/api/import/opencode", { method: "POST", body: "{}" });
+            await loadProviders();
+          },
+        })
+      : null,
+  );
+}
+
 function renderProviderRows() {
   const rows = $("provider-rows");
   rows.replaceChildren();
+  const importRow = openCodeImportRow();
+  if (importRow) rows.append(importRow);
   for (const provider of state.providers) {
     if (provider.kind === "oauth") {
       rows.append(chatgptRow(provider));
@@ -540,6 +568,7 @@ function renderProviderRows() {
           el("div", { class: "name", text: provider.label }),
           el("div", { class: "muted", text: provider.connected ? `Connected (${provider.source === "env" ? "environment variable" : "stored key"})` : "Not connected" }),
           provider.note ? el("div", { class: "muted", text: provider.note }) : null,
+          !provider.connected && provider.keyUrl ? el("a", { href: provider.keyUrl, target: "_blank", rel: "noopener noreferrer", text: "Open the page that creates a key" }) : null,
         ),
         provider.connected && provider.source === "file"
           ? el("button", {

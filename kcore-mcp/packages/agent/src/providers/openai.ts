@@ -6,6 +6,8 @@ export type OpenAICompatibleOptions = {
   apiKey: string;
   fetch?: typeof fetch;
   fallbackModels: string[];
+  /** Where the model list lives when it is not `<baseUrl>/models`. */
+  modelsUrl?: string;
 };
 
 /** Chat Completions streaming. OpenAI API keys and DeepSeek both speak this. */
@@ -15,6 +17,7 @@ export class OpenAICompatible implements Provider {
   private readonly apiKey: string;
   private readonly fetchImpl: typeof fetch;
   private readonly fallbackModels: string[];
+  private readonly modelsUrl: string;
 
   constructor(options: OpenAICompatibleOptions) {
     this.id = options.id;
@@ -22,11 +25,12 @@ export class OpenAICompatible implements Provider {
     this.apiKey = options.apiKey;
     this.fetchImpl = options.fetch ?? fetch;
     this.fallbackModels = options.fallbackModels;
+    this.modelsUrl = options.modelsUrl ?? `${this.baseUrl}/models`;
   }
 
   async models(): Promise<string[]> {
     try {
-      const response = await this.fetchImpl(`${this.baseUrl}/models`, {
+      const response = await this.fetchImpl(this.modelsUrl, {
         headers: { authorization: `Bearer ${this.apiKey}` },
         signal: AbortSignal.timeout(10_000),
       });

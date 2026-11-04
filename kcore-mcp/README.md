@@ -43,7 +43,7 @@ npm install && npm run build
 kctl agent
 ```
 
-Set `OPENAI_API_KEY` or `DEEPSEEK_API_KEY`, or paste a key in the Providers dialog. `OPENAI_BASE_URL` points it at another OpenAI-compatible server.
+Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY` or `OPENCODE_API_KEY` (`OPENCODE_GO_API_KEY` for the Go plan), or paste a key in the Providers dialog. Claude and DeepSeek have no sign-in for other apps, so those take a key; the dialog links to the page that makes one and can import API keys from an existing OpenCode install. `OPENAI_BASE_URL` points it at another OpenAI-compatible server.
 
 ## Cursor
 
