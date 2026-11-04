@@ -34,6 +34,17 @@ Node install partitions disks. It runs only after the operator sets `spec.acknow
 
 Cluster context, VM, network, SSH key, container, volume, volume snapshot, snapshot policy, security group, disk layout, Ceph cluster, shared filesystem, object store, and cluster update.
 
+## Agent chat UI
+
+`packages/agent` is `kcore-agent`, a local chat UI that uses this server as its tool set. Start it with `kctl agent`: `kctl` hands it the current context's certificates through a private runtime file and a one-time token, and the browser never sees the key. Questions the server asks become forms in the page, and every change waits for an Approve click. See [docs/agent-web-ui.md](../docs/agent-web-ui.md).
+
+```bash
+npm install && npm run build
+kctl agent
+```
+
+Set `OPENAI_API_KEY` or `DEEPSEEK_API_KEY`, or paste a key in the Providers dialog. `OPENAI_BASE_URL` points it at another OpenAI-compatible server.
+
 ## Cursor
 
 This repository is a Cursor plugin. After `npm run build`, install it as a local plugin (the folder that contains `.cursor-plugin/plugin.json`). The rule and the `kcore-operator` skill tell the agent to ask, plan, then apply.
