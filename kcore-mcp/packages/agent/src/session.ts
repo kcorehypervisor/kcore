@@ -7,6 +7,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { isApproval, validateForm, type FormContent, type FormSchema } from "./forms.js";
 import { gate, modelFacingTool } from "./gate.js";
 import type { ChatMessage, Provider, ToolCall, ToolSpec } from "./providers/types.js";
+import type { Restored, TranscriptRecord } from "./transcript.js";
 
 const MAX_STEPS = 25;
 const TOOL_TIMEOUT_MS = 30 * 60 * 1000;
@@ -44,11 +45,12 @@ export type SessionOptions = {
   id: string;
   createServer: () => McpServer;
   logDir?: string;
+  restore?: Restored;
 };
 
 export class Session {
   readonly id: string;
-  readonly createdAt = Date.now();
+  createdAt = Date.now();
   title = "New session";
   private readonly events: AgentEvent[] = [];
   private readonly listeners = new Set<Listener>();
@@ -68,6 +70,43 @@ export class Session {
     this.id = options.id;
     this.options = options;
     if (options.logDir) mkdirSync(options.logDir, { recursive: true, mode: 0o700 });
+    if (options.restore) this.restore(options.restore);
+    else this.persist({ k: "meta", createdAt: this.createdAt, title: this.title });
+  }
+
+  private restore(saved: Restored): void {
+    this.createdAt = saved.createdAt;
+    this.title = saved.title;
+    this.events.push(...saved.events);
+    this.messages.push(...saved.messages);
+    this.formSeq = Math.max(0, ...saved.events.map((e) => (e.type === "form" ? Number(e.formId.slice(1)) || 0 : 0)));
+
+    // Anything the old process left open can never be answered now.
+    const answered = new Set(saved.events.filter((e) => e.type === "form_done").map((e) => (e as { formId: string }).formId));
+    for (const event of saved.events) {
+      if (event.type === "form" && !answered.has(event.formId)) this.emit({ type: "form_done", formId: event.formId, action: "cancel" });
+    }
+    let open = false;
+    for (const event of saved.events) {
+      if (event.type === "turn_start") open = true;
+      if (event.type === "turn_end") open = false;
+    }
+    if (open) this.emit({ type: "error", message: "The agent restarted during this turn." });
+    if (open) this.emit({ type: "turn_end", reason: "cancelled" });
+  }
+
+  private persist(record: TranscriptRecord): void {
+    if (!this.options.logDir) return;
+    try {
+      appendFileSync(join(this.options.logDir, `${this.id}.jsonl`), JSON.stringify(record) + "\n", { mode: 0o600 });
+    } catch {
+      // The transcript is a convenience; a full disk must not stop the operator's work.
+    }
+  }
+
+  private remember(message: ChatMessage): void {
+    this.messages.push(message);
+    this.persist({ k: "message", m: message });
   }
 
   get isBusy(): boolean {
@@ -90,13 +129,7 @@ export class Session {
   private emit(body: EventBody): AgentEvent {
     const event = { id: this.events.length + 1, ts: Date.now(), ...body } as AgentEvent;
     this.events.push(event);
-    if (this.options.logDir) {
-      try {
-        appendFileSync(join(this.options.logDir, `${this.id}.jsonl`), JSON.stringify(event) + "\n", { mode: 0o600 });
-      } catch {
-        // The transcript is a convenience; a full disk must not stop the operator's work.
-      }
-    }
+    this.persist({ k: "event", e: event });
     for (const listener of this.listeners) listener(event);
     return event;
   }
@@ -174,9 +207,12 @@ export class Session {
     if (this.busy) throw new Error("a turn is already running");
     const abort = new AbortController();
     this.busy = abort;
-    if (this.title === "New session") this.title = text.replace(/\s+/g, " ").trim().slice(0, 60) || this.title;
+    if (this.title === "New session") {
+      this.title = text.replace(/\s+/g, " ").trim().slice(0, 60) || this.title;
+      this.persist({ k: "meta", createdAt: this.createdAt, title: this.title });
+    }
     this.emit({ type: "user", text });
-    this.messages.push({ role: "user", content: text });
+    this.remember({ role: "user", content: text });
     this.emit({ type: "turn_start", provider: provider.id, model });
     let reason: "done" | "cancelled" | "error" | "limit" = "done";
     try {
@@ -215,7 +251,7 @@ export class Session {
         }
       }
       if (text) this.emit({ type: "assistant", text });
-      this.messages.push({
+      this.remember({
         role: "assistant",
         content: text || null,
         ...(calls.length > 0
@@ -225,7 +261,7 @@ export class Session {
       if (calls.length === 0) return "done";
       for (const call of calls) {
         const result = await this.runTool(client, call, signal);
-        this.messages.push({ role: "tool", tool_call_id: call.id, content: result });
+        this.remember({ role: "tool", tool_call_id: call.id, content: result });
         if (signal.aborted) return "cancelled";
       }
     }

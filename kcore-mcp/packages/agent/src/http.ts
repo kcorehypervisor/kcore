@@ -8,6 +8,7 @@ import type { AuthStore } from "./auth.js";
 import { CALLBACK_PATH } from "./chatgpt.js";
 import { Session, type AgentEvent, type LiveEvent } from "./session.js";
 import type { ClusterSummary } from "./summary.js";
+import { listTranscripts, readTranscript } from "./transcript.js";
 
 export type AppOptions = {
   token: string;
@@ -35,6 +36,12 @@ export type App = {
 export function createApp(options: AppOptions): App {
   const sessions = new Map<string, Session>();
   const expected = Buffer.from(options.token);
+  if (options.logDir) {
+    for (const id of listTranscripts(options.logDir)) {
+      const restore = readTranscript(options.logDir, id);
+      if (restore) sessions.set(id, new Session({ id, createServer: options.createServer, logDir: options.logDir, restore }));
+    }
+  }
 
   const server = createHttpServer((req, res) => {
     handle(req, res).catch((error) => {
