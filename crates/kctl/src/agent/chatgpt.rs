@@ -161,6 +161,8 @@ struct Inner {
 pub struct CallbackOutcome {
     pub ok: bool,
     pub message: String,
+    /// A fresh authorization the browser should be sent to straight away.
+    pub retry_url: Option<String>,
 }
 
 pub struct ChatGptAuth {
@@ -333,10 +335,29 @@ impl ChatGptAuth {
         Ok(url.to_string())
     }
 
+    fn retry_with_registration(&self, client_id: &str, redirect_uri: &str) -> Option<String> {
+        let port = url::Url::parse(redirect_uri).ok()?.port()?;
+        if self.load().is_none_or(|r| r.client_id.is_empty()) {
+            let record = Record {
+                issuer: self.issuer.clone(),
+                client_id: client_id.to_string(),
+                ext_agent_host_id: self.host_id().ok()?,
+                token_type: "Bearer".to_string(),
+                ..Record::default()
+            };
+            self.save(&record).ok()?;
+        }
+        self.start(port, false).ok()
+    }
+
     fn fail(&self, message: impl Into<String>) -> CallbackOutcome {
         let message = message.into();
         self.lock().last_error = Some(message.clone());
-        CallbackOutcome { ok: false, message }
+        CallbackOutcome {
+            ok: false,
+            message,
+            retry_url: None,
+        }
     }
 
     /// The browser landed on our loopback callback. The message is shown to the operator, so it
@@ -396,12 +417,27 @@ impl ChatGptAuth {
         let tokens = match self.post_token(&form).await {
             Ok(tokens) => tokens,
             Err(error) => {
-                if error
+                let rejected = error
                     .downcast_ref::<TokenError>()
-                    .is_some_and(|e| e.code == "invalid_grant")
-                {
-                    return self
-                        .fail("ChatGPT rejected the sign-in code. Start the sign-in again.");
+                    .is_some_and(|e| e.code == "invalid_grant");
+                if rejected && attempt.client_id.is_none() {
+                    // OpenAI's documented recovery for a first registration whose code is refused:
+                    // keep the issued client id and authorize again with it.
+                    if let Some(url) =
+                        self.retry_with_registration(&client_id, &attempt.redirect_uri)
+                    {
+                        let mut outcome = self.fail(
+                            "ChatGPT did not accept the first sign-in code, so signing in again with the registration it just issued.",
+                        );
+                        outcome.retry_url = Some(url);
+                        return outcome;
+                    }
+                }
+                if rejected {
+                    return self.fail(format!(
+                        "ChatGPT rejected the sign-in code (invalid_grant for client {client_id}, redirect {}). Start the sign-in again.",
+                        attempt.redirect_uri
+                    ));
                 }
                 return self.fail(format!("Could not exchange the sign-in code: {error}"));
             }
@@ -442,7 +478,11 @@ impl ChatGptAuth {
 
         let subject = claims["sub"].as_str().unwrap_or("").to_string();
         let previous = self.load();
-        if attempt.client_id.is_some() && previous.as_ref().is_some_and(|p| p.subject != subject) {
+        if attempt.client_id.is_some()
+            && previous
+                .as_ref()
+                .is_some_and(|p| !p.subject.is_empty() && p.subject != subject)
+        {
             return self.fail("The ChatGPT account that signed in is not the account this registration belongs to.");
         }
         let replaced = previous
@@ -484,6 +524,7 @@ impl ChatGptAuth {
             ok: true,
             message: "Signed in with ChatGPT. You can close this tab and go back to the agent."
                 .to_string(),
+            retry_url: None,
         }
     }
 
@@ -797,6 +838,7 @@ mod tests {
         home: tempfile::TempDir,
         keys: Arc<Keys>,
         nonce: Arc<Mutex<String>>,
+        challenge: Arc<Mutex<String>>,
         tweaks: Arc<Mutex<Tweaks>>,
         refreshes: Arc<AtomicU32>,
     }
@@ -807,6 +849,7 @@ mod tests {
         revoke_status: u16,
         wrong_issuer: bool,
         wrong_audience: bool,
+        fail_first_exchange: bool,
     }
 
     async fn setup() -> Setup {
@@ -819,19 +862,22 @@ mod tests {
             revoke_status: 200,
             wrong_issuer: false,
             wrong_audience: false,
+            fail_first_exchange: false,
         }));
+        let challenge = Arc::new(Mutex::new(String::new()));
         let issuer_cell = Arc::new(Mutex::new(String::new()));
         let net = {
-            let (keys, nonce, refreshes, tweaks, issuer_cell) = (
+            let (keys, nonce, refreshes, tweaks, issuer_cell, challenge) = (
                 keys.clone(),
                 nonce.clone(),
                 refreshes.clone(),
                 tweaks.clone(),
                 issuer_cell.clone(),
+                challenge.clone(),
             );
             mock(move |seen: &Seen| {
                 let issuer = issuer_cell.lock().unwrap().clone();
-                let tweaks = tweaks.lock().unwrap();
+                let mut tweaks = tweaks.lock().unwrap();
                 let form: HashMap<String, String> = url::form_urlencoded::parse(seen.body.as_bytes()).into_owned().collect();
                 match seen.path.as_str() {
                     "/.well-known/openid-configuration" => {
@@ -846,6 +892,11 @@ mod tests {
                         if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
                             let n = refreshes.fetch_add(1, Ordering::SeqCst) + 1;
                             return Reply::json(json!({ "access_token": format!("access-r{n}"), "refresh_token": format!("refresh-r{n}"), "expires_in": 3600, "scope": SCOPE }));
+                        }
+                        let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+                        let pkce_ok = sha256_base64url(&verifier) == *challenge.lock().unwrap();
+                        if !pkce_ok || std::mem::take(&mut tweaks.fail_first_exchange) {
+                            return Reply { status: 400, content_type: "application/json", body: json!({ "error": "invalid_grant" }).to_string() };
                         }
                         let client_id = form.get("client_id").cloned().unwrap_or_default();
                         let id_token = jwt(
@@ -883,6 +934,7 @@ mod tests {
             home,
             keys,
             nonce,
+            challenge,
             tweaks,
             refreshes,
         }
@@ -899,6 +951,7 @@ mod tests {
     async fn sign_in(t: &Setup, client_id: &str) -> (HashMap<String, String>, CallbackOutcome) {
         let url = query(&t.auth.start(4321, false).unwrap());
         *t.nonce.lock().unwrap() = url["nonce"].clone();
+        *t.challenge.lock().unwrap() = url["code_challenge"].clone();
         let params = HashMap::from([
             ("code".to_string(), "code-1".to_string()),
             ("state".to_string(), url["state"].clone()),
@@ -953,6 +1006,50 @@ mod tests {
         let status = t.auth.status();
         assert!(status.signed_in && status.returning && !status.pending);
         assert_eq!(status.email.as_deref(), Some("me@example.test"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_first_code_retries_with_the_issued_registration() {
+        let t = setup().await;
+        t.tweaks.lock().unwrap().fail_first_exchange = true;
+        let (_, first) = sign_in(&t, "oaiapp_abc").await;
+        assert!(!first.ok);
+        let retry = query(&first.retry_url.expect("a retry url"));
+        assert_eq!(retry["client_id"], "oaiapp_abc");
+        assert!(!retry.contains_key("agent_name_hint"));
+        assert_eq!(retry["redirect_uri"], "http://127.0.0.1:4321/auth/callback");
+        assert!(!t.auth.status().signed_in);
+        assert!(t.auth.status().returning);
+
+        *t.nonce.lock().unwrap() = retry["nonce"].clone();
+        *t.challenge.lock().unwrap() = retry["code_challenge"].clone();
+        let params = HashMap::from([
+            ("code".to_string(), "code-2".to_string()),
+            ("state".to_string(), retry["state"].clone()),
+            ("scope".to_string(), SCOPE.to_string()),
+        ]);
+        let second = t.auth.handle_callback(&params).await;
+        assert!(second.ok, "{}", second.message);
+        assert!(t.auth.status().signed_in);
+    }
+
+    #[tokio::test]
+    async fn a_second_refusal_is_reported_with_the_details_and_does_not_loop() {
+        let t = setup().await;
+        t.tweaks.lock().unwrap().token_error = Some("invalid_grant".to_string());
+        let (_, first) = sign_in(&t, "oaiapp_abc").await;
+        let retry = query(&first.retry_url.expect("one retry"));
+        let params = HashMap::from([
+            ("code".to_string(), "code-2".to_string()),
+            ("state".to_string(), retry["state"].clone()),
+        ]);
+        let second = t.auth.handle_callback(&params).await;
+        assert!(second.retry_url.is_none());
+        assert!(
+            second.message.contains("oaiapp_abc") && second.message.contains("127.0.0.1:4321"),
+            "{}",
+            second.message
+        );
     }
 
     #[tokio::test]
@@ -1025,6 +1122,7 @@ mod tests {
         t.tweaks.lock().unwrap().wrong_audience = false;
 
         let url = query(&t.auth.start(4321, false).unwrap());
+        *t.challenge.lock().unwrap() = url["code_challenge"].clone();
         *t.nonce.lock().unwrap() = "not-the-nonce".to_string();
         let params = HashMap::from([
             ("code".into(), "c".into()),
@@ -1072,6 +1170,7 @@ mod tests {
         t.tweaks.lock().unwrap().scope = "openid email".to_string();
         let url = query(&t.auth.start(4321, false).unwrap());
         *t.nonce.lock().unwrap() = url["nonce"].clone();
+        *t.challenge.lock().unwrap() = url["code_challenge"].clone();
         let params = HashMap::from([
             ("code".into(), "c".into()),
             ("state".into(), url["state"].clone()),

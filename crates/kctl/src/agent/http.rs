@@ -291,6 +291,19 @@ async fn route(app: &Arc<AppState>, request: Request) -> Response {
                 .into_owned()
                 .collect();
             let outcome = app.auth.chatgpt.handle_callback(&params).await;
+            if let Some(url) = &outcome.retry_url {
+                let mut response = reply(
+                    302,
+                    "text/html; charset=utf-8",
+                    callback_page(false, &outcome.message),
+                );
+                if let Ok(location) = HeaderValue::from_str(url) {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::LOCATION, location);
+                }
+                return response;
+            }
             return reply(
                 if outcome.ok { 200 } else { 400 },
                 "text/html; charset=utf-8",
