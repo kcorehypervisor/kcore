@@ -450,4 +450,91 @@ mod tests {
             .unwrap();
         }
     }
+
+    fn assert_accepted(call: &super::super::requests::RpcCall) {
+        use super::super::requests::Target;
+        let service = if call.target == Target::Controller {
+            ServiceName::Controller
+        } else {
+            ServiceName::NodeAdmin
+        };
+        let descriptor = find_descriptor(service, call.method)
+            .unwrap_or_else(|e| panic!("{}: {e}", call.method));
+        DynamicMessage::deserialize_with_options(
+            descriptor.input(),
+            call.request.clone(),
+            &DeserializeOptions::new().deny_unknown_fields(true),
+        )
+        .unwrap_or_else(|e| panic!("{} rejects {}: {e}", call.method, call.request));
+    }
+
+    #[test]
+    fn every_resource_kind_builds_requests_the_descriptors_accept() {
+        use super::super::catalog::{find_kind, KINDS};
+        use super::super::requests::{build_apply, build_delete, build_plan_call, build_read};
+        let key = "ssh-ed25519 AAAA operator@host";
+        let specs = json!({
+            "vm": { "name": "web-01", "network": "default", "storageBackend": "ceph", "storageSizeBytes": "40G", "imageUrl": "https://example.com/d.qcow2", "imageSha256": "a".repeat(64), "sshPublicKeys": [key], "cpu": 2 },
+            "network": { "name": "lan", "type": "nat", "externalIp": "10.0.0.2", "gatewayIp": "10.0.0.1" },
+            "ssh-key": { "name": "op", "publicKey": key },
+            "container": { "name": "c1", "image": "nginx:latest", "ports": ["8080:80"], "env": { "A": "b" } },
+            "postgresql": { "name": "db1" },
+            "volume": { "name": "v1", "sizeBytes": "10G" },
+            "volume-snapshot": { "volume": "v1", "name": "s1" },
+            "snapshot-policy": { "name": "p1", "volume": "v1", "keep": 3 },
+            "security-group": { "name": "sg", "rules": ["tcp/22 from 10.0.0.0/8"] },
+            "disk-layout": { "name": "dl", "nodeId": "node-1", "layoutNix": "{ disko.devices = {}; }" },
+            "ceph-cluster": { "name": "san", "publicNetwork": "192.168.47.0/24", "clusterNetwork": "192.168.47.0/24" },
+            "shared-filesystem": { "name": "fs", "cephCluster": "san" },
+            "object-store": { "name": "os", "cephCluster": "san", "members": ["n1"] },
+            "cluster-update": { "name": "u1", "version": "1.2.3", "flakeRef": "github:example/kcore" },
+        });
+        for kind in KINDS
+            .iter()
+            .filter(|k| k.id != "cluster" && k.id != "image")
+        {
+            let spec = specs[kind.id]
+                .as_object()
+                .unwrap_or_else(|| panic!("no spec for {}", kind.id));
+            for call in build_apply(find_kind(Some(kind.id)).unwrap(), spec)
+                .unwrap_or_else(|e| panic!("apply {}: {e}", kind.id))
+            {
+                assert_accepted(&call);
+            }
+            assert_accepted(
+                &build_plan_call(kind, spec, None)
+                    .unwrap_or_else(|e| panic!("plan {}: {e}", kind.id)),
+            );
+            assert_accepted(&build_read(kind, None).unwrap());
+            assert_accepted(&build_read(kind, Some("thing")).unwrap());
+            assert_accepted(
+                &build_delete(kind, "thing").unwrap_or_else(|e| panic!("delete {}: {e}", kind.id)),
+            );
+        }
+    }
+
+    #[test]
+    fn every_operation_builds_requests_the_descriptors_accept() {
+        use super::super::requests::build_operation;
+        let cases = [
+            ("set-vm-state", json!({ "name": "web", "state": "running" })),
+            (
+                "migrate-vm",
+                json!({ "name": "web", "targetNode": "node-2" }),
+            ),
+            ("drain-node", json!({ "nodeId": "node-1" })),
+            ("cordon-node", json!({ "nodeId": "node-1" })),
+            ("uncordon-node", json!({ "nodeId": "node-1" })),
+            ("approve-node", json!({ "nodeId": "node-1" })),
+            ("reject-node", json!({ "nodeId": "node-1" })),
+            ("approve-update", json!({ "name": "u1" })),
+            ("cancel-update", json!({ "name": "u1" })),
+            ("rollback-update", json!({ "name": "u1" })),
+        ];
+        for (action, spec) in cases {
+            let call = build_operation(action, spec.as_object().unwrap())
+                .unwrap_or_else(|e| panic!("{action}: {e}"));
+            assert_accepted(&call);
+        }
+    }
 }

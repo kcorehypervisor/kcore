@@ -46,12 +46,13 @@ fn backend_enum(value: &str) -> Built<&'static str> {
     }
 }
 
-fn desired(value: Option<&Value>) -> Built<&'static str> {
+/// `prefix` is the proto enum name: `VM_DESIRED_STATE` or `WORKLOAD_DESIRED_STATE`.
+fn desired(value: Option<&Value>, prefix: &str) -> Built<String> {
     match value {
-        Some(Value::String(text)) if text == "running" => Ok("VM_DESIRED_STATE_RUNNING"),
-        Some(Value::String(text)) if text == "stopped" => Ok("VM_DESIRED_STATE_STOPPED"),
-        None | Some(Value::Null) => Ok("VM_DESIRED_STATE_UNSPECIFIED"),
-        Some(Value::String(text)) if text.is_empty() => Ok("VM_DESIRED_STATE_UNSPECIFIED"),
+        Some(Value::String(text)) if text == "running" => Ok(format!("{prefix}_RUNNING")),
+        Some(Value::String(text)) if text == "stopped" => Ok(format!("{prefix}_STOPPED")),
+        None | Some(Value::Null) => Ok(format!("{prefix}_UNSPECIFIED")),
+        Some(Value::String(text)) if text.is_empty() => Ok(format!("{prefix}_UNSPECIFIED")),
         _ => input_error("desired state must be running or stopped"),
     }
 }
@@ -397,7 +398,7 @@ fn vm_request(spec: &Spec) -> Built<Value> {
             "memoryBytes": size_bytes(memory.as_deref().unwrap_or("2G"), "memory")?,
             "nics": nics,
             "disks": [],
-            "desiredState": desired(spec.get("desiredState"))?,
+            "desiredState": desired(spec.get("desiredState"), "VM_DESIRED_STATE")?,
         },
     }))
 }
@@ -515,7 +516,7 @@ fn container_request(spec: &Spec) -> Built<Value> {
             "command": string_list(spec.get("command")),
             "env": env,
             "ports": string_list(spec.get("ports")),
-            "desiredState": desired(spec.get("desiredState"))?,
+            "desiredState": desired(spec.get("desiredState"), "WORKLOAD_DESIRED_STATE")?,
         },
     }))
 }
