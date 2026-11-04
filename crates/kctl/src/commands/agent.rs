@@ -28,6 +28,12 @@ pub struct AgentArgs {
     #[arg(long, default_value_t = 0)]
     pub port: u16,
 
+    /// Serve the UI on this LAN address instead of loopback. The page is plain HTTP and the
+    /// session token travels in the link, so anyone who can read that traffic gets this
+    /// context's access. Pair it with `--role` and a trusted network.
+    #[arg(long, value_name = "IPV4")]
+    pub listen: Option<std::net::Ipv4Addr>,
+
     /// Print the URL but do not open a browser
     #[arg(long)]
     pub no_browser: bool,
@@ -237,6 +243,7 @@ pub async fn run(info: &ConnectionInfo, args: &AgentArgs) -> Result<()> {
         None => info,
     };
     let context = context_yaml(info, args.provisioning.as_deref())?;
+    let host = listen_host(args.listen)?;
 
     let runtime = RuntimeDir::create()?;
     let config_path = runtime.path().join("config");
@@ -250,7 +257,11 @@ pub async fn run(info: &ConnectionInfo, args: &AgentArgs) -> Result<()> {
         .env("KCORE_CONFIG", &config_path)
         .env("KCORE_AGENT_TOKEN", &token)
         .env("KCORE_AGENT_PORT", args.port.to_string())
-        .env_remove("KCORE_AGENT_BIND")
+        .env("KCORE_AGENT_BIND", &host)
+        .env(
+            "KCORE_AGENT_ALLOW_REMOTE",
+            if host == LOOPBACK { "0" } else { "1" },
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -266,7 +277,7 @@ pub async fn run(info: &ConnectionInfo, args: &AgentArgs) -> Result<()> {
 
     let port = tokio::time::timeout(STARTUP_TIMEOUT, async {
         while let Some(line) = lines.next_line().await? {
-            if let Some(port) = parse_listening_line(&line) {
+            if let Some(port) = parse_listening_line(&line, &host) {
                 return Ok(port);
             }
             println!("{line}");
@@ -282,11 +293,17 @@ pub async fn run(info: &ConnectionInfo, args: &AgentArgs) -> Result<()> {
         }
     });
 
-    let url = agent_url(port, &token);
-    println!("kcore agent is running at http://127.0.0.1:{port}/");
+    let url = agent_url(&host, port, &token);
+    println!("kcore agent is running at http://{host}:{port}/");
+    if host != LOOPBACK {
+        eprintln!(
+            "warning: listening on {host} over plain HTTP. The session token is in the link; \
+             anyone on this network who gets it can use this agent's access."
+        );
+    }
     println!("Open this link once; it carries the session token: {url}");
     println!("Press Ctrl-C to stop.");
-    if !args.no_browser {
+    if !args.no_browser && host == LOOPBACK {
         open_browser(&url);
     }
 
@@ -461,15 +478,28 @@ fn pem_bytes(field: &str, inline: Option<&str>, path: Option<&str>) -> Result<Ve
     bail!("no {field} in the selected context; `kctl agent` needs the same credentials as other kctl commands (or pass -k for plaintext)")
 }
 
-fn parse_listening_line(line: &str) -> Option<u16> {
+const LOOPBACK: &str = "127.0.0.1";
+
+/// The address the agent binds. A wildcard would expose every interface, so it is refused.
+fn listen_host(listen: Option<std::net::Ipv4Addr>) -> Result<String> {
+    match listen {
+        None => Ok(LOOPBACK.to_string()),
+        Some(ip) if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() => {
+            bail!("--listen needs one specific address of this machine, not {ip}")
+        }
+        Some(ip) => Ok(ip.to_string()),
+    }
+}
+
+fn parse_listening_line(line: &str, host: &str) -> Option<u16> {
     line.trim()
-        .strip_prefix("listening http://127.0.0.1:")?
+        .strip_prefix(&format!("listening http://{host}:"))?
         .parse()
         .ok()
 }
 
-fn agent_url(port: u16, token: &str) -> String {
-    format!("http://127.0.0.1:{port}/#token={token}")
+fn agent_url(host: &str, port: u16, token: &str) -> String {
+    format!("http://{host}:{port}/#token={token}")
 }
 
 fn random_token() -> Result<String> {
@@ -725,16 +755,42 @@ mod tests {
     #[test]
     fn listening_line_is_parsed_only_for_loopback() {
         assert_eq!(
-            parse_listening_line("listening http://127.0.0.1:41233"),
+            parse_listening_line("listening http://127.0.0.1:41233", LOOPBACK),
             Some(41233)
         );
-        assert_eq!(parse_listening_line("listening http://0.0.0.0:41233"), None);
-        assert_eq!(parse_listening_line("something else"), None);
+        assert_eq!(
+            parse_listening_line("listening http://0.0.0.0:41233", LOOPBACK),
+            None
+        );
+        assert_eq!(parse_listening_line("something else", LOOPBACK), None);
+    }
+
+    #[test]
+    fn listening_line_must_name_the_requested_address() {
+        assert_eq!(
+            parse_listening_line("listening http://192.168.40.10:9000", "192.168.40.10"),
+            Some(9000)
+        );
+        assert_eq!(
+            parse_listening_line("listening http://127.0.0.1:9000", "192.168.40.10"),
+            None
+        );
+    }
+
+    #[test]
+    fn listen_refuses_wildcards_and_defaults_to_loopback() {
+        assert_eq!(listen_host(None).unwrap(), "127.0.0.1");
+        assert_eq!(
+            listen_host(Some("192.168.40.10".parse().unwrap())).unwrap(),
+            "192.168.40.10"
+        );
+        assert!(listen_host(Some("0.0.0.0".parse().unwrap())).is_err());
+        assert!(listen_host(Some("255.255.255.255".parse().unwrap())).is_err());
     }
 
     #[test]
     fn the_token_goes_in_the_fragment_not_the_query() {
-        let url = agent_url(8123, "abc");
+        let url = agent_url("127.0.0.1", 8123, "abc");
         assert_eq!(url, "http://127.0.0.1:8123/#token=abc");
     }
 
