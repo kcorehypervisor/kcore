@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="kcore hypervisor roadmap - what's shipped, what's in progress, and what's coming next">
+    <title>Roadmap - kcore hypervisor</title>
+    <link rel="canonical" href="https://kcorehypervisor.com/roadmap.html">
+    <meta name="robots" content="index, follow">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="kcore hypervisor">
+    <meta property="og:title" content="Roadmap - kcore hypervisor">
+    <meta property="og:description" content="kcore hypervisor roadmap - what's shipped, what's in progress, and what's coming next">
+    <meta property="og:url" content="https://kcorehypervisor.com/roadmap.html">
+    <meta property="og:image" content="https://raw.githubusercontent.com/kcorehypervisor/kcore/main/assets/kcore-logo.png">
+    <meta property="og:image:alt" content="kcore hypervisor logo">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:image" content="https://raw.githubusercontent.com/kcorehypervisor/kcore/main/assets/kcore-logo.png">
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/code-color.css">
+    <style>
+        .roadmap-hero {
+            padding: 8rem 0 4rem;
+            margin-top: 60px;
+            text-align: center;
+            background: linear-gradient(180deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+        }
+
+        .roadmap-hero h1 {
+            margin-bottom: 1rem;
+        }
+
+        .roadmap-hero p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 700px;
+            margin: 0 auto;
+        }
+
+        .legend {
+            display: flex;
+            gap: 2rem;
+            justify-content: center;
+            margin-top: 2rem;
+            flex-wrap: wrap;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .status-badge {
+            display: inline-block;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 0.2rem 0.6rem;
+            border-radius: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .status-shipped {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success);
+        }
+
+        .status-in-progress {
+            background: rgba(245, 158, 11, 0.15);
+            color: var(--warning);
+        }
+
+        .status-planned {
+            background: rgba(99, 102, 241, 0.15);
+            color: var(--accent-primary);
+        }
+
+        .timeline-section {
+            padding: 4rem 0 2rem;
+        }
+
+        .timeline {
+            position: relative;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 0 1rem;
+        }
+
+        .timeline-entry::before {
+            content: '';
+            position: absolute;
+            left: 2rem;
+            top: 0;
+            bottom: -3rem;
+            width: 2px;
+            background: var(--success);
+            opacity: 0.45;
+            z-index: 0;
+        }
+
+        .timeline-entry:has(.timeline-dot.planned)::before {
+            background: var(--accent-primary);
+        }
+
+        .timeline-entry:has(.timeline-dot.in-progress)::before {
+            background: var(--warning);
+        }
+
+        .timeline-entry:last-child::before {
+            bottom: 0;
+        }
+
+        .timeline-entry {
+            position: relative;
+            padding-left: 5rem;
+            margin-bottom: 3rem;
+        }
+
+        .timeline-entry:last-child {
+            margin-bottom: 0;
+        }
+
+        .timeline-dot {
+            position: absolute;
+            left: 1.1rem;
+            top: 0.35rem;
+            width: 1.1rem;
+            height: 1.1rem;
+            border-radius: 50%;
+            border: 3px solid var(--bg-primary);
+            z-index: 1;
+        }
+
+        .timeline-dot.shipped {
+            background: var(--success);
+            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.25);
+        }
+
+        .timeline-dot.in-progress {
+            background: var(--warning);
+            box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25);
+            animation: pulse-dot 2s ease-in-out infinite;
+        }
+
+        .timeline-dot.planned {
+            background: var(--accent-primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25); }
+            50% { box-shadow: 0 0 0 6px rgba(245, 158, 11, 0.15); }
+        }
+
+        .timeline-date {
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.5rem;
+        }
+
+        .timeline-date.shipped { color: var(--success); }
+        .timeline-date.in-progress { color: var(--warning); }
+        .timeline-date.planned { color: var(--accent-primary); }
+
+        .timeline-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-primary);
+            border-radius: 0.75rem;
+            padding: 1.75rem;
+            transition: border-color 0.2s;
+        }
+
+        .timeline-card:hover {
+            border-color: var(--border-secondary);
+        }
+
+        .timeline-card h3 {
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-size: 1.15rem;
+        }
+
+        .timeline-card h3 .card-icon {
+            flex-shrink: 0;
+            width: 2rem;
+            height: 2rem;
+            border-radius: 0.4rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+        }
+
+        .card-icon.shipped { background: rgba(16, 185, 129, 0.15); }
+        .card-icon.in-progress { background: rgba(245, 158, 11, 0.15); }
+        .card-icon.planned { background: rgba(99, 102, 241, 0.15); }
+
+        .timeline-card > p {
+            color: var(--text-secondary);
+            line-height: 1.6;
+            margin-bottom: 1rem;
+            font-size: 0.95rem;
+        }
+
+        .feature-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-size: 0.82rem;
+            padding: 0.35rem 0.75rem;
+            border-radius: 0.4rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-primary);
+            color: var(--text-secondary);
+        }
+
+        .chip .check {
+            color: var(--success);
+            font-weight: 700;
+        }
+
+        .shipped-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .shipped-area h4 {
+            font-size: 0.85rem;
+            color: var(--text-tertiary);
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-bottom: 0.5rem;
+        }
+
+        .shipped-area ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        .shipped-area ul li {
+            padding: 0.3rem 0;
+            color: var(--text-secondary);
+            font-size: 0.88rem;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .shipped-area ul li::before {
+            content: "✓";
+            color: var(--success);
+            font-weight: 700;
+            font-size: 0.8rem;
+            flex-shrink: 0;
+        }
+
+        .detail-list {
+            list-style: none;
+            margin: 1rem 0 0;
+            padding: 0;
+        }
+
+        .detail-list li {
+            padding: 0.45rem 0;
+            border-top: 1px solid var(--border-primary);
+            color: var(--text-secondary);
+            font-size: 0.88rem;
+            display: flex;
+            align-items: start;
+            gap: 0.5rem;
+        }
+
+        .detail-list li:first-child {
+            border-top: none;
+        }
+
+        .detail-list li .item-status {
+            flex-shrink: 0;
+            margin-top: 0.1rem;
+        }
+
+        .not-planned-note {
+            max-width: 900px;
+            margin: 3rem auto 0;
+            padding: 0 1rem;
+        }
+
+        .not-planned-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-primary);
+            border-radius: 0.75rem;
+            padding: 1.75rem;
+        }
+
+        .not-planned-card h3 {
+            margin-bottom: 0.75rem;
+            font-size: 1rem;
+        }
+
+        .not-planned-card ul {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .not-planned-card ul li {
+            padding: 0.3rem 0;
+            color: var(--text-tertiary);
+            font-size: 0.88rem;
+        }
+
+        .not-planned-card ul li::before {
+            content: "—";
+            margin-right: 0.5rem;
+        }
+
+        @media (max-width: 768px) {
+            .shipped-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .timeline-entry {
+                padding-left: 4rem;
+            }
+
+            .legend {
+                gap: 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="container">
+            <div class="nav-brand">
+                <a href="index.html" style="color: inherit; text-decoration: none;">
+                    <span class="logo">kcore</span>
+                    <span class="logo-tag">hypervisor</span>
+                </a>
+            </div>
+            <ul class="nav-menu">
+                <li><a href="features.html" data-i18n="nav.features">Features</a></li>
+                <li><a href="pricing.html" data-i18n="nav.pricing">Pricing</a></li>
+                <li><a href="docs.html" data-i18n="nav.docs">Docs</a></li>
+                <li><a href="roadmap.html">Roadmap</a></li>
+                <li><a href="blog.html" data-i18n="footer.blog">Blog</a></li>
+                <li><a href="index.html#get-started" class="btn-primary" data-i18n="nav.getStarted">Get Started</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <!-- Hero -->
+    <section class="roadmap-hero">
+        <div class="container">
+            <h1>Roadmap</h1>
+            <p>
+                What&rsquo;s shipped, what&rsquo;s being built right now, and what&rsquo;s next.
+                Dates reflect real engineering plans, not marketing promises.
+            </p>
+            <div class="legend">
+                <div class="legend-item">
+                    <span class="status-badge status-shipped">Shipped</span>
+                    <span>Done and working</span>
+                </div>
+                <div class="legend-item">
+                    <span class="status-badge status-in-progress">In Progress</span>
+                    <span>Actively being built</span>
+                </div>
+                <div class="legend-item">
+                    <span class="status-badge status-planned">Planned</span>
+                    <span>Designed, not yet started</span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Timeline -->
+    <section class="timeline-section">
+        <div class="container">
+            <div class="timeline">
+
+                <!-- =============================== -->
+                <!-- SHIPPED -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">Shipped &mdash; Live today</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#9745;</span> Core Platform</h3>
+                        <p>
+                            End-to-end declarative VM lifecycle on bare metal. Controller, node agent,
+                            CLI, networking, storage, mTLS &mdash; all working in production.
+                        </p>
+                        <div class="shipped-grid">
+                            <div class="shipped-area">
+                                <h4>VM Lifecycle</h4>
+                                <ul>
+                                    <li>Create, delete, start, stop, update VMs</li>
+                                    <li>Container workloads via containerd (<code>kctl workload</code> / <code>kctl container</code>)</li>
+                                    <li>Unified workload API for VMs and containers</li>
+                                    <li>Desired-state reconciliation via Nix</li>
+                                    <li>Cloud Hypervisor runtime</li>
+                                    <li>YAML manifest support (<code>kctl create vm -f</code>)</li>
+                                    <li>Wait for boot / SSH readiness</li>
+                                    <li>Windows Server and Windows desktop guests</li>
+                                    <li>Serial console (<code>kctl console</code> and the dashboard)</li>
+                                    <li>One physical GPU assigned to one VM</li>
+                                </ul>
+                            </div>
+                            <div class="shipped-area">
+                                <h4>Storage &amp; Volumes</h4>
+                                <ul>
+                                    <li>Filesystem, LVM, and ZFS backends</li>
+                                    <li>Volume create, delete, attach, detach</li>
+                                    <li>Per-VM storage provisioning on create</li>
+                                    <li>Storage overview API (dashboard)</li>
+                                </ul>
+                            </div>
+                            <div class="shipped-area">
+                                <h4>Networking</h4>
+                                <ul>
+                                    <li>NAT, bridge, and VXLAN network types</li>
+                                    <li>Cross-host VXLAN with optional outbound NAT</li>
+                                    <li>VLAN ID support on gateway</li>
+                                    <li>Security groups with ingress + optional DNAT policy</li>
+                                    <li><code>kctl apply -f ...</code> kind-based manifest dispatch (kubectl-style)</li>
+                                    <li>dnsmasq + nftables per network</li>
+                                </ul>
+                            </div>
+                            <div class="shipped-area">
+                                <h4>Security &amp; Operations</h4>
+                                <ul>
+                                    <li>Full mTLS PKI (CA, sub-CA, per-node certs)</li>
+                                    <li>CN-based gRPC authorization</li>
+                                    <li>Cert rotation (<code>kctl rotate</code>)</li>
+                                    <li>Node drain and approval flow</li>
+                                    <li>Compliance reporting</li>
+                                </ul>
+                            </div>
+                            <div class="shipped-area">
+                                <h4>Node Bootstrap</h4>
+                                <ul>
+                                    <li>Automated node install via <code>kctl node install</code></li>
+                                    <li>NixOS ISO with disko integration</li>
+                                    <li>PKI bootstrap into <code>/etc/kcore/certs</code></li>
+                                    <li>Multi-disk layout (OS + data disks)</li>
+                                </ul>
+                            </div>
+                            <div class="shipped-area">
+                                <h4>Platform</h4>
+                                <ul>
+                                    <li>Capacity-aware scheduler (most-free-first)</li>
+                                    <li>Image management (URL+SHA256, upload, pull)</li>
+                                    <li>SSH key management</li>
+                                    <li>Dashboard (web UI), with password and TOTP sign-in</li>
+                                    <li>Terraform provider (separate repo)</li>
+                                    <li>MCP server for agents, calling the same API</li>
+                                    <li>Host updates as one transaction (<code>ClusterUpdate</code>). A failed boot returns to the previous generation</li>
+                                    <li><code>kcore-infect</code> installs kcoreOS on an existing systemd Linux host</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- APRIL 2026: DISKO -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">April 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#9881;</span> Declarative Disk Partitioning</h3>
+                        <p>
+                            Declarative disk layouts from install through day-2. The live ISO generates
+                            <code>disko-config.nix</code> and runs <code>disko --mode format,mount</code>;
+                            the <code>kcore.disko</code> NixOS module expresses OS and data disks with optional
+                            merged fragments; nodes default to <code>installer-only</code> ownership and can be
+                            moved to <code>controller-managed</code> for declarative <code>DiskLayout</code>
+                            resources. The controller stores <code>DiskLayout</code> objects in its replicated
+                            DB and reconciles them to the target node, which atomically persists the layout to
+                            <code>/etc/kcore/disk/current.nix</code> and chains
+                            <code>nixos-rebuild test</code> + <code>switch</code>. The node-agent classifier
+                            refuses any layout that would touch a disk currently backing an active kcore
+                            volume, LVM PV, or ZFS pool member &mdash; the controller never touches VMs.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Install-time disko: generates <code>disko-config.nix</code>, runs <code>disko --mode format,mount</code></span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>modules/kcore-disko.nix</code> with <code>kcore.disko.*</code> (including <code>managementMode</code>, <code>controllerFragments</code>, and <code>persistedLayoutPath</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Ownership split: <code>/etc/kcore/disk-management-mode</code> &mdash; default <code>installer-only</code>; <code>controller-managed</code> unlocks declarative apply (legacy <code>disko-management-mode</code> path read as fallback)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Per-node <code>kctl node apply-disk -f … [--apply] [--no-rebuild]</code> &rarr; node-agent <code>ApplyDiskLayout</code>: classifier-gated, atomic persist to <code>/etc/kcore/disk/current.nix</code>, automatic <code>nixos-rebuild</code> chain</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Declarative fleet rollout: <code>kind: DiskLayout</code> resource, controller CRUD + replication outbox, controller-side reconciler tick that pushes unobserved generations to nodes and writes back <code>observed_generation</code> + <code>phase</code></span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Safe / dangerous classifier in <code>kcore-disko-types</code> shared crate (used by both controller pre-flight and node-agent authoritative gate); refusal codes surface on <code>status.refusalReason</code></span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- LATE APRIL: HA + TLA+ -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">April 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128279;</span> High Availability &amp; Replication</h3>
+                        <p>
+                            Multi-controller clusters with CRDT-based state merge and cross-DC replication.
+                            Replication now runs with automatic reconciliation and compensation paths instead of manual conflict resolution.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Replication DB tables, ack frontiers, LWW/MV merge, and anti-entropy fan-out</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Domain materialization for node/network/vm/security-group/ssh-key event families</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Typed, idempotent compensation executor with zero-manual SLO gating</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>kctl get replication-status [--require-healthy]</code> for hard runtime gates</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Manual <code>kctl resolve conflict</code> removed from operator workflow</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">April 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128208;</span> TLA+ Specifications</h3>
+                        <p>
+                            Formal models of distributed protocols to catch design bugs before they become code bugs.
+                            Models and trace checks are now wired as required CI gates.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Bounded TLA+ specs and required CI integration</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>ControllerNodeReconcile.tla</code> &mdash; reconciliation model</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>ControllerReplication.tla</code> &mdash; single-DC replication</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>CrossDcReplication.tla</code> &mdash; multi-DC model</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>DiskLayoutReconcile.tla</code> &mdash; per-resource state machine for the controller-orchestrated <code>DiskLayout</code>; safety invariant <em>&ldquo;no Applied transition without classifier approval&rdquo;</em></span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Trace bridge: Rust test traces validated against TLA+ invariants</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- APRIL 2026: KANI + PROPTEST -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">April 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128300;</span> Property-Based Testing &amp; Bounded Model Checking</h3>
+                        <p>
+                            The remaining three phases of the formal-methods plan landed alongside TLA+:
+                            generative property tests across every Rust crate, Kani bounded proofs on the
+                            security-critical sanitisers, and proptest coverage of database CRUD invariants.
+                            All four phases (proptest, Kani, DB invariants, TLA+) are now required CI gates.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>proptest on Nix generation: escape round-trip, attribute-key sanitisation, structural validity (controller, node-agent, kctl, dashboard)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Kani harnesses for path traversal, NUL injection, segment validation, and Nix string escaping in the dedicated <code>kcore-sanitize</code> leaf crate (zero non-std deps, so proofs compile in seconds)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Kani harnesses on the <code>DiskLayout</code> diff parser in <code>kcore-disko-types</code>: <code>extract_target_devices</code> never panics, comment stripper preserves length, every emitted path is <code>/dev/</code>-prefixed, extraction is deterministic</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Per-harness CI matrix &mdash; each <code>#[kani::proof]</code> runs on its own GitHub Actions runner with shared toolchain cache, completing the gate in ~1&ndash;2 min on warm cache</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>proptest on database CRUD invariants: VM, node, network, security-group, SSH-key, and <code>DiskLayout</code> round-trips, idempotent upserts, foreign-key integrity, cascading delete, and the reconciler queue (<code>list_disk_layouts_needing_reconcile</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>proptest fuzzers for the <code>DiskLayout</code> safe/dangerous classifier: safe verdicts never overlap an active-VM, system-mount, LVM PV, or zpool-member device; classifier is deterministic on identical inputs</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>575 workspace tests (incl. proptest fuzzers) + Kani matrix + TLA+ trace bridge run on every pull request</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- Q3 2026: WEB CONSOLE -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">August 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128187;</span> Dashboard Web Console</h3>
+                        <p>
+                            In-browser serial console in the dashboard for datacenter use: a CLI
+                            terminal for day-to-day work, rescue, and installers. Also available
+                            from the CLI via <code>kctl console</code>. Console opens are recorded
+                            in the append-only audit log (actor, VM, timestamp). If you need a
+                            graphical desktop, install a VNC server (or equivalent) inside the
+                            guest OS yourself and reach it over the network. kcore does not provide
+                            a hypervisor-level graphical console &mdash; that would add complexity
+                            we do not need for headless workloads.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Serial / CLI console in the browser (xterm.js) via WebSocket to the node-agent serial endpoint</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>&ldquo;Console&rdquo; action on each VM in the dashboard, with paste, resize, and disconnect</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>mTLS-authenticated proxy through the dashboard &mdash; same trust model as the rest of the UI</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>kctl console &lt;vm&gt;</code> for operator serial access from a terminal</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Session audit: who opened which console, and when</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- Q3 2026: SECURITY -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">September 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128274;</span> Security &amp; Compliance</h3>
+                        <p>
+                            RBAC, audit logging, certificate lifecycle, SBOM export, and
+                            per-identity gRPC rate limiting. Node certificates rotate on
+                            their own, and revoked certificates are published over CRL and
+                            OCSP &mdash; see
+                            <a href="docs/user/certificates.html">certificates &amp; encryption</a>.
+                            <code>kctl get crypto-config</code> reports the cryptographic
+                            posture. <code>kctl get sbom</code> exports the CycloneDX
+                            document, and release artifacts are signed with Sigstore.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>RBAC roles: <code>read-only</code>, <code>vm-admin</code>, <code>cluster-admin</code> (per-operator certs <code>CN=kctl:&lt;name&gt;</code>, <code>kctl operator</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Append-only audit log with actor, action, resource, timestamp (includes console session opens)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>ListAuditEvents</code> API (+ <code>kctl audit</code> / dashboard)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Console session audit: <code>AttachVmConsole</code> records who opened which VM console, and when</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Automated certificate rotation and CRL/OCSP revocation &mdash; nodes generate their own keys and CSRs so private keys never leave the node, the sub-CA publishes a signed CRL and answers OCSP, and revoked peers are rejected on every RPC (<code>kctl rotate node-certs</code>, <code>kctl revoke cert</code>, <code>kctl get pki-status</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>SBOM generation and signed release artifacts &mdash; CycloneDX SBOMs in the GitHub release, <code>SHA256SUMS</code> signed with Sigstore keyless signing</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>New APIs: <code>GetCryptoConfig</code>, <code>ExportSbom</code> (<code>kctl get crypto-config</code>, <code>kctl get sbom</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>gRPC rate limiting &mdash; per-identity token bucket on the controller and node-agent (default 100 req/s, burst 200)</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- SEP 2026: kcore SAN (Ceph) -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">September 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128190;</span> kcore SAN (Ceph)</h3>
+                        <p>
+                            Distributed shared block storage for the cluster &mdash; a vSAN-class
+                            fabric powered by Ceph on NixOS, with the controller filling the gaps
+                            NixOS does not declare. Replicated VM disks, cold drain without
+                            copying disks, and Cloud Hypervisor live migration over shared RBD
+                            all work today. See
+                            <a href="docs/user/storage-vsan.html">kcore SAN docs</a>.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Declarative <code>CephCluster</code> resource (MON / MGR / OSD) with dedicated Ceph network</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>NixOS <code>services.ceph</code> + controller-owned bootstrap (keys, <code>ceph-volume</code>, health)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>RBD storage backend for VMs (<code>--storage-backend ceph</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Cold migrate / drain without copying disks (shared RBD)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Cloud Hypervisor live migration over shared RBD</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Volumes: create, attach, detach, resize, snapshot, restore, and flatten</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>New clusters encrypt OSD disks (<code>encryptOsds</code>, immutable after create)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-in-progress">In Progress</span></span>
+                                <span>CephFS (<code>SharedFilesystem</code>) and S3 via RGW (<code>ObjectStore</code>, <code>ObjectUser</code>) are in the API. MDS and RGW lab automation is still incomplete, and VM virtio-fs is not in yet</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- SEP 2026: WEBHOOKS -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">September 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128225;</span> Webhooks &amp; Events</h3>
+                        <p>
+                            Push-based event system for external integrations and alerting.
+                            Endpoints are configured in <code>controller.yaml</code> and
+                            receive a JSON POST, optionally signed with HMAC-SHA256.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Events: <code>node.heartbeat.missed</code>, <code>cert.expiry.warning</code>, <code>vm.created</code>, <code>vm.deleted</code>, <code>vm.state.changed</code>, <code>vm.migrated</code>, <code>ingress.waf.blocked</code>, <code>ingress.waf.detected</code>, <code>ingress.vip.moved</code></span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Configurable webhook endpoints in <code>controller.yaml</code></span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- Q4 2026: SCHEDULER + NETWORKING -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">October 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128202;</span> Advanced Scheduler</h3>
+                        <p>
+                            Topology-aware placement beyond most-free-first. The controller still
+                            spreads a new VM onto the ready node with the most free memory, then
+                            CPU. Free capacity is live heartbeat load subtracted from physical
+                            capacity times the overcommit ratio in <code>controller.yaml</code>.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Label-based affinity (<code>--label dc=dc-a</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Anti-affinity rules for HA workloads</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Overcommit ratio and load-aware placement</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">October 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#127760;</span> Networking Improvements</h3>
+                        <p>
+                            A VM can join more than one network. A network can add an IPv6 /64
+                            beside IPv4, drop VM-to-VM traffic on its bridge, and reuse VXLAN
+                            addresses after a guest is deleted. Security groups still control
+                            north-south exposure, and named target-IP rules stay open when the
+                            east-west filter is on.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Multi-NIC / multi-homed VMs</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>IPv6 support</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>East-west firewall between VMs on the same bridge</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Security groups with YAML apply flow and nftables rendering on nodes</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>VXLAN IP reclamation and improved peer discovery</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- NOV 2026: STORAGE DAY-2 + MOBILITY -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">November 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128190;</span> Volume snapshots and local-disk migration</h3>
+                        <p>
+                            Day-2 disks beyond the first Ceph fabric. Snapshots cover Ceph RBD, ZFS,
+                            and LVM. A filesystem disk is not snapshotted. LVM and ZFS guests can
+                            move while they run; a filesystem disk stays on its node.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Snapshot, clone, restore, and flatten for Ceph RBD, ZFS, and LVM. <code>SnapshotPolicy</code> prunes on a schedule</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Changed-block export and import (<code>ListVolumeChangedExtents</code>, <code>ReadVolumeBlocks</code>, <code>WriteVolumeBlocks</code>) for an external backup tool</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>LUKS on an RBD volume (<code>kctl encrypt volume</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Live migration of LVM and ZFS disks: a device-mapper mirror resyncs, then Cloud Hypervisor sends memory. Cold copy remains the fallback</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="timeline-entry">
+                    <div class="timeline-dot in-progress"></div>
+                    <div class="timeline-date in-progress">November 2026 &mdash; In progress</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon in-progress">&#127918;</span> GPU</h3>
+                        <p>
+                            One physical GPU can be assigned to one VM. NVIDIA vGPU slices a card
+                            across guests. The slice needs an NVIDIA AI Enterprise vGPU manager
+                            package on the host. Live migration does not move a passed-through device.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>PCI passthrough (<code>--pci</code>). One card, one VM</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>NVIDIA vGPU host and slices (<code>NodeVgpu</code>, <code>kctl node vgpu enable</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-in-progress">In Progress</span></span>
+                                <span>Intel and AMD SR-IOV slices use the same manifest. They have not been run on lab hardware</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="timeline-entry">
+                    <div class="timeline-dot in-progress"></div>
+                    <div class="timeline-date in-progress">November 2026 &mdash; In progress</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon in-progress">&#128279;</span> Ingress gateway</h3>
+                        <p>
+                            North-south HTTPS terminates on the cluster. Caddy presents the
+                            certificate, Coraza inspects the request, and keepalived holds the
+                            VIP. A route can target a VM, an external address, or a Kubernetes Service.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>IngressGateway</code>, <code>IngressRoute</code>, and <code>WafPolicy</code> from <code>kctl</code>, the dashboard, MCP, and Terraform</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>ACME (including DNS-01 and wildcards), TCP and SNI routes, rate limits, IP allow and deny lists</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>WAF detect and block modes, with <code>ingress.waf.*</code> webhooks and Caddy metrics in VictoriaMetrics</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>Container backends, a Gateway API <code>HTTPRoute</code>, and certificates issued by the kcore PKI</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">November 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128225;</span> DNS and DHCP provisioner</h3>
+                        <p>
+                            VM networks still get an address from dnsmasq on the host bridge.
+                            A separate provisioner runs PowerDNS and Kea for the networks it owns,
+                            and can read a RouterOS export.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Multi-network PowerDNS and Kea</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>List the leases Kea holds</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Import a RouterOS configuration into the provisioner</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">November 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128421;</span> Slurm on kcoreOS</h3>
+                        <p>
+                            Slurm runs on the nodes, not inside a guest. Compute members are
+                            cordoned, so the VM scheduler leaves them to <code>slurmd</code>.
+                            A node belongs to one Slurm cluster.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>SlurmCluster</code>: controller, optional backup controller, login, accounting (<code>slurmdbd</code> and MariaDB), and compute</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>kctl slurm plan</code>, then apply. The dashboard, MCP, and Terraform provider cover the same resource</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- Q4 2026: MIGRATIONS -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot in-progress"></div>
+                    <div class="timeline-date in-progress">November 2026 &mdash; In progress</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon in-progress">&#128260;</span> Migrations</h3>
+                        <p>
+                            <code>kcore-migrate</code> inventories a vCenter or Proxmox estate and
+                            converts disks you have already exported. It does not read disk bytes
+                            out of the datastore. Cutover stays a project.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>VMware and Proxmox inventory, a gap report, and Terraform for <code>kcore_vm</code></span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Convert an exported OVA, VMDK, qcow2, or raw disk to qcow2 or raw</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>Read disks straight from vCenter</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- Q4 2026: OBSERVABILITY -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot in-progress"></div>
+                    <div class="timeline-date in-progress">November 2026 &mdash; In progress</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon in-progress">&#128200;</span> Observability &amp; Logging</h3>
+                        <p>
+                            Host metrics are scraped inside the cluster. There is no central log store yet.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Prometheus <code>node_exporter</code> on every node (TCP 9100) and VictoriaMetrics on controller nodes (TCP 8428, including vmui)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>kctl get cluster-health</code> for nodes, leftover VMs, certificate expiry, and replication conflicts</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>Central logging from the controller and node agents</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- Q4 2026: BARE-METAL -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot in-progress"></div>
+                    <div class="timeline-date in-progress">November 2026 &mdash; In progress</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon in-progress">&#128421;</span> Bare-Metal</h3>
+                        <p>
+                            PostgreSQL, Kubernetes, and ClickHouse run on kcoreOS itself, declared
+                            through kcore and applied on the node. They do not run inside a VM.
+                            MySQL is the same shape and is not built yet.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>PostgreSQL from the NixOS <code>services.postgresql</code> package. One database per node (<code>kind: PostgreSQL</code>)</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Kubernetes on kcoreOS with Cilium, an API VIP, and LVM or ZFS volumes. <code>kctl kubernetes</code>, the dashboard, MCP, and Terraform</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>MySQL from the NixOS package, declared and applied on the node the same way</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>ClickHouse on kcoreOS (<code>kind: ClickhouseCluster</code>): shards, replicas, and ClickHouse Keeper. <code>kctl clickhouse</code> plans, applies, scales, replaces a replica, upgrades, and deletes. A rollout keeps one healthy replica of each shard and Keeper quorum. MCP and the dashboard cover the same resource</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- Q1 2027: POSTGRESQL CLUSTER -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot planned"></div>
+                    <div class="timeline-date planned">Q1 2027 &mdash; Planned</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon planned">&#128451;</span> PostgreSQL Cluster</h3>
+                        <p>
+                            A PostgreSQL cluster on kcoreOS, built from the NixOS
+                            <code>services.postgresql</code> package. Members run on the nodes
+                            themselves, declared through kcore. The cluster does not run inside a VM.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>Multi-node PostgreSQL on kcoreOS, following the single-database bare-metal service</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>Declarative membership, replication, and failover through the same kcore apply path</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- =============================== -->
+                <!-- 2027: OPERATIONS + FORMAL FOLLOW-UPS -->
+                <!-- =============================== -->
+                <div class="timeline-entry">
+                    <div class="timeline-dot planned"></div>
+                    <div class="timeline-date planned">2027</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon planned">&#128300;</span> Formal Verification &mdash; Next Iteration</h3>
+                        <p>
+                            Building on the four shipped phases (proptest, Kani, DB invariants, TLA+),
+                            extending depth and coverage in places where the current bounds or fuzz
+                            domains leave room for higher-confidence guarantees.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>Raise Kani <code>MAX_INPUT_LEN</code> bound once the per-harness matrix budget allows it</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>Kani harness for <code>validate_path_under_root</code> alongside the already-shipped segment validator</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>TLA+ invariants for the compensation executor and replication reservations</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-planned">Planned</span></span>
+                                <span>Extend proptest coverage to security-group rule rendering and replication outbox state machines</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">November 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128190;</span> Immutable backups</h3>
+                        <p>
+                            kcore Vault is a separate appliance. It snapshots the guest disks,
+                            pulls the changed blocks, and stores chunks that cannot be deleted
+                            before <code>retain_until</code>. <code>kctl backup</code> is still
+                            only a copy of the controller database.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Vault 0.1.1: policies, jobs, restore, and a browser console with TOTP</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Immutability: appliance-enforced retention on the ZFS repository, and S3 Object Lock in COMPLIANCE mode</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Incremental backups from changed extents. A restore writes the volume back as Ceph, LVM, or ZFS</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="timeline-entry">
+                    <div class="timeline-dot shipped"></div>
+                    <div class="timeline-date shipped">October 2026 &mdash; Shipped</div>
+                    <div class="timeline-card">
+                        <h3><span class="card-icon shipped">&#128736;</span> Operations &amp; Node Lifecycle</h3>
+                        <p>
+                            Day-2 tooling for node removal, cluster health, a copy of the controller database,
+                            and moving shared-disk VMs when a node stops heartbeating.
+                        </p>
+                        <ul class="detail-list">
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span><code>GetClusterHealth</code> API &mdash; <code>kctl get cluster-health</code> reports ready nodes, VMs left on not-ready nodes, certificates inside 30 days, and unresolved replication conflicts</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Controller database copy &mdash; <code>kctl backup -o snapshot.sqlite</code> and <code>kctl restore controller -f snapshot.sqlite --confirm</code>. This is not guest backup.</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Automatic VM migration on node failure &mdash; after 90 seconds without a heartbeat, Ceph VMs move to another healthy member; local-disk VMs stay on the failed node</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Node cordon and certificate invalidation on delete &mdash; <code>kctl node cordon</code> stops new placement without moving VMs; <code>kctl node delete</code> refuses while VMs, workloads, or networks remain, then revokes the node's certificates (RFC 5280 reason 5) and removes the row</span>
+                            </li>
+                            <li>
+                                <span class="item-status"><span class="status-badge status-shipped">Shipped</span></span>
+                                <span>Bare-metal provisioner. It configures servers over IPMI and Redfish, and netboots kcore with UEFI HTTP boot.</span>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- Not planned -->
+            <div class="not-planned-note">
+                <div class="not-planned-card">
+                    <h3>Explicitly not planned</h3>
+                    <ul>
+                        <li>CSR approval flow (Kubernetes-style certificate signing requests)</li>
+                        <li>Admission webhooks</li>
+                        <li>Formal API versioning contract</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta" style="margin-top: 2rem;">
+        <div class="container">
+            <div class="cta-content">
+                <h2>Want to shape the roadmap?</h2>
+                <p>Open an issue on GitHub or reach out directly. We prioritise based on real usage.</p>
+                <div class="cta-buttons">
+                    <a href="https://github.com/kcorehypervisor/kcore" class="btn btn-primary btn-large">GitHub</a>
+                    <a href="mailto:team@tacconiconsulting.com" class="btn btn-secondary btn-large">Contact Us</a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h4>kcore</h4>
+                    <p data-i18n="footer.tagline">Declarative virtualization for edge and datacenters</p>
+                </div>
+                <div class="footer-section">
+                    <h4 data-i18n="footer.product">Product</h4>
+                    <ul>
+                        <li><a href="features.html" data-i18n="nav.features">Features</a></li>
+                        <li><a href="pricing.html" data-i18n="nav.pricing">Pricing</a></li>
+                        <li><a href="roadmap.html">Roadmap</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4 data-i18n="footer.resources">Resources</h4>
+                    <ul>
+                        <li><a href="docs.html" data-i18n="footer.documentation">Documentation</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4 data-i18n="footer.company">Company</h4>
+                    <ul>
+                        <li><a href="about.html" data-i18n="footer.about">About</a></li>
+                        <li><a href="blog.html" data-i18n="footer.blog">Blog</a></li>
+                        <li><a href="https://github.com/kcorehypervisor/kcore">GitHub</a></li>
+                        <li><a href="partners.html" data-i18n="footer.partners">Partners</a></li>
+                        <li><a href="trademark.html" data-i18n="footer.trademark">Trademark</a></li>
+                        <li><a href="mailto:team@tacconiconsulting.com" data-i18n="footer.contact">Contact</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; 2026 Tacconi Consulting Ltd. Registered in England and Wales #16750820.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="js/i18n.js"></script>
+    <script src="js/main.js"></script>
+    <script src="js/code-color.js"></script>
+    <!-- Cloudflare Web Analytics --><script type='module' src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "2bd37d513ccf45fbac6c3f92fa8f3348"}'></script><!-- End Cloudflare Web Analytics -->
+</body>
+</html>

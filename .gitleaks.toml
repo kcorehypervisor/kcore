@@ -20,3 +20,8 @@ description = "Design-doc example of a ClickHouse password hash, not a live cred
 paths = ['''docs/bare-metal-clickhouse\.md''']
 regexTarget = "line"
 regexes = ['''passwordSha256Hex:\s*[0-9a-fA-F]{64}''']
+
+[[allowlists]]
+description = "Public Cloudflare Web Analytics site token on the marketing pages."
+regexTarget = "line"
+regexes = ['''data-cf-beacon='\{"token": "[0-9a-f]{32}"\}''']
