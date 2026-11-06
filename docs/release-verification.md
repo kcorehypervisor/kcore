@@ -75,6 +75,12 @@ explicitly.
 
 The identity is the email chosen at the Sigstore prompt. Signing in with
 GitHub records GitHub's OIDC issuer. It is not a GitHub username.
+`scripts/release.sh sign` verifies its own bundle against this pair and
+refuses to publish one signed by any other account.
+
+v0.6.1 is the one exception. It was signed as `team@tacconiconsulting.com`
+with `https://accounts.google.com`. The script and `get-kctl.sh` know this.
+By hand, use that pair for v0.6.1. v0.3.0 and earlier are unsigned.
 
 To read the identity out of a bundle you already have — useful for
 confirming what was published:
@@ -224,8 +230,9 @@ date.
 ## Installing `kctl` with verification
 
 [`scripts/get-kctl.sh`](../scripts/get-kctl.sh) verifies the signature
-automatically **when `cosign` is already on `PATH`** and a signer identity is
-configured, and otherwise falls back silently to checksums alone. This keeps
+automatically **when `cosign` is already on `PATH`**, and otherwise falls back
+silently to checksums alone. `KCTL_SIGNER_IDENTITY` and `KCTL_SIGNER_ISSUER`
+override the expected signer. This keeps
 `curl … | bash` working for users without `cosign`, at the cost of it being
 best-effort: it is not a substitute for verifying deliberately.
 

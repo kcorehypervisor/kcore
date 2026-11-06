@@ -38,6 +38,10 @@ SBOM_FILES=(
 # Signing dist/SHA256SUMS transitively covers every other asset, SBOMs
 # included, so this is the only signature a release carries.
 SIGSTORE_BUNDLE="SHA256SUMS.sigstore.json"
+# Must match docs/release-verification.md, scripts/verify-release.sh, and
+# scripts/get-kctl.sh.
+SIGNER_IDENTITY="82217+rtacconi@users.noreply.github.com"
+SIGNER_ISSUER="https://github.com/login/oauth"
 # cosign 3.0.0-3.0.4 cannot verify Rekor v2 bundles without
 # --use-signed-timestamps; 3.0.5 handles it automatically and already
 # defaults --new-bundle-format=true, which is what writes .sigstore.json.
@@ -247,9 +251,9 @@ cmd_sign() {
 		die "cosign ${cosign_version} is too old; need >= ${COSIGN_MIN_VERSION} for Rekor v2 (see docs/release-verification.md)"
 
 	echo "==> Signing dist/SHA256SUMS with Sigstore (cosign ${cosign_version}, keyless)..."
-	echo "    A browser window opens for OIDC login. Sign in with the"
-	echo "    identity published in docs/release-verification.md; the"
-	echo "    certificate and its identity go into the public Rekor log."
+	echo "    A browser window opens for OIDC login. Choose GitHub and sign in"
+	echo "    as ${SIGNER_IDENTITY}; the certificate and its identity go into"
+	echo "    the public Rekor log."
 	# --yes accepts that transparency-log entry non-interactively, which
 	# would otherwise block the release on a prompt.
 	nix develop --command cosign sign-blob \
@@ -258,6 +262,16 @@ cmd_sign() {
 		dist/SHA256SUMS
 	[[ -s "dist/${SIGSTORE_BUNDLE}" ]] ||
 		die "cosign wrote no dist/${SIGSTORE_BUNDLE}"
+	# A login with another account still produces a valid bundle, which
+	# every verifier would then reject. Catch it before anything is published.
+	if ! nix develop --command cosign verify-blob \
+		--bundle "dist/${SIGSTORE_BUNDLE}" \
+		--certificate-identity "${SIGNER_IDENTITY}" \
+		--certificate-oidc-issuer "${SIGNER_ISSUER}" \
+		dist/SHA256SUMS; then
+		rm -f "dist/${SIGSTORE_BUNDLE}"
+		die "dist/SHA256SUMS was not signed as ${SIGNER_IDENTITY} (${SIGNER_ISSUER}); run '${0} sign' again with that account"
+	fi
 	echo "==> Wrote dist/${SIGSTORE_BUNDLE}"
 }
 

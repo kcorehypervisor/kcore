@@ -17,11 +17,10 @@ set -euo pipefail
 DEFAULT_REPO="kcorehypervisor/kcore"
 REPO="${KCORE_GITHUB_REPO:-${DEFAULT_REPO}}"
 
-# Fulcio certificate for releases signed with the rtacconi GitHub account.
-# See docs/release-verification.md.
-DEFAULT_SIGNER_IDENTITY="82217+rtacconi@users.noreply.github.com"
-SIGNER_IDENTITY="${KCTL_SIGNER_IDENTITY:-${DEFAULT_SIGNER_IDENTITY}}"
-SIGNER_ISSUER="${KCTL_SIGNER_ISSUER:-https://github.com/login/oauth}"
+# Expected Fulcio identity and issuer. Empty values take the default for the
+# release being installed (signer_for). See docs/release-verification.md.
+SIGNER_IDENTITY="${KCTL_SIGNER_IDENTITY:-}"
+SIGNER_ISSUER="${KCTL_SIGNER_ISSUER:-}"
 SUMS_BUNDLE_ASSET="SHA256SUMS.sigstore.json"
 # cosign 3.0.0-3.0.4 rejects Rekor v2 bundles without --use-signed-timestamps.
 COSIGN_MIN_VERSION="3.0.5"
@@ -78,19 +77,33 @@ version_ge() {
 	}'
 }
 
+# "identity issuer" that signed release $1 (a version without the v).
+# Releases are signed through GitHub; v0.6.1 alone was signed through Google.
+signer_for() {
+	if [[ "${1}" == "0.6.1" ]]; then
+		echo "team@tacconiconsulting.com https://accounts.google.com"
+	else
+		echo "82217+rtacconi@users.noreply.github.com https://github.com/login/oauth"
+	fi
+}
+
 # Optional Sigstore verification of the release manifest. Checksums alone
 # catch corruption but not tampering, because SHA256SUMS is served from the
 # same host as the tarball; a signature over it closes that gap.
 #
 # This is opt-in by presence and must stay that way: `curl | bash` has to
 # keep working for the majority of users with no cosign installed. A missing
-# cosign, a cosign too old for Rekor v2, a release cut before signing
-# existed, or an unconfigured expected identity all skip the check quietly.
+# cosign, a cosign too old for Rekor v2, or a release cut before signing
+# existed all skip the check quietly.
 # A signature that is present and *invalid* is a different matter and aborts.
 verify_sums_signature() {
 	local sums_file="${1}" tag="${2}" tmpdir="${3}"
 	have_cmd cosign || return 0
-	[[ -n "${SIGNER_IDENTITY}" ]] || return 0
+
+	local identity issuer
+	read -r identity issuer <<<"$(signer_for "${tag#v}")"
+	identity="${SIGNER_IDENTITY:-${identity}}"
+	issuer="${SIGNER_ISSUER:-${issuer}}"
 
 	local cosign_version
 	cosign_version="$(cosign version 2>/dev/null | awk '/^GitVersion:/ {print $2}')"
@@ -109,8 +122,8 @@ verify_sums_signature() {
 	echo "==> Verifying SHA256SUMS signature with cosign ${cosign_version}"
 	cosign verify-blob \
 		--bundle "${tmpdir}/${SUMS_BUNDLE_ASSET}" \
-		--certificate-identity "${SIGNER_IDENTITY}" \
-		--certificate-oidc-issuer "${SIGNER_ISSUER}" \
+		--certificate-identity "${identity}" \
+		--certificate-oidc-issuer "${issuer}" \
 		"${sums_file}" ||
 		die "SHA256SUMS signature verification failed for ${tag}; refusing to install"
 }
