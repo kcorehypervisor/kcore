@@ -30,7 +30,7 @@
 | Security groups | [security-groups.md](./security-groups.md) |
 | k8s vs kcore security | [security-k8s-vs-kcore.md](./security-k8s-vs-kcore.md) |
 | Bare-metal Kubernetes (plan) | [bare-metal-kubernetes.md](./bare-metal-kubernetes.md) |
-| `kctl agent` chat UI over the MCP (plan) | [agent-web-ui.md](./agent-web-ui.md) |
+| `kctl agent` chat UI | [agent-web-ui.md](./agent-web-ui.md) |
 | Storage | [storage.md](./storage.md) |
 | kcore SAN (Ceph) | [ceph.md](./ceph.md) |
 | VM migration (cold / live) | [vm-migration.md](./vm-migration.md) |

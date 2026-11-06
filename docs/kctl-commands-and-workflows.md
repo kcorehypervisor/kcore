@@ -518,7 +518,7 @@ kctl apply -f ./controller-config.nix --dry-run
 
 Top-level commands:
 
-- `kctl agent [--port N] [--no-browser] [--agent-bin PATH] [--provisioning HOST:PORT] [--role read-only|vm-admin]` opens a local chat UI that drives the cluster through kcore-mcp with this context's certificates (use `--as <operator>` to give it a limited identity); see [agent-web-ui.md](./agent-web-ui.md)
+- `kctl agent [--port N] [--no-browser] [--provisioning HOST:PORT] [--role read-only|vm-admin]` opens a local chat UI that drives the cluster with this context's certificates, all inside the `kctl` binary (use `--as <operator>` to give it a limited identity); see [agent-web-ui.md](./agent-web-ui.md)
 - `kctl create vm ... --storage-backend <filesystem|lvm|zfs|ceph> --storage-size-bytes <bytes>`
 - `kctl create cluster ...`
 - `kctl create vm ... [--extra-network <name>]... [--label key=value]... [--anti-affinity <group>]`

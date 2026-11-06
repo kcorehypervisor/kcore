@@ -59,6 +59,7 @@
               || (toString path) == "${toString ./.}/modules"
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/crates/dashboard/assets/" (toString path)
+              || pkgs.lib.hasPrefix "${toString ./.}/crates/kctl/assets/" (toString path)
               || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path);
           };
 
@@ -114,47 +115,6 @@
             }
           );
 
-          kcore-agent = pkgs.buildNpmPackage {
-            pname = "kcore-agent";
-            inherit (builtins.fromJSON (builtins.readFile ./kcore-mcp/packages/agent/package.json)) version;
-            src = ./kcore-mcp;
-            npmDepsHash = "sha256-EgqCF0Mk0UJ0SQ+dvlGuNE0PAmf63PpnjXNwmu/ocEs=";
-            nodejs = pkgs.nodejs_22;
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-            buildPhase = ''
-              runHook preBuild
-              npm run build -w kcore-agent
-              runHook postBuild
-            '';
-            installPhase = ''
-              runHook preInstall
-              mkdir -p $out/lib/kcore-agent $out/bin
-              cp -r packages/agent/dist/. $out/lib/kcore-agent/
-              makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/kcore-agent \
-                --add-flags $out/lib/kcore-agent/index.js
-              runHook postInstall
-            '';
-            meta = {
-              description = "Local chat UI that drives kcore through kcore-mcp";
-              mainProgram = "kcore-agent";
-            };
-          };
-
-          kctl-with-agent = pkgs.symlinkJoin {
-            name = "kctl-with-agent-${kcoreVersion}";
-            paths = [
-              kctl
-              kcore-agent
-            ];
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-            postBuild = ''
-              rm $out/bin/kctl
-              makeWrapper ${kctl}/bin/kctl $out/bin/kctl \
-                --set-default KCORE_AGENT_BIN ${kcore-agent}/bin/kcore-agent
-            '';
-            meta.mainProgram = "kctl";
-          };
-
           kcoreGitRev = inputs.self.shortRev or inputs.self.dirtyShortRev or "dev";
 
           kcore-console = craneLib.buildPackage (
@@ -183,8 +143,6 @@
               kcore-node-agent
               kcore-controller
               kctl
-              kcore-agent
-              kctl-with-agent
               kcore-dashboard
               kcore-console
               kcore-disk-verify
@@ -196,7 +154,6 @@
               kcore-node-agent
               kcore-controller
               kctl
-              kcore-agent
               kcore-dashboard
               kcore-console
               kcore-disk-verify

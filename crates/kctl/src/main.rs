@@ -5,6 +5,7 @@
     clippy::result_large_err
 )]
 
+mod agent;
 mod apply_summary;
 mod client;
 mod commands;
@@ -2733,7 +2734,20 @@ async fn main() {
         }
         Command::Agent(args) => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::agent::run(&info, args).await
+            let config_path = cli
+                .config
+                .clone()
+                .unwrap_or_else(config::default_config_path);
+            commands::agent::run(
+                commands::agent::Startup {
+                    info: &info,
+                    config_path: &config_path,
+                    operator_as: cli.operator_as.clone(),
+                    pinned: !cli.controller.is_empty() || cli.insecure,
+                },
+                args,
+            )
+            .await
         }
         Command::Console { name } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));

@@ -291,7 +291,7 @@ function vmRequest(spec: Record<string, unknown>): Record<string, unknown> {
       memoryBytes: memory ? sizeBytes(memory, "memory") : sizeBytes("2G", "memory"),
       nics,
       disks: [],
-      desiredState: desired(spec.desiredState),
+      desiredState: desired(spec.desiredState, "VM_DESIRED_STATE"),
     },
   };
 }
@@ -377,7 +377,7 @@ function containerRequest(spec: Record<string, unknown>): Record<string, unknown
       command: stringList(spec.command),
       env,
       ports: stringList(spec.ports),
-      desiredState: desired(spec.desiredState),
+      desiredState: desired(spec.desiredState, "WORKLOAD_DESIRED_STATE"),
     },
   };
 }
@@ -550,10 +550,10 @@ function backendEnum(value: string): string {
   return mapped;
 }
 
-function desired(value: unknown): string {
-  if (value === "running") return "VM_DESIRED_STATE_RUNNING";
-  if (value === "stopped") return "VM_DESIRED_STATE_STOPPED";
-  if (value === undefined || value === "") return "VM_DESIRED_STATE_UNSPECIFIED";
+function desired(value: unknown, prefix: "VM_DESIRED_STATE" | "WORKLOAD_DESIRED_STATE"): string {
+  if (value === "running") return `${prefix}_RUNNING`;
+  if (value === "stopped") return `${prefix}_STOPPED`;
+  if (value === undefined || value === "") return `${prefix}_UNSPECIFIED`;
   throw new InputError("desired state must be running or stopped");
 }
 

@@ -1,0 +1,459 @@
+syntax = "proto3";
+
+package kcore.provisioning;
+
+option go_package = "github.com/kcore/kcore/api/provisioning";
+
+import "google/protobuf/timestamp.proto";
+
+// Provisioning service - manages bare-metal server provisioning
+service Provisioning {
+  // Image Management
+  rpc CreateImage(CreateImageRequest) returns (CreateImageResponse);
+  rpc GetImage(GetImageRequest) returns (GetImageResponse);
+  rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
+  rpc DeleteImage(DeleteImageRequest) returns (DeleteImageResponse);
+  rpc VerifyImage(VerifyImageRequest) returns (VerifyImageResponse);
+  rpc DownloadImage(DownloadImageRequest) returns (DownloadImageResponse);
+
+  // Machine Management (Phase 3+)
+  rpc RegisterMachine(RegisterMachineRequest) returns (RegisterMachineResponse);
+  rpc GetMachine(GetMachineRequest) returns (GetMachineResponse);
+  rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse);
+  rpc UpdateMachine(UpdateMachineRequest) returns (UpdateMachineResponse);
+  rpc DeleteMachine(DeleteMachineRequest) returns (DeleteMachineResponse);
+  
+  // Boot Target Management (Phase 3)
+  rpc SetBootTarget(SetBootTargetRequest) returns (SetBootTargetResponse);
+  rpc GetBootTarget(GetBootTargetRequest) returns (GetBootTargetResponse);
+  rpc ClearBootTarget(ClearBootTargetRequest) returns (ClearBootTargetResponse);
+
+  // Redfish Management (Phase 4)
+  rpc DiscoverMachine(DiscoverMachineRequest) returns (DiscoverMachineResponse);
+  rpc ConfigureBmcBoot(ConfigureBmcBootRequest) returns (ConfigureBmcBootResponse);
+  rpc InstallCaCertificate(InstallCaCertificateRequest) returns (InstallCaCertificateResponse);
+  rpc PowerControl(PowerControlRequest) returns (PowerControlResponse);
+
+  // PKI Management (Phase 5)
+  rpc IssueServerCertificate(IssueServerCertificateRequest) returns (IssueServerCertificateResponse);
+  rpc IssueNodeCertificate(IssueNodeCertificateRequest) returns (IssueNodeCertificateResponse);
+  rpc GetCertificate(GetCertificateRequest) returns (GetCertificateResponse);
+  rpc ListCertificates(ListCertificatesRequest) returns (ListCertificatesResponse);
+  rpc RevokeCertificate(RevokeCertificateRequest) returns (RevokeCertificateResponse);
+  rpc RenewCertificate(RenewCertificateRequest) returns (RenewCertificateResponse);
+  rpc GetCaBundle(GetCaBundleRequest) returns (GetCaBundleResponse);
+}
+
+// ============================================================================
+// Image Resources
+// ============================================================================
+
+message Image {
+  string id = 1;                          // UUID
+  string name = 2;                        // e.g., kcore-os-0.3.0-x86_64
+  string version = 3;                     // e.g., 0.3.0
+  string architecture = 4;                // x86_64, aarch64
+  ImageType image_type = 5;               // ISO, tar.gz, raw, qcow2
+  string source_url = 6;                  // Remote HTTPS URL
+  string local_path = 7;                  // Local filesystem path
+  string sha256 = 8;                      // SHA256 checksum
+  int64 size_bytes = 9;                   // File size
+  VerificationStatus verification_status = 10;
+  bool signature_verified = 11;
+  map<string, string> metadata = 12;      // Additional metadata
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+}
+
+enum ImageType {
+  IMAGE_TYPE_UNSPECIFIED = 0;
+  IMAGE_TYPE_ISO = 1;
+  IMAGE_TYPE_TAR_GZ = 2;
+  IMAGE_TYPE_RAW = 3;
+  IMAGE_TYPE_QCOW2 = 4;
+}
+
+enum VerificationStatus {
+  VERIFICATION_STATUS_UNSPECIFIED = 0;
+  VERIFICATION_STATUS_PENDING = 1;
+  VERIFICATION_STATUS_VERIFIED = 2;
+  VERIFICATION_STATUS_FAILED = 3;
+}
+
+// ============================================================================
+// Image RPCs
+// ============================================================================
+
+message CreateImageRequest {
+  string name = 1;
+  string version = 2;
+  string architecture = 3;
+  ImageType image_type = 4;
+  string source_url = 5;                  // Remote HTTPS URL to download from
+  string sha256 = 6;                      // Expected SHA256 checksum
+  map<string, string> metadata = 7;
+}
+
+message CreateImageResponse {
+  Image image = 1;
+}
+
+message GetImageRequest {
+  string id = 1;                          // Can be ID or name
+}
+
+message GetImageResponse {
+  Image image = 1;
+}
+
+message ListImagesRequest {
+  string architecture = 1;                // Filter by architecture
+  ImageType image_type = 2;               // Filter by type
+  VerificationStatus verification_status = 3; // Filter by verification status
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListImagesResponse {
+  repeated Image images = 1;
+  string next_page_token = 2;
+  int32 total_count = 3;
+}
+
+message DeleteImageRequest {
+  string id = 1;                          // ID or name
+  bool force = 2;                         // Force delete even if in use
+}
+
+message DeleteImageResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message VerifyImageRequest {
+  string id = 1;                          // ID or name
+  bool recheck = 2;                       // Force re-verification
+}
+
+message VerifyImageResponse {
+  bool verified = 1;
+  string message = 2;
+  VerificationStatus status = 3;
+}
+
+message DownloadImageRequest {
+  string id = 1;                          // ID or name
+  bool force = 2;                         // Force re-download
+}
+
+message DownloadImageResponse {
+  bool success = 1;
+  string message = 2;
+  string local_path = 3;
+  int64 size_bytes = 4;
+}
+
+// ============================================================================
+// Machine Resources
+// ============================================================================
+
+message Machine {
+  string id = 1;                          // UUID
+  string name = 2;                        // Human-readable name
+  string mac_address = 3;                 // Primary MAC address
+  string ip_address = 4;                  // Current/last known IP
+  string manufacturer = 5;                // Dell, HP, Supermicro, etc.
+  string model = 6;                       // PowerEdge T140, etc.
+  string serial_number = 7;               // Service tag
+  HardwareInfo hardware = 8;
+  BmcInfo bmc = 9;
+  MachineState state = 10;
+  string boot_target_image_id = 11;       // Current boot target
+  map<string, string> metadata = 12;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+  google.protobuf.Timestamp last_seen_at = 15;
+}
+
+message HardwareInfo {
+  string cpu_model = 1;
+  int32 cpu_cores = 2;
+  int64 memory_bytes = 3;
+  repeated DiskInfo disks = 4;
+  repeated NetworkInterface network_interfaces = 5;
+}
+
+message DiskInfo {
+  string name = 1;                        // sda, nvme0n1
+  int64 size_bytes = 2;
+  string disk_type = 3;                   // HDD, SSD, NVMe
+  string model = 4;
+}
+
+message NetworkInterface {
+  string name = 1;                        // eth0, eno1
+  string mac_address = 2;
+  string ip_address = 3;
+  int32 speed_mbps = 4;
+}
+
+message BmcInfo {
+  string ip_address = 1;                  // iDRAC/BMC IP
+  string mac_address = 2;
+  string bmc_type = 3;                    // iDRAC9, iLO5, IPMI
+  string firmware_version = 4;
+}
+
+enum MachineState {
+  MACHINE_STATE_UNSPECIFIED = 0;
+  MACHINE_STATE_DISCOVERED = 1;           // Found but not yet provisioned
+  MACHINE_STATE_PROVISIONING = 2;         // Currently provisioning
+  MACHINE_STATE_PROVISIONED = 3;          // Successfully provisioned
+  MACHINE_STATE_FAILED = 4;               // Provisioning failed
+  MACHINE_STATE_OFFLINE = 5;              // Not responding
+}
+
+// ============================================================================
+// Machine RPCs
+// ============================================================================
+
+message RegisterMachineRequest {
+  string name = 1;
+  string mac_address = 2;
+  string ip_address = 3;
+  string manufacturer = 4;
+  string model = 5;
+  string serial_number = 6;
+  HardwareInfo hardware = 7;
+  BmcInfo bmc = 8;
+  map<string, string> metadata = 9;
+}
+
+message RegisterMachineResponse {
+  Machine machine = 1;
+}
+
+message GetMachineRequest {
+  string id = 1;                          // Can be ID, name, MAC, or serial
+}
+
+message GetMachineResponse {
+  Machine machine = 1;
+}
+
+message ListMachinesRequest {
+  MachineState state = 1;                 // Filter by state
+  string manufacturer = 2;                // Filter by manufacturer
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListMachinesResponse {
+  repeated Machine machines = 1;
+  string next_page_token = 2;
+  int32 total_count = 3;
+}
+
+message UpdateMachineRequest {
+  string id = 1;
+  string name = 2;
+  string ip_address = 3;
+  MachineState state = 4;
+  HardwareInfo hardware = 5;
+  map<string, string> metadata = 6;
+}
+
+message UpdateMachineResponse {
+  Machine machine = 1;
+}
+
+message DeleteMachineRequest {
+  string id = 1;
+  bool force = 2;
+}
+
+message DeleteMachineResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ============================================================================
+// Boot Target Management
+// ============================================================================
+
+message SetBootTargetRequest {
+  string machine_id = 1;                  // Machine ID, name, MAC, or serial
+  string image_id = 2;                    // Image ID or name
+  map<string, string> boot_params = 3;    // Additional kernel parameters
+}
+
+message SetBootTargetResponse {
+  bool success = 1;
+  string message = 2;
+  Machine machine = 3;
+}
+
+message GetBootTargetRequest {
+  string machine_id = 1;
+}
+
+message GetBootTargetResponse {
+  Machine machine = 1;
+  Image image = 2;
+  map<string, string> boot_params = 3;
+}
+
+message ClearBootTargetRequest {
+  string machine_id = 1;
+}
+
+message ClearBootTargetResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ============================================================================
+// Redfish Management (Phase 4)
+// ============================================================================
+
+message DiscoverMachineRequest {
+  string bmc_address = 1;                 // BMC IP or hostname
+  string username = 2;                    // BMC username
+  string password = 3;                    // BMC password
+  bool register = 4;                      // Auto-register after discovery
+}
+
+message DiscoverMachineResponse {
+  Machine machine = 1;
+  string message = 2;
+}
+
+message ConfigureBmcBootRequest {
+  string machine_id = 1;                  // Machine to configure
+  string boot_url = 2;                    // UEFI HTTP Boot URL
+  bool install_ca_cert = 3;               // Install HTTPS CA certificate
+  string ca_cert_pem = 4;                 // CA certificate in PEM format
+}
+
+message ConfigureBmcBootResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message InstallCaCertificateRequest {
+  string machine_id = 1;
+  string ca_cert_pem = 2;
+}
+
+message InstallCaCertificateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+enum PowerAction {
+  POWER_ACTION_UNSPECIFIED = 0;
+  POWER_ACTION_ON = 1;
+  POWER_ACTION_OFF = 2;
+  POWER_ACTION_CYCLE = 3;
+  POWER_ACTION_RESET = 4;
+}
+
+message PowerControlRequest {
+  string machine_id = 1;
+  PowerAction action = 2;
+  bool force = 3;                         // Force action (hard reset/power off)
+  bool wait = 4;                          // Wait for completion
+}
+
+message PowerControlResponse {
+  bool success = 1;
+  string message = 2;
+  string power_state = 3;                 // Current power state after action
+}
+
+// ============================================================================
+// PKI Management (Phase 5)
+// ============================================================================
+
+message Certificate {
+  string id = 1;                          // UUID
+  string serial = 2;                      // Hex serial number
+  string common_name = 3;
+  string cert_type = 4;                   // server, client, node_bootstrap
+  string cert_pem = 5;
+  string key_pem = 6;
+  string cert_chain_pem = 7;              // Full chain (cert + CA chain)
+  string machine_id = 8;                  // Associated machine (optional)
+  string valid_from = 9;                  // RFC3339
+  string valid_until = 10;                // RFC3339
+  bool revoked = 11;
+  string revoked_at = 12;                 // RFC3339 (if revoked)
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+}
+
+message IssueServerCertificateRequest {
+  string hostname = 1;                    // Common name
+  repeated string san_dns = 2;            // DNS SANs
+  repeated string san_ips = 3;            // IP SANs
+}
+
+message IssueServerCertificateResponse {
+  Certificate certificate = 1;
+}
+
+message IssueNodeCertificateRequest {
+  string machine_id = 1;                  // Machine to issue cert for
+}
+
+message IssueNodeCertificateResponse {
+  Certificate certificate = 1;
+}
+
+message GetCertificateRequest {
+  string serial_or_common_name = 1;       // Serial number or common name
+}
+
+message GetCertificateResponse {
+  Certificate certificate = 1;
+}
+
+message ListCertificatesRequest {
+  string machine_id = 1;                  // Filter by machine
+  string cert_type = 2;                   // Filter by type
+  bool include_revoked = 3;               // Include revoked certs
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListCertificatesResponse {
+  repeated Certificate certificates = 1;
+  string next_page_token = 2;
+  int32 total_count = 3;
+}
+
+message RevokeCertificateRequest {
+  string serial = 1;                      // Certificate serial number
+}
+
+message RevokeCertificateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RenewCertificateRequest {
+  string serial_or_common_name = 1;       // Certificate to renew
+}
+
+message RenewCertificateResponse {
+  Certificate certificate = 1;            // New certificate
+  string message = 2;
+}
+
+message GetCaBundleRequest {
+  bool include_chain = 1;                 // Include parent CA chain
+}
+
+message GetCaBundleResponse {
+  string ca_bundle_pem = 1;               // CA certificate(s) in PEM format
+}
