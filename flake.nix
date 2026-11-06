@@ -249,6 +249,12 @@
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
             kcore-slurm = import ./tests/kcore-slurm.nix { inherit pkgs; };
+            mail-module-eval = import ./tests/mail-module-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
+            kcore-mail = import ./tests/kcore-mail.nix { inherit pkgs; };
             ch-vm-module-eval = import ./tests/ch-vm-module-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;
@@ -345,6 +351,7 @@
           chVmModule = ./modules/ch-vm;
           cephModule = ./modules/kcore-ceph.nix;
           slurmModule = ./modules/kcore-slurm.nix;
+          mailModule = ./modules/kcore-mail.nix;
           metricsModule = ./modules/kcore-metrics.nix;
           inherit (inputs.nixpkgs) lib;
 
@@ -479,6 +486,7 @@
             kcore-disko = ./modules/kcore-disko.nix;
             kcore-ceph = cephModule;
             kcore-slurm = slurmModule;
+            kcore-mail = mailModule;
             kcore-metrics = metricsModule;
             # The version follows the kcore input, so moving that pin updates
             # /etc/kcore/version without editing the host flake.
