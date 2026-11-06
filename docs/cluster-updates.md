@@ -7,6 +7,8 @@ and `kcore.lib.mkNode { root = ./.; }`. Its `flake.lock` pins the kcore commit
 and every input behind it, so the controller, node agent, dashboard, console,
 `kctl`, and the nixpkgs they were tested with all move together. Updating
 kcore moves that pin and rebuilds the node; it never reinstalls the OS.
+[update-lifecycle.md](update-lifecycle.md) plans how releases, NixOS
+releases, and on-disk state move over time.
 
 ## Installing a release
 
