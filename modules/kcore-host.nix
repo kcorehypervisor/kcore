@@ -12,6 +12,8 @@ let
   candidateFiles = "flake.nix flake.lock legacy-configuration.nix";
   systemctl = "${pkgs.systemd}/bin/systemctl";
   bootctl = "${pkgs.systemd}/bin/bootctl";
+  # Longer than the agent's RestartSec, so a crash loop never counts.
+  healthyUpSeconds = 20;
 
   # boot-pending is written by the node agent when it stages a generation:
   # toplevel, previous (the generation that was running), staging (the host
@@ -28,22 +30,36 @@ let
       previous=$(field previous)
       printf 'toplevel=%s\nreason=%s\n' "$expected" "$1" > /var/lib/kcore/updates/boot-failed
       rm -f "$pending"
-      if [ -n "$previous" ] && [ -x "$previous/bin/switch-to-configuration" ]; then
-        ${config.nix.package}/bin/nix-env -p /nix/var/nix/profiles/system --set "$previous"
-        "$previous/bin/switch-to-configuration" boot
-      fi
+      boot_into "$previous"
       ${systemctl} reboot
       exit 0
     }
+    # Make $1 the newest generation and drop the pin the agent set for the
+    # staged boot, so loader.conf names it and later generations still boot.
+    boot_into() {
+      if [ -n "$1" ] && [ -x "$1/bin/switch-to-configuration" ]; then
+        ${config.nix.package}/bin/nix-env -p /nix/var/nix/profiles/system --set "$1" \
+          && "$1/bin/switch-to-configuration" boot \
+          && ${bootctl} set-default "" || true
+      fi
+    }
   '';
 
+  # A unit that crash-loops under Restart=always is "active" for a moment
+  # after every restart, so a unit must also have stayed up for a while.
   healthy = ''
+    up_for() {
+      ${systemctl} is-active --quiet "$1" || return 1
+      since=$(${systemctl} show -p ActiveEnterTimestampMonotonic --value "$1")
+      now=$(cut -d. -f1 /proc/uptime)
+      [ $(( now - ''${since:-0} / 1000000 )) -ge ${toString healthyUpSeconds} ]
+    }
     healthy() {
-      ${systemctl} is-active --quiet kcore-node-agent.service || return 1
+      up_for kcore-node-agent.service || return 1
       restarts=$(${systemctl} show -p NRestarts --value kcore-node-agent.service)
       [ "''${restarts:-0}" -lt 3 ] || return 1
       if ${systemctl} is-enabled --quiet kcore-controller.service 2>/dev/null; then
-        ${systemctl} is-active --quiet kcore-controller.service || return 1
+        up_for kcore-controller.service || return 1
       fi
       return 0
     }
@@ -64,6 +80,7 @@ let
       printf 'toplevel=%s\nreason=%s\n' "$expected" "booted $booted instead of the staged generation" \
         > /var/lib/kcore/updates/boot-failed
       rm -f "$pending"
+      boot_into "$booted"
       exit 0
     fi
     deadline=$(( $(date +%s) + ${toString cfg.bootConfirm.timeoutSeconds} ))
@@ -79,13 +96,10 @@ let
       fi
       sleep 10
     done
-    entry=$(${bootctl} status --json=short 2>/dev/null | ${pkgs.jq}/bin/jq -r '.entry // empty' || true)
-    if [ -z "$entry" ]; then
-      entry=$(${bootctl} status 2>/dev/null | sed -n 's/^.*id: //p' | head -n 1 || true)
-    fi
-    if [ -n "$entry" ]; then
-      ${bootctl} set-default "$entry" || true
-    fi
+    # The agent pinned the previous entry for the staged boot. Pinning this
+    # one instead would override every later generation, so drop the pin:
+    # loader.conf already names the staged generation.
+    ${bootctl} set-default "" || true
     # The host flake moves to the update's pins only once its generation has
     # proven itself. Same file list and backup layout as system_update.rs.
     staging=$(field staging)

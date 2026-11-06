@@ -29,6 +29,22 @@ pub const SWITCH_FAILED: &str = "/var/lib/kcore/updates/switch-failed";
 /// Transient timer that undoes a switch nobody confirmed.
 const GUARD_UNIT: &str = "kcore-update-guard";
 const GUARD_SECONDS: u64 = 900;
+/// Transient unit that runs a live switch outside the agent's cgroup.
+const SWITCH_UNIT: &str = "kcore-update-switch";
+/// In the update directory: the switch unit's exit code, and why it failed.
+const SWITCH_EXIT: &str = "switch-exit";
+const SWITCH_ERROR: &str = "switch-error";
+/// Same as `healthyUpSeconds` in `modules/kcore-host.nix`.
+const HEALTHY_UP_SECONDS: u64 = 20;
+
+/// Set on SIGTERM. Shutdown drains in-flight requests, and an activate
+/// request waiting on a switch would otherwise hold the agent until systemd
+/// kills it.
+pub static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
 /// The host flake every node runs. Shared with the ISO installer.
 const HOST_FLAKE_TEMPLATE: &str = include_str!("../../../nix/host-flake.nix");
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
@@ -729,10 +745,19 @@ fn default_boot_entry() -> String {
         .unwrap_or_default()
 }
 
+/// Remove the `LoaderEntryDefault` EFI variable. While it is set it overrides
+/// the default NixOS writes to loader.conf, so every later generation would
+/// boot into the pinned entry.
+fn clear_boot_default() {
+    let _ = Command::new("bootctl").args(["set-default", ""]).status();
+}
+
 /// After a generation became the boot default: keep `previous` as the default
 /// and boot the new entry once. A generation that never gets blessed by
 /// kcore-boot-confirm falls back to `previous` on the next reboot.
+/// kcore-boot-confirm clears the pin once the new entry is blessed.
 fn arm_oneshot(previous: &str) {
+    clear_boot_default();
     let staged = default_boot_entry();
     if previous.is_empty() || staged.is_empty() || staged == previous {
         return;
@@ -893,6 +918,68 @@ fn nixos_rebuild(action: &str, flake: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Shell for the switch unit. A failed switch starts the guard at once, from
+/// the unit, so the outcome does not depend on this agent still running.
+fn switch_script(flake: &str, update_dir: &Path) -> String {
+    let dir = update_dir.display();
+    format!(
+        r#"set -u
+nixos-rebuild switch --flake '{flake}'
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  printf '%s' "nixos-rebuild switch exited with $rc; see journalctl -u {SWITCH_UNIT}" > {dir}/{SWITCH_ERROR}
+  systemctl start --no-block {GUARD_UNIT}.service
+fi
+echo "$rc" > {dir}/{SWITCH_EXIT}
+"#
+    )
+}
+
+/// `nixos-rebuild switch` in its own transient unit. Run as a child of the
+/// agent, it dies half way through when the switch stops the agent. Returns
+/// `Ok(true)` once the switch succeeded while this agent kept running, and
+/// `Ok(false)` when this agent stops or gives up first.
+fn detached_switch(flake: &str, update_dir: &Path) -> Result<bool, String> {
+    let exit_file = update_dir.join(SWITCH_EXIT);
+    let _ = fs::remove_file(&exit_file);
+    let _ = fs::remove_file(update_dir.join(SWITCH_ERROR));
+    let _ = Command::new("systemctl")
+        .args(["reset-failed", &format!("{SWITCH_UNIT}.service")])
+        .status();
+    let tools = resolved(Path::new("/run/current-system/sw"));
+    let status = Command::new("systemd-run")
+        .args([
+            &format!("--unit={SWITCH_UNIT}"),
+            "--collect",
+            "--quiet",
+            "--setenv=HOME=/root",
+            &format!("--setenv=PATH=/run/wrappers/bin:{tools}/bin"),
+            &format!("{tools}/bin/sh"),
+            "-c",
+            &switch_script(flake, update_dir),
+        ])
+        .status()
+        .map_err(|e| format!("systemd-run: {e}"))?;
+    if !status.success() {
+        return Err("could not start the switch unit".into());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(GUARD_SECONDS);
+    loop {
+        if let Ok(rc) = fs::read_to_string(&exit_file) {
+            if rc.trim() == "0" {
+                return Ok(true);
+            }
+            let reason = fs::read_to_string(update_dir.join(SWITCH_ERROR))
+                .unwrap_or_else(|_| "nixos-rebuild switch failed".into());
+            return Err(reason);
+        }
+        if shutting_down() || std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
 fn update_dir_of(manifest_path: &Path) -> PathBuf {
     manifest_path
         .parent()
@@ -952,6 +1039,7 @@ pub fn activate_staged(manifest_path: &Path, mode: &str) -> Result<ActivateOutco
     }
 
     if activation == "boot" {
+        clear_boot_default();
         let previous = default_boot_entry();
         nixos_rebuild("boot", &staged_flake)?;
         arm_oneshot(&previous);
@@ -975,12 +1063,15 @@ pub fn activate_staged(manifest_path: &Path, mode: &str) -> Result<ActivateOutco
         let previous_files = update_dir.join("previous");
         install_candidate(live, &staging, &previous_files)?;
         arm_switch_guard(&toplevel, &running, &update_dir)?;
-        if let Err(e) = nixos_rebuild("switch", &staged_flake) {
-            let reverted = revert_switch(&running, &update_dir, &e);
-            return Err(match reverted {
-                Ok(()) => format!("{e}; reverted to {running}"),
-                Err(r) => format!("{e}; revert failed: {r}"),
-            });
+        match detached_switch(&staged_flake, &update_dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(
+                    "this node agent stopped before the switch finished; the guard decides the outcome"
+                        .into(),
+                );
+            }
+            Err(e) => return Err(format!("{e}; switching back to {running}")),
         }
         // The agent survived the switch: its package did not change.
         confirm_switch();
@@ -1047,6 +1138,7 @@ pub fn rollback_staged(manifest_path: &Path) -> Result<String, String> {
                 .status();
         }
         nixos_rebuild("boot", flake)?;
+        clear_boot_default();
         if booted_target {
             return Ok(ROLLED_BACK_REBOOT.into());
         }
@@ -1097,7 +1189,8 @@ pub fn reboot_staged() -> Result<String, String> {
 
 /// Phase, target closure, and failure reason for GetSystemUpdateStatus.
 /// `failed` means the node already went back to the previous generation.
-/// `boot_pending` means a staged boot has not been confirmed healthy yet.
+/// `boot_pending` and `switch_pending` mean the node has not confirmed the
+/// target healthy yet and may still go back.
 pub fn update_status(manifest_path: &Path) -> (String, String, String) {
     let Ok(m) = read_manifest(manifest_path) else {
         return ("unknown".into(), String::new(), String::new());
@@ -1109,11 +1202,14 @@ pub fn update_status(manifest_path: &Path) -> (String, String, String) {
             return ("failed".into(), m.target_generation, reason);
         }
     }
-    let pending = fs::read_to_string(BOOT_PENDING).unwrap_or_default();
-    let phase = if !m.toplevel.is_empty()
-        && marker_field(&pending, "toplevel") == Some(m.toplevel.as_str())
-    {
+    let pending = |path: &str| {
+        let body = fs::read_to_string(path).unwrap_or_default();
+        !m.toplevel.is_empty() && marker_field(&body, "toplevel") == Some(m.toplevel.as_str())
+    };
+    let phase = if pending(BOOT_PENDING) {
         "boot_pending"
+    } else if pending(SWITCH_PENDING) {
+        "switch_pending"
     } else if m.activated {
         "activated"
     } else {
@@ -1137,7 +1233,11 @@ fn guard_script(previous: &str, update_dir: &Path) -> String {
 m={SWITCH_PENDING}
 [ -f "$m" ] || exit 0
 target=$(sed -n 's/^toplevel=//p' "$m")
+reason="the node agent did not confirm the switch within {GUARD_SECONDS}s"
+if [ -s "{dir}/{SWITCH_ERROR}" ]; then reason=$(cat "{dir}/{SWITCH_ERROR}"); fi
+printf 'toplevel=%s\nreason=%s\n' "$target" "$reason" > {SWITCH_FAILED}
 rm -f "$m"
+systemctl stop {GUARD_UNIT}.timer 2>/dev/null
 for f in {files}; do
   if [ -f "{dir}/previous/$f" ]; then
     cp "{dir}/previous/$f" "{HOST_DIR}/.$f.kcore-tmp" && mv -f "{HOST_DIR}/.$f.kcore-tmp" "{HOST_DIR}/$f"
@@ -1146,7 +1246,6 @@ for f in {files}; do
   fi
 done
 rm -rf "{dir}/previous"
-printf 'toplevel=%s\nreason=%s\n' "$target" "the node agent did not confirm the switch within {GUARD_SECONDS}s" > {SWITCH_FAILED}
 nix-env -p {SYSTEM_PROFILE} --set {previous}
 {previous}/bin/switch-to-configuration switch
 "#,
@@ -1200,57 +1299,89 @@ fn disarm_switch_guard() {
         .status();
 }
 
-/// Switch back to `previous` after a failed switch, from this agent.
-fn revert_switch(previous: &str, update_dir: &Path, reason: &str) -> Result<(), String> {
-    disarm_switch_guard();
-    let target = fs::read_to_string(SWITCH_PENDING).unwrap_or_default();
-    let _ = fs::remove_file(SWITCH_PENDING);
-    restore_previous(Path::new(HOST_DIR), &update_dir.join("previous"))?;
-    let _ = fs::write(
-        SWITCH_FAILED,
-        format!(
-            "toplevel={}\nreason={reason}\n",
-            marker_field(&target, "toplevel").unwrap_or("")
-        ),
-    );
-    let status = Command::new("nix-env")
-        .args(["-p", SYSTEM_PROFILE, "--set", previous])
-        .status()
-        .map_err(|e| format!("nix-env --set: {e}"))?;
-    if !status.success() {
-        return Err("nix-env --set failed".into());
+/// Called by the agent once it is serving. A pending switch to the
+/// generation this agent runs in is confirmed after three healthy checks in
+/// a row, the same rule kcore-boot-confirm applies after a reboot. Until then
+/// the guard timer stays armed and reverts the switch when it fires.
+pub fn confirm_switch() {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(GUARD_SECONDS.saturating_sub(60));
+    let mut healthy = 0;
+    loop {
+        let Ok(body) = fs::read_to_string(SWITCH_PENDING) else {
+            return;
+        };
+        let target = marker_field(&body, "toplevel").unwrap_or("").to_string();
+        if target.is_empty() {
+            return;
+        }
+        if resolved(Path::new("/run/current-system")) == target && controller_healthy() {
+            healthy += 1;
+        } else {
+            healthy = 0;
+        }
+        if healthy >= 3 {
+            disarm_switch_guard();
+            let _ = fs::remove_file(SWITCH_PENDING);
+            return;
+        }
+        if shutting_down() || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
-    let status = Command::new(format!("{previous}/bin/switch-to-configuration"))
-        .arg("switch")
-        .status()
-        .map_err(|e| format!("switch-to-configuration: {e}"))?;
-    if !status.success() {
-        return Err("switch-to-configuration switch failed".into());
-    }
-    Ok(())
 }
 
-/// Called by the agent once it is serving. A pending switch to the
-/// generation this agent runs in is confirmed, unless the controller unit
-/// failed in it; the guard timer then reverts it.
-pub fn confirm_switch() {
-    let Ok(body) = fs::read_to_string(SWITCH_PENDING) else {
-        return;
+/// A controller that crash-loops under `Restart=always` is rarely in the
+/// failed state, so its restart count is checked too.
+fn controller_healthy() -> bool {
+    let systemctl = |args: &[&str]| {
+        Command::new("systemctl")
+            .args(args)
+            .output()
+            .map(|o| {
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                )
+            })
+            .unwrap_or((false, String::new()))
     };
-    let target = marker_field(&body, "toplevel").unwrap_or("");
-    if target.is_empty() || resolved(Path::new("/run/current-system")) != target {
-        return;
+    let unit = "kcore-controller.service";
+    if !systemctl(&["is-enabled", "--quiet", unit]).0 {
+        return true;
     }
-    let controller_failed = Command::new("systemctl")
-        .args(["is-failed", "--quiet", "kcore-controller.service"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if controller_failed {
-        return;
+    if !systemctl(&["is-active", "--quiet", unit]).0 {
+        return false;
     }
-    disarm_switch_guard();
-    let _ = fs::remove_file(SWITCH_PENDING);
+    let (_, restarts) = systemctl(&["show", "-p", "NRestarts", "--value", unit]);
+    if restarts.parse::<u32>().unwrap_or(0) >= 3 {
+        return false;
+    }
+    let (_, since) = systemctl(&[
+        "show",
+        "-p",
+        "ActiveEnterTimestampMonotonic",
+        "--value",
+        unit,
+    ]);
+    let now = fs::read_to_string("/proc/uptime").unwrap_or_default();
+    up_long_enough(&since, &now)
+}
+
+/// A unit that crash-loops is "active" for a moment after every restart, so
+/// it must also have stayed up longer than its RestartSec. `since` is
+/// ActiveEnterTimestampMonotonic in microseconds, `uptime` is /proc/uptime.
+fn up_long_enough(since: &str, uptime: &str) -> bool {
+    let Ok(since_us) = since.trim().parse::<u64>() else {
+        return false;
+    };
+    let now_s = uptime
+        .split(['.', ' '])
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    now_s.saturating_sub(since_us / 1_000_000) >= HEALTHY_UP_SECONDS
 }
 
 pub fn current_generations() -> (String, String) {
@@ -1420,6 +1551,29 @@ mod tests {
         assert!(script.contains("--set /nix/store/old-system"));
         assert!(script.contains("/nix/store/old-system/bin/switch-to-configuration switch"));
         assert!(script.contains(SWITCH_FAILED));
+        assert!(script.contains("/var/lib/kcore/updates/u/switch-error"));
+        assert!(script.find(SWITCH_FAILED) < script.find("rm -f \"$m\""));
+    }
+
+    #[test]
+    fn a_unit_must_stay_up_to_count_as_healthy() {
+        assert!(up_long_enough("100000000", "130.52 400.10\n"));
+        assert!(!up_long_enough("125000000", "130.52 400.10\n"));
+        assert!(!up_long_enough("", "130.52 400.10\n"));
+        assert!(!up_long_enough("0", ""));
+    }
+
+    #[test]
+    fn a_failed_switch_fires_the_guard_from_its_own_unit() {
+        let script = switch_script(
+            "path:/var/lib/kcore/updates/u/host#kcore",
+            Path::new("/var/lib/kcore/updates/u"),
+        );
+        assert!(script
+            .contains("nixos-rebuild switch --flake 'path:/var/lib/kcore/updates/u/host#kcore'"));
+        assert!(script.contains("> /var/lib/kcore/updates/u/switch-error"));
+        assert!(script.contains("systemctl start --no-block kcore-update-guard.service"));
+        assert!(script.contains("> /var/lib/kcore/updates/u/switch-exit"));
     }
 
     #[test]

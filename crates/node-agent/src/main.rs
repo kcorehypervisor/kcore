@@ -344,4 +344,5 @@ async fn shutdown_signal() {
         _ = ctrl_c => { info!("received Ctrl+C, shutting down"); },
         _ = terminate => { info!("received SIGTERM, shutting down"); },
     }
+    system_update::SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
 }

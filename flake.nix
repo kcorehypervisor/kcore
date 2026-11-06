@@ -59,7 +59,7 @@
               || (toString path) == "${toString ./.}/nix/host-flake.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/ingress/" (toString path)
               || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/slurm/" (toString path)
-              || pkgs.lib.hasPrefix "${toString ./.}/examples/ingress/" (toString path)
+              || pkgs.lib.hasPrefix "${toString ./.}/examples/" (toString path)
               || (toString path) == "${toString ./.}/modules"
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
@@ -465,6 +465,10 @@
                         };
                         kctl.package = pkgs'.kctl;
                       };
+                      # Nix reuses a locked input from the store before it
+                      # downloads it. Keeping the sources in the generation
+                      # keeps rebuilds working offline after garbage collection.
+                      system.extraDependencies = [ inputs.self.outPath ] ++ flakeInputPaths;
                     }
                   )
                 ]
@@ -1548,7 +1552,7 @@
                                                                   '/mnt/etc/nixos#nixosConfigurations.kcore.config.system.build.toplevel')
                                                                 nix copy --no-check-sigs --to /mnt \
                                                                   "$SYSTEM" \
-                                                                  "${./.}" \
+                                                                  "${inputs.self.outPath}" \
                                                                   ${lib.concatStringsSep " " flakeInputPaths}
                                                                 nixos-install --system "$SYSTEM" --root /mnt --no-root-passwd
                                                                 # The host flake's nixpkgs is a path: input, which has no rev to report.
@@ -1642,7 +1646,10 @@
                   # flake and lock a node gets when it is updated to that tag. A
                   # development build has no rev and names this source by path.
                   environment.etc."kcore/installed-flake.nix".text = hostFlakeText (
-                    if inputs.self ? rev then "github:kcorehypervisor/kcore/${releaseTag}" else "path:${./.}"
+                    if inputs.self ? rev then
+                      "github:kcorehypervisor/kcore/${releaseTag}"
+                    else
+                      "path:${inputs.self.outPath}"
                   );
                   environment.etc."kcore/installed-flake.lock" = lib.mkIf (inputs.self ? rev) {
                     text = hostFlakeLock;
