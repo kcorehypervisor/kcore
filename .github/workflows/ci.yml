@@ -93,6 +93,9 @@ jobs:
       - name: Slurm module eval (kcore.slurm.enable + firewall)
         run: nix build --no-link .#checks.x86_64-linux.slurm-module-eval
 
+      - name: Mail module eval (kcore.mail.enable + firewall)
+        run: nix build --no-link .#checks.x86_64-linux.mail-module-eval
+
       - name: Local disk migration rehearsal
         run: nix build --no-link .#checks.x86_64-linux.local-disk-migrate
 
