@@ -22,6 +22,7 @@ The clients are `kctl` (commands and `apply -f` manifests), the Terraform provid
 | Object user | yes | `ObjectUser` | `kcore_object_user` | delete only | yes | `examples/object-user` |
 | Kubernetes cluster | yes | `KubernetesCluster` | `kcore_kubernetes_cluster` | `kubernetes-cluster` | yes | `examples/kubernetes` |
 | Cluster update | yes | `ClusterUpdate` | `kcore_cluster_update` | `cluster-update` | yes | `examples/cluster-update` |
+| Cluster version and canary | `update version`, `update cluster promote` | n/a | `kcore_cluster_version` | `set-version`, `promote-update` | Release page | n/a |
 | Slurm cluster | yes | `SlurmCluster` | `kcore_slurm_cluster` | `slurm-cluster` | yes | `examples/slurm` |
 | Ingress gateway, route, WAF policy | yes | `IngressGateway`, `IngressRoute`, `WafPolicy` | `kcore_ingress_gateway`, `kcore_ingress_route`, `kcore_waf_policy` | `ingress-gateway`, `ingress-route`, `waf-policy` | yes | `examples/ingress` |
 | vGPU host (NVIDIA, Intel, AMD) | yes | `NodeVgpu` | `kcore_vgpu_host` | `node-vgpu` | node actions | `examples/vgpu` |

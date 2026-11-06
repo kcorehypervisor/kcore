@@ -618,6 +618,12 @@ mod shipped_example_tests {
         );
         let manifest = parse_manifest(path).unwrap();
         assert_eq!(manifest.spec.target.version, "0.3.0");
-        assert_eq!(manifest.spec.strategy.strategy_type, "one-at-a-time");
+        assert_eq!(manifest.spec.strategy.strategy_type, "canary");
+        assert_eq!(manifest.spec.strategy.canary_soak_seconds, 3600);
+        let spec = to_proto(manifest);
+        assert_eq!(
+            spec.strategy.unwrap().r#type,
+            controller_proto::ClusterUpdateStrategyType::ClusterUpdateStrategyCanary as i32
+        );
     }
 }
