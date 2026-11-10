@@ -10,7 +10,10 @@ pub mod rollout;
 pub mod spec;
 
 pub use nixgen::{render_disabled, render_member, MemberFragment};
-pub use rollout::{plan_rollout, rollout_invariants, MemberHealth, OpKind, RolloutRequest, Step};
+pub use rollout::{
+    etcd_quorum, etcd_restart_allowed, plan_rollout, rollout_invariants, safe_to_restart,
+    safe_to_take_down, switchover_candidate, MemberHealth, OpKind, RolloutRequest, Step,
+};
 pub use spec::{
     diff, normalize, parse_manifest, validate, ClusterSpec, Issue, PlanAction, PlanDiff,
 };

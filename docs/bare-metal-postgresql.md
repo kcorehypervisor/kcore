@@ -1,6 +1,6 @@
 # Bare-metal PostgreSQL clusters on kcoreOS
 
-Status: **implemented in tree, not yet run on hardware**. The NixOS module, the pure `kcore-postgresql` crate, the node-agent RPCs, the controller engine and API, and `kctl pg-cluster` are in this revision. The Nix module is checked by evaluation only and the Rust code by unit and fake-agent tests; nothing here has run a real Patroni yet. See [Built and not built](#built-and-not-built).
+Status: **implemented in tree; lab target is the three Dell hypervisors**. The NixOS module, the pure `kcore-postgresql` crate, the node-agent RPCs, the controller engine and API, `kctl pg-cluster`, the ClusterUpdate switchover gate, the MCP kind, the dashboard card, and the NixOS VM test are in this revision. Apply on the Dells with `examples/postgresql-cluster/dell-lab.yaml`. See [Built and not built](#built-and-not-built).
 
 Checked against nixpkgs `b40629efe5d6` (the flake pin). That pin provides `postgresql_14` 14.22, `postgresql_15` 15.17, `postgresql_16` 16.13, `postgresql_17` 17.9 (also `postgresql`), `postgresql_18` 18.3, `patroni` 4.1.0, `etcd` 3.6.8, `pgbackrest` 2.57.0 and `keepalived`. The NixOS `services.patroni` module is present. Its `raft` option was removed because upstream deprecated Raft, so the DCS has to be etcd. `vip-manager` is not packaged.
 
@@ -109,7 +109,7 @@ Preflight rejects a spec whose advertise address is not on `iface`, or whose `if
 
 ### Example manifest
 
-`examples/postgresql-cluster/orders.yaml`:
+Lab apply uses the three Dells: `examples/postgresql-cluster/dell-lab.yaml` (`dell-1` / `dell-2` / `dell-3`, `enp6s0`, `vg_kcore`, VIP `192.168.40.160/24`). A generic three-node template remains at `examples/postgresql-cluster/orders.yaml`.
 
 ```yaml
 kind: PostgresqlCluster
@@ -118,23 +118,23 @@ metadata:
 spec:
   package: postgresql_17
   members:
-    - nodeId: node-105
+    - nodeId: dell-1
       role: primary
-      advertiseAddress: 192.168.40.105
+      advertiseAddress: 192.168.40.103
       iface: enp6s0
-      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg0, sizeBytes: 214748364800, fsType: xfs }
-    - nodeId: node-106
-      advertiseAddress: 192.168.40.106
+      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 107374182400, fsType: xfs }
+    - nodeId: dell-2
+      advertiseAddress: 192.168.40.113
       iface: enp6s0
-      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg0, sizeBytes: 214748364800, fsType: xfs }
-    - nodeId: node-108
-      advertiseAddress: 192.168.40.108
+      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 107374182400, fsType: xfs }
+    - nodeId: dell-3
+      advertiseAddress: 192.168.40.123
       iface: enp6s0
-      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg0, sizeBytes: 214748364800, fsType: xfs }
+      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 107374182400, fsType: xfs }
   replication:
     mode: quorum
   vip:
-    address: 192.168.40.150/24
+    address: 192.168.40.160/24
     virtualRouterId: 61
   clientNetworks: [192.168.40.0/24]
   parameters:
@@ -149,7 +149,7 @@ spec:
       extensions: [pg_stat_statements, pgcrypto]
 ```
 
-Canonical YAML is camelCase. snake_case keys are accepted (except inside `parameters`, whose keys are PostgreSQL names), and unknown fields are refused. `kctl` parses with `kcore_postgresql::spec::parse_manifest` and never interprets fields itself. A login role without `passwordScram` (a SCRAM-SHA-256 verifier) gets a kcore-generated password, returned by `credentials`. The node ids are placeholders. `node-107` is the controller in the garage lab and stays out of `spec` until the operator puts it there.
+Canonical YAML is camelCase. snake_case keys are accepted (except inside `parameters`, whose keys are PostgreSQL names), and unknown fields are refused. `kctl` parses with `kcore_postgresql::spec::parse_manifest` and never interprets fields itself. A login role without `passwordScram` (a SCRAM-SHA-256 verifier) gets a kcore-generated password, returned by `credentials`. The controller host (`node-107` in the garage lab) stays out of `spec` unless the operator puts it there.
 
 ## Declarative split: Nix, DCS and SQL
 
@@ -364,14 +364,18 @@ Built and tested on macOS (Rust tests, Nix evaluation):
 - `crates/kcore-postgresql`: spec, validation, diff, planner, gates, Nix renderer with golden files, SQL and Patroni helpers, with unit and property tests.
 - Node agent RPCs, controller schema 72, PKI, engine with fake-agent scenarios (create order, leader-last roll, an unplanned failover mid-roll, reload-only update, one operation at a time, unreachable nodes with and without force, failover event, major upgrade order), gRPC handlers, RBAC rows, webhook, and `kctl pg-cluster`.
 
+Built in this revision (beyond the list above):
+
+- **NixOS VM test** (`tests/postgresql-cluster-module.nix`, `.github/workflows/postgresql-cluster-vm.yml`): three machines, etcd quorum, Patroni leader, write through the VIP, kill the leader, rejoin, switchover. Major-upgrade `set-initialize-key` coverage is still thin until the 16→17 step is added to the script.
+- **ClusterUpdate hook**: before activate/reboot, the reconciler switches the Patroni leader off the node when needed and refuses a reboot that would lose etcd quorum (`safe_to_take_down`).
+- MCP kind `postgresql-cluster` and the dashboard card.
+- Lab example for the three Dells: `examples/postgresql-cluster/dell-lab.yaml`.
+
 Not built yet:
 
-- **NixOS VM test** (three machines, kill the leader, rejoin with `pg_rewind`, switchover under load, a 16 to 17 upgrade). It needs a Linux builder, and it is the gate for the `set-initialize-key` sequence and the keepalived check.
 - **Backups** (pgBackRest repo, schedules, `Backup/Restore/ListPostgresqlBackups`). The design above stays the plan, but there are no RPCs for it yet, so a major upgrade takes no automatic backup. Take one yourself first.
 - TLA+ model and trace check, soak script.
 - `postgres_exporter` scrape targets; a periodic certificate rotation pass (today a certificate is reissued at the member's next apply once it is due).
-- The `ClusterUpdate` hook that switches over before rebooting the leader's node. Until it exists, run `kctl pg-cluster switchover` before approving an update that reboots the leader.
-- MCP kind `postgresql-cluster` and the dashboard card. The MCP server's proto copy is updated.
 - Adding an etcd voter outside Replace; more than one cluster per node; a reader VIP.
 
 ## Tests
@@ -506,15 +510,14 @@ A writer commits numbered rows continuously while the controller runs an update,
 
 ## Phases
 
-Phases 1, 2 and the code of 3 to 5 are in this revision (see [Built and not built](#built-and-not-built)). What remains, in order:
+The VM test, ClusterUpdate hook, MCP kind, dashboard card, and Dell lab example are in this revision (see [Built and not built](#built-and-not-built)). What remains, in order:
 
-1. **NixOS VM test** on a Linux builder: VM test steps 1 to 7. This is the gate for the agent's commands against a real Patroni 4.1 and etcd 3.6, and in particular for the major-upgrade `initialize` key sequence and the keepalived check.
-2. **Cluster-update hook**: switch over before a `ClusterUpdate` reboots the leader's node, and refuse a reboot that would lose etcd quorum.
-3. **Backups**: pgBackRest module, RPCs, schedules, restore into a new cluster, and a full backup as the first step of a major upgrade.
-4. **Clients**: MCP kind and dashboard card; metrics targets; a periodic certificate rotation pass.
-5. **Formal model and soak.**
-6. **Lab apply.** Blocked on the questions below. It rebuilds NixOS on live hypervisors. Exit: the lab e2e list (create, write via VIP, read on both standbys, power off the primary host, rejoin, switchover, minor upgrade, replace member).
-7. **Later.**
+1. **VM test depth**: add the 16→17 major-upgrade path (and its `set-initialize-key` sequence) to `tests/postgresql-cluster-module.nix`.
+2. **Backups**: pgBackRest module, RPCs, schedules, restore into a new cluster, and a full backup as the first step of a major upgrade.
+3. **Clients polish**: metrics targets; a periodic certificate rotation pass.
+4. **Formal model and soak.**
+5. **Lab apply** on the three Dells with `examples/postgresql-cluster/dell-lab.yaml`. Exit: create, write via VIP, read on both standbys, power off the primary host, rejoin, switchover, minor upgrade, replace member.
+6. **Later.**
    - etcd voter add and remove outside Replace
    - reader VIP or HAProxy
    - logical-replication blue/green major upgrade
@@ -524,7 +527,7 @@ Phases 1, 2 and the code of 3 to 5 are in this revision (see [Built and not buil
 
 ## Risks
 
-- **A hypervisor reboot is a failover.** `nixos-rebuild switch` never restarts the database (`restartIfChanged = false`), but a `ClusterUpdate` reboot does. The cluster-update hook (not built yet) will switch over first; until then, run `kctl pg-cluster switchover` before such an update.
+- **A hypervisor reboot is a failover.** `nixos-rebuild switch` never restarts the database (`restartIfChanged = false`), but a `ClusterUpdate` reboot does. The ClusterUpdate hook switches the Patroni leader off the node first and refuses a reboot that would lose etcd quorum.
 - **No watchdog by default.** A hung Patroni primary can keep its PostgreSQL accepting connections after a standby promotes. Synchronous quorum mode keeps those writes from being acknowledged, and the VIP check moves clients. Under `async` this window can lose writes, and plan says so.
 - **etcd quorum loss stops failover and stops writes.** With 3 voters, losing 2 nodes leaves the survivor read-only. This is by design. The way out is Replace, not a bypass.
 - **Memory.** PostgreSQL on a hypervisor competes with guests. `MemoryMax` and the derived `shared_buffers` keep it bounded. Preflight warns.
@@ -532,15 +535,17 @@ Phases 1, 2 and the code of 3 to 5 are in this revision (see [Built and not buil
 - **Upstream NixOS Patroni module.** If its shape changes, the fallback is an in-tree copy pinned with the package, as with Ceph.
 - **Pin moves.** A versioned attribute (`postgresql_17`) only changes minor on a pin bump. The release notes name the PostgreSQL, Patroni and etcd versions so an operator can hold a `ClusterUpdate`.
 
-## Blocking questions before the lab apply
+## Lab apply answers (three Dells)
 
-The remaining code phases do not need these. A lab apply does.
+| Question | Answer |
+|---|---|
+| Which three nodes, bootstrap primary? | `dell-1` (primary), `dell-2`, `dell-3`. Controller host stays out. |
+| Advertise address / iface | `192.168.40.103` / `.113` / `.123` on `enp6s0` (confirm reservations match the live Dells). |
+| VIP / VRRP id | `192.168.40.160/24`, `virtualRouterId: 61` (not the Kubernetes API VIP). |
+| RPO | `quorum` (default). |
+| Volumes | One data LV per node on `vg_kcore` (`pg-orders`, 100 GiB, xfs). WAL and etcd stay on the data volume for the first lab run. |
+| Backup target | None yet (backups not built). Take a manual snapshot or dump before a major upgrade. |
+| Client networks | `192.168.40.0/24`. |
+| Rebuild while guests run | Yes for the first lab apply; ClusterUpdate will switch over before a reboot. Confirm guest impact with the operator. |
 
-1. Which three nodes host the first cluster, and which one bootstraps as primary? Placeholders: `node-105`, `node-106`, `node-108` (`node-107` is the controller and stays out unless you say so).
-2. Static advertise addresses and the interface per node.
-3. A free VIP address and VRRP router id on that subnet, not used by the ingress or Kubernetes keepalived instances.
-4. RPO choice: `quorum` (default, no acknowledged-write loss) or `async`.
-5. Does each node have a VG or pool with room for a data volume, and should WAL and etcd get their own volumes?
-6. Backup target: a kcore ObjectStore bucket, an external S3, or a disk path. Retention.
-7. Client networks allowed to reach 5432.
-8. May the lab apply run `nixos-rebuild switch` on those nodes while they host guests?
+Manifest: `examples/postgresql-cluster/dell-lab.yaml`.
