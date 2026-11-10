@@ -68,9 +68,13 @@ let
   cidr = net: if lib.hasInfix "/" net then net else "${net}/32";
   hostType = if cfg.tls.enable then "hostssl" else "host";
 
+  # "all" does not match replication connections; Patroni uses TCP to
+  # 127.0.0.1 for local replication probes when use_unix_socket_repl is false.
   pgHba = [
     "local all all scram-sha-256"
+    "local replication replicator scram-sha-256"
     "${hostType} all all 127.0.0.1/32 scram-sha-256"
+    "${hostType} replication replicator 127.0.0.1/32 scram-sha-256"
   ]
   ++ lib.concatMap (host: [
     "${hostType} replication replicator ${cidr host} scram-sha-256"

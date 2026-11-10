@@ -68,6 +68,9 @@ assert patroni.postgresql.listen == "192.168.40.105,127.0.0.1,192.168.40.150:543
 assert patroni.restapi.listen == "0.0.0.0:8008";
 assert patroni.postgresql.authentication.replication.sslmode == "verify-full";
 assert lib.all (line: !lib.hasInfix "trust" line) patroni.postgresql.pg_hba;
+assert lib.elem "local replication replicator scram-sha-256" patroni.postgresql.pg_hba;
+assert lib.elem "hostssl replication replicator 127.0.0.1/32 scram-sha-256"
+  patroni.postgresql.pg_hba;
 assert lib.elem "hostssl replication replicator 192.168.40.106/32 scram-sha-256"
   patroni.postgresql.pg_hba;
 assert lib.elem "hostssl all all 192.168.40.0/24 scram-sha-256" patroni.postgresql.pg_hba;

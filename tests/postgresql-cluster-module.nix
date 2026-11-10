@@ -173,10 +173,12 @@ pkgs.testers.runNixOSTest {
         )
 
     wait_leader()
+    # Primary reports state=running; streaming standbys report state=streaming.
     a.wait_until_succeeds(
         patroni
         + " http://127.0.0.1:8008/cluster "
-        + "| grep -c '\"state\": \"running\"' | grep -qx 3"
+        + "| jq -e '[.members[] | select(.state==\"running\" or .state==\"streaming\")] "
+        + "| length == 3' >/dev/null"
     )
     a.wait_until_succeeds(
         patroni
