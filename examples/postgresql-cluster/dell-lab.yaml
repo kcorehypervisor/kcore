@@ -1,13 +1,18 @@
-# PostgresqlCluster for the three Dell lab hypervisors (dell-1, dell-2, dell-3).
-# Management NIC is enp6s0 on each Dell; LVM data volumes live on vg_kcore.
+# PostgresqlCluster for the three Dell lab hypervisors (Ceph members).
+# Live Kea reservations (2026-11-10, `kcore-provisioning status --state-dir
+# /var/lib/kcore-provisioning` on nixos1):
 #
-# Advertise addresses must match the Kea DHCP reservations in the network
-# provisioner catalog (runtime SQLite under the provisioner state dir, rendered
-# to kea-dhcp4.json). Dump them with:
-#   kcore-provisioning status --state-dir /var/lib/kcore-provisioning
-# or ListReservations on the NetworkProvisioner API. Replace the IPs below if
-# the live reservations differ. VIP must not collide with the Kubernetes API
-# VIP or ingress keepalived on 192.168.40.0/24.
+#   nodeId     Kea hostname / comment              IP
+#   dell-20    kvm-node / node-103 br0/eno1        192.168.40.103
+#   dell-21    node-113 br0/eno1 (Ceph mon)        192.168.40.143
+#   node-118   node-118 br0/eno2 (Ceph mon)        192.168.40.145
+#
+# nodeIds match the controller registrations where known (dell-20, dell-21);
+# the third member uses the Kea hostname node-118. Confirm node-118 is
+# registered under that id before apply. iface must carry advertiseAddress and
+# must not be br0/kbr-* (preflight rejects bridges); lab NICs are typically
+# enp6s0 or eno1 under the bridge — verify with `ip -4 addr` on each host.
+# VIP 192.168.40.160 is free in Kea (not reserved). LVM data on vg_kcore.
 #
 #   kctl pg-cluster plan -f examples/postgresql-cluster/dell-lab.yaml
 #   kctl pg-cluster apply -f examples/postgresql-cluster/dell-lab.yaml --confirm
@@ -21,7 +26,7 @@ metadata:
 spec:
   package: postgresql_17
   members:
-    - nodeId: dell-1
+    - nodeId: dell-20
       role: primary
       advertiseAddress: 192.168.40.103
       iface: enp6s0
@@ -33,8 +38,8 @@ spec:
           sizeBytes: 107374182400,
           fsType: xfs,
         }
-    - nodeId: dell-2
-      advertiseAddress: 192.168.40.113
+    - nodeId: dell-21
+      advertiseAddress: 192.168.40.143
       iface: enp6s0
       dataVolume:
         {
@@ -44,8 +49,8 @@ spec:
           sizeBytes: 107374182400,
           fsType: xfs,
         }
-    - nodeId: dell-3
-      advertiseAddress: 192.168.40.123
+    - nodeId: node-118
+      advertiseAddress: 192.168.40.145
       iface: enp6s0
       dataVolume:
         {

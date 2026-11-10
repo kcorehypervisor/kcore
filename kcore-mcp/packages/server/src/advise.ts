@@ -338,10 +338,10 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
         ),
         question(
           "members",
-          "Which three nodes (Dell lab: dell-1, dell-2, dell-3), advertise addresses, and interfaces?",
+          "Which three nodes (Dell lab: dell-20, dell-21, node-118), advertise addresses, and interfaces?",
           "Each member needs nodeId, advertiseAddress, and iface. One member may set role: primary for bootstrap. Lab example: examples/postgresql-cluster/dell-lab.yaml.",
           !Array.isArray(spec.members) || spec.members.length === 0,
-          { example: "dell-1 at 192.168.40.103 on enp6s0" },
+          { example: "dell-20 at 192.168.40.103 on enp6s0" },
         ),
         question(
           "vip",
