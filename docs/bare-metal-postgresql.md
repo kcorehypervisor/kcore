@@ -109,7 +109,7 @@ Preflight rejects a spec whose advertise address is not on `iface`, or whose `if
 
 ### Example manifest
 
-Lab apply uses the three Dells: `examples/postgresql-cluster/dell-lab.yaml` (`dell-1` / `dell-2` / `dell-3`, `enp6s0`, `vg_kcore`, VIP `192.168.40.160/24`). A generic three-node template remains at `examples/postgresql-cluster/orders.yaml`.
+Lab apply uses the three Dells: `examples/postgresql-cluster/dell-lab.yaml` (`dell-20` / `dell-21` / `node-118`, Kea `.103` / `.143` / `.145`, `enp6s0`, `vg_kcore`, VIP `192.168.40.160/24`). A generic three-node template remains at `examples/postgresql-cluster/orders.yaml`.
 
 ```yaml
 kind: PostgresqlCluster
@@ -118,17 +118,17 @@ metadata:
 spec:
   package: postgresql_17
   members:
-    - nodeId: dell-1
+    - nodeId: dell-20
       role: primary
       advertiseAddress: 192.168.40.103
       iface: enp6s0
       dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 107374182400, fsType: xfs }
-    - nodeId: dell-2
-      advertiseAddress: 192.168.40.113
+    - nodeId: dell-21
+      advertiseAddress: 192.168.40.143
       iface: enp6s0
       dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 107374182400, fsType: xfs }
-    - nodeId: dell-3
-      advertiseAddress: 192.168.40.123
+    - nodeId: node-118
+      advertiseAddress: 192.168.40.145
       iface: enp6s0
       dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 107374182400, fsType: xfs }
   replication:
@@ -539,8 +539,8 @@ The VM test, ClusterUpdate hook, MCP kind, dashboard card, and Dell lab example 
 
 | Question | Answer |
 |---|---|
-| Which three nodes, bootstrap primary? | `dell-1` (primary), `dell-2`, `dell-3`. Controller host stays out. |
-| Advertise address / iface | From the Kea reservations in the network provisioner catalog (`kcore-provisioning status`). Example placeholders in `dell-lab.yaml`: `.103` / `.113` / `.123` on `enp6s0`. |
+| Which three nodes, bootstrap primary? | `dell-20` (primary), `dell-21`, `node-118`. Controller host stays out. |
+| Advertise address / iface | Live Kea (2026-11-10): `.103` / `.143` / `.145` on `enp6s0` (confirm the address is on that iface, not only on `br0`). |
 | VIP / VRRP id | `192.168.40.160/24`, `virtualRouterId: 61` (not the Kubernetes API VIP). |
 | RPO | `quorum` (default). |
 | Volumes | One data LV per node on `vg_kcore` (`pg-orders`, 100 GiB, xfs). WAL and etcd stay on the data volume for the first lab run. |
