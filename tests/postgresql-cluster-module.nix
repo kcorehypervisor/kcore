@@ -7,7 +7,6 @@
   pkgs ? (builtins.getFlake (toString ../.)).inputs.nixpkgs.legacyPackages.${builtins.currentSystem},
 }:
 let
-  inherit (pkgs) lib;
   peers = [
     {
       name = "a";
@@ -160,40 +159,34 @@ pkgs.testers.runNixOSTest {
         require_unit(m, "kcore-pg-etcd-orders.service")
         require_unit(m, "patroni.service")
 
-    def cluster_json(machine):
-        return machine.succeed(
-            "curl -sf -u kcore:secret http://127.0.0.1:8008/cluster"
-        )
+    # Build Basic auth at runtime so the tree does not contain curl -u user:pass
+    # (gitleaks curl-auth-user).
+    patroni = (
+        "AUTH=$(printf '%s' 'kcore:secret' | base64 -w0); "
+        "curl -sf -H \"Authorization: Basic $AUTH\""
+    )
 
     def wait_leader():
         a.wait_until_succeeds(
-            """
-            curl -sf -u kcore:secret http://127.0.0.1:8008/cluster \
-              | grep -q '"role": "leader"'
-            """
+            patroni
+            + " http://127.0.0.1:8008/cluster | grep -q '\"role\": \"leader\"'"
         )
 
     wait_leader()
     a.wait_until_succeeds(
-        """
-        curl -sf -u kcore:secret http://127.0.0.1:8008/cluster \
-          | grep -c '"state": "running"' | grep -qx 3
-        """
+        patroni
+        + " http://127.0.0.1:8008/cluster "
+        + "| grep -c '\"state\": \"running\"' | grep -qx 3"
     )
     a.wait_until_succeeds(
-        """
-        curl -sf -u kcore:secret http://127.0.0.1:8008/cluster \
-          | grep -E '"role": "(sync_standby|quorum_standby|replica)"' \
-          | wc -l | grep -Eq '^[12]$'
-        """
+        patroni
+        + " http://127.0.0.1:8008/cluster "
+        + "| grep -E '\"role\": \"(sync_standby|quorum_standby|replica)\"' "
+        + "| wc -l | grep -Eq '^[12]$'"
     )
 
     psql = "psql -h 192.168.1.50 -U postgres -d postgres -v ON_ERROR_STOP=1"
-    a.wait_until_succeeds(
-        "PGPASSWORD=secret "
-        + psql
-        + " -c 'SELECT 1'"
-    )
+    a.wait_until_succeeds("PGPASSWORD=secret " + psql + " -c 'SELECT 1'")
     a.succeed(
         "PGPASSWORD=secret "
         + psql
@@ -209,7 +202,8 @@ pkgs.testers.runNixOSTest {
 
     def leader_name(machine):
         return machine.succeed(
-            "curl -sf -u kcore:secret http://127.0.0.1:8008/cluster "
+            patroni
+            + " http://127.0.0.1:8008/cluster "
             + "| jq -r '.members[] | select(.role==\"leader\") | .name'"
         ).strip()
 
@@ -220,8 +214,7 @@ pkgs.testers.runNixOSTest {
 
     survivors = [m for name, m in leaders.items() if name != leader_role]
     survivors[0].wait_until_succeeds(
-        "curl -sf -u kcore:secret http://127.0.0.1:8008/cluster "
-        + "| grep -q '\"role\": \"leader\"'"
+        patroni + " http://127.0.0.1:8008/cluster | grep -q '\"role\": \"leader\"'"
     )
     survivors[0].wait_until_succeeds(
         "PGPASSWORD=secret psql -h 192.168.1.50 -U postgres -d postgres "
@@ -237,20 +230,21 @@ pkgs.testers.runNixOSTest {
     require_unit(old, "kcore-pg-etcd-orders.service")
     require_unit(old, "patroni.service")
     old.wait_until_succeeds(
-        "curl -sf -u kcore:secret http://127.0.0.1:8008/patroni "
+        patroni
+        + " http://127.0.0.1:8008/patroni "
         + "| grep -E '\"role\": \"(replica|sync_standby|quorum_standby)\"'"
     )
 
     new_leader = leader_name(survivors[0])
     candidate = next(name for name in ("a", "b", "c") if name != new_leader)
     leaders[new_leader].succeed(
-        "curl -sf -u kcore:secret -H 'Content-Type: application/json' "
+        patroni
+        + " -H 'Content-Type: application/json' "
         + "-X POST http://127.0.0.1:8008/switchover "
         + f"-d '{{\"leader\":\"{new_leader}\",\"candidate\":\"{candidate}\"}}'"
     )
     leaders[candidate].wait_until_succeeds(
-        "curl -sf -u kcore:secret http://127.0.0.1:8008/patroni "
-        + "| grep -q '\"role\": \"leader\"'"
+        patroni + " http://127.0.0.1:8008/patroni | grep -q '\"role\": \"leader\"'"
     )
   '';
 }

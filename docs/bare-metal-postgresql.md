@@ -540,7 +540,7 @@ The VM test, ClusterUpdate hook, MCP kind, dashboard card, and Dell lab example 
 | Question | Answer |
 |---|---|
 | Which three nodes, bootstrap primary? | `dell-1` (primary), `dell-2`, `dell-3`. Controller host stays out. |
-| Advertise address / iface | `192.168.40.103` / `.113` / `.123` on `enp6s0` (confirm reservations match the live Dells). |
+| Advertise address / iface | From the Kea reservations in the network provisioner catalog (`kcore-provisioning status`). Example placeholders in `dell-lab.yaml`: `.103` / `.113` / `.123` on `enp6s0`. |
 | VIP / VRRP id | `192.168.40.160/24`, `virtualRouterId: 61` (not the Kubernetes API VIP). |
 | RPO | `quorum` (default). |
 | Volumes | One data LV per node on `vg_kcore` (`pg-orders`, 100 GiB, xfs). WAL and etcd stay on the data volume for the first lab run. |
