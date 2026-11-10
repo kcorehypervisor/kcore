@@ -74,6 +74,15 @@ export const KINDS: ResourceKind[] = [
     immutable: ["database", "package", "targetNode"],
   },
   {
+    id: "postgresql-cluster",
+    yamlKind: "PostgresqlCluster",
+    title: "PostgreSQL cluster",
+    summary:
+      "One PostgreSQL primary and streaming standbys on kcoreOS nodes, each with an etcd voter. Patroni decides automatic failover. Apply confirms the rollout. Package major, members, VIP, and replication mode stay fixed after create except through the dedicated scale/replace/upgrade RPCs.",
+    mutable: ["parameters", "roles", "databases", "clientNetworks"],
+    immutable: ["package", "members", "replication.mode", "vip"],
+  },
+  {
     id: "container",
     yamlKind: "Container",
     title: "Container",

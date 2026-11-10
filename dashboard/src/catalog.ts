@@ -11,6 +11,7 @@ import {
   KubernetesClusterSpecSchema,
   KubernetesNodeSpecSchema,
   NicSchema,
+  PostgresqlClusterSpecSchema,
   SecurityGroupRuleSchema,
   VmSpecSchema,
   OperatorRoleKindSchema,
@@ -203,6 +204,25 @@ function slurmSpec(v: Values) {
   } catch (error) {
     throw new FormError(`Spec is not a valid Slurm cluster: ${(error as Error).message}`);
   }
+}
+
+function postgresqlClusterSpec(v: Values) {
+  const parsed = JSON.parse(specJson(v)) as JsonObject;
+  try {
+    return fromJson(PostgresqlClusterSpecSchema, parsed);
+  } catch (error) {
+    throw new FormError(`Spec is not a valid PostgreSQL cluster: ${(error as Error).message}`);
+  }
+}
+
+function postgresqlClusterRow(row: Row): Row {
+  const status = (row.status ?? {}) as Row;
+  return {
+    ...flatten(row),
+    phase: status.phase ?? row.phase,
+    leader: status.leaderNodeId ?? status.leader_node_id ?? "",
+    streaming: status.streamingStandbys ?? status.streaming_standbys ?? "",
+  };
 }
 
 function wafPolicyRow(row: Row): Row {
@@ -1850,6 +1870,66 @@ export const RESOURCES: Resource[] = [
     actions: [
       act("delete", "Delete", true, [], async (v) => {
         await controller.deletePostgresql({ name: ident(v) });
+        return { ok: true };
+      }),
+    ],
+  },
+  {
+    id: "postgresql-cluster",
+    noun: "PostgreSQL cluster",
+    title: "PostgreSQL cluster",
+    group: "Services",
+    terraform: ["kcore_postgresql_cluster"],
+    kctl: "pg-cluster get",
+    idField: "name",
+    fields: [f("name", "Name", true), specField("Spec (JSON)")],
+    checks: ["plan"],
+    list: async () =>
+      rowsOf(await controller.listPostgresqlClusters({}), "clusters").map(postgresqlClusterRow),
+    create: async (v) => {
+      const resp = await controller.createPostgresqlCluster({
+        name: required(v, "name"),
+        spec: postgresqlClusterSpec(v),
+        confirm: true,
+      });
+      return ok(resp, { operation: resp.operationId });
+    },
+    inspect: async (key) => {
+      const cluster = rowOf(await controller.getPostgresqlCluster({ name: key })).cluster as Row;
+      let health: Row | undefined;
+      try {
+        health = rowOf(await controller.getPostgresqlClusterHealth({ name: key }));
+      } catch {
+        /* health is optional while the cluster is still creating */
+      }
+      return { detail: { ...cluster, health } };
+    },
+    actions: [
+      act("plan", "Plan", false, [], async (v) => {
+        const name = ident(v);
+        if (text(v, "spec")) {
+          return rowOf(
+            await controller.planPostgresqlCluster({ name, spec: postgresqlClusterSpec(v) }),
+          );
+        }
+        const stored = (await controller.getPostgresqlCluster({ name })).cluster?.spec;
+        if (!stored) throw new Error(`PostgreSQL cluster ${name} has no spec`);
+        return rowOf(await controller.planPostgresqlCluster({ name, spec: stored }));
+      }),
+      act("switchover", "Switchover", true, [f("to", "Candidate node")], async (v) => {
+        const resp = await controller.switchoverPostgresqlCluster({
+          name: ident(v),
+          candidate: text(v, "to"),
+          confirm: true,
+        });
+        return ok(resp, { operation: resp.operationId });
+      }),
+      act("delete", "Delete", true, [bool("force", "Force")], async (v) => {
+        await controller.deletePostgresqlCluster({
+          name: ident(v),
+          confirm: true,
+          force: flag(v, "force"),
+        });
         return { ok: true };
       }),
     ],

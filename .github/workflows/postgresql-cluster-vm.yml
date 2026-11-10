@@ -1,0 +1,32 @@
+name: postgresql-cluster-vm
+
+# Three-machine Patroni/etcd/keepalived test. It is not part of nix-checks:
+# that job must not download or build the PostgreSQL/Patroni closure.
+on:
+  pull_request:
+    paths:
+      - "modules/kcore-postgresql-cluster.nix"
+      - "tests/postgresql-cluster-module.nix"
+      - ".github/workflows/postgresql-cluster-vm.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgresql-cluster-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v21
+
+      - name: Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+        continue-on-error: true
+
+      - name: Run the three-machine PostgreSQL cluster test
+        run: nix build --extra-experimental-features 'nix-command flakes' --file tests/postgresql-cluster-module.nix

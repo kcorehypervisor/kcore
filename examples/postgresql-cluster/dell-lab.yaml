@@ -1,0 +1,68 @@
+# PostgresqlCluster for the three Dell lab hypervisors (dell-1, dell-2, dell-3).
+# Management NIC is enp6s0 on each Dell; LVM data volumes live on vg_kcore.
+#
+# Confirm advertise addresses and the VIP are free on 192.168.40.0/24 before
+# apply (VIP must not collide with the Kubernetes API VIP or ingress keepalived).
+#
+#   kctl pg-cluster plan -f examples/postgresql-cluster/dell-lab.yaml
+#   kctl pg-cluster apply -f examples/postgresql-cluster/dell-lab.yaml --confirm
+#   kctl pg-cluster health orders
+#   kctl pg-cluster credentials orders
+#
+# See docs/bare-metal-postgresql.md (lab apply answers for the three Dells).
+kind: PostgresqlCluster
+metadata:
+  name: orders
+spec:
+  package: postgresql_17
+  members:
+    - nodeId: dell-1
+      role: primary
+      advertiseAddress: 192.168.40.103
+      iface: enp6s0
+      dataVolume:
+        {
+          name: pg-orders,
+          storageClass: lvm,
+          volumeGroup: vg_kcore,
+          sizeBytes: 107374182400,
+          fsType: xfs,
+        }
+    - nodeId: dell-2
+      advertiseAddress: 192.168.40.113
+      iface: enp6s0
+      dataVolume:
+        {
+          name: pg-orders,
+          storageClass: lvm,
+          volumeGroup: vg_kcore,
+          sizeBytes: 107374182400,
+          fsType: xfs,
+        }
+    - nodeId: dell-3
+      advertiseAddress: 192.168.40.123
+      iface: enp6s0
+      dataVolume:
+        {
+          name: pg-orders,
+          storageClass: lvm,
+          volumeGroup: vg_kcore,
+          sizeBytes: 107374182400,
+          fsType: xfs,
+        }
+  replication:
+    mode: quorum
+  vip:
+    address: 192.168.40.160/24
+    virtualRouterId: 61
+  clientNetworks: [192.168.40.0/24]
+  parameters:
+    max_connections: "300"
+    work_mem: "16MB"
+  roles:
+    - name: app
+      login: true
+  databases:
+    - name: orders
+      owner: app
+      extensions: [pg_stat_statements, pgcrypto]

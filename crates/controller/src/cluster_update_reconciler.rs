@@ -303,7 +303,18 @@ async fn reconcile_update(
                         }
                         return Ok(());
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if let Err(err) =
+                            prepare_postgresql_for_reboot(db, clients, &node_row.node_id).await
+                        {
+                            db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                                last_error: err,
+                                ..node_row.clone()
+                            })
+                            .map_err(|e| format!("mark postgresql gate: {e}"))?;
+                            return Ok(());
+                        }
+                    }
                     Err(err) => return Err(err),
                 }
                 let closure = node_row.prepared_closure.clone();
@@ -397,6 +408,16 @@ async fn reconcile_update(
                 return Ok(());
             }
             "drained" => {
+                if let Err(err) =
+                    prepare_postgresql_for_reboot(db, clients, &node_row.node_id).await
+                {
+                    db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                        last_error: err,
+                        ..node_row.clone()
+                    })
+                    .map_err(|e| format!("mark postgresql gate: {e}"))?;
+                    return Ok(());
+                }
                 let closure = node_row.prepared_closure.clone();
                 let req = node_proto::ActivateSystemUpdateRequest {
                     update_name: update.name.clone(),
@@ -1199,6 +1220,83 @@ fn other_control_plane_is_mid_update(db: &Database, node_id: &str) -> Result<boo
         }
     }
     Ok(false)
+}
+
+/// Before a ClusterUpdate activates (and may reboot) a node that hosts a
+/// PostgresqlCluster member: switch the Patroni leader off that node when
+/// needed, and refuse when the reboot would lose etcd quorum.
+async fn prepare_postgresql_for_reboot(
+    db: &Database,
+    clients: &NodeClients,
+    node_id: &str,
+) -> Result<(), String> {
+    let Some(cluster_name) = db
+        .pg_cluster_of_node(node_id)
+        .map_err(|e| format!("postgresql membership: {e}"))?
+    else {
+        return Ok(());
+    };
+    let cluster = db
+        .get_pg_cluster(&cluster_name)
+        .map_err(|e| format!("get postgresql cluster: {e}"))?
+        .ok_or_else(|| format!("PostgreSQL cluster {cluster_name} disappeared"))?;
+    let spec: kcore_postgresql::ClusterSpec = serde_json::from_str(&cluster.spec_json)
+        .map_err(|e| format!("decode postgresql spec: {e}"))?;
+    let voters = crate::postgresql_cluster_engine::voters_of(db, &cluster_name);
+    let health = crate::postgresql_cluster_engine::health_of(db, &cluster_name);
+    if health.is_empty() {
+        return Err(format!(
+            "postgresql health for {cluster_name} has not been observed"
+        ));
+    }
+
+    if kcore_postgresql::rollout::leader_of(&health) == Some(node_id) {
+        let exclude = vec![node_id.to_string()];
+        let Some(candidate) = kcore_postgresql::switchover_candidate(&spec, &health, &exclude, &[])
+        else {
+            return Err(format!(
+                "{node_id} is the Patroni leader of {cluster_name} and no streaming standby is ready for switchover"
+            ));
+        };
+        let node = db
+            .get_node(node_id)
+            .map_err(|e| format!("get node {node_id}: {e}"))?
+            .ok_or_else(|| format!("node {node_id} is not registered"))?;
+        if clients.get_admin(&node.address).is_none() {
+            clients
+                .connect(&node.address)
+                .await
+                .map_err(|e| format!("connect {node_id} at {}: {e}", node.address))?;
+        }
+        let mut admin = clients
+            .get_admin(&node.address)
+            .ok_or_else(|| format!("no admin client for {}", node.address))?;
+        let response = admin
+            .run_postgresql_admin(Request::new(node_proto::RunPostgresqlAdminRequest {
+                cluster_name: cluster_name.clone(),
+                spec_json: cluster.spec_json.clone(),
+                node_id: node_id.to_string(),
+                command: Some(
+                    node_proto::run_postgresql_admin_request::Command::SwitchoverCandidate(
+                        candidate.clone(),
+                    ),
+                ),
+            }))
+            .await
+            .map_err(|e| format!("postgresql switchover on {node_id}: {e}"))?
+            .into_inner();
+        if !response.ok {
+            return Err(format!(
+                "postgresql switchover on {node_id}: {}",
+                response.message
+            ));
+        }
+        return Err(format!(
+            "switched PostgreSQL cluster {cluster_name} from {node_id} to {candidate}; waiting for the new leader before reboot"
+        ));
+    }
+
+    kcore_postgresql::safe_to_take_down(&spec, &voters, &health, node_id)
 }
 
 async fn drain_slurm_member(
