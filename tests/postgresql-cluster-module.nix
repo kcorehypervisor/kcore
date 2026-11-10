@@ -158,6 +158,7 @@ pkgs.testers.runNixOSTest {
     for m in (a, b, c):
         require_unit(m, "kcore-pg-etcd-orders.service")
         require_unit(m, "patroni.service")
+        require_unit(m, "keepalived-pg-orders.service")
 
     # Build Basic auth at runtime so the tree does not contain curl -u user:pass
     # (gitleaks curl-auth-user).
@@ -169,7 +170,8 @@ pkgs.testers.runNixOSTest {
     def wait_leader():
         a.wait_until_succeeds(
             patroni
-            + " http://127.0.0.1:8008/cluster | grep -q '\"role\": \"leader\"'"
+            + " http://127.0.0.1:8008/cluster | grep -q '\"role\": \"leader\"'",
+            timeout=180,
         )
 
     wait_leader()
@@ -178,17 +180,25 @@ pkgs.testers.runNixOSTest {
         patroni
         + " http://127.0.0.1:8008/cluster "
         + "| jq -e '[.members[] | select(.state==\"running\" or .state==\"streaming\")] "
-        + "| length == 3' >/dev/null"
+        + "| length == 3' >/dev/null",
+        timeout=180,
     )
     a.wait_until_succeeds(
         patroni
         + " http://127.0.0.1:8008/cluster "
         + "| grep -E '\"role\": \"(sync_standby|quorum_standby|replica)\"' "
-        + "| wc -l | grep -Eq '^[12]$'"
+        + "| wc -l | grep -Eq '^[12]$'",
+        timeout=60,
     )
 
     psql = "psql -h 192.168.1.50 -U postgres -d postgres -v ON_ERROR_STOP=1"
-    a.wait_until_succeeds("PGPASSWORD=secret " + psql + " -c 'SELECT 1'")
+    a.wait_until_succeeds(
+        "ip -4 -o addr show | grep -q '192.168.1.50/' "
+        + "|| true; PGPASSWORD=secret "
+        + psql
+        + " -c 'SELECT 1'",
+        timeout=180,
+    )
     a.succeed(
         "PGPASSWORD=secret "
         + psql
@@ -214,15 +224,30 @@ pkgs.testers.runNixOSTest {
     old = leaders[leader_role]
     old.crash()
 
-    survivors = [m for name, m in leaders.items() if name != leader_role]
-    survivors[0].wait_until_succeeds(
-        patroni + " http://127.0.0.1:8008/cluster | grep -q '\"role\": \"leader\"'"
+    survivors = {name: m for name, m in leaders.items() if name != leader_role}
+    survivor = next(iter(survivors.values()))
+    survivor.wait_until_succeeds(
+        patroni + " http://127.0.0.1:8008/cluster | grep -q '\"role\": \"leader\"'",
+        timeout=180,
     )
-    survivors[0].wait_until_succeeds(
-        "PGPASSWORD=secret psql -h 192.168.1.50 -U postgres -d postgres "
+    new_leader = leader_name(survivor)
+    new_m = leaders[new_leader]
+    # keepalived only places the VIP after /primary succeeds on the new leader.
+    new_m.wait_until_succeeds(
+        "ip -4 -o addr show | grep -q '192.168.1.50/'",
+        timeout=180,
+    )
+    new_m.succeed(
+        "PGPASSWORD=secret psql -h 127.0.0.1 -U postgres -d postgres "
         + "-c \"INSERT INTO hits VALUES (1001) ON CONFLICT DO NOTHING;\""
     )
-    got = survivors[0].succeed(
+    standby = next(m for name, m in survivors.items() if name != new_leader)
+    standby.succeed("ip neigh flush all || true")
+    standby.wait_until_succeeds(
+        "PGPASSWORD=secret psql -h 192.168.1.50 -U postgres -d postgres -c 'SELECT 1'",
+        timeout=120,
+    )
+    got = standby.succeed(
         "PGPASSWORD=secret psql -h 127.0.0.1 -U postgres -d postgres "
         + "-Atc 'SELECT count(*) FROM hits'"
     ).strip()
@@ -234,10 +259,10 @@ pkgs.testers.runNixOSTest {
     old.wait_until_succeeds(
         patroni
         + " http://127.0.0.1:8008/patroni "
-        + "| grep -E '\"role\": \"(replica|sync_standby|quorum_standby)\"'"
+        + "| grep -E '\"role\": \"(replica|sync_standby|quorum_standby)\"'",
+        timeout=180,
     )
 
-    new_leader = leader_name(survivors[0])
     candidate = next(name for name in ("a", "b", "c") if name != new_leader)
     leaders[new_leader].succeed(
         patroni
@@ -246,7 +271,8 @@ pkgs.testers.runNixOSTest {
         + f"-d '{{\"leader\":\"{new_leader}\",\"candidate\":\"{candidate}\"}}'"
     )
     leaders[candidate].wait_until_succeeds(
-        patroni + " http://127.0.0.1:8008/patroni | grep -q '\"role\": \"leader\"'"
+        patroni + " http://127.0.0.1:8008/patroni | grep -q '\"role\": \"leader\"'",
+        timeout=180,
     )
   '';
 }
