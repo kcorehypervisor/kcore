@@ -146,6 +146,7 @@ in
     ./kcore-ceph.nix
     ./kcore-ingress.nix
     ./kcore-metrics.nix
+    ./kcore-postgresql-cluster.nix
     (lib.mkRemovedOptionModule [
       "services"
       "kcore"

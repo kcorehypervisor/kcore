@@ -1,4 +1,5 @@
 mod ingress;
+mod postgresql;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -11515,6 +11516,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .map_err(|e| Status::internal(format!("listing postgresql: {e}")))?
                 .into_iter()
                 .map(|row| row.node_id)
+                .chain(
+                    self.db
+                        .list_pg_clusters()
+                        .map_err(|e| Status::internal(format!("listing postgresql clusters: {e}")))?
+                        .into_iter()
+                        .flat_map(|c| self.db.list_pg_members(&c.name).unwrap_or_default())
+                        .map(|m| m.node_id),
+                )
                 .collect::<HashSet<_>>();
             let nodes = self
                 .db
@@ -11543,6 +11552,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
             return Err(Status::failed_precondition(format!(
                 "node '{}' already runs postgresql '{}'; v1 is a single database per node",
                 node.id, other.name
+            )));
+        }
+        if let Some(cluster) = self
+            .db
+            .pg_cluster_of_node(&node.id)
+            .map_err(|e| Status::internal(format!("checking node postgresql cluster: {e}")))?
+        {
+            return Err(Status::failed_precondition(format!(
+                "node '{}' is a member of PostgreSQL cluster '{cluster}'",
+                node.id
             )));
         }
 
@@ -19230,6 +19249,132 @@ impl controller_proto::controller_server::Controller for ControllerService {
             success: true,
             message,
         }))
+    }
+    async fn plan_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::PlanPostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::PlanPostgresqlClusterResponse>, Status> {
+        self.pg_plan_rpc(request).await
+    }
+    async fn create_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::CreatePostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_create(request).await
+    }
+    async fn update_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::UpdatePostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_update(request).await
+    }
+    async fn get_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::GetPostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::GetPostgresqlClusterResponse>, Status> {
+        self.pg_get(request).await
+    }
+    async fn list_postgresql_clusters(
+        &self,
+        request: Request<controller_proto::ListPostgresqlClustersRequest>,
+    ) -> Result<Response<controller_proto::ListPostgresqlClustersResponse>, Status> {
+        self.pg_list(request).await
+    }
+    async fn delete_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::DeletePostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_delete(request).await
+    }
+    async fn scale_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::ScalePostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_scale(request).await
+    }
+    async fn replace_postgresql_member(
+        &self,
+        request: Request<controller_proto::ReplacePostgresqlMemberRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_replace(request).await
+    }
+    async fn reinit_postgresql_member(
+        &self,
+        request: Request<controller_proto::ReinitPostgresqlMemberRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_reinit(request).await
+    }
+    async fn upgrade_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::UpgradePostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_upgrade(request).await
+    }
+    async fn finalize_postgresql_upgrade(
+        &self,
+        request: Request<controller_proto::PostgresqlClusterNameRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_finalize(request, false).await
+    }
+    async fn rollback_postgresql_upgrade(
+        &self,
+        request: Request<controller_proto::PostgresqlClusterNameRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_finalize(request, true).await
+    }
+    async fn switchover_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::SwitchoverPostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_switchover(request).await
+    }
+    async fn failover_postgresql_cluster(
+        &self,
+        request: Request<controller_proto::FailoverPostgresqlClusterRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_failover(request).await
+    }
+    async fn set_postgresql_maintenance(
+        &self,
+        request: Request<controller_proto::SetPostgresqlMaintenanceRequest>,
+    ) -> Result<Response<controller_proto::PostgresqlClusterOperationResponse>, Status> {
+        self.pg_maintenance(request).await
+    }
+    async fn get_postgresql_cluster_health(
+        &self,
+        request: Request<controller_proto::PostgresqlClusterNameRequest>,
+    ) -> Result<Response<controller_proto::GetPostgresqlClusterHealthResponse>, Status> {
+        self.pg_health(request).await
+    }
+    async fn list_postgresql_cluster_events(
+        &self,
+        request: Request<controller_proto::ListPostgresqlClusterEventsRequest>,
+    ) -> Result<Response<controller_proto::ListPostgresqlClusterEventsResponse>, Status> {
+        self.pg_events(request).await
+    }
+    async fn get_postgresql_operation(
+        &self,
+        request: Request<controller_proto::GetPostgresqlOperationRequest>,
+    ) -> Result<Response<controller_proto::GetPostgresqlOperationResponse>, Status> {
+        self.pg_get_operation(request).await
+    }
+    async fn list_postgresql_operations(
+        &self,
+        request: Request<controller_proto::ListPostgresqlOperationsRequest>,
+    ) -> Result<Response<controller_proto::ListPostgresqlOperationsResponse>, Status> {
+        self.pg_list_operations(request).await
+    }
+    async fn cancel_postgresql_operation(
+        &self,
+        request: Request<controller_proto::GetPostgresqlOperationRequest>,
+    ) -> Result<Response<controller_proto::GetPostgresqlOperationResponse>, Status> {
+        self.pg_cancel_operation(request).await
+    }
+    async fn get_postgresql_cluster_credentials(
+        &self,
+        request: Request<controller_proto::PostgresqlClusterNameRequest>,
+    ) -> Result<Response<controller_proto::GetPostgresqlClusterCredentialsResponse>, Status> {
+        self.pg_credentials(request).await
     }
 
     async fn plan_kubernetes_cluster(

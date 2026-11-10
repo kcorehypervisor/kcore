@@ -18,6 +18,7 @@ the event.
 | `ingress.waf.blocked` | Gateway nodes reported requests the WAF refused. One event per route per minute, with `count`, `topRules` and `topClients`. |
 | `ingress.waf.detected` | Same, for requests a rule matched while the route was in `detect` mode. |
 | `ingress.vip.moved` | The node holding an ingress gateway's VIP changed. `data` has `from`, `to` and `address`. |
+| `postgresql.failover` | Patroni promoted a new leader in a PostgreSQL cluster while no operation was running. `data` has `cluster`, `oldLeader`, `newLeader` and `timeline`. |
 
 Each controller delivers events it observes itself. Set `replication.controllerId`
 when several controllers post to the same URL; the field is copied onto every

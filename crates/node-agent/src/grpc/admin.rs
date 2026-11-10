@@ -3055,6 +3055,107 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn check_postgresql_cluster_preflight(
+        &self,
+        request: Request<proto::CheckPostgresqlClusterPreflightRequest>,
+    ) -> Result<Response<proto::CheckPostgresqlClusterPreflightResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        crate::postgresql_cluster_agent::preflight(&req)
+            .await
+            .map(Response::new)
+            .map_err(Status::invalid_argument)
+    }
+
+    async fn apply_postgresql_cluster_config(
+        &self,
+        request: Request<proto::ApplyPostgresqlClusterConfigRequest>,
+    ) -> Result<Response<proto::ApplyPostgresqlClusterConfigResponse>, Status> {
+        use crate::postgresql_cluster_agent as pg;
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let values = pg::render_values(&req).map_err(Status::invalid_argument)?;
+        if req.stage == "disable" {
+            pg::remove_secrets(&req.cluster_name);
+        } else {
+            let secrets = req
+                .secrets
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("secrets are required"))?;
+            pg::write_secrets(&req.cluster_name, secrets)
+                .await
+                .map_err(Status::internal)?;
+            let spec = pg::parse_spec(&req.cluster_name, &req.spec_json)
+                .map_err(Status::invalid_argument)?;
+            pg::ensure_volumes(&req.cluster_name, &spec, &req.node_id)
+                .await
+                .map_err(Status::internal)?;
+        }
+        tokio::fs::write(pg::VALUES_FILE, values.as_bytes())
+            .await
+            .map_err(|e| Status::internal(format!("writing {}: {e}", pg::VALUES_FILE)))?;
+        let apply_id = format!("pg-{}", uuid_like_suffix());
+        write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
+        let apply_lock = Arc::clone(&self.apply_lock);
+        let spawned_id = apply_id.clone();
+        tokio::spawn(async move {
+            let _guard = apply_lock.lock().await;
+            run_test_then_switch(
+                PathBuf::from(pg::VALUES_FILE),
+                Vec::new(),
+                Vec::new(),
+                spawned_id,
+            )
+            .await;
+        });
+        Ok(Response::new(proto::ApplyPostgresqlClusterConfigResponse {
+            message: format!(
+                "{} written; nixos-rebuild {apply_id} started",
+                pg::VALUES_FILE
+            ),
+            apply_id,
+        }))
+    }
+
+    async fn get_postgresql_cluster_status(
+        &self,
+        request: Request<proto::GetPostgresqlClusterStatusRequest>,
+    ) -> Result<Response<proto::GetPostgresqlClusterStatusResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        if !kcore_postgresql::spec::valid_identifier(&req.cluster_name) {
+            return Err(Status::invalid_argument(
+                "cluster_name is not a valid identifier",
+            ));
+        }
+        Ok(Response::new(
+            crate::postgresql_cluster_agent::status(&req.cluster_name).await,
+        ))
+    }
+
+    async fn run_postgresql_admin(
+        &self,
+        request: Request<proto::RunPostgresqlAdminRequest>,
+    ) -> Result<Response<proto::RunPostgresqlAdminResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        match crate::postgresql_cluster_agent::admin(&req).await {
+            Ok(message) => Ok(Response::new(proto::RunPostgresqlAdminResponse {
+                ok: true,
+                result: message.clone(),
+                message,
+            })),
+            Err(message) => {
+                warn!(cluster = %req.cluster_name, error = %message, "postgresql admin command failed");
+                Ok(Response::new(proto::RunPostgresqlAdminResponse {
+                    ok: false,
+                    message,
+                    result: String::new(),
+                }))
+            }
+        }
+    }
+
     async fn bootstrap_ceph_osd(
         &self,
         request: Request<proto::BootstrapCephOsdRequest>,

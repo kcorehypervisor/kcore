@@ -44,6 +44,8 @@ mod object_store_spec;
 mod path_safety;
 mod pci;
 mod pki;
+mod postgresql_cluster_engine;
+mod postgresql_cluster_pki;
 mod rate_limit;
 mod replication;
 mod replication_policy;
@@ -289,6 +291,12 @@ async fn main() -> anyhow::Result<()> {
     ingress_reconciler::spawn_ingress_reconciler(
         database.clone(),
         clients.clone(),
+        webhooks.clone(),
+    );
+    postgresql_cluster_engine::spawn(
+        database.clone(),
+        clients.clone(),
+        cfg.replication.clone(),
         webhooks.clone(),
     );
 

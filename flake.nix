@@ -64,6 +64,8 @@
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
               || (toString path) == "${toString ./.}/modules/kcore-slurm.nix"
+              || (toString path) == "${toString ./.}/modules/kcore-postgresql-cluster.nix"
+              || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/postgresql-cluster/" (toString path)
               || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path);
           };
 
@@ -249,6 +251,11 @@
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
             kcore-slurm = import ./tests/kcore-slurm.nix { inherit pkgs; };
+            postgresql-cluster-module-eval = import ./tests/postgresql-cluster-module-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
             ch-vm-module-eval = import ./tests/ch-vm-module-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;
@@ -368,6 +375,7 @@
             "kcore-vms.nix"
             "kcore-ceph.nix"
             "kcore-slurm.nix"
+            "kcore-postgresql-cluster.nix"
             "legacy-configuration.nix"
           ];
 
@@ -483,6 +491,7 @@
             kcore-disko = ./modules/kcore-disko.nix;
             kcore-ceph = cephModule;
             kcore-slurm = slurmModule;
+            kcore-postgresql-cluster = ./modules/kcore-postgresql-cluster.nix;
             kcore-metrics = metricsModule;
             # The version follows the kcore input, so moving that pin updates
             # /etc/kcore/version without editing the host flake.
@@ -1184,6 +1193,7 @@
                                                                 echo "kcore packages come from the host flake; not copying /opt/kcore/bin."
                                                                 printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-ceph.nix
                                                                 printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-slurm.nix
+                                                                printf '{ ... }: {}\n' > /mnt/etc/nixos/kcore-postgresql-cluster.nix
                                                                 # The format already happened. The saved graph must not point at
                                                                 # /tmp, which is gone after reboot.
                                                                 sed 's|passwordFile = "/tmp/luks/password"|passwordFile = "/etc/kcore/recovery/crypto_keyfile.bin"|' /tmp/disko-config.nix > /mnt/etc/nixos/disko-config.nix

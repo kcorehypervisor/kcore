@@ -21,6 +21,7 @@ pub mod object_store;
 pub mod object_user;
 pub mod operation;
 pub mod operator;
+pub mod pg_cluster;
 pub mod pki;
 pub mod postgresql;
 pub mod resource_manifests;

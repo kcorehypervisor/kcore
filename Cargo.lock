@@ -1479,6 +1479,7 @@ dependencies = [
  "hyper-util",
  "kcore-disko-types",
  "kcore-gpu",
+ "kcore-postgresql",
  "kcore-sanitize",
  "libc",
  "pem",
@@ -1564,6 +1565,7 @@ dependencies = [
  "hyperlocal",
  "kcore-disko-types",
  "kcore-gpu",
+ "kcore-postgresql",
  "kcore-sanitize",
  "kcore-volume-mirror",
  "libc",
@@ -1590,6 +1592,17 @@ dependencies = [
  "x509-cert",
  "x509-ocsp",
  "x509-parser",
+]
+
+[[package]]
+name = "kcore-postgresql"
+version = "0.1.0"
+dependencies = [
+ "kcore-sanitize",
+ "proptest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -1646,6 +1659,7 @@ dependencies = [
  "dirs",
  "kcore-disk-layout-yaml",
  "kcore-gpu",
+ "kcore-postgresql",
  "kcore-sanitize",
  "libc",
  "proptest",
