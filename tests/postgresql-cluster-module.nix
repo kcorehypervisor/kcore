@@ -268,8 +268,22 @@ pkgs.testers.runNixOSTest {
         timeout=300,
     )
 
+    # Quorum mode only switchovers onto a sync/quorum standby.
+    survivor.wait_until_succeeds(
+        patroni
+        + " http://127.0.0.1:8008/cluster "
+        + "| jq -e '[.members[] | select(.role == \"sync_standby\" "
+        + "or .role == \"quorum_standby\")] | length >= 1' >/dev/null",
+        timeout=180,
+    )
     current = leader_name(survivor)
-    candidate = next(name for name in ("a", "b", "c") if name != current)
+    candidate = survivor.succeed(
+        patroni
+        + " http://127.0.0.1:8008/cluster "
+        + "| jq -r '[.members[] | select(.role == \"sync_standby\" "
+        + "or .role == \"quorum_standby\")][0].name'"
+    ).strip()
+    assert candidate and candidate != current, candidate
     leaders[current].succeed(
         patroni
         + " -H 'Content-Type: application/json' "
