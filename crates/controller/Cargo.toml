@@ -7,6 +7,7 @@ edition = "2021"
 autoexamples = false
 
 [dependencies]
+kcore-postgresql = { path = "../kcore-postgresql" }
 anyhow = "1.0.102"
 kcore-gpu = { path = "../kcore-gpu" }
 kcore-sanitize = { path = "../kcore-sanitize" }
