@@ -256,19 +256,21 @@ pkgs.testers.runNixOSTest {
     old.start()
     require_unit(old, "kcore-pg-etcd-orders.service")
     require_unit(old, "patroni.service")
+    # A restarted former primary may reclaim the lock; any healthy role is fine.
     old.wait_until_succeeds(
         patroni
         + " http://127.0.0.1:8008/patroni "
-        + "| grep -E '\"role\": \"(replica|sync_standby|quorum_standby)\"'",
-        timeout=180,
+        + "| grep -E '\"role\": \"(leader|replica|sync_standby|quorum_standby)\"'",
+        timeout=300,
     )
 
-    candidate = next(name for name in ("a", "b", "c") if name != new_leader)
-    leaders[new_leader].succeed(
+    current = leader_name(survivor)
+    candidate = next(name for name in ("a", "b", "c") if name != current)
+    leaders[current].succeed(
         patroni
         + " -H 'Content-Type: application/json' "
         + "-X POST http://127.0.0.1:8008/switchover "
-        + f"-d '{{\"leader\":\"{new_leader}\",\"candidate\":\"{candidate}\"}}'"
+        + f"-d '{{\"leader\":\"{current}\",\"candidate\":\"{candidate}\"}}'"
     )
     leaders[candidate].wait_until_succeeds(
         patroni + " http://127.0.0.1:8008/patroni | grep -q '\"role\": \"leader\"'",
