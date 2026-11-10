@@ -256,11 +256,15 @@ pkgs.testers.runNixOSTest {
     old.start()
     require_unit(old, "kcore-pg-etcd-orders.service")
     require_unit(old, "patroni.service")
-    # A restarted former primary may reclaim the lock; any healthy role is fine.
-    old.wait_until_succeeds(
+    # Ask a live peer's /cluster view whether the crashed node rejoined.
+    # Curling /patroni on the recovering node races REST readiness; the
+    # cluster roster is the source of truth (and may show it as leader again).
+    survivor.wait_until_succeeds(
         patroni
-        + " http://127.0.0.1:8008/patroni "
-        + "| grep -E '\"role\": \"(leader|replica|sync_standby|quorum_standby)\"'",
+        + " http://127.0.0.1:8008/cluster "
+        + f"| jq -e --arg n '{leader_role}' "
+        + "'.members[] | select(.name == $n) "
+        + "| select(.state == \"running\" or .state == \"streaming\")' >/dev/null",
         timeout=300,
     )
 
@@ -272,8 +276,11 @@ pkgs.testers.runNixOSTest {
         + "-X POST http://127.0.0.1:8008/switchover "
         + f"-d '{{\"leader\":\"{current}\",\"candidate\":\"{candidate}\"}}'"
     )
-    leaders[candidate].wait_until_succeeds(
-        patroni + " http://127.0.0.1:8008/patroni | grep -q '\"role\": \"leader\"'",
+    survivor.wait_until_succeeds(
+        patroni
+        + " http://127.0.0.1:8008/cluster "
+        + f"| jq -e --arg n '{candidate}' "
+        + "'.members[] | select(.name == $n and .role == \"leader\")' >/dev/null",
         timeout=180,
     )
   '';
