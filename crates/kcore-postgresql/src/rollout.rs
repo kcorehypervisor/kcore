@@ -607,6 +607,43 @@ pub fn safe_to_restart(
     Ok(())
 }
 
+/// May a ClusterUpdate reboot take `node` down? Checks etcd quorum after the
+/// loss, then the same gates as [`safe_to_restart`] for PostgreSQL members.
+/// Callers that find the node is still the leader should switch over first and
+/// re-check; this function does not perform the switchover.
+pub fn safe_to_take_down(
+    spec: &ClusterSpec,
+    voters: &[String],
+    health: &[MemberHealth],
+    node: &str,
+) -> Result<(), String> {
+    if health.is_empty() {
+        return Err(format!(
+            "postgresql health for {node} has not been observed"
+        ));
+    }
+    if voters.iter().any(|v| v == node) {
+        let mut projected = health.to_vec();
+        if let Some(h) = projected.iter_mut().find(|h| h.node_id == node) {
+            h.etcd_active = false;
+            h.patroni_active = false;
+            h.role.clear();
+        } else {
+            return Err(format!("no health for etcd voter {node}"));
+        }
+        if !etcd_quorum(voters, &projected) {
+            return Err(format!(
+                "rebooting {node} would lose etcd quorum for the PostgreSQL cluster"
+            ));
+        }
+        etcd_restart_allowed(voters, health, node)?;
+    }
+    if spec.postgres_members().any(|m| m.node_id == node) {
+        safe_to_restart(spec, health, node)?;
+    }
+    Ok(())
+}
+
 /// May the etcd member on `node` restart? Every other voter must be up and
 /// the ensemble must have a leader.
 pub fn etcd_restart_allowed(
@@ -974,6 +1011,28 @@ mod tests {
         assert!(safe_to_restart(&spec, &health, "node-108").is_ok());
         health[1].lag_bytes = -1;
         assert!(safe_to_restart(&spec, &health, "node-108").is_err());
+    }
+
+    #[test]
+    fn take_down_refuses_leader_and_etcd_quorum_loss() {
+        let (_, spec) = sample();
+        let v = voters(&spec);
+        let mut health = healthy(&spec, "node-105");
+        assert!(safe_to_take_down(&spec, &v, &health, "node-106").is_ok());
+        assert!(safe_to_take_down(&spec, &v, &health, "node-105")
+            .unwrap_err()
+            .contains("leader"));
+        health[2].etcd_active = false;
+        assert!(safe_to_take_down(&spec, &v, &health, "node-106")
+            .unwrap_err()
+            .contains("etcd"));
+        // Two voters already down: taking the last one would leave no quorum.
+        health[1].etcd_active = false;
+        let err = safe_to_take_down(&spec, &v, &health, "node-105").unwrap_err();
+        assert!(
+            err.contains("quorum") || err.contains("etcd") || err.contains("leader"),
+            "{err}"
+        );
     }
 
     #[test]

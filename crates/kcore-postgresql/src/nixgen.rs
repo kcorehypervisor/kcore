@@ -233,7 +233,7 @@ pub fn render_member(f: &MemberFragment, stage: Stage) -> String {
     let postgres = f.postgres && stage == Stage::Full;
     let mut out = String::new();
     out.push_str("# Written by the kcore node agent. Do not edit: the next apply replaces it.\n");
-    out.push_str("_:\n{\n  kcore.postgresqlCluster = {\n");
+    out.push_str("_: {\n  kcore.postgresqlCluster = {\n");
     out.push_str("    enable = true;\n");
     out.push_str(&format!("    clusterName = {};\n", q(&f.cluster)));
     out.push_str(&format!("    generation = {};\n", f.generation));
@@ -325,7 +325,7 @@ pub fn render_member(f: &MemberFragment, stage: Stage) -> String {
 
 /// The values file of a node that is not (or no longer) a member.
 pub fn render_disabled() -> String {
-    "# Written by the kcore node agent. Do not edit: the next apply replaces it.\n_:\n{\n  kcore.postgresqlCluster.enable = false;\n}\n"
+    "# Written by the kcore node agent. Do not edit: the next apply replaces it.\n_: {\n  kcore.postgresqlCluster.enable = false;\n}\n"
         .to_string()
 }
 
