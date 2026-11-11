@@ -241,17 +241,22 @@ pkgs.testers.runNixOSTest {
         "PGPASSWORD=secret psql -h 127.0.0.1 -U postgres -d postgres "
         + "-c \"INSERT INTO hits VALUES (1001) ON CONFLICT DO NOTHING;\""
     )
+    got = new_m.succeed(
+        "PGPASSWORD=secret psql -h 127.0.0.1 -U postgres -d postgres "
+        + "-Atc 'SELECT count(*) FROM hits'"
+    ).strip()
+    assert got == "1001", f"leader count after insert: {got}"
     standby = next(m for name, m in survivors.items() if name != new_leader)
     standby.succeed("ip neigh flush all || true")
     standby.wait_until_succeeds(
         "PGPASSWORD=secret psql -h 192.168.1.50 -U postgres -d postgres -c 'SELECT 1'",
         timeout=120,
     )
-    got = standby.succeed(
+    standby.wait_until_succeeds(
         "PGPASSWORD=secret psql -h 127.0.0.1 -U postgres -d postgres "
-        + "-Atc 'SELECT count(*) FROM hits'"
-    ).strip()
-    assert got == "1001", got
+        + "-Atc 'SELECT count(*) FROM hits' | grep -qx 1001",
+        timeout=120,
+    )
 
     old.start()
     require_unit(old, "kcore-pg-etcd-orders.service")
