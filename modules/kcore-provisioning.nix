@@ -48,6 +48,59 @@ let
       ${pkgs.sqlite}/bin/sqlite3 "$db" < ${pkgs.pdns}/share/doc/pdns/schema.sqlite3.sql
     fi
   '';
+
+  # network-online.target alone is not enough here: lan10g can still be
+  # operstate!=up (or missing its address) when Kea/pdns start after reboot.
+  dhcpInterfaces = lib.unique (
+    lib.filter (iface: iface != "") (lib.mapAttrsToList (_: network: network.interface) cfg.networks)
+  );
+  waitAddresses = lib.unique (
+    lib.filter (addr: addr != "127.0.0.1" && addr != "::1" && addr != "") (
+      (lib.concatLists (lib.mapAttrsToList (_: network: network.dnsServers) cfg.networks))
+      ++ map (lib.head) (
+        builtins.filter (parts: builtins.length parts > 0) (map (lib.splitString ":") cfg.listenAddresses)
+      )
+    )
+  );
+  waitNetwork = pkgs.writeShellScript "kcore-provisioning-wait-network" ''
+    set -eu
+    timeout_sec=90
+    deadline=$((SECONDS + timeout_sec))
+    ip=${pkgs.iproute2}/bin/ip
+
+    for iface in ${lib.escapeShellArgs dhcpInterfaces}; do
+      echo "waiting for interface ''${iface} (operstate=up)"
+      while true; do
+        if [ -r "/sys/class/net/''${iface}/operstate" ]; then
+          state=$(cat "/sys/class/net/''${iface}/operstate")
+          if [ "$state" = "up" ]; then
+            break
+          fi
+        else
+          state=missing
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+          echo "timed out after ''${timeout_sec}s waiting for ''${iface} (operstate=$state)" >&2
+          exit 1
+        fi
+        sleep 0.5
+      done
+    done
+
+    for addr in ${lib.escapeShellArgs waitAddresses}; do
+      echo "waiting for address ''${addr}"
+      while true; do
+        if "$ip" -4 -o addr show | ${pkgs.gnugrep}/bin/grep -F -q " ''${addr}/"; then
+          break
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+          echo "timed out after ''${timeout_sec}s waiting for address ''${addr}" >&2
+          exit 1
+        fi
+        sleep 0.5
+      done
+    done
+  '';
 in
 {
   options.services.kcore.provisioning = {
@@ -285,12 +338,17 @@ in
       after = [
         "kcore-provisioning-prepare.service"
         "kcore-pdns.service"
+        "network-online.target"
       ];
       requires = [ "kcore-provisioning-prepare.service" ];
+      wants = [ "network-online.target" ];
+      startLimitBurst = 10;
+      startLimitIntervalSec = 120;
       serviceConfig = {
         RuntimeDirectory = "pdns-recursor";
         AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
         CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+        ExecStartPre = [ "${waitNetwork}" ];
         ExecStart = utils.escapeSystemdExecArgs [
           "${pkgs.pdns-recursor}/bin/pdns_recursor"
           "--config-dir=${cfg.stateDir}"
@@ -300,7 +358,7 @@ in
           "${pkgs.pdns-recursor}/bin/rec_control --socket-dir=/run/pdns-recursor reload-lua-script"
         ];
         Restart = "on-failure";
-        RestartSec = 2;
+        RestartSec = 5;
       };
     };
 
@@ -313,6 +371,8 @@ in
       ];
       requires = [ "kcore-provisioning-prepare.service" ];
       wants = [ "network-online.target" ];
+      startLimitBurst = 10;
+      startLimitIntervalSec = 120;
       serviceConfig = {
         RuntimeDirectory = "kea";
         RuntimeDirectoryMode = "0750";
@@ -324,10 +384,13 @@ in
           "CAP_NET_BIND_SERVICE"
           "CAP_NET_RAW"
         ];
-        ExecStartPre = utils.escapeSystemdExecArgs [
-          "${pkgs.kea}/bin/kea-dhcp4"
-          "-t"
-          "${cfg.stateDir}/kea-dhcp4.json"
+        ExecStartPre = [
+          "${waitNetwork}"
+          (utils.escapeSystemdExecArgs [
+            "${pkgs.kea}/bin/kea-dhcp4"
+            "-t"
+            "${cfg.stateDir}/kea-dhcp4.json"
+          ])
         ];
         ExecStart = utils.escapeSystemdExecArgs [
           "${pkgs.kea}/bin/kea-dhcp4"
@@ -339,7 +402,7 @@ in
           "reload-kea"
         ];
         Restart = "on-failure";
-        RestartSec = 2;
+        RestartSec = 5;
       };
     };
 
@@ -349,10 +412,15 @@ in
       after = [
         "kcore-provisioning-prepare.service"
         "kcore-pdns.service"
+        "network-online.target"
       ];
       requires = [ "kcore-provisioning-prepare.service" ];
-      wants = [ "kcore-pdns.service" ];
+      wants = [
+        "kcore-pdns.service"
+        "network-online.target"
+      ];
       serviceConfig = {
+        ExecStartPre = [ "${waitNetwork}" ];
         ExecStart = utils.escapeSystemdExecArgs (
           [
             "${cfg.package}/bin/kcore-provisioning"
@@ -366,7 +434,7 @@ in
           ]) cfg.listenAddresses
         );
         Restart = "on-failure";
-        RestartSec = 2;
+        RestartSec = 5;
       };
     };
   };
