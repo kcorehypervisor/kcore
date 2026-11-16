@@ -236,6 +236,12 @@ enum Command {
         #[command(subcommand)]
         action: SlurmAction,
     },
+    /// PostgreSQL cluster (Patroni primary with streaming standbys) management
+    #[command(name = "pg-cluster", alias = "postgresql-cluster")]
+    PgCluster {
+        #[command(subcommand)]
+        action: PgClusterAction,
+    },
     /// Pull a resource
     Pull {
         #[command(subcommand)]
@@ -1916,6 +1922,136 @@ enum KubernetesAction {
         /// Remove nodes (node IDs, comma-separated)
         #[arg(long = "remove")]
         remove: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PgClusterAction {
+    /// Plan a PostgresqlCluster manifest without changing anything
+    Plan {
+        #[arg(short = 'f', long)]
+        file: String,
+    },
+    /// Create or update from a manifest (refused without a clean plan)
+    Apply {
+        #[arg(short = 'f', long)]
+        file: String,
+        #[arg(long)]
+        confirm: bool,
+        /// Drop roles and databases that left the spec
+        #[arg(long)]
+        force: bool,
+    },
+    /// List PostgresqlClusters
+    List,
+    /// Show one PostgresqlCluster
+    Get { name: String },
+    /// Live health: leader, lag, etcd quorum, VIP
+    Health { name: String },
+    /// Failovers and leader moves
+    Events {
+        name: String,
+        #[arg(long, default_value_t = 50)]
+        limit: i32,
+    },
+    /// Superuser and generated role passwords, connection URIs, CA
+    Credentials { name: String },
+    /// Operations of a cluster
+    Operations { name: String },
+    /// Steps of one operation
+    Operation { id: String },
+    /// Cancel an operation before its next step
+    Cancel { id: String },
+    /// Planned move of the primary role
+    Switchover {
+        name: String,
+        /// Candidate node id; empty lets the engine pick
+        #[arg(long = "to", default_value = "")]
+        to: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Manual promotion when Patroni cannot elect (may lose data)
+    Failover {
+        name: String,
+        #[arg(long = "to")]
+        to: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Patroni maintenance mode: on pauses automatic failover
+    Maintenance {
+        name: String,
+        /// on or off
+        state: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Rebuild a standby from the leader
+    Reinit {
+        name: String,
+        node_id: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Add a member from a member YAML, or remove members
+    Scale {
+        name: String,
+        #[arg(long = "add")]
+        add: Option<String>,
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Replace a member (and its etcd vote) with a new node
+    Replace {
+        name: String,
+        #[arg(long = "old")]
+        old: String,
+        #[arg(short = 'f', long)]
+        file: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Rolling minor upgrade (same package) or pg_upgrade to a newer major
+    Upgrade {
+        name: String,
+        #[arg(long, default_value = "")]
+        package: String,
+        /// Accept pg_upgrade --link (no rollback) on filesystems without reflink
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Remove the pre-upgrade data; rollback is no longer possible
+    FinalizeUpgrade {
+        name: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Return to the previous major (loses writes made since the upgrade)
+    RollbackUpgrade {
+        name: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Delete the cluster
+    Delete {
+        name: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        retain_data: bool,
+        #[arg(long)]
+        confirm: bool,
     },
 }
 
@@ -3710,6 +3846,162 @@ async fn main() {
                 .map(|s| s.split(',').map(String::from).collect())
                 .unwrap_or_default();
             commands::kubernetes::scale(&info, name, add_cp, add_wk, rem).await
+        }
+
+        Command::PgCluster { action } => {
+            use commands::pg_cluster::{self as pg, Verb};
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            match action {
+                PgClusterAction::Plan { file } => pg::plan_from_file(&info, file).await,
+                PgClusterAction::Apply {
+                    file,
+                    confirm,
+                    force,
+                } => pg::apply_from_file(&info, file, *confirm, *force).await,
+                PgClusterAction::List => pg::list(&info).await,
+                PgClusterAction::Get { name } => pg::get(&info, name).await,
+                PgClusterAction::Health { name } => pg::health(&info, name).await,
+                PgClusterAction::Events { name, limit } => pg::events(&info, name, *limit).await,
+                PgClusterAction::Credentials { name } => pg::credentials(&info, name).await,
+                PgClusterAction::Operations { name } => pg::operations(&info, name).await,
+                PgClusterAction::Operation { id } => pg::operation(&info, id).await,
+                PgClusterAction::Cancel { id } => pg::cancel(&info, id).await,
+                PgClusterAction::Switchover { name, to, confirm } => {
+                    pg::run(
+                        &info,
+                        name,
+                        Verb::Switchover {
+                            candidate: to.clone(),
+                        },
+                        *confirm,
+                    )
+                    .await
+                }
+                PgClusterAction::Failover {
+                    name,
+                    to,
+                    force,
+                    confirm,
+                } => {
+                    pg::run(
+                        &info,
+                        name,
+                        Verb::Failover {
+                            candidate: to.clone(),
+                            force: *force,
+                        },
+                        *confirm,
+                    )
+                    .await
+                }
+                PgClusterAction::Maintenance {
+                    name,
+                    state,
+                    confirm,
+                } => {
+                    let enabled = match state.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => {
+                            fatal(&format!("maintenance state must be on or off, got {other}"))
+                        }
+                    };
+                    pg::run(&info, name, Verb::Maintenance { enabled }, *confirm).await
+                }
+                PgClusterAction::Reinit {
+                    name,
+                    node_id,
+                    confirm,
+                } => {
+                    pg::run(
+                        &info,
+                        name,
+                        Verb::Reinit {
+                            node: node_id.clone(),
+                        },
+                        *confirm,
+                    )
+                    .await
+                }
+                PgClusterAction::Scale {
+                    name,
+                    add,
+                    remove,
+                    force,
+                    confirm,
+                } => {
+                    pg::run(
+                        &info,
+                        name,
+                        Verb::Scale {
+                            add: add.clone(),
+                            remove: remove.clone(),
+                            force: *force,
+                        },
+                        *confirm,
+                    )
+                    .await
+                }
+                PgClusterAction::Replace {
+                    name,
+                    old,
+                    file,
+                    force,
+                    confirm,
+                } => {
+                    pg::run(
+                        &info,
+                        name,
+                        Verb::Replace {
+                            old: old.clone(),
+                            file: file.clone(),
+                            force: *force,
+                        },
+                        *confirm,
+                    )
+                    .await
+                }
+                PgClusterAction::Upgrade {
+                    name,
+                    package,
+                    force,
+                    confirm,
+                } => {
+                    pg::run(
+                        &info,
+                        name,
+                        Verb::Upgrade {
+                            package: package.clone(),
+                            force: *force,
+                        },
+                        *confirm,
+                    )
+                    .await
+                }
+                PgClusterAction::FinalizeUpgrade { name, confirm } => {
+                    pg::run(&info, name, Verb::Finalize, *confirm).await
+                }
+                PgClusterAction::RollbackUpgrade { name, confirm } => {
+                    pg::run(&info, name, Verb::Rollback, *confirm).await
+                }
+                PgClusterAction::Delete {
+                    name,
+                    force,
+                    retain_data,
+                    confirm,
+                } => {
+                    pg::run(
+                        &info,
+                        name,
+                        Verb::Delete {
+                            force: *force,
+                            retain_data: *retain_data,
+                        },
+                        *confirm,
+                    )
+                    .await
+                }
+            }
         }
 
         Command::Slurm {

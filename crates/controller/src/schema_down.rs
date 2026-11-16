@@ -435,6 +435,11 @@ DROP TABLE IF EXISTS slurm_clusters;",
         sql: "ALTER TABLE issued_certificates DROP COLUMN first_seen_at;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 72,
+        sql: crate::db::POSTGRESQL_TABLES_DOWN,
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

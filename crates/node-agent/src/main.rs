@@ -24,6 +24,7 @@ mod nixgen_k8s;
 mod nixgen_slurm;
 mod path_safety;
 mod pki;
+mod postgresql_cluster_agent;
 mod rate_limit;
 mod rbd_nbd;
 mod registration;

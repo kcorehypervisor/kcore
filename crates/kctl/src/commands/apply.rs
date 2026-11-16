@@ -84,6 +84,7 @@ pub const SUPPORTED_KINDS: &[&str] = &[
     "KubernetesCluster",
     "ClusterUpdate",
     "SlurmCluster",
+    "PostgresqlCluster",
     "Volume",
     "SnapshotPolicy",
     "Operator",
@@ -123,6 +124,9 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
             "postgresql" | "postgres" => return postgresql::create_from_manifest(info, file).await,
             "slurmcluster" | "slurm-cluster" | "slurm_cluster" => {
                 return slurm::apply_from_file(info, file).await
+            }
+            "postgresqlcluster" | "postgresql-cluster" | "postgresql_cluster" => {
+                return crate::commands::pg_cluster::apply_from_file(info, file, true, false).await
             }
             "disklayout" | "disk-layout" | "disk_layout" => {
                 return disk_layout::apply_from_file(info, file).await

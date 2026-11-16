@@ -298,6 +298,35 @@ service Controller {
   rpc RotateSlurmMungeKey(RotateSlurmMungeKeyRequest) returns (RotateSlurmMungeKeyResponse);
   rpc DrainSlurmNode(DrainSlurmNodeRequest) returns (DrainSlurmNodeResponse);
   rpc ResumeSlurmNode(ResumeSlurmNodeRequest) returns (ResumeSlurmNodeResponse);
+
+  // PostgresqlCluster — a Patroni-managed primary with streaming standbys on
+  // kcoreOS nodes (docs/bare-metal-postgresql.md). Patroni and etcd decide
+  // automatic failover; these RPCs drive every planned change as an operation.
+  rpc PlanPostgresqlCluster(PlanPostgresqlClusterRequest) returns (PlanPostgresqlClusterResponse);
+  rpc CreatePostgresqlCluster(CreatePostgresqlClusterRequest) returns (PostgresqlClusterOperationResponse);
+  rpc UpdatePostgresqlCluster(UpdatePostgresqlClusterRequest) returns (PostgresqlClusterOperationResponse);
+  rpc GetPostgresqlCluster(GetPostgresqlClusterRequest) returns (GetPostgresqlClusterResponse);
+  rpc ListPostgresqlClusters(ListPostgresqlClustersRequest) returns (ListPostgresqlClustersResponse);
+  rpc DeletePostgresqlCluster(DeletePostgresqlClusterRequest) returns (PostgresqlClusterOperationResponse);
+  rpc ScalePostgresqlCluster(ScalePostgresqlClusterRequest) returns (PostgresqlClusterOperationResponse);
+  rpc ReplacePostgresqlMember(ReplacePostgresqlMemberRequest) returns (PostgresqlClusterOperationResponse);
+  rpc ReinitPostgresqlMember(ReinitPostgresqlMemberRequest) returns (PostgresqlClusterOperationResponse);
+  // Same major: rolling minor upgrade (after a pin move). Higher major:
+  // pg_upgrade with a downtime window stated by plan.
+  rpc UpgradePostgresqlCluster(UpgradePostgresqlClusterRequest) returns (PostgresqlClusterOperationResponse);
+  rpc FinalizePostgresqlUpgrade(PostgresqlClusterNameRequest) returns (PostgresqlClusterOperationResponse);
+  rpc RollbackPostgresqlUpgrade(PostgresqlClusterNameRequest) returns (PostgresqlClusterOperationResponse);
+  rpc SwitchoverPostgresqlCluster(SwitchoverPostgresqlClusterRequest) returns (PostgresqlClusterOperationResponse);
+  // Manual promotion when Patroni cannot elect. Requires force and a candidate.
+  rpc FailoverPostgresqlCluster(FailoverPostgresqlClusterRequest) returns (PostgresqlClusterOperationResponse);
+  rpc SetPostgresqlMaintenance(SetPostgresqlMaintenanceRequest) returns (PostgresqlClusterOperationResponse);
+  rpc GetPostgresqlClusterHealth(PostgresqlClusterNameRequest) returns (GetPostgresqlClusterHealthResponse);
+  rpc ListPostgresqlClusterEvents(ListPostgresqlClusterEventsRequest) returns (ListPostgresqlClusterEventsResponse);
+  rpc GetPostgresqlOperation(GetPostgresqlOperationRequest) returns (GetPostgresqlOperationResponse);
+  rpc ListPostgresqlOperations(ListPostgresqlOperationsRequest) returns (ListPostgresqlOperationsResponse);
+  rpc CancelPostgresqlOperation(GetPostgresqlOperationRequest) returns (GetPostgresqlOperationResponse);
+  // Superuser and generated role passwords, connection strings, CA. Audited.
+  rpc GetPostgresqlClusterCredentials(PostgresqlClusterNameRequest) returns (GetPostgresqlClusterCredentialsResponse);
 }
 
 message RegisterNodeRequest {
@@ -3784,4 +3813,344 @@ message ResumeSlurmNodeRequest {
 message ResumeSlurmNodeResponse {
   bool success = 1;
   string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// PostgresqlCluster
+// ---------------------------------------------------------------------------
+
+// Local LVM or ZFS storage, created through the node's storage RPCs.
+message PostgresqlHostVolume {
+  string name = 1;
+  string storage_class = 2;   // "lvm" (default) or "zfs"
+  string volume_group = 3;    // VG (lvm) or pool (zfs)
+  int64 size_bytes = 4;
+  string fs_type = 5;         // "xfs" (default; reflink for pg_upgrade --clone) or "ext4"
+}
+
+// One node: an etcd voter (initial members) plus Patroni and PostgreSQL,
+// unless witness is set. A node belongs to at most one PostgreSQL cluster.
+message PostgresqlMemberSpec {
+  string node_id = 1;
+  string advertise_address = 2;
+  string iface = 3;
+  // "primary" marks the bootstrap node. Ignored after create: Patroni owns
+  // who is primary.
+  string role = 4;
+  // etcd only, to make the voter count odd with two PostgreSQL members.
+  bool witness = 5;
+  PostgresqlHostVolume data_volume = 6;
+  PostgresqlHostVolume wal_volume = 7;
+  PostgresqlHostVolume etcd_volume = 8;
+  bool no_failover = 9;
+  bool no_load_balance = 10;
+  int32 failover_priority = 11;
+  string datacenter = 12;
+}
+
+message PostgresqlReplicationSpec {
+  // "quorum" (default with >= 2 standbys), "sync", "strict", "async".
+  string mode = 1;
+  int32 sync_count = 2;
+  int64 maximum_lag_on_failover_bytes = 3;
+}
+
+message PostgresqlPatroniSpec {
+  int32 ttl = 1;
+  int32 loop_wait = 2;
+  int32 retry_timeout = 3;
+  // "off" (default), "automatic", "required". A reset reboots the host.
+  string watchdog = 4;
+}
+
+// Writer VIP held by keepalived only where Patroni GET /primary is 200.
+message PostgresqlVipSpec {
+  string address = 1;         // a.b.c.d/nn on the members' subnet
+  int32 virtual_router_id = 2;
+}
+
+message PostgresqlRoleSpec {
+  string name = 1;
+  bool login = 2;
+  // SCRAM-SHA-256 verifier. Empty with login: kcore generates a password and
+  // returns it from GetPostgresqlClusterCredentials.
+  string password_scram = 3;
+  bool create_db = 4;
+  int32 connection_limit = 5;
+  repeated string member_of = 6;
+}
+
+message PostgresqlDatabaseSpec {
+  string name = 1;
+  string owner = 2;
+  repeated string extensions = 3;
+}
+
+message PostgresqlPorts {
+  int32 postgres = 1;         // 5432
+  int32 patroni_api = 2;      // 8008
+  int32 etcd_client = 3;      // 2479
+  int32 etcd_peer = 4;        // 2480
+}
+
+message PostgresqlClusterSpec {
+  string package = 1;         // "postgresql_14" .. "postgresql_18"
+  repeated PostgresqlMemberSpec members = 2;
+  PostgresqlReplicationSpec replication = 3;
+  PostgresqlPatroniSpec patroni = 4;
+  PostgresqlVipSpec vip = 5;
+  map<string, string> parameters = 6;
+  repeated PostgresqlRoleSpec roles = 7;
+  repeated PostgresqlDatabaseSpec databases = 8;
+  repeated string client_networks = 9;
+  bool tls_disabled = 10;
+  int32 tls_rotate_before_days = 11;
+  PostgresqlPorts ports = 12;
+  int64 memory_limit_bytes = 13;
+  int64 max_replication_lag_bytes = 14;
+  int32 step_timeout_seconds = 15;
+  bool allow_dc_majority = 16;
+  int32 retain_old_data_days = 17;
+}
+
+message PostgresqlClusterStatus {
+  // pending, bootstrapping, ready, degraded, updating, upgrading, scaling,
+  // switching-over, deleting, failed
+  string phase = 1;
+  string message = 2;
+  int64 observed_generation = 3;
+  string leader_node_id = 4;
+  int64 timeline = 5;
+  int32 streaming_standbys = 6;
+  int32 total_members = 7;
+  string running_version = 8;
+  bool paused = 9;
+  string active_operation_id = 10;
+  // Set between a major upgrade and finalize or rollback.
+  string previous_package = 11;
+  string updated_at = 12;
+}
+
+message PostgresqlCluster {
+  string name = 1;
+  int64 generation = 2;
+  PostgresqlClusterSpec spec = 3;
+  PostgresqlClusterStatus status = 4;
+}
+
+message PostgresqlNodePlan {
+  string node_id = 1;
+  string roles = 2;           // "postgres+etcd", "postgres", "etcd"
+  bool preflight_passed = 3;
+  repeated string issues = 4;
+  string resolved_version = 5;
+}
+
+message PlanPostgresqlClusterRequest {
+  string name = 1;
+  PostgresqlClusterSpec spec = 2;
+}
+
+message PlanPostgresqlClusterResponse {
+  // create, update, upgrade-major, scale, replace, unchanged
+  string action = 1;
+  repeated string blocking_issues = 2;
+  repeated string warnings = 3;
+  repeated string changed_fields = 4;
+  // "name=reload" or "name=restart"
+  repeated string changed_parameters = 5;
+  repeated PostgresqlNodePlan node_plans = 6;
+  repeated string rollout_steps = 7;
+  string rpo = 8;
+  string rendered_nix_preview = 9;
+}
+
+message CreatePostgresqlClusterRequest {
+  string name = 1;
+  PostgresqlClusterSpec spec = 2;
+  bool confirm = 3;
+}
+
+message UpdatePostgresqlClusterRequest {
+  string name = 1;
+  PostgresqlClusterSpec spec = 2;
+  bool confirm = 3;
+  // Needed to drop roles or databases that left the spec.
+  bool force = 4;
+}
+
+message PostgresqlClusterOperationResponse {
+  PostgresqlCluster cluster = 1;
+  string operation_id = 2;
+  string message = 3;
+}
+
+message PostgresqlClusterNameRequest {
+  string name = 1;
+  bool confirm = 2;
+}
+
+message GetPostgresqlClusterRequest { string name = 1; }
+message GetPostgresqlClusterResponse { PostgresqlCluster cluster = 1; }
+message ListPostgresqlClustersRequest {}
+message ListPostgresqlClustersResponse { repeated PostgresqlCluster clusters = 1; }
+
+message DeletePostgresqlClusterRequest {
+  string name = 1;
+  bool confirm = 2;
+  // Drop the rows even when members cannot be reached.
+  bool force = 3;
+  // Keep data, WAL and etcd volumes.
+  bool retain_data = 4;
+}
+
+message ScalePostgresqlClusterRequest {
+  string name = 1;
+  // New members join as standbys and etcd clients (not voters).
+  repeated PostgresqlMemberSpec add_members = 2;
+  // Node ids. The primary is switched away from first. etcd voters leave
+  // only through ReplacePostgresqlMember.
+  repeated string remove_members = 3;
+  bool confirm = 4;
+  bool force = 5;
+}
+
+message ReplacePostgresqlMemberRequest {
+  string name = 1;
+  string old_node_id = 2;
+  PostgresqlMemberSpec new_member = 3;
+  bool confirm = 4;
+  // The old node is unreachable: steps on it are skipped.
+  bool force = 5;
+}
+
+message ReinitPostgresqlMemberRequest {
+  string name = 1;
+  string node_id = 2;
+  bool confirm = 3;
+}
+
+message UpgradePostgresqlClusterRequest {
+  string name = 1;
+  // Same as the running package: rolling minor upgrade. Higher major:
+  // pg_upgrade. Lower: refused.
+  string package = 2;
+  bool confirm = 3;
+  // Upgrade although a data volume has no reflink (pg_upgrade --link, no
+  // rollback).
+  bool force = 4;
+}
+
+message SwitchoverPostgresqlClusterRequest {
+  string name = 1;
+  // Empty: the engine picks the best streaming candidate.
+  string candidate = 2;
+  bool confirm = 3;
+}
+
+message FailoverPostgresqlClusterRequest {
+  string name = 1;
+  string candidate = 2;
+  bool confirm = 3;
+  bool force = 4;
+}
+
+message SetPostgresqlMaintenanceRequest {
+  string name = 1;
+  bool enabled = 2;
+  bool confirm = 3;
+}
+
+message PostgresqlMemberHealth {
+  string node_id = 1;
+  bool patroni_active = 2;
+  bool etcd_active = 3;
+  // leader, sync_standby, quorum_standby, replica, or empty
+  string role = 4;
+  string state = 5;
+  int64 timeline = 6;
+  // -1 when unknown
+  int64 lag_bytes = 7;
+  bool pending_restart = 8;
+  string version = 9;
+  bool holds_vip = 10;
+  int64 data_free_bytes = 11;
+  bool etcd_leader = 12;
+  string message = 13;
+}
+
+message GetPostgresqlClusterHealthResponse {
+  // healthy, degraded, critical
+  string overall_health = 1;
+  string leader_node_id = 2;
+  int64 timeline = 3;
+  bool etcd_quorum = 4;
+  int32 etcd_members_up = 5;
+  int32 etcd_members_total = 6;
+  bool paused = 7;
+  repeated PostgresqlMemberHealth members = 8;
+}
+
+message ListPostgresqlClusterEventsRequest {
+  string name = 1;
+  int32 limit = 2;
+}
+
+message PostgresqlClusterEvent {
+  int64 id = 1;
+  // failover, etcd-quorum-lost, etcd-quorum-restored
+  string kind = 2;
+  string old_leader = 3;
+  string new_leader = 4;
+  int64 timeline = 5;
+  string message = 6;
+  string created_at = 7;
+}
+
+message ListPostgresqlClusterEventsResponse { repeated PostgresqlClusterEvent events = 1; }
+
+message PostgresqlOperationStep {
+  int32 index = 1;
+  string kind = 2;
+  string node_id = 3;
+  string unit = 4;
+  string detail = 5;
+  // pending, running, succeeded, failed, skipped
+  string state = 6;
+  string message = 7;
+}
+
+message PostgresqlOperation {
+  string id = 1;
+  string cluster_name = 2;
+  string kind = 3;
+  // running, succeeded, failed, cancelled
+  string state = 4;
+  int64 target_generation = 5;
+  repeated PostgresqlOperationStep steps = 6;
+  string message = 7;
+  string created_at = 8;
+  string updated_at = 9;
+}
+
+message GetPostgresqlOperationRequest { string id = 1; }
+message GetPostgresqlOperationResponse { PostgresqlOperation operation = 1; }
+message ListPostgresqlOperationsRequest { string cluster_name = 1; }
+message ListPostgresqlOperationsResponse { repeated PostgresqlOperation operations = 1; }
+
+message PostgresqlRoleCredential {
+  string role = 1;
+  string password = 2;
+}
+
+message GetPostgresqlClusterCredentialsResponse {
+  string superuser = 1;
+  string superuser_password = 2;
+  // VIP when set, else libpq multi-host with target_session_attrs=read-write.
+  string writer_uri = 3;
+  // libpq multi-host over standbys, prefer-standby, load_balance_hosts=random.
+  string reader_uri = 4;
+  string ca_pem = 5;
+  // Passwords kcore generated for login roles without passwordScram.
+  repeated PostgresqlRoleCredential roles = 6;
 }

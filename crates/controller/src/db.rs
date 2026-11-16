@@ -5,10 +5,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 mod auth_store;
 mod ingress_store;
+mod postgresql_store;
 pub use auth_store::{AuthTokenRow, OperatorCredentials};
 pub use ingress_store::{
     IngressGatewayRow, IngressGatewayStatusRow, IngressRouteRow, IngressRouteStatusRow,
     WafEventFilter, WafEventRow, WafPolicyRow, INGRESS_TABLES_DOWN,
+};
+pub use postgresql_store::{
+    PgCertRow, PgClusterRow, PgMemberRow, PgOperationRow, PgSecretRow, POSTGRESQL_TABLES_DOWN,
 };
 
 fn is_sqlite_memory_database_path(path: &str) -> bool {
@@ -868,7 +872,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 71;
+pub const SCHEMA_VERSION: i32 = 72;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -882,7 +886,8 @@ pub const SCHEMA_VERSION: i32 = 71;
 /// `node_vgpu`, the operator's vGPU host configuration. Version 70 adds
 /// `node_vgpu.vendor` with a default. Version 71 adds
 /// `issued_certificates.first_seen_at`, empty until the certificate is first
-/// presented to the controller.
+/// presented to the controller. Version 72 adds the PostgreSQL cluster
+/// tables, which an older reader never selects.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2328,6 +2333,10 @@ impl Database {
                     [],
                 )?;
             }
+        }
+
+        if version < 72 {
+            conn.execute_batch(postgresql_store::POSTGRESQL_TABLES)?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;

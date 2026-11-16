@@ -198,6 +198,17 @@ service NodeAdmin {
   rpc GetSlurmStatus(GetSlurmStatusRequest) returns (GetSlurmStatusResponse);
   // Only drain and resume are accepted; scontrol runs on this node.
   rpc SlurmControl(SlurmControlRequest) returns (SlurmControlResponse);
+
+  // PostgreSQL cluster member (Patroni, PostgreSQL, etcd). The request carries
+  // the normalized cluster spec; the agent re-validates it and renders
+  // /etc/nixos/kcore-postgresql-cluster.nix itself.
+  rpc CheckPostgresqlClusterPreflight(CheckPostgresqlClusterPreflightRequest) returns (CheckPostgresqlClusterPreflightResponse);
+  rpc ApplyPostgresqlClusterConfig(ApplyPostgresqlClusterConfigRequest) returns (ApplyPostgresqlClusterConfigResponse);
+  // Units, Patroni GET /patroni and /cluster, etcd endpoint status.
+  rpc GetPostgresqlClusterStatus(GetPostgresqlClusterStatusRequest) returns (GetPostgresqlClusterStatusResponse);
+  // Closed command set: Patroni REST calls, unit control, SQL built by the
+  // agent with quoted identifiers, pg_upgrade, etcd membership.
+  rpc RunPostgresqlAdmin(RunPostgresqlAdminRequest) returns (RunPostgresqlAdminResponse);
   rpc BootstrapCephOsd(BootstrapCephOsdRequest) returns (BootstrapCephOsdResponse);
   // Create every OSD in osd_devices that is not already prepared, and retire
   // OSDs this node has that are not in that list. Retirement only touches
@@ -2119,4 +2130,159 @@ message RebootNodeRequest {}
 message RebootNodeResponse {
   bool success = 1;
   string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// PostgreSQL cluster member
+// ---------------------------------------------------------------------------
+
+message PostgresqlNodeSecrets {
+  string superuser_password = 1;
+  string replication_password = 2;
+  string rewind_password = 3;
+  string restapi_password = 4;
+  bytes tls_cert_pem = 5;
+  bytes tls_key_pem = 6;
+  bytes tls_ca_pem = 7;
+}
+
+message CheckPostgresqlClusterPreflightRequest {
+  string cluster_name = 1;
+  // Normalized kcore_postgresql::ClusterSpec as JSON.
+  string spec_json = 2;
+  string node_id = 3;
+  repeated string etcd_voters = 4;
+  // Parameters whose pg_settings.context the controller wants (running
+  // members only).
+  repeated string changed_parameters = 5;
+  // Major upgrade target, e.g. "postgresql_18".
+  string upgrade_package = 6;
+}
+
+message PostgresqlPreflightIssue {
+  bool blocking = 1;
+  // flake, conflict, iface, address, port, volume, clock, memory, reflink
+  string check = 2;
+  string message = 3;
+}
+
+message CheckPostgresqlClusterPreflightResponse {
+  bool ok = 1;
+  repeated PostgresqlPreflightIssue issues = 2;
+  // Running server version, e.g. "17.9"; empty when not running.
+  string running_version = 3;
+  // Parameters among changed_parameters with context postmaster.
+  repeated string restart_parameters = 4;
+  bool reflink_supported = 5;
+  int64 memory_bytes = 6;
+}
+
+message ApplyPostgresqlClusterConfigRequest {
+  string cluster_name = 1;
+  int64 generation = 2;
+  // Normalized spec JSON. Empty with enable=false.
+  string spec_json = 3;
+  string node_id = 4;
+  repeated string etcd_voters = 5;
+  // "full", "etcd-only", "join" (etcd initial state existing), "upgrade",
+  // "rollback", "disable"
+  string stage = 6;
+  // During a major upgrade: the package being upgraded from (stage upgrade)
+  // or back to (stage rollback).
+  string previous_package = 7;
+  PostgresqlNodeSecrets secrets = 8;
+}
+
+message ApplyPostgresqlClusterConfigResponse {
+  string apply_id = 1;
+  string message = 2;
+}
+
+message GetPostgresqlClusterStatusRequest {
+  string cluster_name = 1;
+}
+
+message PostgresqlClusterMemberStatus {
+  string name = 1;
+  string role = 2;
+  string state = 3;
+  string host = 4;
+  int64 timeline = 5;
+  int64 lag_bytes = 6;
+  bool pending_restart = 7;
+  bool nofailover = 8;
+}
+
+message GetPostgresqlClusterStatusResponse {
+  bool patroni_active = 1;
+  bool etcd_active = 2;
+  bool etcd_leader = 3;
+  // This member from GET /patroni.
+  string role = 4;
+  string state = 5;
+  int64 timeline = 6;
+  bool pending_restart = 7;
+  bool paused = 8;
+  string version = 9;
+  // The whole cluster as this member sees it (GET /cluster).
+  repeated PostgresqlClusterMemberStatus members = 10;
+  bool holds_vip = 11;
+  int64 data_free_bytes = 12;
+  string message = 13;
+}
+
+message RunPostgresqlAdminRequest {
+  string cluster_name = 1;
+  // Normalized spec JSON for commands that need roles, databases or the
+  // dynamic config.
+  string spec_json = 2;
+  oneof command {
+    string switchover_candidate = 3;   // empty: Patroni picks
+    string failover_candidate = 4;
+    bool restart_member = 5;           // systemctl restart patroni
+    bool reinitialize = 6;             // POST /reinitialize
+    bool pause = 7;                    // true pause, false resume
+    bool patch_dynamic_config = 8;     // PATCH /config from spec_json
+    bool reload = 9;                   // POST /reload
+    UnitAction unit = 10;
+    bool stop_postgres = 11;           // pg_ctl stop -m fast (Patroni stopped)
+    EnsureSql ensure_roles = 12;
+    EnsureSql ensure_databases = 13;
+    EnsureSql ensure_extensions = 14;
+    bool analyze = 15;
+    PgUpgrade pg_upgrade_check = 16;
+    PgUpgrade pg_upgrade_run = 17;
+    bool set_initialize_key = 18;
+    string remove_data_major = 19;     // rm -rf pgdata/<major> (and pgwal)
+    string etcd_member_add = 20;       // "name=peer-url"
+    string etcd_member_remove = 21;    // member name
+    bool verify = 22;
+    // Delete this member's LVs or zvols after the disable apply unmounted them.
+    bool release_volumes = 23;
+  }
+  // This node, for commands that act on its own member (release_volumes).
+  string node_id = 30;
+
+  message UnitAction {
+    string unit = 1;                   // "patroni" or "etcd"
+    string action = 2;                 // "start", "stop", "restart"
+  }
+  message EnsureSql {
+    // Role passwords kcore generated, by role name.
+    map<string, string> generated_passwords = 1;
+    bool update_extensions = 2;
+    // Drop roles and databases that are not in the spec.
+    repeated string drop_roles = 3;
+    repeated string drop_databases = 4;
+  }
+  message PgUpgrade {
+    string from_package = 1;
+    string to_package = 2;
+  }
+}
+
+message RunPostgresqlAdminResponse {
+  bool ok = 1;
+  string message = 2;
+  string result = 3;
 }
