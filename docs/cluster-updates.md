@@ -317,8 +317,9 @@ spec:
   selector:
     datacenters: ["DC1"]
   strategy:
-    strategyType: one-at-a-time
+    strategyType: canary
     maxUnavailable: 1
+    canarySoakSeconds: 3600
   drainVms: true
   drainTimeoutSeconds: 900
   activation:

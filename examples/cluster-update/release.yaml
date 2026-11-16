@@ -1,4 +1,5 @@
-# Shape of cluster-update-X.Y.Z.yaml from a release. Submit with:
+# A hand-written ClusterUpdate. Releases do not ship one: `kctl update version
+# set vX.Y.Z` rolls the cluster to a tag. Submit this with:
 #   kctl update cluster apply -f release.yaml
 kind: ClusterUpdate
 metadata:
@@ -11,8 +12,9 @@ spec:
   selector:
     allNodes: true
   strategy:
-    strategyType: one-at-a-time
+    strategyType: canary
     maxUnavailable: 1
+    canarySoakSeconds: 3600
   drainVms: false
   activation:
     mode: auto
