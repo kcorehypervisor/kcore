@@ -2,6 +2,8 @@
 # kcoreOS nodes. Each node also runs an etcd voter; Patroni uses etcd to elect
 # the leader and fails over without the controller.
 #
+# Lab target (three Dells): examples/postgresql-cluster/dell-lab.yaml
+#
 #   kctl pg-cluster plan -f examples/postgresql-cluster/orders.yaml
 #   kctl pg-cluster apply -f examples/postgresql-cluster/orders.yaml --confirm
 #   kctl pg-cluster health orders
@@ -20,15 +22,15 @@ spec:
       role: primary
       advertiseAddress: 192.168.40.105
       iface: enp6s0
-      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg0, sizeBytes: 214748364800, fsType: xfs }
+      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 214748364800, fsType: xfs }
     - nodeId: node-106
       advertiseAddress: 192.168.40.106
       iface: enp6s0
-      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg0, sizeBytes: 214748364800, fsType: xfs }
+      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 214748364800, fsType: xfs }
     - nodeId: node-108
       advertiseAddress: 192.168.40.108
       iface: enp6s0
-      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg0, sizeBytes: 214748364800, fsType: xfs }
+      dataVolume: { name: pg-orders, storageClass: lvm, volumeGroup: vg_kcore, sizeBytes: 214748364800, fsType: xfs }
   replication:
     mode: quorum
   vip:

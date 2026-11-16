@@ -32,6 +32,7 @@ const INTENT: Array<[RegExp, string]> = [
   [/\bvirtual machines?\b|\bvms?\b/i, "vm"],
   [/\bnetworks?\b|\bvxlan\b|\bbridge\b/i, "network"],
   [/\bssh keys?\b/i, "ssh-key"],
+  [/\bpostgres(?:ql)?\s+clusters?\b|\bpatroni\b|\bpg-cluster\b/i, "postgresql-cluster"],
   [/\bpostgres(?:ql)?\b/i, "postgresql"],
   [/\bslurm\b|\bhpc\b/i, "slurm-cluster"],
   [/\bkubernetes\b|\bk8s\b/i, "kubernetes-cluster"],
@@ -326,6 +327,37 @@ export function questionsFor(kind: ResourceKind, spec: Record<string, unknown>):
           false,
         ),
       ].filter((item) => item.required || missing(spec, item.id));
+    case "postgresql-cluster":
+      return [
+        question(
+          "name",
+          "What should the PostgreSQL cluster be called?",
+          "kctl, the dashboard, and credentials use this name.",
+          missing(spec, "name"),
+          { example: "orders" },
+        ),
+        question(
+          "members",
+          "Which three nodes (Dell lab: dell-20, dell-21, node-118), advertise addresses, and interfaces?",
+          "Each member needs nodeId, advertiseAddress, and iface. One member may set role: primary for bootstrap. Lab example: examples/postgresql-cluster/dell-lab.yaml.",
+          !Array.isArray(spec.members) || spec.members.length === 0,
+          { example: "dell-20 at 192.168.40.103 on enp6s0" },
+        ),
+        question(
+          "vip",
+          "Which writer VIP and VRRP router id?",
+          "Held only by the Patroni leader. Must not collide with the Kubernetes API VIP or ingress keepalived.",
+          spec.vip == null,
+          { example: "192.168.40.160/24, virtualRouterId 61" },
+        ),
+        question(
+          "clientNetworks",
+          "Which client networks may connect to 5432?",
+          "Empty means member addresses only. Lab default is 192.168.40.0/24.",
+          false,
+          { example: "192.168.40.0/24" },
+        ),
+      ].filter((item) => item.required);
     case "container":
       return [
         question("name", "What should the container be called?", "This is the workload name.", missing(spec, "name")),
@@ -744,6 +776,11 @@ export function warningsFor(kind: ResourceKind, spec: Record<string, unknown>): 
   if (kind.id === "postgresql") {
     warnings.push(
       "v1 is one database per node, from the NixOS postgresql package, on the local Unix socket. Deleting the resource removes it from the node config and leaves /var/lib/postgresql on disk.",
+    );
+  }
+  if (kind.id === "postgresql-cluster") {
+    warnings.push(
+      "Patroni decides automatic failover through etcd. A ClusterUpdate reboots after switching the leader off the node. There is no backup feature yet; take one by hand before a major upgrade. Lab target: the three Dells via examples/postgresql-cluster/dell-lab.yaml.",
     );
   }
   if (kind.id === "kubernetes-cluster") {
