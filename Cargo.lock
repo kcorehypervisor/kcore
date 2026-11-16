@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-console"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-controller"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-node-agent"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "kcore-volume-mirror"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "kcore-sanitize",
  "libc",
@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "kctl"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",

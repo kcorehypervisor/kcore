@@ -133,7 +133,7 @@
                 );
             };
             sourceRoot = "source/dashboard";
-            npmDepsHash = "sha256-EOcPawCPoY4RWRv/TIQJ0yIBxWOzfSrZhIwZ3vPFHV4=";
+            npmDepsHash = "sha256-gfyzLvSM233v9l+1LtNmMR7dY6Pd0XqZrn2/rHk1oTQ=";
             nativeBuildInputs = [ pkgs.protobuf ];
             doCheck = true;
             checkPhase = ''
