@@ -81,5 +81,10 @@ pkgs.runCommand "provisioning-module-eval"
     test ${lib.boolToString cfg.systemd.services.kcore-pdns-recursor.enable} = true
     test ${lib.boolToString cfg.systemd.services.kcore-provisioning.enable} = true
     echo ${lib.escapeShellArg cfg.systemd.services.kcore-provisioning.serviceConfig.ExecStart} | grep -q '192.168.40.10:9443'
+    echo ${lib.escapeShellArg (builtins.toJSON cfg.systemd.services.kcore-kea-dhcp4.serviceConfig.ExecStartPre)} | grep -q 'kcore-provisioning-wait-network'
+    echo ${lib.escapeShellArg (builtins.toJSON cfg.systemd.services.kcore-pdns-recursor.serviceConfig.ExecStartPre)} | grep -q 'kcore-provisioning-wait-network'
+    echo ${lib.escapeShellArg (builtins.toJSON cfg.systemd.services.kcore-provisioning.serviceConfig.ExecStartPre)} | grep -q 'kcore-provisioning-wait-network'
+    echo ${lib.escapeShellArg (toString cfg.systemd.services.kcore-kea-dhcp4.after)} | grep -q 'network-online.target'
+    echo ${lib.escapeShellArg (toString cfg.systemd.services.kcore-pdns-recursor.after)} | grep -q 'network-online.target'
     touch $out
   ''

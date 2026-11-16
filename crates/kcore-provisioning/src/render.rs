@@ -36,7 +36,10 @@ pub fn kea_dhcp4(catalog: &Catalog, lease_file: &str, socket: &str) -> Value {
         "Dhcp4": {
             "interfaces-config": {
                 "interfaces": interfaces,
-                "dhcp-socket-type": "raw"
+                "dhcp-socket-type": "raw",
+                // Boot can race the NIC coming up; retry instead of starting deaf.
+                "service-sockets-max-retries": 60,
+                "service-sockets-retry-wait-time": 1000
             },
             "control-socket": {
                 "socket-type": "unix",
@@ -390,6 +393,14 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(ifaces.len(), 2);
+        assert_eq!(
+            value["Dhcp4"]["interfaces-config"]["service-sockets-max-retries"],
+            60
+        );
+        assert_eq!(
+            value["Dhcp4"]["interfaces-config"]["service-sockets-retry-wait-time"],
+            1000
+        );
     }
 
     #[test]
