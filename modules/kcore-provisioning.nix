@@ -57,7 +57,7 @@ let
   waitAddresses = lib.unique (
     lib.filter (addr: addr != "127.0.0.1" && addr != "::1" && addr != "") (
       (lib.concatLists (lib.mapAttrsToList (_: network: network.dnsServers) cfg.networks))
-      ++ map (lib.head) (
+      ++ map lib.head (
         builtins.filter (parts: builtins.length parts > 0) (map (lib.splitString ":") cfg.listenAddresses)
       )
     )
