@@ -2364,7 +2364,7 @@ impl Database {
         }
         let dest = format!("{file}.pre-migrate-{from_version}");
         conn.backup(
-            rusqlite::DatabaseName::Main,
+            rusqlite::MAIN_DB,
             dest,
             None::<fn(rusqlite::backup::Progress)>,
         )
@@ -2489,7 +2489,7 @@ impl Database {
         let version = Self::schema_version(&conn);
         let path = snapshot_temp_path();
         conn.backup(
-            rusqlite::DatabaseName::Main,
+            rusqlite::MAIN_DB,
             &path,
             None::<fn(rusqlite::backup::Progress)>,
         )
@@ -2541,7 +2541,7 @@ impl Database {
             {
                 let mut conn = self.lock_conn().map_err(|e| e.to_string())?;
                 conn.restore(
-                    rusqlite::DatabaseName::Main,
+                    rusqlite::MAIN_DB,
                     &path,
                     None::<fn(rusqlite::backup::Progress)>,
                 )

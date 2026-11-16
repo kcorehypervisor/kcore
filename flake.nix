@@ -135,7 +135,7 @@
                 );
             };
             sourceRoot = "source/dashboard";
-            npmDepsHash = "sha256-EOcPawCPoY4RWRv/TIQJ0yIBxWOzfSrZhIwZ3vPFHV4=";
+            npmDepsHash = "sha256-gfyzLvSM233v9l+1LtNmMR7dY6Pd0XqZrn2/rHk1oTQ=";
             nativeBuildInputs = [ pkgs.protobuf ];
             doCheck = true;
             checkPhase = ''
@@ -256,6 +256,12 @@
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
+            mail-module-eval = import ./tests/mail-module-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+            };
+            kcore-mail = import ./tests/kcore-mail.nix { inherit pkgs; };
             ch-vm-module-eval = import ./tests/ch-vm-module-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;
@@ -352,6 +358,7 @@
           chVmModule = ./modules/ch-vm;
           cephModule = ./modules/kcore-ceph.nix;
           slurmModule = ./modules/kcore-slurm.nix;
+          mailModule = ./modules/kcore-mail.nix;
           metricsModule = ./modules/kcore-metrics.nix;
           inherit (inputs.nixpkgs) lib;
 
@@ -492,6 +499,7 @@
             kcore-ceph = cephModule;
             kcore-slurm = slurmModule;
             kcore-postgresql-cluster = ./modules/kcore-postgresql-cluster.nix;
+            kcore-mail = mailModule;
             kcore-metrics = metricsModule;
             # The version follows the kcore input, so moving that pin updates
             # /etc/kcore/version without editing the host flake.

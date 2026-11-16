@@ -25,6 +25,7 @@ This directory contains the complete implementation plan for running Kubernetes 
 - **ClickHouse proto:** [proto-snippets-clickhouse.proto](./proto-snippets-clickhouse.proto) - Controller and node RPCs (compiles standalone)
 - **PostgreSQL clusters:** [bare-metal-postgresql.md](./bare-metal-postgresql.md) - Primary and streaming standbys with Patroni and etcd: failover, switchover, minor and major upgrades, scale, replace; what is built and what is not
 - **Ingress design:** [ingress-waf-load-balancer-plan.md](./ingress-waf-load-balancer-plan.md) - Caddy HTTPS load balancer with Coraza WAF and Let's Encrypt, fronting VMs, containers, and Kubernetes services
+- **Mail server:** [mail.md](./mail.md) - Stalwart behind nginx with Let's Encrypt; what Nix owns, ports, DNS and first deployment
 
 ## 🎯 What This Implements
 

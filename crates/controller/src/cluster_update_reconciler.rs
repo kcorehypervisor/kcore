@@ -702,7 +702,7 @@ async fn reconcile_update(
                             spec.drain_vms,
                         )
                         .await;
-                        format!("rolled back; {rebooted}")
+                        after_revert(&resp.message, rebooted)
                     }
                     _ => "rolled back (MVP)".into(),
                 };
@@ -986,7 +986,7 @@ async fn fail_and_revert(
         Ok(resp) if resp.success && resp.reboot_required => {
             let rebooted =
                 reboot_into_previous(db, clients, cfg, address, node_row, drain_vms).await;
-            format!("{reason}; {}; {rebooted}", resp.message)
+            format!("{reason}; {}", after_revert(&resp.message, rebooted))
         }
         Ok(resp) if resp.success => format!("{reason}; {}", resp.message),
         Ok(resp) => format!("{reason}; rollback failed: {}", resp.message),
@@ -1000,9 +1000,19 @@ async fn fail_and_revert(
     .map_err(|e| format!("mark node failed: {e}"))
 }
 
+/// What `last_error` says after a revert that left the node on the update
+/// generation. The agent's advice to reboot only stands when the controller
+/// could not reboot the node itself.
+fn after_revert(agent_message: &str, rebooted: Result<(), String>) -> String {
+    match rebooted {
+        Ok(()) => "rolled back; rebooting into the previous generation".into(),
+        Err(why) => format!("{agent_message}; not rebooted: {why}"),
+    }
+}
+
 /// A node rolled back while it ran the update generation stays on it until
 /// it reboots. Move its guests off when the update drains, then reboot it
-/// into the previous generation. Returns what happened, for `last_error`.
+/// into the previous generation. `Err` says why the node was not rebooted.
 async fn reboot_into_previous(
     db: &Database,
     clients: &NodeClients,
@@ -1010,12 +1020,11 @@ async fn reboot_into_previous(
     address: &str,
     node_row: &ClusterUpdateNodeRow,
     drain_vms: bool,
-) -> String {
+) -> Result<(), String> {
     let guests = db.list_vms_for_node(&node_row.node_id).unwrap_or_default();
     if !guests.is_empty() {
         if !drain_vms {
-            return "not rebooted: guests are still on the node and the update does not drain them"
-                .into();
+            return Err("guests are still on the node and the update does not drain them".into());
         }
         let svc = ControllerService::new(
             db.clone(),
@@ -1033,26 +1042,26 @@ async fn reboot_into_previous(
         match svc.drain_node_vms(&node_row.node_id, "", drain).await {
             Ok(outcome) if outcome.errors.is_empty() => {}
             Ok(outcome) => {
-                return format!("not rebooted: drain failed: {}", outcome.errors.join("; "));
+                return Err(format!("drain failed: {}", outcome.errors.join("; ")));
             }
-            Err(e) => return format!("not rebooted: drain failed: {}", e.message()),
+            Err(e) => return Err(format!("drain failed: {}", e.message())),
         }
     }
     if clients.get_admin(address).is_none() {
         if let Err(e) = clients.connect(address).await {
-            return format!("not rebooted: connect: {e}");
+            return Err(format!("connect: {e}"));
         }
     }
     let Some(mut admin) = clients.get_admin(address) else {
-        return "not rebooted: no admin client".into();
+        return Err("no admin client".into());
     };
     match admin
         .reboot_node(Request::new(node_proto::RebootNodeRequest {}))
         .await
     {
-        Ok(resp) if resp.get_ref().success => "rebooting into the previous generation".into(),
-        Ok(resp) => format!("not rebooted: {}", resp.into_inner().message),
-        Err(e) => format!("not rebooted: {e}"),
+        Ok(resp) if resp.get_ref().success => Ok(()),
+        Ok(resp) => Err(resp.into_inner().message),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1740,8 +1749,10 @@ mod tests {
         let mut row = update_node("", false);
         row.node_id = "a".into();
         let clients = NodeClients::new(None);
-        let said = reboot_into_previous(&db, &clients, &test_cfg(), "a:9091", &row, false).await;
-        assert!(said.starts_with("not rebooted: guests"), "{said}");
+        let said = reboot_into_previous(&db, &clients, &test_cfg(), "a:9091", &row, false)
+            .await
+            .unwrap_err();
+        assert!(said.starts_with("guests are still on the node"), "{said}");
         let unreachable = reboot_into_previous(
             &Database::open(":memory:").unwrap(),
             &clients,
@@ -1751,7 +1762,19 @@ mod tests {
             false,
         )
         .await;
-        assert!(unreachable.starts_with("not rebooted"), "{unreachable}");
+        assert!(unreachable.is_err(), "{unreachable:?}");
+    }
+
+    #[test]
+    fn a_revert_keeps_the_reboot_advice_only_when_the_node_was_not_rebooted() {
+        let advice = "rolled back; reboot the node to leave the update generation";
+        assert_eq!(
+            after_revert(advice, Ok(())),
+            "rolled back; rebooting into the previous generation"
+        );
+        let kept = after_revert(advice, Err("connect: refused".into()));
+        assert!(kept.starts_with(advice), "{kept}");
+        assert!(kept.ends_with("not rebooted: connect: refused"), "{kept}");
     }
 
     fn ready_node(id: &str) -> crate::db::NodeRow {
