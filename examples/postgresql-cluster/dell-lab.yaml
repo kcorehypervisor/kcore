@@ -1,0 +1,78 @@
+# PostgresqlCluster for the three Dell lab hypervisors (Ceph members).
+# Live Kea reservations (2026-11-10, `kcore-provisioning status --state-dir
+# /var/lib/kcore-provisioning` on nixos1):
+#
+#   nodeId     Kea hostname / comment              IP
+#   dell-20    kvm-node / node-103 br0/eno1        192.168.40.103
+#   dell-21    node-113 br0/eno1 (Ceph mon)        192.168.40.143
+#   node-118   node-118 br0/eno2 (Ceph mon)        192.168.40.145
+#
+# nodeIds match the controller registrations where known (dell-20, dell-21);
+# the third member uses the Kea hostname node-118. Confirm node-118 is
+# registered under that id before apply. iface must carry advertiseAddress and
+# must not be br0/kbr-* (preflight rejects bridges); lab NICs are typically
+# enp6s0 or eno1 under the bridge — verify with `ip -4 addr` on each host.
+# VIP 192.168.40.160 is free in Kea (not reserved). LVM data on vg_kcore.
+#
+#   kctl pg-cluster plan -f examples/postgresql-cluster/dell-lab.yaml
+#   kctl pg-cluster apply -f examples/postgresql-cluster/dell-lab.yaml --confirm
+#   kctl pg-cluster health orders
+#   kctl pg-cluster credentials orders
+#
+# See docs/bare-metal-postgresql.md (lab apply answers for the three Dells).
+kind: PostgresqlCluster
+metadata:
+  name: orders
+spec:
+  package: postgresql_17
+  members:
+    - nodeId: dell-20
+      role: primary
+      advertiseAddress: 192.168.40.103
+      iface: enp6s0
+      dataVolume:
+        {
+          name: pg-orders,
+          storageClass: lvm,
+          volumeGroup: vg_kcore,
+          sizeBytes: 107374182400,
+          fsType: xfs,
+        }
+    - nodeId: dell-21
+      advertiseAddress: 192.168.40.143
+      iface: enp6s0
+      dataVolume:
+        {
+          name: pg-orders,
+          storageClass: lvm,
+          volumeGroup: vg_kcore,
+          sizeBytes: 107374182400,
+          fsType: xfs,
+        }
+    - nodeId: node-118
+      advertiseAddress: 192.168.40.145
+      iface: enp6s0
+      dataVolume:
+        {
+          name: pg-orders,
+          storageClass: lvm,
+          volumeGroup: vg_kcore,
+          sizeBytes: 107374182400,
+          fsType: xfs,
+        }
+  replication:
+    mode: quorum
+  vip:
+    address: 192.168.40.160/24
+    virtualRouterId: 61
+  clientNetworks: [192.168.40.0/24]
+  parameters:
+    max_connections: "300"
+    work_mem: "16MB"
+  roles:
+    - name: app
+      login: true
+  databases:
+    - name: orders
+      owner: app
+      extensions: [pg_stat_statements, pgcrypto]

@@ -40,6 +40,14 @@ export function buildApply(kind: ResourceKind, spec: Record<string, unknown>): R
       return [{ target: "controller", method: "createWorkload", request: containerRequest(spec) }];
     case "postgresql":
       return [{ target: "controller", method: "createPostgresql", request: postgresqlRequest(spec) }];
+    case "postgresql-cluster":
+      return [
+        {
+          target: "controller",
+          method: "createPostgresqlCluster",
+          request: { ...postgresqlClusterPlan(spec), confirm: true },
+        },
+      ];
     case "slurm-cluster": {
       const request = slurmClusterRequest(spec);
       return [{ target: "controller", method: "createSlurmCluster", request }];
@@ -126,6 +134,10 @@ export function buildRead(kind: ResourceKind, name?: string): RpcCall {
       return named
         ? { target: "controller", method: "getPostgresql", request: { name: named } }
         : { target: "controller", method: "listPostgresqls", request: {} };
+    case "postgresql-cluster":
+      return named
+        ? { target: "controller", method: "getPostgresqlCluster", request: { name: named } }
+        : { target: "controller", method: "listPostgresqlClusters", request: {} };
     case "slurm-cluster":
       return named
         ? { target: "controller", method: "getSlurmCluster", request: { name: named } }
@@ -217,6 +229,12 @@ export function buildDelete(kind: ResourceKind, name: string): RpcCall {
       return { target: "controller", method: "deleteWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: id } };
     case "postgresql":
       return { target: "controller", method: "deletePostgresql", request: { name: id } };
+    case "postgresql-cluster":
+      return {
+        target: "controller",
+        method: "deletePostgresqlCluster",
+        request: { name: id, confirm: true, force: false },
+      };
     case "kubernetes-cluster":
       return { target: "controller", method: "deleteKubernetesCluster", request: { name: id, confirm: true, force: false } };
     case "operator":
@@ -291,6 +309,9 @@ export function buildPlanCall(kind: ResourceKind, spec: Record<string, unknown>,
       method: "planSlurmCluster",
       request: { name: request.name, spec: request.spec },
     };
+  }
+  if (kind.id === "postgresql-cluster") {
+    return { target: "controller", method: "planPostgresqlCluster", request: postgresqlClusterPlan(spec) };
   }
   return buildRead(kind, name ?? (typeof spec.name === "string" ? spec.name : undefined));
 }
@@ -1199,6 +1220,13 @@ const POSTGRESQL_PACKAGES = new Set([
   "postgresql_16",
   "postgresql_17",
 ]);
+
+function postgresqlClusterPlan(spec: Record<string, unknown>): Record<string, unknown> {
+  const name = assertName(required(spec, "name", "name"), "name");
+  const body = { ...spec };
+  delete body.name;
+  return { name, spec: body };
+}
 
 function postgresqlRequest(spec: Record<string, unknown>): Record<string, unknown> {
   const name = assertName(required(spec, "name", "name"), "name");

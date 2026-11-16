@@ -1,12 +1,13 @@
 [package]
 name = "kctl"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 kcore-gpu = { path = "../kcore-gpu" }
 kcore-sanitize = { path = "../kcore-sanitize" }
+kcore-postgresql = { path = "../kcore-postgresql" }
 kcore-disk-layout-yaml = { path = "../kcore-disk-layout-yaml" }
 dirs = "6"
 prost = "0.13"
