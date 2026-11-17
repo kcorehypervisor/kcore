@@ -186,6 +186,9 @@ fn to_proto(m: ClusterUpdateManifest) -> controller_proto::ClusterUpdateSpec {
             nixpkgs_rev: m.spec.target.nixpkgs_rev,
             system_profile: m.spec.target.system_profile,
             tag: m.spec.target.tag,
+            channel: String::new(),
+            prebuilt_url: String::new(),
+            prebuilt_sha256: String::new(),
         }),
         selector: Some(controller_proto::ClusterUpdateSelector {
             node_ids: m.spec.selector.node_ids,
@@ -384,12 +387,19 @@ pub async fn set_version(
     info: &ConnectionInfo,
     version: &str,
     flake_ref: &str,
+    channel: &str,
     drain_vms: bool,
     dry_run: bool,
     canary: CanaryArgs<'_>,
 ) -> Result<()> {
     if canary.disabled && (canary.soak.is_some() || canary.node.is_some()) {
         bail!("--no-canary cannot be combined with --soak or --canary");
+    }
+    if !channel.is_empty() && channel != "community" && channel != "enterprise" {
+        bail!("--channel must be community or enterprise");
+    }
+    if channel == "enterprise" && !flake_ref.is_empty() {
+        bail!("--flake-ref cannot be combined with --channel enterprise");
     }
     let canary_soak_seconds = canary.soak.map(parse_soak).transpose()?.unwrap_or(0);
     let mut client = client::controller_client(info).await?;
@@ -402,6 +412,7 @@ pub async fn set_version(
             canary_soak_seconds,
             no_canary: canary.disabled,
             canary_node_id: canary.node.unwrap_or("").into(),
+            channel: channel.into(),
         })
         .await
         .context("set_cluster_version rpc")?

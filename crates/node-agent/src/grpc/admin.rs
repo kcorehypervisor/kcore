@@ -4933,6 +4933,10 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let update_kind = req.update_kind.clone();
         let nixpkgs_rev = req.nixpkgs_rev.clone();
         let flake_tag = req.flake_tag.trim().to_string();
+        let prebuilt_url = req.prebuilt_url.clone();
+        let prebuilt_sha256 = req.prebuilt_sha256.clone();
+        let prebuilt_token = req.prebuilt_token.clone();
+        let pin_source_by_rev = req.pin_source_by_rev;
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_sec),
@@ -4946,6 +4950,10 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
                     version: flake_rev,
                     had_flake: false,
                     flake_tag,
+                    prebuilt_url,
+                    prebuilt_sha256,
+                    prebuilt_token,
+                    pin_source_by_rev,
                 })
             }),
         )

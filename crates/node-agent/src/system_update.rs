@@ -557,9 +557,16 @@ pub fn prepare_generation(req: &PrepareRequest) -> Result<StagedManifest, String
     copy_host_tree(Path::new(HOST_DIR), &staging, &[])?;
     let staged_flake = staging.join("flake.nix");
     let first_flake = !staged_flake.exists();
-    if !req.flake_tag.is_empty() {
-        validate_release_tag(&req.flake_tag)?;
-        stage_release_flake(&staging, &flake_url_at(&req.flake_ref, &req.flake_tag))?;
+    if !req.flake_tag.is_empty() || req.pin_source_by_rev {
+        if !req.flake_tag.is_empty() {
+            validate_release_tag(&req.flake_tag)?;
+        }
+        let pin = if req.pin_source_by_rev {
+            req.flake_rev.as_str()
+        } else {
+            req.flake_tag.as_str()
+        };
+        stage_release_flake(&staging, &flake_url_at(&req.flake_ref, pin))?;
     } else if first_flake {
         write_migration_flake(&staging, &req.flake_ref, &req.flake_rev, &req.nixpkgs_rev)?;
     } else {
@@ -573,14 +580,31 @@ pub fn prepare_generation(req: &PrepareRequest) -> Result<StagedManifest, String
         let text = fs::read_to_string(&staged_flake).map_err(|e| e.to_string())?;
         fs::write(&staged_flake, strip_version_pin(&text)).map_err(|e| e.to_string())?;
     }
-    let toplevel = build_toplevel(&staging)?;
-    if !req.flake_tag.is_empty() {
+    let prebuilt_cache = if req.prebuilt_url.trim().is_empty() {
+        None
+    } else {
+        Some(fetch_prebuilt_cache(
+            &update_dir,
+            &req.prebuilt_url,
+            &req.prebuilt_sha256,
+            &req.prebuilt_token,
+        )?)
+    };
+    let toplevel = build_toplevel(&staging, prebuilt_cache.as_deref())?;
+    if let Some(cache) = prebuilt_cache.as_ref() {
+        let _ = fs::remove_dir_all(cache);
+    }
+    if !req.flake_tag.is_empty() || req.pin_source_by_rev {
         let lock = fs::read_to_string(staging.join("flake.lock")).unwrap_or_default();
         let locked = locked_input_rev(&lock, "kcore").unwrap_or_default();
         if locked != req.flake_rev.trim() {
+            let label = if req.pin_source_by_rev {
+                req.flake_rev.as_str()
+            } else {
+                req.flake_tag.as_str()
+            };
             return Err(format!(
-                "{} resolves to {locked} on this node; the controller resolved {}",
-                req.flake_tag,
+                "{label} resolves to {locked} on this node; the controller resolved {}",
                 req.flake_rev.trim()
             ));
         }
@@ -625,6 +649,13 @@ pub struct PrepareRequest {
     /// Release tag. When set, the staged host flake is the shared template
     /// pointing at this tag, and the lock must pin `flake_rev`.
     pub flake_tag: String,
+    /// Enterprise prebuilt Nix file-cache URL (empty for community).
+    pub prebuilt_url: String,
+    pub prebuilt_sha256: String,
+    /// Classic GitHub PAT for downloading `prebuilt_url`. Never logged.
+    pub prebuilt_token: String,
+    /// Stage the host flake at `flake_rev` instead of `flake_tag`.
+    pub pin_source_by_rev: bool,
 }
 
 /// Replace the staged host flake with the release template. The old lock is
@@ -670,18 +701,144 @@ fn staged_flake_ref(staging: &Path) -> String {
     format!("path:{}", staging.display())
 }
 
-/// Build the staged host flake. Writes its `flake.lock`, which pins every
-/// input, including the kcore input's own nixpkgs, crane, and rust-overlay.
-fn build_toplevel(staging: &Path) -> Result<String, String> {
-    let out = Command::new("nix")
+/// Download, verify, and unpack an enterprise prebuilt Nix file cache.
+/// The token is passed to curl on stdin so it never appears in argv.
+pub fn fetch_prebuilt_cache(
+    update_dir: &Path,
+    url: &str,
+    sha256_hex: &str,
+    token: &str,
+) -> Result<PathBuf, String> {
+    if sha256_hex.len() != 64 || !sha256_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("prebuilt_sha256 is not a hex digest: {sha256_hex}"));
+    }
+    let tar_path = update_dir.join("prebuilt.tar");
+    let cache_dir = update_dir.join("prebuilt-cache");
+    let _ = fs::remove_file(&tar_path);
+    let _ = fs::remove_dir_all(&cache_dir);
+    fs::create_dir_all(&cache_dir).map_err(|e| format!("mkdir prebuilt-cache: {e}"))?;
+
+    let mut child = Command::new("curl")
         .args([
-            "build",
-            &format!("{}#{TOPLEVEL_ATTR}", staged_flake_ref(staging)),
-            "--no-link",
-            "--print-out-paths",
+            "-fsSL",
+            "-H",
+            "Accept: application/octet-stream",
+            "-H",
+            "User-Agent: kcore-node-agent",
+            "-H",
+            "@-",
+            "-o",
+            tar_path.to_str().ok_or("prebuilt path not utf8")?,
+            url,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl: {e}"))?;
+    {
+        use std::io::Write;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "curl stdin missing".to_string())?;
+        writeln!(stdin, "Authorization: Bearer {}", token.trim())
+            .map_err(|e| format!("curl stdin: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&tar_path);
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "download prebuilt failed: {}",
+            err.trim().lines().last().unwrap_or("curl failed")
+        ));
+    }
+
+    let digest = sha256_file(&tar_path)?;
+    if digest != sha256_hex.to_ascii_lowercase() {
+        let _ = fs::remove_file(&tar_path);
+        return Err(format!(
+            "prebuilt sha256 mismatch: got {digest}, want {}",
+            sha256_hex.to_ascii_lowercase()
+        ));
+    }
+
+    let unpack = Command::new("tar")
+        .args([
+            "-xf",
+            tar_path.to_str().ok_or("prebuilt path not utf8")?,
+            "-C",
+            cache_dir.to_str().ok_or("cache path not utf8")?,
         ])
         .output()
-        .map_err(|e| format!("nix build: {e}"))?;
+        .map_err(|e| format!("tar: {e}"))?;
+    let _ = fs::remove_file(&tar_path);
+    if !unpack.status.success() {
+        let _ = fs::remove_dir_all(&cache_dir);
+        return Err(format!(
+            "tar extract failed: {}",
+            String::from_utf8_lossy(&unpack.stderr)
+        ));
+    }
+    if !cache_dir.join("nix-cache-info").exists() {
+        let _ = fs::remove_dir_all(&cache_dir);
+        return Err("prebuilt tar is not a Nix file cache (missing nix-cache-info)".into());
+    }
+    Ok(cache_dir)
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("sha256sum: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "sha256sum failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let digest = text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "sha256sum produced no digest".to_string())?
+        .to_ascii_lowercase();
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("sha256sum produced bad digest: {digest}"));
+    }
+    Ok(digest)
+}
+
+/// Build the staged host flake. Writes its `flake.lock`, which pins every
+/// input, including the kcore input's own nixpkgs, crane, and rust-overlay.
+/// When `prebuilt_cache` is set, nix substitutes from that file cache and
+/// trusts the enterprise signing key for this build only.
+fn build_toplevel(staging: &Path, prebuilt_cache: Option<&Path>) -> Result<String, String> {
+    let mut cmd = Command::new("nix");
+    cmd.args([
+        "build",
+        &format!("{}#{TOPLEVEL_ATTR}", staged_flake_ref(staging)),
+        "--no-link",
+        "--print-out-paths",
+    ]);
+    if let Some(cache) = prebuilt_cache {
+        let subst = format!(
+            "file://{}?trusted=1",
+            cache
+                .canonicalize()
+                .unwrap_or_else(|_| cache.to_path_buf())
+                .display()
+        );
+        cmd.args([
+            "--extra-substituters",
+            &subst,
+            "--extra-trusted-public-keys",
+            crate::enterprise::NIX_PUBLIC_KEY,
+        ]);
+    }
+    let out = cmd.output().map_err(|e| format!("nix build: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "nix build failed: {}",
@@ -698,6 +855,18 @@ fn build_toplevel(staging: &Path) -> Result<String, String> {
         return Err("nix build printed no store path".into());
     }
     Ok(path)
+}
+
+/// Argv fragments used when a prebuilt cache is present. Tested so the
+/// enterprise key is always passed and never configured system-wide.
+pub fn prebuilt_nix_args(cache: &Path) -> Vec<String> {
+    let subst = format!("file://{}?trusted=1", cache.display());
+    vec![
+        "--extra-substituters".into(),
+        subst,
+        "--extra-trusted-public-keys".into(),
+        crate::enterprise::NIX_PUBLIC_KEY.into(),
+    ]
 }
 
 fn kernel_of(toplevel: &str) -> String {
@@ -1027,7 +1196,8 @@ pub fn activate_staged(manifest_path: &Path, mode: &str) -> Result<ActivateOutco
     }
     let live = Path::new(HOST_DIR);
     restage_host_tree(live, &staging)?;
-    let toplevel = build_toplevel(&staging)?;
+    // Prebuilt cache was consumed during prepare; store paths remain local.
+    let toplevel = build_toplevel(&staging, None)?;
     manifest.toplevel = toplevel.clone();
     manifest.target_generation = toplevel.clone();
     manifest.activation = activation.clone();
@@ -1518,6 +1688,55 @@ mod tests {
         assert!(text.contains("kcore.lib.mkNode"));
         assert!(!root.path().join("flake.lock").exists());
         assert!(root.path().join("legacy-configuration.nix").exists());
+    }
+
+    #[test]
+    fn release_flake_can_pin_by_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let rev = "0123456789abcdef0123456789abcdef01234567";
+        stage_release_flake(
+            root.path(),
+            &flake_url_at("github:kcorehypervisor/kcore", rev),
+        )
+        .unwrap();
+        let text = fs::read_to_string(root.path().join("flake.nix")).unwrap();
+        assert!(text.contains(&format!(
+            "inputs.kcore.url = \"github:kcorehypervisor/kcore/{rev}\";"
+        )));
+    }
+
+    #[test]
+    fn prebuilt_nix_args_trust_the_enterprise_key() {
+        let args = prebuilt_nix_args(Path::new("/var/lib/kcore/updates/u/prebuilt-cache"));
+        assert!(args.iter().any(|a| a == "--extra-substituters"));
+        assert!(args.iter().any(|a| a == "--extra-trusted-public-keys"));
+        assert!(args.iter().any(|a| a == crate::enterprise::NIX_PUBLIC_KEY));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("file://") && a.contains("trusted=1")));
+    }
+
+    #[test]
+    fn prebuilt_download_argv_keeps_the_token_off_argv() {
+        // Mirror of fetch_prebuilt_cache's curl argv (without the token).
+        let url = "https://github.com/kcorehypervisor/enterprise/releases/download/v0.8.0/x.tar";
+        let token = "ghp_must_not_appear";
+        let argv = [
+            "curl",
+            "-fsSL",
+            "-H",
+            "Accept: application/octet-stream",
+            "-H",
+            "User-Agent: kcore-node-agent",
+            "-H",
+            "@-",
+            "-o",
+            "/tmp/prebuilt.tar",
+            url,
+        ];
+        let joined = argv.join(" ");
+        assert!(!joined.contains(token));
+        assert!(argv.contains(&"@-"));
     }
 
     #[test]

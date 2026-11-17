@@ -16985,6 +16985,94 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
+    async fn set_subscription(
+        &self,
+        request: Request<controller_proto::SetSubscriptionRequest>,
+    ) -> Result<Response<controller_proto::SetSubscriptionResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if req.clear {
+            self.db.clear_subscription().map_err(internal_db)?;
+            self.record_audit(&actor, "SetSubscription", "subscription", "cleared");
+            return Ok(Response::new(controller_proto::SetSubscriptionResponse {
+                success: true,
+                message: "subscription cleared; updates use the community channel".into(),
+                github_login: String::new(),
+            }));
+        }
+        let token = req.token.trim().to_string();
+        if token.is_empty() {
+            return Err(Status::invalid_argument(
+                "token is required (or pass clear=true)",
+            ));
+        }
+        let identity = crate::enterprise::verify_token(&token)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("token check failed: {e}")))?;
+        // Confirm the token can see the enterprise repo.
+        let _ = crate::enterprise::latest_tag(&token).await.map_err(|e| {
+            Status::failed_precondition(format!(
+                "token works as {}, but cannot read {}: {e}",
+                identity.login,
+                crate::enterprise::ENTERPRISE_REPO
+            ))
+        })?;
+        self.db
+            .upsert_subscription(&token, &identity.login)
+            .map_err(internal_db)?;
+        self.record_audit(
+            &actor,
+            "SetSubscription",
+            "subscription",
+            format!("github_login={}", identity.login),
+        );
+        Ok(Response::new(controller_proto::SetSubscriptionResponse {
+            success: true,
+            message: format!(
+                "subscription stored for GitHub user {}; updates default to the enterprise channel",
+                identity.login
+            ),
+            github_login: identity.login,
+        }))
+    }
+
+    async fn get_subscription(
+        &self,
+        request: Request<controller_proto::GetSubscriptionRequest>,
+    ) -> Result<Response<controller_proto::GetSubscriptionResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let _ = request;
+        let Some(row) = self.db.get_subscription().map_err(internal_db)? else {
+            return Ok(Response::new(controller_proto::GetSubscriptionResponse {
+                configured: false,
+                message: "no subscription stored; updates use the community channel".into(),
+                ..Default::default()
+            }));
+        };
+        if row.token.trim().is_empty() {
+            return Ok(Response::new(controller_proto::GetSubscriptionResponse {
+                configured: false,
+                message: "no subscription stored; updates use the community channel".into(),
+                ..Default::default()
+            }));
+        }
+        match crate::enterprise::latest_tag(&row.token).await {
+            Ok(latest) => Ok(Response::new(controller_proto::GetSubscriptionResponse {
+                configured: true,
+                github_login: row.github_login,
+                latest_release: latest,
+                message: "subscription token works".into(),
+            })),
+            Err(e) => Ok(Response::new(controller_proto::GetSubscriptionResponse {
+                configured: true,
+                github_login: row.github_login,
+                latest_release: String::new(),
+                message: format!("subscription stored but token check failed: {e}"),
+            })),
+        }
+    }
+
     async fn get_ceph_dashboard_credentials(
         &self,
         request: Request<controller_proto::GetCephDashboardCredentialsRequest>,
@@ -18349,6 +18437,30 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
         let tag = cluster_version::normalize_tag(&req.version).map_err(Status::invalid_argument)?;
+        let subscription = self.db.get_subscription().map_err(internal_db)?;
+        let channel = match req.channel.trim() {
+            "" => {
+                if subscription
+                    .as_ref()
+                    .is_some_and(|s| !s.token.trim().is_empty())
+                {
+                    "enterprise"
+                } else {
+                    "community"
+                }
+            }
+            "community" | "enterprise" => req.channel.trim(),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "channel must be community or enterprise, got {other}"
+                )));
+            }
+        };
+        if channel == "enterprise" && !req.flake_ref.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "flake_ref cannot be set with channel=enterprise",
+            ));
+        }
         let flake_ref = match req.flake_ref.trim() {
             "" => cluster_version::DEFAULT_FLAKE_REF.to_string(),
             other => other.to_string(),
@@ -18401,9 +18513,39 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }));
         }
 
-        let release = cluster_version::resolve_release(&flake_ref, &tag)
+        let (release, enterprise_target) = if channel == "enterprise" {
+            let token = subscription
+                .as_ref()
+                .map(|s| s.token.as_str())
+                .unwrap_or("");
+            let ent = crate::enterprise::resolve_release(token, &tag)
+                .await
+                .map_err(|e| {
+                    Status::failed_precondition(format!(
+                        "enterprise channel for {tag}: {e}; check the subscription with `kctl get subscription`"
+                    ))
+                })?;
+            // Public source by commit (tag may still be embargoed).
+            let release = cluster_version::resolve_release_at_rev(
+                crate::enterprise::DEFAULT_FLAKE_REF,
+                &tag,
+                &ent.kcore_rev,
+            )
             .await
             .map_err(Status::failed_precondition)?;
+            (
+                release,
+                Some(cluster_version::EnterpriseTarget {
+                    prebuilt_url: ent.prebuilt_url,
+                    prebuilt_sha256: ent.prebuilt_sha256,
+                }),
+            )
+        } else {
+            let release = cluster_version::resolve_release(&flake_ref, &tag)
+                .await
+                .map_err(Status::failed_precondition)?;
+            (release, None)
+        };
         cluster_version::check_schema(&release, crate::db::MIN_COMPATIBLE_SCHEMA_READER)
             .map_err(Status::failed_precondition)?;
         let versions: Vec<(String, String)> = self
@@ -18451,13 +18593,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
         };
         let strategy =
             cluster_version::strategy((!req.no_canary).then_some((soak_secs, canary_node)));
-        let spec = cluster_version::update_spec(
+        let spec = cluster_version::update_spec_with_channel(
             &name,
             &flake_ref,
             &release,
             target_ids.clone(),
             req.drain_vms,
             strategy,
+            channel,
+            enterprise_target,
         );
         cluster_update_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
         let mut ordered: Vec<ClusterUpdateNodeRow> = target_ids
@@ -24679,6 +24823,9 @@ mod tests {
                 nixpkgs_rev: String::new(),
                 system_profile: String::new(),
                 tag: String::new(),
+                channel: String::new(),
+                prebuilt_url: String::new(),
+                prebuilt_sha256: String::new(),
             }),
             selector: Some(controller_proto::ClusterUpdateSelector {
                 all_nodes: true,

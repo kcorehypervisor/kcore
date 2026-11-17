@@ -318,6 +318,14 @@ in
         ]
         ++ lib.optional cfg.controller.enable "kcore-controller.service";
         wants = [ "network-online.target" ];
+        # curl and gnutar download and unpack the enterprise prebuilt cache
+        # during prepare; sha256sum verifies it.
+        path = [
+          config.nix.package
+          pkgs.curl
+          pkgs.gnutar
+          pkgs.coreutils
+        ];
         serviceConfig = {
           Type = "simple";
           ExecStart = "${cfg.nodeAgent.package}/bin/kcore-node-agent --config ${cfg.nodeAgent.configFile}";
@@ -336,9 +344,12 @@ in
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         # Version updates resolve a release tag with `nix flake metadata`.
+        # curl downloads enterprise release metadata with the subscription
+        # token on stdin.
         path = [
           config.nix.package
           pkgs.git
+          pkgs.curl
         ];
         serviceConfig = {
           Type = "simple";

@@ -103,11 +103,32 @@ pub async fn resolve_release(flake_ref: &str, tag: &str) -> Result<Release, Stri
     if rev.len() != 40 || !rev.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("{url} did not resolve to a commit"));
     }
-    let pinned = format!("{}#lib.kcore", flake_url_at(flake_ref, &rev));
-    let info = nix_json(&["eval", "--json", &pinned])
-        .await
-        .map_err(|e| format!("{tag} has no lib.kcore, so it predates tag updates: {e}"))?;
+    let info = eval_lib_kcore(flake_ref, &rev).await?;
     parse_release(tag, &rev, &info)
+}
+
+/// Evaluate `lib.kcore` at a known commit. Used by the enterprise channel when
+/// the public tag is not pushed yet (embargo).
+pub async fn eval_lib_kcore(flake_ref: &str, rev: &str) -> Result<serde_json::Value, String> {
+    if rev.len() != 40 || !rev.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{rev} is not a commit"));
+    }
+    let pinned = format!("{}#lib.kcore", flake_url_at(flake_ref, rev));
+    nix_json(&["eval", "--json", &pinned])
+        .await
+        .map_err(|e| format!("{rev} has no lib.kcore: {e}"))
+}
+
+/// Read `lib.kcore` at a known commit. Used by the enterprise channel when
+/// the public tag is not pushed yet (embargo): source is public by commit,
+/// the tag lives only on the private enterprise release.
+pub async fn resolve_release_at_rev(
+    flake_ref: &str,
+    tag: &str,
+    rev: &str,
+) -> Result<Release, String> {
+    let info = eval_lib_kcore(flake_ref, rev).await?;
+    parse_release(tag, rev, &info)
 }
 
 pub fn parse_release(tag: &str, rev: &str, info: &serde_json::Value) -> Result<Release, String> {
@@ -196,6 +217,13 @@ pub fn strategy(canary: Option<(i32, &str)>) -> ClusterUpdateStrategy {
     }
 }
 
+/// Extra fields for an enterprise-channel ClusterUpdate.
+#[derive(Debug, Clone, Default)]
+pub struct EnterpriseTarget {
+    pub prebuilt_url: String,
+    pub prebuilt_sha256: String,
+}
+
 /// Approved, and rebooted by the controller when the node staged a new
 /// kernel.
 pub fn update_spec(
@@ -206,6 +234,32 @@ pub fn update_spec(
     drain_vms: bool,
     strategy: ClusterUpdateStrategy,
 ) -> ClusterUpdateSpec {
+    update_spec_with_channel(
+        name,
+        flake_ref,
+        release,
+        node_ids,
+        drain_vms,
+        strategy,
+        "community",
+        None,
+    )
+}
+
+pub fn update_spec_with_channel(
+    name: &str,
+    flake_ref: &str,
+    release: &Release,
+    node_ids: Vec<String>,
+    drain_vms: bool,
+    strategy: ClusterUpdateStrategy,
+    channel: &str,
+    enterprise: Option<EnterpriseTarget>,
+) -> ClusterUpdateSpec {
+    let (prebuilt_url, prebuilt_sha256) = match enterprise {
+        Some(e) => (e.prebuilt_url, e.prebuilt_sha256),
+        None => (String::new(), String::new()),
+    };
     ClusterUpdateSpec {
         name: name.to_string(),
         target: Some(ClusterUpdateTarget {
@@ -213,6 +267,9 @@ pub fn update_spec(
             flake_ref: flake_ref.to_string(),
             flake_rev: release.flake_rev.clone(),
             tag: release.tag.clone(),
+            channel: channel.to_string(),
+            prebuilt_url,
+            prebuilt_sha256,
             ..Default::default()
         }),
         selector: Some(ClusterUpdateSelector {

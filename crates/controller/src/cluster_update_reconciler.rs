@@ -162,15 +162,22 @@ async fn reconcile_update(
                         .split(',')
                         .any(|cap| cap == "nixos-generation")
                 });
+                let target = spec.target.clone().unwrap_or_default();
+                let enterprise = target.channel == "enterprise";
+                let prebuilt_token = if enterprise {
+                    db.get_subscription()
+                        .ok()
+                        .flatten()
+                        .map(|s| s.token)
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let req = node_proto::PrepareSystemUpdateRequest {
                     update_name: update.name.clone(),
                     flake_ref: update.flake_ref.clone(),
                     flake_rev: update.flake_rev.clone(),
-                    system_profile: spec
-                        .target
-                        .as_ref()
-                        .map(|t| t.system_profile.clone())
-                        .unwrap_or_default(),
+                    system_profile: target.system_profile.clone(),
                     host_system: String::new(),
                     timeout_seconds: NODE_PREPARE_TIMEOUT_SECS,
                     update_kind: if has_generation {
@@ -182,19 +189,16 @@ async fn reconcile_update(
                     } else {
                         "bootstrap".into()
                     },
-                    nixpkgs_rev: spec
-                        .target
-                        .as_ref()
-                        .map(|t| t.nixpkgs_rev.clone())
-                        .unwrap_or_default(),
+                    nixpkgs_rev: target.nixpkgs_rev.clone(),
                     flake_tag: if has_generation {
-                        spec.target
-                            .as_ref()
-                            .map(|t| t.tag.clone())
-                            .unwrap_or_default()
+                        target.tag.clone()
                     } else {
                         String::new()
                     },
+                    prebuilt_url: target.prebuilt_url.clone(),
+                    prebuilt_sha256: target.prebuilt_sha256.clone(),
+                    prebuilt_token,
+                    pin_source_by_rev: enterprise,
                     ..Default::default()
                 };
                 let result = prepare_on_node(clients, &address, req).await;

@@ -15,7 +15,7 @@ For how licensing relates to subscriptions, see [Licensing & editions](https://k
 
 - £249 / year / CPU socket
 - Official signed ISO images
-- Stable production update channel
+- Enterprise update channel (prebuilt packages, 14 days before community)
 - Tested updates
 - Support via customer portal or support email
 - 5 support tickets per year
@@ -25,7 +25,7 @@ For how licensing relates to subscriptions, see [Licensing & editions](https://k
 
 - £599 / year / CPU socket
 - Official signed ISO images
-- Stable production update channel
+- Enterprise update channel (prebuilt packages, 14 days before community)
 - Tested updates
 - Support via customer portal or support email
 - Unlimited support tickets
@@ -66,7 +66,7 @@ We run a partner program for resellers, integrators, and service providers. Cont
 No. You can download Community Edition from GitHub Releases or build from source without a subscription. Subscriptions apply to the official supported distribution, the stable production update channel, signed ISOs, and commercial support.
 
 **What does a subscription cover?**  
-The official supported distribution: signed ISO images, access to the stable production update channel, tested updates, and support under the terms of Standard, Premium, or Enterprise.
+The official supported distribution: signed ISO images, access to the enterprise update channel (prebuilt packages, published 14 days before the community tag), tested updates, and support under the terms of Standard, Premium, or Enterprise. See [`docs/enterprise-channel.md`](docs/enterprise-channel.md).
 
 **Is Community Edition open source?**  
 Yes. The Community Edition core is licensed under the Apache License 2.0.

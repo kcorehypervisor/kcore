@@ -496,6 +496,10 @@ enum UpdateVersionCmd {
         /// Repository the tag is resolved in (default github:kcorehypervisor/kcore)
         #[arg(long)]
         flake_ref: Option<String>,
+        /// Update channel: community or enterprise. Empty uses enterprise when
+        /// a subscription is stored, otherwise community.
+        #[arg(long)]
+        channel: Option<String>,
         /// Migrate guests off a node before it reboots into a new kernel
         #[arg(long)]
         drain_vms: bool,
@@ -1264,6 +1268,15 @@ enum SetResource {
         #[arg(long)]
         password: String,
     },
+    /// Store or clear the enterprise update-channel GitHub token
+    Subscription {
+        /// File containing a classic GitHub PAT (repo scope)
+        #[arg(long = "token-file", conflicts_with = "clear")]
+        token_file: Option<std::path::PathBuf>,
+        /// Remove the stored subscription (return to community channel)
+        #[arg(long, default_value_t = false)]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1503,6 +1516,8 @@ enum GetResource {
         /// Logical CephCluster name
         name: String,
     },
+    /// Show the enterprise update-channel subscription status
+    Subscription,
     /// List SharedFilesystem resources
     #[command(
         name = "shared-filesystems",
@@ -2984,6 +2999,18 @@ async fn main() {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::ceph_dashboard_credentials::set(&info, name, url, username, password).await
         }
+        Command::Set {
+            resource: SetResource::Subscription { token_file, clear },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            if *clear {
+                commands::subscription::clear(&info).await
+            } else if let Some(path) = token_file {
+                commands::subscription::set(&info, path).await
+            } else {
+                fatal("pass --token-file PATH or --clear")
+            }
+        }
 
         Command::Update {
             resource:
@@ -3058,6 +3085,7 @@ async fn main() {
                 UpdateVersionCmd::Set {
                     version,
                     flake_ref,
+                    channel,
                     drain_vms,
                     dry_run,
                     soak,
@@ -3068,6 +3096,7 @@ async fn main() {
                         &info,
                         version,
                         flake_ref.as_deref().unwrap_or(""),
+                        channel.as_deref().unwrap_or(""),
                         *drain_vms,
                         *dry_run,
                         commands::cluster_update::CanaryArgs {
@@ -3266,6 +3295,12 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::ceph_dashboard_credentials::get(&info, name).await
+        }
+        Command::Get {
+            resource: GetResource::Subscription,
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::subscription::get(&info).await
         }
         Command::Ingress {
             action:

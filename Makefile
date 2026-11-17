@@ -123,11 +123,22 @@ release-build:
 release-dist:
 	bash ./scripts/release.sh $(RELEASE_FLAGS) dist
 
+release-prebuilt:
+	bash ./scripts/release.sh $(RELEASE_FLAGS) prebuilt
+
+release-publish-enterprise:
+	bash ./scripts/release.sh $(RELEASE_FLAGS) publish-enterprise
+
 release-sign:
 	bash ./scripts/release.sh $(RELEASE_FLAGS) sign
 
-release-publish:
-	bash ./scripts/release.sh $(RELEASE_FLAGS) publish
+# Stage the community draft (compat name: release-publish).
+release-publish release-stage-public:
+	bash ./scripts/release.sh $(RELEASE_FLAGS) stage-public
+
+# Push the tag and publish the community draft after the embargo.
+release-public:
+	bash ./scripts/release.sh $(RELEASE_FLAGS) publish-public
 
 release:
 	bash ./scripts/release.sh $(RELEASE_FLAGS) release

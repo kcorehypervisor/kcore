@@ -30,6 +30,7 @@ pub mod shared_filesystem;
 pub mod slurm;
 pub mod ssh_key;
 pub mod storage_class;
+pub mod subscription;
 pub mod vault;
 pub mod vm;
 pub mod volume;

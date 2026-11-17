@@ -185,6 +185,8 @@ pub(crate) static CONTROLLER_OPERATOR_RPC_AFTER_RENEW: &[(&str, &str)] = &[
     ("PromoteClusterUpdate", "cluster-admin"),
     ("SetClusterVersion", "cluster-admin"),
     ("GetClusterVersion", "read-only"),
+    ("SetSubscription", "cluster-admin"),
+    ("GetSubscription", "cluster-admin"),
     ("CreateOperator", "cluster-admin"),
     ("DeleteOperator", "cluster-admin"),
     ("ListOperators", "cluster-admin"),

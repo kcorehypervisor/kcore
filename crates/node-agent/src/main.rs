@@ -11,6 +11,7 @@ mod config;
 mod console;
 mod discovery;
 mod disk;
+mod enterprise;
 mod grpc;
 mod guest_ops;
 mod ha;
