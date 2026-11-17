@@ -56,7 +56,9 @@ nix build ".#nixosConfigurations.kcore-controller-node.config.system.build.tople
 echo "==> Collecting closure paths not on cache.nixos.org..."
 : >"${WORK}/paths.txt"
 for link in node controller; do
-	nix path-info -r --store /nix/store "$(readlink -f "${WORK}/${link}")" >>"${WORK}/all-paths.txt"
+	# Do not pass --store /nix/store: a bare path is a chroot store root, so
+	# Nix would look under /nix/store/nix/store and fail on the read-only FS.
+	nix path-info -r "$(readlink -f "${WORK}/${link}")" >>"${WORK}/all-paths.txt"
 done
 sort -u "${WORK}/all-paths.txt" -o "${WORK}/all-paths.txt"
 
