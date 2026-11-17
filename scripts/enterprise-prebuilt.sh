@@ -50,10 +50,15 @@ printf 'StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n' >"${CACHE}/nix-c
 # Real host flakes pull these packages from the kcore input. The
 # nixosConfigurations.kcore-node fixtures use hello placeholders so their
 # closures are useless for a binary cache.
+#
+# Build from the pushed commit so store paths match customer installs and
+# a dirty worktree cannot change the source filter hash.
 packages=(kctl kcore-node-agent kcore-controller kcore-console kcore-dashboard)
-echo "==> Building kcore packages for prebuilt cache..."
+kcore_rev="$(git rev-parse HEAD)"
+flake_ref="github:kcorehypervisor/kcore/${kcore_rev}"
+echo "==> Building kcore packages for prebuilt cache from ${flake_ref}..."
 for attr in "${packages[@]}"; do
-	nix build ".#${attr}" -o "${WORK}/${attr}"
+	nix build "${flake_ref}#${attr}" -o "${WORK}/${attr}"
 done
 
 # Paths that cache.nixos.org already serves stay out of the enterprise tar.
@@ -98,14 +103,12 @@ fi
 
 echo "==> Rehearsing: prebuilt + cache.nixos.org must build kcore packages with --max-jobs 0..."
 cleanup_rehearsal() {
+	# Nix store paths are read-only; chmod before rm.
+	chmod -R u+w "${REHEARSAL_STORE}" 2>/dev/null || true
 	rm -rf "${REHEARSAL_STORE}"
 }
 trap cleanup_rehearsal EXIT
 mkdir -p "${REHEARSAL_STORE}"
-# Rehearse against this tree. Day-0 enterprise publish pins the same commit
-# on main; customers resolve github:kcorehypervisor/kcore/<rev> to matching
-# store paths.
-flake_ref="path:${ROOT}"
 for attr in "${packages[@]}"; do
 	echo "    nix build ${flake_ref}#${attr} --max-jobs 0"
 	nix build \
