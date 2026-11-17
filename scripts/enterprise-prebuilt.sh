@@ -18,7 +18,8 @@ PREBUILT_NAME="kcore-prebuilt-${VERSION}-x86_64-linux.tar"
 WORK="${ROOT}/dist/enterprise-work"
 CACHE="${WORK}/cache"
 STORE="${WORK}/store"
-REHEARSAL_STORE="${WORK}/rehearsal-store"
+# Keep the chroot store out of the repo so pre-commit nixfmt does not scan it.
+REHEARSAL_STORE="${TMPDIR:-/tmp}/kcore-enterprise-rehearsal-$$"
 MAX_ASSET_BYTES=$((2 * 1024 * 1024 * 1024)) # GitHub release asset limit
 
 die() {
@@ -96,7 +97,10 @@ if ((asset_size > MAX_ASSET_BYTES)); then
 fi
 
 echo "==> Rehearsing: prebuilt + cache.nixos.org must build kcore packages with --max-jobs 0..."
-rm -rf "${REHEARSAL_STORE}"
+cleanup_rehearsal() {
+	rm -rf "${REHEARSAL_STORE}"
+}
+trap cleanup_rehearsal EXIT
 mkdir -p "${REHEARSAL_STORE}"
 # Rehearse against this tree. Day-0 enterprise publish pins the same commit
 # on main; customers resolve github:kcorehypervisor/kcore/<rev> to matching

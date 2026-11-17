@@ -14,7 +14,7 @@ cargo fmt --check || {
 }
 
 echo "pre-commit: checking Nix formatting..."
-find . -name '*.nix' -not -path './result*' -exec nixfmt --check {} + || {
+find . -name '*.nix' -not -path './result*' -not -path './dist/*' -not -path './target/*' -exec nixfmt --check {} + || {
     echo ""
     echo "  Nix formatting check failed. Run 'make fmt' to fix."
     exit 1
