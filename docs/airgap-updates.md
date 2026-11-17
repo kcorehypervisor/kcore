@@ -23,8 +23,11 @@ already run without a network (see [cluster-updates.md](cluster-updates.md)).
   source, the Rust crate sources, every flake input, and the nixpkgs outputs
   that `cache.nixos.org` already serves. Each node compiles the kcore packages
   during prepare, as Community nodes do on a connected site.
-- **Subscriber bundle (later channel).** The same layout, plus prebuilt kcore
-  closures, signed with a Nix key for that channel. It is out of scope here.
+- **Subscriber / enterprise channel.** Online subscribers use the private
+  enterprise repo and a prebuilt Nix file cache signed with
+  `kcore-enterprise-1` (see [enterprise-channel.md](enterprise-channel.md)).
+  An air-gapped **subscriber bundle** that carries those same closures is
+  still out of scope here.
 - **Generic by default.** One bundle serves every site. It does not need
   anything from the site, so nothing has to leave the air gap.
 - **Full and delta bundles.** A full bundle is self-contained. A delta holds

@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
-# Build release artifacts (Nix ISO + Linux/macOS kctl), package dist/, publish GitHub Release.
+# Build release artifacts (Nix ISO + Linux/macOS kctl), package dist/, publish
+# the enterprise channel, then stage (and later publish) the community release.
 # Usage:
-#   ./scripts/release.sh build    # nix build ISO + Linux kctl, cargo-zigbuild macOS kctl
-#   ./scripts/release.sh dist     # dist/*.tar.gz, ISO copy, SBOMs, dist/SHA256SUMS
-#   ./scripts/release.sh tag      # create/push v$(VERSION)
-#   ./scripts/release.sh sign     # cosign sign-blob dist/SHA256SUMS (Sigstore keyless)
-#   ./scripts/release.sh publish  # sign + gh release create/upload (needs tag on remote)
-#   ./scripts/release.sh release  # tag + build + dist + publish
+#   ./scripts/release.sh build              # nix build ISO + Linux/macOS kctl
+#   ./scripts/release.sh dist               # dist/*.tar.gz, ISO, SBOMs, SHA256SUMS
+#   ./scripts/release.sh tag                # create local annotated tag (no push)
+#   ./scripts/release.sh prebuilt           # enterprise prebuilt Nix file cache
+#   ./scripts/release.sh publish-enterprise # release on kcorehypervisor/enterprise
+#   ./scripts/release.sh stage-public       # draft community release (no tag push)
+#   ./scripts/release.sh publish-public     # push tag + publish draft (≥14 days)
+#   ./scripts/release.sh sign               # cosign sign-blob dist/SHA256SUMS
+#   ./scripts/release.sh publish            # alias of stage-public (compat)
+#   ./scripts/release.sh release            # tag + build + dist + prebuilt +
+#                                           # publish-enterprise + stage-public
 # Options:
-#   --no-sign       Skip Sigstore signing. Explicit opt-out for a maintainer
-#                   without cosign configured; the release is then UNSIGNED.
+#   --no-sign         Skip Sigstore signing. Explicit opt-out; unsigned release.
+#   --break-embargo   Allow publish-public before the 14-day embargo ends.
 # Environment:
-#   RELEASE_NOTES   Optional path to release notes file (defaults to RELEASE_NOTES.md if present;
-#                   otherwise GitHub auto-generated release notes are used)
-#   GH_REPO         owner/repo override for gh (optional; defaults to git remote)
+#   RELEASE_NOTES              Optional notes file (defaults to RELEASE_NOTES.md)
+#   GH_REPO                    owner/repo override for the public channel
+#   KCORE_NIX_SIGNING_KEY_FILE Path to the kcore-enterprise-1 Nix secret key
+#   KCORE_ENTERPRISE_REPO      Override enterprise repo (default kcorehypervisor/enterprise)
+#   KCORE_EMBARGO_DAYS         Days before a draft may be published (default 14)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${0}")/.." && pwd)"
@@ -36,7 +44,7 @@ SBOM_FILES=(
 	"kcore-${VERSION}-iso-closure.spdx.json"
 )
 # Signing dist/SHA256SUMS transitively covers every other asset, SBOMs
-# included, so this is the only signature a release carries.
+# included, so this is the only signature a community release carries.
 SIGSTORE_BUNDLE="SHA256SUMS.sigstore.json"
 # Must match docs/release-verification.md, scripts/verify-release.sh, and
 # scripts/get-kctl.sh.
@@ -47,7 +55,11 @@ SIGNER_ISSUER="https://github.com/login/oauth"
 # defaults --new-bundle-format=true, which is what writes .sigstore.json.
 COSIGN_MIN_VERSION="3.0.5"
 TAG="v${VERSION}"
+ENTERPRISE_REPO="${KCORE_ENTERPRISE_REPO:-kcorehypervisor/enterprise}"
+PREBUILT_NAME="kcore-prebuilt-${VERSION}-x86_64-linux.tar"
+EMBARGO_DAYS="${KCORE_EMBARGO_DAYS:-14}"
 NO_SIGN=0
+BREAK_EMBARGO=0
 
 die() {
 	echo "release.sh: $*" >&2
@@ -97,6 +109,8 @@ ensure_clean_tree() {
 }
 
 cmd_tag() {
+	# Day 0 creates the local tag only. The remote tag is pushed by
+	# publish-public after the enterprise embargo ends.
 	require_cmd git
 	validate_version
 	ensure_clean_tree
@@ -105,8 +119,9 @@ cmd_tag() {
 	if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
 		local_tag_commit="$(git rev-parse "${TAG}^{commit}")"
 		[[ "${local_tag_commit}" == "${head_commit}" ]] || die "local tag ${TAG} points to ${local_tag_commit}, not HEAD ${head_commit}"
+		echo "==> Local tag ${TAG} already points at HEAD."
 	else
-		echo "==> Creating annotated tag ${TAG}..."
+		echo "==> Creating annotated tag ${TAG} (not pushed; publish-public pushes it)..."
 		git tag -a "${TAG}" -m "kcore ${VERSION}"
 	fi
 
@@ -117,10 +132,13 @@ cmd_tag() {
 	if [[ -n "${remote_tag_commit}" ]]; then
 		[[ "${remote_tag_commit}" == "${head_commit}" ]] || die "remote tag ${TAG} points to ${remote_tag_commit}, not HEAD ${head_commit}"
 		echo "==> Remote tag ${TAG} already points at HEAD."
-	else
-		echo "==> Pushing tag ${TAG} to origin..."
-		git push origin "${TAG}"
 	fi
+}
+
+cmd_prebuilt() {
+	load_dotenv
+	export ROOT VERSION KCORE_NIX_SIGNING_KEY_FILE
+	bash "${ROOT}/scripts/enterprise-prebuilt.sh"
 }
 
 cmd_build() {
@@ -275,10 +293,25 @@ cmd_sign() {
 	echo "==> Wrote dist/${SIGSTORE_BUNDLE}"
 }
 
-cmd_publish() {
-	require_cmd nix
-	require_cmd git
-	load_dotenv
+public_assets() {
+	local assets=("dist/${ISO_NAME}")
+	local archive sbom
+	for archive in "${KCTL_ARCHIVES[@]}"; do
+		assets+=("dist/${archive}")
+	done
+	for sbom in "${SBOM_FILES[@]}"; do
+		assets+=("dist/${sbom}")
+	done
+	assets+=("dist/kcore-${VERSION}-release.json")
+	assets+=(dist/SHA256SUMS)
+	if [[ -f "dist/${SIGSTORE_BUNDLE}" ]]; then
+		assets+=("dist/${SIGSTORE_BUNDLE}")
+	fi
+	printf '%s\n' "${assets[@]}"
+}
+
+require_public_dist() {
+	local archive sbom
 	for archive in "${KCTL_ARCHIVES[@]}"; do
 		[[ -f "dist/${archive}" ]] || die "run '${0} dist' first (missing dist/${archive})"
 	done
@@ -288,72 +321,228 @@ cmd_publish() {
 	done
 	[[ -f dist/SHA256SUMS ]] || die "run '${0} dist' first"
 	[[ -f "dist/kcore-${VERSION}-release.json" ]] || die "run '${0} dist' first (missing release.json)"
+}
 
+release_notes_body() {
+	if [[ -n "${RELEASE_NOTES:-}" ]]; then
+		[[ -f "${RELEASE_NOTES}" ]] || die "missing RELEASE_NOTES file: ${RELEASE_NOTES}"
+		cat "${RELEASE_NOTES}"
+	elif [[ -f RELEASE_NOTES.md ]]; then
+		cat RELEASE_NOTES.md
+	else
+		echo "kcore ${VERSION}"
+	fi
+}
+
+cmd_publish_enterprise() {
+	require_cmd nix
+	require_cmd git
+	require_cmd sha256sum
+	load_dotenv
+	[[ -f "dist/enterprise/${PREBUILT_NAME}" ]] || die "run '${0} prebuilt' first (missing dist/enterprise/${PREBUILT_NAME})"
+
+	mkdir -p dist/enterprise
+	local kcore_rev schema_version min_reader
+	kcore_rev="$(git rev-parse HEAD)"
+	schema_version="$(sed -n 's/^pub const SCHEMA_VERSION: i32 = \([0-9]*\);/\1/p' crates/controller/src/db.rs | head -n 1)"
+	min_reader="$(sed -n 's/^pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = \([0-9]*\);/\1/p' crates/controller/src/db.rs | head -n 1)"
+
+	echo "==> Writing dist/enterprise/kcore-${VERSION}-release.json..."
+	cat >"dist/enterprise/kcore-${VERSION}-release.json" <<EOF
+{
+  "version": "${VERSION}",
+  "channel": "enterprise",
+  "nodeBuild": "prebuilt",
+  "kcoreRev": "${kcore_rev}",
+  "schemaVersion": ${schema_version:-0},
+  "previousSchemaVersion": ${min_reader:-0},
+  "minCompatibleReader": ${min_reader:-0},
+  "prebuilt": "${PREBUILT_NAME}",
+  "iso": "${ISO_NAME}",
+  "kctl": [
+    "${KCTL_LINUX_ARCHIVE}",
+    "${KCTL_MACOS_X86_64_ARCHIVE}",
+    "${KCTL_MACOS_AARCH64_ARCHIVE}"
+  ],
+  "docsUrl": "https://kcorehypervisor.com/docs/${VERSION}/"
+}
+EOF
+
+	# Enterprise SHA256SUMS covers the prebuilt tar and release.json. Community
+	# assets are published on the public draft and are not duplicated here.
+	(
+		cd dist/enterprise
+		sha256sum "${PREBUILT_NAME}" "kcore-${VERSION}-release.json" >SHA256SUMS
+	)
+
+	# Sign the enterprise checksums with the same Sigstore identity without
+	# clobbering a community SHA256SUMS / bundle already in dist/.
+	local saved_sums saved_bundle
+	saved_sums="$(mktemp)"
+	saved_bundle="$(mktemp)"
+	if [[ -f dist/SHA256SUMS ]]; then
+		cp dist/SHA256SUMS "${saved_sums}"
+	else
+		rm -f "${saved_sums}"
+		saved_sums=""
+	fi
+	if [[ -f "dist/${SIGSTORE_BUNDLE}" ]]; then
+		cp "dist/${SIGSTORE_BUNDLE}" "${saved_bundle}"
+	else
+		rm -f "${saved_bundle}"
+		saved_bundle=""
+	fi
+	cp dist/enterprise/SHA256SUMS dist/SHA256SUMS
+	cmd_sign
+	if [[ -f "dist/${SIGSTORE_BUNDLE}" ]]; then
+		cp "dist/${SIGSTORE_BUNDLE}" "dist/enterprise/${SIGSTORE_BUNDLE}"
+	fi
+	if [[ -n "${saved_sums}" ]]; then
+		mv "${saved_sums}" dist/SHA256SUMS
+	else
+		rm -f dist/SHA256SUMS
+	fi
+	if [[ -n "${saved_bundle}" ]]; then
+		mv "${saved_bundle}" "dist/${SIGSTORE_BUNDLE}"
+	else
+		rm -f "dist/${SIGSTORE_BUNDLE}"
+	fi
+
+	local target_commit
+	target_commit="$(git rev-parse HEAD)"
+	local -a create_args=(
+		api "repos/${ENTERPRISE_REPO}/releases"
+		-X POST
+		-f tag_name="${TAG}"
+		-f target_commitish="main"
+		-f name="kcore ${VERSION} (enterprise)"
+		-F draft=false
+		-F prerelease=false
+		-f body="$(release_notes_body)
+
+Enterprise channel. Prebuilt packages for paying subscribers. Source is public at github:kcorehypervisor/kcore@${kcore_rev}."
+	)
+
+	echo "==> Creating enterprise release ${TAG} on ${ENTERPRISE_REPO}..."
+	# Create an empty commit-less tag on the enterprise repo via the Releases
+	# API by targeting main; the repo holds artifacts only.
+	if nix develop --command gh release view "${TAG}" --repo "${ENTERPRISE_REPO}" >/dev/null 2>&1; then
+		echo "==> Enterprise release ${TAG} exists; uploading assets with --clobber..."
+	else
+		nix develop --command gh "${create_args[@]}" --jq .html_url
+	fi
+
+	local asset
+	for asset in \
+		"dist/enterprise/${PREBUILT_NAME}" \
+		"dist/enterprise/kcore-${VERSION}-release.json" \
+		dist/enterprise/SHA256SUMS; do
+		echo "==> Uploading $(basename "${asset}") to ${ENTERPRISE_REPO}..."
+		nix develop --command gh release upload "${TAG}" --repo "${ENTERPRISE_REPO}" --clobber "${asset}"
+	done
+	if [[ -f "dist/enterprise/${SIGSTORE_BUNDLE}" ]]; then
+		nix develop --command gh release upload "${TAG}" --repo "${ENTERPRISE_REPO}" --clobber "dist/enterprise/${SIGSTORE_BUNDLE}"
+	fi
+	# Also attach the community ISO and kctl so subscribers can download them
+	# during the embargo without waiting for the public draft to publish.
+	require_public_dist
+	for asset in "dist/${ISO_NAME}" "dist/${KCTL_LINUX_ARCHIVE}" "dist/${KCTL_MACOS_X86_64_ARCHIVE}" "dist/${KCTL_MACOS_AARCH64_ARCHIVE}"; do
+		echo "==> Uploading $(basename "${asset}") to ${ENTERPRISE_REPO}..."
+		nix develop --command gh release upload "${TAG}" --repo "${ENTERPRISE_REPO}" --clobber "${asset}"
+	done
+	echo "==> Enterprise release ready: nix develop --command gh release view ${TAG} --repo ${ENTERPRISE_REPO}"
+	echo "    commit ${target_commit}"
+}
+
+cmd_stage_public() {
+	# Upload community assets as a draft. Maintainers can see it; the public
+	# cannot. The tag is not pushed yet.
+	require_cmd nix
+	require_cmd git
+	load_dotenv
+	require_public_dist
 	cmd_sign
 
+	local target_commit repo
 	target_commit="$(git rev-parse "${TAG}^{commit}" 2>/dev/null)" || die "missing local tag ${TAG}; run '${0} tag' first"
-	remote_tag_commit="$(git ls-remote origin "refs/tags/${TAG}^{}" | awk '{print $1}')"
-	if [[ -z "${remote_tag_commit}" ]]; then
-		remote_tag_commit="$(git ls-remote origin "refs/tags/${TAG}" | awk '{print $1}')"
-	fi
-	[[ -n "${remote_tag_commit}" ]] || die "missing remote tag ${TAG}; run '${0} tag' first"
-	[[ "${remote_tag_commit}" == "${target_commit}" ]] || die "remote tag ${TAG} points to ${remote_tag_commit}, not local tag target ${target_commit}"
-
 	repo="$(repo_slug)"
-	assets=("dist/${ISO_NAME}")
-	for archive in "${KCTL_ARCHIVES[@]}"; do
-		assets+=("dist/${archive}")
-	done
-	for sbom in "${SBOM_FILES[@]}"; do
-		assets+=("dist/${sbom}")
-	done
-	assets+=("dist/kcore-${VERSION}-release.json")
-	assets+=(dist/SHA256SUMS)
-	# Absent only under --no-sign, which cmd_sign already warned about.
-	if [[ -f "dist/${SIGSTORE_BUNDLE}" ]]; then
-		assets+=("dist/${SIGSTORE_BUNDLE}")
-	fi
-	create_args=(
+
+	local -a create_args=(
 		api "repos/${repo}/releases"
 		-X POST
 		-f tag_name="${TAG}"
 		-f target_commitish="${target_commit}"
 		-f name="kcore ${VERSION}"
-		-F draft=false
+		-F draft=true
 		-F prerelease=false
+		-f body="$(release_notes_body)"
 	)
-	if [[ -n "${RELEASE_NOTES:-}" ]]; then
-		[[ -f "${RELEASE_NOTES}" ]] || die "missing RELEASE_NOTES file: ${RELEASE_NOTES}"
-		create_args+=(-f body="$(<"${RELEASE_NOTES}")")
-	elif [[ -f RELEASE_NOTES.md ]]; then
-		create_args+=(-f body="$(<RELEASE_NOTES.md)")
-	else
-		create_args+=(-F generate_release_notes=true)
-	fi
 
-	if nix develop --command gh release view "${TAG}" >/dev/null 2>&1; then
-		echo "==> GitHub release ${TAG} exists; uploading assets with --clobber..."
+	local existing
+	existing="$(nix develop --command gh api "repos/${repo}/releases/tags/${TAG}" --jq .id 2>/dev/null || true)"
+	if [[ -n "${existing}" ]]; then
+		echo "==> Public draft/release ${TAG} exists (id ${existing}); uploading assets with --clobber..."
 	else
-		echo "==> Creating GitHub release ${TAG}..."
+		echo "==> Creating draft GitHub release ${TAG} on ${repo}..."
 		nix develop --command gh "${create_args[@]}" --jq .html_url
 	fi
 
-	for asset in "${assets[@]}"; do
+	local asset
+	while IFS= read -r asset; do
+		[[ -n "${asset}" ]] || continue
 		echo "==> Uploading $(basename "${asset}")..."
-		nix develop --command gh release upload "${TAG}" --clobber "${asset}"
-	done
-	echo "==> Done: nix develop --command gh release view ${TAG}"
+		nix develop --command gh release upload "${TAG}" --repo "${repo}" --clobber "${asset}"
+	done < <(public_assets)
+	echo "==> Draft staged. After ${EMBARGO_DAYS} days run: make release-public"
+}
+
+cmd_publish_public() {
+	require_cmd nix
+	require_cmd git
+	load_dotenv
+
+	local repo target_commit draft_created created_epoch now_epoch age_days
+	repo="$(repo_slug)"
+	target_commit="$(git rev-parse "${TAG}^{commit}" 2>/dev/null)" || die "missing local tag ${TAG}; run '${0} tag' first"
+
+	draft_created="$(nix develop --command gh api "repos/${repo}/releases/tags/${TAG}" --jq .created_at 2>/dev/null)" ||
+		die "no GitHub release ${TAG} on ${repo}; run '${0} stage-public' first"
+	created_epoch="$(date -u -d "${draft_created}" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "${draft_created}" +%s)"
+	now_epoch="$(date -u +%s)"
+	age_days=$(((now_epoch - created_epoch) / 86400))
+	if ((age_days < EMBARGO_DAYS)) && [[ "${BREAK_EMBARGO}" -ne 1 ]]; then
+		die "enterprise embargo: draft is ${age_days} day(s) old; need ${EMBARGO_DAYS} (pass --break-embargo to override)"
+	fi
+	if [[ "${BREAK_EMBARGO}" -eq 1 ]] && ((age_days < EMBARGO_DAYS)); then
+		echo "==> --break-embargo: publishing after ${age_days} day(s) (embargo is ${EMBARGO_DAYS})"
+	fi
+
+	echo "==> Pushing tag ${TAG} to origin..."
+	git push origin "${TAG}"
+
+	local release_id
+	release_id="$(nix develop --command gh api "repos/${repo}/releases/tags/${TAG}" --jq .id)"
+	echo "==> Publishing draft release ${TAG} (id ${release_id})..."
+	nix develop --command gh api "repos/${repo}/releases/${release_id}" -X PATCH -F draft=false --jq .html_url
+	echo "==> Community release published."
+}
+
+# Compat alias used by older docs and make targets.
+cmd_publish() {
+	cmd_stage_public
 }
 
 cmd_release() {
 	cmd_tag
 	cmd_build
 	cmd_dist
-	cmd_publish
+	cmd_prebuilt
+	cmd_publish_enterprise
+	cmd_stage_public
 }
 
 usage() {
-	echo "Usage: ${0} [--no-sign] {build|dist|tag|sign|publish|release}"
+	echo "Usage: ${0} [--no-sign] [--break-embargo] {build|dist|tag|prebuilt|publish-enterprise|stage-public|publish-public|sign|publish|release}"
 	exit 1
 }
 
@@ -361,6 +550,7 @@ subcommand=""
 while [[ "$#" -gt 0 ]]; do
 	case "${1}" in
 		--no-sign) NO_SIGN=1 ;;
+		--break-embargo) BREAK_EMBARGO=1 ;;
 		-h | --help) usage ;;
 		-*) die "unknown option: ${1}" ;;
 		*)
@@ -375,6 +565,10 @@ case "${subcommand}" in
 	build) cmd_build ;;
 	dist) cmd_dist ;;
 	tag) cmd_tag ;;
+	prebuilt) cmd_prebuilt ;;
+	publish-enterprise) cmd_publish_enterprise ;;
+	stage-public) cmd_stage_public ;;
+	publish-public) cmd_publish_public ;;
 	sign) cmd_sign ;;
 	publish) cmd_publish ;;
 	release) cmd_release ;;

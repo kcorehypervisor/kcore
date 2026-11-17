@@ -440,6 +440,11 @@ DROP TABLE IF EXISTS slurm_clusters;",
         sql: crate::db::POSTGRESQL_TABLES_DOWN,
         irreversible: false,
     },
+    SchemaDown {
+        version: 73,
+        sql: "DROP TABLE IF EXISTS subscription;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

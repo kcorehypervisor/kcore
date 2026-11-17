@@ -1,8 +1,10 @@
 # Local Release Process (Make + Nix + GitHub Releases)
 
-Releases run from an operator machine, not GitHub Actions. One command creates
-and pushes the Git tag, builds the ISO plus Linux/macOS `kctl` binaries,
-packages `dist/`, then creates or updates the GitHub Release assets.
+Releases run from an operator machine, not GitHub Actions. Day 0 builds the
+ISO and `kctl` binaries, publishes the **enterprise** channel (prebuilt
+packages on `kcorehypervisor/enterprise`), and stages a **draft** community
+release. Day 14 (`make release-public`) pushes the public tag and publishes
+the draft. See [enterprise-channel.md](enterprise-channel.md).
 
 ## Version sources (policy)
 
@@ -20,27 +22,30 @@ packages `dist/`, then creates or updates the GitHub Release assets.
   with `cargo-zigbuild` from the Nix dev shell.
 - `gh` is available and authenticated from the Nix dev shell. Use
   `nix develop --command gh auth status` to verify, or set `GH_TOKEN` for
-  non-interactive use. If a local `.env` exists, `scripts/release.sh publish`
+  non-interactive use. If a local `.env` exists, `scripts/release.sh`
   sources it before invoking `gh`, so `GH_TOKEN=...` in `.env` is enough for
   `make release`.
-- `cosign` signs `dist/SHA256SUMS` during the publish step, using Sigstore
-  keyless signing. This opens a **browser window for OIDC login**, so
-  `make release` is not fully unattended. Choose GitHub and sign in as
-  `82217+rtacconi@users.noreply.github.com`. The step checks the bundle
-  against that identity and stops if another account signed it. A maintainer without `cosign`
-  configured must opt out explicitly with `RELEASE_FLAGS=--no-sign`; the
-  release is then unsigned and
+- `KCORE_NIX_SIGNING_KEY_FILE` in `.env` points at the
+  `kcore-enterprise-1` Nix secret key (never commit it). Needed for
+  `make release-prebuilt` / `make release`.
+- `cosign` signs each channel's `SHA256SUMS` with Sigstore keyless signing.
+  That opens a **browser window for OIDC login** (twice on day 0: enterprise
+  then community draft), so `make release` is not fully unattended. Choose
+  GitHub and sign in as `82217+rtacconi@users.noreply.github.com`. The step
+  checks the bundle against that identity and stops if another account signed
+  it. A maintainer without `cosign` configured must opt out explicitly with
+  `RELEASE_FLAGS=--no-sign`; the release is then unsigned and
   [`scripts/verify-release.sh`](../scripts/verify-release.sh) will reject it.
   See [release-verification.md](./release-verification.md).
-- The working tree is clean before `make release`; the script tags the exact
-  checked-out commit.
+- The working tree is clean before `make release`; the script creates a local
+  tag for the checked-out commit. The remote tag is pushed on day 14.
 
 ## Steps
 
 1. **Bump version**  
    Edit [`VERSION`](../VERSION) to `X.Y.Z` (and optionally align `crates/kctl/Cargo.toml` and other crates if you follow the policy above). Open a PR, get CI green, merge to `main`.
 
-2. **Run the local release**
+2. **Run the local release (day 0)**
 
    ```bash
    git fetch origin main && git checkout main && git pull
@@ -50,17 +55,24 @@ packages `dist/`, then creates or updates the GitHub Release assets.
    `make release` runs [`scripts/release.sh`](../scripts/release.sh) `release`:
 
    - validates `VERSION`,
-   - creates annotated tag `v$(cat VERSION)` if missing,
-   - verifies an existing local or remote tag points at the current commit,
-   - pushes the tag to `origin`,
+   - creates a local annotated tag `v$(cat VERSION)` if missing (does not push),
    - builds the ISO and Linux `kctl` with Nix,
    - cross-compiles `kctl` for Intel macOS and Apple Silicon,
    - packages `dist/` and generates both SBOMs,
-   - signs `dist/SHA256SUMS` with `cosign`,
-   - creates the GitHub Release through `gh api`,
-   - uploads release assets one by one with `gh release upload --clobber`.
+   - builds and signs the enterprise prebuilt cache,
+   - publishes the enterprise release on `kcorehypervisor/enterprise`,
+   - signs `dist/SHA256SUMS` and stages a **draft** community release.
 
-3. **Verify what you published**
+3. **Publish the community release (day 14)**
+
+   ```bash
+   make release-public
+   ```
+
+   Pushes the tag and publishes the draft. Refuses until the draft is 14 days
+   old unless `RELEASE_FLAGS=--break-embargo`.
+
+4. **Verify what you published**
 
    ```bash
    make verify-release V=v$(cat VERSION)
@@ -74,8 +86,11 @@ packages `dist/`, then creates or updates the GitHub Release assets.
 make release-tag
 make release-build
 make release-dist
+make release-prebuilt
+make release-publish-enterprise
 make release-sign
-make release-publish
+make release-stage-public   # also: make release-publish
+make release-public         # day 14
 ```
 
 `RELEASE_FLAGS` is passed through to `scripts/release.sh`, e.g.

@@ -421,6 +421,14 @@ pub struct CephDashboardCredentialsRow {
     pub updated_at: String,
 }
 
+/// Cluster-wide enterprise channel credentials. One row (`id = 1`).
+#[derive(Debug, Clone)]
+pub struct SubscriptionRow {
+    pub token: String,
+    pub github_login: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SharedFilesystemRow {
     pub name: String,
@@ -872,7 +880,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 72;
+pub const SCHEMA_VERSION: i32 = 73;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -887,7 +895,8 @@ pub const SCHEMA_VERSION: i32 = 72;
 /// `node_vgpu.vendor` with a default. Version 71 adds
 /// `issued_certificates.first_seen_at`, empty until the certificate is first
 /// presented to the controller. Version 72 adds the PostgreSQL cluster
-/// tables, which an older reader never selects.
+/// tables, which an older reader never selects. Version 73 adds the
+/// enterprise `subscription` table, which an older reader never selects.
 /// Older readers select the original columns and still open the file.
 pub const MIN_COMPATIBLE_SCHEMA_READER: i32 = 56;
 
@@ -2337,6 +2346,17 @@ impl Database {
 
         if version < 72 {
             conn.execute_batch(postgresql_store::POSTGRESQL_TABLES)?;
+        }
+
+        if version < 73 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS subscription (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    token TEXT NOT NULL DEFAULT '',
+                    github_login TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                );",
+            )?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -4666,6 +4686,44 @@ impl Database {
                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
             params![row.name, row.url, row.username, row.password],
         )?;
+        Ok(())
+    }
+
+    pub fn get_subscription(&self) -> Result<Option<SubscriptionRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt =
+            conn.prepare("SELECT token, github_login, updated_at FROM subscription WHERE id = 1")?;
+        let mut rows = stmt.query_map([], |r| {
+            Ok(SubscriptionRow {
+                token: r.get(0)?,
+                github_login: r.get(1)?,
+                updated_at: r.get(2)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    pub fn upsert_subscription(
+        &self,
+        token: &str,
+        github_login: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO subscription (id, token, github_login, updated_at)
+             VALUES (1, ?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             ON CONFLICT(id) DO UPDATE SET
+               token=excluded.token,
+               github_login=excluded.github_login,
+               updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            params![token, github_login],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_subscription(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM subscription WHERE id = 1", [])?;
         Ok(())
     }
 
@@ -10606,6 +10664,23 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(rotated.password, "rotated");
+    }
+
+    #[test]
+    fn subscription_round_trip_and_clear() {
+        let db = Database::open(":memory:").expect("open");
+        assert!(db.get_subscription().expect("get").is_none());
+        db.upsert_subscription("ghp_test_token", "acme-bot")
+            .expect("upsert");
+        let got = db.get_subscription().expect("get").expect("row");
+        assert_eq!(got.token, "ghp_test_token");
+        assert_eq!(got.github_login, "acme-bot");
+        db.upsert_subscription("ghp_rotated", "acme-bot")
+            .expect("rotate");
+        let got = db.get_subscription().expect("get").expect("row");
+        assert_eq!(got.token, "ghp_rotated");
+        db.clear_subscription().expect("clear");
+        assert!(db.get_subscription().expect("get").is_none());
     }
 
     #[test]

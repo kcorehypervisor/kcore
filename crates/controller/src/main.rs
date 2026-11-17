@@ -20,6 +20,7 @@ mod config;
 mod crypto_profile;
 mod db;
 mod disk_reconciler;
+mod enterprise;
 mod grpc;
 mod guest_ops;
 mod ha;

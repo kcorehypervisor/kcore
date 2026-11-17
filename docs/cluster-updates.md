@@ -22,24 +22,33 @@ same lock. An ISO install and an update to the same tag build the same system.
 kctl update version set v0.7.0            # upgrade, or downgrade to a lower tag
 kctl update version set v0.7.0 --dry-run   # resolve and compare only
 kctl update version get                    # the version set last and each node's
+kctl set subscription --token-file ./tok   # enterprise channel (paying customers)
+kctl update version set v0.8.0 --channel enterprise
 ```
 
 `SetClusterVersion` (what `kctl` and the Terraform provider call):
 
-1. Resolves the tag with `nix flake metadata` in `--flake-ref` (default
-   `github:kcorehypervisor/kcore`). An unknown tag is refused.
-2. Reads `lib.kcore` from that commit: the version, which must match the tag,
+1. Picks the channel: `enterprise` when a subscription is stored (or
+   `--channel enterprise`), otherwise `community`. `--flake-ref` with
+   enterprise is refused.
+2. **Community:** resolves the tag with `nix flake metadata` in `--flake-ref`
+   (default `github:kcorehypervisor/kcore`). An unknown tag is refused.
+   **Enterprise:** reads `release.json` from
+   `kcorehypervisor/enterprise`, then evaluates `lib.kcore` at the public
+   commit named there (the public tag may still be embargoed).
+3. Reads `lib.kcore` from that commit: the version, which must match the tag,
    and the controller schema. A tag whose controller cannot read this
    database (`schemaVersion` below `MIN_COMPATIBLE_SCHEMA_READER`) is refused.
    Tags cut before this change have no `lib.kcore` and are refused too.
-3. Compares the tag with the version each node reports. Nodes already on it
+4. Compares the tag with the version each node reports. Nodes already on it
    are left alone. The answer is `upgrade`, `downgrade`, `mixed`, or
    `unchanged`.
-4. Starts a ClusterUpdate named `version-vX-Y-Z`: a canary first, then one
+5. Starts a ClusterUpdate named `version-vX-Y-Z`: a canary first, then one
    node at a time, approved, `activation: auto`, and rebooted by the
-   controller when needed. Setting the same tag again while it rolls out
-   returns that update; setting another tag is refused until it finishes or is
-   cancelled.
+   controller when needed. Enterprise updates also download a prebuilt Nix
+   file cache during prepare (see [enterprise-channel.md](enterprise-channel.md)).
+   Setting the same tag again while it rolls out returns that update; setting
+   another tag is refused until it finishes or is cancelled.
 
 An air-gapped site resolves tags against a mirror:
 `--flake-ref git+https://git.example/kcore` or `git+file:///srv/kcore`.

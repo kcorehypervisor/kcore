@@ -60,6 +60,12 @@ pub struct StoredTarget {
     pub system_profile: String,
     #[serde(default)]
     pub tag: String,
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub prebuilt_url: String,
+    #[serde(default)]
+    pub prebuilt_sha256: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -112,6 +118,9 @@ fn stored_from_proto(spec: &ClusterUpdateSpec) -> StoredClusterUpdateSpec {
             nixpkgs_rev: target.nixpkgs_rev,
             system_profile: target.system_profile,
             tag: target.tag,
+            channel: target.channel,
+            prebuilt_url: target.prebuilt_url,
+            prebuilt_sha256: target.prebuilt_sha256,
         },
         selector: StoredSelector {
             node_ids: selector.node_ids.clone(),
@@ -161,6 +170,9 @@ fn proto_from_stored(s: StoredClusterUpdateSpec) -> ClusterUpdateSpec {
             nixpkgs_rev: s.target.nixpkgs_rev,
             system_profile: s.target.system_profile,
             tag: s.target.tag,
+            channel: s.target.channel,
+            prebuilt_url: s.target.prebuilt_url,
+            prebuilt_sha256: s.target.prebuilt_sha256,
         }),
         selector: Some(ClusterUpdateSelector {
             node_ids: s.selector.node_ids,
@@ -358,6 +370,9 @@ mod tests {
                 nixpkgs_rev: "".into(),
                 system_profile: "".into(),
                 tag: "".into(),
+                channel: "".into(),
+                prebuilt_url: "".into(),
+                prebuilt_sha256: "".into(),
             }),
             selector: Some(ClusterUpdateSelector {
                 all_nodes: true,
