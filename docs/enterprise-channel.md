@@ -104,9 +104,10 @@ Individual steps: `make release-prebuilt`, `make release-publish-enterprise`,
 
 ## Limits
 
-- Prebuilt covers the `kcore-node` and `kcore-controller-node` reference
-  systems. Features outside them (for example NVIDIA host drivers) still
-  build on the node.
+- Prebuilt covers the flake packages a host update substitutes (`kctl`,
+  `kcore-node-agent`, `kcore-controller`, `kcore-console`,
+  `kcore-dashboard`). Features outside them (for example NVIDIA host
+  drivers) still build on the node.
 - The first release that ships this code goes to both channels the same day
   so clusters can update into the new controller and agent. The 14-day lead
   starts with the release after that.
