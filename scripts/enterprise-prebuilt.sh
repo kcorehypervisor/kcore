@@ -18,7 +18,8 @@ PREBUILT_NAME="kcore-prebuilt-${VERSION}-x86_64-linux.tar"
 WORK="${ROOT}/dist/enterprise-work"
 CACHE="${WORK}/cache"
 STORE="${WORK}/store"
-REHEARSAL_STORE="${WORK}/rehearsal-store"
+# Keep the chroot store out of the repo so pre-commit nixfmt does not scan it.
+REHEARSAL_STORE="${TMPDIR:-/tmp}/kcore-enterprise-rehearsal-$$"
 MAX_ASSET_BYTES=$((2 * 1024 * 1024 * 1024)) # GitHub release asset limit
 
 die() {
@@ -46,17 +47,30 @@ rm -rf "${WORK}"
 mkdir -p "${CACHE}/nar" "${STORE}" "dist/enterprise"
 printf 'StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n' >"${CACHE}/nix-cache-info"
 
-echo "==> Building reference systems for prebuilt cache..."
-nix build ".#nixosConfigurations.kcore-node.config.system.build.toplevel" -o "${WORK}/node"
-nix build ".#nixosConfigurations.kcore-controller-node.config.system.build.toplevel" -o "${WORK}/controller"
+# Real host flakes pull these packages from the kcore input. The
+# nixosConfigurations.kcore-node fixtures use hello placeholders so their
+# closures are useless for a binary cache.
+#
+# Build from the pushed commit so store paths match customer installs and
+# a dirty worktree cannot change the source filter hash.
+packages=(kctl kcore-node-agent kcore-controller kcore-console kcore-dashboard)
+kcore_rev="$(git rev-parse HEAD)"
+flake_ref="github:kcorehypervisor/kcore/${kcore_rev}"
+echo "==> Building kcore packages for prebuilt cache from ${flake_ref}..."
+for attr in "${packages[@]}"; do
+	nix build "${flake_ref}#${attr}" -o "${WORK}/${attr}"
+done
 
 # Paths that cache.nixos.org already serves stay out of the enterprise tar.
-# Everything else (kcore packages and their local dependents) is signed and
+# Everything else (kcore packages and their runtime closure) is signed and
 # exported into the file cache.
 echo "==> Collecting closure paths not on cache.nixos.org..."
+: >"${WORK}/all-paths.txt"
 : >"${WORK}/paths.txt"
-for link in node controller; do
-	nix path-info -r --store /nix/store "$(readlink -f "${WORK}/${link}")" >>"${WORK}/all-paths.txt"
+for attr in "${packages[@]}"; do
+	# Do not pass --store /nix/store: a bare path is a chroot store root, so
+	# Nix would look under /nix/store/nix/store and fail on the read-only FS.
+	nix path-info -r "$(readlink -f "${WORK}/${attr}")" >>"${WORK}/all-paths.txt"
 done
 sort -u "${WORK}/all-paths.txt" -o "${WORK}/all-paths.txt"
 
@@ -88,20 +102,21 @@ if ((asset_size > MAX_ASSET_BYTES)); then
 fi
 
 echo "==> Rehearsing: prebuilt + cache.nixos.org must build kcore packages with --max-jobs 0..."
-rm -rf "${REHEARSAL_STORE}"
+cleanup_rehearsal() {
+	# Nix store paths are read-only; chmod before rm.
+	chmod -R u+w "${REHEARSAL_STORE}" 2>/dev/null || true
+	rm -rf "${REHEARSAL_STORE}"
+}
+trap cleanup_rehearsal EXIT
 mkdir -p "${REHEARSAL_STORE}"
-kcore_rev="$(git rev-parse HEAD)"
-flake_url="github:kcorehypervisor/kcore/${kcore_rev}"
-# Build the packages a node pulls from the kcore flake. --max-jobs 0 refuses
-# to compile; a missing path fails the release.
-for attr in kctl kcore-node-agent kcore-controller kcore-console kcore-dashboard; do
-	echo "    nix build ${flake_url}#${attr} --max-jobs 0"
+for attr in "${packages[@]}"; do
+	echo "    nix build ${flake_ref}#${attr} --max-jobs 0"
 	nix build \
 		--store "${REHEARSAL_STORE}" \
 		--extra-substituters "file://${CACHE}?trusted=1 https://cache.nixos.org" \
 		--extra-trusted-public-keys "${PUBLIC_KEY} cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" \
 		--max-jobs 0 \
-		"${flake_url}#${attr}" \
+		"${flake_ref}#${attr}" \
 		-o "${WORK}/rehearsal-${attr}" ||
 		die "rehearsal failed for ${attr}: a path would have to compile"
 done
