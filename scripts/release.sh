@@ -479,7 +479,10 @@ cmd_stage_public() {
 	)
 
 	local existing
+	# gh api prints the 404 JSON body on stdout even when it fails; only a
+	# numeric id means the release already exists.
 	existing="$(nix develop --command gh api "repos/${repo}/releases/tags/${TAG}" --jq .id 2>/dev/null || true)"
+	[[ "${existing}" =~ ^[0-9]+$ ]] || existing=""
 	if [[ -n "${existing}" ]]; then
 		echo "==> Public draft/release ${TAG} exists (id ${existing}); uploading assets with --clobber..."
 	else
