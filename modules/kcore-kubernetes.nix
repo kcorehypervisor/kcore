@@ -29,11 +29,54 @@ let
 
   keepalivedNotrack = import ./kcore-keepalived-notrack.nix { inherit pkgs; };
 
+  # The controller reads the same file to decide which versions an apply may
+  # ask for. The node agent installs it next to this module.
+  kubernetesReleases = builtins.fromJSON (builtins.readFile ./kubernetes-releases.json);
+
+  # Upstream release binaries are published with checksums, so a version other
+  # than the nixpkgs pin is downloaded, not compiled per node. The kubelet
+  # links glibc through /lib64, which NixOS does not have, hence autoPatchelf.
+  kubernetesPackage =
+    version:
+    if version == "" || version == pkgs.kubernetes.version then
+      pkgs.kubernetes
+    else if !(kubernetesReleases.releases ? ${version}) then
+      throw "kcore.kubernetes: version ${version} is not listed in kubernetes-releases.json"
+    else if !pkgs.stdenv.hostPlatform.isx86_64 then
+      throw "kcore.kubernetes: upstream Kubernetes ${version} binaries are only listed for x86_64"
+    else
+      let
+        hashes = kubernetesReleases.releases.${version};
+        fetchBin =
+          bin:
+          pkgs.fetchurl {
+            url = "https://dl.k8s.io/release/v${version}/bin/linux/amd64/${bin}";
+            hash = hashes.${bin};
+          };
+      in
+      pkgs.runCommand "kubernetes-${version}"
+        {
+          inherit version;
+          nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+          passthru = { inherit version; };
+        }
+        (
+          ''
+            mkdir -p $out/bin
+          ''
+          + lib.concatMapStrings (
+            bin: "install -m0755 ${fetchBin bin} $out/bin/${bin}\n"
+          ) kubernetesReleases.binaries
+          + ''
+            autoPatchelf $out/bin
+          ''
+        );
+
   provisionerApply =
-    kubeconfig: manifestPath:
+    package: kubeconfig: manifestPath:
     pkgs.writeShellScript "kcore-apply-provisioner" ''
       set -eu
-      kube=${pkgs.kubectl}/bin/kubectl
+      kube=${package}/bin/kubectl
       for _ in $(seq 1 90); do
         if "$kube" --kubeconfig=${kubeconfig} get --raw=/readyz >/dev/null 2>&1; then
           "$kube" --kubeconfig=${kubeconfig} apply -f ${manifestPath}
@@ -110,7 +153,7 @@ let
   ciliumApply = pkgs.writeShellScript "kcore-cilium-install" ''
     set -eu
     export KUBECONFIG=/etc/kubernetes/admin.conf
-    kube=${pkgs.kubectl}/bin/kubectl
+    kube=${cfg.package}/bin/kubectl
     cli=${pkgs.cilium-cli}/bin/cilium
     ready=0
     for _ in $(${pkgs.coreutils}/bin/seq 1 90); do
@@ -174,10 +217,10 @@ let
       "node-role.kubernetes.io/control-plane=";
 
   nodeRoleApply =
-    kubeconfig: hostname: labels:
+    package: kubeconfig: hostname: labels:
     pkgs.writeShellScript "kcore-node-roles" ''
       set -eu
-      kube=${pkgs.kubectl}/bin/kubectl
+      kube=${package}/bin/kubectl
       for _ in $(${pkgs.coreutils}/bin/seq 1 90); do
         if "$kube" --kubeconfig=${kubeconfig} get node ${hostname} >/dev/null 2>&1; then
           "$kube" --kubeconfig=${kubeconfig} label node ${hostname} ${labels} --overwrite
@@ -226,6 +269,7 @@ let
       last = if octets == [ ] then 100 else lib.toInt (lib.last octets);
       priority = if last > 0 && last < 255 then last else 100;
       vrrpName = "kcore_" + lib.replaceStrings [ "-" ] [ "_" ] name;
+      package = kubernetesPackage c.version;
     in
     lib.optionalAttrs c.enable {
       assertions = [
@@ -256,9 +300,8 @@ let
       environment.systemPackages =
         with pkgs;
         [
-          kubernetes
+          package
           etcd
-          kubectl
           containerd
           cni-plugins
         ]
@@ -550,7 +593,7 @@ let
         serviceConfig = {
           Type = "notify";
           ExecStart = ''
-            ${pkgs.kubernetes}/bin/kube-apiserver \
+            ${package}/bin/kube-apiserver \
               --advertise-address=${c.advertiseAddress} \
               --bind-address=0.0.0.0 \
               --secure-port=${toString apiPort} \
@@ -583,7 +626,7 @@ let
         serviceConfig = {
           Type = "simple";
           ExecStart = ''
-            ${pkgs.kubernetes}/bin/kube-controller-manager \
+            ${package}/bin/kube-controller-manager \
               --bind-address=127.0.0.1 \
               --secure-port=${toString c.controllerManagerPort} \
               --allocate-node-cidrs=true \
@@ -611,7 +654,7 @@ let
         serviceConfig = {
           Type = "simple";
           ExecStart = ''
-            ${pkgs.kubernetes}/bin/kube-scheduler \
+            ${package}/bin/kube-scheduler \
               --bind-address=127.0.0.1 \
               --secure-port=${toString c.schedulerPort} \
               --kubeconfig=${kubeconfigFile} \
@@ -653,7 +696,7 @@ let
           Type = "simple";
           ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p ${root}/manifests";
           ExecStart = ''
-            ${pkgs.kubernetes}/bin/kubelet \
+            ${package}/bin/kubelet \
               --config=${root}/kubelet-config.yaml \
               --kubeconfig=${root}/kubelet.conf \
               --bootstrap-kubeconfig=${root}/bootstrap-kubelet.conf \
@@ -680,7 +723,7 @@ let
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = nodeRoleApply "${root}/admin.conf" config.networking.hostName (
+          ExecStart = nodeRoleApply package "${root}/admin.conf" config.networking.hostName (
             roleLabelArgs c.role c.scheduleOnControlPlane
           );
           Restart = "on-failure";
@@ -722,7 +765,7 @@ let
             serviceConfig = {
               Type = "oneshot";
               RemainAfterExit = true;
-              ExecStart = provisionerApply "${root}/admin.conf" "${root}/provisioner.yaml";
+              ExecStart = provisionerApply package "${root}/admin.conf" "${root}/provisioner.yaml";
               Restart = "on-failure";
               RestartSec = "15s";
             };
@@ -766,6 +809,24 @@ in
 {
   options.kcore.kubernetes = {
     enable = lib.mkEnableOption "kcore Kubernetes cluster services";
+
+    version = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        Kubernetes version for this node, for example 1.36.6. Empty, or the
+        version of pkgs.kubernetes, uses the host nixpkgs pin. Any other
+        version must be listed in kubernetes-releases.json. The controller
+        sets this one node at a time during an upgrade.
+      '';
+    };
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = kubernetesPackage cfg.version;
+      defaultText = "pkgs.kubernetes, or the upstream release binaries for version";
+      description = "Kubernetes package used for apiserver, controller-manager, scheduler, kubelet, and kubectl.";
+    };
 
     role = lib.mkOption {
       type = lib.types.enum [
@@ -1044,6 +1105,11 @@ in
               default = false;
               description = "Register this control-plane node as a schedulable worker.";
             };
+            version = lib.mkOption {
+              type = lib.types.str;
+              default = "";
+              description = "Kubernetes version for this cluster on this node. Same rules as kcore.kubernetes.version.";
+            };
             clusterName = lib.mkOption {
               type = lib.types.str;
               default = "";
@@ -1264,10 +1330,9 @@ in
       environment.systemPackages =
         with pkgs;
         [
-          kubernetes
+          cfg.package
           etcd
           cilium-cli
-          kubectl
           containerd
         ]
         ++ lib.optionals cfg.haEnabled [ keepalived ];
@@ -1553,7 +1618,7 @@ in
         serviceConfig = {
           Type = "notify";
           ExecStart = ''
-            ${pkgs.kubernetes}/bin/kube-apiserver \
+            ${cfg.package}/bin/kube-apiserver \
               --advertise-address=${cfg.advertiseAddress} \
               --bind-address=0.0.0.0 \
               --secure-port=${toString k8sPorts.apiServer} \
@@ -1588,7 +1653,7 @@ in
         serviceConfig = {
           Type = "simple";
           ExecStart = ''
-            ${pkgs.kubernetes}/bin/kube-controller-manager \
+            ${cfg.package}/bin/kube-controller-manager \
               --bind-address=127.0.0.1 \
               --allocate-node-cidrs=true \
               --cluster-cidr=${cfg.clusterCidr} \
@@ -1617,7 +1682,7 @@ in
         serviceConfig = {
           Type = "simple";
           ExecStart = ''
-            ${pkgs.kubernetes}/bin/kube-scheduler \
+            ${cfg.package}/bin/kube-scheduler \
               --bind-address=127.0.0.1 \
               --kubeconfig=${kubeconfigPath} \
               --leader-elect=true
@@ -1649,7 +1714,7 @@ in
         serviceConfig = {
           Type = "simple";
           ExecStart = ''
-            ${pkgs.kubernetes}/bin/kubelet \
+            ${cfg.package}/bin/kubelet \
               --config=/etc/kubernetes/kubelet-config.yaml \
               --kubeconfig=/etc/kubernetes/kubelet.conf \
               --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf \
@@ -1673,7 +1738,7 @@ in
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = nodeRoleApply "/etc/kubernetes/admin.conf" config.networking.hostName (
+          ExecStart = nodeRoleApply cfg.package "/etc/kubernetes/admin.conf" config.networking.hostName (
             roleLabelArgs cfg.role cfg.scheduleOnControlPlane
           );
           Restart = "on-failure";
@@ -1716,7 +1781,9 @@ in
             serviceConfig = {
               Type = "oneshot";
               RemainAfterExit = true;
-              ExecStart = provisionerApply "/etc/kubernetes/admin.conf" "/etc/kubernetes/provisioner.yaml";
+              ExecStart =
+                provisionerApply cfg.package "/etc/kubernetes/admin.conf"
+                  "/etc/kubernetes/provisioner.yaml";
               Restart = "on-failure";
               RestartSec = "15s";
             };

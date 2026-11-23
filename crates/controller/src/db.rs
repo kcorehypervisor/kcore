@@ -488,6 +488,20 @@ pub struct KubernetesClusterNodeRow {
     pub k8s_node_name: String,
 }
 
+/// A member's Kubernetes version and rolling-upgrade progress. Kept apart
+/// from [`KubernetesClusterNodeRow`] so membership upserts never reset it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesNodeUpgradeRow {
+    pub node_id: String,
+    pub role: String,
+    pub kubernetes_version: String,
+    pub upgrade_state: String,
+    pub upgrade_apply_id: String,
+    pub upgrade_cordoned: bool,
+    pub pending_join: bool,
+    pub pending_removal: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct KubernetesClusterConfigRow {
     pub cluster_name: String,
@@ -503,6 +517,8 @@ pub struct KubernetesClusterConfigRow {
     pub local_provisioner_json: String,
     /// Control-plane nodes are schedulable workers.
     pub schedule_on_control_plane: bool,
+    /// Desired Kubernetes version; empty uses the host nixpkgs pin.
+    pub kubernetes_version: String,
 }
 
 #[derive(Debug, Clone)]
@@ -880,7 +896,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 73;
+pub const SCHEMA_VERSION: i32 = 74;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -2357,6 +2373,38 @@ impl Database {
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
                 );",
             )?;
+        }
+
+        if version < 74 {
+            let has_k8s_version: i32 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('kubernetes_cluster_config') WHERE name = 'kubernetes_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_k8s_version == 0 {
+                conn.execute(
+                    "ALTER TABLE kubernetes_cluster_config ADD COLUMN kubernetes_version TEXT NOT NULL DEFAULT '';",
+                    [],
+                )?;
+            }
+            for (column, ddl) in [
+                ("kubernetes_version", "TEXT NOT NULL DEFAULT ''"),
+                ("upgrade_state", "TEXT NOT NULL DEFAULT ''"),
+                ("upgrade_apply_id", "TEXT NOT NULL DEFAULT ''"),
+                ("upgrade_cordoned", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                let present: i32 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('kubernetes_cluster_nodes') WHERE name = ?1",
+                    params![column],
+                    |row| row.get(0),
+                )?;
+                if present == 0 {
+                    conn.execute(
+                        &format!("ALTER TABLE kubernetes_cluster_nodes ADD COLUMN {column} {ddl};"),
+                        [],
+                    )?;
+                }
+            }
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -8109,8 +8157,10 @@ impl Database {
             "INSERT INTO kubernetes_cluster_nodes (
                 cluster_name, node_id, role, advertise_address, iface,
                 initial_cluster, join_existing, kubelet_ready,
-                pending_join, pending_removal, k8s_node_name
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                pending_join, pending_removal, k8s_node_name, kubernetes_version
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                COALESCE((SELECT kubernetes_version FROM kubernetes_cluster_config
+                          WHERE cluster_name = ?1), ''))
             ON CONFLICT(cluster_name, node_id) DO UPDATE SET
                 role=excluded.role,
                 advertise_address=excluded.advertise_address,
@@ -8211,6 +8261,69 @@ impl Database {
         )? > 0)
     }
 
+    pub fn list_kubernetes_node_upgrades(
+        &self,
+        cluster_name: &str,
+    ) -> Result<Vec<KubernetesNodeUpgradeRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, role, kubernetes_version, upgrade_state, upgrade_apply_id,
+                    upgrade_cordoned, pending_join, pending_removal
+             FROM kubernetes_cluster_nodes WHERE cluster_name=?1 ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map(params![cluster_name], |r| {
+            Ok(KubernetesNodeUpgradeRow {
+                node_id: r.get(0)?,
+                role: r.get(1)?,
+                kubernetes_version: r.get(2)?,
+                upgrade_state: r.get(3)?,
+                upgrade_apply_id: r.get(4)?,
+                upgrade_cordoned: r.get(5)?,
+                pending_join: r.get(6)?,
+                pending_removal: r.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Version rendered into a member's Nix. Empty is the host pin.
+    pub fn kubernetes_node_version(
+        &self,
+        cluster_name: &str,
+        node_id: &str,
+    ) -> Result<Option<String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT kubernetes_version FROM kubernetes_cluster_nodes
+             WHERE cluster_name=?1 AND node_id=?2",
+            params![cluster_name, node_id],
+            |r| r.get(0),
+        )
+        .optional()
+    }
+
+    pub fn set_kubernetes_node_upgrade(
+        &self,
+        cluster_name: &str,
+        upgrade: &KubernetesNodeUpgradeRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_nodes SET
+                kubernetes_version=?3, upgrade_state=?4, upgrade_apply_id=?5, upgrade_cordoned=?6
+             WHERE cluster_name=?1 AND node_id=?2",
+            params![
+                cluster_name,
+                upgrade.node_id,
+                upgrade.kubernetes_version,
+                upgrade.upgrade_state,
+                upgrade.upgrade_apply_id,
+                upgrade.upgrade_cordoned
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_kubernetes_cluster_config(
         &self,
         row: &KubernetesClusterConfigRow,
@@ -8220,8 +8333,9 @@ impl Database {
             "INSERT INTO kubernetes_cluster_config (
                 cluster_name, ha_enabled, vip_address, vip_interface,
                 cilium_mode, cilium_mtu, cilium_tunnel, cilium_auto_direct_routes,
-                cilium_lb_ip_pools, local_provisioner_json, schedule_on_control_plane
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                cilium_lb_ip_pools, local_provisioner_json, schedule_on_control_plane,
+                kubernetes_version
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(cluster_name) DO UPDATE SET
                 ha_enabled=excluded.ha_enabled,
                 vip_address=excluded.vip_address,
@@ -8232,7 +8346,8 @@ impl Database {
                 cilium_auto_direct_routes=excluded.cilium_auto_direct_routes,
                 cilium_lb_ip_pools=excluded.cilium_lb_ip_pools,
                 local_provisioner_json=excluded.local_provisioner_json,
-                schedule_on_control_plane=excluded.schedule_on_control_plane",
+                schedule_on_control_plane=excluded.schedule_on_control_plane,
+                kubernetes_version=excluded.kubernetes_version",
             params![
                 row.cluster_name,
                 row.ha_enabled,
@@ -8244,7 +8359,8 @@ impl Database {
                 row.cilium_auto_direct_routes,
                 row.cilium_lb_ip_pools,
                 row.local_provisioner_json,
-                row.schedule_on_control_plane
+                row.schedule_on_control_plane,
+                row.kubernetes_version
             ],
         )?;
         Ok(())
@@ -8258,7 +8374,8 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT cluster_name, ha_enabled, vip_address, vip_interface,
                     cilium_mode, cilium_mtu, cilium_tunnel, cilium_auto_direct_routes,
-                    cilium_lb_ip_pools, local_provisioner_json, schedule_on_control_plane
+                    cilium_lb_ip_pools, local_provisioner_json, schedule_on_control_plane,
+                    kubernetes_version
              FROM kubernetes_cluster_config WHERE cluster_name=?1",
         )?;
         let mut rows = stmt.query_map(params![cluster_name], |r| {
@@ -8274,6 +8391,7 @@ impl Database {
                 cilium_lb_ip_pools: r.get(8)?,
                 local_provisioner_json: r.get(9)?,
                 schedule_on_control_plane: r.get(10)?,
+                kubernetes_version: r.get(11)?,
             })
         })?;
         rows.next().transpose()

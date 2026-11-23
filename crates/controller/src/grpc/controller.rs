@@ -19540,6 +19540,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut blocking_issues = Vec::new();
         let mut warnings = Vec::new();
 
+        if let Err(err) = crate::kubernetes_versions::validate(&spec.version) {
+            blocking_issues.push(err);
+        }
+
         if spec.cluster_cidr.is_empty() {
             blocking_issues.push("cluster_cidr is required".to_string());
         }
@@ -19559,10 +19563,30 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .db
             .get_kubernetes_cluster(&req.name)
             .map_err(internal_db)?;
-        let action = if existing.is_some() {
-            "update"
-        } else {
+        let version_change = match &existing {
+            Some(cluster) => {
+                match self.kubernetes_version_change(&req.name, &cluster.phase, &spec, req.force) {
+                    Ok(change) => change,
+                    Err(status) => {
+                        blocking_issues.push(status.message().to_string());
+                        crate::kubernetes_upgrade::VersionChange::None
+                    }
+                }
+            }
+            None => crate::kubernetes_upgrade::VersionChange::None,
+        };
+        if version_change != crate::kubernetes_upgrade::VersionChange::None {
+            warnings.push(format!(
+                "Kubernetes moves to {} one node at a time: control planes first, then workers. Nodes that run pods are drained before their rebuild.",
+                crate::kubernetes_versions::effective(&spec.version)
+            ));
+        }
+        let action = if existing.is_none() {
             "create"
+        } else if version_change != crate::kubernetes_upgrade::VersionChange::None {
+            "upgrade"
+        } else {
+            "update"
         };
 
         // Validate control plane nodes exist and are ready
@@ -19666,6 +19690,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        crate::kubernetes_versions::validate(&spec.version).map_err(Status::invalid_argument)?;
 
         // Check if cluster already exists
         if let Some(_existing) = self
@@ -19796,6 +19821,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        crate::kubernetes_versions::validate(&spec.version).map_err(Status::invalid_argument)?;
+        let version_change =
+            self.kubernetes_version_change(&req.name, &existing.phase, &spec, req.force)?;
+        let upgrading = version_change != crate::kubernetes_upgrade::VersionChange::None;
+        let next_version = crate::kubernetes_versions::effective(&spec.version);
         let provisioner = Self::local_provisioner_of(&req.name, &spec)?;
         let existing_members = self
             .db
@@ -19835,7 +19865,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
             api_server_endpoint: spec.api_server_endpoint.clone(),
             cni: stored_cni(&spec.api_server_endpoint, &spec.cni),
             phase: "updating".to_string(),
-            status_message: "cluster update in progress".to_string(),
+            status_message: if upgrading {
+                format!("updating configuration before the upgrade to Kubernetes {next_version}")
+            } else {
+                "cluster update in progress".to_string()
+            },
             ready_control_planes: existing.ready_control_planes,
             ready_workers: existing.ready_workers,
             created_at: existing.created_at,
@@ -19896,6 +19930,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
         } else if let Some(message) = deploy_error.or(volume_error) {
             cluster_row.phase = "degraded".to_string();
             cluster_row.status_message = message;
+        } else if upgrading {
+            // The orchestrator rolls the version out; nodes keep their
+            // current version until it reaches them.
+            cluster_row.phase = "upgrading".to_string();
+            cluster_row.status_message = format!(
+                "upgrade to Kubernetes {next_version} queued: control planes first, then workers"
+            );
         } else {
             // A ready cluster stays ready. A degraded cluster is the previous
             // attempt's failure; this attempt deployed, so it is ready again.
@@ -20271,6 +20312,62 @@ impl ControllerService {
         Ok(changed)
     }
 
+    /// Whether applying `spec` starts, resumes, or leaves alone a version
+    /// upgrade. Refusals come back as `FailedPrecondition`.
+    fn kubernetes_version_change(
+        &self,
+        cluster_name: &str,
+        phase: &str,
+        spec: &controller_proto::KubernetesClusterSpec,
+        force: bool,
+    ) -> Result<crate::kubernetes_upgrade::VersionChange, Status> {
+        let stored = self
+            .db
+            .get_kubernetes_cluster_config(cluster_name)
+            .map_err(internal_db)?
+            .map(|cfg| cfg.kubernetes_version)
+            .unwrap_or_default();
+        let members = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)
+            .map_err(internal_db)?;
+        let existing_pairs: Vec<(String, String)> = members
+            .iter()
+            .map(|row| (row.node_id.clone(), row.role.clone()))
+            .collect();
+        let desired: Vec<(String, String)> = spec
+            .control_plane_nodes
+            .iter()
+            .map(|node| (node.node_id.clone(), "control-plane".to_string()))
+            .chain(
+                spec.worker_nodes
+                    .iter()
+                    .map(|node| (node.node_id.clone(), "worker".to_string())),
+            )
+            .collect();
+        let membership_changes =
+            crate::kubernetes_lifecycle::membership_delta(&existing_pairs, &desired)
+                .map(|delta| !delta.add.is_empty() || !delta.remove.is_empty())
+                .unwrap_or(false);
+        let nodes: Vec<(String, String)> = self
+            .db
+            .list_kubernetes_node_upgrades(cluster_name)
+            .map_err(internal_db)?
+            .into_iter()
+            .filter(|row| !row.pending_join && !row.pending_removal)
+            .map(|row| (row.kubernetes_version, row.upgrade_state))
+            .collect();
+        crate::kubernetes_upgrade::version_change(
+            phase,
+            &stored,
+            &nodes,
+            &spec.version,
+            membership_changes,
+            force,
+        )
+        .map_err(Status::failed_precondition)
+    }
+
     fn kubernetes_members(
         spec: &controller_proto::KubernetesClusterSpec,
     ) -> std::collections::BTreeSet<String> {
@@ -20343,6 +20440,7 @@ impl ControllerService {
                 .unwrap_or_default(),
             local_provisioner_json: crate::kubernetes_local::encode(provisioner),
             schedule_on_control_plane: spec.schedule_on_control_plane,
+            kubernetes_version: crate::kubernetes_versions::normalize(&spec.version),
         }
     }
 
@@ -20755,6 +20853,10 @@ impl ControllerService {
                     .as_ref()
                     .map(|c| c.schedule_on_control_plane)
                     .unwrap_or(false),
+                version: config
+                    .as_ref()
+                    .map(|c| c.kubernetes_version.clone())
+                    .unwrap_or_default(),
             }),
             status: Some(controller_proto::KubernetesClusterStatus {
                 phase: row.phase.clone(),
@@ -20770,6 +20872,18 @@ impl ControllerService {
                 ),
                 last_updated: None,
                 active_node_ids: vec![],
+                node_versions: self
+                    .db
+                    .list_kubernetes_node_upgrades(&row.name)
+                    .map_err(internal_db)?
+                    .into_iter()
+                    .map(|node| {
+                        (
+                            node.node_id,
+                            crate::kubernetes_versions::effective(&node.kubernetes_version),
+                        )
+                    })
+                    .collect(),
             }),
         })
     }

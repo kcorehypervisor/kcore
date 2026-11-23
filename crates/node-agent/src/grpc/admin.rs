@@ -5392,7 +5392,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
 
         // Generate apply_id for tracking
         let apply_id = format!("k8s-apply-{}", uuid_like_suffix());
-        write_apply_state(&apply_id, "running", "queued");
+        write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
 
         // Write kubeconfig if provided
         if !req.kubeconfig_data.is_empty() {
@@ -5558,7 +5558,7 @@ impl AdminService {
     }
 
     async fn run_k8s_nixos_rebuild(_config_path: PathBuf, apply_id: String) {
-        write_apply_state(&apply_id, "rebuilding", "running nixos-rebuild switch");
+        record_apply_state(&apply_id, NIX_APPLY_RUNNING, "running nixos-rebuild switch");
 
         // Get NIX_PATH from bash login shell, then run nixos-rebuild
         // This ensures we have the correct nixpkgs path from the system configuration
@@ -5571,7 +5571,11 @@ impl AdminService {
         match switch_result {
             Ok(output) if output.status.success() => {
                 info!(apply_id = %apply_id, "nixos-rebuild switch succeeded");
-                write_apply_state(&apply_id, "completed", "kubernetes configuration active");
+                write_apply_state(
+                    &apply_id,
+                    NIX_APPLY_SUCCEEDED,
+                    "kubernetes configuration active",
+                );
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5582,11 +5586,15 @@ impl AdminService {
                     stdout = %stdout,
                     "nixos-rebuild switch failed"
                 );
-                write_apply_state(&apply_id, "failed", &format!("switch failed: {}", stderr));
+                write_apply_state(
+                    &apply_id,
+                    NIX_APPLY_FAILED,
+                    &format!("switch failed: {}", stderr),
+                );
             }
             Err(e) => {
                 error!(apply_id = %apply_id, error = %e, "failed to run nixos-rebuild switch");
-                write_apply_state(&apply_id, "failed", &format!("switch error: {}", e));
+                write_apply_state(&apply_id, NIX_APPLY_FAILED, &format!("switch error: {}", e));
             }
         }
     }

@@ -6,9 +6,11 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
-use crate::db::{Database, KubernetesClusterNodeRow};
+use crate::db::{Database, KubernetesClusterNodeRow, KubernetesNodeUpgradeRow};
 use crate::kubernetes_lifecycle::{self, MemberSnapshot, ScaleStep};
 use crate::kubernetes_pki::{self, KubernetesPki, NodeInfo};
+use crate::kubernetes_upgrade::{self, ApplyProgress, UpgradeMember, UpgradeStep, UpgradeView};
+use crate::kubernetes_versions;
 use crate::node_client::NodeClients;
 
 /// Orchestrates Kubernetes cluster bootstrap across multiple nodes
@@ -385,7 +387,7 @@ impl KubernetesOrchestrator {
         _cluster_cidr: &str,
         _service_cidr: &str,
         _all_nodes: &[ClusterNode],
-    ) -> Result<()> {
+    ) -> Result<String> {
         info!(
             cluster = cluster_name,
             node_id = node.node_id,
@@ -449,7 +451,7 @@ impl KubernetesOrchestrator {
             "Kubernetes configuration deployment started on node"
         );
 
-        Ok(())
+        Ok(response.apply_id)
     }
 
     /// Nix for every cluster that already has PKI and includes this node.
@@ -526,6 +528,14 @@ impl KubernetesOrchestrator {
                 provisioner_manifest: applied_provisioner_manifest(
                     &cfg.local_provisioner_json,
                     &cluster.api_server_endpoint,
+                ),
+                // The node's own version, not the cluster's: a rollout moves
+                // one node at a time, and any other redeploy must not jump ahead.
+                version: crate::kubernetes_versions::normalize(
+                    &self
+                        .db
+                        .kubernetes_node_version(&cluster.name, node_id)?
+                        .unwrap_or_default(),
                 ),
             };
             let ports = crate::nixgen::kubernetes_listen_ports(&settings.api_server_endpoint);
@@ -861,6 +871,318 @@ impl KubernetesOrchestrator {
         Ok(())
     }
 
+    /// Advance a rolling version upgrade until a step has to wait.
+    async fn reconcile_upgrade(&self, cluster_name: &str) -> Result<()> {
+        for _ in 0..16 {
+            let view = self.observe_upgrade(cluster_name).await?;
+            let desired = kubernetes_versions::effective(&view.desired);
+            let (done, total) = kubernetes_upgrade::progress(&view);
+            let step = kubernetes_upgrade::next_upgrade_step(&view);
+            info!(
+                cluster = cluster_name,
+                ?step,
+                done,
+                total,
+                "kubernetes upgrade step"
+            );
+            match step {
+                UpgradeStep::Done => {
+                    let control_planes = view
+                        .members
+                        .iter()
+                        .filter(|member| member.role != "worker")
+                        .count() as i32;
+                    self.db
+                        .mark_kubernetes_cluster_ready(cluster_name, control_planes)?;
+                    self.db.set_kubernetes_cluster_status(
+                        cluster_name,
+                        "ready",
+                        &format!("Kubernetes {desired} on all {total} nodes"),
+                    )?;
+                    return Ok(());
+                }
+                UpgradeStep::Wait { message, .. } => {
+                    self.set_upgrade_status(cluster_name, &desired, done, total, &message)?;
+                    return Ok(());
+                }
+                UpgradeStep::Drain { node_id } => {
+                    self.set_upgrade_status(
+                        cluster_name,
+                        &desired,
+                        done,
+                        total,
+                        &format!("draining {node_id}"),
+                    )?;
+                    let mut row = self.upgrade_row(cluster_name, &node_id)?;
+                    // Recorded first so a crash mid-drain still uncordons later.
+                    row.upgrade_cordoned = true;
+                    self.db.set_kubernetes_node_upgrade(cluster_name, &row)?;
+                    if let Err(err) = self.drain_member(cluster_name, &node_id).await {
+                        self.fail_upgrade(
+                            cluster_name,
+                            &node_id,
+                            &format!("drain of {node_id} failed: {err:#}"),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    row.upgrade_state = kubernetes_upgrade::STATE_DRAINED.to_string();
+                    self.db.set_kubernetes_node_upgrade(cluster_name, &row)?;
+                }
+                UpgradeStep::Apply { node_id } => {
+                    let previous = self.upgrade_row(cluster_name, &node_id)?;
+                    let mut row = previous.clone();
+                    row.kubernetes_version = view.desired.clone();
+                    row.upgrade_state = kubernetes_upgrade::STATE_APPLYING.to_string();
+                    row.upgrade_apply_id = String::new();
+                    self.db.set_kubernetes_node_upgrade(cluster_name, &row)?;
+                    match self.push_member_config(cluster_name, &node_id).await {
+                        Ok(apply_id) => {
+                            // An agent without apply tracking returns no id;
+                            // the kubelet version alone then shows progress.
+                            row.upgrade_apply_id = if apply_id.is_empty() {
+                                "untracked".to_string()
+                            } else {
+                                apply_id
+                            };
+                            self.db.set_kubernetes_node_upgrade(cluster_name, &row)?;
+                        }
+                        Err(err) => {
+                            self.db
+                                .set_kubernetes_node_upgrade(cluster_name, &previous)?;
+                            return Err(
+                                err.context(format!("push Kubernetes {desired} to {node_id}"))
+                            );
+                        }
+                    }
+                    self.set_upgrade_status(
+                        cluster_name,
+                        &desired,
+                        done,
+                        total,
+                        &format!("rebuilding {node_id} with Kubernetes {desired}"),
+                    )?;
+                    return Ok(());
+                }
+                UpgradeStep::Uncordon { node_id } => {
+                    self.uncordon_member(cluster_name, &node_id).await?;
+                    let mut row = self.upgrade_row(cluster_name, &node_id)?;
+                    row.upgrade_cordoned = false;
+                    self.db.set_kubernetes_node_upgrade(cluster_name, &row)?;
+                }
+                UpgradeStep::Finish { node_id } => {
+                    let mut row = self.upgrade_row(cluster_name, &node_id)?;
+                    row.upgrade_state = kubernetes_upgrade::STATE_IDLE.to_string();
+                    row.upgrade_apply_id = String::new();
+                    self.db.set_kubernetes_node_upgrade(cluster_name, &row)?;
+                    info!(cluster = cluster_name, node_id, version = %desired, "node upgraded");
+                }
+                UpgradeStep::Fail { node_id, message } => {
+                    self.fail_upgrade(cluster_name, &node_id, &message).await?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_upgrade_status(
+        &self,
+        cluster_name: &str,
+        desired: &str,
+        done: usize,
+        total: usize,
+        message: &str,
+    ) -> Result<()> {
+        self.db.set_kubernetes_cluster_status(
+            cluster_name,
+            "upgrading",
+            &format!("upgrading to Kubernetes {desired} ({done}/{total} nodes): {message}"),
+        )?;
+        Ok(())
+    }
+
+    /// Stop the rollout on `node_id`. The node is uncordoned and stays on
+    /// whatever its last rebuild activated; re-applying the manifest resumes.
+    async fn fail_upgrade(&self, cluster_name: &str, node_id: &str, message: &str) -> Result<()> {
+        error!(
+            cluster = cluster_name,
+            node_id, message, "kubernetes upgrade stopped"
+        );
+        let mut row = self.upgrade_row(cluster_name, node_id)?;
+        if row.upgrade_cordoned {
+            if let Err(err) = self.uncordon_member(cluster_name, node_id).await {
+                error!(cluster = cluster_name, node_id, error = %err, "uncordon after a failed upgrade");
+            } else {
+                row.upgrade_cordoned = false;
+            }
+        }
+        row.upgrade_state = kubernetes_upgrade::STATE_FAILED.to_string();
+        row.upgrade_apply_id = String::new();
+        self.db.set_kubernetes_node_upgrade(cluster_name, &row)?;
+        self.db.set_kubernetes_cluster_status(
+            cluster_name,
+            "degraded",
+            &format!(
+                "{}: {message}. Fix the node and re-apply the manifest to resume.",
+                kubernetes_upgrade::UPGRADE_FAILED
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn upgrade_row(&self, cluster_name: &str, node_id: &str) -> Result<KubernetesNodeUpgradeRow> {
+        self.db
+            .list_kubernetes_node_upgrades(cluster_name)?
+            .into_iter()
+            .find(|row| row.node_id == node_id)
+            .with_context(|| format!("{node_id} is not a member of {cluster_name}"))
+    }
+
+    async fn uncordon_member(&self, cluster_name: &str, node_id: &str) -> Result<()> {
+        let (address, _) = self.api_peer(cluster_name, None).await?;
+        let name = self
+            .registered_name(cluster_name, node_id, &address)
+            .await?;
+        crate::kubernetes_admin::cordon(&self.node_clients, &address, &name, false)
+            .await
+            .map_err(|err| anyhow!(err))
+    }
+
+    /// Render and push one member's Nix; returns the node's apply id.
+    async fn push_member_config(&self, cluster_name: &str, node_id: &str) -> Result<String> {
+        let cluster = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+        let pki = self
+            .db
+            .load_kubernetes_pki(cluster_name)?
+            .context("PKI not found")?;
+        let nodes = self.get_cluster_nodes(cluster_name).await?;
+        let node = nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .context("member not found")?;
+        self.configure_node(
+            cluster_name,
+            node,
+            &pki,
+            &cluster.cluster_cidr,
+            &cluster.service_cidr,
+            &nodes,
+        )
+        .await
+    }
+
+    async fn apply_progress(&self, address: &str, apply_id: &str) -> (ApplyProgress, String) {
+        use crate::node_proto::{GetNixApplyStatusRequest, NixApplyPhase};
+        if self.node_clients.get_admin(address).is_none()
+            && self.node_clients.connect(address).await.is_err()
+        {
+            return (
+                ApplyProgress::Running,
+                format!("node agent {address} unreachable"),
+            );
+        }
+        let Some(mut admin) = self.node_clients.get_admin(address) else {
+            return (
+                ApplyProgress::Running,
+                format!("node agent {address} unreachable"),
+            );
+        };
+        match admin
+            .get_nix_apply_status(GetNixApplyStatusRequest {
+                apply_id: apply_id.to_string(),
+            })
+            .await
+        {
+            Ok(response) => {
+                let response = response.into_inner();
+                let progress = match NixApplyPhase::try_from(response.phase) {
+                    Ok(NixApplyPhase::Running) => ApplyProgress::Running,
+                    Ok(NixApplyPhase::Succeeded) => ApplyProgress::Succeeded,
+                    Ok(NixApplyPhase::Failed) => ApplyProgress::Failed,
+                    _ => ApplyProgress::Unknown,
+                };
+                (progress, response.message)
+            }
+            // A rebuild can restart the agent; keep waiting for it.
+            Err(err) => (ApplyProgress::Running, err.message().to_string()),
+        }
+    }
+
+    async fn observe_upgrade(&self, cluster_name: &str) -> Result<UpgradeView> {
+        let cfg = self
+            .db
+            .get_kubernetes_cluster_config(cluster_name)?
+            .context("cluster config not found")?;
+        let membership = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        let api_ready = self.apiserver_is_ready(cluster_name).await?;
+        let api_nodes = self
+            .list_api_nodes(cluster_name, None)
+            .await
+            .unwrap_or_default();
+        let mut members = Vec::new();
+        for row in self.db.list_kubernetes_node_upgrades(cluster_name)? {
+            if row.pending_join || row.pending_removal {
+                continue;
+            }
+            let member = membership
+                .iter()
+                .find(|m| m.node_id == row.node_id)
+                .context("membership row not found")?;
+            let node = self.db.get_node(&row.node_id)?;
+            let hostname = node
+                .as_ref()
+                .map(|n| n.hostname.clone())
+                .unwrap_or_default();
+            let address = node.as_ref().map(|n| n.address.clone()).unwrap_or_default();
+            let ip = self.member_ip(member).unwrap_or_default();
+            let listed = kubernetes_lifecycle::match_registered_node(
+                &api_nodes,
+                &member.k8s_node_name,
+                &hostname,
+                &ip,
+            );
+            let etcd_healthy = row.role != "worker"
+                && self
+                    .probe_etcd_member(cluster_name, &ip)
+                    .await
+                    .unwrap_or(false);
+            let (apply, apply_message) = if row.upgrade_state != kubernetes_upgrade::STATE_APPLYING
+            {
+                (ApplyProgress::Unknown, String::new())
+            } else if row.upgrade_apply_id.is_empty() {
+                (ApplyProgress::NotRecorded, String::new())
+            } else if address.is_empty() {
+                (ApplyProgress::Unknown, String::new())
+            } else {
+                self.apply_progress(&address, &row.upgrade_apply_id).await
+            };
+            members.push(UpgradeMember {
+                node_id: row.node_id,
+                role: row.role,
+                version: row.kubernetes_version,
+                state: row.upgrade_state,
+                cordoned: row.upgrade_cordoned,
+                apply,
+                apply_message,
+                kubelet_version: listed
+                    .map(|n| n.kubelet_version.clone())
+                    .unwrap_or_default(),
+                node_ready: listed.is_some_and(|n| n.ready),
+                etcd_healthy,
+            });
+        }
+        Ok(UpgradeView {
+            desired: kubernetes_versions::normalize(&cfg.kubernetes_version),
+            schedule_on_control_plane: cfg.schedule_on_control_plane,
+            api_ready,
+            members,
+        })
+    }
+
     async fn observe_members(&self, cluster_name: &str) -> Result<Vec<MemberSnapshot>> {
         let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
         let needs_etcd = rows
@@ -984,6 +1306,7 @@ impl KubernetesOrchestrator {
             &[],
         )
         .await
+        .map(|_| ())
     }
 
     fn mark_member_joined(
@@ -1533,7 +1856,7 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
                 // on nodes that are already serving.
                 if matches!(
                     cluster.phase.as_str(),
-                    "bootstrapping" | "ready" | "scaling"
+                    "bootstrapping" | "ready" | "scaling" | "upgrading"
                 ) {
                     continue;
                 }
@@ -1661,6 +1984,36 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
             }
             Err(e) => {
                 error!(error = %e, "failed to list scaling Kubernetes clusters");
+            }
+        }
+
+        match db.list_kubernetes_clusters_by_phase("upgrading") {
+            Ok(clusters) => {
+                for cluster in clusters {
+                    if !orchestrator.claim(&cluster.name) {
+                        continue;
+                    }
+                    let orchestrator = orchestrator.clone();
+                    let cluster_name = cluster.name.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = orchestrator.reconcile_upgrade(&cluster_name).await {
+                            error!(
+                                cluster = cluster_name,
+                                error = %e,
+                                "Kubernetes upgrade step failed"
+                            );
+                            let _ = orchestrator.db.set_kubernetes_cluster_status(
+                                &cluster_name,
+                                "upgrading",
+                                &format!("upgrade step error, retrying: {e:#}"),
+                            );
+                        }
+                        orchestrator.release(&cluster_name);
+                    });
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to list upgrading Kubernetes clusters");
             }
         }
 

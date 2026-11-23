@@ -1903,6 +1903,10 @@ enum KubernetesAction {
         /// YAML manifest file
         #[arg(short = 'f', long)]
         file: String,
+        /// Allow a spec.version change that skips a minor version, downgrades,
+        /// or retargets an upgrade that is still running
+        #[arg(long)]
+        force: bool,
     },
     /// Get a Kubernetes cluster
     Get {
@@ -3824,10 +3828,10 @@ async fn main() {
         }
 
         Command::Kubernetes {
-            action: KubernetesAction::Apply { file },
+            action: KubernetesAction::Apply { file, force },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::kubernetes::apply_from_file(&info, file).await
+            commands::kubernetes::apply_from_file(&info, file, *force).await
         }
 
         Command::Kubernetes {
