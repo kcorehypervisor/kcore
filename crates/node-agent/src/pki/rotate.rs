@@ -244,54 +244,34 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// `ip route get` prints `src <address>` for the chosen source.
-pub fn route_src(text: &str) -> Option<String> {
-    let mut words = text.split_whitespace();
-    while let Some(word) = words.next() {
-        if word == "src" {
-            let ip = words.next()?.trim();
-            if ip.is_empty() || ip.starts_with("127.") {
-                return None;
-            }
-            return Some(ip.to_string());
-        }
-    }
-    None
-}
-
-/// The address this host uses toward the controller, when the current
-/// certificate does not name it. The controller issues that address and
-/// rejects any other SAN.
-pub fn cert_host_for_renewal(current_sans: &[String], primary_ip: &str) -> Option<String> {
-    let ip = primary_ip.trim();
-    if ip.is_empty() || current_sans.iter().any(|san| san == ip) {
+/// The address this node registers with, when the current certificate does
+/// not name it. The controller issues that address and rejects any other SAN.
+pub fn cert_host_for_renewal(current_sans: &[String], registered_host: &str) -> Option<String> {
+    let host = registered_host.trim();
+    if host.is_empty() || current_sans.iter().any(|san| san == host) {
         None
     } else {
-        Some(ip.to_string())
+        Some(host.to_string())
     }
 }
 
-fn primary_ip_toward(cfg: &Config) -> Option<String> {
-    let target = cfg
-        .controller_addr
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    // No controller address means we do not know which source the controller
-    // will accept. Inventing a route target would renew a healthy certificate.
-    if target.is_empty() {
+/// Some(new host) when the installed certificate does not name the address
+/// this node registers with, so the controller cannot dial it.
+fn address_mismatch(cfg: &Config, current: &CertFacts) -> Option<String> {
+    // Without a controller nobody dials this node by address.
+    if cfg.controller_endpoints().is_empty() {
         return None;
     }
-    let out = std::process::Command::new("ip")
-        .args(["-4", "route", "get", &target])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    route_src(&String::from_utf8_lossy(&out.stdout))
+    crate::registration::registered_host(cfg)
+        .and_then(|host| cert_host_for_renewal(&current.sans, &host))
+}
+
+fn installed_cert_names_other_address(cfg: &Config) -> bool {
+    cfg.tls
+        .as_ref()
+        .and_then(|tls| std::fs::read_to_string(&tls.cert_file).ok())
+        .and_then(|pem| facts_from_pem(&pem).ok())
+        .is_some_and(|current| address_mismatch(cfg, &current).is_some())
 }
 
 /// Run one rotation attempt for this node.
@@ -320,7 +300,7 @@ pub async fn rotate_once(
 
     let now = OffsetDateTime::now_utc();
     let days_until_expiry = current.days_remaining(now) as i32;
-    let san_fix = primary_ip_toward(cfg).and_then(|ip| cert_host_for_renewal(&current.sans, &ip));
+    let san_fix = address_mismatch(cfg, &current);
     if san_fix.is_none()
         && !force
         && !is_due_for_renewal(
@@ -385,7 +365,7 @@ pub async fn rotate_once(
     }
 
     // Everything below is validated before a single byte is written.
-    let facts = validate_signed_chain(&signed.cert_chain_pem, &key, &current.subject_cn, now)?;
+    let facts = validate_signed_chain(&signed.cert_chain_pem, &key, &cn, now)?;
 
     let rollback = install_chain(
         &cert_file,
@@ -428,6 +408,10 @@ pub async fn rotate_once(
     })
 }
 
+/// Delay before the first check, and between retries while the certificate
+/// does not name the address this node registers with.
+const ADDRESS_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Background loop that rotates this node's certificate when it comes due.
 ///
 /// The controller drives rotation too (`NodeAdmin.RotateNodeCert`); this loop
@@ -441,13 +425,24 @@ pub fn spawn_rotation_loop(cfg: Config, reload: ReloadHandle) {
     }
     let interval = std::time::Duration::from_secs(rotation.check_interval_secs.max(60));
     tokio::spawn(async move {
+        // A node that came back on a new address is unreachable until its
+        // certificate names that address, so check soon after start and keep
+        // retrying at a short interval until it does.
+        let mut wait = ADDRESS_RETRY;
         loop {
-            tokio::time::sleep(interval).await;
-            match rotate_once(&cfg, &rotation, false, "node-timer", &reload).await {
-                Ok(outcome) if outcome.rotated => {}
-                Ok(_) => {}
-                Err(error) => warn!(%error, "scheduled certificate rotation failed"),
-            }
+            tokio::time::sleep(wait).await;
+            let failed = match rotate_once(&cfg, &rotation, false, "node-timer", &reload).await {
+                Ok(_) => false,
+                Err(error) => {
+                    warn!(%error, "scheduled certificate rotation failed");
+                    true
+                }
+            };
+            wait = if failed && installed_cert_names_other_address(&cfg) {
+                ADDRESS_RETRY
+            } else {
+                interval
+            };
         }
     });
 }
@@ -464,10 +459,6 @@ mod tests {
     #[test]
     fn a_moved_address_is_the_san_the_next_certificate_requests() {
         assert_eq!(
-            route_src("192.168.40.107 dev br0 src 192.168.40.103 uid 0"),
-            Some("192.168.40.103".into())
-        );
-        assert_eq!(
             cert_host_for_renewal(&["192.168.40.141".into()], "192.168.40.103").as_deref(),
             Some("192.168.40.103")
         );
@@ -475,6 +466,52 @@ mod tests {
             cert_host_for_renewal(&["192.168.40.103".into()], "192.168.40.103"),
             None
         );
+    }
+
+    fn cfg_listening_on(listen_addr: &str, controllers: Vec<String>) -> Config {
+        Config {
+            node_id: "node-1".to_string(),
+            listen_addr: listen_addr.to_string(),
+            controller_addr: String::new(),
+            controllers,
+            dc_id: "DC1".to_string(),
+            tls: None,
+            vm_socket_dir: "/run/kcore".to_string(),
+            nix_config_path: "/etc/nixos/kcore-vms.nix".to_string(),
+            storage: crate::config::StorageConfig::default(),
+            cert_rotation: CertRotationConfig::default(),
+            revocation: crate::config::NodeRevocationConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
+        }
+    }
+
+    #[test]
+    fn a_certificate_for_the_old_address_is_a_mismatch() {
+        let (ca_cert, ca_key) = test_ca("test-sub-ca");
+        let (old, _) = node_leaf(&ca_cert, &ca_key, "10.0.0.5", Duration::days(300));
+        let (same, _) = node_leaf(&ca_cert, &ca_key, "10.0.0.7", Duration::days(300));
+        let old = facts_from_pem(&old).expect("facts");
+        let same = facts_from_pem(&same).expect("facts");
+
+        let cfg = cfg_listening_on("10.0.0.7:9091", vec!["10.0.0.1:9090".into()]);
+        assert_eq!(address_mismatch(&cfg, &old).as_deref(), Some("10.0.0.7"));
+        assert_eq!(address_mismatch(&cfg, &same), None);
+
+        let standalone = cfg_listening_on("10.0.0.7:9091", vec![]);
+        assert_eq!(address_mismatch(&standalone, &old), None);
+    }
+
+    #[test]
+    fn the_replacement_for_a_moved_node_is_checked_against_its_new_name() {
+        let (ca_cert, ca_key) = test_ca("test-sub-ca");
+        let (csr_pem, key) =
+            build_csr("kcore-node-10.0.0.7", &["10.0.0.7".to_string()]).expect("csr");
+        let chain = sign_csr(&ca_cert, &ca_key, &csr_pem, "10.0.0.7", Duration::days(7));
+
+        validate_signed_chain(&chain, &key, "kcore-node-10.0.0.7", now())
+            .expect("the requested name is the one to check");
+        assert!(validate_signed_chain(&chain, &key, "kcore-node-10.0.0.5", now()).is_err());
     }
 
     #[test]

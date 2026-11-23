@@ -182,6 +182,15 @@ async fn connect_and_register(
     Ok(())
 }
 
+/// Host part of the address this node registers with. The controller dials it
+/// and signs node certificates for it.
+pub(crate) fn registered_host(cfg: &Config) -> Option<String> {
+    let address = derive_external_address(&cfg.listen_addr);
+    endpoint_host(&address)
+        .filter(|host| !host.is_empty() && *host != "0.0.0.0")
+        .map(str::to_string)
+}
+
 fn derive_external_address(listen_addr: &str) -> String {
     if let Some(port) = listen_addr.strip_prefix("0.0.0.0:") {
         if let Ok(ip) = get_primary_ip() {
