@@ -71979,6 +71979,14 @@ var KINDS = [
     immutable: ["database", "package", "targetNode"]
   },
   {
+    id: "postgresql-cluster",
+    yamlKind: "PostgresqlCluster",
+    title: "PostgreSQL cluster",
+    summary: "One PostgreSQL primary and streaming standbys on kcoreOS nodes, each with an etcd voter. Patroni decides automatic failover. Apply confirms the rollout. Package major, members, VIP, and replication mode stay fixed after create except through the dedicated scale/replace/upgrade RPCs.",
+    mutable: ["parameters", "roles", "databases", "clientNetworks"],
+    immutable: ["package", "members", "replication.mode", "vip"]
+  },
+  {
     id: "container",
     yamlKind: "Container",
     title: "Container",
@@ -72094,8 +72102,8 @@ var KINDS = [
     id: "kubernetes-cluster",
     yamlKind: "KubernetesCluster",
     title: "Kubernetes cluster",
-    summary: "Kubernetes on kcoreOS nodes with Cilium. Apply creates the cluster, or updates it when it exists: adding or removing nodes changes membership. Plan runs node preflight checks and lists blocking issues before any node is rebuilt.",
-    mutable: ["workerNodes", "controlPlaneNodes", "cilium", "highAvailability", "localProvisioner", "scheduleOnControlPlane"],
+    summary: "Kubernetes on kcoreOS nodes with Cilium. Apply creates the cluster, or updates it when it exists: adding or removing nodes changes membership, and changing version upgrades it in place one node at a time. An empty version means the release's pinned Kubernetes. Skipping a minor version or downgrading needs force: true. Plan runs node preflight checks and lists blocking issues before any node is rebuilt.",
+    mutable: ["workerNodes", "controlPlaneNodes", "cilium", "highAvailability", "localProvisioner", "scheduleOnControlPlane", "version"],
     immutable: ["clusterCidr", "serviceCidr", "clusterDns", "apiServerEndpoint", "cni"]
   },
   {
@@ -72244,6 +72252,7 @@ var INTENT = [
   [/\bvirtual machines?\b|\bvms?\b/i, "vm"],
   [/\bnetworks?\b|\bvxlan\b|\bbridge\b/i, "network"],
   [/\bssh keys?\b/i, "ssh-key"],
+  [/\bpostgres(?:ql)?\s+clusters?\b|\bpatroni\b|\bpg-cluster\b/i, "postgresql-cluster"],
   [/\bpostgres(?:ql)?\b/i, "postgresql"],
   [/\bslurm\b|\bhpc\b/i, "slurm-cluster"],
   [/\bkubernetes\b|\bk8s\b/i, "kubernetes-cluster"],
@@ -72523,6 +72532,37 @@ function questionsFor(kind, spec) {
           false
         )
       ].filter((item) => item.required || missing(spec, item.id));
+    case "postgresql-cluster":
+      return [
+        question(
+          "name",
+          "What should the PostgreSQL cluster be called?",
+          "kctl, the dashboard, and credentials use this name.",
+          missing(spec, "name"),
+          { example: "orders" }
+        ),
+        question(
+          "members",
+          "Which three nodes (Dell lab: dell-20, dell-21, node-118), advertise addresses, and interfaces?",
+          "Each member needs nodeId, advertiseAddress, and iface. One member may set role: primary for bootstrap. Lab example: examples/postgresql-cluster/dell-lab.yaml.",
+          !Array.isArray(spec.members) || spec.members.length === 0,
+          { example: "dell-20 at 192.168.40.103 on enp6s0" }
+        ),
+        question(
+          "vip",
+          "Which writer VIP and VRRP router id?",
+          "Held only by the Patroni leader. Must not collide with the Kubernetes API VIP or ingress keepalived.",
+          spec.vip == null,
+          { example: "192.168.40.160/24, virtualRouterId 61" }
+        ),
+        question(
+          "clientNetworks",
+          "Which client networks may connect to 5432?",
+          "Empty means member addresses only. Lab default is 192.168.40.0/24.",
+          false,
+          { example: "192.168.40.0/24" }
+        )
+      ].filter((item) => item.required);
     case "container":
       return [
         question("name", "What should the container be called?", "This is the workload name.", missing(spec, "name")),
@@ -72938,6 +72978,11 @@ function warningsFor(kind, spec) {
   if (kind.id === "postgresql") {
     warnings.push(
       "v1 is one database per node, from the NixOS postgresql package, on the local Unix socket. Deleting the resource removes it from the node config and leaves /var/lib/postgresql on disk."
+    );
+  }
+  if (kind.id === "postgresql-cluster") {
+    warnings.push(
+      "Patroni decides automatic failover through etcd. A ClusterUpdate reboots after switching the leader off the node. There is no backup feature yet; take one by hand before a major upgrade. Lab target: the three Dells via examples/postgresql-cluster/dell-lab.yaml."
     );
   }
   if (kind.id === "kubernetes-cluster") {
@@ -73622,6 +73667,14 @@ function buildApply(kind, spec) {
       return [{ target: "controller", method: "createWorkload", request: containerRequest(spec) }];
     case "postgresql":
       return [{ target: "controller", method: "createPostgresql", request: postgresqlRequest(spec) }];
+    case "postgresql-cluster":
+      return [
+        {
+          target: "controller",
+          method: "createPostgresqlCluster",
+          request: { ...postgresqlClusterPlan(spec), confirm: true }
+        }
+      ];
     case "slurm-cluster": {
       const request = slurmClusterRequest(spec);
       return [{ target: "controller", method: "createSlurmCluster", request }];
@@ -73699,6 +73752,8 @@ function buildRead(kind, name) {
       return named ? { target: "controller", method: "getWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: named } } : { target: "controller", method: "listWorkloads", request: { kind: "WORKLOAD_KIND_CONTAINER" } };
     case "postgresql":
       return named ? { target: "controller", method: "getPostgresql", request: { name: named } } : { target: "controller", method: "listPostgresqls", request: {} };
+    case "postgresql-cluster":
+      return named ? { target: "controller", method: "getPostgresqlCluster", request: { name: named } } : { target: "controller", method: "listPostgresqlClusters", request: {} };
     case "slurm-cluster":
       return named ? { target: "controller", method: "getSlurmCluster", request: { name: named } } : { target: "controller", method: "listSlurmClusters", request: {} };
     case "kubernetes-cluster":
@@ -73759,6 +73814,12 @@ function buildDelete(kind, name) {
       return { target: "controller", method: "deleteWorkload", request: { kind: "WORKLOAD_KIND_CONTAINER", workloadId: id } };
     case "postgresql":
       return { target: "controller", method: "deletePostgresql", request: { name: id } };
+    case "postgresql-cluster":
+      return {
+        target: "controller",
+        method: "deletePostgresqlCluster",
+        request: { name: id, confirm: true, force: false }
+      };
     case "kubernetes-cluster":
       return { target: "controller", method: "deleteKubernetesCluster", request: { name: id, confirm: true, force: false } };
     case "operator":
@@ -73833,6 +73894,9 @@ function buildPlanCall(kind, spec, name) {
       request: { name: request.name, spec: request.spec }
     };
   }
+  if (kind.id === "postgresql-cluster") {
+    return { target: "controller", method: "planPostgresqlCluster", request: postgresqlClusterPlan(spec) };
+  }
   return buildRead(kind, name ?? (typeof spec.name === "string" ? spec.name : void 0));
 }
 var OPERATION_ACTIONS_HINT = "action must be set-vm-state, migrate-vm, cancel-vm-operation, drain-node, cordon-node, uncordon-node, approve-node, reject-node, reboot-node, rotate-node-certs, approve-update, promote-update, cancel-update, rollback-update, reboot-update-node, set-version, slurm-drain-node, slurm-resume-node, slurm-rotate-munge-key, attach-volume, detach-volume, resize-volume, restore-volume, flatten-volume, format-volume, mount-volume, unmount-volume, encrypt-volume, set-route-waf-mode, delete-object-user, grant-operator-role, revoke-operator-role, or install-node";
@@ -73900,6 +73964,8 @@ function buildOperation(action, spec) {
       const canaryNode = opt(spec, "canaryNode") ?? opt(spec, "canaryNodeId");
       const soak = spec.soak ?? spec.canarySoakSeconds;
       if (noCanary && (canaryNode || soak !== void 0)) throw new InputError("noCanary cannot be combined with canaryNode or soak");
+      const channel = opt(spec, "channel") ?? "";
+      if (!["", "community", "enterprise"].includes(channel)) throw new InputError("channel must be community or enterprise");
       return {
         target: "controller",
         method: "setClusterVersion",
@@ -73910,7 +73976,8 @@ function buildOperation(action, spec) {
           dryRun: boolish(spec.dryRun),
           canarySoakSeconds: soak === void 0 ? 0 : soakSeconds(soak),
           noCanary,
-          canaryNodeId: canaryNode ? assertName(canaryNode, "canary node") : ""
+          canaryNodeId: canaryNode ? assertName(canaryNode, "canary node") : "",
+          channel
         }
       };
     }
@@ -74649,7 +74716,8 @@ function kubernetesRequest(spec) {
     },
     controlPlaneNodes: controlPlane,
     workerNodes: kubernetesNodes(spec.workerNodes, "worker", "workerNodes"),
-    scheduleOnControlPlane: boolish(spec.scheduleOnControlPlane)
+    scheduleOnControlPlane: boolish(spec.scheduleOnControlPlane),
+    version: opt(spec, "version") ?? ""
   };
   if (boolish(ha.enabled)) {
     result.highAvailability = {
@@ -74680,7 +74748,7 @@ function kubernetesRequest(spec) {
       })
     };
   }
-  return { name, spec: result };
+  return { name, spec: result, force: boolish(spec.force) };
 }
 var POSTGRESQL_PACKAGES = /* @__PURE__ */ new Set([
   "postgresql",
@@ -74689,6 +74757,12 @@ var POSTGRESQL_PACKAGES = /* @__PURE__ */ new Set([
   "postgresql_16",
   "postgresql_17"
 ]);
+function postgresqlClusterPlan(spec) {
+  const name = assertName(required3(spec, "name", "name"), "name");
+  const body = { ...spec };
+  delete body.name;
+  return { name, spec: body };
+}
 function postgresqlRequest(spec) {
   const name = assertName(required3(spec, "name", "name"), "name");
   const database = opt(spec, "database") ?? name;

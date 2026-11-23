@@ -257,7 +257,20 @@ test("a Kubernetes cluster apply carries the spec the controller reads", () => {
   assert.equal(decoded.spec.controlPlaneNodes[1].role, "control-plane");
   assert.deepEqual(decoded.spec.ciliumConfig.loadBalancerIpPools, ["192.168.40.220/29"]);
   assert.equal(decoded.spec.highAvailability.vipAddress, "192.168.40.200");
-  assert.equal(buildPlanCall(kind, { name: "prod", clusterCidr: "a", serviceCidr: "b", apiServerEndpoint: "c:1", controlPlaneNodes: [{ nodeId: "n", advertiseAddress: "1.2.3.4" }] }).method, "planKubernetesCluster");
+  assert.equal(decoded.spec.version, "");
+  const plan = buildPlanCall(kind, {
+    name: "prod",
+    clusterCidr: "a",
+    serviceCidr: "b",
+    apiServerEndpoint: "c:1",
+    controlPlaneNodes: [{ nodeId: "n", advertiseAddress: "1.2.3.4" }],
+    version: "1.36.6",
+    force: true,
+  });
+  assert.equal(plan.method, "planKubernetesCluster");
+  const planned = wire(plan) as { force: boolean; spec: Record<string, any> };
+  assert.equal(planned.spec.version, "1.36.6");
+  assert.equal(planned.force, true);
   assert.throws(() => buildApply(kind, { name: "prod", clusterCidr: "a", serviceCidr: "b", apiServerEndpoint: "c:1" }), /controlPlaneNodes/);
   assert.deepEqual(buildDelete(kind, "prod").request, { name: "prod", confirm: true, force: false });
 });
@@ -382,7 +395,10 @@ test("set-version and promote-update reach the release RPCs", () => {
     canarySoakSeconds: 14400,
     noCanary: false,
     canaryNodeId: "node-b",
+    channel: "",
   });
+  assert.equal(wire(buildOperation("set-version", { version: "0.7.0", channel: "enterprise" })).channel, "enterprise");
+  assert.throws(() => buildOperation("set-version", { version: "0.7.0", channel: "beta" }), /channel/);
   const plain = buildOperation("set-version", { version: "v0.7.0", noCanary: true, dryRun: true });
   const decoded = wire(plain);
   assert.equal(decoded.version, "v0.7.0");
