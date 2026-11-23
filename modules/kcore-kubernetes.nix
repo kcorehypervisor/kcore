@@ -10,6 +10,7 @@ let
   # Cilium ports
   ciliumPorts = {
     healthPort = 9879;
+    clusterHealthPort = 4240;
     metricsPort = 9962;
     vxlanPort = 8472;
     genevePort = 6081;
@@ -606,6 +607,7 @@ let
               --tls-private-key-file=${pki}/apiserver.key \
               --kubelet-client-certificate=${pki}/apiserver-kubelet-client.crt \
               --kubelet-client-key=${pki}/apiserver-kubelet-client.key \
+              --kubelet-preferred-address-types=InternalIP,Hostname,InternalDNS,ExternalDNS,ExternalIP \
               --service-account-key-file=${pki}/sa.pub \
               --service-account-signing-key-file=${pki}/sa.key \
               --service-account-issuer=https://${c.apiServerEndpoint} \
@@ -1370,6 +1372,7 @@ in
           k8sPorts.kubeletHealthz
           k8sPorts.etcdClient
           k8sPorts.etcdPeer
+          ciliumPorts.clusterHealthPort
         ]
         ++ lib.optionals (cfg.role == "control-plane") [
           k8sPorts.kubeScheduler
@@ -1631,6 +1634,7 @@ in
               --tls-private-key-file=/etc/kubernetes/pki/apiserver.key \
               --kubelet-client-certificate=/etc/kubernetes/pki/apiserver-kubelet-client.crt \
               --kubelet-client-key=/etc/kubernetes/pki/apiserver-kubelet-client.key \
+              --kubelet-preferred-address-types=InternalIP,Hostname,InternalDNS,ExternalDNS,ExternalIP \
               --service-account-key-file=/etc/kubernetes/pki/sa.pub \
               --service-account-signing-key-file=/etc/kubernetes/pki/sa.key \
               --service-account-issuer=https://${cfg.apiServerEndpoint} \
@@ -1878,6 +1882,12 @@ in
       );
       networking.firewall.trustedInterfaces = lib.concatLists (
         map (extra: extra.networking.firewall.trustedInterfaces or [ ]) extras
+      );
+      # Cilium routes the pod CIDR through cilium_host, but replies from a
+      # local pod arrive on its lxc device, so the strict reverse-path check
+      # drops every host-to-local-pod packet.
+      networking.firewall.checkReversePath = lib.mkIf (cfg.enable || extras != [ ]) (
+        lib.mkDefault "loose"
       );
       systemd.services = lib.mkMerge (map (extra: extra.systemd.services or { }) extras);
     }
