@@ -1288,6 +1288,15 @@ message PrepareSystemUpdateRequest {
   // Release tag (vX.Y.Z). The node stages the release host flake for this
   // tag and checks that its lock pins flake_rev.
   string flake_tag = 13;
+  // GitHub release asset URL for the enterprise prebuilt Nix file cache.
+  string prebuilt_url = 14;
+  // SHA-256 hex of the prebuilt tar.
+  string prebuilt_sha256 = 15;
+  // Classic GitHub PAT used only to download prebuilt_url. Never logged.
+  string prebuilt_token = 16;
+  // When true, stage the host flake at flake_rev instead of flake_tag so
+  // the public source is fetched without needing a pushed tag.
+  bool pin_source_by_rev = 17;
 }
 
 message PrepareSystemUpdateResponse {

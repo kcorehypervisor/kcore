@@ -202,8 +202,8 @@ export const KINDS: ResourceKind[] = [
     yamlKind: "KubernetesCluster",
     title: "Kubernetes cluster",
     summary:
-      "Kubernetes on kcoreOS nodes with Cilium. Apply creates the cluster, or updates it when it exists: adding or removing nodes changes membership. Plan runs node preflight checks and lists blocking issues before any node is rebuilt.",
-    mutable: ["workerNodes", "controlPlaneNodes", "cilium", "highAvailability", "localProvisioner", "scheduleOnControlPlane"],
+      "Kubernetes on kcoreOS nodes with Cilium. Apply creates the cluster, or updates it when it exists: adding or removing nodes changes membership, and changing version upgrades it in place one node at a time. An empty version means the release's pinned Kubernetes. Skipping a minor version or downgrading needs force: true. Plan runs node preflight checks and lists blocking issues before any node is rebuilt.",
+    mutable: ["workerNodes", "controlPlaneNodes", "cilium", "highAvailability", "localProvisioner", "scheduleOnControlPlane", "version"],
     immutable: ["clusterCidr", "serviceCidr", "clusterDns", "apiServerEndpoint", "cni"],
   },
   {

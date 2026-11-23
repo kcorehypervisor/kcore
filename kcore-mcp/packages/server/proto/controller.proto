@@ -217,6 +217,11 @@ service Controller {
   // nodes one at a time, and stops at the first failing node.
   rpc SetClusterVersion(SetClusterVersionRequest) returns (SetClusterVersionResponse);
   rpc GetClusterVersion(GetClusterVersionRequest) returns (GetClusterVersionResponse);
+  // Subscription token for the private enterprise update channel
+  // (kcorehypervisor/enterprise). Cluster-admin only; the token is a
+  // GitHub classic PAT with repo scope for a dedicated collaborator account.
+  rpc SetSubscription(SetSubscriptionRequest) returns (SetSubscriptionResponse);
+  rpc GetSubscription(GetSubscriptionRequest) returns (GetSubscriptionResponse);
 
   // CephCluster — declarative cluster-scoped Ceph SAN configuration.
   rpc PlanCephCluster(PlanCephClusterRequest) returns (PlanCephClusterResponse);
@@ -2569,6 +2574,13 @@ message ClusterUpdateTarget {
   // Release tag (vX.Y.Z). Nodes install the release host flake for this tag,
   // the same flake.nix and flake.lock the tag's ISO installs.
   string tag = 6;
+  // "community" (default) or "enterprise". Enterprise pins source by
+  // flake_rev and downloads a prebuilt Nix file cache during prepare.
+  string channel = 7;
+  // GitHub release asset URL for the prebuilt tar (enterprise only).
+  string prebuilt_url = 8;
+  // SHA-256 hex of the prebuilt tar, from the enterprise SHA256SUMS.
+  string prebuilt_sha256 = 9;
 }
 
 message ClusterUpdateSelector {
@@ -2795,6 +2807,7 @@ message SetClusterVersionRequest {
   string version = 1;
   // Repository the tag is resolved in. Empty means github:kcorehypervisor/kcore.
   // An air-gapped site names its mirror, for example git+https://git.example/kcore.
+  // Refused together with channel=enterprise.
   string flake_ref = 2;
   // Migrate guests off a node before it reboots into a new kernel.
   bool drain_vms = 3;
@@ -2809,6 +2822,9 @@ message SetClusterVersionRequest {
   // first node in rollout order. A node that runs a controller is refused
   // unless every node does.
   string canary_node_id = 7;
+  // "community", "enterprise", or empty. Empty uses enterprise when a
+  // subscription is stored, otherwise community.
+  string channel = 8;
 }
 
 message SetClusterVersionResponse {
@@ -2847,6 +2863,33 @@ message GetClusterVersionResponse {
   string update_name = 4;
   ClusterUpdatePhase phase = 5;
   repeated NodeVersion nodes = 6;
+}
+
+message SetSubscriptionRequest {
+  // Classic GitHub PAT with repo scope. Empty together with clear=true
+  // removes the stored subscription.
+  string token = 1;
+  // When true, delete the stored subscription (return to community).
+  bool clear = 2;
+}
+
+message SetSubscriptionResponse {
+  bool success = 1;
+  string message = 2;
+  // Login of the GitHub user the token authenticates as, empty when cleared.
+  string github_login = 3;
+}
+
+message GetSubscriptionRequest {}
+
+message GetSubscriptionResponse {
+  // True when a token is stored.
+  bool configured = 1;
+  // GitHub login checked when the token was last verified, empty if never.
+  string github_login = 2;
+  // Latest enterprise release tag the token can see, empty on failure.
+  string latest_release = 3;
+  string message = 4;
 }
 
 // --- CephCluster ----------------------------------------------------------------------------
@@ -3343,15 +3386,22 @@ message KubernetesClusterSpec {
   // Control-plane nodes also accept pods. A cluster can list no separate
   // worker nodes and still schedule workloads on the masters.
   bool schedule_on_control_plane = 11;
+  // Desired Kubernetes version, for example "1.36.6". Empty is the host
+  // nixpkgs pin. Changing it and re-applying the same manifest upgrades the
+  // cluster in place: control planes first, then workers, one node at a time.
+  string version = 12;
 }
 
 message KubernetesClusterStatus {
-  string phase = 1;                 // pending, bootstrapping, scaling, ready, degraded, failed
+  string phase = 1;                 // pending, bootstrapping, scaling, upgrading, ready, degraded, failed
   string message = 2;
   int32 ready_control_planes = 3;
   int32 ready_workers = 4;
   google.protobuf.Timestamp last_updated = 5;
   repeated string active_node_ids = 6;
+  // Kubernetes version rendered on each member, keyed by node id. During an
+  // upgrade the members move to spec.version one at a time.
+  map<string, string> node_versions = 7;
 }
 
 message KubernetesCluster {
@@ -3366,6 +3416,8 @@ message KubernetesCluster {
 message PlanKubernetesClusterRequest {
   string name = 1;
   KubernetesClusterSpec spec = 2;
+  // Same as UpdateKubernetesClusterRequest.force.
+  bool force = 3;
 }
 
 message NodePlanResult {
@@ -3397,6 +3449,9 @@ message UpdateKubernetesClusterRequest {
   string name = 1;
   KubernetesClusterSpec spec = 2;
   bool confirm = 3;
+  // Allow skipping a minor version, downgrading, or retargeting an upgrade
+  // that is still running.
+  bool force = 4;
 }
 
 message UpdateKubernetesClusterResponse {
