@@ -1,5 +1,4 @@
-{ ... }:
-{
+_: {
   kcore.slurm = {
     enable = true;
     nodeId = "node-2";
