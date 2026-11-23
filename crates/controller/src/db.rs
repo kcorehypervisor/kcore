@@ -8514,6 +8514,22 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_kubernetes_ready_counts(
+        &self,
+        cluster_name: &str,
+        ready_control_planes: i32,
+        ready_workers: i32,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_clusters
+             SET ready_control_planes=?1, ready_workers=?2
+             WHERE name=?3",
+            params![ready_control_planes, ready_workers, cluster_name],
+        )?;
+        Ok(())
+    }
+
     /// Record that etcd has quorum and the API server answered.
     pub fn mark_kubernetes_cluster_ready(
         &self,
