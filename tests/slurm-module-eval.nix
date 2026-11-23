@@ -4,6 +4,7 @@
   pkgs,
   lib,
   nixosSystem,
+  mkNode,
 }:
 let
   base = {
@@ -100,6 +101,10 @@ let
     ];
   };
 
+  # An installed node builds through its host flake, which only imports the
+  # node-local files mkNode lists.
+  installed = mkNode { root = ./fixtures/slurm-host; };
+
   cfg = controller.config;
   disabledCfg = disabled.config;
   rules = cfg.networking.firewall.extraInputRules;
@@ -124,6 +129,8 @@ assert disabledCfg.kcore.slurm.enable == false;
 assert disabledCfg.services.munge.enable == false;
 assert disabledCfg.services.slurm.server.enable == false;
 assert disabledCfg.networking.firewall.extraInputRules == "";
+assert installed.config.kcore.slurm.enable;
+assert installed.config.services.slurm.client.enable;
 pkgs.runCommand "slurm-module-eval-ok" { } ''
   echo ok > "$out"
 ''
