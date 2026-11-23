@@ -215,16 +215,27 @@ let
     else if scheduleOnControlPlane then
       "node-role.kubernetes.io/control-plane= node-role.kubernetes.io/worker="
     else
-      "node-role.kubernetes.io/control-plane=";
+      "node-role.kubernetes.io/control-plane= node-role.kubernetes.io/worker-";
+
+  controlPlaneTaint = "node-role.kubernetes.io/control-plane:NoSchedule";
 
   nodeRoleApply =
-    package: kubeconfig: hostname: labels:
+    package: kubeconfig: hostname: labels: schedulable:
     pkgs.writeShellScript "kcore-node-roles" ''
       set -eu
       kube=${package}/bin/kubectl
       for _ in $(${pkgs.coreutils}/bin/seq 1 90); do
         if "$kube" --kubeconfig=${kubeconfig} get node ${hostname} >/dev/null 2>&1; then
           "$kube" --kubeconfig=${kubeconfig} label node ${hostname} ${labels} --overwrite
+          ${
+            if schedulable then
+              ''
+                if "$kube" --kubeconfig=${kubeconfig} get node ${hostname} -o jsonpath='{.spec.taints[*].key}' | ${pkgs.gnugrep}/bin/grep -qw node-role.kubernetes.io/control-plane; then
+                  "$kube" --kubeconfig=${kubeconfig} taint node ${hostname} ${controlPlaneTaint}-
+                fi''
+            else
+              ''"$kube" --kubeconfig=${kubeconfig} taint node ${hostname} ${controlPlaneTaint} --overwrite''
+          }
           exit 0
         fi
         sleep 2
@@ -725,9 +736,10 @@ let
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = nodeRoleApply package "${root}/admin.conf" config.networking.hostName (
-            roleLabelArgs c.role c.scheduleOnControlPlane
-          );
+          ExecStart =
+            nodeRoleApply package "${root}/admin.conf" config.networking.hostName
+              (roleLabelArgs c.role c.scheduleOnControlPlane)
+              c.scheduleOnControlPlane;
           Restart = "on-failure";
           RestartSec = "15s";
         };
@@ -842,7 +854,7 @@ in
     scheduleOnControlPlane = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Register this control-plane node as a schedulable worker.";
+      description = "Let workloads run on this control-plane node. When false it is tainted NoSchedule.";
     };
 
     clusterName = lib.mkOption {
@@ -1742,9 +1754,10 @@ in
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = nodeRoleApply cfg.package "/etc/kubernetes/admin.conf" config.networking.hostName (
-            roleLabelArgs cfg.role cfg.scheduleOnControlPlane
-          );
+          ExecStart =
+            nodeRoleApply cfg.package "/etc/kubernetes/admin.conf" config.networking.hostName
+              (roleLabelArgs cfg.role cfg.scheduleOnControlPlane)
+              cfg.scheduleOnControlPlane;
           Restart = "on-failure";
           RestartSec = "15s";
         };

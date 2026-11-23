@@ -524,7 +524,10 @@ impl KubernetesOrchestrator {
                     .filter(|pool| !pool.is_empty())
                     .map(|pool| pool.to_string())
                     .collect(),
-                schedule_on_control_plane: cfg.schedule_on_control_plane,
+                schedule_on_control_plane: control_planes_take_workloads(
+                    cfg.schedule_on_control_plane,
+                    &membership,
+                ),
                 provisioner_manifest: applied_provisioner_manifest(
                     &cfg.local_provisioner_json,
                     &cluster.api_server_endpoint,
@@ -1802,6 +1805,18 @@ struct RenderedNodeNix {
 
 /// Shared mode is applied on the cluster. LVM mode creates a thin pool and
 /// does not install a provisioner.
+/// A cluster without workers has nowhere else to run pods, so its control
+/// planes stay untainted whatever the spec says.
+fn control_planes_take_workloads(
+    schedule_on_control_plane: bool,
+    membership: &[crate::db::KubernetesClusterNodeRow],
+) -> bool {
+    schedule_on_control_plane
+        || !membership
+            .iter()
+            .any(|row| row.role == "worker" && !row.pending_removal)
+}
+
 fn applied_provisioner_manifest(json: &str, api_server_endpoint: &str) -> String {
     let provisioner = crate::kubernetes_local::decode(json)
         .unwrap_or_else(|_| crate::kubernetes_local::LocalProvisioner::disabled());
@@ -2018,6 +2033,46 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
 
         // Check every 30 seconds
         sleep(Duration::from_secs(30)).await;
+    }
+}
+
+#[cfg(test)]
+mod taint_tests {
+    use super::control_planes_take_workloads;
+    use crate::db::KubernetesClusterNodeRow;
+
+    fn member(role: &str, pending_removal: bool) -> KubernetesClusterNodeRow {
+        KubernetesClusterNodeRow {
+            cluster_name: "c".into(),
+            node_id: format!("{role}-{pending_removal}"),
+            role: role.into(),
+            advertise_address: String::new(),
+            iface: String::new(),
+            initial_cluster: false,
+            join_existing: false,
+            kubelet_ready: true,
+            pending_join: false,
+            pending_removal,
+            k8s_node_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn control_planes_are_tainted_only_when_workers_exist() {
+        let cp = member("control-plane", false);
+        let worker = member("worker", false);
+        let leaving = member("worker", true);
+
+        assert!(!control_planes_take_workloads(
+            false,
+            &[cp.clone(), worker.clone()]
+        ));
+        assert!(control_planes_take_workloads(true, &[cp.clone(), worker]));
+        assert!(control_planes_take_workloads(
+            false,
+            std::slice::from_ref(&cp)
+        ));
+        assert!(control_planes_take_workloads(false, &[cp, leaving]));
     }
 }
 

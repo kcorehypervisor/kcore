@@ -19952,10 +19952,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             };
             cluster_row.status_message = if spec.schedule_on_control_plane {
                 "control-plane nodes accept workloads; node configuration deployed".to_string()
-            } else if recovered {
-                "cluster configuration deployed".to_string()
             } else {
-                format!("{}; node configuration deployed", existing.status_message)
+                "cluster configuration deployed".to_string()
             };
         }
         self.db
