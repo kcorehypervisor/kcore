@@ -81,6 +81,65 @@ fn guest_virtio_serial(vol: &VolumeRow, runtime_vm_name: &str) -> String {
 }
 
 #[cfg(test)]
+mod kubernetes_health_tests {
+    use super::kubernetes_health_response;
+    use crate::kubernetes_orchestrator::{ClusterHealth, MemberHealth};
+
+    fn member(id: &str, role: &str, ready: Option<bool>, etcd: bool) -> MemberHealth {
+        MemberHealth {
+            node_id: id.into(),
+            role: role.into(),
+            ready,
+            etcd_healthy: etcd,
+            api_healthy: etcd,
+        }
+    }
+
+    #[test]
+    fn health_comes_from_the_probes_not_the_roles() {
+        let healthy = ClusterHealth {
+            api_reachable: true,
+            nodes: vec![
+                member("cp", "control-plane", Some(true), true),
+                member("w1", "worker", Some(true), false),
+            ],
+        };
+        let response = kubernetes_health_response(&healthy, false);
+        assert_eq!(response.overall_health, "healthy");
+        assert_eq!((response.ready_workers, response.total_workers), (1, 1));
+
+        let worker_down = ClusterHealth {
+            api_reachable: true,
+            nodes: vec![
+                member("cp", "control-plane", Some(true), true),
+                member("w1", "worker", Some(false), false),
+            ],
+        };
+        let response = kubernetes_health_response(&worker_down, false);
+        assert_eq!(response.overall_health, "degraded");
+        assert_eq!(response.node_health[1].kubernetes_status, "NotReady");
+
+        let etcd_down = ClusterHealth {
+            api_reachable: true,
+            nodes: vec![member("cp", "control-plane", Some(true), false)],
+        };
+        let response = kubernetes_health_response(&etcd_down, false);
+        assert_eq!(response.overall_health, "critical");
+        assert!(!response.etcd_healthy);
+        assert!(!response.node_health[0].etcd_active);
+
+        let api_down = ClusterHealth {
+            api_reachable: false,
+            nodes: vec![member("cp", "control-plane", None, true)],
+        };
+        let response = kubernetes_health_response(&api_down, true);
+        assert_eq!(response.overall_health, "critical");
+        assert_eq!(response.node_health[0].kubernetes_status, "Unknown");
+        assert_eq!((response.ready_workers, response.total_workers), (0, 1));
+    }
+}
+
+#[cfg(test)]
 mod guest_serial_tests {
     use super::*;
 
@@ -20078,8 +20137,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
 
-        let cluster = self
-            .db
+        self.db
             .get_kubernetes_cluster(&req.name)
             .map_err(internal_db)?
             .ok_or_else(|| Status::not_found(format!("cluster {} not found", req.name)))?;
@@ -20089,83 +20147,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(internal_db)?
             .map(|config| config.schedule_on_control_plane)
             .unwrap_or(false);
-        let mut control_plane_ready_budget =
-            if schedule_on_control_plane && cluster.phase == "ready" {
-                cluster.ready_control_planes
-            } else {
-                0
-            };
 
-        let nodes = self
-            .db
-            .list_kubernetes_cluster_nodes(&req.name)
-            .map_err(internal_db)?;
-
-        let mut node_health = Vec::new();
-        let mut ready_control_planes = 0;
-        let mut total_control_planes = 0;
-        let mut ready_workers = 0;
-        let mut total_workers = 0;
-
-        for node in &nodes {
-            let control_plane = node.role == "control-plane";
-            if control_plane {
-                total_control_planes += 1;
-                if node.kubelet_ready {
-                    ready_control_planes += 1;
-                }
-            }
-            if !control_plane || schedule_on_control_plane {
-                total_workers += 1;
-                let ready = if node.kubelet_ready {
-                    true
-                } else if control_plane && control_plane_ready_budget > 0 {
-                    control_plane_ready_budget -= 1;
-                    true
-                } else {
-                    false
-                };
-                if ready {
-                    ready_workers += 1;
-                }
-            }
-
-            node_health.push(controller_proto::NodeHealth {
-                node_id: node.node_id.clone(),
-                kubernetes_status: if node.kubelet_ready {
-                    "Ready"
-                } else {
-                    "NotReady"
-                }
-                .to_string(),
-                kubelet_active: node.kubelet_ready,
-                etcd_active: node.role == "control-plane",
-                api_server_active: node.role == "control-plane",
-            });
-        }
-
-        let overall_health =
-            if ready_control_planes == total_control_planes && ready_workers == total_workers {
-                "healthy"
-            } else if ready_control_planes > 0 {
-                "degraded"
-            } else {
-                "critical"
-            };
-
-        Ok(Response::new(
-            controller_proto::GetKubernetesClusterHealthResponse {
-                overall_health: overall_health.to_string(),
-                ready_control_planes,
-                total_control_planes,
-                ready_workers,
-                total_workers,
-                etcd_healthy: ready_control_planes > 0,
-                etcd_member_count: total_control_planes,
-                api_server_reachable: ready_control_planes > 0,
-                node_health,
-            },
-        ))
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let health = orchestrator
+            .observe_health(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("kubernetes health: {e:#}")))?;
+        Ok(Response::new(kubernetes_health_response(
+            &health,
+            schedule_on_control_plane,
+        )))
     }
 
     async fn classify_disk_layout(
@@ -20903,6 +20897,72 @@ fn stored_cni(api_endpoint: &str, requested: &str) -> String {
         }
     } else {
         "bridge".to_string()
+    }
+}
+
+fn kubernetes_health_response(
+    health: &crate::kubernetes_orchestrator::ClusterHealth,
+    schedule_on_control_plane: bool,
+) -> controller_proto::GetKubernetesClusterHealthResponse {
+    let mut node_health = Vec::new();
+    let mut ready_control_planes = 0;
+    let mut total_control_planes = 0;
+    let mut ready_workers = 0;
+    let mut total_workers = 0;
+    let mut healthy_etcd = 0;
+
+    for node in &health.nodes {
+        let control_plane = node.role != "worker";
+        let ready = node.ready == Some(true);
+        if control_plane {
+            total_control_planes += 1;
+            if ready {
+                ready_control_planes += 1;
+            }
+            if node.etcd_healthy {
+                healthy_etcd += 1;
+            }
+        }
+        if !control_plane || schedule_on_control_plane {
+            total_workers += 1;
+            if ready {
+                ready_workers += 1;
+            }
+        }
+        node_health.push(controller_proto::NodeHealth {
+            node_id: node.node_id.clone(),
+            kubernetes_status: match node.ready {
+                Some(true) => "Ready",
+                Some(false) => "NotReady",
+                None => "Unknown",
+            }
+            .to_string(),
+            kubelet_active: ready,
+            etcd_active: node.etcd_healthy,
+            api_server_active: node.api_healthy,
+        });
+    }
+
+    let etcd_quorum = total_control_planes > 0 && healthy_etcd > total_control_planes / 2;
+    let all_ready = ready_control_planes == total_control_planes && ready_workers == total_workers;
+    let overall_health = if !health.api_reachable || !etcd_quorum {
+        "critical"
+    } else if all_ready && healthy_etcd == total_control_planes {
+        "healthy"
+    } else {
+        "degraded"
+    };
+
+    controller_proto::GetKubernetesClusterHealthResponse {
+        overall_health: overall_health.to_string(),
+        ready_control_planes,
+        total_control_planes,
+        ready_workers,
+        total_workers,
+        etcd_healthy: etcd_quorum,
+        etcd_member_count: total_control_planes,
+        api_server_reachable: health.api_reachable,
+        node_health,
     }
 }
 

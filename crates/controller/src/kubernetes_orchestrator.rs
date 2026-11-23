@@ -34,8 +34,26 @@ pub enum BootstrapPhase {
     JoiningNodes,
     WaitingForQuorum,
     StartingApiServer,
+    WaitingForNodes,
     Ready,
     Failed,
+}
+
+const NODES_READY_TIMEOUT_SECS: u64 = 600;
+pub const NODES_NOT_READY: &str = "nodes not Ready";
+
+pub struct MemberHealth {
+    pub node_id: String,
+    pub role: String,
+    /// None when the API could not list nodes.
+    pub ready: Option<bool>,
+    pub etcd_healthy: bool,
+    pub api_healthy: bool,
+}
+
+pub struct ClusterHealth {
+    pub api_reachable: bool,
+    pub nodes: Vec<MemberHealth>,
 }
 
 impl BootstrapPhase {
@@ -47,6 +65,7 @@ impl BootstrapPhase {
             Self::JoiningNodes => "joining-nodes",
             Self::WaitingForQuorum => "waiting-for-quorum",
             Self::StartingApiServer => "starting-apiserver",
+            Self::WaitingForNodes => "waiting-for-nodes",
             Self::Ready => "ready",
             Self::Failed => "failed",
         }
@@ -68,6 +87,13 @@ impl KubernetesOrchestrator {
             .lock()
             .expect("kubernetes inflight")
             .insert(cluster_name.to_string())
+    }
+
+    fn is_claimed(&self, cluster_name: &str) -> bool {
+        self.inflight
+            .lock()
+            .expect("kubernetes inflight")
+            .contains(cluster_name)
     }
 
     fn release(&self, cluster_name: &str) {
@@ -226,16 +252,173 @@ impl KubernetesOrchestrator {
             .await?;
         self.wait_for_apiserver(cluster_name, 180).await?;
 
-        // Phase 5: Mark ready
-        self.update_phase(cluster_name, BootstrapPhase::Ready)
+        // Phase 5: every member has registered and reports Ready
+        self.update_phase(cluster_name, BootstrapPhase::WaitingForNodes)
             .await?;
+        self.wait_for_nodes_ready(
+            cluster_name,
+            control_planes as i32,
+            NODES_READY_TIMEOUT_SECS,
+        )
+        .await?;
 
         info!(
             cluster = cluster_name,
             nodes = nodes.len(),
-            "cluster bootstrap completed successfully"
+            "cluster bootstrap completed"
         );
         Ok(())
+    }
+
+    /// Ready once every member is Ready in the API. After the timeout the
+    /// cluster is degraded and names the missing nodes; the health loop
+    /// promotes it when they come up.
+    async fn wait_for_nodes_ready(
+        &self,
+        cluster_name: &str,
+        control_planes: i32,
+        timeout_secs: u64,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        let mut not_ready = Vec::new();
+        while start.elapsed().as_secs() < timeout_secs {
+            match self.refresh_node_readiness(cluster_name).await {
+                Ok(missing) if missing.is_empty() => {
+                    self.db
+                        .mark_kubernetes_cluster_ready(cluster_name, control_planes)?;
+                    return Ok(());
+                }
+                Ok(missing) => not_ready = missing,
+                Err(e) => info!(cluster = cluster_name, error = %e, "node readiness check failed"),
+            }
+            sleep(Duration::from_secs(10)).await;
+        }
+        let message = if not_ready.is_empty() {
+            format!("{NODES_NOT_READY}: the API did not list the nodes")
+        } else {
+            format!("{NODES_NOT_READY}: {}", not_ready.join(", "))
+        };
+        self.db
+            .set_kubernetes_cluster_status(cluster_name, "degraded", &message)?;
+        Ok(())
+    }
+
+    /// Store each member's Ready condition and the ready counts from the API
+    /// node list. Returns the members that are not Ready.
+    async fn refresh_node_readiness(&self, cluster_name: &str) -> Result<Vec<String>> {
+        let api_nodes = self.list_api_nodes(cluster_name, None).await?;
+        let mut not_ready = Vec::new();
+        let mut ready_control_planes = 0;
+        let mut ready_workers = 0;
+        for mut row in self.db.list_kubernetes_cluster_nodes(cluster_name)? {
+            if row.pending_join || row.pending_removal {
+                continue;
+            }
+            let hostname = self
+                .db
+                .get_node(&row.node_id)?
+                .map(|node| node.hostname)
+                .unwrap_or_default();
+            let ip = self.member_ip(&row).unwrap_or_default();
+            let listed = kubernetes_lifecycle::match_registered_node(
+                &api_nodes,
+                &row.k8s_node_name,
+                &hostname,
+                &ip,
+            );
+            let ready = listed.is_some_and(|node| node.ready);
+            if !ready {
+                not_ready.push(row.node_id.clone());
+            } else if row.role == "worker" {
+                ready_workers += 1;
+            } else {
+                ready_control_planes += 1;
+            }
+            let name = listed
+                .map(|node| node.name.clone())
+                .unwrap_or_else(|| row.k8s_node_name.clone());
+            if row.kubelet_ready != ready || row.k8s_node_name != name {
+                row.kubelet_ready = ready;
+                row.k8s_node_name = name;
+                self.db.upsert_kubernetes_cluster_node(&row)?;
+            }
+        }
+        self.db
+            .set_kubernetes_ready_counts(cluster_name, ready_control_planes, ready_workers)?;
+        Ok(not_ready)
+    }
+
+    /// Live etcd, API server, and node readiness for every member.
+    pub async fn observe_health(&self, cluster_name: &str) -> Result<ClusterHealth> {
+        let cluster = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+        let pki = self.db.load_kubernetes_pki(cluster_name)?;
+        let api_reachable = self.apiserver_is_ready(cluster_name).await?;
+        let api_nodes = if api_reachable {
+            match self.list_api_nodes(cluster_name, None).await {
+                Ok(nodes) => Some(nodes),
+                Err(e) => {
+                    info!(cluster = cluster_name, error = %e, "listing API nodes failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let endpoint = endpoint_host_port(&cluster.api_server_endpoint);
+        let api_host = endpoint.split(':').next().unwrap_or("").to_string();
+        let api_port =
+            crate::nixgen::kubernetes_listen_ports(&cluster.api_server_endpoint).api_server;
+
+        let mut nodes = Vec::new();
+        for row in self.db.list_kubernetes_cluster_nodes(cluster_name)? {
+            let control_plane = row.role != "worker";
+            let hostname = self
+                .db
+                .get_node(&row.node_id)?
+                .map(|node| node.hostname)
+                .unwrap_or_default();
+            let ip = self.member_ip(&row).unwrap_or_default();
+            let ready = api_nodes.as_ref().map(|listed| {
+                kubernetes_lifecycle::match_registered_node(
+                    listed,
+                    &row.k8s_node_name,
+                    &hostname,
+                    &ip,
+                )
+                .is_some_and(|node| node.ready)
+            });
+            let etcd_healthy = control_plane
+                && self
+                    .probe_etcd_member(cluster_name, &ip)
+                    .await
+                    .unwrap_or(false);
+            // Every control plane serves the same certificate, so check the
+            // node's address against the cluster endpoint's name.
+            let api_healthy = control_plane
+                && !ip.is_empty()
+                && match &pki {
+                    Some(pki) => {
+                        apiserver_ready_at(&format!("{ip}:{api_port}"), &api_host, &pki.ca_cert)
+                            .await
+                            .unwrap_or(false)
+                    }
+                    None => false,
+                };
+            nodes.push(MemberHealth {
+                node_id: row.node_id,
+                role: row.role,
+                ready,
+                etcd_healthy,
+                api_healthy,
+            });
+        }
+        Ok(ClusterHealth {
+            api_reachable,
+            nodes,
+        })
     }
 
     async fn get_cluster_nodes(&self, cluster_name: &str) -> Result<Vec<ClusterNode>> {
@@ -732,10 +915,20 @@ impl KubernetesOrchestrator {
 
     /// A cluster left in `failed` by the old stub health check can already
     /// have etcd and the API server up. Promote it without minting new PKI.
+    /// A ready cluster only has its node readiness and counts refreshed.
     async fn promote_if_healthy(&self, cluster_name: &str) -> Result<()> {
+        if self.is_claimed(cluster_name) {
+            return Ok(());
+        }
         let Some(cluster) = self.db.get_kubernetes_cluster(cluster_name)? else {
             return Ok(());
         };
+        if cluster.phase == "ready" {
+            if let Err(e) = self.refresh_node_readiness(cluster_name).await {
+                info!(cluster = cluster_name, error = %e, "node readiness refresh failed");
+            }
+            return Ok(());
+        }
         if crate::kubernetes_lifecycle::promotion_blocked(&cluster.phase, &cluster.status_message) {
             return Ok(());
         }
@@ -745,6 +938,17 @@ impl KubernetesOrchestrator {
             return Ok(());
         }
         if !self.apiserver_is_ready(cluster_name).await? {
+            return Ok(());
+        }
+        let not_ready = self.refresh_node_readiness(cluster_name).await?;
+        if !not_ready.is_empty() {
+            if cluster.phase == "degraded" && cluster.status_message.starts_with(NODES_NOT_READY) {
+                self.db.set_kubernetes_cluster_status(
+                    cluster_name,
+                    "degraded",
+                    &format!("{NODES_NOT_READY}: {}", not_ready.join(", ")),
+                )?;
+            }
             return Ok(());
         }
         let control_planes = self
@@ -1656,10 +1860,14 @@ async fn etcd_member_healthy(
 async fn apiserver_ready(api_endpoint: &str, ca_pem: &str) -> Result<bool> {
     let endpoint = endpoint_host_port(api_endpoint);
     let host = endpoint.split(':').next().unwrap_or("").to_string();
-    if host.is_empty() {
+    apiserver_ready_at(&endpoint, &host, ca_pem).await
+}
+
+async fn apiserver_ready_at(addr: &str, server_name: &str, ca_pem: &str) -> Result<bool> {
+    if server_name.is_empty() {
         return Ok(false);
     }
-    let (status, body) = tls_get(&endpoint, &host, "/readyz", ca_pem, None).await?;
+    let (status, body) = tls_get(addr, server_name, "/readyz", ca_pem, None).await?;
     Ok(response_reports_ready("/readyz", status, &body))
 }
 
