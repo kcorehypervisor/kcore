@@ -49,8 +49,6 @@ pub struct UpgradeMember {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeView {
     pub desired: String,
-    /// Control planes run pods and must be drained too.
-    pub schedule_on_control_plane: bool,
     pub api_ready: bool,
     pub members: Vec<UpgradeMember>,
 }
@@ -99,6 +97,22 @@ pub fn progress(view: &UpgradeView) -> (usize, usize) {
     (done, view.members.len())
 }
 
+const FAILURE_SUMMARY_CHARS: usize = 240;
+
+/// The agent reports the whole nixos-rebuild output. The cluster message
+/// keeps the last line, which names the step that failed.
+fn failure_summary(output: &str) -> String {
+    let Some(last) = output.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+        return "nixos-rebuild failed".to_string();
+    };
+    let chars = last.chars().count();
+    if chars <= FAILURE_SUMMARY_CHARS {
+        return last.to_string();
+    }
+    let tail: String = last.chars().skip(chars - FAILURE_SUMMARY_CHARS).collect();
+    format!("...{tail}")
+}
+
 pub fn next_upgrade_step(view: &UpgradeView) -> UpgradeStep {
     let desired = kubernetes_versions::effective(&view.desired);
     let control_planes: Vec<&UpgradeMember> = view
@@ -123,11 +137,7 @@ pub fn next_upgrade_step(view: &UpgradeView) -> UpgradeStep {
                     return wait(format!("rebuilding {node_id} with Kubernetes {desired}"));
                 }
                 ApplyProgress::Failed => {
-                    let detail = if member.apply_message.is_empty() {
-                        "nixos-rebuild failed".to_string()
-                    } else {
-                        member.apply_message.clone()
-                    };
+                    let detail = failure_summary(&member.apply_message);
                     return UpgradeStep::Fail {
                         node_id,
                         message: format!("rebuild of {} failed: {detail}", member.node_id),
@@ -175,8 +185,9 @@ pub fn next_upgrade_step(view: &UpgradeView) -> UpgradeStep {
         if member.state == STATE_DRAINED {
             return UpgradeStep::Apply { node_id };
         }
-        let runs_pods = !is_control_plane(member) || view.schedule_on_control_plane;
-        if runs_pods && !member.cordoned {
+        // Control planes are not tainted, so they can run pods whatever
+        // scheduleOnControlPlane says.
+        if !member.cordoned {
             return UpgradeStep::Drain { node_id };
         }
         return UpgradeStep::Apply { node_id };
@@ -269,7 +280,6 @@ mod tests {
     fn view(members: Vec<UpgradeMember>) -> UpgradeView {
         UpgradeView {
             desired: TO.to_string(),
-            schedule_on_control_plane: false,
             api_ready: true,
             members,
         }
@@ -343,41 +353,25 @@ mod tests {
     }
 
     #[test]
-    fn workers_are_drained_before_the_rebuild_and_uncordoned_after() {
+    fn every_node_is_drained_before_the_rebuild_and_uncordoned_after() {
         let mut v = view(vec![member("cp1", "control-plane"), member("w1", "worker")]);
         let steps = drive(&mut v);
         let pos = |wanted: UpgradeStep| steps.iter().position(|s| *s == wanted).unwrap();
-        let w1 = "w1".to_string();
-        assert!(
-            pos(UpgradeStep::Drain {
-                node_id: w1.clone()
-            }) < pos(UpgradeStep::Apply {
-                node_id: w1.clone()
-            })
-        );
-        assert!(
-            pos(UpgradeStep::Apply {
-                node_id: w1.clone()
-            }) < pos(UpgradeStep::Uncordon {
-                node_id: w1.clone()
-            })
-        );
-        assert!(!steps.contains(&UpgradeStep::Drain {
-            node_id: "cp1".to_string()
-        }));
-    }
-
-    #[test]
-    fn schedulable_control_planes_are_drained_too() {
-        let mut v = view(vec![member("cp1", "control-plane")]);
-        v.schedule_on_control_plane = true;
-        let steps = drive(&mut v);
-        assert_eq!(
-            steps[0],
-            UpgradeStep::Drain {
-                node_id: "cp1".to_string()
-            }
-        );
+        for id in ["cp1", "w1"] {
+            let node_id = id.to_string();
+            assert!(
+                pos(UpgradeStep::Drain {
+                    node_id: node_id.clone()
+                }) < pos(UpgradeStep::Apply {
+                    node_id: node_id.clone()
+                })
+            );
+            assert!(
+                pos(UpgradeStep::Apply {
+                    node_id: node_id.clone()
+                }) < pos(UpgradeStep::Uncordon { node_id })
+            );
+        }
     }
 
     #[test]
@@ -408,6 +402,36 @@ mod tests {
             next_upgrade_step(&v),
             UpgradeStep::Fail { ref node_id, ref message } if node_id == "cp1" && message.contains("build error")
         ));
+    }
+
+    #[test]
+    fn a_failed_rebuild_reports_the_last_line_of_its_output() {
+        let mut w = member("w1", "worker");
+        w.version = TO.to_string();
+        w.state = STATE_APPLYING.to_string();
+        w.apply = ApplyProgress::Failed;
+        let command = format!(
+            "Command 'systemd-run --unit=nixos-rebuild-switch-to-configuration /nix/store/{}-nixos-system/bin/switch-to-configuration switch' returned non-zero exit status 4.",
+            "x".repeat(300)
+        );
+        w.apply_message = format!(
+            "switch failed: nixos-rebuild: warning: --fast is deprecated\nbuilding the system configuration...\n  /nix/store/abc-kubelet.drv\n{command}\n\n"
+        );
+        let mut cp = member("cp1", "control-plane");
+        cp.version = TO.to_string();
+        cp.kubelet_version = format!("v{TO}");
+        let v = view(vec![cp, w]);
+        let UpgradeStep::Fail { message, .. } = next_upgrade_step(&v) else {
+            panic!("expected a failure");
+        };
+        assert!(
+            message.ends_with("returned non-zero exit status 4."),
+            "{message}"
+        );
+        assert!(!message.contains('\n'), "{message}");
+        assert!(!message.contains("kubelet.drv"), "{message}");
+        assert!(message.len() < 300, "{message}");
+        assert_eq!(failure_summary(""), "nixos-rebuild failed");
     }
 
     #[test]

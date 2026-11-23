@@ -19540,9 +19540,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut blocking_issues = Vec::new();
         let mut warnings = Vec::new();
 
-        if let Err(err) = crate::kubernetes_versions::validate(&spec.version) {
-            blocking_issues.push(err);
-        }
+        let version_valid = match crate::kubernetes_versions::validate(&spec.version) {
+            Ok(()) => true,
+            Err(err) => {
+                blocking_issues.push(err);
+                false
+            }
+        };
 
         if spec.cluster_cidr.is_empty() {
             blocking_issues.push("cluster_cidr is required".to_string());
@@ -19564,7 +19568,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .get_kubernetes_cluster(&req.name)
             .map_err(internal_db)?;
         let version_change = match &existing {
-            Some(cluster) => {
+            Some(cluster) if version_valid => {
                 match self.kubernetes_version_change(&req.name, &cluster.phase, &spec, req.force) {
                     Ok(change) => change,
                     Err(status) => {
@@ -19573,11 +19577,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     }
                 }
             }
-            None => crate::kubernetes_upgrade::VersionChange::None,
+            _ => crate::kubernetes_upgrade::VersionChange::None,
         };
         if version_change != crate::kubernetes_upgrade::VersionChange::None {
             warnings.push(format!(
-                "Kubernetes moves to {} one node at a time: control planes first, then workers. Nodes that run pods are drained before their rebuild.",
+                "Kubernetes moves to {} one node at a time: control planes first, then workers. Each node is drained before its rebuild.",
                 crate::kubernetes_versions::effective(&spec.version)
             ));
         }

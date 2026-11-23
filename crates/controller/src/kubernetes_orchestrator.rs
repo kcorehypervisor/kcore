@@ -1177,7 +1177,6 @@ impl KubernetesOrchestrator {
         }
         Ok(UpgradeView {
             desired: kubernetes_versions::normalize(&cfg.kubernetes_version),
-            schedule_on_control_plane: cfg.schedule_on_control_plane,
             api_ready,
             members,
         })
