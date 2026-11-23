@@ -75,6 +75,7 @@ let
               role = "control-plane";
               advertiseAddress = "10.0.0.1";
               apiServerEndpoint = "10.0.0.1:7443";
+              scheduleOnControlPlane = true;
             };
           };
         }
@@ -82,6 +83,8 @@ let
     ];
   };
   # `kubectl exec` must not depend on DNS for node names.
+  roleScript =
+    unit: builtins.readFile controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStart;
   dialsInternalIp =
     unit:
     lib.hasInfix "--kubelet-preferred-address-types=InternalIP,"
@@ -99,6 +102,12 @@ assert installed.config.networking.firewall.checkReversePath == "loose";
 assert lib.elem 4240 installed.config.networking.firewall.allowedTCPPorts;
 assert dialsInternalIp "kube-apiserver";
 assert dialsInternalIp "kube-apiserver-b";
+assert lib.hasInfix "control-plane:NoSchedule --overwrite" (
+  roleScript "kcore-kubernetes-node-roles"
+);
+assert lib.hasInfix "node-role.kubernetes.io/worker-" (roleScript "kcore-kubernetes-node-roles");
+assert lib.hasInfix "control-plane:NoSchedule-" (roleScript "kcore-kubernetes-node-roles-b");
+assert !lib.hasInfix "NoSchedule --overwrite" (roleScript "kcore-kubernetes-node-roles-b");
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;
 assert runs pinned "kubelet" "kubernetes-${pkgs.kubernetes.version}";
 assert runs pinned "kubelet-b" "kubernetes-${pkgs.kubernetes.version}";

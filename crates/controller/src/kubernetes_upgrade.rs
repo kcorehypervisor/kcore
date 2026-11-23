@@ -185,8 +185,8 @@ pub fn next_upgrade_step(view: &UpgradeView) -> UpgradeStep {
         if member.state == STATE_DRAINED {
             return UpgradeStep::Apply { node_id };
         }
-        // Control planes are not tainted, so they can run pods whatever
-        // scheduleOnControlPlane says.
+        // A tainted control plane still runs pods that tolerate the taint or
+        // were scheduled before it was added.
         if !member.cordoned {
             return UpgradeStep::Drain { node_id };
         }

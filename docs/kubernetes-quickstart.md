@@ -282,7 +282,7 @@ kctl kubernetes apply -f lab-cluster.yaml   # plan shows "upgrade"
 kctl kubernetes get lab                      # phase, progress, and each node's version
 ```
 
-The controller upgrades one node at a time. Control-plane nodes go first, then workers, because a kubelet must not be newer than the API servers it talks to. Before each node it waits until every etcd member is healthy and the API answers. Each node, control planes included, is cordoned and drained first: control planes carry no taint, so they can run pods even when `scheduleOnControlPlane` is false. The next node starts only after this one's kubelet reports the new version and is Ready; then it is uncordoned. The cluster stays in phase `upgrading` until the last node is done, then returns to `ready`.
+The controller upgrades one node at a time. Control-plane nodes go first, then workers, because a kubelet must not be newer than the API servers it talks to. Before each node it waits until every etcd member is healthy and the API answers. Each node, control planes included, is cordoned and drained first, because a tainted control plane can still run pods that tolerate the taint. The next node starts only after this one's kubelet reports the new version and is Ready; then it is uncordoned. The cluster stays in phase `upgrading` until the last node is done, then returns to `ready`.
 
 Versions come from [`modules/kubernetes-releases.json`](../modules/kubernetes-releases.json). The host pin uses `pkgs.kubernetes`; any other listed version uses the upstream release binaries from `dl.k8s.io`, checked against the hashes in that file, so nodes download them instead of compiling Kubernetes. Adding a release means adding its five binary hashes there.
 
@@ -446,6 +446,8 @@ Before running `kctl kubernetes apply`:
 - **Ceph OSD-only nodes:** Leave dedicated to storage
 
 ### Scheduling Preference
+
+Control-plane nodes are tainted `node-role.kubernetes.io/control-plane:NoSchedule`, so workloads land on workers. Set `scheduleOnControlPlane: true` in the cluster spec to remove the taint. A cluster with no workers never taints its control planes.
 
 Tag worker nodes for specific workloads:
 ```bash
