@@ -6,6 +6,7 @@
   pkgs,
   lib,
   nixosSystem,
+  mkNode,
 }:
 let
   releases = builtins.fromJSON (builtins.readFile ../modules/kubernetes-releases.json);
@@ -53,6 +54,10 @@ let
     host: unit: name:
     lib.hasInfix "-${name}/bin/kubelet" (kubeletOf host unit);
 
+  # An installed node builds through its host flake, which only imports the
+  # host files mkNode lists. The agent writes both Kubernetes files there.
+  installed = mkNode { root = ./fixtures/kubernetes-host; };
+
   pinned = mkHost "" releases.hostPin;
   upgraded = lib.mapAttrsToList (version: _: {
     inherit version;
@@ -60,6 +65,7 @@ let
   }) releases.releases;
 in
 assert releases.hostPin == pkgs.kubernetes.version;
+assert runs installed "kubelet" "kubernetes-${pkgs.kubernetes.version}";
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;
 assert runs pinned "kubelet" "kubernetes-${pkgs.kubernetes.version}";
 assert runs pinned "kubelet-b" "kubernetes-${pkgs.kubernetes.version}";

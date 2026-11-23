@@ -267,6 +267,7 @@
               inherit pkgs;
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+              inherit (inputs.self.lib) mkNode;
             };
             ch-vm-module-eval = import ./tests/ch-vm-module-eval.nix {
               inherit pkgs;
@@ -389,6 +390,8 @@
             "kcore-ceph.nix"
             "kcore-slurm.nix"
             "kcore-postgresql-cluster.nix"
+            "modules/kcore-kubernetes.nix"
+            "kcore-kubernetes.nix"
             "legacy-configuration.nix"
           ];
 
