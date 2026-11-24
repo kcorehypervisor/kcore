@@ -132,6 +132,13 @@ let
       rise 2
     }
   '';
+  # etcd reads these only when it creates its data dir. Kept out of
+  # ExecStart so a membership change re-renders the survivors without
+  # restarting their etcd, which would cost a two-member cluster its quorum.
+  etcdBootstrapEnv = initialCluster: members: ''
+    ETCD_INITIAL_CLUSTER_STATE=${if initialCluster then "new" else "existing"}
+    ETCD_INITIAL_CLUSTER=${members}
+  '';
   provisionerApply = manifestApply "provisioner";
   coreDnsApply = manifestApply "coredns";
 
@@ -766,6 +773,7 @@ let
         serviceConfig = {
           Type = "notify";
           ExecStartPre = etcdPrepare name etcdDir "${pki}/etcd/ca.crt";
+          EnvironmentFile = "${root}/etcd-bootstrap.env";
           ExecStart = ''
             ${pkgs.etcd}/bin/etcd \
               --name=${config.networking.hostName} \
@@ -774,10 +782,6 @@ let
               --listen-client-urls=https://${c.advertiseAddress}:${toString etcdClient},https://127.0.0.1:${toString etcdClient} \
               --advertise-client-urls=https://${c.advertiseAddress}:${toString etcdClient} \
               --initial-advertise-peer-urls=https://${c.advertiseAddress}:${toString etcdPeer} \
-              ${
-                if c.initialCluster then "--initial-cluster-state=new" else "--initial-cluster-state=existing"
-              } \
-              --initial-cluster=${c.etcdInitialCluster} \
               --client-cert-auth=true \
               --trusted-ca-file=${pki}/etcd/ca.crt \
               --cert-file=${pki}/etcd/server.crt \
@@ -792,6 +796,11 @@ let
           LimitNOFILE = 65536;
           StateDirectory = "etcd-${name}";
         };
+      };
+
+      environment.etc."kubernetes/${name}/etcd-bootstrap.env" = lib.mkIf (c.role == "control-plane") {
+        mode = "0644";
+        text = etcdBootstrapEnv c.initialCluster c.etcdInitialCluster;
       };
 
       systemd.services."kube-apiserver-${name}" = lib.mkIf (c.role == "control-plane") {
@@ -1830,6 +1839,7 @@ in
         serviceConfig = {
           Type = "notify";
           ExecStartPre = etcdPrepare "primary" "/var/lib/etcd" "/etc/kubernetes/pki/etcd/ca.crt";
+          EnvironmentFile = "/etc/kubernetes/etcd-bootstrap.env";
           ExecStart = ''
             ${pkgs.etcd}/bin/etcd \
               --name=${config.networking.hostName} \
@@ -1838,10 +1848,6 @@ in
               --listen-client-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdClient},https://127.0.0.1:${toString k8sPorts.etcdClient} \
               --advertise-client-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdClient} \
               --initial-advertise-peer-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdPeer} \
-              ${
-                if cfg.initialCluster then "--initial-cluster-state=new" else "--initial-cluster-state=existing"
-              } \
-              --initial-cluster=${etcdInitialCluster} \
               --client-cert-auth=true \
               --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \
               --cert-file=/etc/kubernetes/pki/etcd/server.crt \
@@ -1856,6 +1862,11 @@ in
           LimitNOFILE = 65536;
           StateDirectory = "etcd";
         };
+      };
+
+      environment.etc."kubernetes/etcd-bootstrap.env" = lib.mkIf (cfg.role == "control-plane") {
+        mode = "0644";
+        text = etcdBootstrapEnv cfg.initialCluster etcdInitialCluster;
       };
 
       # kube-apiserver (control-plane only)

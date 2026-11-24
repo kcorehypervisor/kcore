@@ -19981,22 +19981,33 @@ impl controller_proto::controller_server::Controller for ControllerService {
             self.db.clone(),
             self.clients.clone(),
         );
-        let deploy_error = match orchestrator
-            .redeploy_node_certificates(
-                &req.name,
-                &cluster_row.api_server_endpoint,
-                &cluster_row.service_cidr,
-            )
-            .await
-        {
-            Ok(()) => None,
-            Err(err) => {
-                warn!(
-                    cluster = %req.name,
-                    error = %err,
-                    "kubernetes node configuration was not deployed"
-                );
-                Some(format!("{err:#}"))
+        // A serving cluster gets the change one node at a time from the
+        // orchestrator; pushing to every node at once restarts etcd and the
+        // API server everywhere together. An upgrade pushes each node's full
+        // configuration in its own step. Only a cluster that is already down,
+        // or a membership change that needs certificates, gets the parallel push.
+        let rolling =
+            !membership_changed && !upgrading && orchestrator.etcd_has_quorum(&req.name).await;
+        let deploy_error = if rolling || (upgrading && !membership_changed) {
+            None
+        } else {
+            match orchestrator
+                .redeploy_node_certificates(
+                    &req.name,
+                    &cluster_row.api_server_endpoint,
+                    &cluster_row.service_cidr,
+                )
+                .await
+            {
+                Ok(()) => None,
+                Err(err) => {
+                    warn!(
+                        cluster = %req.name,
+                        error = %err,
+                        "kubernetes node configuration was not deployed"
+                    );
+                    Some(format!("{err:#}"))
+                }
             }
         };
         if membership_changed {
@@ -20015,6 +20026,10 @@ impl controller_proto::controller_server::Controller for ControllerService {
             cluster_row.status_message = format!(
                 "upgrade to Kubernetes {next_version} queued: control planes first, then workers"
             );
+        } else if rolling {
+            cluster_row.phase = crate::kubernetes_orchestrator::PHASE_RECONFIGURING.to_string();
+            cluster_row.status_message =
+                "configuration queued: one node at a time, control planes first".to_string();
         } else {
             // A ready cluster stays ready. A degraded cluster is the previous
             // attempt's failure; this attempt deployed, so it is ready again.

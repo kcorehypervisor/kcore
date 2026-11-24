@@ -117,6 +117,13 @@ let
     && lib.hasInfix "kcore-apiserver-check-${toString port}" (keepalivedConf path);
   reloadsOnChange = unit: controlPlane.config.systemd.services.${unit}.reloadTriggers != [ ];
 
+  # A membership change must not restart etcd on the members that stay.
+  membersOutsideExecStart =
+    unit: path:
+    !lib.hasInfix "--initial-cluster"
+      controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStart
+    && lib.hasInfix "ETCD_INITIAL_CLUSTER=" controlPlane.config.environment.etc.${path}.text;
+
   pinned = mkHost "" releases.hostPin;
   upgraded = lib.mapAttrsToList (version: _: {
     inherit version;
@@ -148,6 +155,8 @@ assert tracksApiServer "keepalived/keepalived.conf" 6443;
 assert tracksApiServer "keepalived/keepalived-b.conf" 7443;
 assert reloadsOnChange "keepalived";
 assert reloadsOnChange "keepalived-b";
+assert membersOutsideExecStart "etcd" "kubernetes/etcd-bootstrap.env";
+assert membersOutsideExecStart "etcd-b" "kubernetes/b/etcd-bootstrap.env";
 assert retiresPrimary pinned;
 assert !lib.hasInfix "b|-)" (retireScript pinned);
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;
