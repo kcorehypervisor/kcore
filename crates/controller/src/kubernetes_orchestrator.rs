@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::db::{Database, KubernetesClusterNodeRow, KubernetesNodeUpgradeRow};
 use crate::kubernetes_lifecycle::{self, MemberSnapshot, ScaleStep};
@@ -41,6 +41,10 @@ pub enum BootstrapPhase {
 
 const NODES_READY_TIMEOUT_SECS: u64 = 600;
 pub const NODES_NOT_READY: &str = "nodes not Ready";
+/// A cluster whose nodes are being released by DeleteKubernetesCluster.
+/// No reconcile loop acts on it, and node renders leave it out.
+pub const PHASE_DELETING: &str = "deleting";
+const KUBERNETES_DISABLED_NIX: &str = "{\n  kcore.kubernetes.enable = false;\n}\n";
 
 pub struct MemberHealth {
     pub node_id: String,
@@ -651,6 +655,9 @@ impl KubernetesOrchestrator {
         let mut members = Vec::new();
         let mut primary_kubeconfig = String::new();
         for cluster in clusters {
+            if cluster.phase == PHASE_DELETING {
+                continue;
+            }
             let membership = self.db.list_kubernetes_cluster_nodes(&cluster.name)?;
             if membership
                 .iter()
@@ -1646,17 +1653,60 @@ impl KubernetesOrchestrator {
         Ok((node.address, single))
     }
 
+    /// Push a node's configuration without `cluster_name`: its other clusters
+    /// when it has any, otherwise Kubernetes switched off.
     async fn clear_member_nix(&self, cluster_name: &str, node_id: &str) -> Result<()> {
         let node = self.db.get_node(node_id)?.context("node not found")?;
-        let pki = self
-            .db
-            .load_kubernetes_pki(cluster_name)?
-            .context("PKI not found")?;
-        let nix = match self.render_node_nix(node_id, cluster_name, &pki, "").await {
-            Ok(rendered) => rendered.nix,
-            Err(_) => "{\n  kcore.kubernetes.enable = false;\n}\n".to_string(),
+        // A render error must not fall back to switching Kubernetes off on a
+        // node that still serves another cluster.
+        let nix = if self.node_in_other_cluster(cluster_name, node_id)? {
+            let pki = self
+                .db
+                .load_kubernetes_pki(cluster_name)?
+                .context("PKI not found")?;
+            self.render_node_nix(node_id, cluster_name, &pki, "")
+                .await?
+                .nix
+        } else {
+            KUBERNETES_DISABLED_NIX.to_string()
         };
         self.push_nix(&node.address, &nix, "").await
+    }
+
+    fn node_in_other_cluster(&self, cluster_name: &str, node_id: &str) -> Result<bool> {
+        for cluster in self.db.list_kubernetes_clusters()? {
+            if cluster.name == cluster_name || cluster.phase == PHASE_DELETING {
+                continue;
+            }
+            if self
+                .db
+                .list_kubernetes_cluster_nodes(&cluster.name)?
+                .iter()
+                .any(|row| row.node_id == node_id && !row.pending_removal)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Take a cluster off every member node before its records are dropped.
+    /// The cluster is marked deleting first, so renders for any node leave it
+    /// out. Returns the nodes that did not take the new configuration.
+    pub async fn release_members(&self, cluster_name: &str) -> Result<Vec<(String, String)>> {
+        self.db.set_kubernetes_cluster_status(
+            cluster_name,
+            PHASE_DELETING,
+            "removing Kubernetes from the member nodes",
+        )?;
+        let mut failed = Vec::new();
+        for row in self.db.list_kubernetes_cluster_nodes(cluster_name)? {
+            if let Err(err) = self.clear_member_nix(cluster_name, &row.node_id).await {
+                warn!(cluster = cluster_name, node_id = %row.node_id, error = %format!("{err:#}"), "could not remove Kubernetes from node");
+                failed.push((row.node_id, format!("{err:#}")));
+            }
+        }
+        Ok(failed)
     }
 
     async fn push_nix(&self, address: &str, nix: &str, kubeconfig: &str) -> Result<()> {
@@ -2078,7 +2128,7 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
                 // on nodes that are already serving.
                 if matches!(
                     cluster.phase.as_str(),
-                    "bootstrapping" | "ready" | "scaling" | "upgrading"
+                    "bootstrapping" | "ready" | "scaling" | "upgrading" | PHASE_DELETING
                 ) {
                     continue;
                 }
@@ -2316,5 +2366,109 @@ mod health_tests {
     fn apiserver_readyz_accepts_ok() {
         assert!(response_reports_ready("/readyz", 200, "ok"));
         assert!(!response_reports_ready("/readyz", 500, "ok"));
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::{KubernetesOrchestrator, PHASE_DELETING};
+    use crate::db::{Database, KubernetesClusterNodeRow, KubernetesClusterRow, NodeRow};
+    use crate::node_client::NodeClients;
+
+    fn node(db: &Database, id: &str) {
+        db.upsert_node(&NodeRow {
+            id: id.to_string(),
+            hostname: id.to_string(),
+            // Port 1 on loopback refuses at once.
+            address: "127.0.0.1:1".to_string(),
+            cpu_cores: 4,
+            memory_bytes: 8_000_000_000,
+            status: "ready".to_string(),
+            last_heartbeat: String::new(),
+            gateway_interface: "br0".to_string(),
+            cpu_used: 0,
+            memory_used: 0,
+            storage_backend: "filesystem".to_string(),
+            disable_vxlan: false,
+            approval_status: "approved".to_string(),
+            cert_expiry_days: 300,
+            luks_method: String::new(),
+            dc_id: "DC1".to_string(),
+        })
+        .unwrap();
+    }
+
+    fn cluster(db: &Database, name: &str, members: &[&str]) {
+        db.upsert_kubernetes_cluster(&KubernetesClusterRow {
+            name: name.to_string(),
+            generation: 1,
+            cluster_cidr: "10.244.0.0/16".to_string(),
+            service_cidr: "10.96.0.0/12".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            api_server_endpoint: "10.0.0.1:6443".to_string(),
+            cni: "cilium".to_string(),
+            phase: "ready".to_string(),
+            status_message: String::new(),
+            ready_control_planes: 1,
+            ready_workers: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        for id in members {
+            db.upsert_kubernetes_cluster_node(&KubernetesClusterNodeRow {
+                cluster_name: name.to_string(),
+                node_id: id.to_string(),
+                role: "control-plane".to_string(),
+                advertise_address: "10.0.0.1".to_string(),
+                iface: "br0".to_string(),
+                initial_cluster: true,
+                join_existing: false,
+                kubelet_ready: true,
+                pending_join: false,
+                pending_removal: false,
+                k8s_node_name: String::new(),
+            })
+            .unwrap();
+        }
+    }
+
+    fn setup() -> (Database, KubernetesOrchestrator) {
+        let db = Database::open(":memory:").unwrap();
+        node(&db, "shared");
+        node(&db, "only-a");
+        cluster(&db, "a", &["shared", "only-a"]);
+        cluster(&db, "b", &["shared"]);
+        let orchestrator = KubernetesOrchestrator::new(db.clone(), NodeClients::new(None));
+        (db, orchestrator)
+    }
+
+    #[test]
+    fn a_node_keeps_kubernetes_only_for_clusters_that_are_not_being_deleted() {
+        let (db, orchestrator) = setup();
+        assert!(orchestrator.node_in_other_cluster("a", "shared").unwrap());
+        assert!(!orchestrator.node_in_other_cluster("a", "only-a").unwrap());
+
+        db.set_kubernetes_cluster_status("b", PHASE_DELETING, "")
+            .unwrap();
+        assert!(!orchestrator.node_in_other_cluster("a", "shared").unwrap());
+    }
+
+    #[tokio::test]
+    async fn releasing_marks_the_cluster_deleting_and_reports_unreachable_nodes() {
+        let (db, orchestrator) = setup();
+        let failed = orchestrator.release_members("a").await.unwrap();
+
+        let mut nodes: Vec<_> = failed.iter().map(|(node, _)| node.as_str()).collect();
+        nodes.sort_unstable();
+        assert_eq!(nodes, ["only-a", "shared"]);
+        assert_eq!(
+            db.get_kubernetes_cluster("a").unwrap().unwrap().phase,
+            PHASE_DELETING
+        );
+        assert_eq!(
+            db.get_kubernetes_cluster("b").unwrap().unwrap().phase,
+            "ready"
+        );
     }
 }

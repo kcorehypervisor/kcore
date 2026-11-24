@@ -19626,6 +19626,15 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .db
             .get_kubernetes_cluster(&req.name)
             .map_err(internal_db)?;
+        if existing
+            .as_ref()
+            .is_some_and(|cluster| cluster.phase == crate::kubernetes_orchestrator::PHASE_DELETING)
+        {
+            blocking_issues.push(format!(
+                "cluster {} is being deleted; finish the delete before applying it again",
+                req.name
+            ));
+        }
         let version_change = match &existing {
             Some(cluster) if version_valid => {
                 match self.kubernetes_version_change(&req.name, &cluster.phase, &spec, req.force) {
@@ -19880,6 +19889,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .get_kubernetes_cluster(&req.name)
             .map_err(internal_db)?
             .ok_or_else(|| Status::not_found(format!("cluster {} not found", req.name)))?;
+        if existing.phase == crate::kubernetes_orchestrator::PHASE_DELETING {
+            return Err(Status::failed_precondition(format!(
+                "cluster {} is being deleted; finish the delete before applying it again",
+                req.name
+            )));
+        }
 
         let spec = req
             .spec
@@ -20073,14 +20088,45 @@ impl controller_proto::controller_server::Controller for ControllerService {
             return Err(Status::failed_precondition("confirm must be true"));
         }
 
-        let deleted = self
+        if self
             .db
-            .delete_kubernetes_cluster(&req.name)
-            .map_err(internal_db)?;
-
-        if !deleted {
+            .get_kubernetes_cluster(&req.name)
+            .map_err(internal_db)?
+            .is_none()
+        {
             return Err(Status::not_found(format!("cluster {} not found", req.name)));
         }
+
+        // Dropping the records alone would leave etcd, the API server and the
+        // kubelets running on every member.
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let failed = orchestrator
+            .release_members(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("removing cluster from nodes: {e:#}")))?;
+        if !failed.is_empty() {
+            let nodes = failed
+                .iter()
+                .map(|(node, error)| format!("{node}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !req.force {
+                return Err(Status::unavailable(format!(
+                    "cluster {} is marked deleting, but Kubernetes could not be removed from {nodes}. \
+                     Run the delete again once those nodes are reachable, or pass --force to drop \
+                     the cluster and leave them as they are",
+                    req.name
+                )));
+            }
+            warn!(cluster = %req.name, %nodes, "force-deleting kubernetes cluster with nodes not released");
+        }
+
+        self.db
+            .delete_kubernetes_cluster(&req.name)
+            .map_err(internal_db)?;
 
         info!(cluster = %req.name, "kubernetes cluster deleted");
 

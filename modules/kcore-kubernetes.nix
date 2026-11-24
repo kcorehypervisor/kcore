@@ -30,6 +30,33 @@ let
 
   keepalivedNotrack = import ./kcore-keepalived-notrack.nix { inherit pkgs; };
 
+  # The etcd data directory outlives the cluster that wrote it: deleting a
+  # cluster and creating a new one on the same hosts must not start etcd on
+  # the old cluster's data. The directory records the etcd CA it was written
+  # under, and a member directory from another CA is moved aside, not deleted.
+  # A directory with no marker is adopted, so live clusters keep their data.
+  # An empty member directory (a crash before the first WAL) is removed
+  # because etcd refuses --initial-cluster-state=new on it.
+  etcdPrepare =
+    tag: dataDir: caFile:
+    pkgs.writeShellScript "kcore-etcd-prepare-${tag}" ''
+      set -eu
+      dir=${dataDir}
+      if [ ! -e "$dir/member/snap/db" ] && [ ! -d "$dir/member/wal" ]; then
+        rm -rf "$dir/member"
+      fi
+      [ -r ${caFile} ] || exit 0
+      want=$(${pkgs.coreutils}/bin/sha256sum ${caFile} | ${pkgs.coreutils}/bin/cut -d' ' -f1)
+      mark="$dir/kcore-etcd-ca.sha256"
+      if [ -d "$dir/member" ] && [ -e "$mark" ] && [ "$(cat "$mark")" != "$want" ]; then
+        stale="$dir/member.stale-$(${pkgs.coreutils}/bin/date +%s)"
+        echo "etcd data in $dir was written under another cluster CA; moving it to $stale"
+        mv "$dir/member" "$stale"
+      fi
+      mkdir -p "$dir"
+      echo "$want" > "$mark"
+    '';
+
   # The controller reads the same file to decide which versions an apply may
   # ask for. The node agent installs it next to this module.
   kubernetesReleases = builtins.fromJSON (builtins.readFile ./kubernetes-releases.json);
@@ -561,11 +588,7 @@ let
         wants = [ "network-online.target" ];
         serviceConfig = {
           Type = "notify";
-          ExecStartPre = "${pkgs.writeShellScript "kcore-etcd-clear-empty-${name}" ''
-            if [ ! -e ${etcdDir}/member/snap/db ] && [ ! -d ${etcdDir}/member/wal ]; then
-              rm -rf ${etcdDir}/member
-            fi
-          ''}";
+          ExecStartPre = etcdPrepare name etcdDir "${pki}/etcd/ca.crt";
           ExecStart = ''
             ${pkgs.etcd}/bin/etcd \
               --name=${config.networking.hostName} \
@@ -1584,14 +1607,7 @@ in
 
         serviceConfig = {
           Type = "notify";
-          # A crash before the first WAL (missing peer certs) leaves an empty
-          # member directory. etcd then refuses --initial-cluster-state=new.
-          # Keep a directory that already has a snapshot or WAL.
-          ExecStartPre = "${pkgs.writeShellScript "kcore-etcd-clear-empty-member" ''
-            if [ ! -e /var/lib/etcd/member/snap/db ] && [ ! -d /var/lib/etcd/member/wal ]; then
-              rm -rf /var/lib/etcd/member
-            fi
-          ''}";
+          ExecStartPre = etcdPrepare "primary" "/var/lib/etcd" "/etc/kubernetes/pki/etcd/ca.crt";
           ExecStart = ''
             ${pkgs.etcd}/bin/etcd \
               --name=${config.networking.hostName} \
@@ -1903,6 +1919,34 @@ in
         lib.mkDefault "loose"
       );
       systemd.services = lib.mkMerge (map (extra: extra.systemd.services or { }) extras);
+
+      # A host taken out of a cluster keeps that cluster's etcd data, which
+      # predates the CA marker etcdPrepare checks. Set it aside so a cluster
+      # created here later cannot start on it. Activation runs after
+      # switch-to-configuration has stopped the etcd units it removed.
+      system.activationScripts.kcoreRetiredEtcd.text = ''
+        kcore_retire_etcd() {
+          if [ -d "$1/member" ]; then
+            dest="$1/member.retired-$(${pkgs.coreutils}/bin/date +%s)"
+            echo "kcore: $1 belongs to no configured Kubernetes cluster; moving its data to $dest"
+            ${pkgs.coreutils}/bin/mv "$1/member" "$dest"
+          fi
+        }
+        ${lib.optionalString (
+          !(cfg.enable && cfg.role == "control-plane")
+        ) "kcore_retire_etcd /var/lib/etcd"}
+        for dir in /var/lib/etcd-*; do
+          [ -d "$dir" ] || continue
+          case "''${dir#/var/lib/etcd-}" in
+            ${
+              lib.concatStringsSep "|" (
+                lib.attrNames (lib.filterAttrs (_: c: c.role == "control-plane") cfg.additionalClusters) ++ [ "-" ]
+              )
+            }) ;;
+            *) kcore_retire_etcd "$dir" ;;
+          esac
+        done
+      '';
     }
   ];
 }

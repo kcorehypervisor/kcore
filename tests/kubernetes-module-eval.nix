@@ -90,6 +90,14 @@ let
     lib.hasInfix "--kubelet-preferred-address-types=InternalIP,"
       controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStart;
 
+  # Stale etcd data from another cluster is set aside, never served.
+  retireScript = host: host.config.system.activationScripts.kcoreRetiredEtcd.text;
+  retiresPrimary = host: lib.hasInfix "kcore_retire_etcd /var/lib/etcd\n" (retireScript host);
+  preparesEtcd =
+    unit:
+    lib.hasInfix "kcore-etcd-prepare" "${controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStartPre
+    }";
+
   pinned = mkHost "" releases.hostPin;
   upgraded = lib.mapAttrsToList (version: _: {
     inherit version;
@@ -108,6 +116,12 @@ assert lib.hasInfix "control-plane:NoSchedule --overwrite" (
 assert lib.hasInfix "node-role.kubernetes.io/worker-" (roleScript "kcore-kubernetes-node-roles");
 assert lib.hasInfix "control-plane:NoSchedule-" (roleScript "kcore-kubernetes-node-roles-b");
 assert !lib.hasInfix "NoSchedule --overwrite" (roleScript "kcore-kubernetes-node-roles-b");
+assert preparesEtcd "etcd";
+assert preparesEtcd "etcd-b";
+assert !retiresPrimary controlPlane;
+assert lib.hasInfix "b|-)" (retireScript controlPlane);
+assert retiresPrimary pinned;
+assert !lib.hasInfix "b|-)" (retireScript pinned);
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;
 assert runs pinned "kubelet" "kubernetes-${pkgs.kubernetes.version}";
 assert runs pinned "kubelet-b" "kubernetes-${pkgs.kubernetes.version}";
