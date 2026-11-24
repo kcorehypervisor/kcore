@@ -71,11 +71,17 @@ let
             role = "control-plane";
             advertiseAddress = "10.0.0.1";
             apiServerEndpoint = "10.0.0.1:6443";
+            haEnabled = true;
+            vipAddress = "10.0.0.100";
+            vipInterface = "eth0";
             additionalClusters.b = {
               role = "control-plane";
               advertiseAddress = "10.0.0.1";
               apiServerEndpoint = "10.0.0.1:7443";
               scheduleOnControlPlane = true;
+              haEnabled = true;
+              vipAddress = "10.0.0.101";
+              vipInterface = "eth0";
             };
           };
         }
@@ -89,6 +95,34 @@ let
     unit:
     lib.hasInfix "--kubelet-preferred-address-types=InternalIP,"
       controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStart;
+
+  # Stale etcd data from another cluster is set aside, never served.
+  retireScript = host: host.config.system.activationScripts.kcoreRetiredEtcd.text;
+  retiresPrimary = host: lib.hasInfix "kcore_retire_etcd /var/lib/etcd\n" (retireScript host);
+  preparesEtcd =
+    unit:
+    lib.hasInfix "kcore-etcd-prepare" "${controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStartPre
+    }";
+
+  # Kubelets point pods at clusterDns; something has to answer there.
+  coreDns = host: path: host.config.environment.etc.${path}.text or "";
+  hasCoreDnsUnit = host: unit: host.config.systemd.services ? ${unit};
+
+  # The VIP must leave a node whose API server is down, and a config change
+  # must reach the running keepalived.
+  keepalivedConf = path: controlPlane.config.environment.etc.${path}.text;
+  tracksApiServer =
+    path: port:
+    lib.hasInfix "track_script" (keepalivedConf path)
+    && lib.hasInfix "kcore-apiserver-check-${toString port}" (keepalivedConf path);
+  reloadsOnChange = unit: controlPlane.config.systemd.services.${unit}.reloadTriggers != [ ];
+
+  # A membership change must not restart etcd on the members that stay.
+  membersOutsideExecStart =
+    unit: path:
+    !lib.hasInfix "--initial-cluster"
+      controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStart
+    && lib.hasInfix "ETCD_INITIAL_CLUSTER=" controlPlane.config.environment.etc.${path}.text;
 
   pinned = mkHost "" releases.hostPin;
   upgraded = lib.mapAttrsToList (version: _: {
@@ -108,6 +142,24 @@ assert lib.hasInfix "control-plane:NoSchedule --overwrite" (
 assert lib.hasInfix "node-role.kubernetes.io/worker-" (roleScript "kcore-kubernetes-node-roles");
 assert lib.hasInfix "control-plane:NoSchedule-" (roleScript "kcore-kubernetes-node-roles-b");
 assert !lib.hasInfix "NoSchedule --overwrite" (roleScript "kcore-kubernetes-node-roles-b");
+assert preparesEtcd "etcd";
+assert preparesEtcd "etcd-b";
+assert !retiresPrimary controlPlane;
+assert lib.hasInfix "b|-)" (retireScript controlPlane);
+assert lib.hasInfix "clusterIP: 10.96.0.10" (coreDns controlPlane "kubernetes/coredns.yaml");
+assert lib.hasInfix "clusterIP: 10.112.0.10" (coreDns controlPlane "kubernetes/b/coredns.yaml");
+assert hasCoreDnsUnit controlPlane "kcore-kubernetes-coredns";
+assert hasCoreDnsUnit controlPlane "kcore-kubernetes-coredns-b";
+assert !hasCoreDnsUnit installed "kcore-kubernetes-coredns";
+assert tracksApiServer "keepalived/keepalived.conf" 6443;
+assert tracksApiServer "keepalived/keepalived-b.conf" 7443;
+assert reloadsOnChange "keepalived";
+assert reloadsOnChange "keepalived-b";
+assert lib.elem "containerd.service" installed.config.systemd.services.kubelet.after;
+assert membersOutsideExecStart "etcd" "kubernetes/etcd-bootstrap.env";
+assert membersOutsideExecStart "etcd-b" "kubernetes/b/etcd-bootstrap.env";
+assert retiresPrimary pinned;
+assert !lib.hasInfix "b|-)" (retireScript pinned);
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;
 assert runs pinned "kubelet" "kubernetes-${pkgs.kubernetes.version}";
 assert runs pinned "kubelet-b" "kubernetes-${pkgs.kubernetes.version}";

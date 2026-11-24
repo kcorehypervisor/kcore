@@ -30,6 +30,33 @@ let
 
   keepalivedNotrack = import ./kcore-keepalived-notrack.nix { inherit pkgs; };
 
+  # The etcd data directory outlives the cluster that wrote it: deleting a
+  # cluster and creating a new one on the same hosts must not start etcd on
+  # the old cluster's data. The directory records the etcd CA it was written
+  # under, and a member directory from another CA is moved aside, not deleted.
+  # A directory with no marker is adopted, so live clusters keep their data.
+  # An empty member directory (a crash before the first WAL) is removed
+  # because etcd refuses --initial-cluster-state=new on it.
+  etcdPrepare =
+    tag: dataDir: caFile:
+    pkgs.writeShellScript "kcore-etcd-prepare-${tag}" ''
+      set -eu
+      dir=${dataDir}
+      if [ ! -e "$dir/member/snap/db" ] && [ ! -d "$dir/member/wal" ]; then
+        rm -rf "$dir/member"
+      fi
+      [ -r ${caFile} ] || exit 0
+      want=$(${pkgs.coreutils}/bin/sha256sum ${caFile} | ${pkgs.coreutils}/bin/cut -d' ' -f1)
+      mark="$dir/kcore-etcd-ca.sha256"
+      if [ -d "$dir/member" ] && [ -e "$mark" ] && [ "$(cat "$mark")" != "$want" ]; then
+        stale="$dir/member.stale-$(${pkgs.coreutils}/bin/date +%s)"
+        echo "etcd data in $dir was written under another cluster CA; moving it to $stale"
+        mv "$dir/member" "$stale"
+      fi
+      mkdir -p "$dir"
+      echo "$want" > "$mark"
+    '';
+
   # The controller reads the same file to decide which versions an apply may
   # ask for. The node agent installs it next to this module.
   kubernetesReleases = builtins.fromJSON (builtins.readFile ./kubernetes-releases.json);
@@ -73,9 +100,9 @@ let
           ''
         );
 
-  provisionerApply =
-    package: kubeconfig: manifestPath:
-    pkgs.writeShellScript "kcore-apply-provisioner" ''
+  manifestApply =
+    what: package: kubeconfig: manifestPath:
+    pkgs.writeShellScript "kcore-apply-${what}" ''
       set -eu
       kube=${package}/bin/kubectl
       for _ in $(seq 1 90); do
@@ -85,8 +112,192 @@ let
         fi
         sleep 2
       done
-      echo "Kubernetes API was not ready for the local provisioner" >&2
+      echo "Kubernetes API was not ready for ${what}" >&2
       exit 1
+    '';
+  # keepalived only knows the host is up. Without this check the VIP stays
+  # on a node whose API server is down and the cluster API goes with it.
+  # Two missed one-second checks move it, so a rebuild costs about 2s.
+  apiServerCheck =
+    port:
+    pkgs.writeShellScript "kcore-apiserver-check-${toString port}" ''
+      exec ${pkgs.curl}/bin/curl -sk -m 1 -o /dev/null -f https://127.0.0.1:${toString port}/livez
+    '';
+  vrrpApiServerScript = name: port: ''
+    vrrp_script ${name} {
+      script "${apiServerCheck port}"
+      interval 1
+      timeout 2
+      fall 2
+      rise 2
+    }
+  '';
+  # etcd reads these only when it creates its data dir. Kept out of
+  # ExecStart so a membership change re-renders the survivors without
+  # restarting their etcd, which would cost a two-member cluster its quorum.
+  etcdBootstrapEnv = initialCluster: members: ''
+    ETCD_INITIAL_CLUSTER_STATE=${if initialCluster then "new" else "existing"}
+    ETCD_INITIAL_CLUSTER=${members}
+  '';
+  provisionerApply = manifestApply "provisioner";
+  coreDnsApply = manifestApply "coredns";
+
+  # Kubelets hand pods clusterDns as their resolver, so every cluster needs
+  # this service. Upstream queries go to the node's resolv.conf.
+  coreDnsYaml =
+    { clusterDns, image }:
+    ''
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: coredns
+        namespace: kube-system
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: system:coredns
+      rules:
+        - apiGroups: [""]
+          resources: [endpoints, services, pods, namespaces]
+          verbs: [list, watch]
+        - apiGroups: [discovery.k8s.io]
+          resources: [endpointslices]
+          verbs: [list, watch]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: system:coredns
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: system:coredns
+      subjects:
+        - kind: ServiceAccount
+          name: coredns
+          namespace: kube-system
+      ---
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: coredns
+        namespace: kube-system
+      data:
+        Corefile: |
+          .:53 {
+              errors
+              health {
+                  lameduck 5s
+              }
+              ready
+              kubernetes cluster.local in-addr.arpa ip6.arpa {
+                  pods insecure
+                  fallthrough in-addr.arpa ip6.arpa
+                  ttl 30
+              }
+              prometheus :9153
+              forward . /etc/resolv.conf {
+                  max_concurrent 1000
+              }
+              cache 30
+              loop
+              reload
+              loadbalance
+          }
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: coredns
+        namespace: kube-system
+        labels:
+          k8s-app: kube-dns
+      spec:
+        replicas: 2
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 1
+        selector:
+          matchLabels:
+            k8s-app: kube-dns
+        template:
+          metadata:
+            labels:
+              k8s-app: kube-dns
+          spec:
+            priorityClassName: system-cluster-critical
+            serviceAccountName: coredns
+            dnsPolicy: Default
+            nodeSelector:
+              kubernetes.io/os: linux
+            tolerations:
+              - key: CriticalAddonsOnly
+                operator: Exists
+              - key: node-role.kubernetes.io/control-plane
+                effect: NoSchedule
+            affinity:
+              podAntiAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    podAffinityTerm:
+                      topologyKey: kubernetes.io/hostname
+                      labelSelector:
+                        matchLabels:
+                          k8s-app: kube-dns
+            containers:
+              - name: coredns
+                image: ${image}
+                args: ["-conf", "/etc/coredns/Corefile"]
+                resources:
+                  limits:
+                    memory: 170Mi
+                  requests:
+                    cpu: 100m
+                    memory: 70Mi
+                ports:
+                  - { name: dns, containerPort: 53, protocol: UDP }
+                  - { name: dns-tcp, containerPort: 53, protocol: TCP }
+                  - { name: metrics, containerPort: 9153, protocol: TCP }
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    add: [NET_BIND_SERVICE]
+                    drop: [ALL]
+                livenessProbe:
+                  httpGet: { path: /health, port: 8080, scheme: HTTP }
+                  initialDelaySeconds: 60
+                  timeoutSeconds: 5
+                  failureThreshold: 5
+                readinessProbe:
+                  httpGet: { path: /ready, port: 8181, scheme: HTTP }
+                volumeMounts:
+                  - { name: config-volume, mountPath: /etc/coredns, readOnly: true }
+            volumes:
+              - name: config-volume
+                configMap:
+                  name: coredns
+                  items:
+                    - { key: Corefile, path: Corefile }
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: kube-dns
+        namespace: kube-system
+        labels:
+          k8s-app: kube-dns
+          kubernetes.io/name: CoreDNS
+      spec:
+        selector:
+          k8s-app: kube-dns
+        clusterIP: ${clusterDns}
+        ports:
+          - { name: dns, port: 53, protocol: UDP }
+          - { name: dns-tcp, port: 53, protocol: TCP }
+          - { name: metrics, port: 9153, protocol: TCP }
     '';
 
   # Primary cluster only. Extra clusters use the bridge CNI and must not
@@ -561,11 +772,8 @@ let
         wants = [ "network-online.target" ];
         serviceConfig = {
           Type = "notify";
-          ExecStartPre = "${pkgs.writeShellScript "kcore-etcd-clear-empty-${name}" ''
-            if [ ! -e ${etcdDir}/member/snap/db ] && [ ! -d ${etcdDir}/member/wal ]; then
-              rm -rf ${etcdDir}/member
-            fi
-          ''}";
+          ExecStartPre = etcdPrepare name etcdDir "${pki}/etcd/ca.crt";
+          EnvironmentFile = "${root}/etcd-bootstrap.env";
           ExecStart = ''
             ${pkgs.etcd}/bin/etcd \
               --name=${config.networking.hostName} \
@@ -574,10 +782,6 @@ let
               --listen-client-urls=https://${c.advertiseAddress}:${toString etcdClient},https://127.0.0.1:${toString etcdClient} \
               --advertise-client-urls=https://${c.advertiseAddress}:${toString etcdClient} \
               --initial-advertise-peer-urls=https://${c.advertiseAddress}:${toString etcdPeer} \
-              ${
-                if c.initialCluster then "--initial-cluster-state=new" else "--initial-cluster-state=existing"
-              } \
-              --initial-cluster=${c.etcdInitialCluster} \
               --client-cert-auth=true \
               --trusted-ca-file=${pki}/etcd/ca.crt \
               --cert-file=${pki}/etcd/server.crt \
@@ -594,6 +798,11 @@ let
         };
       };
 
+      environment.etc."kubernetes/${name}/etcd-bootstrap.env" = lib.mkIf (c.role == "control-plane") {
+        mode = "0644";
+        text = etcdBootstrapEnv c.initialCluster c.etcdInitialCluster;
+      };
+
       systemd.services."kube-apiserver-${name}" = lib.mkIf (c.role == "control-plane") {
         description = "Kubernetes API server for ${name}";
         wantedBy = [ "multi-user.target" ];
@@ -604,6 +813,7 @@ let
         wants = [ "network-online.target" ];
         serviceConfig = {
           Type = "notify";
+          TimeoutStopSec = "30s";
           ExecStart = ''
             ${package}/bin/kube-apiserver \
               --advertise-address=${c.advertiseAddress} \
@@ -750,6 +960,7 @@ let
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
+        reloadTriggers = [ config.environment.etc."keepalived/keepalived-${name}.conf".source ];
         serviceConfig = {
           Type = "forking";
           PIDFile = "/run/keepalived-${name}.pid";
@@ -757,6 +968,7 @@ let
           # A second keepalived cannot share the primary daemon's
           # /run/vrrp.pid. -r gives this cluster its own VRRP pid file.
           ExecStart = "${pkgs.keepalived}/bin/keepalived -f /etc/keepalived/keepalived-${name}.conf -p /run/keepalived-${name}.pid -r /run/vrrp-${name}.pid";
+          ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
           Restart = "always";
           RestartSec = "5s";
         };
@@ -785,6 +997,31 @@ let
             };
           };
 
+      environment.etc."kubernetes/${name}/coredns.yaml" = lib.mkIf (c.role == "control-plane") {
+        mode = "0644";
+        text = coreDnsYaml {
+          inherit (c) clusterDns;
+          image = cfg.coreDnsImage;
+        };
+      };
+
+      systemd.services."kcore-kubernetes-coredns-${name}" = lib.mkIf (c.role == "control-plane") {
+        description = "Apply CoreDNS for Kubernetes cluster ${name}";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "kube-apiserver-${name}.service"
+          "kubelet-${name}.service"
+        ];
+        restartTriggers = [ config.environment.etc."kubernetes/${name}/coredns.yaml".source ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = coreDnsApply package "${root}/admin.conf" "${root}/coredns.yaml";
+          Restart = "on-failure";
+          RestartSec = "15s";
+        };
+      };
+
       environment.etc."keepalived/keepalived-${name}.conf" =
         lib.mkIf (c.role == "control-plane" && c.haEnabled)
           {
@@ -792,7 +1029,10 @@ let
             text = ''
               global_defs {
                 router_id ${config.networking.hostName}-${name}
+                script_user root
+                enable_script_security
               }
+              ${vrrpApiServerScript "${vrrpName}_api" apiPort}
               vrrp_instance ${vrrpName} {
                 state BACKUP
                 interface ${c.vipInterface}
@@ -807,6 +1047,9 @@ let
                 authentication {
                   auth_type PASS
                   auth_pass k${toString c.virtualRouterId}
+                }
+                track_script {
+                  ${vrrpName}_api
                 }
                 virtual_ipaddress {
                   ${c.vipAddress}/24
@@ -879,6 +1122,12 @@ in
       type = lib.types.str;
       default = "10.96.0.10";
       description = "DNS service IP (CoreDNS).";
+    };
+
+    coreDnsImage = lib.mkOption {
+      type = lib.types.str;
+      default = "registry.k8s.io/coredns/coredns:v1.13.1";
+      description = "CoreDNS image the control planes deploy for every cluster on this node.";
     };
 
     advertiseAddress = lib.mkOption {
@@ -1348,8 +1597,14 @@ in
           etcd
           cilium-cli
           containerd
+          cri-tools
         ]
         ++ lib.optionals cfg.haEnabled [ keepalived ];
+
+      environment.etc."crictl.yaml".text = ''
+        runtime-endpoint: unix:///run/containerd/containerd.sock
+        image-endpoint: unix:///run/containerd/containerd.sock
+      '';
 
       # containerd configuration
       virtualisation.containerd = {
@@ -1584,14 +1839,8 @@ in
 
         serviceConfig = {
           Type = "notify";
-          # A crash before the first WAL (missing peer certs) leaves an empty
-          # member directory. etcd then refuses --initial-cluster-state=new.
-          # Keep a directory that already has a snapshot or WAL.
-          ExecStartPre = "${pkgs.writeShellScript "kcore-etcd-clear-empty-member" ''
-            if [ ! -e /var/lib/etcd/member/snap/db ] && [ ! -d /var/lib/etcd/member/wal ]; then
-              rm -rf /var/lib/etcd/member
-            fi
-          ''}";
+          ExecStartPre = etcdPrepare "primary" "/var/lib/etcd" "/etc/kubernetes/pki/etcd/ca.crt";
+          EnvironmentFile = "/etc/kubernetes/etcd-bootstrap.env";
           ExecStart = ''
             ${pkgs.etcd}/bin/etcd \
               --name=${config.networking.hostName} \
@@ -1600,10 +1849,6 @@ in
               --listen-client-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdClient},https://127.0.0.1:${toString k8sPorts.etcdClient} \
               --advertise-client-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdClient} \
               --initial-advertise-peer-urls=https://${cfg.advertiseAddress}:${toString k8sPorts.etcdPeer} \
-              ${
-                if cfg.initialCluster then "--initial-cluster-state=new" else "--initial-cluster-state=existing"
-              } \
-              --initial-cluster=${etcdInitialCluster} \
               --client-cert-auth=true \
               --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \
               --cert-file=/etc/kubernetes/pki/etcd/server.crt \
@@ -1620,6 +1865,11 @@ in
         };
       };
 
+      environment.etc."kubernetes/etcd-bootstrap.env" = lib.mkIf (cfg.role == "control-plane") {
+        mode = "0644";
+        text = etcdBootstrapEnv cfg.initialCluster etcdInitialCluster;
+      };
+
       # kube-apiserver (control-plane only)
       systemd.services.kube-apiserver = lib.mkIf (cfg.role == "control-plane") {
         description = "Kubernetes API Server";
@@ -1632,6 +1882,9 @@ in
 
         serviceConfig = {
           Type = "notify";
+          # With etcd already gone the graceful shutdown retries it until
+          # the stop timeout; a healthy stop takes about two seconds.
+          TimeoutStopSec = "30s";
           ExecStart = ''
             ${cfg.package}/bin/kube-apiserver \
               --advertise-address=${cfg.advertiseAddress} \
@@ -1709,14 +1962,18 @@ in
       };
 
       # kubelet (all nodes)
+      # Started before containerd's socket is up, kubelet exits and the
+      # switch counts the failed unit as a failed rebuild.
       systemd.services.kubelet = {
         description = "Kubernetes Kubelet";
         wantedBy = [ "multi-user.target" ];
         after = [
           "network-online.target"
+          "containerd.service"
         ]
         ++ lib.optionals (cfg.role == "control-plane") [ "kube-apiserver.service" ];
         wants = [ "network-online.target" ];
+        requires = [ "containerd.service" ];
         # Volume setup execs mount(8). The default unit PATH is the NixOS
         # activation set, which does not include util-linux.
         path = with pkgs; [
@@ -1769,12 +2026,15 @@ in
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
+        # A reload keeps the VIP where it is; a restart would drop it.
+        reloadTriggers = [ config.environment.etc."keepalived/keepalived.conf".source ];
 
         serviceConfig = {
           Type = "forking";
           PIDFile = "/run/keepalived.pid";
           ExecStartPre = keepalivedNotrack;
           ExecStart = "${pkgs.keepalived}/bin/keepalived -f /etc/keepalived/keepalived.conf -p /run/keepalived.pid";
+          ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
           Restart = "always";
           RestartSec = "5s";
         };
@@ -1806,6 +2066,34 @@ in
             };
           };
 
+      environment.etc."kubernetes/coredns.yaml" = lib.mkIf (cfg.role == "control-plane") {
+        mode = "0644";
+        text = coreDnsYaml {
+          inherit (cfg) clusterDns;
+          image = cfg.coreDnsImage;
+        };
+      };
+
+      # Pods stay Pending until Cilium is up, so ordering after it only
+      # avoids a failed first apply.
+      systemd.services.kcore-kubernetes-coredns = lib.mkIf (cfg.role == "control-plane") {
+        description = "Apply CoreDNS";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "kube-apiserver.service"
+          "kubelet.service"
+          "kcore-kubernetes-cilium.service"
+        ];
+        restartTriggers = [ config.environment.etc."kubernetes/coredns.yaml".source ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = coreDnsApply cfg.package "/etc/kubernetes/admin.conf" "/etc/kubernetes/coredns.yaml";
+          Restart = "on-failure";
+          RestartSec = "15s";
+        };
+      };
+
       # VRRP for the API VIP. The unit used to start with no config file, so
       # keepalived exited before it could own vipAddress.
       environment.etc."keepalived/keepalived.conf" =
@@ -1830,7 +2118,10 @@ in
               ''
                 global_defs {
                   router_id ${config.networking.hostName}
+                  script_user root
+                  enable_script_security
                 }
+                ${vrrpApiServerScript "kcore_api_check" k8sPorts.apiServer}
                 vrrp_instance kcore_api {
                   state BACKUP
                   interface ${cfg.vipInterface}
@@ -1845,6 +2136,9 @@ in
                   authentication {
                     auth_type PASS
                     auth_pass kcoreapi
+                  }
+                  track_script {
+                    kcore_api_check
                   }
                   virtual_ipaddress {
                     ${cfg.vipAddress}/24
@@ -1903,6 +2197,34 @@ in
         lib.mkDefault "loose"
       );
       systemd.services = lib.mkMerge (map (extra: extra.systemd.services or { }) extras);
+
+      # A host taken out of a cluster keeps that cluster's etcd data, which
+      # predates the CA marker etcdPrepare checks. Set it aside so a cluster
+      # created here later cannot start on it. Activation runs after
+      # switch-to-configuration has stopped the etcd units it removed.
+      system.activationScripts.kcoreRetiredEtcd.text = ''
+        kcore_retire_etcd() {
+          if [ -d "$1/member" ]; then
+            dest="$1/member.retired-$(${pkgs.coreutils}/bin/date +%s)"
+            echo "kcore: $1 belongs to no configured Kubernetes cluster; moving its data to $dest"
+            ${pkgs.coreutils}/bin/mv "$1/member" "$dest"
+          fi
+        }
+        ${lib.optionalString (
+          !(cfg.enable && cfg.role == "control-plane")
+        ) "kcore_retire_etcd /var/lib/etcd"}
+        for dir in /var/lib/etcd-*; do
+          [ -d "$dir" ] || continue
+          case "''${dir#/var/lib/etcd-}" in
+            ${
+              lib.concatStringsSep "|" (
+                lib.attrNames (lib.filterAttrs (_: c: c.role == "control-plane") cfg.additionalClusters) ++ [ "-" ]
+              )
+            }) ;;
+            *) kcore_retire_etcd "$dir" ;;
+          esac
+        done
+      '';
     }
   ];
 }

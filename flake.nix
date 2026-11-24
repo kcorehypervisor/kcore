@@ -64,6 +64,7 @@
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
               || (toString path) == "${toString ./.}/modules/kubernetes-releases.json"
+              || (toString path) == "${toString ./.}/modules/kcore-keepalived-notrack.nix"
               || (toString path) == "${toString ./.}/modules/kcore-slurm.nix"
               || (toString path) == "${toString ./.}/modules/kcore-postgresql-cluster.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/postgresql-cluster/" (toString path)

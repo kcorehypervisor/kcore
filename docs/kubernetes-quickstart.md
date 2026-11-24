@@ -223,8 +223,9 @@ kubectl get pods -o wide
 # On node-107, stop API server
 ssh node-107 'sudo systemctl stop kube-apiserver'
 
-# VIP should move to node-105 or node-119 within 5 seconds
-# kubectl commands should still work via VIP
+# keepalived checks the local API server's /livez every second. After two
+# misses the node gives up the VIP and node-105 or node-119 takes it, about
+# 2 seconds of failed requests. kubectl keeps working through the VIP.
 
 # Verify
 kubectl --kubeconfig=... --server=https://192.168.40.200:6443 get nodes
@@ -245,6 +246,8 @@ kctl kubernetes scale lab --remove node-108
 ```
 
 `--remove` cordons and drains the node, then deletes it from the API. A control-plane node leaves the etcd member list first. The command refuses a removal that would drop etcd below quorum, and it refuses to remove the last control-plane node.
+
+When a control plane joins or leaves, the control planes that stay are re-rendered one at a time so their keepalived peer lists match the new member set. For a join this happens before the new node is configured; otherwise the new node would not hear the VIP holder and would claim the VIP too. The refresh reloads keepalived and does not restart etcd, because etcd reads its initial member list from `/etc/kubernetes/etcd-bootstrap.env` and only uses it when it creates its data directory. Workers get the `node-role.kubernetes.io/worker` label from the controller when they join.
 
 ### Drain Node for Maintenance
 
@@ -267,6 +270,12 @@ Then:
 kctl kubernetes plan -f lab-cluster.yaml   # Shows "update" action
 kctl kubernetes apply -f lab-cluster.yaml  # Rolling update
 ```
+
+The cluster goes to phase `reconfiguring` and the controller pushes the configuration one node at a time, control planes first. Each node's rebuild has to finish, and a control plane's etcd has to be whole again, before the next node starts, so a change that restarts etcd or the API server never takes them down on two control planes at once. `kctl kubernetes get` shows which node is being applied. If a rebuild fails the cluster goes `degraded` with a message starting `configuration rollout stopped` and the Nix error line; fix the cause and apply again.
+
+Applying the same manifest again is also how a ready cluster picks up a newer kcore Kubernetes module after the node agents were upgraded: a ready cluster is not re-rendered on its own.
+
+A cluster that has lost etcd quorum gets the configuration on every node at once instead, since one node at a time could never bring etcd back.
 
 ### Upgrade Kubernetes
 
@@ -296,10 +305,14 @@ Rules:
 ### Delete Cluster
 
 ```bash
-kctl kubernetes delete lab-ha --confirm
+kctl kubernetes delete lab-ha --yes
 ```
 
-This renders `enable = false` in Nix, stops all Kubernetes services, and removes the cluster record.
+The cluster goes to phase `deleting` and each member is re-rendered without it: a node in no other cluster gets `enable = false`, which stops all Kubernetes services. The record is removed only after every member took the change. An unreachable member fails the delete; `--force` removes the record anyway and leaves that node to be cleaned up. etcd data the node no longer serves is moved aside to `member.retired-<time>`, and an etcd data directory created under a different CA is moved to `member.stale-<time>` before etcd starts, so a cluster recreated with the same name starts clean.
+
+## Cluster services
+
+Each control plane applies Cilium and CoreDNS. CoreDNS runs two replicas spread across hosts behind the `kube-dns` service on `clusterDns`, forwards other names to the node's resolvers, and its image is `kcore.kubernetes.coreDnsImage`. `crictl` is installed on every node and pointed at containerd.
 
 ## Troubleshooting
 

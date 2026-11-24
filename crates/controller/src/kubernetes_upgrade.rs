@@ -30,6 +30,38 @@ pub enum ApplyProgress {
     Failed,
 }
 
+/// A node rebuild the controller started and has not seen finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApply {
+    pub node_id: String,
+    pub address: String,
+    pub apply_id: String,
+}
+
+const APPLY_SUMMARY_MAX: usize = 400;
+
+/// The line that explains a failed rebuild: the last Nix `error:` line, or
+/// the last non-empty line. The agent stores the whole stderr.
+pub fn apply_failure_summary(message: &str) -> String {
+    let lines: Vec<&str> = message
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let line = lines
+        .iter()
+        .rev()
+        .find_map(|l| l.find("error:").map(|at| &l[at..]))
+        .or_else(|| lines.last().copied())
+        .unwrap_or("no error output");
+    if line.chars().count() <= APPLY_SUMMARY_MAX {
+        return line.to_string();
+    }
+    let mut cut: String = line.chars().take(APPLY_SUMMARY_MAX).collect();
+    cut.push('…');
+    cut
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeMember {
     pub node_id: String,
@@ -258,6 +290,27 @@ pub fn version_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_summary_keeps_the_nix_error_line() {
+        let message = "switch failed: building the system configuration...\n\
+             … while evaluating the module\n\
+             error: path '/nix/store/x-source/modules/kcore-keepalived-notrack.nix' does not exist\n";
+        assert_eq!(
+            apply_failure_summary(message),
+            "error: path '/nix/store/x-source/modules/kcore-keepalived-notrack.nix' does not exist"
+        );
+        assert_eq!(
+            apply_failure_summary("nixos-rebuild test+switch failed (exit 1)\n"),
+            "nixos-rebuild test+switch failed (exit 1)"
+        );
+        assert_eq!(apply_failure_summary(""), "no error output");
+        let long = "x".repeat(APPLY_SUMMARY_MAX + 10);
+        assert_eq!(
+            apply_failure_summary(&long).chars().count(),
+            APPLY_SUMMARY_MAX + 1
+        );
+    }
 
     const FROM: &str = "1.35.2";
     const TO: &str = "1.36.6";

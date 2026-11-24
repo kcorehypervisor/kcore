@@ -113,6 +113,25 @@ pub async fn cordon(
     Ok(())
 }
 
+/// NodeRestriction stops a kubelet from setting node-role labels on itself,
+/// and control planes only label themselves, so workers are labelled here.
+pub async fn label_worker(clients: &NodeClients, address: &str, name: &str) -> Result<(), String> {
+    let name = api_name(name)?;
+    let (status, response) = kubernetes_request(
+        clients,
+        address,
+        "PATCH",
+        &format!("/api/v1/nodes/{name}"),
+        r#"{"metadata":{"labels":{"node-role.kubernetes.io/worker":""}}}"#,
+        "application/merge-patch+json",
+    )
+    .await?;
+    if status != 200 {
+        return Err(format!("label {name} returned {status}: {response}"));
+    }
+    Ok(())
+}
+
 pub async fn delete_node(clients: &NodeClients, address: &str, name: &str) -> Result<(), String> {
     let name = api_name(name)?;
     let (status, body) = kubernetes_request(

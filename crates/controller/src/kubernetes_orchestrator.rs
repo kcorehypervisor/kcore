@@ -4,12 +4,15 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::db::{Database, KubernetesClusterNodeRow, KubernetesNodeUpgradeRow};
 use crate::kubernetes_lifecycle::{self, MemberSnapshot, ScaleStep};
 use crate::kubernetes_pki::{self, KubernetesPki, NodeInfo};
-use crate::kubernetes_upgrade::{self, ApplyProgress, UpgradeMember, UpgradeStep, UpgradeView};
+use crate::kubernetes_upgrade::{
+    self, apply_failure_summary, ApplyProgress, PendingApply, UpgradeMember, UpgradeStep,
+    UpgradeView,
+};
 use crate::kubernetes_versions;
 use crate::node_client::NodeClients;
 
@@ -41,6 +44,13 @@ pub enum BootstrapPhase {
 
 const NODES_READY_TIMEOUT_SECS: u64 = 600;
 pub const NODES_NOT_READY: &str = "nodes not Ready";
+/// A cluster whose nodes are being released by DeleteKubernetesCluster.
+/// No reconcile loop acts on it, and node renders leave it out.
+pub const PHASE_DELETING: &str = "deleting";
+pub const PHASE_RECONFIGURING: &str = "reconfiguring";
+const APPLY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const ETCD_MEMBERS_TIMEOUT_SECS: u64 = 300;
+const KUBERNETES_DISABLED_NIX: &str = "{\n  kcore.kubernetes.enable = false;\n}\n";
 
 pub struct MemberHealth {
     pub node_id: String,
@@ -207,25 +217,30 @@ impl KubernetesOrchestrator {
             deploy_tasks.push(task);
         }
 
-        // Wait for all deployments to complete
-        let mut deploy_results = Vec::new();
-        for task in deploy_tasks {
-            deploy_results.push(task.await.context("task join failed")?);
+        let mut applies = Vec::new();
+        let mut failures = Vec::new();
+        for (node, task) in nodes.iter().zip(deploy_tasks) {
+            match task.await.context("task join failed")? {
+                Ok(apply_id) => applies.push(PendingApply {
+                    node_id: node.node_id.clone(),
+                    address: format!("{}:9091", node.ip_address),
+                    apply_id,
+                }),
+                Err(e) => failures.push(format!("{}: {e:#}", node.node_id)),
+            }
         }
-
-        // Check if any deployments failed
-        let failed_count = deploy_results.iter().filter(|r| r.is_err()).count();
-        if failed_count > 0 {
+        if !failures.is_empty() {
             error!(
                 cluster = cluster_name,
-                failed = failed_count,
+                failed = failures.len(),
                 total = nodes.len(),
                 "some node deployments failed"
             );
             return Err(anyhow!(
-                "{} of {} node deployments failed",
-                failed_count,
-                nodes.len()
+                "{} of {} node deployments failed: {}",
+                failures.len(),
+                nodes.len(),
+                failures.join("; ")
             ));
         }
 
@@ -244,7 +259,7 @@ impl KubernetesOrchestrator {
             anyhow::bail!("cluster {cluster_name} has no control-plane node");
         }
         let required_quorum = (control_planes / 2) + 1;
-        self.wait_for_etcd_quorum(cluster_name, required_quorum, 300)
+        self.wait_for_etcd_quorum(cluster_name, required_quorum, &mut applies, 300)
             .await?;
 
         // Phase 4: Wait for API server
@@ -284,6 +299,9 @@ impl KubernetesOrchestrator {
         while start.elapsed().as_secs() < timeout_secs {
             match self.refresh_node_readiness(cluster_name).await {
                 Ok(missing) if missing.is_empty() => {
+                    if let Err(err) = self.label_workers(cluster_name).await {
+                        warn!(cluster = cluster_name, error = %err, "worker role labels not applied");
+                    }
                     self.db
                         .mark_kubernetes_cluster_ready(cluster_name, control_planes)?;
                     return Ok(());
@@ -533,15 +551,17 @@ impl KubernetesOrchestrator {
             }
         };
 
-        let pending_join: HashSet<String> = self
+        // Joining nodes are configured by the scaling steps, and a leaving
+        // node no longer renders this cluster.
+        let not_serving: HashSet<String> = self
             .db
             .list_kubernetes_cluster_nodes(cluster_name)?
             .into_iter()
-            .filter(|row| row.pending_join)
+            .filter(|row| row.pending_join || row.pending_removal)
             .map(|row| row.node_id)
             .collect();
         for node in &nodes {
-            if pending_join.contains(&node.node_id) {
+            if not_serving.contains(&node.node_id) {
                 continue;
             }
             self.configure_node(
@@ -651,6 +671,9 @@ impl KubernetesOrchestrator {
         let mut members = Vec::new();
         let mut primary_kubeconfig = String::new();
         for cluster in clusters {
+            if cluster.phase == PHASE_DELETING {
+                continue;
+            }
             let membership = self.db.list_kubernetes_cluster_nodes(&cluster.name)?;
             if membership
                 .iter()
@@ -810,6 +833,7 @@ impl KubernetesOrchestrator {
         &self,
         cluster_name: &str,
         expected_nodes: usize,
+        applies: &mut Vec<PendingApply>,
         timeout_secs: u64,
     ) -> Result<()> {
         info!(
@@ -820,6 +844,7 @@ impl KubernetesOrchestrator {
 
         let start = std::time::Instant::now();
         while start.elapsed().as_secs() < timeout_secs {
+            self.check_pending_applies(applies).await?;
             let healthy_count = self.count_healthy_etcd_members(cluster_name).await?;
 
             if healthy_count >= expected_nodes {
@@ -841,7 +866,34 @@ impl KubernetesOrchestrator {
             sleep(Duration::from_secs(10)).await;
         }
 
-        anyhow::bail!("timeout waiting for etcd quorum in {}", cluster_name)
+        let rebuilding: Vec<&str> = applies.iter().map(|a| a.node_id.as_str()).collect();
+        if rebuilding.is_empty() {
+            anyhow::bail!("timeout waiting for etcd quorum in {cluster_name}")
+        }
+        anyhow::bail!(
+            "timeout waiting for etcd quorum in {cluster_name}; still rebuilding: {}",
+            rebuilding.join(", ")
+        )
+    }
+
+    /// Drops finished rebuilds and fails on the first one that failed, so a
+    /// broken node configuration is reported instead of a quorum timeout.
+    async fn check_pending_applies(&self, applies: &mut Vec<PendingApply>) -> Result<()> {
+        let mut still_running = Vec::new();
+        for apply in applies.drain(..) {
+            let (progress, message) = self.apply_progress(&apply.address, &apply.apply_id).await;
+            match progress {
+                ApplyProgress::Failed => anyhow::bail!(
+                    "nixos-rebuild failed on {}: {}",
+                    apply.node_id,
+                    apply_failure_summary(&message)
+                ),
+                ApplyProgress::Succeeded => {}
+                _ => still_running.push(apply),
+            }
+        }
+        *applies = still_running;
+        Ok(())
     }
 
     async fn count_healthy_etcd_members(&self, cluster_name: &str) -> Result<usize> {
@@ -891,6 +943,169 @@ impl KubernetesOrchestrator {
             .filter(|row| row.role == "control-plane")
             .count();
         Ok((control_planes / 2) + 1)
+    }
+
+    /// True when enough etcd members answer that one control plane can
+    /// restart without taking the cluster down.
+    pub async fn etcd_has_quorum(&self, cluster_name: &str) -> bool {
+        let healthy = self
+            .count_healthy_etcd_members(cluster_name)
+            .await
+            .unwrap_or(0);
+        let need = self.control_plane_quorum(cluster_name).await.unwrap_or(1);
+        healthy >= need
+    }
+
+    /// Push the stored configuration to `members` one at a time, control
+    /// planes first. Each rebuild has to finish, and a control plane's etcd
+    /// has to be back, before the next node starts, so a change that restarts
+    /// etcd or the API server never takes them down on two nodes at once.
+    async fn roll_config(
+        &self,
+        cluster_name: &str,
+        mut members: Vec<ClusterNode>,
+        phase: &str,
+    ) -> Result<()> {
+        members.sort_by_key(|member| member.role == "worker");
+        let total = members.len();
+        for (done, member) in members.iter().enumerate() {
+            self.db.set_kubernetes_cluster_status(
+                cluster_name,
+                phase,
+                &format!(
+                    "applying configuration to {} ({done}/{total} nodes, control planes first)",
+                    member.node_id
+                ),
+            )?;
+            let apply_id = self
+                .push_member_config(cluster_name, &member.node_id)
+                .await
+                .with_context(|| format!("push configuration to {}", member.node_id))?;
+            self.wait_for_apply(
+                &member.node_id,
+                &format!("{}:9091", member.ip_address),
+                &apply_id,
+            )
+            .await?;
+            if member.role != "worker" {
+                self.wait_for_etcd_members(cluster_name, &member.node_id)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn wait_for_apply(&self, node_id: &str, address: &str, apply_id: &str) -> Result<()> {
+        if apply_id.is_empty() {
+            return Ok(());
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let (progress, message) = self.apply_progress(address, apply_id).await;
+            match progress {
+                ApplyProgress::Succeeded => return Ok(()),
+                ApplyProgress::Failed => anyhow::bail!(
+                    "nixos-rebuild failed on {node_id}: {}",
+                    apply_failure_summary(&message)
+                ),
+                // The agent lost the record; etcd health decides for a
+                // control plane.
+                ApplyProgress::Unknown | ApplyProgress::NotRecorded => return Ok(()),
+                ApplyProgress::Running => {}
+            }
+            if start.elapsed() > APPLY_TIMEOUT {
+                anyhow::bail!(
+                    "nixos-rebuild on {node_id} did not finish in {} minutes",
+                    APPLY_TIMEOUT.as_secs() / 60
+                );
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Waits until every control plane that is already in etcd answers.
+    async fn wait_for_etcd_members(&self, cluster_name: &str, after: &str) -> Result<()> {
+        let expected = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)?
+            .iter()
+            .filter(|row| row.role == "control-plane" && !row.pending_join)
+            .count();
+        let start = std::time::Instant::now();
+        let mut healthy = 0;
+        while start.elapsed().as_secs() < ETCD_MEMBERS_TIMEOUT_SECS {
+            healthy = self.count_healthy_etcd_members(cluster_name).await?;
+            if healthy >= expected {
+                return Ok(());
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
+        anyhow::bail!(
+            "etcd did not recover after {after} was reconfigured: {healthy} of {expected} members healthy"
+        )
+    }
+
+    fn member_role(&self, cluster_name: &str, node_id: &str) -> Result<String> {
+        Ok(self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)?
+            .into_iter()
+            .find(|row| row.node_id == node_id)
+            .map(|row| row.role)
+            .unwrap_or_default())
+    }
+
+    /// Re-render the control planes already serving after the control-plane
+    /// set changed. Their keepalived peers come from the member list: a
+    /// joining node they do not list never hears the VIP holder and claims
+    /// the VIP too.
+    async fn refresh_serving_control_planes(&self, cluster_name: &str, skip: &str) -> Result<()> {
+        let serving: HashSet<String> = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)?
+            .into_iter()
+            .filter(|row| {
+                row.role == "control-plane"
+                    && !row.pending_join
+                    && !row.pending_removal
+                    && row.node_id != skip
+            })
+            .map(|row| row.node_id)
+            .collect();
+        let members = self
+            .get_cluster_nodes(cluster_name)
+            .await?
+            .into_iter()
+            .filter(|member| serving.contains(&member.node_id))
+            .collect();
+        self.roll_config(cluster_name, members, "scaling").await
+    }
+
+    /// Roll the configuration the operator last applied out to every member.
+    async fn reconcile_reconfigure(&self, cluster_name: &str) -> Result<()> {
+        let generation = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?
+            .generation;
+        let members = self.get_cluster_nodes(cluster_name).await?;
+        self.roll_config(cluster_name, members, PHASE_RECONFIGURING)
+            .await?;
+        let current = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+        // Applied again mid-rollout: leave the phase so the next pass rolls
+        // the newer spec out.
+        if current.generation != generation {
+            return Ok(());
+        }
+        self.db.set_kubernetes_cluster_status(
+            cluster_name,
+            "ready",
+            "cluster configuration deployed",
+        )?;
+        Ok(())
     }
 
     async fn apiserver_is_ready(&self, cluster_name: &str) -> Result<bool> {
@@ -1039,6 +1254,10 @@ impl KubernetesOrchestrator {
                     self.etcd_member_add(cluster_name, &node_id).await?;
                 }
                 ScaleStep::Configure { node_id } => {
+                    if self.member_role(cluster_name, &node_id)? == "control-plane" {
+                        self.refresh_serving_control_planes(cluster_name, &node_id)
+                            .await?;
+                    }
                     self.configure_joining_node(cluster_name, &node_id).await?;
                     self.db.set_kubernetes_cluster_status(
                         cluster_name,
@@ -1052,6 +1271,9 @@ impl KubernetesOrchestrator {
                     registered_name,
                 } => {
                     self.mark_member_joined(cluster_name, &node_id, &registered_name)?;
+                    if let Err(err) = self.label_workers(cluster_name).await {
+                        warn!(cluster = cluster_name, error = %err, "worker role labels not applied");
+                    }
                 }
                 ScaleStep::CordonDrain { node_id } => {
                     self.drain_member(cluster_name, &node_id).await?;
@@ -1064,9 +1286,14 @@ impl KubernetesOrchestrator {
                     self.delete_api_member(cluster_name, &node_id).await?;
                 }
                 ScaleStep::DeleteMembership { node_id } => {
+                    let role = self.member_role(cluster_name, &node_id)?;
                     self.clear_member_nix(cluster_name, &node_id).await?;
                     self.db
                         .delete_kubernetes_cluster_node(cluster_name, &node_id)?;
+                    if role == "control-plane" {
+                        self.refresh_serving_control_planes(cluster_name, &node_id)
+                            .await?;
+                    }
                 }
             }
         }
@@ -1503,16 +1730,20 @@ impl KubernetesOrchestrator {
             role: row.role,
             kubelet_kubeconfig: kubelet,
         };
-        self.configure_node(
-            cluster_name,
-            &member,
-            &pki,
-            &cluster.cluster_cidr,
-            &cluster.service_cidr,
-            &[],
-        )
-        .await
-        .map(|_| ())
+        let apply_id = self
+            .configure_node(
+                cluster_name,
+                &member,
+                &pki,
+                &cluster.cluster_cidr,
+                &cluster.service_cidr,
+                &[],
+            )
+            .await?;
+        // The next pass sees the node outside the API until kubelet registers.
+        // Returning before the rebuild ends would start another one.
+        self.wait_for_apply(node_id, &format!("{}:9091", member.ip_address), &apply_id)
+            .await
     }
 
     fn mark_member_joined(
@@ -1560,6 +1791,27 @@ impl KubernetesOrchestrator {
         crate::kubernetes_admin::drain_node(&self.node_clients, &address, &name)
             .await
             .map_err(|err| anyhow!(err))
+    }
+
+    async fn label_workers(&self, cluster_name: &str) -> Result<()> {
+        let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        let workers: Vec<_> = rows
+            .iter()
+            .filter(|row| row.role == "worker" && !row.pending_removal)
+            .collect();
+        if workers.is_empty() {
+            return Ok(());
+        }
+        let (address, _) = self.api_peer(cluster_name, None).await?;
+        for row in workers {
+            let name = self
+                .registered_name(cluster_name, &row.node_id, &address)
+                .await?;
+            crate::kubernetes_admin::label_worker(&self.node_clients, &address, &name)
+                .await
+                .map_err(|err| anyhow!(err))?;
+        }
+        Ok(())
     }
 
     async fn delete_api_member(&self, cluster_name: &str, node_id: &str) -> Result<()> {
@@ -1646,17 +1898,60 @@ impl KubernetesOrchestrator {
         Ok((node.address, single))
     }
 
+    /// Push a node's configuration without `cluster_name`: its other clusters
+    /// when it has any, otherwise Kubernetes switched off.
     async fn clear_member_nix(&self, cluster_name: &str, node_id: &str) -> Result<()> {
         let node = self.db.get_node(node_id)?.context("node not found")?;
-        let pki = self
-            .db
-            .load_kubernetes_pki(cluster_name)?
-            .context("PKI not found")?;
-        let nix = match self.render_node_nix(node_id, cluster_name, &pki, "").await {
-            Ok(rendered) => rendered.nix,
-            Err(_) => "{\n  kcore.kubernetes.enable = false;\n}\n".to_string(),
+        // A render error must not fall back to switching Kubernetes off on a
+        // node that still serves another cluster.
+        let nix = if self.node_in_other_cluster(cluster_name, node_id)? {
+            let pki = self
+                .db
+                .load_kubernetes_pki(cluster_name)?
+                .context("PKI not found")?;
+            self.render_node_nix(node_id, cluster_name, &pki, "")
+                .await?
+                .nix
+        } else {
+            KUBERNETES_DISABLED_NIX.to_string()
         };
         self.push_nix(&node.address, &nix, "").await
+    }
+
+    fn node_in_other_cluster(&self, cluster_name: &str, node_id: &str) -> Result<bool> {
+        for cluster in self.db.list_kubernetes_clusters()? {
+            if cluster.name == cluster_name || cluster.phase == PHASE_DELETING {
+                continue;
+            }
+            if self
+                .db
+                .list_kubernetes_cluster_nodes(&cluster.name)?
+                .iter()
+                .any(|row| row.node_id == node_id && !row.pending_removal)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Take a cluster off every member node before its records are dropped.
+    /// The cluster is marked deleting first, so renders for any node leave it
+    /// out. Returns the nodes that did not take the new configuration.
+    pub async fn release_members(&self, cluster_name: &str) -> Result<Vec<(String, String)>> {
+        self.db.set_kubernetes_cluster_status(
+            cluster_name,
+            PHASE_DELETING,
+            "removing Kubernetes from the member nodes",
+        )?;
+        let mut failed = Vec::new();
+        for row in self.db.list_kubernetes_cluster_nodes(cluster_name)? {
+            if let Err(err) = self.clear_member_nix(cluster_name, &row.node_id).await {
+                warn!(cluster = cluster_name, node_id = %row.node_id, error = %format!("{err:#}"), "could not remove Kubernetes from node");
+                failed.push((row.node_id, format!("{err:#}")));
+            }
+        }
+        Ok(failed)
     }
 
     async fn push_nix(&self, address: &str, nix: &str, kubeconfig: &str) -> Result<()> {
@@ -2078,7 +2373,12 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
                 // on nodes that are already serving.
                 if matches!(
                     cluster.phase.as_str(),
-                    "bootstrapping" | "ready" | "scaling" | "upgrading"
+                    "bootstrapping"
+                        | "ready"
+                        | "scaling"
+                        | "upgrading"
+                        | PHASE_DELETING
+                        | PHASE_RECONFIGURING
                 ) {
                     continue;
                 }
@@ -2166,9 +2466,11 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
                                 error = %e,
                                 "Kubernetes bootstrap failed"
                             );
-                            let _ = orchestrator
-                                .update_phase(&cluster_name, BootstrapPhase::Failed)
-                                .await;
+                            let _ = orchestrator.db.set_kubernetes_cluster_status(
+                                &cluster_name,
+                                BootstrapPhase::Failed.as_str(),
+                                &format!("bootstrap failed: {e:#}"),
+                            );
                         }
                         orchestrator.release(&cluster_name);
                     });
@@ -2206,6 +2508,36 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
             }
             Err(e) => {
                 error!(error = %e, "failed to list scaling Kubernetes clusters");
+            }
+        }
+
+        match db.list_kubernetes_clusters_by_phase(PHASE_RECONFIGURING) {
+            Ok(clusters) => {
+                for cluster in clusters {
+                    if !orchestrator.claim(&cluster.name) {
+                        continue;
+                    }
+                    let orchestrator = orchestrator.clone();
+                    let cluster_name = cluster.name.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = orchestrator.reconcile_reconfigure(&cluster_name).await {
+                            error!(
+                                cluster = cluster_name,
+                                error = %e,
+                                "Kubernetes configuration rollout stopped"
+                            );
+                            let _ = orchestrator.db.set_kubernetes_cluster_status(
+                                &cluster_name,
+                                "degraded",
+                                &format!("{}: {e:#}", kubernetes_lifecycle::ROLLOUT_STOPPED),
+                            );
+                        }
+                        orchestrator.release(&cluster_name);
+                    });
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to list reconfiguring Kubernetes clusters");
             }
         }
 
@@ -2316,5 +2648,109 @@ mod health_tests {
     fn apiserver_readyz_accepts_ok() {
         assert!(response_reports_ready("/readyz", 200, "ok"));
         assert!(!response_reports_ready("/readyz", 500, "ok"));
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::{KubernetesOrchestrator, PHASE_DELETING};
+    use crate::db::{Database, KubernetesClusterNodeRow, KubernetesClusterRow, NodeRow};
+    use crate::node_client::NodeClients;
+
+    fn node(db: &Database, id: &str) {
+        db.upsert_node(&NodeRow {
+            id: id.to_string(),
+            hostname: id.to_string(),
+            // Port 1 on loopback refuses at once.
+            address: "127.0.0.1:1".to_string(),
+            cpu_cores: 4,
+            memory_bytes: 8_000_000_000,
+            status: "ready".to_string(),
+            last_heartbeat: String::new(),
+            gateway_interface: "br0".to_string(),
+            cpu_used: 0,
+            memory_used: 0,
+            storage_backend: "filesystem".to_string(),
+            disable_vxlan: false,
+            approval_status: "approved".to_string(),
+            cert_expiry_days: 300,
+            luks_method: String::new(),
+            dc_id: "DC1".to_string(),
+        })
+        .unwrap();
+    }
+
+    fn cluster(db: &Database, name: &str, members: &[&str]) {
+        db.upsert_kubernetes_cluster(&KubernetesClusterRow {
+            name: name.to_string(),
+            generation: 1,
+            cluster_cidr: "10.244.0.0/16".to_string(),
+            service_cidr: "10.96.0.0/12".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            api_server_endpoint: "10.0.0.1:6443".to_string(),
+            cni: "cilium".to_string(),
+            phase: "ready".to_string(),
+            status_message: String::new(),
+            ready_control_planes: 1,
+            ready_workers: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        for id in members {
+            db.upsert_kubernetes_cluster_node(&KubernetesClusterNodeRow {
+                cluster_name: name.to_string(),
+                node_id: id.to_string(),
+                role: "control-plane".to_string(),
+                advertise_address: "10.0.0.1".to_string(),
+                iface: "br0".to_string(),
+                initial_cluster: true,
+                join_existing: false,
+                kubelet_ready: true,
+                pending_join: false,
+                pending_removal: false,
+                k8s_node_name: String::new(),
+            })
+            .unwrap();
+        }
+    }
+
+    fn setup() -> (Database, KubernetesOrchestrator) {
+        let db = Database::open(":memory:").unwrap();
+        node(&db, "shared");
+        node(&db, "only-a");
+        cluster(&db, "a", &["shared", "only-a"]);
+        cluster(&db, "b", &["shared"]);
+        let orchestrator = KubernetesOrchestrator::new(db.clone(), NodeClients::new(None));
+        (db, orchestrator)
+    }
+
+    #[test]
+    fn a_node_keeps_kubernetes_only_for_clusters_that_are_not_being_deleted() {
+        let (db, orchestrator) = setup();
+        assert!(orchestrator.node_in_other_cluster("a", "shared").unwrap());
+        assert!(!orchestrator.node_in_other_cluster("a", "only-a").unwrap());
+
+        db.set_kubernetes_cluster_status("b", PHASE_DELETING, "")
+            .unwrap();
+        assert!(!orchestrator.node_in_other_cluster("a", "shared").unwrap());
+    }
+
+    #[tokio::test]
+    async fn releasing_marks_the_cluster_deleting_and_reports_unreachable_nodes() {
+        let (db, orchestrator) = setup();
+        let failed = orchestrator.release_members("a").await.unwrap();
+
+        let mut nodes: Vec<_> = failed.iter().map(|(node, _)| node.as_str()).collect();
+        nodes.sort_unstable();
+        assert_eq!(nodes, ["only-a", "shared"]);
+        assert_eq!(
+            db.get_kubernetes_cluster("a").unwrap().unwrap().phase,
+            PHASE_DELETING
+        );
+        assert_eq!(
+            db.get_kubernetes_cluster("b").unwrap().unwrap().phase,
+            "ready"
+        );
     }
 }
