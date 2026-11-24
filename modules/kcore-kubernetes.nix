@@ -813,6 +813,7 @@ let
         wants = [ "network-online.target" ];
         serviceConfig = {
           Type = "notify";
+          TimeoutStopSec = "30s";
           ExecStart = ''
             ${package}/bin/kube-apiserver \
               --advertise-address=${c.advertiseAddress} \
@@ -1881,6 +1882,9 @@ in
 
         serviceConfig = {
           Type = "notify";
+          # With etcd already gone the graceful shutdown retries it until
+          # the stop timeout; a healthy stop takes about two seconds.
+          TimeoutStopSec = "30s";
           ExecStart = ''
             ${cfg.package}/bin/kube-apiserver \
               --advertise-address=${cfg.advertiseAddress} \
