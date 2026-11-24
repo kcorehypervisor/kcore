@@ -1019,6 +1019,7 @@ let
               global_defs {
                 router_id ${config.networking.hostName}-${name}
                 script_user root
+                enable_script_security
               }
               ${vrrpApiServerScript "${vrrpName}_api" apiPort}
               vrrp_instance ${vrrpName} {
@@ -2098,6 +2099,7 @@ in
                 global_defs {
                   router_id ${config.networking.hostName}
                   script_user root
+                  enable_script_security
                 }
                 ${vrrpApiServerScript "kcore_api_check" k8sPorts.apiServer}
                 vrrp_instance kcore_api {
