@@ -1907,6 +1907,9 @@ enum KubernetesAction {
         /// or retargets an upgrade that is still running
         #[arg(long)]
         force: bool,
+        /// Apply the plan without asking
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
     },
     /// Get a Kubernetes cluster
     Get {
@@ -1922,6 +1925,9 @@ enum KubernetesAction {
         /// Force delete even if nodes are unreachable
         #[arg(long)]
         force: bool,
+        /// Delete without asking for the cluster name
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
     },
     /// Get cluster health status
     Health {
@@ -3828,10 +3834,10 @@ async fn main() {
         }
 
         Command::Kubernetes {
-            action: KubernetesAction::Apply { file, force },
+            action: KubernetesAction::Apply { file, force, yes },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::kubernetes::apply_from_file(&info, file, *force).await
+            commands::kubernetes::apply_from_file(&info, file, *force, *yes).await
         }
 
         Command::Kubernetes {
@@ -3849,10 +3855,10 @@ async fn main() {
         }
 
         Command::Kubernetes {
-            action: KubernetesAction::Delete { name, force },
+            action: KubernetesAction::Delete { name, force, yes },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::kubernetes::delete(&info, name, *force).await
+            commands::kubernetes::delete(&info, name, *force, *yes).await
         }
 
         Command::Kubernetes {
@@ -4581,4 +4587,39 @@ async fn main() {
 fn fatal(msg: &str) -> ! {
     eprintln!("Error: {msg}");
     process::exit(1);
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn kubernetes(args: &[&str]) -> KubernetesAction {
+        let argv = ["kctl", "kubernetes"].iter().chain(args).copied();
+        match Cli::try_parse_from(argv).expect("parse").command {
+            Command::Kubernetes { action } => action,
+            _ => panic!("not a kubernetes command"),
+        }
+    }
+
+    #[test]
+    fn kubernetes_apply_and_delete_take_yes() {
+        for flag in ["--yes", "-y", "--confirm"] {
+            assert!(matches!(
+                kubernetes(&["apply", "-f", "c.yaml", flag]),
+                KubernetesAction::Apply { yes: true, .. }
+            ));
+            assert!(matches!(
+                kubernetes(&["delete", "c", flag]),
+                KubernetesAction::Delete {
+                    yes: true,
+                    force: false,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            kubernetes(&["apply", "-f", "c.yaml"]),
+            KubernetesAction::Apply { yes: false, .. }
+        ));
+    }
 }

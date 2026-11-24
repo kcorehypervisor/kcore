@@ -250,6 +250,7 @@
               inherit pkgs;
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+              inherit (inputs.self.lib) mkNode;
             };
             kcore-slurm = import ./tests/kcore-slurm.nix { inherit pkgs; };
             postgresql-cluster-module-eval = import ./tests/postgresql-cluster-module-eval.nix {
@@ -399,6 +400,7 @@
             "node.nix"
             "kcore-vms.nix"
             "kcore-ceph.nix"
+            "modules/kcore-slurm.nix"
             "kcore-slurm.nix"
             "kcore-postgresql-cluster.nix"
             "modules/kcore-kubernetes.nix"

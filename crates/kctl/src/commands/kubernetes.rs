@@ -254,7 +254,22 @@ fn worker_slot_count(spec: &controller_proto::KubernetesClusterSpec) -> i32 {
     }
 }
 
-pub async fn apply_from_file(info: &ConnectionInfo, file: &str, force: bool) -> Result<()> {
+/// An empty stdin is a script that forgot `--yes`, not a "no".
+fn read_answer(prompt: &str) -> Result<String> {
+    println!("{prompt}");
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input)? == 0 {
+        anyhow::bail!("no answer on stdin; pass --yes to run without a prompt");
+    }
+    Ok(input.trim().to_string())
+}
+
+pub async fn apply_from_file(
+    info: &ConnectionInfo,
+    file: &str,
+    force: bool,
+    yes: bool,
+) -> Result<()> {
     let manifest = parse_manifest(file)?;
     let mut client = client::controller_client(info).await?;
 
@@ -311,10 +326,7 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str, force: bool) -> 
         println!("\nLocal-path manifest:\n{}", plan.rendered_nix_preview);
     }
 
-    println!("\n📝 Proceed? (y/n)");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if !input.trim().eq_ignore_ascii_case("y") {
+    if !yes && !read_answer("\n📝 Proceed? (y/n)")?.eq_ignore_ascii_case("y") {
         println!("Aborted");
         return Ok(());
     }
@@ -526,16 +538,11 @@ pub async fn list(info: &ConnectionInfo) -> Result<()> {
     Ok(())
 }
 
-pub async fn delete(info: &ConnectionInfo, name: &str, force: bool) -> Result<()> {
+pub async fn delete(info: &ConnectionInfo, name: &str, force: bool, yes: bool) -> Result<()> {
     println!("⚠️  Delete Kubernetes cluster '{}'?", name);
-    if !force {
-        println!("Type cluster name to confirm:");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if input.trim() != name {
-            println!("Aborted");
-            return Ok(());
-        }
+    if !force && !yes && read_answer("Type cluster name to confirm:")? != name {
+        println!("Aborted");
+        return Ok(());
     }
 
     let mut client = client::controller_client(info).await?;
