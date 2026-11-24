@@ -124,6 +124,31 @@ impl tower::Service<ChannelRequest> for NodeChannel {
     }
 }
 
+/// A dial failure with its whole cause chain. tonic's own message is only
+/// "transport error"; the reason (refused, timed out, certificate for another
+/// address) is in the sources.
+fn connect_error(address: &str, err: &(dyn std::error::Error + 'static)) -> anyhow::Error {
+    let mut parts: Vec<String> = Vec::new();
+    let mut next = Some(err);
+    while let Some(e) = next {
+        let text = e.to_string();
+        if !parts.iter().any(|p| p.contains(&text)) {
+            parts.push(text);
+        }
+        next = e.source();
+    }
+    let chain = parts.join(": ");
+    if chain.contains("not valid for name") || chain.contains("NotValidForName") {
+        anyhow::anyhow!(
+            "{chain}; node {address} presents a certificate issued for another address \
+             (its IP probably changed). The node agent requests a new one once it has \
+             re-registered from {address}"
+        )
+    } else {
+        anyhow::anyhow!("{chain}")
+    }
+}
+
 #[derive(Clone)]
 pub struct TlsClientConfig {
     pub ca_file: String,
@@ -172,13 +197,15 @@ impl NodeClients {
                 .connect_timeout(NODE_CONNECT_TIMEOUT)
                 .tls_config(tls)?
                 .connect()
-                .await?
+                .await
+                .map_err(|e| connect_error(address, &e))?
         } else {
             let endpoint = format!("http://{address}");
             Channel::from_shared(endpoint)?
                 .connect_timeout(NODE_CONNECT_TIMEOUT)
                 .connect()
-                .await?
+                .await
+                .map_err(|e| connect_error(address, &e))?
         };
         let channel = NodeChannel {
             inner: channel,
@@ -298,5 +325,65 @@ mod tests {
         assert!(!is_agent_fault(tonic::Code::InvalidArgument));
         assert!(!is_agent_fault(tonic::Code::Unimplemented));
         assert!(!is_agent_fault(tonic::Code::NotFound));
+    }
+
+    #[test]
+    fn connect_error_keeps_the_cause_and_explains_a_moved_node() {
+        let io = std::io::Error::other(
+            "invalid peer certificate: certificate not valid for name \"10.0.0.2\"; \
+             certificate is only valid for 10.0.0.9",
+        );
+        let msg = connect_error("10.0.0.2:9091", &io).to_string();
+        assert!(msg.contains("only valid for 10.0.0.9"), "{msg}");
+        assert!(msg.contains("issued for another address"), "{msg}");
+
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let msg = connect_error("10.0.0.2:9091", &refused).to_string();
+        assert_eq!(msg, "refused");
+    }
+
+    /// A node serving a certificate for its old address must produce an error
+    /// that says so, not a bare "transport error".
+    #[tokio::test]
+    async fn dialing_a_node_whose_certificate_names_another_address_says_so() {
+        use crate::grpc::signing::{sign_node_cert, test_support};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (ca_cert, ca_key) = test_support::generate_test_ca();
+        let (sub_cert, sub_key) = test_support::generate_test_sub_ca(&ca_cert, &ca_key);
+        let (node_chain, node_key) = sign_node_cert(&sub_cert, &sub_key, "10.0.0.9").unwrap();
+        let (ctl_chain, ctl_key) = sign_node_cert(&sub_cert, &sub_key, "127.0.0.1").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (_, health) = tonic_health::server::health_reporter();
+        let server = tonic::transport::Server::builder()
+            .tls_config(
+                tonic::transport::ServerTlsConfig::new()
+                    .identity(Identity::from_pem(&node_chain, &node_key)),
+            )
+            .unwrap()
+            .add_service(health)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
+        let server = tokio::spawn(server);
+
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path.display().to_string()
+        };
+        let clients = NodeClients::new(Some(TlsClientConfig {
+            ca_file: write("ca.crt", &ca_cert),
+            cert_file: write("controller.crt", &ctl_chain),
+            key_file: write("controller.key", &ctl_key),
+        }));
+
+        let msg = format!("{}", clients.connect(&address).await.unwrap_err());
+        server.abort();
+        assert!(msg.contains("not valid for name"), "{msg}");
+        assert!(msg.contains("10.0.0.9"), "{msg}");
+        assert!(msg.contains("issued for another address"), "{msg}");
+        assert!(clients.get_admin(&address).is_none());
     }
 }
