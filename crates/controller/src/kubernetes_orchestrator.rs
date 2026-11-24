@@ -2500,7 +2500,7 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
                             let _ = orchestrator.db.set_kubernetes_cluster_status(
                                 &cluster_name,
                                 "degraded",
-                                &format!("configuration rollout stopped: {e:#}"),
+                                &format!("{}: {e:#}", kubernetes_lifecycle::ROLLOUT_STOPPED),
                             );
                         }
                         orchestrator.release(&cluster_name);

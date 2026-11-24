@@ -131,10 +131,21 @@ pub struct EtcdMember {
     pub peer_urls: Vec<String>,
 }
 
+/// Status prefix of a configuration rollout that stopped on a node. The
+/// cluster can be healthy with that node on its old configuration, so the
+/// health loop must not call it ready.
+pub const ROLLOUT_STOPPED: &str = "configuration rollout stopped";
+
 pub fn phase_blocks_promotion(phase: &str) -> bool {
     matches!(
         phase,
-        "ready" | "bootstrapping" | "updating" | "scaling" | "upgrading"
+        "ready"
+            | "bootstrapping"
+            | "updating"
+            | "scaling"
+            | "upgrading"
+            | crate::kubernetes_orchestrator::PHASE_RECONFIGURING
+            | crate::kubernetes_orchestrator::PHASE_DELETING
     )
 }
 
@@ -148,6 +159,7 @@ pub fn promotion_blocked(phase: &str, message: &str) -> bool {
     phase_blocks_promotion(phase)
         || (phase == "failed" && refusal_status(message))
         || (phase == "degraded" && message.starts_with(crate::kubernetes_upgrade::UPGRADE_FAILED))
+        || (phase == "degraded" && message.starts_with(ROLLOUT_STOPPED))
 }
 
 pub fn scaling_blocks_ready(message: &str) -> bool {
@@ -640,6 +652,17 @@ mod tests {
         assert!(scaling_blocks_ready(
             "node worker-2 is not an approved kcore node"
         ));
+    }
+
+    #[test]
+    fn rollouts_and_deletes_are_not_promoted_to_ready() {
+        assert!(phase_blocks_promotion("reconfiguring"));
+        assert!(phase_blocks_promotion("deleting"));
+        assert!(promotion_blocked(
+            "degraded",
+            "configuration rollout stopped: nixos-rebuild failed on n1: error: x"
+        ));
+        assert!(!promotion_blocked("degraded", "etcd was down"));
     }
 
     #[test]
