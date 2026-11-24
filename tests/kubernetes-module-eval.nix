@@ -98,6 +98,10 @@ let
     lib.hasInfix "kcore-etcd-prepare" "${controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStartPre
     }";
 
+  # Kubelets point pods at clusterDns; something has to answer there.
+  coreDns = host: path: host.config.environment.etc.${path}.text or "";
+  hasCoreDnsUnit = host: unit: host.config.systemd.services ? ${unit};
+
   pinned = mkHost "" releases.hostPin;
   upgraded = lib.mapAttrsToList (version: _: {
     inherit version;
@@ -120,6 +124,11 @@ assert preparesEtcd "etcd";
 assert preparesEtcd "etcd-b";
 assert !retiresPrimary controlPlane;
 assert lib.hasInfix "b|-)" (retireScript controlPlane);
+assert lib.hasInfix "clusterIP: 10.96.0.10" (coreDns controlPlane "kubernetes/coredns.yaml");
+assert lib.hasInfix "clusterIP: 10.112.0.10" (coreDns controlPlane "kubernetes/b/coredns.yaml");
+assert hasCoreDnsUnit controlPlane "kcore-kubernetes-coredns";
+assert hasCoreDnsUnit controlPlane "kcore-kubernetes-coredns-b";
+assert !hasCoreDnsUnit installed "kcore-kubernetes-coredns";
 assert retiresPrimary pinned;
 assert !lib.hasInfix "b|-)" (retireScript pinned);
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;

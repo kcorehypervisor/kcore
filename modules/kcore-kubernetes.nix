@@ -100,9 +100,9 @@ let
           ''
         );
 
-  provisionerApply =
-    package: kubeconfig: manifestPath:
-    pkgs.writeShellScript "kcore-apply-provisioner" ''
+  manifestApply =
+    what: package: kubeconfig: manifestPath:
+    pkgs.writeShellScript "kcore-apply-${what}" ''
       set -eu
       kube=${package}/bin/kubectl
       for _ in $(seq 1 90); do
@@ -112,8 +112,168 @@ let
         fi
         sleep 2
       done
-      echo "Kubernetes API was not ready for the local provisioner" >&2
+      echo "Kubernetes API was not ready for ${what}" >&2
       exit 1
+    '';
+  provisionerApply = manifestApply "provisioner";
+  coreDnsApply = manifestApply "coredns";
+
+  # Kubelets hand pods clusterDns as their resolver, so every cluster needs
+  # this service. Upstream queries go to the node's resolv.conf.
+  coreDnsYaml =
+    { clusterDns, image }:
+    ''
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: coredns
+        namespace: kube-system
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: system:coredns
+      rules:
+        - apiGroups: [""]
+          resources: [endpoints, services, pods, namespaces]
+          verbs: [list, watch]
+        - apiGroups: [discovery.k8s.io]
+          resources: [endpointslices]
+          verbs: [list, watch]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: system:coredns
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: system:coredns
+      subjects:
+        - kind: ServiceAccount
+          name: coredns
+          namespace: kube-system
+      ---
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: coredns
+        namespace: kube-system
+      data:
+        Corefile: |
+          .:53 {
+              errors
+              health {
+                  lameduck 5s
+              }
+              ready
+              kubernetes cluster.local in-addr.arpa ip6.arpa {
+                  pods insecure
+                  fallthrough in-addr.arpa ip6.arpa
+                  ttl 30
+              }
+              prometheus :9153
+              forward . /etc/resolv.conf {
+                  max_concurrent 1000
+              }
+              cache 30
+              loop
+              reload
+              loadbalance
+          }
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: coredns
+        namespace: kube-system
+        labels:
+          k8s-app: kube-dns
+      spec:
+        replicas: 2
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 1
+        selector:
+          matchLabels:
+            k8s-app: kube-dns
+        template:
+          metadata:
+            labels:
+              k8s-app: kube-dns
+          spec:
+            priorityClassName: system-cluster-critical
+            serviceAccountName: coredns
+            dnsPolicy: Default
+            nodeSelector:
+              kubernetes.io/os: linux
+            tolerations:
+              - key: CriticalAddonsOnly
+                operator: Exists
+              - key: node-role.kubernetes.io/control-plane
+                effect: NoSchedule
+            affinity:
+              podAntiAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    podAffinityTerm:
+                      topologyKey: kubernetes.io/hostname
+                      labelSelector:
+                        matchLabels:
+                          k8s-app: kube-dns
+            containers:
+              - name: coredns
+                image: ${image}
+                args: ["-conf", "/etc/coredns/Corefile"]
+                resources:
+                  limits:
+                    memory: 170Mi
+                  requests:
+                    cpu: 100m
+                    memory: 70Mi
+                ports:
+                  - { name: dns, containerPort: 53, protocol: UDP }
+                  - { name: dns-tcp, containerPort: 53, protocol: TCP }
+                  - { name: metrics, containerPort: 9153, protocol: TCP }
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    add: [NET_BIND_SERVICE]
+                    drop: [ALL]
+                livenessProbe:
+                  httpGet: { path: /health, port: 8080, scheme: HTTP }
+                  initialDelaySeconds: 60
+                  timeoutSeconds: 5
+                  failureThreshold: 5
+                readinessProbe:
+                  httpGet: { path: /ready, port: 8181, scheme: HTTP }
+                volumeMounts:
+                  - { name: config-volume, mountPath: /etc/coredns, readOnly: true }
+            volumes:
+              - name: config-volume
+                configMap:
+                  name: coredns
+                  items:
+                    - { key: Corefile, path: Corefile }
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: kube-dns
+        namespace: kube-system
+        labels:
+          k8s-app: kube-dns
+          kubernetes.io/name: CoreDNS
+      spec:
+        selector:
+          k8s-app: kube-dns
+        clusterIP: ${clusterDns}
+        ports:
+          - { name: dns, port: 53, protocol: UDP }
+          - { name: dns-tcp, port: 53, protocol: TCP }
+          - { name: metrics, port: 9153, protocol: TCP }
     '';
 
   # Primary cluster only. Extra clusters use the bridge CNI and must not
@@ -808,6 +968,31 @@ let
             };
           };
 
+      environment.etc."kubernetes/${name}/coredns.yaml" = lib.mkIf (c.role == "control-plane") {
+        mode = "0644";
+        text = coreDnsYaml {
+          inherit (c) clusterDns;
+          image = cfg.coreDnsImage;
+        };
+      };
+
+      systemd.services."kcore-kubernetes-coredns-${name}" = lib.mkIf (c.role == "control-plane") {
+        description = "Apply CoreDNS for Kubernetes cluster ${name}";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "kube-apiserver-${name}.service"
+          "kubelet-${name}.service"
+        ];
+        restartTriggers = [ config.environment.etc."kubernetes/${name}/coredns.yaml".source ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = coreDnsApply package "${root}/admin.conf" "${root}/coredns.yaml";
+          Restart = "on-failure";
+          RestartSec = "15s";
+        };
+      };
+
       environment.etc."keepalived/keepalived-${name}.conf" =
         lib.mkIf (c.role == "control-plane" && c.haEnabled)
           {
@@ -902,6 +1087,12 @@ in
       type = lib.types.str;
       default = "10.96.0.10";
       description = "DNS service IP (CoreDNS).";
+    };
+
+    coreDnsImage = lib.mkOption {
+      type = lib.types.str;
+      default = "registry.k8s.io/coredns/coredns:v1.13.1";
+      description = "CoreDNS image the control planes deploy for every cluster on this node.";
     };
 
     advertiseAddress = lib.mkOption {
@@ -1371,8 +1562,14 @@ in
           etcd
           cilium-cli
           containerd
+          cri-tools
         ]
         ++ lib.optionals cfg.haEnabled [ keepalived ];
+
+      environment.etc."crictl.yaml".text = ''
+        runtime-endpoint: unix:///run/containerd/containerd.sock
+        image-endpoint: unix:///run/containerd/containerd.sock
+      '';
 
       # containerd configuration
       virtualisation.containerd = {
@@ -1821,6 +2018,34 @@ in
               RestartSec = "15s";
             };
           };
+
+      environment.etc."kubernetes/coredns.yaml" = lib.mkIf (cfg.role == "control-plane") {
+        mode = "0644";
+        text = coreDnsYaml {
+          inherit (cfg) clusterDns;
+          image = cfg.coreDnsImage;
+        };
+      };
+
+      # Pods stay Pending until Cilium is up, so ordering after it only
+      # avoids a failed first apply.
+      systemd.services.kcore-kubernetes-coredns = lib.mkIf (cfg.role == "control-plane") {
+        description = "Apply CoreDNS";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "kube-apiserver.service"
+          "kubelet.service"
+          "kcore-kubernetes-cilium.service"
+        ];
+        restartTriggers = [ config.environment.etc."kubernetes/coredns.yaml".source ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = coreDnsApply cfg.package "/etc/kubernetes/admin.conf" "/etc/kubernetes/coredns.yaml";
+          Restart = "on-failure";
+          RestartSec = "15s";
+        };
+      };
 
       # VRRP for the API VIP. The unit used to start with no config file, so
       # keepalived exited before it could own vipAddress.
