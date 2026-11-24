@@ -119,9 +119,20 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
 /// NixOS module that turns `kcore.kubernetes.*` into units and PKI files.
 pub const KUBERNETES_MODULE_NIX: &str = include_str!("../../../modules/kcore-kubernetes.nix");
 
-/// Versions and binary hashes the module reads with `./kubernetes-releases.json`.
-pub const KUBERNETES_RELEASES_JSON: &str =
-    include_str!("../../../modules/kubernetes-releases.json");
+/// Files the module reads by relative path, installed next to it. A host
+/// flake evaluates the module from `/etc/nixos/modules`, so one missing here
+/// fails the rebuild only for the clusters that reach it (HA reaches the
+/// keepalived helper).
+pub const KUBERNETES_MODULE_COMPANIONS: &[(&str, &str)] = &[
+    (
+        "kubernetes-releases.json",
+        include_str!("../../../modules/kubernetes-releases.json"),
+    ),
+    (
+        "kcore-keepalived-notrack.nix",
+        include_str!("../../../modules/kcore-keepalived-notrack.nix"),
+    ),
+];
 
 /// True when `configuration.nix` already lists this import path on its own line.
 pub fn configuration_imports_path(config: &str, path: &str) -> bool {
@@ -178,10 +189,9 @@ fn is_legacy_kubernetes_runtime_import(trimmed: &str) -> bool {
 /// certificates the controller writes.
 pub fn install_kubernetes_module_sources() -> std::io::Result<()> {
     std::fs::create_dir_all("/etc/nixos/modules")?;
-    std::fs::write(
-        "/etc/nixos/modules/kubernetes-releases.json",
-        KUBERNETES_RELEASES_JSON,
-    )?;
+    for (name, contents) in KUBERNETES_MODULE_COMPANIONS {
+        std::fs::write(format!("/etc/nixos/modules/{name}"), contents)?;
+    }
     std::fs::write(
         "/etc/nixos/modules/kcore-kubernetes.nix",
         KUBERNETES_MODULE_NIX,
@@ -202,6 +212,31 @@ pub fn install_kubernetes_module_sources() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `./name` the module imports or reads must be installed with it.
+    #[test]
+    fn every_file_the_module_reads_is_installed_next_to_it() {
+        let mut referenced = Vec::new();
+        for (at, _) in KUBERNETES_MODULE_NIX.match_indices("./") {
+            if KUBERNETES_MODULE_NIX[..at].ends_with('.') {
+                continue;
+            }
+            let name: String = KUBERNETES_MODULE_NIX[at + 2..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                .collect();
+            if name.ends_with(".nix") || name.ends_with(".json") {
+                referenced.push(name);
+            }
+        }
+        assert!(referenced.contains(&"kcore-keepalived-notrack.nix".to_string()));
+        for name in referenced {
+            assert!(
+                KUBERNETES_MODULE_COMPANIONS.iter().any(|(n, _)| *n == name),
+                "modules/kcore-kubernetes.nix reads ./{name}, which the agent does not install"
+            );
+        }
+    }
 
     #[test]
     fn import_insert_does_not_confuse_module_path_with_values_path() {

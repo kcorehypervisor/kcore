@@ -9,7 +9,10 @@ use tracing::{error, info, warn};
 use crate::db::{Database, KubernetesClusterNodeRow, KubernetesNodeUpgradeRow};
 use crate::kubernetes_lifecycle::{self, MemberSnapshot, ScaleStep};
 use crate::kubernetes_pki::{self, KubernetesPki, NodeInfo};
-use crate::kubernetes_upgrade::{self, ApplyProgress, UpgradeMember, UpgradeStep, UpgradeView};
+use crate::kubernetes_upgrade::{
+    self, apply_failure_summary, ApplyProgress, PendingApply, UpgradeMember, UpgradeStep,
+    UpgradeView,
+};
 use crate::kubernetes_versions;
 use crate::node_client::NodeClients;
 
@@ -211,25 +214,30 @@ impl KubernetesOrchestrator {
             deploy_tasks.push(task);
         }
 
-        // Wait for all deployments to complete
-        let mut deploy_results = Vec::new();
-        for task in deploy_tasks {
-            deploy_results.push(task.await.context("task join failed")?);
+        let mut applies = Vec::new();
+        let mut failures = Vec::new();
+        for (node, task) in nodes.iter().zip(deploy_tasks) {
+            match task.await.context("task join failed")? {
+                Ok(apply_id) => applies.push(PendingApply {
+                    node_id: node.node_id.clone(),
+                    address: format!("{}:9091", node.ip_address),
+                    apply_id,
+                }),
+                Err(e) => failures.push(format!("{}: {e:#}", node.node_id)),
+            }
         }
-
-        // Check if any deployments failed
-        let failed_count = deploy_results.iter().filter(|r| r.is_err()).count();
-        if failed_count > 0 {
+        if !failures.is_empty() {
             error!(
                 cluster = cluster_name,
-                failed = failed_count,
+                failed = failures.len(),
                 total = nodes.len(),
                 "some node deployments failed"
             );
             return Err(anyhow!(
-                "{} of {} node deployments failed",
-                failed_count,
-                nodes.len()
+                "{} of {} node deployments failed: {}",
+                failures.len(),
+                nodes.len(),
+                failures.join("; ")
             ));
         }
 
@@ -248,7 +256,7 @@ impl KubernetesOrchestrator {
             anyhow::bail!("cluster {cluster_name} has no control-plane node");
         }
         let required_quorum = (control_planes / 2) + 1;
-        self.wait_for_etcd_quorum(cluster_name, required_quorum, 300)
+        self.wait_for_etcd_quorum(cluster_name, required_quorum, &mut applies, 300)
             .await?;
 
         // Phase 4: Wait for API server
@@ -817,6 +825,7 @@ impl KubernetesOrchestrator {
         &self,
         cluster_name: &str,
         expected_nodes: usize,
+        applies: &mut Vec<PendingApply>,
         timeout_secs: u64,
     ) -> Result<()> {
         info!(
@@ -827,6 +836,7 @@ impl KubernetesOrchestrator {
 
         let start = std::time::Instant::now();
         while start.elapsed().as_secs() < timeout_secs {
+            self.check_pending_applies(applies).await?;
             let healthy_count = self.count_healthy_etcd_members(cluster_name).await?;
 
             if healthy_count >= expected_nodes {
@@ -848,7 +858,34 @@ impl KubernetesOrchestrator {
             sleep(Duration::from_secs(10)).await;
         }
 
-        anyhow::bail!("timeout waiting for etcd quorum in {}", cluster_name)
+        let rebuilding: Vec<&str> = applies.iter().map(|a| a.node_id.as_str()).collect();
+        if rebuilding.is_empty() {
+            anyhow::bail!("timeout waiting for etcd quorum in {cluster_name}")
+        }
+        anyhow::bail!(
+            "timeout waiting for etcd quorum in {cluster_name}; still rebuilding: {}",
+            rebuilding.join(", ")
+        )
+    }
+
+    /// Drops finished rebuilds and fails on the first one that failed, so a
+    /// broken node configuration is reported instead of a quorum timeout.
+    async fn check_pending_applies(&self, applies: &mut Vec<PendingApply>) -> Result<()> {
+        let mut still_running = Vec::new();
+        for apply in applies.drain(..) {
+            let (progress, message) = self.apply_progress(&apply.address, &apply.apply_id).await;
+            match progress {
+                ApplyProgress::Failed => anyhow::bail!(
+                    "nixos-rebuild failed on {}: {}",
+                    apply.node_id,
+                    apply_failure_summary(&message)
+                ),
+                ApplyProgress::Succeeded => {}
+                _ => still_running.push(apply),
+            }
+        }
+        *applies = still_running;
+        Ok(())
     }
 
     async fn count_healthy_etcd_members(&self, cluster_name: &str) -> Result<usize> {
@@ -2216,9 +2253,11 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
                                 error = %e,
                                 "Kubernetes bootstrap failed"
                             );
-                            let _ = orchestrator
-                                .update_phase(&cluster_name, BootstrapPhase::Failed)
-                                .await;
+                            let _ = orchestrator.db.set_kubernetes_cluster_status(
+                                &cluster_name,
+                                BootstrapPhase::Failed.as_str(),
+                                &format!("bootstrap failed: {e:#}"),
+                            );
                         }
                         orchestrator.release(&cluster_name);
                     });
