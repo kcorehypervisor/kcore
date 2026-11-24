@@ -551,15 +551,17 @@ impl KubernetesOrchestrator {
             }
         };
 
-        let pending_join: HashSet<String> = self
+        // Joining nodes are configured by the scaling steps, and a leaving
+        // node no longer renders this cluster.
+        let not_serving: HashSet<String> = self
             .db
             .list_kubernetes_cluster_nodes(cluster_name)?
             .into_iter()
-            .filter(|row| row.pending_join)
+            .filter(|row| row.pending_join || row.pending_removal)
             .map(|row| row.node_id)
             .collect();
         for node in &nodes {
-            if pending_join.contains(&node.node_id) {
+            if not_serving.contains(&node.node_id) {
                 continue;
             }
             self.configure_node(
