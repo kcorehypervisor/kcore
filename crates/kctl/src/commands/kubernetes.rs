@@ -42,6 +42,10 @@ struct ManifestSpec {
     /// Masters accept pods. Dedicated workerNodes may be empty.
     #[serde(default)]
     schedule_on_control_plane: bool,
+    /// Desired Kubernetes version. Empty uses the host nixpkgs pin. Changing
+    /// it and re-applying upgrades the cluster one node at a time.
+    #[serde(default)]
+    version: String,
 }
 
 fn default_cluster_dns() -> String {
@@ -237,6 +241,7 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
         high_availability: ha_config,
         local_provisioner,
         schedule_on_control_plane: spec.schedule_on_control_plane,
+        version: spec.version.clone(),
     }
 }
 
@@ -259,7 +264,12 @@ fn read_answer(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-pub async fn apply_from_file(info: &ConnectionInfo, file: &str, yes: bool) -> Result<()> {
+pub async fn apply_from_file(
+    info: &ConnectionInfo,
+    file: &str,
+    force: bool,
+    yes: bool,
+) -> Result<()> {
     let manifest = parse_manifest(file)?;
     let mut client = client::controller_client(info).await?;
 
@@ -268,6 +278,7 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str, yes: bool) -> Re
         .plan_kubernetes_cluster(controller_proto::PlanKubernetesClusterRequest {
             name: manifest.metadata.name.clone(),
             spec: Some(to_proto_spec(&manifest.spec)),
+            force,
         })
         .await
         .context("plan_kubernetes_cluster rpc")?
@@ -321,13 +332,14 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str, yes: bool) -> Re
     }
 
     let spec = Some(to_proto_spec(&manifest.spec));
-    let updating = plan.action == "update";
+    let updating = plan.action == "update" || plan.action == "upgrade";
     let result = if updating {
         client
             .update_kubernetes_cluster(controller_proto::UpdateKubernetesClusterRequest {
                 name: manifest.metadata.name.clone(),
                 spec,
                 confirm: true,
+                force,
             })
             .await
             .context("update_kubernetes_cluster rpc")?
@@ -378,6 +390,11 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
             println!("  Service CIDR: {}", spec.service_cidr);
             println!("  API Endpoint: {}", spec.api_server_endpoint);
             println!("  CNI: {}", spec.cni);
+            if spec.version.is_empty() {
+                println!("  Version: host pin");
+            } else {
+                println!("  Version: {}", spec.version);
+            }
 
             if let Some(ha) = spec.high_availability {
                 if ha.enabled {
@@ -455,6 +472,14 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
             println!("  Message: {}", status.message);
             println!("  Ready Control Planes: {}", status.ready_control_planes);
             println!("  Ready Workers: {}", status.ready_workers);
+            if !status.node_versions.is_empty() {
+                println!("  Node Versions:");
+                let mut versions: Vec<_> = status.node_versions.iter().collect();
+                versions.sort();
+                for (node_id, version) in versions {
+                    println!("    {node_id}: {version}");
+                }
+            }
         }
     }
 

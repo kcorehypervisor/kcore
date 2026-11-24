@@ -1903,6 +1903,10 @@ enum KubernetesAction {
         /// YAML manifest file
         #[arg(short = 'f', long)]
         file: String,
+        /// Allow a spec.version change that skips a minor version, downgrades,
+        /// or retargets an upgrade that is still running
+        #[arg(long)]
+        force: bool,
         /// Apply the plan without asking
         #[arg(short = 'y', long, alias = "confirm")]
         yes: bool,
@@ -3830,10 +3834,10 @@ async fn main() {
         }
 
         Command::Kubernetes {
-            action: KubernetesAction::Apply { file, yes },
+            action: KubernetesAction::Apply { file, force, yes },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
-            commands::kubernetes::apply_from_file(&info, file, *yes).await
+            commands::kubernetes::apply_from_file(&info, file, *force, *yes).await
         }
 
         Command::Kubernetes {

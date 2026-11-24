@@ -119,6 +119,10 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
 /// NixOS module that turns `kcore.kubernetes.*` into units and PKI files.
 pub const KUBERNETES_MODULE_NIX: &str = include_str!("../../../modules/kcore-kubernetes.nix");
 
+/// Versions and binary hashes the module reads with `./kubernetes-releases.json`.
+pub const KUBERNETES_RELEASES_JSON: &str =
+    include_str!("../../../modules/kubernetes-releases.json");
+
 /// True when `configuration.nix` already lists this import path on its own line.
 pub fn configuration_imports_path(config: &str, path: &str) -> bool {
     config.lines().any(|line| {
@@ -174,6 +178,10 @@ fn is_legacy_kubernetes_runtime_import(trimmed: &str) -> bool {
 /// certificates the controller writes.
 pub fn install_kubernetes_module_sources() -> std::io::Result<()> {
     std::fs::create_dir_all("/etc/nixos/modules")?;
+    std::fs::write(
+        "/etc/nixos/modules/kubernetes-releases.json",
+        KUBERNETES_RELEASES_JSON,
+    )?;
     std::fs::write(
         "/etc/nixos/modules/kcore-kubernetes.nix",
         KUBERNETES_MODULE_NIX,

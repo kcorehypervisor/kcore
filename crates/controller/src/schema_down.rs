@@ -445,6 +445,15 @@ DROP TABLE IF EXISTS slurm_clusters;",
         sql: "DROP TABLE IF EXISTS subscription;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 74,
+        sql: "ALTER TABLE kubernetes_cluster_config DROP COLUMN kubernetes_version;
+ALTER TABLE kubernetes_cluster_nodes DROP COLUMN kubernetes_version;
+ALTER TABLE kubernetes_cluster_nodes DROP COLUMN upgrade_state;
+ALTER TABLE kubernetes_cluster_nodes DROP COLUMN upgrade_apply_id;
+ALTER TABLE kubernetes_cluster_nodes DROP COLUMN upgrade_cordoned;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

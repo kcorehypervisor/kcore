@@ -6,6 +6,8 @@ spec:
   serviceCidr: 10.96.0.0/12
   clusterDns: 10.96.0.10
   apiServerEndpoint: 192.168.40.200:6443
+  # Empty uses the host nixpkgs pin. Change it and re-apply to upgrade in place.
+  version: ""
   cni: cilium
   cilium:
     mode: native-routing

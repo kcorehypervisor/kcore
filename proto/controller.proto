@@ -3386,15 +3386,22 @@ message KubernetesClusterSpec {
   // Control-plane nodes also accept pods. A cluster can list no separate
   // worker nodes and still schedule workloads on the masters.
   bool schedule_on_control_plane = 11;
+  // Desired Kubernetes version, for example "1.36.6". Empty is the host
+  // nixpkgs pin. Changing it and re-applying the same manifest upgrades the
+  // cluster in place: control planes first, then workers, one node at a time.
+  string version = 12;
 }
 
 message KubernetesClusterStatus {
-  string phase = 1;                 // pending, bootstrapping, scaling, ready, degraded, failed
+  string phase = 1;                 // pending, bootstrapping, scaling, upgrading, ready, degraded, failed
   string message = 2;
   int32 ready_control_planes = 3;
   int32 ready_workers = 4;
   google.protobuf.Timestamp last_updated = 5;
   repeated string active_node_ids = 6;
+  // Kubernetes version rendered on each member, keyed by node id. During an
+  // upgrade the members move to spec.version one at a time.
+  map<string, string> node_versions = 7;
 }
 
 message KubernetesCluster {
@@ -3409,6 +3416,8 @@ message KubernetesCluster {
 message PlanKubernetesClusterRequest {
   string name = 1;
   KubernetesClusterSpec spec = 2;
+  // Same as UpdateKubernetesClusterRequest.force.
+  bool force = 3;
 }
 
 message NodePlanResult {
@@ -3440,6 +3449,9 @@ message UpdateKubernetesClusterRequest {
   string name = 1;
   KubernetesClusterSpec spec = 2;
   bool confirm = 3;
+  // Allow skipping a minor version, downgrading, or retargeting an upgrade
+  // that is still running.
+  bool force = 4;
 }
 
 message UpdateKubernetesClusterResponse {

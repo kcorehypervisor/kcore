@@ -231,6 +231,7 @@ mod kubernetes_cluster_tests {
             cilium_lb_ip_pools: "192.168.40.220/29".to_string(),
             local_provisioner_json: String::new(),
             schedule_on_control_plane: false,
+            kubernetes_version: String::new(),
         };
 
         db.upsert_kubernetes_cluster_config(&config_row).unwrap();
@@ -320,6 +321,7 @@ mod kubernetes_cluster_tests {
             cilium_lb_ip_pools: "192.168.40.220/29".to_string(),
             local_provisioner_json: String::new(),
             schedule_on_control_plane: false,
+            kubernetes_version: String::new(),
         };
         db.upsert_kubernetes_cluster_config(&config_row).unwrap();
 
@@ -449,5 +451,80 @@ mod kubernetes_cluster_tests {
 
         let nodes = db.list_kubernetes_cluster_nodes("test-cluster").unwrap();
         assert!(nodes[0].kubelet_ready);
+    }
+
+    #[test]
+    fn new_members_inherit_the_cluster_version_and_membership_upserts_keep_upgrade_state() {
+        let db = Database::open(":memory:").expect("open db");
+        db.upsert_kubernetes_cluster(&KubernetesClusterRow {
+            name: "c".to_string(),
+            generation: 1,
+            cluster_cidr: "10.244.0.0/16".to_string(),
+            service_cidr: "10.96.0.0/12".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            api_server_endpoint: "192.168.40.200:6443".to_string(),
+            cni: "cilium".to_string(),
+            phase: "ready".to_string(),
+            status_message: String::new(),
+            ready_control_planes: 0,
+            ready_workers: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        db.upsert_kubernetes_cluster_config(&KubernetesClusterConfigRow {
+            cluster_name: "c".to_string(),
+            ha_enabled: false,
+            vip_address: String::new(),
+            vip_interface: String::new(),
+            cilium_mode: "native-routing".to_string(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".to_string(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: String::new(),
+            local_provisioner_json: String::new(),
+            schedule_on_control_plane: false,
+            kubernetes_version: "1.36.6".to_string(),
+        })
+        .unwrap();
+        ensure_node(&db, "node-105");
+        let member = KubernetesClusterNodeRow {
+            cluster_name: "c".to_string(),
+            node_id: "node-105".to_string(),
+            role: "worker".to_string(),
+            advertise_address: "192.168.40.105".to_string(),
+            iface: "enp6s0".to_string(),
+            initial_cluster: false,
+            join_existing: true,
+            kubelet_ready: false,
+            pending_join: false,
+            pending_removal: false,
+            k8s_node_name: String::new(),
+        };
+        db.upsert_kubernetes_cluster_node(&member).unwrap();
+        assert_eq!(
+            db.kubernetes_node_version("c", "node-105")
+                .unwrap()
+                .as_deref(),
+            Some("1.36.6")
+        );
+
+        let mut upgrade = db.list_kubernetes_node_upgrades("c").unwrap().remove(0);
+        upgrade.kubernetes_version = "1.37.2".to_string();
+        upgrade.upgrade_state = "applying".to_string();
+        upgrade.upgrade_apply_id = "k8s-apply-1".to_string();
+        upgrade.upgrade_cordoned = true;
+        db.set_kubernetes_node_upgrade("c", &upgrade).unwrap();
+
+        db.upsert_kubernetes_cluster_node(&KubernetesClusterNodeRow {
+            kubelet_ready: true,
+            ..member
+        })
+        .unwrap();
+        assert_eq!(
+            db.list_kubernetes_node_upgrades("c").unwrap(),
+            vec![upgrade]
+        );
+        assert_eq!(db.kubernetes_node_version("c", "node-404").unwrap(), None);
     }
 }
