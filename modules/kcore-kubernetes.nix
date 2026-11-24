@@ -117,17 +117,18 @@ let
     '';
   # keepalived only knows the host is up. Without this check the VIP stays
   # on a node whose API server is down and the cluster API goes with it.
+  # Two missed one-second checks move it, so a rebuild costs about 2s.
   apiServerCheck =
     port:
     pkgs.writeShellScript "kcore-apiserver-check-${toString port}" ''
-      exec ${pkgs.curl}/bin/curl -sk -m 2 -o /dev/null -f https://127.0.0.1:${toString port}/livez
+      exec ${pkgs.curl}/bin/curl -sk -m 1 -o /dev/null -f https://127.0.0.1:${toString port}/livez
     '';
   vrrpApiServerScript = name: port: ''
     vrrp_script ${name} {
       script "${apiServerCheck port}"
-      interval 2
-      timeout 3
-      fall 3
+      interval 1
+      timeout 2
+      fall 2
       rise 2
     }
   '';
