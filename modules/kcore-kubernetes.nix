@@ -115,6 +115,22 @@ let
       echo "Kubernetes API was not ready for ${what}" >&2
       exit 1
     '';
+  # keepalived only knows the host is up. Without this check the VIP stays
+  # on a node whose API server is down and the cluster API goes with it.
+  apiServerCheck =
+    port:
+    pkgs.writeShellScript "kcore-apiserver-check-${toString port}" ''
+      exec ${pkgs.curl}/bin/curl -sk -m 2 -o /dev/null -f https://127.0.0.1:${toString port}/livez
+    '';
+  vrrpApiServerScript = name: port: ''
+    vrrp_script ${name} {
+      script "${apiServerCheck port}"
+      interval 2
+      timeout 3
+      fall 3
+      rise 2
+    }
+  '';
   provisionerApply = manifestApply "provisioner";
   coreDnsApply = manifestApply "coredns";
 
@@ -933,6 +949,7 @@ let
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
+        reloadTriggers = [ config.environment.etc."keepalived/keepalived-${name}.conf".source ];
         serviceConfig = {
           Type = "forking";
           PIDFile = "/run/keepalived-${name}.pid";
@@ -940,6 +957,7 @@ let
           # A second keepalived cannot share the primary daemon's
           # /run/vrrp.pid. -r gives this cluster its own VRRP pid file.
           ExecStart = "${pkgs.keepalived}/bin/keepalived -f /etc/keepalived/keepalived-${name}.conf -p /run/keepalived-${name}.pid -r /run/vrrp-${name}.pid";
+          ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
           Restart = "always";
           RestartSec = "5s";
         };
@@ -1000,7 +1018,9 @@ let
             text = ''
               global_defs {
                 router_id ${config.networking.hostName}-${name}
+                script_user root
               }
+              ${vrrpApiServerScript "${vrrpName}_api" apiPort}
               vrrp_instance ${vrrpName} {
                 state BACKUP
                 interface ${c.vipInterface}
@@ -1015,6 +1035,9 @@ let
                 authentication {
                   auth_type PASS
                   auth_pass k${toString c.virtualRouterId}
+                }
+                track_script {
+                  ${vrrpName}_api
                 }
                 virtual_ipaddress {
                   ${c.vipAddress}/24
@@ -1982,12 +2005,15 @@ in
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
+        # A reload keeps the VIP where it is; a restart would drop it.
+        reloadTriggers = [ config.environment.etc."keepalived/keepalived.conf".source ];
 
         serviceConfig = {
           Type = "forking";
           PIDFile = "/run/keepalived.pid";
           ExecStartPre = keepalivedNotrack;
           ExecStart = "${pkgs.keepalived}/bin/keepalived -f /etc/keepalived/keepalived.conf -p /run/keepalived.pid";
+          ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
           Restart = "always";
           RestartSec = "5s";
         };
@@ -2071,7 +2097,9 @@ in
               ''
                 global_defs {
                   router_id ${config.networking.hostName}
+                  script_user root
                 }
+                ${vrrpApiServerScript "kcore_api_check" k8sPorts.apiServer}
                 vrrp_instance kcore_api {
                   state BACKUP
                   interface ${cfg.vipInterface}
@@ -2086,6 +2114,9 @@ in
                   authentication {
                     auth_type PASS
                     auth_pass kcoreapi
+                  }
+                  track_script {
+                    kcore_api_check
                   }
                   virtual_ipaddress {
                     ${cfg.vipAddress}/24

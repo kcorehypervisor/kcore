@@ -71,11 +71,17 @@ let
             role = "control-plane";
             advertiseAddress = "10.0.0.1";
             apiServerEndpoint = "10.0.0.1:6443";
+            haEnabled = true;
+            vipAddress = "10.0.0.100";
+            vipInterface = "eth0";
             additionalClusters.b = {
               role = "control-plane";
               advertiseAddress = "10.0.0.1";
               apiServerEndpoint = "10.0.0.1:7443";
               scheduleOnControlPlane = true;
+              haEnabled = true;
+              vipAddress = "10.0.0.101";
+              vipInterface = "eth0";
             };
           };
         }
@@ -101,6 +107,15 @@ let
   # Kubelets point pods at clusterDns; something has to answer there.
   coreDns = host: path: host.config.environment.etc.${path}.text or "";
   hasCoreDnsUnit = host: unit: host.config.systemd.services ? ${unit};
+
+  # The VIP must leave a node whose API server is down, and a config change
+  # must reach the running keepalived.
+  keepalivedConf = path: controlPlane.config.environment.etc.${path}.text;
+  tracksApiServer =
+    path: port:
+    lib.hasInfix "track_script" (keepalivedConf path)
+    && lib.hasInfix "kcore-apiserver-check-${toString port}" (keepalivedConf path);
+  reloadsOnChange = unit: controlPlane.config.systemd.services.${unit}.reloadTriggers != [ ];
 
   pinned = mkHost "" releases.hostPin;
   upgraded = lib.mapAttrsToList (version: _: {
@@ -129,6 +144,10 @@ assert lib.hasInfix "clusterIP: 10.112.0.10" (coreDns controlPlane "kubernetes/b
 assert hasCoreDnsUnit controlPlane "kcore-kubernetes-coredns";
 assert hasCoreDnsUnit controlPlane "kcore-kubernetes-coredns-b";
 assert !hasCoreDnsUnit installed "kcore-kubernetes-coredns";
+assert tracksApiServer "keepalived/keepalived.conf" 6443;
+assert tracksApiServer "keepalived/keepalived-b.conf" 7443;
+assert reloadsOnChange "keepalived";
+assert reloadsOnChange "keepalived-b";
 assert retiresPrimary pinned;
 assert !lib.hasInfix "b|-)" (retireScript pinned);
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;
