@@ -1958,14 +1958,18 @@ in
       };
 
       # kubelet (all nodes)
+      # Started before containerd's socket is up, kubelet exits and the
+      # switch counts the failed unit as a failed rebuild.
       systemd.services.kubelet = {
         description = "Kubernetes Kubelet";
         wantedBy = [ "multi-user.target" ];
         after = [
           "network-online.target"
+          "containerd.service"
         ]
         ++ lib.optionals (cfg.role == "control-plane") [ "kube-apiserver.service" ];
         wants = [ "network-online.target" ];
+        requires = [ "containerd.service" ];
         # Volume setup execs mount(8). The default unit PATH is the NixOS
         # activation set, which does not include util-linux.
         path = with pkgs; [

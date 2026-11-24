@@ -299,6 +299,9 @@ impl KubernetesOrchestrator {
         while start.elapsed().as_secs() < timeout_secs {
             match self.refresh_node_readiness(cluster_name).await {
                 Ok(missing) if missing.is_empty() => {
+                    if let Err(err) = self.label_workers(cluster_name).await {
+                        warn!(cluster = cluster_name, error = %err, "worker role labels not applied");
+                    }
                     self.db
                         .mark_kubernetes_cluster_ready(cluster_name, control_planes)?;
                     return Ok(());
@@ -1266,6 +1269,9 @@ impl KubernetesOrchestrator {
                     registered_name,
                 } => {
                     self.mark_member_joined(cluster_name, &node_id, &registered_name)?;
+                    if let Err(err) = self.label_workers(cluster_name).await {
+                        warn!(cluster = cluster_name, error = %err, "worker role labels not applied");
+                    }
                 }
                 ScaleStep::CordonDrain { node_id } => {
                     self.drain_member(cluster_name, &node_id).await?;
@@ -1783,6 +1789,27 @@ impl KubernetesOrchestrator {
         crate::kubernetes_admin::drain_node(&self.node_clients, &address, &name)
             .await
             .map_err(|err| anyhow!(err))
+    }
+
+    async fn label_workers(&self, cluster_name: &str) -> Result<()> {
+        let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        let workers: Vec<_> = rows
+            .iter()
+            .filter(|row| row.role == "worker" && !row.pending_removal)
+            .collect();
+        if workers.is_empty() {
+            return Ok(());
+        }
+        let (address, _) = self.api_peer(cluster_name, None).await?;
+        for row in workers {
+            let name = self
+                .registered_name(cluster_name, &row.node_id, &address)
+                .await?;
+            crate::kubernetes_admin::label_worker(&self.node_clients, &address, &name)
+                .await
+                .map_err(|err| anyhow!(err))?;
+        }
+        Ok(())
     }
 
     async fn delete_api_member(&self, cluster_name: &str, node_id: &str) -> Result<()> {

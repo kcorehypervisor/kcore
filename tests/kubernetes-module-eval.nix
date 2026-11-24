@@ -155,6 +155,7 @@ assert tracksApiServer "keepalived/keepalived.conf" 6443;
 assert tracksApiServer "keepalived/keepalived-b.conf" 7443;
 assert reloadsOnChange "keepalived";
 assert reloadsOnChange "keepalived-b";
+assert lib.elem "containerd.service" installed.config.systemd.services.kubelet.after;
 assert membersOutsideExecStart "etcd" "kubernetes/etcd-bootstrap.env";
 assert membersOutsideExecStart "etcd-b" "kubernetes/b/etcd-bootstrap.env";
 assert retiresPrimary pinned;
