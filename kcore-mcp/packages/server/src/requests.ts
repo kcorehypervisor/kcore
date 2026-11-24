@@ -383,6 +383,8 @@ export function buildOperation(action: string, spec: Record<string, unknown>): R
       const canaryNode = opt(spec, "canaryNode") ?? opt(spec, "canaryNodeId");
       const soak = spec.soak ?? spec.canarySoakSeconds;
       if (noCanary && (canaryNode || soak !== undefined)) throw new InputError("noCanary cannot be combined with canaryNode or soak");
+      const channel = opt(spec, "channel") ?? "";
+      if (!["", "community", "enterprise"].includes(channel)) throw new InputError("channel must be community or enterprise");
       return {
         target: "controller",
         method: "setClusterVersion",
@@ -394,6 +396,7 @@ export function buildOperation(action: string, spec: Record<string, unknown>): R
           canarySoakSeconds: soak === undefined ? 0 : soakSeconds(soak),
           noCanary,
           canaryNodeId: canaryNode ? assertName(canaryNode, "canary node") : "",
+          channel,
         },
       };
     }
@@ -1156,7 +1159,7 @@ function kubernetesNodes(value: unknown, role: "control-plane" | "worker", label
   });
 }
 
-function kubernetesRequest(spec: Record<string, unknown>): { name: string; spec: Record<string, unknown> } {
+function kubernetesRequest(spec: Record<string, unknown>): { name: string; spec: Record<string, unknown>; force: boolean } {
   const name = assertName(required(spec, "name", "cluster name"), "cluster name");
   const controlPlane = kubernetesNodes(spec.controlPlaneNodes, "control-plane", "controlPlaneNodes");
   if (controlPlane.length === 0) throw new InputError("controlPlaneNodes must list at least one node");
@@ -1180,6 +1183,7 @@ function kubernetesRequest(spec: Record<string, unknown>): { name: string; spec:
     controlPlaneNodes: controlPlane,
     workerNodes: kubernetesNodes(spec.workerNodes, "worker", "workerNodes"),
     scheduleOnControlPlane: boolish(spec.scheduleOnControlPlane),
+    version: opt(spec, "version") ?? "",
   };
   if (boolish(ha.enabled)) {
     result.highAvailability = {
@@ -1210,7 +1214,8 @@ function kubernetesRequest(spec: Record<string, unknown>): { name: string; spec:
       }),
     };
   }
-  return { name, spec: result };
+  // Plan and update read force; create ignores it.
+  return { name, spec: result, force: boolish(spec.force) };
 }
 
 const POSTGRESQL_PACKAGES = new Set([

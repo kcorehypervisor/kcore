@@ -35,6 +35,8 @@ mod kubernetes_lifecycle;
 mod kubernetes_local;
 mod kubernetes_orchestrator;
 mod kubernetes_pki;
+mod kubernetes_upgrade;
+mod kubernetes_versions;
 mod local_migrate;
 mod metrics_targets;
 mod net_policy;

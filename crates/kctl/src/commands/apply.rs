@@ -155,7 +155,7 @@ pub async fn apply(info: &ConnectionInfo, file: &str, dry_run: bool) -> Result<(
                 return object_user::apply_from_file(info, file).await
             }
             "kubernetescluster" | "kubernetes-cluster" | "kubernetes_cluster" => {
-                return kubernetes::apply_from_file(info, file).await
+                return kubernetes::apply_from_file(info, file, false, true).await
             }
             "clusterupdate" | "cluster-update" | "cluster_update" => {
                 return cluster_update::apply(info, file).await

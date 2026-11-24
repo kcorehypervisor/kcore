@@ -42,6 +42,10 @@ struct ManifestSpec {
     /// Masters accept pods. Dedicated workerNodes may be empty.
     #[serde(default)]
     schedule_on_control_plane: bool,
+    /// Desired Kubernetes version. Empty uses the host nixpkgs pin. Changing
+    /// it and re-applying upgrades the cluster one node at a time.
+    #[serde(default)]
+    version: String,
 }
 
 fn default_cluster_dns() -> String {
@@ -237,6 +241,7 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
         high_availability: ha_config,
         local_provisioner,
         schedule_on_control_plane: spec.schedule_on_control_plane,
+        version: spec.version.clone(),
     }
 }
 
@@ -249,7 +254,22 @@ fn worker_slot_count(spec: &controller_proto::KubernetesClusterSpec) -> i32 {
     }
 }
 
-pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
+/// An empty stdin is a script that forgot `--yes`, not a "no".
+fn read_answer(prompt: &str) -> Result<String> {
+    println!("{prompt}");
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input)? == 0 {
+        anyhow::bail!("no answer on stdin; pass --yes to run without a prompt");
+    }
+    Ok(input.trim().to_string())
+}
+
+pub async fn apply_from_file(
+    info: &ConnectionInfo,
+    file: &str,
+    force: bool,
+    yes: bool,
+) -> Result<()> {
     let manifest = parse_manifest(file)?;
     let mut client = client::controller_client(info).await?;
 
@@ -258,6 +278,7 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
         .plan_kubernetes_cluster(controller_proto::PlanKubernetesClusterRequest {
             name: manifest.metadata.name.clone(),
             spec: Some(to_proto_spec(&manifest.spec)),
+            force,
         })
         .await
         .context("plan_kubernetes_cluster rpc")?
@@ -305,22 +326,20 @@ pub async fn apply_from_file(info: &ConnectionInfo, file: &str) -> Result<()> {
         println!("\nLocal-path manifest:\n{}", plan.rendered_nix_preview);
     }
 
-    println!("\n📝 Proceed? (y/n)");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if !input.trim().eq_ignore_ascii_case("y") {
+    if !yes && !read_answer("\n📝 Proceed? (y/n)")?.eq_ignore_ascii_case("y") {
         println!("Aborted");
         return Ok(());
     }
 
     let spec = Some(to_proto_spec(&manifest.spec));
-    let updating = plan.action == "update";
+    let updating = plan.action == "update" || plan.action == "upgrade";
     let result = if updating {
         client
             .update_kubernetes_cluster(controller_proto::UpdateKubernetesClusterRequest {
                 name: manifest.metadata.name.clone(),
                 spec,
                 confirm: true,
+                force,
             })
             .await
             .context("update_kubernetes_cluster rpc")?
@@ -371,6 +390,11 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
             println!("  Service CIDR: {}", spec.service_cidr);
             println!("  API Endpoint: {}", spec.api_server_endpoint);
             println!("  CNI: {}", spec.cni);
+            if spec.version.is_empty() {
+                println!("  Version: host pin");
+            } else {
+                println!("  Version: {}", spec.version);
+            }
 
             if let Some(ha) = spec.high_availability {
                 if ha.enabled {
@@ -448,6 +472,14 @@ pub async fn get(info: &ConnectionInfo, name: &str) -> Result<()> {
             println!("  Message: {}", status.message);
             println!("  Ready Control Planes: {}", status.ready_control_planes);
             println!("  Ready Workers: {}", status.ready_workers);
+            if !status.node_versions.is_empty() {
+                println!("  Node Versions:");
+                let mut versions: Vec<_> = status.node_versions.iter().collect();
+                versions.sort();
+                for (node_id, version) in versions {
+                    println!("    {node_id}: {version}");
+                }
+            }
         }
     }
 
@@ -506,16 +538,11 @@ pub async fn list(info: &ConnectionInfo) -> Result<()> {
     Ok(())
 }
 
-pub async fn delete(info: &ConnectionInfo, name: &str, force: bool) -> Result<()> {
+pub async fn delete(info: &ConnectionInfo, name: &str, force: bool, yes: bool) -> Result<()> {
     println!("⚠️  Delete Kubernetes cluster '{}'?", name);
-    if !force {
-        println!("Type cluster name to confirm:");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if input.trim() != name {
-            println!("Aborted");
-            return Ok(());
-        }
+    if !force && !yes && read_answer("Type cluster name to confirm:")? != name {
+        println!("Aborted");
+        return Ok(());
     }
 
     let mut client = client::controller_client(info).await?;

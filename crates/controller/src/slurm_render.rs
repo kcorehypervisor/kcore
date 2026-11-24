@@ -321,14 +321,56 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Lex a Nix double-quoted string the way Nix does: `\x` is an escape,
+    /// `$$` and `$\x` are literal, and `${` starts an interpolation. Returns
+    /// the byte offset of the closing quote, or None at an interpolation or
+    /// when the string never closes.
+    fn nix_string_close(s: &str) -> Option<usize> {
+        let b = s.as_bytes();
+        if b.first() != Some(&b'"') {
+            return None;
+        }
+        let mut i = 1;
+        while i < b.len() {
+            match (b[i], b.get(i + 1)) {
+                (b'"', _) => return Some(i),
+                (b'\\', _) => i += 2,
+                (b'$', Some(b'{')) => return None,
+                (b'$', Some(b'\\')) => i += 3,
+                (b'$', Some(b'"')) | (b'$', None) => i += 1,
+                (b'$', Some(_)) => i += 2,
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_lexer_matches_nix() {
+        assert_eq!(nix_string_close(r#""a$${x}b""#), Some(8));
+        assert_eq!(nix_string_close(r#""a\${x}b""#), Some(8));
+        assert_eq!(nix_string_close(r#""a$$${x}b""#), None);
+        assert_eq!(nix_string_close(r#""a${x}b""#), None);
+        assert_eq!(nix_string_close(r#""a\""#), None);
+    }
+
     proptest! {
         #[test]
         fn nix_escaping_leaves_no_raw_interpolation(value in ".*") {
             let escaped = nix_string(&value);
-            let without_escapes = escaped.replace("\\${", "");
-            prop_assert!(!without_escapes.contains("${"), "raw interpolation in {}", escaped);
-            prop_assert!(escaped.starts_with('"'));
-            prop_assert!(escaped.ends_with('"'));
+            prop_assert_eq!(
+                nix_string_close(&escaped),
+                Some(escaped.len() - 1),
+                "interpolation or early close in {}",
+                escaped
+            );
+        }
+
+        #[test]
+        fn dollar_runs_before_a_brace_stay_literal(n in 0usize..6, tail in "[{}a-z$]{0,4}") {
+            let value = format!("{}{{{}", "$".repeat(n), tail);
+            let escaped = nix_string(&value);
+            prop_assert_eq!(nix_string_close(&escaped), Some(escaped.len() - 1), "{}", escaped);
         }
     }
     use crate::slurm_cluster_spec::{

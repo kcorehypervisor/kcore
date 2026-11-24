@@ -268,6 +268,31 @@ kctl kubernetes plan -f lab-cluster.yaml   # Shows "update" action
 kctl kubernetes apply -f lab-cluster.yaml  # Rolling update
 ```
 
+### Upgrade Kubernetes
+
+The Kubernetes version lives in the same manifest. Change `spec.version` and apply it again:
+
+```yaml
+spec:
+  version: 1.36.6   # empty or absent means the version in the host nixpkgs pin
+```
+
+```bash
+kctl kubernetes apply -f lab-cluster.yaml   # plan shows "upgrade"
+kctl kubernetes get lab                      # phase, progress, and each node's version
+```
+
+The controller upgrades one node at a time. Control-plane nodes go first, then workers, because a kubelet must not be newer than the API servers it talks to. Before each node it waits until every etcd member is healthy and the API answers. Each node, control planes included, is cordoned and drained first, because a tainted control plane can still run pods that tolerate the taint. The next node starts only after this one's kubelet reports the new version and is Ready; then it is uncordoned. The cluster stays in phase `upgrading` until the last node is done, then returns to `ready`.
+
+Versions come from [`modules/kubernetes-releases.json`](../modules/kubernetes-releases.json). The host pin uses `pkgs.kubernetes`; any other listed version uses the upstream release binaries from `dl.k8s.io`, checked against the hashes in that file, so nodes download them instead of compiling Kubernetes. Adding a release means adding its five binary hashes there.
+
+Rules:
+
+- One minor version per apply (1.35 to 1.36, then 1.36 to 1.37). A skip, a downgrade, or changing the target while an upgrade is running needs `--force`. A forced downgrade still goes control planes first, which Kubernetes does not support; use it only to recover.
+- Do not change the node list in the same apply as the version. A version change is refused while the cluster is bootstrapping or scaling.
+- If a drain times out or a rebuild fails, the node is uncordoned, the cluster goes `degraded` with a message starting `Kubernetes upgrade stopped`, and the remaining nodes are left alone. Fix the node and apply the same manifest again to resume.
+- The controller keeps each node's progress, so a controller restart resumes the rollout.
+
 ### Delete Cluster
 
 ```bash
@@ -421,6 +446,8 @@ Before running `kctl kubernetes apply`:
 - **Ceph OSD-only nodes:** Leave dedicated to storage
 
 ### Scheduling Preference
+
+Control-plane nodes are tainted `node-role.kubernetes.io/control-plane:NoSchedule`, so workloads land on workers. Set `scheduleOnControlPlane: true` in the cluster spec to remove the taint. A cluster with no workers never taints its control planes.
 
 Tag worker nodes for specific workloads:
 ```bash

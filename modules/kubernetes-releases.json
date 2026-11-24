@@ -1,0 +1,33 @@
+{
+  "hostPin": "1.35.2",
+  "binaries": [
+    "kube-apiserver",
+    "kube-controller-manager",
+    "kube-scheduler",
+    "kubelet",
+    "kubectl"
+  ],
+  "releases": {
+    "1.35.10": {
+      "kube-apiserver": "sha256-mPPacyIx/w3s6Z+HMZCKM6mzE/jhamWHsqUuTzoRliA=",
+      "kube-controller-manager": "sha256-aoujWWjKydgv8gwwdJ9zqKAb8AwcgWmzn3LAphbXnvk=",
+      "kube-scheduler": "sha256-89Cmtk0N9+UAJtf8o5UVnqggA5PPhHQjWAJRNbyJCik=",
+      "kubelet": "sha256-JdJkXk+Jdd7I2GS3zyielglFb8hkyJLJxuZEw4SioGE=",
+      "kubectl": "sha256-xJoo8fTvxNR17QX0fyzo5WO/e+9p7Xf+G5JOptg7Yyc="
+    },
+    "1.36.6": {
+      "kube-apiserver": "sha256-iGGfJDKaznbZwvfC+91aiiiDHnEd9APXqsqT7OUSVPs=",
+      "kube-controller-manager": "sha256-4G9Bl7i1aFJiq5Pohlys8kl1JoTYWlKm6Xt5aO4uJiA=",
+      "kube-scheduler": "sha256-47EoSw5S+9oRv/yBstbTZzNk7CGWJ4vCAM8gOgb9Xlo=",
+      "kubelet": "sha256-z4uq6Gm4ENhDOPjHER4rsycz6ZLAwIEHz2aSEg9eIp8=",
+      "kubectl": "sha256-KYGLZynckmK2kjB0cNBVjQJ3Jec4vl3UfHYCYYaKJjQ="
+    },
+    "1.37.2": {
+      "kube-apiserver": "sha256-uH5akRB8+ZS/o4xsGyjrOfAfwEBzTsmULCJzi8i480s=",
+      "kube-controller-manager": "sha256-+5MoTAyP5/irh5ia1u437rZ5o1laNtjQZG181S3GG04=",
+      "kube-scheduler": "sha256-bItcEYRvWP2ItZzhndHPE9PdhTZJNsVIyEGUbYdlaps=",
+      "kubelet": "sha256-oODEusqdfh4KZ0NZ8WFbVioQkdxBTG96YJTsI6osvlk=",
+      "kubectl": "sha256-wESHUj56p9FJP3gIF0yJnbk9epz1dTFCDNdrm9QV+PQ="
+    }
+  }
+}

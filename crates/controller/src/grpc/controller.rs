@@ -81,6 +81,65 @@ fn guest_virtio_serial(vol: &VolumeRow, runtime_vm_name: &str) -> String {
 }
 
 #[cfg(test)]
+mod kubernetes_health_tests {
+    use super::kubernetes_health_response;
+    use crate::kubernetes_orchestrator::{ClusterHealth, MemberHealth};
+
+    fn member(id: &str, role: &str, ready: Option<bool>, etcd: bool) -> MemberHealth {
+        MemberHealth {
+            node_id: id.into(),
+            role: role.into(),
+            ready,
+            etcd_healthy: etcd,
+            api_healthy: etcd,
+        }
+    }
+
+    #[test]
+    fn health_comes_from_the_probes_not_the_roles() {
+        let healthy = ClusterHealth {
+            api_reachable: true,
+            nodes: vec![
+                member("cp", "control-plane", Some(true), true),
+                member("w1", "worker", Some(true), false),
+            ],
+        };
+        let response = kubernetes_health_response(&healthy, false);
+        assert_eq!(response.overall_health, "healthy");
+        assert_eq!((response.ready_workers, response.total_workers), (1, 1));
+
+        let worker_down = ClusterHealth {
+            api_reachable: true,
+            nodes: vec![
+                member("cp", "control-plane", Some(true), true),
+                member("w1", "worker", Some(false), false),
+            ],
+        };
+        let response = kubernetes_health_response(&worker_down, false);
+        assert_eq!(response.overall_health, "degraded");
+        assert_eq!(response.node_health[1].kubernetes_status, "NotReady");
+
+        let etcd_down = ClusterHealth {
+            api_reachable: true,
+            nodes: vec![member("cp", "control-plane", Some(true), false)],
+        };
+        let response = kubernetes_health_response(&etcd_down, false);
+        assert_eq!(response.overall_health, "critical");
+        assert!(!response.etcd_healthy);
+        assert!(!response.node_health[0].etcd_active);
+
+        let api_down = ClusterHealth {
+            api_reachable: false,
+            nodes: vec![member("cp", "control-plane", None, true)],
+        };
+        let response = kubernetes_health_response(&api_down, true);
+        assert_eq!(response.overall_health, "critical");
+        assert_eq!(response.node_health[0].kubernetes_status, "Unknown");
+        assert_eq!((response.ready_workers, response.total_workers), (0, 1));
+    }
+}
+
+#[cfg(test)]
 mod guest_serial_tests {
     use super::*;
 
@@ -19540,6 +19599,14 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let mut blocking_issues = Vec::new();
         let mut warnings = Vec::new();
 
+        let version_valid = match crate::kubernetes_versions::validate(&spec.version) {
+            Ok(()) => true,
+            Err(err) => {
+                blocking_issues.push(err);
+                false
+            }
+        };
+
         if spec.cluster_cidr.is_empty() {
             blocking_issues.push("cluster_cidr is required".to_string());
         }
@@ -19559,10 +19626,30 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .db
             .get_kubernetes_cluster(&req.name)
             .map_err(internal_db)?;
-        let action = if existing.is_some() {
-            "update"
-        } else {
+        let version_change = match &existing {
+            Some(cluster) if version_valid => {
+                match self.kubernetes_version_change(&req.name, &cluster.phase, &spec, req.force) {
+                    Ok(change) => change,
+                    Err(status) => {
+                        blocking_issues.push(status.message().to_string());
+                        crate::kubernetes_upgrade::VersionChange::None
+                    }
+                }
+            }
+            _ => crate::kubernetes_upgrade::VersionChange::None,
+        };
+        if version_change != crate::kubernetes_upgrade::VersionChange::None {
+            warnings.push(format!(
+                "Kubernetes moves to {} one node at a time: control planes first, then workers. Each node is drained before its rebuild.",
+                crate::kubernetes_versions::effective(&spec.version)
+            ));
+        }
+        let action = if existing.is_none() {
             "create"
+        } else if version_change != crate::kubernetes_upgrade::VersionChange::None {
+            "upgrade"
+        } else {
+            "update"
         };
 
         // Validate control plane nodes exist and are ready
@@ -19666,6 +19753,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        crate::kubernetes_versions::validate(&spec.version).map_err(Status::invalid_argument)?;
 
         // Check if cluster already exists
         if let Some(_existing) = self
@@ -19796,6 +19884,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        crate::kubernetes_versions::validate(&spec.version).map_err(Status::invalid_argument)?;
+        let version_change =
+            self.kubernetes_version_change(&req.name, &existing.phase, &spec, req.force)?;
+        let upgrading = version_change != crate::kubernetes_upgrade::VersionChange::None;
+        let next_version = crate::kubernetes_versions::effective(&spec.version);
         let provisioner = Self::local_provisioner_of(&req.name, &spec)?;
         let existing_members = self
             .db
@@ -19835,7 +19928,11 @@ impl controller_proto::controller_server::Controller for ControllerService {
             api_server_endpoint: spec.api_server_endpoint.clone(),
             cni: stored_cni(&spec.api_server_endpoint, &spec.cni),
             phase: "updating".to_string(),
-            status_message: "cluster update in progress".to_string(),
+            status_message: if upgrading {
+                format!("updating configuration before the upgrade to Kubernetes {next_version}")
+            } else {
+                "cluster update in progress".to_string()
+            },
             ready_control_planes: existing.ready_control_planes,
             ready_workers: existing.ready_workers,
             created_at: existing.created_at,
@@ -19896,6 +19993,13 @@ impl controller_proto::controller_server::Controller for ControllerService {
         } else if let Some(message) = deploy_error.or(volume_error) {
             cluster_row.phase = "degraded".to_string();
             cluster_row.status_message = message;
+        } else if upgrading {
+            // The orchestrator rolls the version out; nodes keep their
+            // current version until it reaches them.
+            cluster_row.phase = "upgrading".to_string();
+            cluster_row.status_message = format!(
+                "upgrade to Kubernetes {next_version} queued: control planes first, then workers"
+            );
         } else {
             // A ready cluster stays ready. A degraded cluster is the previous
             // attempt's failure; this attempt deployed, so it is ready again.
@@ -19907,10 +20011,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
             };
             cluster_row.status_message = if spec.schedule_on_control_plane {
                 "control-plane nodes accept workloads; node configuration deployed".to_string()
-            } else if recovered {
-                "cluster configuration deployed".to_string()
             } else {
-                format!("{}; node configuration deployed", existing.status_message)
+                "cluster configuration deployed".to_string()
             };
         }
         self.db
@@ -20035,8 +20137,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
         let req = request.into_inner();
 
-        let cluster = self
-            .db
+        self.db
             .get_kubernetes_cluster(&req.name)
             .map_err(internal_db)?
             .ok_or_else(|| Status::not_found(format!("cluster {} not found", req.name)))?;
@@ -20046,83 +20147,19 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map_err(internal_db)?
             .map(|config| config.schedule_on_control_plane)
             .unwrap_or(false);
-        let mut control_plane_ready_budget =
-            if schedule_on_control_plane && cluster.phase == "ready" {
-                cluster.ready_control_planes
-            } else {
-                0
-            };
 
-        let nodes = self
-            .db
-            .list_kubernetes_cluster_nodes(&req.name)
-            .map_err(internal_db)?;
-
-        let mut node_health = Vec::new();
-        let mut ready_control_planes = 0;
-        let mut total_control_planes = 0;
-        let mut ready_workers = 0;
-        let mut total_workers = 0;
-
-        for node in &nodes {
-            let control_plane = node.role == "control-plane";
-            if control_plane {
-                total_control_planes += 1;
-                if node.kubelet_ready {
-                    ready_control_planes += 1;
-                }
-            }
-            if !control_plane || schedule_on_control_plane {
-                total_workers += 1;
-                let ready = if node.kubelet_ready {
-                    true
-                } else if control_plane && control_plane_ready_budget > 0 {
-                    control_plane_ready_budget -= 1;
-                    true
-                } else {
-                    false
-                };
-                if ready {
-                    ready_workers += 1;
-                }
-            }
-
-            node_health.push(controller_proto::NodeHealth {
-                node_id: node.node_id.clone(),
-                kubernetes_status: if node.kubelet_ready {
-                    "Ready"
-                } else {
-                    "NotReady"
-                }
-                .to_string(),
-                kubelet_active: node.kubelet_ready,
-                etcd_active: node.role == "control-plane",
-                api_server_active: node.role == "control-plane",
-            });
-        }
-
-        let overall_health =
-            if ready_control_planes == total_control_planes && ready_workers == total_workers {
-                "healthy"
-            } else if ready_control_planes > 0 {
-                "degraded"
-            } else {
-                "critical"
-            };
-
-        Ok(Response::new(
-            controller_proto::GetKubernetesClusterHealthResponse {
-                overall_health: overall_health.to_string(),
-                ready_control_planes,
-                total_control_planes,
-                ready_workers,
-                total_workers,
-                etcd_healthy: ready_control_planes > 0,
-                etcd_member_count: total_control_planes,
-                api_server_reachable: ready_control_planes > 0,
-                node_health,
-            },
-        ))
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let health = orchestrator
+            .observe_health(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("kubernetes health: {e:#}")))?;
+        Ok(Response::new(kubernetes_health_response(
+            &health,
+            schedule_on_control_plane,
+        )))
     }
 
     async fn classify_disk_layout(
@@ -20271,6 +20308,62 @@ impl ControllerService {
         Ok(changed)
     }
 
+    /// Whether applying `spec` starts, resumes, or leaves alone a version
+    /// upgrade. Refusals come back as `FailedPrecondition`.
+    fn kubernetes_version_change(
+        &self,
+        cluster_name: &str,
+        phase: &str,
+        spec: &controller_proto::KubernetesClusterSpec,
+        force: bool,
+    ) -> Result<crate::kubernetes_upgrade::VersionChange, Status> {
+        let stored = self
+            .db
+            .get_kubernetes_cluster_config(cluster_name)
+            .map_err(internal_db)?
+            .map(|cfg| cfg.kubernetes_version)
+            .unwrap_or_default();
+        let members = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)
+            .map_err(internal_db)?;
+        let existing_pairs: Vec<(String, String)> = members
+            .iter()
+            .map(|row| (row.node_id.clone(), row.role.clone()))
+            .collect();
+        let desired: Vec<(String, String)> = spec
+            .control_plane_nodes
+            .iter()
+            .map(|node| (node.node_id.clone(), "control-plane".to_string()))
+            .chain(
+                spec.worker_nodes
+                    .iter()
+                    .map(|node| (node.node_id.clone(), "worker".to_string())),
+            )
+            .collect();
+        let membership_changes =
+            crate::kubernetes_lifecycle::membership_delta(&existing_pairs, &desired)
+                .map(|delta| !delta.add.is_empty() || !delta.remove.is_empty())
+                .unwrap_or(false);
+        let nodes: Vec<(String, String)> = self
+            .db
+            .list_kubernetes_node_upgrades(cluster_name)
+            .map_err(internal_db)?
+            .into_iter()
+            .filter(|row| !row.pending_join && !row.pending_removal)
+            .map(|row| (row.kubernetes_version, row.upgrade_state))
+            .collect();
+        crate::kubernetes_upgrade::version_change(
+            phase,
+            &stored,
+            &nodes,
+            &spec.version,
+            membership_changes,
+            force,
+        )
+        .map_err(Status::failed_precondition)
+    }
+
     fn kubernetes_members(
         spec: &controller_proto::KubernetesClusterSpec,
     ) -> std::collections::BTreeSet<String> {
@@ -20343,6 +20436,7 @@ impl ControllerService {
                 .unwrap_or_default(),
             local_provisioner_json: crate::kubernetes_local::encode(provisioner),
             schedule_on_control_plane: spec.schedule_on_control_plane,
+            kubernetes_version: crate::kubernetes_versions::normalize(&spec.version),
         }
     }
 
@@ -20755,6 +20849,10 @@ impl ControllerService {
                     .as_ref()
                     .map(|c| c.schedule_on_control_plane)
                     .unwrap_or(false),
+                version: config
+                    .as_ref()
+                    .map(|c| c.kubernetes_version.clone())
+                    .unwrap_or_default(),
             }),
             status: Some(controller_proto::KubernetesClusterStatus {
                 phase: row.phase.clone(),
@@ -20770,6 +20868,18 @@ impl ControllerService {
                 ),
                 last_updated: None,
                 active_node_ids: vec![],
+                node_versions: self
+                    .db
+                    .list_kubernetes_node_upgrades(&row.name)
+                    .map_err(internal_db)?
+                    .into_iter()
+                    .map(|node| {
+                        (
+                            node.node_id,
+                            crate::kubernetes_versions::effective(&node.kubernetes_version),
+                        )
+                    })
+                    .collect(),
             }),
         })
     }
@@ -20787,6 +20897,72 @@ fn stored_cni(api_endpoint: &str, requested: &str) -> String {
         }
     } else {
         "bridge".to_string()
+    }
+}
+
+fn kubernetes_health_response(
+    health: &crate::kubernetes_orchestrator::ClusterHealth,
+    schedule_on_control_plane: bool,
+) -> controller_proto::GetKubernetesClusterHealthResponse {
+    let mut node_health = Vec::new();
+    let mut ready_control_planes = 0;
+    let mut total_control_planes = 0;
+    let mut ready_workers = 0;
+    let mut total_workers = 0;
+    let mut healthy_etcd = 0;
+
+    for node in &health.nodes {
+        let control_plane = node.role != "worker";
+        let ready = node.ready == Some(true);
+        if control_plane {
+            total_control_planes += 1;
+            if ready {
+                ready_control_planes += 1;
+            }
+            if node.etcd_healthy {
+                healthy_etcd += 1;
+            }
+        }
+        if !control_plane || schedule_on_control_plane {
+            total_workers += 1;
+            if ready {
+                ready_workers += 1;
+            }
+        }
+        node_health.push(controller_proto::NodeHealth {
+            node_id: node.node_id.clone(),
+            kubernetes_status: match node.ready {
+                Some(true) => "Ready",
+                Some(false) => "NotReady",
+                None => "Unknown",
+            }
+            .to_string(),
+            kubelet_active: ready,
+            etcd_active: node.etcd_healthy,
+            api_server_active: node.api_healthy,
+        });
+    }
+
+    let etcd_quorum = total_control_planes > 0 && healthy_etcd > total_control_planes / 2;
+    let all_ready = ready_control_planes == total_control_planes && ready_workers == total_workers;
+    let overall_health = if !health.api_reachable || !etcd_quorum {
+        "critical"
+    } else if all_ready && healthy_etcd == total_control_planes {
+        "healthy"
+    } else {
+        "degraded"
+    };
+
+    controller_proto::GetKubernetesClusterHealthResponse {
+        overall_health: overall_health.to_string(),
+        ready_control_planes,
+        total_control_planes,
+        ready_workers,
+        total_workers,
+        etcd_healthy: etcd_quorum,
+        etcd_member_count: total_control_planes,
+        api_server_reachable: health.api_reachable,
+        node_health,
     }
 }
 

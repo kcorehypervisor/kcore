@@ -111,6 +111,8 @@ pub struct ListedNode {
     pub name: String,
     pub internal_ips: Vec<String>,
     pub ready: bool,
+    /// `status.nodeInfo.kubeletVersion`, for example `v1.36.6`.
+    pub kubelet_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,7 +132,10 @@ pub struct EtcdMember {
 }
 
 pub fn phase_blocks_promotion(phase: &str) -> bool {
-    matches!(phase, "ready" | "bootstrapping" | "updating" | "scaling")
+    matches!(
+        phase,
+        "ready" | "bootstrapping" | "updating" | "scaling" | "upgrading"
+    )
 }
 
 pub fn refusal_status(message: &str) -> bool {
@@ -140,7 +145,9 @@ pub fn refusal_status(message: &str) -> bool {
 /// `failed` from a refused scale stays failed. An older `failed` row whose
 /// etcd and API server are already up can still be promoted.
 pub fn promotion_blocked(phase: &str, message: &str) -> bool {
-    phase_blocks_promotion(phase) || (phase == "failed" && refusal_status(message))
+    phase_blocks_promotion(phase)
+        || (phase == "failed" && refusal_status(message))
+        || (phase == "degraded" && message.starts_with(crate::kubernetes_upgrade::UPGRADE_FAILED))
 }
 
 pub fn scaling_blocks_ready(message: &str) -> bool {
@@ -410,10 +417,16 @@ pub fn nodes_from_list(body: &str) -> Vec<ListedNode> {
                             && condition.get("status").and_then(Value::as_str) == Some("True")
                     })
                 });
+            let kubelet_version = item
+                .pointer("/status/nodeInfo/kubeletVersion")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             Some(ListedNode {
                 name,
                 internal_ips,
                 ready,
+                kubelet_version,
             })
         })
         .collect()
@@ -893,11 +906,12 @@ mod tests {
         assert_eq!(found.id, "99");
         assert!(member_for_ip(&members, "192.168.40.10").is_none());
         let nodes = nodes_from_list(
-            r#"{"items":[{"metadata":{"name":"registered-worker"},"status":{"addresses":[{"type":"InternalIP","address":"192.168.40.110"}],"conditions":[{"type":"Ready","status":"True"}]}}]}"#,
+            r#"{"items":[{"metadata":{"name":"registered-worker"},"status":{"addresses":[{"type":"InternalIP","address":"192.168.40.110"}],"conditions":[{"type":"Ready","status":"True"}],"nodeInfo":{"kubeletVersion":"v1.36.6"}}}]}"#,
         );
         let matched = match_registered_node(&nodes, "", "worker-2", "192.168.40.110").unwrap();
         assert_eq!(matched.name, "registered-worker");
         assert!(matched.ready);
+        assert_eq!(matched.kubelet_version, "v1.36.6");
         assert_ne!(matched.name, "worker-2");
     }
 

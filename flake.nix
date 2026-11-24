@@ -63,6 +63,7 @@
               || (toString path) == "${toString ./.}/modules"
               || (toString path) == "${toString ./.}/modules/kcore-ceph.nix"
               || (toString path) == "${toString ./.}/modules/kcore-kubernetes.nix"
+              || (toString path) == "${toString ./.}/modules/kubernetes-releases.json"
               || (toString path) == "${toString ./.}/modules/kcore-slurm.nix"
               || (toString path) == "${toString ./.}/modules/kcore-postgresql-cluster.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/postgresql-cluster/" (toString path)
@@ -249,6 +250,7 @@
               inherit pkgs;
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+              inherit (inputs.self.lib) mkNode;
             };
             kcore-slurm = import ./tests/kcore-slurm.nix { inherit pkgs; };
             postgresql-cluster-module-eval = import ./tests/postgresql-cluster-module-eval.nix {
@@ -262,6 +264,12 @@
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
             kcore-mail = import ./tests/kcore-mail.nix { inherit pkgs; };
+            kubernetes-module-eval = import ./tests/kubernetes-module-eval.nix {
+              inherit pkgs;
+              inherit (pkgs) lib;
+              nixosSystem = inputs.nixpkgs.lib.nixosSystem;
+              inherit (inputs.self.lib) mkNode;
+            };
             ch-vm-module-eval = import ./tests/ch-vm-module-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;
@@ -286,6 +294,17 @@
               inherit (pkgs) lib;
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
+            # The MCP server loads its own proto copies at run time; a stale
+            # copy silently drops new fields such as KubernetesClusterSpec.version.
+            mcp-protos-in-sync = pkgs.runCommand "mcp-protos-in-sync" { } ''
+              for proto in controller node vault_install; do
+                if ! cmp -s ${./proto}/$proto.proto ${./kcore-mcp/packages/server/proto}/$proto.proto; then
+                  echo "kcore-mcp/packages/server/proto/$proto.proto is out of date; run kcore-mcp/scripts/sync-protos.sh" >&2
+                  exit 1
+                fi
+              done
+              touch $out
+            '';
             # The stdenv shell is bash, but the `bash` name is not on PATH.
             kcore-infect = pkgs.runCommand "kcore-infect-test" { } ''
               export PATH="${pkgs.lib.removeSuffix "/bash" pkgs.stdenv.shell}:$PATH"
@@ -381,8 +400,11 @@
             "node.nix"
             "kcore-vms.nix"
             "kcore-ceph.nix"
+            "modules/kcore-slurm.nix"
             "kcore-slurm.nix"
             "kcore-postgresql-cluster.nix"
+            "modules/kcore-kubernetes.nix"
+            "kcore-kubernetes.nix"
             "legacy-configuration.nix"
           ];
 
