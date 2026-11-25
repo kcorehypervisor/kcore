@@ -410,8 +410,7 @@ let
       ];
 
       virtiofsEntries = map (fs: {
-        tag = fs.tag;
-        sharedFilesystem = fs.sharedFilesystem;
+        inherit (fs) tag sharedFilesystem;
         source =
           if fs.sourcePath != "" then fs.sourcePath else "/var/lib/kcore/virtiofs/${vmName}/${fs.tag}";
         socket = "${cfg.socketDir}/${vmName}.virtiofs.${fs.tag}.sock";
