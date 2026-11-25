@@ -1,5 +1,8 @@
-# Three-node Ceph fabric. Mon addresses must be static or DHCP reservations.
-# Preview with: kctl diff -f cluster.yaml
+# Three-node Ceph fabric with every optional field.
+# Preview with: kctl diff -f cluster.yaml   Apply with: kctl apply -f cluster.yaml
+# Which optional fields this build acts on: docs/ceph-lifecycle.md. A field the
+# reconciler does not read yet is validated and otherwise ignored.
+# Mon addresses must be static or DHCP reservations.
 kind: CephCluster
 metadata:
   name: lab-san
@@ -10,22 +13,72 @@ spec:
   replication:
     size: 3
     minSize: 2
+  # LUKS per OSD. Default true; fixed once any OSD exists.
+  encryptOsds: true
+  # ms_cluster_mode / ms_service_mode: secure or prefer-crc.
+  msMode: secure
+  # New RBD images. Existing images keep their features.
+  imageFeatures: layering,exclusive-lock
+  # writeback (default) or writethrough for new rbd-nbd maps.
+  cachePolicy: writethrough
+  recovery:
+    maxBackfills: 1
+    recoveryMaxActive: 1
+    # Scrub only between 02:00 and 05:00. -1 (or omitted) leaves Ceph's default.
+    scrubBeginHour: 2
+    scrubEndHour: 5
+    # 8500 = 85 %.
+    nearfullRatioBp: 8500
+  # kcore-vms (RBD for VM disks) is always ensured. List it to tune it, and add
+  # more pools here.
+  pools:
+    - name: kcore-vms
+      application: rbd
+      size: 3
+      minSize: 2
+      compressionMode: none
+    - name: team-data
+      application: cephfs
+      crushRule: replicated_rule
+      quotaBytes: 1099511627776
+    # Erasure-coded pools need a profile that exists in Ceph.
+    # - name: archive
+    #   application: rgw
+    #   poolType: erasure
+    #   erasureProfile: k2m1
+  # A host that will never answer: remove it from nodes and list it here in the
+  # same apply. A survivor drains it, purges its OSDs, and runs `ceph mon rm`.
+  # lostMembers:
+  #   - node-4
   nodes:
     - nodeId: node-1
+      role: full            # mon + mgr + OSDs (default)
       monAddr: "10.10.0.11:6789"
       clusterAddr: "10.20.0.11"
       publicIface: eth1
       clusterIface: eth2
       osdDevice: /dev/disk/by-id/ata-EXAMPLE_SERIAL_1
+      deviceClass: ssd
     - nodeId: node-2
+      role: full
       monAddr: "10.10.0.12:6789"
       clusterAddr: "10.20.0.12"
       publicIface: eth1
       clusterIface: eth2
       osdDevice: /dev/disk/by-id/ata-EXAMPLE_SERIAL_2
+      # Extra OSD disks on the same host.
+      osdDevices:
+        - /dev/disk/by-id/ata-EXAMPLE_SERIAL_2B
     - nodeId: node-3
+      role: full
       monAddr: "10.10.0.13:6789"
       clusterAddr: "10.20.0.13"
       publicIface: eth1
       clusterIface: eth2
       osdDevice: /dev/disk/by-id/ata-EXAMPLE_SERIAL_3
+      # CRUSH weight override; 0 or omitted leaves Ceph's default.
+      weight: 0.5
+# Maintenance is a command, not a resource:
+#   kctl node maintenance node-2 on    # cordon, noout, drain VMs
+#   kctl node maintenance node-2 off
+# See docs/ceph.md.

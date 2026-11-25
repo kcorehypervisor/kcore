@@ -128,7 +128,11 @@ export const PRESETS: Record<string, Column[]> = {
   ceph: [
     col("name"),
     col("phase", "status"),
-    col("health_message", "text", { label: "Health" }),
+    col("health_status", "status", { label: "Ceph health" }),
+    col("osds", "text", { label: "OSDs" }),
+    col("flags", "list"),
+    col("health_message", "text", { label: "Health", hidden: true }),
+    col("operation_message", "text", { label: "Operation", hidden: true }),
     col("size", "number", { label: "Replicas" }),
     col("min_size", "number", { label: "Min replicas" }),
     col("public_network"),

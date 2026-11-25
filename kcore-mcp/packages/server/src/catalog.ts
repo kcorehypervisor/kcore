@@ -134,9 +134,10 @@ export const KINDS: ResourceKind[] = [
     id: "ceph-cluster",
     yamlKind: "CephCluster",
     title: "Ceph cluster",
-    summary: "Ceph cluster spec. publicNetwork and clusterNetwork are required.",
-    mutable: ["size", "minSize"],
-    immutable: ["publicNetwork", "clusterNetwork", "fsid"],
+    summary:
+      "Ceph cluster spec. publicNetwork and clusterNetwork are required. Optional: pools, recovery, msMode, imageFeatures, cachePolicy, lostMembers, external, and per-node role/weight/deviceClass. Status carries typed health (quorum, OSDs, PG states, flags). See docs/ceph-lifecycle.md for which fields the reconciler acts on.",
+    mutable: ["size", "minSize", "nodes", "pools", "recovery", "msMode", "imageFeatures", "cachePolicy", "lostMembers"],
+    immutable: ["publicNetwork", "clusterNetwork", "fsid", "encryptOsds", "external"],
   },
   {
     id: "shared-filesystem",

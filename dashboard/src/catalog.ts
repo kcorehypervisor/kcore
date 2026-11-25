@@ -4,6 +4,8 @@ import { fromJson, type JsonObject, type MessageInitShape as Init } from "@bufbu
 import {
   CephClusterNodeSpecSchema,
   CephClusterSchema,
+  CephPoolSpecSchema,
+  CephRecoverySpecSchema,
   ClusterUpdateSpecSchema,
   ClusterUpdateStrategyType,
   DiskLayoutSchema,
@@ -324,18 +326,77 @@ function targetKind(v: Values): SecurityGroupTargetKind {
   throw new FormError(`target_kind must be vm or network, got ${kind}`);
 }
 
+const CEPH_ROLES = ["full", "mon", "osd"];
+
+function oneOf(v: Values, key: string, allowed: string[], where = ""): string {
+  const value = text(v, key);
+  if (value && !allowed.includes(value)) throw new FormError(`${where}${key} must be ${allowed.join(", ")}`);
+  return value;
+}
+
 function cephNodes(v: Values): (Init<typeof CephClusterNodeSpecSchema> & { nodeId: string })[] {
   return records(v, "nodes")
-    .map((item) => ({
-      nodeId: text(item, "node_id"),
-      osdDevice: text(item, "osd_device"),
-      osdDevices: strings(item, "osd_devices"),
-      monAddr: text(item, "mon_addr"),
-      clusterAddr: text(item, "cluster_addr"),
-      publicIface: text(item, "public_iface"),
-      clusterIface: text(item, "cluster_iface"),
-    }))
+    .map((item) => {
+      const nodeId = text(item, "node_id");
+      const weight = text(item, "weight") ? Number(text(item, "weight")) : 0;
+      if (!Number.isFinite(weight) || weight < 0) throw new FormError(`${nodeId}: weight must be a number of 0 or more`);
+      return {
+        nodeId,
+        osdDevice: text(item, "osd_device"),
+        osdDevices: strings(item, "osd_devices"),
+        monAddr: text(item, "mon_addr"),
+        clusterAddr: text(item, "cluster_addr"),
+        publicIface: text(item, "public_iface"),
+        clusterIface: text(item, "cluster_iface"),
+        role: oneOf(item, "role", CEPH_ROLES, `${nodeId}: `),
+        weight,
+        deviceClass: text(item, "device_class"),
+      };
+    })
     .filter((node) => node.nodeId);
+}
+
+function cephPools(v: Values): Init<typeof CephPoolSpecSchema>[] {
+  return records(v, "pools")
+    .filter((item) => text(item, "name"))
+    .map((item) => {
+      const where = `pool ${text(item, "name")}: `;
+      return {
+        name: text(item, "name"),
+        application: oneOf(item, "application", ["rbd", "cephfs", "rgw"], where),
+        poolType: oneOf(item, "pool_type", ["replicated", "erasure"], where),
+        size: int(item, "size"),
+        minSize: int(item, "min_size"),
+        pgNum: int(item, "pg_num"),
+        crushRule: text(item, "crush_rule"),
+        compressionMode: oneOf(item, "compression_mode", ["none", "passive", "aggressive", "force"], where),
+        quotaBytes: bytes(item, "quota_bytes"),
+        erasureProfile: text(item, "erasure_profile"),
+      };
+    });
+}
+
+function scrubHour(v: Values, key: string): number {
+  if (!text(v, key)) return -1;
+  const hour = int(v, key);
+  if (hour < 0 || hour > 23) throw new FormError(`${key} must be an hour from 0 to 23`);
+  return hour;
+}
+
+const RECOVERY_KEYS = ["max_backfills", "recovery_max_active", "scrub_begin_hour", "scrub_end_hour", "nearfull_percent"];
+
+/** Unset unless the form names a recovery knob, so an apply does not reset Ceph's own defaults. */
+function cephRecovery(v: Values): Init<typeof CephRecoverySpecSchema> | undefined {
+  if (!RECOVERY_KEYS.some((key) => text(v, key))) return undefined;
+  const percent = text(v, "nearfull_percent") ? Number(text(v, "nearfull_percent")) : 0;
+  if (!Number.isFinite(percent) || percent < 0 || percent > 100) throw new FormError("nearfull_percent must be between 0 and 100");
+  return {
+    maxBackfills: int(v, "max_backfills"),
+    recoveryMaxActive: int(v, "recovery_max_active"),
+    scrubBeginHour: scrubHour(v, "scrub_begin_hour"),
+    scrubEndHour: scrubHour(v, "scrub_end_hour"),
+    nearfullRatioBp: Math.round(percent * 100),
+  };
 }
 
 function cephCluster(v: Values): Init<typeof CephClusterSchema> {
@@ -352,6 +413,12 @@ function cephCluster(v: Values): Init<typeof CephClusterSchema> {
       forceWipe: flag(v, "force_wipe"),
       encryptOsds: flag(v, "encrypt_osds"),
       nodes,
+      pools: cephPools(v),
+      recovery: cephRecovery(v),
+      msMode: oneOf(v, "ms_mode", ["secure", "prefer-crc"]),
+      imageFeatures: text(v, "image_features"),
+      cachePolicy: oneOf(v, "cache_policy", ["writeback", "writethrough"]),
+      lostMembers: strings(v, "lost_members"),
     },
   };
 }
@@ -359,6 +426,10 @@ function cephCluster(v: Values): Init<typeof CephClusterSchema> {
 function cephForm(row: Row): Values {
   const spec = (row.spec ?? {}) as Row;
   const nodes = Array.isArray(spec.nodes) ? (spec.nodes as Row[]) : [];
+  const pools = Array.isArray(spec.pools) ? (spec.pools as Row[]) : [];
+  const recovery = (spec.recovery ?? {}) as Row;
+  const hour = (value: unknown) => (typeof value === "number" && value >= 0 && value <= 23 ? value : undefined);
+  const positive = (value: unknown) => (typeof value === "number" && value > 0 ? value : undefined);
   return {
     name: row.name,
     fsid: spec.fsid,
@@ -367,8 +438,59 @@ function cephForm(row: Row): Values {
     size: spec.size,
     min_size: spec.min_size,
     encrypt_osds: spec.encrypt_osds,
-    nodes: nodes.map((node) => ({ ...node, osd_devices: Array.isArray(node.osd_devices) ? node.osd_devices.join(",") : "" })),
+    nodes: nodes.map((node) => ({
+      ...node,
+      osd_devices: Array.isArray(node.osd_devices) ? node.osd_devices.join(",") : "",
+      weight: positive(node.weight) ?? "",
+    })),
+    pools: pools.map((pool) => ({ ...pool, quota_bytes: positive(pool.quota_bytes) ?? "", pg_num: positive(pool.pg_num) ?? "" })),
+    max_backfills: positive(recovery.max_backfills),
+    recovery_max_active: positive(recovery.recovery_max_active),
+    scrub_begin_hour: spec.recovery ? hour(recovery.scrub_begin_hour) : undefined,
+    scrub_end_hour: spec.recovery ? hour(recovery.scrub_end_hour) : undefined,
+    nearfull_percent: positive(recovery.nearfull_ratio_bp) !== undefined ? Number(recovery.nearfull_ratio_bp) / 100 : undefined,
+    ms_mode: spec.ms_mode,
+    image_features: spec.image_features,
+    cache_policy: spec.cache_policy,
+    lost_members: spec.lost_members,
   };
+}
+
+/** The list row with the typed health lifted, so the table can show it next to the phase. */
+function cephClusterRow(row: Row): Row {
+  const status = (row.status ?? {}) as Row;
+  const health = (status.typed_health ?? {}) as Row;
+  const flags = Array.isArray(health.flags) ? (health.flags as string[]) : [];
+  const total = typeof health.osd_total === "number" ? health.osd_total : 0;
+  return {
+    ...flatten(row),
+    health_status: health.health_status || null,
+    osds: total ? `${health.osd_up ?? 0}/${total} up, ${health.osd_in ?? 0} in` : null,
+    flags: [...new Set([...(health.noout ? ["noout"] : []), ...(health.norebalance ? ["norebalance"] : []), ...flags])],
+  };
+}
+
+/** Shared filesystems and object stores that name this cluster. */
+async function cephConsumers(name: string): Promise<Row> {
+  const [filesystems, stores] = await Promise.allSettled([controller.listSharedFilesystems({}), controller.listObjectStores({})]);
+  const named = (rows: Row[]) => rows.filter((row) => (row.spec as Row | undefined)?.ceph_cluster === name).map((row) => String(row.name));
+  return {
+    filesystems: filesystems.status === "fulfilled" ? named(rowsOf(filesystems.value, "shared_filesystems")) : null,
+    object_stores: stores.status === "fulfilled" ? named(rowsOf(stores.value, "object_stores")) : null,
+  };
+}
+
+/** The Ceph cluster a shared filesystem or object store runs on, for its member list. */
+async function cephMembersOf(cluster: unknown): Promise<Row> {
+  if (typeof cluster !== "string" || !cluster) return {};
+  try {
+    const row = (rowOf(await controller.getCephCluster({ name: cluster })).ceph_cluster ?? {}) as Row;
+    const spec = (row.spec ?? {}) as Row;
+    const status = (row.status ?? {}) as Row;
+    return { cluster_members: Array.isArray(spec.nodes) ? spec.nodes : [], cluster_phase: status.phase ?? null };
+  } catch (error) {
+    return { cluster_error: (error as Error).message };
+  }
 }
 
 function k8sNode(item: Values, defaultRole: string) {
@@ -598,6 +720,27 @@ const k8sFields: Field[] = [
   f("vip_interface", "VIP interface"),
   f("method", "HA method", false, "keepalived"),
   bool("schedule_on_control_plane", "Schedule on control plane"),
+];
+
+const cephFields: Field[] = [
+  f("public_network", "Public network", true),
+  list("nodes", "Nodes and OSD devices", true),
+  f("cluster_network", "Cluster network"),
+  f("fsid", "FSID"),
+  num("size", "Size"),
+  num("min_size", "Min size"),
+  bool("encrypt_osds", "Encrypt OSDs"),
+  bool("force_wipe", "Wipe OSD devices"),
+  list("pools", "Pools"),
+  f("lost_members", "Lost members", false, "node ids that will not come back, comma separated"),
+  pick("ms_mode", "Messenger mode", ["secure", "prefer-crc"]),
+  pick("cache_policy", "RBD cache policy", ["writeback", "writethrough"]),
+  f("image_features", "RBD image features", false, "layering,exclusive-lock"),
+  num("max_backfills", "Max backfills"),
+  num("recovery_max_active", "Recovery max active"),
+  num("scrub_begin_hour", "Scrub begin hour", false, "0-23"),
+  num("scrub_end_hour", "Scrub end hour", false, "0-23"),
+  f("nearfull_percent", "Nearfull ratio %", false, "85"),
 ];
 
 export const RESOURCES: Resource[] = [
@@ -1079,29 +1222,18 @@ export const RESOURCES: Resource[] = [
     terraform: ["kcore_ceph_cluster"],
     kctl: "get ceph-clusters",
     idField: "name",
-    fields: [
-      f("name", "Name", true),
-      f("public_network", "Public network", true),
-      f("cluster_network", "Cluster network"),
-      f("fsid", "FSID"),
-      num("size", "Size"),
-      num("min_size", "Min size"),
-      list("nodes", "Nodes and OSD devices", true),
-      bool("encrypt_osds", "Encrypt OSDs"),
-      bool("force_wipe", "Wipe OSD devices"),
-    ],
+    refreshMs: 15000,
+    fields: [f("name", "Name", true), ...cephFields],
     checks: ["plan"],
-    list: async () => rowsOf(await controller.listCephClusters({}), "ceph_clusters").map(flatten),
+    list: async () => rowsOf(await controller.listCephClusters({}), "ceph_clusters").map(cephClusterRow),
     create: async (v) => ok(await controller.createCephCluster({ cephCluster: cephCluster(v) })),
     inspect: async (key) => {
       const cluster = rowOf(await controller.getCephCluster({ name: key }));
       const row = (cluster.ceph_cluster ?? {}) as Row;
-      const detail: Row = { ...row };
-      try {
-        detail.capacity = rowOf(await controller.getCephClusterCapacity({ name: key }));
-      } catch (error) {
-        detail.capacity_error = (error as Error).message;
-      }
+      const [capacity, consumers] = await Promise.allSettled([controller.getCephClusterCapacity({ name: key }), cephConsumers(key)]);
+      const detail: Row = { ...row, ...(consumers.status === "fulfilled" ? consumers.value : {}) };
+      if (capacity.status === "fulfilled") detail.capacity = rowOf(capacity.value);
+      else detail.capacity_error = (capacity.reason as Error).message;
       return { detail, spec: cephForm(row) };
     },
     actions: [
@@ -1109,6 +1241,7 @@ export const RESOURCES: Resource[] = [
         const cluster = fromRow(v) ? (await controller.getCephCluster({ name: ident(v) })).cephCluster : cephCluster(v);
         return rowOf(await controller.planCephCluster({ cephCluster: cluster }));
       }),
+      act("update", "Update", true, cephFields, async (v) => ok(await controller.createCephCluster({ cephCluster: cephCluster(v) })), { preload: true }),
       act("credentials", "Set dashboard login", true, [f("url", "URL"), f("username", "Username", true), secret("password", "Password")], async (v) => {
         await controller.setCephDashboardCredentials({ name: ident(v), url: text(v, "url"), username: required(v, "username"), password: required(v, "password") });
         return { ok: true };
@@ -1139,7 +1272,10 @@ export const RESOURCES: Resource[] = [
           sharedFilesystem: { name: required(v, "name"), spec: { cephCluster: required(v, "ceph_cluster"), quotaBytes: bytes(v, "quota_bytes"), fsName: text(v, "fs_name") } },
         }),
       ),
-    inspect: async (key) => ({ detail: rowOf(await controller.getSharedFilesystem({ name: key })).shared_filesystem }),
+    inspect: async (key) => {
+      const row = (rowOf(await controller.getSharedFilesystem({ name: key })).shared_filesystem ?? {}) as Row;
+      return { detail: { ...row, ...(await cephMembersOf((row.spec as Row | undefined)?.ceph_cluster)) } };
+    },
     actions: [
       act("delete", "Delete", true, [], async (v) => {
         await controller.deleteSharedFilesystem({ name: ident(v) });
@@ -1298,7 +1434,10 @@ export const RESOURCES: Resource[] = [
           },
         }),
       ),
-    inspect: async (key) => ({ detail: rowOf(await controller.getObjectStore({ name: key })).object_store }),
+    inspect: async (key) => {
+      const row = (rowOf(await controller.getObjectStore({ name: key })).object_store ?? {}) as Row;
+      return { detail: { ...row, ...(await cephMembersOf((row.spec as Row | undefined)?.ceph_cluster)) } };
+    },
     actions: [
       act("add-user", "Add user", false, [f("user", "User name", true)], async (v): Promise<Reveal> => {
         const resp = await controller.createObjectUser({ objectUser: { name: required(v, "user"), spec: { store: ident(v) } } });

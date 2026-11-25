@@ -36,6 +36,19 @@ pub struct LocalProvisioner {
     /// "shared" or "lvm".
     #[serde(default)]
     pub mode: String,
+    /// When set, install Ceph CSI (RBD, and CephFS when `ceph_filesystem` is set).
+    #[serde(default)]
+    pub ceph_cluster: String,
+    /// Resolved from the CephCluster when the spec is applied, so rendering
+    /// needs no database.
+    #[serde(default)]
+    pub ceph_monitors: Vec<String>,
+    #[serde(default)]
+    pub ceph_pool: String,
+    /// CephFS filesystem name for CSI (`fsName`). Empty skips CephFS manifests.
+    /// Resolved from a SharedFilesystem on the same CephCluster when applied.
+    #[serde(default)]
+    pub ceph_filesystem: String,
 }
 
 impl LocalProvisioner {
@@ -45,7 +58,33 @@ impl LocalProvisioner {
             storage_class_name: String::new(),
             volumes: Vec::new(),
             mode: String::new(),
+            ceph_cluster: String::new(),
+            ceph_monitors: Vec::new(),
+            ceph_pool: String::new(),
+            ceph_filesystem: String::new(),
         }
+    }
+
+    /// A provisioner that is off but still names a CephCluster: only Ceph CSI
+    /// manifests are rendered (RBD, and CephFS when a filesystem name is set).
+    pub fn ceph_only(ceph_cluster: &str) -> Self {
+        Self {
+            ceph_cluster: ceph_cluster.trim().to_string(),
+            ..Self::disabled()
+        }
+    }
+
+    pub fn has_ceph(&self) -> bool {
+        !self.ceph_cluster.is_empty()
+    }
+
+    pub fn has_cephfs(&self) -> bool {
+        self.has_ceph() && !self.ceph_filesystem.trim().is_empty()
+    }
+
+    /// True when `manifests_at` renders anything.
+    pub fn renders_manifests(&self) -> bool {
+        (self.enabled && !self.is_lvm()) || self.has_ceph()
     }
 
     pub fn is_lvm(&self) -> bool {
@@ -79,7 +118,26 @@ pub fn normalize(
         return Ok(LocalProvisioner::disabled());
     }
     if volumes.is_empty() {
-        return Err("local provisioner requires at least one lvm or zfs volume".to_string());
+        // Enabled with no host volumes is only valid when a Ceph CSI class
+        // will be attached afterwards (ceph_cluster set by the caller).
+        return Ok(LocalProvisioner {
+            enabled: true,
+            storage_class_name: {
+                let name = storage_class_name.trim();
+                if name.is_empty() {
+                    "local-path".to_string()
+                } else {
+                    dns_label(name)?;
+                    name.to_string()
+                }
+            },
+            volumes: Vec::new(),
+            mode: String::new(),
+            ceph_cluster: String::new(),
+            ceph_monitors: Vec::new(),
+            ceph_pool: String::new(),
+            ceph_filesystem: String::new(),
+        });
     }
     let mode = match mode.trim() {
         "" | "shared" => "shared".to_string(),
@@ -220,11 +278,45 @@ pub fn normalize(
         storage_class_name,
         volumes: normalized,
         mode,
+        ceph_cluster: String::new(),
+        ceph_monitors: Vec::new(),
+        ceph_pool: String::new(),
+        ceph_filesystem: String::new(),
     })
 }
 
+/// Monitor addresses and RBD pool a Kubernetes cluster's CSI StorageClass
+/// uses for this CephCluster.
+pub fn ceph_endpoints(spec: &crate::controller_proto::CephClusterSpec) -> (Vec<String>, String) {
+    if let Some(ext) = crate::ceph_cluster_spec::active_external(spec) {
+        let monitors = ext
+            .mon_hosts
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .collect();
+        return (monitors, ext.pool.trim().to_string());
+    }
+    let monitors = spec
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                crate::ceph_cluster_spec::normalize_role(&n.role).as_str(),
+                "full" | "mon"
+            )
+        })
+        .filter_map(|n| {
+            let ip = n.mon_addr.split(':').next().unwrap_or("").trim();
+            (!ip.is_empty()).then(|| format!("{ip}:6789"))
+        })
+        .collect();
+    (monitors, "kcore-vms".to_string())
+}
+
 pub fn encode(provisioner: &LocalProvisioner) -> String {
-    if !provisioner.enabled {
+    if !provisioner.enabled && !provisioner.has_ceph() {
         return String::new();
     }
     serde_json::to_string(provisioner).unwrap_or_default()
@@ -257,6 +349,850 @@ pub fn manifests(provisioner: &LocalProvisioner) -> String {
 /// service dispatch. The provisioner then uses the host network and that
 /// endpoint instead of the ClusterIP, which nothing on the bridge answers.
 pub fn manifests_at(provisioner: &LocalProvisioner, api_server_endpoint: &str) -> String {
+    let mut out = local_path_manifests(provisioner, api_server_endpoint);
+    if let Some(rbd) = rbd_manifests(provisioner) {
+        if !out.is_empty() {
+            out.push_str("---\n");
+        }
+        out.push_str(&rbd);
+    }
+    if let Some(cephfs) = cephfs_manifests(provisioner, &provisioner.ceph_filesystem) {
+        if !out.is_empty() {
+            out.push_str("---\n");
+        }
+        out.push_str(&cephfs);
+    }
+    out
+}
+
+/// Name of the StorageClass that provisions RBD images.
+pub const RBD_STORAGE_CLASS: &str = "kcore-rbd";
+/// Name of the StorageClass that provisions CephFS subvolumes.
+pub const CEPHFS_STORAGE_CLASS: &str = "kcore-cephfs";
+pub const RBD_NAMESPACE: &str = "ceph-csi";
+pub const CEPH_CSI_NAMESPACE: &str = RBD_NAMESPACE;
+
+/// Pinned Ceph CSI plugin image (RBD and CephFS).
+pub const CEPH_CSI_IMAGE: &str = "quay.io/cephcsi/cephcsi:v3.13.1";
+
+/// JSON body for `csi-rbd-secret` / `csi-cephfs-secret` (applied via kube API, never Nix).
+pub fn csi_user_secret_json(name: &str, namespace: &str, user_id: &str, user_key: &str) -> String {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": { "name": name, "namespace": namespace },
+        "type": "Opaque",
+        "stringData": {
+            "userID": user_id,
+            "userKey": user_key,
+        }
+    })
+    .to_string()
+}
+
+/// Extract the `key = …` value from a cephx keyring body.
+pub fn cephx_key_from_keyring(keyring: &str) -> Option<String> {
+    for line in keyring.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("key") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let key = rest.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+const CSI_PROVISIONER_IMAGE: &str = "registry.k8s.io/sig-storage/csi-provisioner:v5.0.1";
+const CSI_ATTACHER_IMAGE: &str = "registry.k8s.io/sig-storage/csi-attacher:v4.6.1";
+const CSI_RESIZER_IMAGE: &str = "registry.k8s.io/sig-storage/csi-resizer:v1.11.1";
+const CSI_REGISTRAR_IMAGE: &str = "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.11.1";
+
+/// Ceph CSI Secrets (`csi-rbd-secret` / `csi-cephfs-secret`) are **not** rendered
+/// into these manifests: a cephx key must never land in the world-readable Nix
+/// store. The controller applies those Secrets via the kube API separately.
+///
+/// RBD CSI: Namespace, ConfigMaps, CSIDriver, StorageClass, RBAC, provisioner
+/// Deployment (`csi-rbdplugin-provisioner`), and node DaemonSet (`csi-rbdplugin`).
+pub fn rbd_manifests(provisioner: &LocalProvisioner) -> Option<String> {
+    if !provisioner.has_ceph() || provisioner.ceph_monitors.is_empty() {
+        return None;
+    }
+    let cluster = &provisioner.ceph_cluster;
+    let monitors = provisioner
+        .ceph_monitors
+        .iter()
+        .map(|m| format!("\"{m}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pool = if provisioner.ceph_pool.is_empty() {
+        "kcore-vms"
+    } else {
+        provisioner.ceph_pool.as_str()
+    };
+    let ns = CEPH_CSI_NAMESPACE;
+    Some(format!(
+        r#"apiVersion: v1
+kind: Namespace
+metadata:
+  name: {ns}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-csi-config
+  namespace: {ns}
+data:
+  config.json: |-
+    [{{"clusterID": "{cluster}", "monitors": [{monitors}]}}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-config
+  namespace: {ns}
+data:
+  ceph.conf: |
+    [global]
+    auth_cluster_required = cephx
+    auth_service_required = cephx
+    auth_client_required = cephx
+  keyring: |
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rbd-csi-provisioner
+  namespace: {ns}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rbd-csi-nodeplugin
+  namespace: {ns}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rbd-external-provisioner-runner
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "secrets", "configmaps", "serviceaccounts"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rbd-csi-provisioner-role
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rbd-external-provisioner-runner
+subjects:
+  - kind: ServiceAccount
+    name: rbd-csi-provisioner
+    namespace: {ns}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rbd-external-provisioner-cfg
+  namespace: {ns}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rbd-csi-provisioner-role-cfg
+  namespace: {ns}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rbd-external-provisioner-cfg
+subjects:
+  - kind: ServiceAccount
+    name: rbd-csi-provisioner
+    namespace: {ns}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rbd-csi-nodeplugin
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "secrets", "configmaps", "serviceaccounts", "persistentvolumes"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rbd-csi-nodeplugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rbd-csi-nodeplugin
+subjects:
+  - kind: ServiceAccount
+    name: rbd-csi-nodeplugin
+    namespace: {ns}
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: rbd.csi.ceph.com
+spec:
+  attachRequired: true
+  podInfoOnMount: false
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {class}
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: {cluster}
+  pool: {pool}
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: {ns}
+  csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: {ns}
+  csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: {ns}
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csi-rbdplugin-provisioner
+  namespace: {ns}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: csi-rbdplugin-provisioner
+  template:
+    metadata:
+      labels:
+        app: csi-rbdplugin-provisioner
+    spec:
+      serviceAccountName: rbd-csi-provisioner
+      containers:
+        - name: csi-provisioner
+          image: {provisioner_image}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--v=1"
+            - "--timeout=150s"
+            - "--leader-election=true"
+            - "--default-fstype=ext4"
+            - "--extra-create-metadata=true"
+          env:
+            - name: ADDRESS
+              value: unix:///csi/csi-provisioner.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-attacher
+          image: {attacher_image}
+          args:
+            - "--v=1"
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election=true"
+            - "--default-fstype=ext4"
+          env:
+            - name: ADDRESS
+              value: unix:///csi/csi-provisioner.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-resizer
+          image: {resizer_image}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--v=1"
+            - "--timeout=150s"
+            - "--leader-election"
+            - "--handle-volume-inuse-error=false"
+          env:
+            - name: ADDRESS
+              value: unix:///csi/csi-provisioner.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-rbdplugin
+          image: {csi_image}
+          args:
+            - "--nodeid=$(NODE_ID)"
+            - "--type=rbd"
+            - "--controllerserver=true"
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--v=5"
+            - "--drivername=rbd.csi.ceph.com"
+            - "--pidlimit=-1"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi-provisioner.sock
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: ceph-csi-config
+              mountPath: /etc/ceph-csi-config/
+            - name: ceph-config
+              mountPath: /etc/ceph/
+            - name: keys-tmp-dir
+              mountPath: /tmp/csi/keys
+      volumes:
+        - name: socket-dir
+          emptyDir:
+            medium: Memory
+        - name: ceph-csi-config
+          configMap:
+            name: ceph-csi-config
+        - name: ceph-config
+          configMap:
+            name: ceph-config
+        - name: keys-tmp-dir
+          emptyDir:
+            medium: Memory
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: csi-rbdplugin
+  namespace: {ns}
+spec:
+  selector:
+    matchLabels:
+      app: csi-rbdplugin
+  template:
+    metadata:
+      labels:
+        app: csi-rbdplugin
+    spec:
+      serviceAccountName: rbd-csi-nodeplugin
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: driver-registrar
+          image: {registrar_image}
+          args:
+            - "--v=1"
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/rbd.csi.ceph.com/csi.sock"
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: csi-rbdplugin
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          image: {csi_image}
+          args:
+            - "--nodeid=$(NODE_ID)"
+            - "--pluginpath=/var/lib/kubelet/plugins"
+            - "--stagingpath=/var/lib/kubelet/plugins/kubernetes.io/csi/"
+            - "--type=rbd"
+            - "--nodeserver=true"
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--v=5"
+            - "--drivername=rbd.csi.ceph.com"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: host-dev
+              mountPath: /dev
+            - name: host-sys
+              mountPath: /sys
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+            - name: ceph-csi-config
+              mountPath: /etc/ceph-csi-config/
+            - name: ceph-config
+              mountPath: /etc/ceph/
+            - name: plugin-dir
+              mountPath: /var/lib/kubelet/plugins
+              mountPropagation: Bidirectional
+            - name: mountpoint-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: keys-tmp-dir
+              mountPath: /tmp/csi/keys
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/rbd.csi.ceph.com
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins
+            type: Directory
+        - name: mountpoint-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: DirectoryOrCreate
+        - name: host-dev
+          hostPath:
+            path: /dev
+        - name: host-sys
+          hostPath:
+            path: /sys
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: ceph-csi-config
+          configMap:
+            name: ceph-csi-config
+        - name: ceph-config
+          configMap:
+            name: ceph-config
+        - name: keys-tmp-dir
+          emptyDir:
+            medium: Memory
+"#,
+        class = RBD_STORAGE_CLASS,
+        csi_image = CEPH_CSI_IMAGE,
+        provisioner_image = CSI_PROVISIONER_IMAGE,
+        attacher_image = CSI_ATTACHER_IMAGE,
+        resizer_image = CSI_RESIZER_IMAGE,
+        registrar_image = CSI_REGISTRAR_IMAGE,
+    ))
+}
+
+/// CephFS CSI manifests for `cephfs.csi.ceph.com` / StorageClass `kcore-cephfs`.
+///
+/// Like RBD, this never embeds cephx key material. The controller applies
+/// `csi-cephfs-secret` in namespace `ceph-csi` via the kube API separately.
+pub fn cephfs_manifests(provisioner: &LocalProvisioner, fs_name: &str) -> Option<String> {
+    let fs_name = fs_name.trim();
+    if !provisioner.has_ceph() || provisioner.ceph_monitors.is_empty() || fs_name.is_empty() {
+        return None;
+    }
+    let cluster = &provisioner.ceph_cluster;
+    let ns = CEPH_CSI_NAMESPACE;
+    Some(format!(
+        r#"apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cephfs-csi-provisioner
+  namespace: {ns}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cephfs-csi-nodeplugin
+  namespace: {ns}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cephfs-external-provisioner-runner
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "secrets", "configmaps", "serviceaccounts"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cephfs-csi-provisioner-role
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cephfs-external-provisioner-runner
+subjects:
+  - kind: ServiceAccount
+    name: cephfs-csi-provisioner
+    namespace: {ns}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cephfs-external-provisioner-cfg
+  namespace: {ns}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cephfs-csi-provisioner-role-cfg
+  namespace: {ns}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cephfs-external-provisioner-cfg
+subjects:
+  - kind: ServiceAccount
+    name: cephfs-csi-provisioner
+    namespace: {ns}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cephfs-csi-nodeplugin
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "secrets", "configmaps", "serviceaccounts"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cephfs-csi-nodeplugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cephfs-csi-nodeplugin
+subjects:
+  - kind: ServiceAccount
+    name: cephfs-csi-nodeplugin
+    namespace: {ns}
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: cephfs.csi.ceph.com
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  fsGroupPolicy: File
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {class}
+provisioner: cephfs.csi.ceph.com
+parameters:
+  clusterID: {cluster}
+  fsName: {fs_name}
+  csi.storage.k8s.io/provisioner-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: {ns}
+  csi.storage.k8s.io/controller-expand-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: {ns}
+  csi.storage.k8s.io/node-stage-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: {ns}
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csi-cephfsplugin-provisioner
+  namespace: {ns}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: csi-cephfsplugin-provisioner
+  template:
+    metadata:
+      labels:
+        app: csi-cephfsplugin-provisioner
+    spec:
+      serviceAccountName: cephfs-csi-provisioner
+      containers:
+        - name: csi-provisioner
+          image: {provisioner_image}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--v=1"
+            - "--timeout=150s"
+            - "--leader-election=true"
+            - "--extra-create-metadata=true"
+          env:
+            - name: ADDRESS
+              value: unix:///csi/csi-provisioner.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-resizer
+          image: {resizer_image}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--v=1"
+            - "--timeout=150s"
+            - "--leader-election"
+            - "--handle-volume-inuse-error=false"
+          env:
+            - name: ADDRESS
+              value: unix:///csi/csi-provisioner.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-cephfsplugin
+          image: {csi_image}
+          args:
+            - "--nodeid=$(NODE_ID)"
+            - "--type=cephfs"
+            - "--controllerserver=true"
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--v=5"
+            - "--drivername=cephfs.csi.ceph.com"
+            - "--pidlimit=-1"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi-provisioner.sock
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: ceph-csi-config
+              mountPath: /etc/ceph-csi-config/
+            - name: ceph-config
+              mountPath: /etc/ceph/
+            - name: keys-tmp-dir
+              mountPath: /tmp/csi/keys
+      volumes:
+        - name: socket-dir
+          emptyDir:
+            medium: Memory
+        - name: ceph-csi-config
+          configMap:
+            name: ceph-csi-config
+        - name: ceph-config
+          configMap:
+            name: ceph-config
+        - name: keys-tmp-dir
+          emptyDir:
+            medium: Memory
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: csi-cephfsplugin
+  namespace: {ns}
+spec:
+  selector:
+    matchLabels:
+      app: csi-cephfsplugin
+  template:
+    metadata:
+      labels:
+        app: csi-cephfsplugin
+    spec:
+      serviceAccountName: cephfs-csi-nodeplugin
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: driver-registrar
+          image: {registrar_image}
+          args:
+            - "--v=1"
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/cephfs.csi.ceph.com/csi.sock"
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: csi-cephfsplugin
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          image: {csi_image}
+          args:
+            - "--nodeid=$(NODE_ID)"
+            - "--type=cephfs"
+            - "--nodeserver=true"
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--v=5"
+            - "--drivername=cephfs.csi.ceph.com"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: mountpoint-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: plugin-dir
+              mountPath: /var/lib/kubelet/plugins
+              mountPropagation: Bidirectional
+            - name: host-sys
+              mountPath: /sys
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+            - name: host-dev
+              mountPath: /dev
+            - name: ceph-csi-config
+              mountPath: /etc/ceph-csi-config/
+            - name: ceph-config
+              mountPath: /etc/ceph/
+            - name: keys-tmp-dir
+              mountPath: /tmp/csi/keys
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/cephfs.csi.ceph.com/
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: mountpoint-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: DirectoryOrCreate
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: host-dev
+          hostPath:
+            path: /dev
+        - name: ceph-csi-config
+          configMap:
+            name: ceph-csi-config
+        - name: ceph-config
+          configMap:
+            name: ceph-config
+        - name: keys-tmp-dir
+          emptyDir:
+            medium: Memory
+"#,
+        class = CEPHFS_STORAGE_CLASS,
+        csi_image = CEPH_CSI_IMAGE,
+        provisioner_image = CSI_PROVISIONER_IMAGE,
+        resizer_image = CSI_RESIZER_IMAGE,
+        registrar_image = CSI_REGISTRAR_IMAGE,
+    ))
+}
+
+fn local_path_manifests(provisioner: &LocalProvisioner, api_server_endpoint: &str) -> String {
     if !provisioner.enabled {
         return String::new();
     }
@@ -703,5 +1639,79 @@ mod tests {
         mounted.mount_path = "/mnt/kcore/lab/kcore-kdata";
         let err = normalize("lab", &members(), true, "kcore-lvm", "lvm", &[mounted]).unwrap_err();
         assert!(err.contains("not mounted"));
+    }
+
+    #[test]
+    fn a_ceph_cluster_adds_an_rbd_storage_class_and_keeps_local_path() {
+        let mut provisioner = normalize(
+            "lab",
+            &members(),
+            true,
+            "",
+            "",
+            &[volume("kcore-kdata", "node-105", "lvm", 1 << 30)],
+        )
+        .unwrap();
+        assert!(rbd_manifests(&provisioner).is_none());
+        provisioner.ceph_cluster = "kcore-san".into();
+        provisioner.ceph_monitors = vec!["192.168.47.2:6789".into(), "192.168.47.3:6789".into()];
+        let yaml = manifests_at(&provisioner, "");
+        assert!(yaml.contains("rancher.io/local-path"));
+        assert!(yaml.contains("provisioner: rbd.csi.ceph.com"));
+        assert!(yaml.contains("rbd.csi.ceph.com"));
+        assert!(yaml.contains("kind: Deployment"));
+        assert!(yaml.contains("kind: DaemonSet"));
+        assert!(yaml.contains("name: csi-rbdplugin-provisioner"));
+        assert!(yaml.contains("name: csi-rbdplugin"));
+        assert!(yaml.contains(CEPH_CSI_IMAGE));
+        assert!(yaml.contains("\"monitors\": [\"192.168.47.2:6789\", \"192.168.47.3:6789\"]"));
+        assert!(yaml.contains("clusterID: kcore-san"));
+        assert!(yaml.contains("csi-rbd-secret"));
+        assert!(!yaml.contains("userKey"));
+        assert!(!yaml.contains("userID"));
+        assert!(cephfs_manifests(&provisioner, "").is_none());
+        assert!(!yaml.contains("cephfs.csi.ceph.com"));
+    }
+
+    #[test]
+    fn a_ceph_only_provisioner_renders_just_rbd_and_survives_encoding() {
+        let mut provisioner = LocalProvisioner::ceph_only("kcore-san");
+        provisioner.ceph_monitors = vec!["10.0.0.1:6789".into()];
+        provisioner.ceph_pool = "kcore-vms".into();
+        assert!(provisioner.renders_manifests());
+        let yaml = manifests_at(&provisioner, "");
+        assert!(!yaml.contains("local-path"));
+        assert!(yaml.contains("name: kcore-rbd"));
+        assert!(yaml.contains("kind: Deployment"));
+        assert!(yaml.contains("kind: DaemonSet"));
+        let back = decode(&encode(&provisioner)).unwrap();
+        assert_eq!(back, provisioner);
+        assert_eq!(encode(&LocalProvisioner::disabled()), "");
+    }
+
+    #[test]
+    fn cephfs_renders_when_filesystem_name_is_set() {
+        let mut provisioner = LocalProvisioner::ceph_only("kcore-san");
+        provisioner.ceph_monitors = vec!["10.0.0.1:6789".into()];
+        provisioner.ceph_filesystem = "lab-fs".into();
+        let cephfs = cephfs_manifests(&provisioner, "lab-fs").unwrap();
+        assert!(cephfs.contains("cephfs.csi.ceph.com"));
+        assert!(cephfs.contains("name: kcore-cephfs"));
+        assert!(cephfs.contains("fsName: lab-fs"));
+        assert!(cephfs.contains("kind: Deployment"));
+        assert!(cephfs.contains("kind: DaemonSet"));
+        assert!(cephfs.contains("name: csi-cephfsplugin-provisioner"));
+        assert!(cephfs.contains("name: csi-cephfsplugin"));
+        assert!(cephfs.contains("csi-cephfs-secret"));
+        assert!(cephfs.contains(CEPH_CSI_IMAGE));
+        assert!(!cephfs.contains("userKey"));
+        assert!(!cephfs.contains("userID"));
+
+        let yaml = manifests_at(&provisioner, "");
+        assert!(yaml.contains("rbd.csi.ceph.com"));
+        assert!(yaml.contains("cephfs.csi.ceph.com"));
+        assert!(yaml.contains("name: kcore-cephfs"));
+        assert!(yaml.contains("kind: Deployment"));
+        assert!(yaml.contains("kind: DaemonSet"));
     }
 }

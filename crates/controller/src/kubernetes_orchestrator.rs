@@ -1142,6 +1142,9 @@ impl KubernetesOrchestrator {
             if let Err(e) = self.refresh_node_readiness(cluster_name).await {
                 info!(cluster = cluster_name, error = %e, "node readiness refresh failed");
             }
+            if let Err(e) = self.ensure_ceph_csi_secrets(cluster_name).await {
+                info!(cluster = cluster_name, error = %e, "ceph CSI secret apply failed");
+            }
             return Ok(());
         }
         if crate::kubernetes_lifecycle::promotion_blocked(&cluster.phase, &cluster.status_message) {
@@ -1180,6 +1183,86 @@ impl KubernetesOrchestrator {
             control_planes,
             "recorded kubernetes cluster ready"
         );
+        if let Err(e) = self.ensure_ceph_csi_secrets(cluster_name).await {
+            info!(cluster = cluster_name, error = %e, "ceph CSI secret apply failed");
+        }
+        Ok(())
+    }
+
+    /// Fetch client.kcore and apply CSI Secrets via the kube API (not Nix).
+    async fn ensure_ceph_csi_secrets(&self, cluster_name: &str) -> Result<()> {
+        let Some(cfg) = self.db.get_kubernetes_cluster_config(cluster_name)? else {
+            return Ok(());
+        };
+        let provisioner = crate::kubernetes_local::decode(&cfg.local_provisioner_json)
+            .unwrap_or_else(|_| crate::kubernetes_local::LocalProvisioner::disabled());
+        if !provisioner.has_ceph() {
+            return Ok(());
+        }
+        let ceph_name = provisioner.ceph_cluster.clone();
+        let ceph_row = self
+            .db
+            .get_ceph_cluster(&ceph_name)?
+            .context("CephCluster for CSI missing")?;
+        let ceph_spec = crate::ceph_cluster_spec::spec_from_json(&ceph_row.spec_json)
+            .context("decode CephCluster")?;
+        let member = ceph_spec
+            .nodes
+            .first()
+            .context("CephCluster has no members")?;
+        let mut admin = crate::ceph_cluster_reconciler::admin_for(
+            &self.db,
+            &self.node_clients,
+            &member.node_id,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let key_resp = admin
+            .ensure_ceph_client_key(tonic::Request::new(
+                crate::node_proto::EnsureCephClientKeyRequest {
+                    client_name: "client.kcore".into(),
+                    pool: if provisioner.ceph_pool.is_empty() {
+                        "kcore-vms".into()
+                    } else {
+                        provisioner.ceph_pool.clone()
+                    },
+                },
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("EnsureCephClientKey: {e}"))?
+            .into_inner();
+        let user_key = crate::kubernetes_local::cephx_key_from_keyring(&key_resp.keyring)
+            .context("client.kcore keyring has no key=")?;
+        let cp = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)?
+            .into_iter()
+            .find(|n| n.role == "control-plane" && !n.pending_removal)
+            .context("no control-plane for CSI secret")?;
+        let node = self
+            .db
+            .get_node(&cp.node_id)?
+            .context("control-plane node missing")?;
+        crate::kubernetes_admin::upsert_ceph_csi_secret(
+            &self.node_clients,
+            &node.address,
+            "csi-rbd-secret",
+            "kcore",
+            &user_key,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        if provisioner.has_cephfs() {
+            crate::kubernetes_admin::upsert_ceph_csi_secret(
+                &self.node_clients,
+                &node.address,
+                "csi-cephfs-secret",
+                "kcore",
+                &user_key,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        }
         Ok(())
     }
 
@@ -2323,7 +2406,7 @@ fn control_planes_take_workloads(
 fn applied_provisioner_manifest(json: &str, api_server_endpoint: &str) -> String {
     let provisioner = crate::kubernetes_local::decode(json)
         .unwrap_or_else(|_| crate::kubernetes_local::LocalProvisioner::disabled());
-    if !provisioner.enabled || provisioner.is_lvm() {
+    if !provisioner.renders_manifests() {
         String::new()
     } else {
         crate::kubernetes_local::manifests_at(&provisioner, api_server_endpoint)

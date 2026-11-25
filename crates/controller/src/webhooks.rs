@@ -45,6 +45,7 @@ pub const EVENT_INGRESS_WAF_BLOCKED: &str = "ingress.waf.blocked";
 pub const EVENT_INGRESS_WAF_DETECTED: &str = "ingress.waf.detected";
 pub const EVENT_INGRESS_VIP_MOVED: &str = "ingress.vip.moved";
 pub const EVENT_POSTGRESQL_FAILOVER: &str = "postgresql.failover";
+pub const EVENT_CEPH_HEALTH: &str = "ceph.health";
 
 pub const KNOWN_EVENTS: &[&str] = &[
     EVENT_NODE_HEARTBEAT_MISSED,
@@ -61,6 +62,7 @@ pub const KNOWN_EVENTS: &[&str] = &[
     EVENT_INGRESS_WAF_DETECTED,
     EVENT_INGRESS_VIP_MOVED,
     EVENT_POSTGRESQL_FAILOVER,
+    EVENT_CEPH_HEALTH,
 ];
 
 const QUEUE_CAPACITY: usize = 256;

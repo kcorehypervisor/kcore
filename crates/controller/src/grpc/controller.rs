@@ -1,5 +1,6 @@
 mod ingress;
 mod postgresql;
+mod volume_move_rpc;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -1894,11 +1895,29 @@ impl ControllerService {
                 return HashSet::new();
             }
         };
-        clusters
+        let specs: Vec<_> = clusters
             .into_iter()
             .filter_map(|c| ceph_cluster_spec::spec_from_json(&c.spec_json).ok())
-            .flat_map(|s| s.nodes.into_iter().map(|n| n.node_id))
-            .collect()
+            .collect();
+        let mut ids: HashSet<String> = specs
+            .iter()
+            .flat_map(|s| s.nodes.iter().map(|n| n.node_id.clone()))
+            .collect();
+        if specs
+            .iter()
+            .any(|s| ceph_cluster_spec::active_external(s).is_some())
+        {
+            // Every approved node is a client of an external cluster.
+            ids.extend(
+                self.db
+                    .list_nodes()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|n| n.approval_status == "approved")
+                    .map(|n| n.id),
+            );
+        }
+        ids
     }
 
     pub(crate) fn node_supports_backend(&self, node: &NodeRow, backend: &str) -> bool {
@@ -1922,13 +1941,16 @@ impl ControllerService {
         };
         let spec = ceph_cluster_spec::spec_from_json(&cluster.spec_json)
             .map_err(|e| Status::internal(format!("decode ceph cluster spec: {e}")))?;
+        let external = ceph_cluster_spec::active_external(&spec).is_some();
         let members: HashSet<String> = spec.nodes.into_iter().map(|n| n.node_id).collect();
         let mut names: Vec<String> = self
             .db
             .list_vms()
             .map_err(|e| Status::internal(e.to_string()))?
             .into_iter()
-            .filter(|vm| vm.storage_backend == "ceph" && members.contains(&vm.node_id))
+            .filter(|vm| {
+                vm.storage_backend == "ceph" && (external || members.contains(&vm.node_id))
+            })
             .map(|vm| vm.name)
             .collect();
         names.sort();
@@ -1951,8 +1973,17 @@ impl ControllerService {
             if status.phase != "healthy" {
                 continue;
             }
+            let external_client = |s: &controller_proto::CephClusterSpec| {
+                ceph_cluster_spec::active_external(s).is_some()
+                    && self
+                        .db
+                        .get_node(node_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|n| n.approval_status == "approved")
+            };
             let member = ceph_cluster_spec::spec_from_json(&cluster.spec_json)
-                .map(|s| s.nodes.iter().any(|n| n.node_id == node_id))
+                .map(|s| s.nodes.iter().any(|n| n.node_id == node_id) || external_client(&s))
                 .unwrap_or(false);
             if member {
                 return Ok(true);
@@ -2033,6 +2064,9 @@ impl ControllerService {
             encrypted: vol.encrypted,
             mount_point: vol.mount_point.clone(),
             fs_type: vol.fs_type.clone(),
+            rbd_namespace: String::new(),
+            qos_iops: 0,
+            qos_bps: 0,
         }
     }
 
@@ -3455,6 +3489,18 @@ impl ControllerService {
         runtime_name: &str,
         dest_host: &str,
     ) -> Result<LiveMigrateOutcome, LiveMigrateFailure> {
+        // virtio-fs (CephFS) mounts are cold-migrate only.
+        if let Ok(vols) = self.db.list_attached_volumes_for_vm(&vm.id) {
+            if vols.iter().any(|v| v.role == VolumeRow::ROLE_FILESYSTEM) {
+                return Err(LiveMigrateFailure {
+                    send_succeeded: false,
+                    status: Status::failed_precondition(
+                        "live migrate refuses VMs with virtio-fs (CephFS) mounts; stop the guest and cold-migrate",
+                    ),
+                    operation_id: String::new(),
+                });
+            }
+        }
         // A local-disk move records MirrorSyncing/Copying before calling in.
         // That row is this attempt, not a conflict.
         let local_disk = volume.is_none();
@@ -5218,6 +5264,69 @@ impl ControllerService {
             .ok_or_else(|| Status::unavailable(format!("no connection to node {}", node.address)))
     }
 
+    /// Refuse when a ClusterUpdate is mid-rollout on any member of `spec`.
+    fn refuse_if_ceph_members_mid_rollout(
+        &self,
+        spec: &controller_proto::CephClusterSpec,
+    ) -> Result<(), Status> {
+        let member_ids: std::collections::HashSet<&str> =
+            spec.nodes.iter().map(|n| n.node_id.as_str()).collect();
+        let updates = self
+            .db
+            .list_cluster_updates()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        for update in updates {
+            if !matches!(
+                update.phase.as_str(),
+                "rolling_out" | "rolling_back" | "ready"
+            ) {
+                continue;
+            }
+            let nodes = self
+                .db
+                .list_cluster_update_nodes(&update.name)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            for node in nodes {
+                if member_ids.contains(node.node_id.as_str())
+                    && crate::ceph_update_gate::in_flight(&node.phase)
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "cluster update '{}' has Ceph member '{}' mid-rollout ({}); wait until it finishes",
+                        update.name, node.node_id, node.phase
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Dial any registered CephCluster member that answers.
+    async fn admin_for_any_ceph_member(
+        &self,
+    ) -> Result<
+        node_proto::node_admin_client::NodeAdminClient<crate::node_client::NodeChannel>,
+        String,
+    > {
+        let clusters = self.db.list_ceph_clusters().map_err(|e| e.to_string())?;
+        let mut last = "no CephCluster members registered".to_string();
+        for cluster in clusters {
+            let Ok(spec) = ceph_cluster_spec::spec_from_json(&cluster.spec_json) else {
+                continue;
+            };
+            for member in &spec.nodes {
+                let Ok(Some(node)) = self.db.get_node(&member.node_id) else {
+                    last = format!("member {} is not registered", member.node_id);
+                    continue;
+                };
+                match self.ensure_admin_client_for_node(&node).await {
+                    Ok(admin) => return Ok(admin),
+                    Err(e) => last = format!("{}: {e}", member.node_id),
+                }
+            }
+        }
+        Err(last)
+    }
+
     /// Health as a surviving member reports it, for deciding whether a host
     /// may leave. `None` when no survivor answered.
     async fn ceph_health_via_survivor(
@@ -5294,6 +5403,8 @@ impl ControllerService {
         let cluster_issues = removal.issues;
         let mut node_results = Vec::new();
         let mon_map = crate::ceph_cluster_reconciler::mon_map_string(spec);
+        let service_flags = crate::ceph_cluster_reconciler::ceph_service_flags(&self.db, name)
+            .map_err(Status::internal)?;
         for (index, node) in spec.nodes.iter().enumerate() {
             let Some(node_row) = self
                 .db
@@ -5309,8 +5420,13 @@ impl ControllerService {
             };
             let daemon_id =
                 crate::ceph_cluster_reconciler::sanitize_daemon_id(&node.node_id, index);
-            let ceph_nix =
-                crate::ceph_cluster_reconciler::generate_ceph_nix(spec, node, &daemon_id, &mon_map);
+            let ceph_nix = crate::ceph_cluster_reconciler::generate_ceph_nix(
+                spec,
+                node,
+                &daemon_id,
+                &mon_map,
+                &service_flags.extras_for(spec, node),
+            );
             let devices = ceph_cluster_spec::osd_devices(node);
             let mut admin = match self.ensure_admin_client_for_node(&node_row).await {
                 Ok(c) => c,
@@ -6280,31 +6396,189 @@ fn slurm_cluster_to_proto(
     })
 }
 
+fn typed_health_from_status_json(raw: &str) -> Option<controller_proto::CephTypedHealth> {
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    // Keep the parser next to the node agent; duplicate the small mapping here
+    // so the controller does not depend on node-agent crates.
+    let health_status = json
+        .pointer("/health/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if health_status.is_empty() && raw.trim().is_empty() {
+        return None;
+    }
+    let mon_quorum: Vec<String> = json
+        .get("quorum_names")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mon_count = json
+        .pointer("/monmap/num_mons")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(mon_quorum.len() as i64) as i32;
+    let osd_total = json
+        .pointer("/osdmap/num_osds")
+        .or_else(|| json.pointer("/osdmap/osdmap/num_osds"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let osd_up = json
+        .pointer("/osdmap/num_up_osds")
+        .or_else(|| json.pointer("/osdmap/osdmap/num_up_osds"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let osd_in = json
+        .pointer("/osdmap/num_in_osds")
+        .or_else(|| json.pointer("/osdmap/osdmap/num_in_osds"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let pgs_total = json
+        .pointer("/pgmap/num_pgs")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let mut pgs_by_state = Vec::new();
+    let mut pgs_not_clean = 0;
+    let mut backfill_pgs = 0;
+    if let Some(states) = json
+        .pointer("/pgmap/pgs_by_state")
+        .and_then(|v| v.as_array())
+    {
+        for s in states {
+            let Some(state) = s.get("state_name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let count = s.get("count").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            if state != "active+clean" {
+                pgs_not_clean += count;
+            }
+            if state.contains("backfill") {
+                backfill_pgs += count;
+            }
+            pgs_by_state.push(controller_proto::CephPgStateCount {
+                state: state.to_string(),
+                count,
+            });
+        }
+    }
+    let mut flags = Vec::new();
+    for pointer in ["/osdmap/flags", "/osdmap/flags_set", "/osdmap/osdmap/flags"] {
+        match json.pointer(pointer) {
+            Some(serde_json::Value::Array(items)) => {
+                flags.extend(items.iter().filter_map(|f| f.as_str()).map(str::to_string));
+            }
+            Some(serde_json::Value::String(text)) => {
+                flags.extend(
+                    text.split([',', ' '])
+                        .filter(|f| !f.is_empty())
+                        .map(str::to_string),
+                );
+            }
+            _ => {}
+        }
+    }
+    flags.sort();
+    flags.dedup();
+    let noout = flags.iter().any(|f| f == "noout");
+    let norebalance = flags.iter().any(|f| f == "norebalance");
+    let mut checks = Vec::new();
+    if let Some(obj) = json.pointer("/health/checks").and_then(|c| c.as_object()) {
+        let mut names: Vec<&String> = obj.keys().collect();
+        names.sort();
+        for name in names {
+            let severity = obj[name]
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let summary = obj[name]
+                .pointer("/summary/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            if summary.is_empty() {
+                continue;
+            }
+            checks.push(controller_proto::CephHealthCheck {
+                severity,
+                r#type: name.clone(),
+                summary,
+            });
+        }
+    }
+    Some(controller_proto::CephTypedHealth {
+        health_status,
+        mon_quorum,
+        mon_count,
+        osd_total,
+        osd_up,
+        osd_in,
+        pgs_total,
+        pgs_by_state,
+        noout,
+        norebalance,
+        flags,
+        checks,
+        bytes_total: json
+            .pointer("/pgmap/bytes_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        bytes_used: json
+            .pointer("/pgmap/bytes_used")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        bytes_avail: json
+            .pointer("/pgmap/bytes_avail")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        pgs_not_clean,
+        backfill_pgs,
+    })
+}
+
 fn ceph_cluster_to_proto(
     row: &CephClusterRow,
     status: Option<CephClusterStatusRow>,
 ) -> Result<controller_proto::CephCluster, Status> {
-    let status = status.map(|s| controller_proto::CephClusterStatus {
-        observed_generation: s.observed_generation,
-        phase: match s.phase.as_str() {
-            "pending" => controller_proto::CephClusterPhase::Pending as i32,
-            "bootstrapping" => controller_proto::CephClusterPhase::Bootstrapping as i32,
-            "healthy" => controller_proto::CephClusterPhase::Healthy as i32,
-            "degraded" => controller_proto::CephClusterPhase::Degraded as i32,
-            "failed" => controller_proto::CephClusterPhase::Failed as i32,
-            _ => controller_proto::CephClusterPhase::Unspecified as i32,
-        },
-        health_message: s.health_message,
-        ceph_status_json: s.ceph_status_json,
-        last_transition_at: parse_datetime_to_timestamp(&s.last_transition_at),
+    let mut spec = ceph_cluster_spec::spec_from_json(&row.spec_json)
+        .map_err(|e| Status::internal(format!("decode ceph spec: {e}")))?;
+    if let Some(ext) = spec.external.as_mut() {
+        // Never return the keyring on get/list.
+        ext.client_keyring.clear();
+    }
+    let status = status.map(|s| {
+        let typed_health = typed_health_from_status_json(&s.ceph_status_json);
+        controller_proto::CephClusterStatus {
+            observed_generation: s.observed_generation,
+            phase: match s.phase.as_str() {
+                "pending" => controller_proto::CephClusterPhase::Pending as i32,
+                "bootstrapping" => controller_proto::CephClusterPhase::Bootstrapping as i32,
+                "healthy" => controller_proto::CephClusterPhase::Healthy as i32,
+                "degraded" => controller_proto::CephClusterPhase::Degraded as i32,
+                "failed" => controller_proto::CephClusterPhase::Failed as i32,
+                _ => controller_proto::CephClusterPhase::Unspecified as i32,
+            },
+            health_message: s.health_message.clone(),
+            ceph_status_json: s.ceph_status_json,
+            last_transition_at: parse_datetime_to_timestamp(&s.last_transition_at),
+            typed_health,
+            operation_message: if s.health_message.starts_with("removing ")
+                || s.health_message.contains("active+clean")
+                || s.health_message.contains("backfill")
+            {
+                s.health_message
+            } else {
+                String::new()
+            },
+        }
     });
     Ok(controller_proto::CephCluster {
         name: row.name.clone(),
         generation: row.generation,
-        spec: Some(
-            ceph_cluster_spec::spec_from_json(&row.spec_json)
-                .map_err(|e| Status::internal(format!("decode ceph spec: {e}")))?,
-        ),
+        spec: Some(spec),
         status,
         created_at: parse_datetime_to_timestamp(&row.created_at),
         updated_at: parse_datetime_to_timestamp(&row.updated_at),
@@ -7999,6 +8273,165 @@ impl ControllerService {
         }))
     }
 
+    /// Node and pool that hold a new Ceph volume. An empty `cluster` is any
+    /// healthy member. A named cluster must be managed and healthy: node
+    /// storage writes into one default pool, so an external pool is refused.
+    async fn ceph_volume_target(&self, cluster: &str) -> Result<(NodeRow, String), Status> {
+        let cluster = cluster.trim();
+        if cluster.is_empty() {
+            let node = self
+                .pick_healthy_ceph_node()
+                .await
+                .map_err(Status::failed_precondition)?;
+            return Ok((node, "kcore-vms".to_string()));
+        }
+        let row = self
+            .db
+            .get_ceph_cluster(cluster)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("CephCluster '{cluster}' not found")))?;
+        let spec = ceph_cluster_spec::spec_from_json(&row.spec_json)
+            .map_err(|e| Status::internal(format!("CephCluster '{cluster}' spec: {e}")))?;
+        if ceph_cluster_spec::active_external(&spec).is_some() {
+            return Err(Status::failed_precondition(format!(
+                "CephCluster '{cluster}' is external; node storage writes into the default pool, \
+                 so volumes cannot be created in the external pool yet"
+            )));
+        }
+        let healthy = self
+            .db
+            .get_ceph_cluster_status(cluster)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_some_and(|s| s.phase == "healthy");
+        if !healthy {
+            return Err(Status::failed_precondition(format!(
+                "CephCluster '{cluster}' is not healthy"
+            )));
+        }
+        for member in &spec.nodes {
+            let Ok(Some(node)) = self.db.get_node(&member.node_id) else {
+                continue;
+            };
+            if crate::volume_export::node_ready(&node).is_ok() {
+                return Ok((node, "kcore-vms".to_string()));
+            }
+        }
+        Err(Status::failed_precondition(format!(
+            "CephCluster '{cluster}' has no ready member node"
+        )))
+    }
+
+    /// Stream every block of an exposed snapshot into `dest_handle` (an RBD
+    /// `pool/image`) without leaving the controller. A read error after the
+    /// first block fails the copy: the write stream would otherwise end
+    /// cleanly on a short image.
+    async fn stream_lease_into_ceph(
+        &self,
+        lease: &crate::volume_export::ExportLease,
+        dest_node: &NodeRow,
+        dest_handle: &str,
+    ) -> Result<node_proto::WriteVolumeExtentsResponse, Status> {
+        if self.clients.get_storage(&lease.node_address).is_none() {
+            let _ = self.clients.connect(&lease.node_address).await;
+        }
+        let mut source = self
+            .clients
+            .get_storage(&lease.node_address)
+            .ok_or_else(|| Status::unavailable("source storage client unavailable"))?;
+        let mut reads = source
+            .read_volume_extents(node_proto::ReadVolumeExtentsRequest {
+                lease_id: lease.lease_id.clone(),
+                extents: Vec::new(),
+                block_size: 4 * 1024 * 1024,
+                elide_zero_blocks: true,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("read snapshot: {e}")))?
+            .into_inner();
+        let mut dest = self.connect_node_storage(dest_node).await?;
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(node_proto::WriteVolumeExtentsRequest {
+            msg: Some(node_proto::write_volume_extents_request::Msg::Target(
+                node_proto::WriteVolumeTarget {
+                    backend_handle: dest_handle.to_string(),
+                    storage_class: "ceph".into(),
+                    punch_zero_runs: false,
+                },
+            )),
+        })
+        .await
+        .map_err(|_| Status::internal("failed to queue write target"))?;
+        let pump = tokio::spawn(async move {
+            loop {
+                match reads.message().await {
+                    Ok(Some(block)) => {
+                        let msg = node_proto::WriteVolumeExtentsRequest {
+                            msg: Some(node_proto::write_volume_extents_request::Msg::Block(block)),
+                        };
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(format!("read snapshot: {}", e.message())),
+                }
+            }
+        });
+        let written = dest
+            .write_volume_extents(ReceiverStream::new(rx))
+            .await
+            .map_err(|e| Status::internal(format!("write volume: {e}")));
+        match pump.await {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => return Err(Status::internal(msg)),
+            Err(e) => return Err(Status::internal(format!("copy task: {e}"))),
+        }
+        Ok(written?.into_inner())
+    }
+
+    /// Undo a failed copy or convert: release the lease, drop the half
+    /// written image, drop the snapshot this call made. Every step is best
+    /// effort; the error that got us here is the one the caller sees.
+    async fn abort_volume_transfer(
+        &self,
+        shell: &Request<()>,
+        lease_id: &str,
+        new_image: Option<(NodeRow, String)>,
+        snapshot: Option<&String>,
+    ) {
+        use controller_proto::controller_server::Controller as _;
+        if !lease_id.is_empty() {
+            let _ = self
+                .unexpose_volume_snapshot(Self::with_caller(
+                    shell,
+                    controller_proto::UnexposeVolumeSnapshotRequest {
+                        lease_id: lease_id.to_string(),
+                    },
+                ))
+                .await;
+        }
+        if let Some((node, handle)) = new_image {
+            if let Ok(mut storage) = self.connect_node_storage(&node).await {
+                if let Err(e) = storage
+                    .delete_volume(node_proto::DeleteVolumeRequest {
+                        backend_handle: handle.clone(),
+                    })
+                    .await
+                {
+                    warn!(%handle, error = %e, "could not remove the partial image");
+                }
+            }
+        }
+        if let Some(name) = snapshot {
+            let _ = self
+                .delete_volume_snapshot(Self::with_caller(
+                    shell,
+                    controller_proto::DeleteVolumeSnapshotRequest { name: name.clone() },
+                ))
+                .await;
+        }
+    }
+
     async fn host_volume_node(&self, vol: &VolumeRow) -> Result<NodeRow, Status> {
         if vol.host_node_id.is_empty() {
             return Err(Status::failed_precondition(
@@ -8215,10 +8648,21 @@ impl ControllerService {
                     "storage.filesystem '{}' does not exist",
                     spec.storage.filesystem
                 )),
-                Some(_) => blocking.push(
-                    "shared-filesystem mode is refused: the SharedFilesystem reconciler cannot issue a CephFS client key yet (see docs/cephfs-rgw.md); use nfs or none"
-                        .into(),
-                ),
+                Some(_) => {
+                    let phase = self
+                        .db
+                        .get_shared_filesystem_status(&spec.storage.filesystem)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.phase)
+                        .unwrap_or_default();
+                    if phase != "healthy" {
+                        warnings.push(format!(
+                            "SharedFilesystem '{}' phase is '{phase}'; mounts may wait until it is healthy (see docs/cephfs-rgw.md)",
+                            spec.storage.filesystem
+                        ));
+                    }
+                }
             }
         }
         if spec.storage.mode == "nfs" {
@@ -13536,6 +13980,159 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
+    async fn set_node_maintenance(
+        &self,
+        request: Request<controller_proto::SetNodeMaintenanceRequest>,
+    ) -> Result<Response<controller_proto::SetNodeMaintenanceResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        let node = self
+            .db
+            .get_node(&req.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
+
+        let clusters = self
+            .db
+            .list_ceph_clusters()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut membership: Option<(String, crate::controller_proto::CephClusterSpec)> = None;
+        for cluster in &clusters {
+            let spec = ceph_cluster_spec::spec_from_json(&cluster.spec_json)
+                .map_err(|e| Status::internal(format!("decode ceph spec: {e}")))?;
+            if spec.nodes.iter().any(|n| n.node_id == node.id) {
+                membership = Some((cluster.name.clone(), spec));
+                break;
+            }
+        }
+
+        if req.enable {
+            if let Some((cluster_name, spec)) = membership.as_ref() {
+                let mon_count = spec
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        let role = ceph_cluster_spec::normalize_role(&n.role);
+                        role == "full" || role == "mon"
+                    })
+                    .count();
+                let role = spec
+                    .nodes
+                    .iter()
+                    .find(|n| n.node_id == node.id)
+                    .map(|n| ceph_cluster_spec::normalize_role(&n.role))
+                    .unwrap_or_else(|| "full".into());
+                if (role == "full" || role == "mon") && mon_count <= 1 {
+                    return Err(Status::failed_precondition(format!(
+                        "node '{}' is the only monitor in CephCluster '{cluster_name}'",
+                        node.id
+                    )));
+                }
+                let remaining_osd_hosts = spec
+                    .nodes
+                    .iter()
+                    .filter(|n| n.node_id != node.id)
+                    .filter(|n| {
+                        let role = ceph_cluster_spec::normalize_role(&n.role);
+                        role == "full" || role == "osd"
+                    })
+                    .count() as i32;
+                if remaining_osd_hosts < spec.min_size {
+                    return Err(Status::failed_precondition(format!(
+                        "taking node '{}' down would leave {remaining_osd_hosts} OSD host(s) for minSize {}",
+                        node.id, spec.min_size
+                    )));
+                }
+                let survivor = spec
+                    .nodes
+                    .iter()
+                    .find(|n| n.node_id != node.id)
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "no surviving Ceph member to set noout".to_string(),
+                        )
+                    })?;
+                let mut admin = crate::ceph_cluster_reconciler::admin_for(
+                    &self.db,
+                    &self.clients,
+                    &survivor.node_id,
+                )
+                .await
+                .map_err(Status::unavailable)?;
+                let flags = admin
+                    .set_ceph_flags(Request::new(crate::node_proto::SetCephFlagsRequest {
+                        set_flags: vec!["noout".into()],
+                        unset_flags: vec![],
+                    }))
+                    .await
+                    .map_err(|e| Status::internal(format!("ceph osd set noout: {e}")))?
+                    .into_inner();
+                if !flags.success {
+                    return Err(Status::internal(flags.message));
+                }
+            }
+
+            let outcome = self
+                .drain_node_vms(&node.id, "", NodeDrainOptions::default())
+                .await?;
+            self.record_audit(&actor, "SetNodeMaintenance", &node.id, "enable");
+            let msg = if outcome.errors.is_empty() {
+                format!(
+                    "node '{}' in maintenance (noout set when Ceph member); {} VMs moved",
+                    node.id, outcome.migrated
+                )
+            } else {
+                format!(
+                    "node '{}' in maintenance with drain errors: {}",
+                    node.id,
+                    outcome.errors.join("; ")
+                )
+            };
+            Ok(Response::new(
+                controller_proto::SetNodeMaintenanceResponse {
+                    success: outcome.errors.is_empty(),
+                    message: msg,
+                },
+            ))
+        } else {
+            if let Some((_, spec)) = membership.as_ref() {
+                if let Some(survivor) = spec.nodes.first() {
+                    let mut admin = crate::ceph_cluster_reconciler::admin_for(
+                        &self.db,
+                        &self.clients,
+                        &survivor.node_id,
+                    )
+                    .await
+                    .map_err(Status::unavailable)?;
+                    let flags = admin
+                        .set_ceph_flags(Request::new(crate::node_proto::SetCephFlagsRequest {
+                            set_flags: vec![],
+                            unset_flags: vec!["noout".into()],
+                        }))
+                        .await
+                        .map_err(|e| Status::internal(format!("ceph osd unset noout: {e}")))?
+                        .into_inner();
+                    if !flags.success {
+                        return Err(Status::internal(flags.message));
+                    }
+                }
+            }
+            if matches!(node.status.as_str(), "cordoned" | "draining" | "drained") {
+                self.db
+                    .update_node_status(&node.id, "ready")
+                    .map_err(|e| Status::internal(format!("uncordoning node: {e}")))?;
+            }
+            self.record_audit(&actor, "SetNodeMaintenance", &node.id, "disable");
+            Ok(Response::new(
+                controller_proto::SetNodeMaintenanceResponse {
+                    success: true,
+                    message: format!("node '{}' left maintenance", node.id),
+                },
+            ))
+        }
+    }
+
     async fn delete_node(
         &self,
         request: Request<controller_proto::DeleteNodeRequest>,
@@ -13684,6 +14281,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .map(|row| row.holder.clone())
             .unwrap_or_default();
         let ha_lease_term = lease.as_ref().map(|row| row.term).unwrap_or(0);
+        let mut ceph_flags = Vec::new();
+        for cluster in self.db.list_ceph_clusters().unwrap_or_default() {
+            if let Ok(Some(status)) = self.db.get_ceph_cluster_status(&cluster.name) {
+                if let Some(typed) = typed_health_from_status_json(&status.ceph_status_json) {
+                    for flag in typed.flags {
+                        if !ceph_flags.iter().any(|f| f == &flag) {
+                            ceph_flags.push(flag);
+                        }
+                    }
+                }
+            }
+        }
         Ok(Response::new(controller_proto::GetClusterHealthResponse {
             status: health.status,
             ready_nodes: health.ready_nodes,
@@ -13701,6 +14310,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             ha_lease_holder,
             ha_lease_term,
             unprotected_vms_on_lost_nodes,
+            ceph_flags,
         }))
     }
 
@@ -15971,6 +16581,210 @@ impl controller_proto::controller_server::Controller for ControllerService {
         }))
     }
 
+    async fn convert_volume(
+        &self,
+        request: Request<controller_proto::ConvertVolumeRequest>,
+    ) -> Result<Response<controller_proto::ConvertVolumeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::VmAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let shell = Self::caller_shell(&request);
+        let req = request.into_inner();
+        if req.target_storage_class.trim() != "ceph" {
+            return Err(Status::invalid_argument(
+                "target_storage_class must be ceph",
+            ));
+        }
+        let mut vol = self
+            .resolve_volume_row(req.volume.trim())?
+            .ok_or_else(|| Status::not_found(format!("volume '{}' not found", req.volume)))?;
+        if !crate::host_volume::is_host(&vol.storage_class) {
+            return Err(Status::failed_precondition(format!(
+                "volume '{}' is {}; only lvm and zfs volumes can be converted to ceph",
+                vol.name,
+                crate::host_volume::normalized_storage_class(&vol.storage_class)
+            )));
+        }
+        if !vol.mount_point.is_empty() {
+            return Err(Status::failed_precondition(
+                "unmount the volume before converting it",
+            ));
+        }
+        if !vol.vm_id.is_empty() {
+            if let Some(vm) = self
+                .db
+                .get_vm(&vol.vm_id)
+                .map_err(|e| Status::internal(e.to_string()))?
+            {
+                if self.vm_is_live(&vm).await? {
+                    return Err(Status::failed_precondition(format!(
+                        "VM '{}' is running; stop it before converting its volume",
+                        vm.name
+                    )));
+                }
+            }
+        }
+        let snapshots = self
+            .db
+            .list_volume_snapshots(Some(&vol.id))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !snapshots.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "volume '{}' still has {} snapshot(s); delete them first (kctl delete volume-snapshot)",
+                vol.name,
+                snapshots.len()
+            )));
+        }
+        let old_class = vol.storage_class.clone();
+        let old_device = crate::host_volume::device_path(&old_class, &vol.pool, &vol.image)
+            .map_err(Status::failed_precondition)?;
+        let host_node = self.host_volume_node(&vol).await?;
+        let (dest_node, pool) = self.ceph_volume_target(&req.ceph_cluster).await?;
+
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let snap_name = format!("convert-{secs}");
+        self.create_volume_snapshot(Self::with_caller(
+            &shell,
+            controller_proto::CreateVolumeSnapshotRequest {
+                volume: vol.id.clone(),
+                name: snap_name.clone(),
+                consistency: String::new(),
+            },
+        ))
+        .await?;
+        let exposed = match self
+            .expose_volume_snapshot(Self::with_caller(
+                &shell,
+                controller_proto::ExposeVolumeSnapshotRequest {
+                    volume_name: vol.name.clone(),
+                    snapshot_name: snap_name.clone(),
+                    lease_seconds: 86_400,
+                },
+            ))
+            .await
+        {
+            Ok(resp) => resp.into_inner(),
+            Err(e) => {
+                self.abort_volume_transfer(&shell, "", None, Some(&snap_name))
+                    .await;
+                return Err(e);
+            }
+        };
+        let Some(lease) = crate::volume_export::global_export_leases().get(&exposed.lease_id)
+        else {
+            self.abort_volume_transfer(&shell, &exposed.lease_id, None, Some(&snap_name))
+                .await;
+            return Err(Status::internal("export lease vanished before the convert"));
+        };
+
+        let new_image = format!(
+            "kcore-vol-{}",
+            VolumeRow::serial_from_id(&Uuid::new_v4().to_string())
+        );
+        let new_size = vol.size_bytes.max(lease.size_bytes);
+        let handle = format!("{pool}/{new_image}");
+        let image_created = std::sync::atomic::AtomicBool::new(false);
+        let moved: Result<node_proto::WriteVolumeExtentsResponse, Status> = async {
+            let mut storage = self.connect_node_storage(&dest_node).await?;
+            storage
+                .create_volume(node_proto::CreateVolumeRequest {
+                    volume_id: new_image.clone(),
+                    storage_class: "ceph".into(),
+                    size_bytes: new_size,
+                    parameters: HashMap::new(),
+                    lv_name: String::new(),
+                })
+                .await
+                .map_err(|e| Status::internal(format!("creating RBD volume: {e}")))?;
+            image_created.store(true, std::sync::atomic::Ordering::SeqCst);
+            let written = self
+                .stream_lease_into_ceph(&lease, &dest_node, &handle)
+                .await?;
+            self.unexpose_volume_snapshot(Self::with_caller(
+                &shell,
+                controller_proto::UnexposeVolumeSnapshotRequest {
+                    lease_id: lease.lease_id.clone(),
+                },
+            ))
+            .await?;
+            // The snapshot belongs to the backend about to be removed; if it
+            // cannot go, keep the source volume as it is.
+            self.delete_volume_snapshot(Self::with_caller(
+                &shell,
+                controller_proto::DeleteVolumeSnapshotRequest {
+                    name: snap_name.clone(),
+                },
+            ))
+            .await?;
+            Ok(written)
+        }
+        .await;
+        let written = match moved {
+            Ok(w) => w,
+            Err(e) => {
+                let image = image_created
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then(|| (dest_node.clone(), handle.clone()));
+                self.abort_volume_transfer(&shell, &lease.lease_id, image, Some(&snap_name))
+                    .await;
+                return Err(e);
+            }
+        };
+
+        vol.storage_class = "ceph".into();
+        vol.pool = pool;
+        vol.image = new_image;
+        vol.size_bytes = new_size;
+        vol.host_node_id = String::new();
+        vol.generation += 1;
+        if let Err(e) = self.db.upsert_volume(&vol) {
+            // The new image is complete but unrecorded; the source still is
+            // the volume of record.
+            if let Ok(mut storage) = self.connect_node_storage(&dest_node).await {
+                let _ = storage
+                    .delete_volume(node_proto::DeleteVolumeRequest {
+                        backend_handle: handle,
+                    })
+                    .await;
+            }
+            return Err(Status::internal(format!("updating volume row: {e}")));
+        }
+        self.log_replication_event(
+            &actor,
+            Some("volume.convert"),
+            EVT_VOLUME_UPDATE,
+            &format!("volume/{}", vol.name),
+            self.host_volume_event(&vol),
+        );
+
+        let removed = match self.connect_node_storage(&host_node).await {
+            Ok(mut storage) => storage
+                .delete_volume(node_proto::DeleteVolumeRequest {
+                    backend_handle: old_device.clone(),
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.message().to_string()),
+        };
+        let mut message = format!(
+            "converted '{}' from {old_class} to ceph ({} bytes written, {} zero runs)",
+            vol.name, written.bytes_written, written.zero_runs
+        );
+        if let Err(e) = removed {
+            message.push_str(&format!(
+                "; the old {old_class} volume {old_device} on {} was not removed ({e}) and needs manual cleanup",
+                host_node.id
+            ));
+        }
+        Ok(Response::new(controller_proto::ConvertVolumeResponse {
+            success: true,
+            message,
+        }))
+    }
+
     async fn freeze_vm_filesystems(
         &self,
         request: Request<controller_proto::FreezeVmFilesystemsRequest>,
@@ -16064,6 +16878,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 volume_path: finished.volume_path,
             },
         ))
+    }
+
+    async fn convert_vm_storage(
+        &self,
+        request: Request<controller_proto::ConvertVmStorageRequest>,
+    ) -> Result<Response<controller_proto::ConvertVmStorageResponse>, Status> {
+        self.convert_vm_storage_rpc(request).await
+    }
+
+    async fn copy_volume_to_cluster(
+        &self,
+        request: Request<controller_proto::CopyVolumeToClusterRequest>,
+    ) -> Result<Response<controller_proto::CopyVolumeToClusterResponse>, Status> {
+        self.copy_volume_to_cluster_rpc(request).await
     }
 
     async fn encrypt_volume(
@@ -16880,6 +17708,21 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 spec.fsid = Uuid::new_v4().to_string();
             }
         }
+        if let Some(ext) = spec.external.as_mut() {
+            if ext.client_keyring.trim().is_empty() {
+                // Reads never return the keyring, so an applied manifest that
+                // omits it keeps the stored one.
+                if let Some(prev) = self
+                    .db
+                    .get_ceph_cluster(&name)
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .and_then(|e| ceph_cluster_spec::spec_from_json(&e.spec_json).ok())
+                    .and_then(|s| s.external)
+                {
+                    ext.client_keyring = prev.client_keyring;
+                }
+            }
+        }
         ceph_cluster_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
         for node in &spec.nodes {
             if self
@@ -17221,6 +18064,312 @@ impl controller_proto::controller_server::Controller for ControllerService {
         ))
     }
 
+    async fn finalize_ceph_osd_release(
+        &self,
+        request: Request<controller_proto::FinalizeCephOsdReleaseRequest>,
+    ) -> Result<Response<controller_proto::FinalizeCephOsdReleaseResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_ceph_cluster(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("ceph cluster '{name}' not found")))?;
+        let spec = ceph_cluster_spec::spec_from_json(&row.spec_json)
+            .map_err(|e| Status::internal(format!("decode ceph spec: {e}")))?;
+        if spec.nodes.is_empty() {
+            return Err(Status::failed_precondition("cluster has no members"));
+        }
+        self.refuse_if_ceph_members_mid_rollout(&spec)?;
+
+        let member = &spec.nodes[0];
+        let node = self
+            .db
+            .get_node(&member.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "member '{}' is not registered",
+                    member.node_id
+                ))
+            })?;
+        let mut admin = self.ensure_admin_client_for_node(&node).await?;
+        let resp = admin
+            .finalize_ceph_osd_release(node_proto::FinalizeCephOsdReleaseRequest {
+                release: req.release.clone(),
+                confirm: true,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("FinalizeCephOsdRelease on {}: {e}", node.id)))?
+            .into_inner();
+        self.record_audit(
+            &actor,
+            "FinalizeCephOsdRelease",
+            &format!("ceph_cluster/{name}"),
+            format!("release={} via={}", resp.release, node.id),
+        );
+        Ok(Response::new(
+            controller_proto::FinalizeCephOsdReleaseResponse {
+                success: resp.success,
+                message: resp.message,
+                release: resp.release,
+            },
+        ))
+    }
+
+    async fn rotate_ceph_mon_key(
+        &self,
+        request: Request<controller_proto::RotateCephMonKeyRequest>,
+    ) -> Result<Response<controller_proto::RotateCephMonKeyResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let row = self
+            .db
+            .get_ceph_cluster(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("ceph cluster '{name}' not found")))?;
+        let spec = ceph_cluster_spec::spec_from_json(&row.spec_json)
+            .map_err(|e| Status::internal(format!("decode ceph spec: {e}")))?;
+        if spec.nodes.is_empty() {
+            return Err(Status::failed_precondition("cluster has no members"));
+        }
+
+        let survivors: Vec<&controller_proto::CephClusterNodeSpec> = spec.nodes.iter().collect();
+        if let Some(health) = self.ceph_health_via_survivor(&survivors).await {
+            if health != "HEALTH_OK" {
+                return Err(Status::failed_precondition(format!(
+                    "cluster health is {health}; prefer HEALTH_OK before rotating the mon key"
+                )));
+            }
+        }
+
+        let member = &spec.nodes[0];
+        let node = self
+            .db
+            .get_node(&member.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "member '{}' is not registered",
+                    member.node_id
+                ))
+            })?;
+        let mut admin = self.ensure_admin_client_for_node(&node).await?;
+        let resp = admin
+            .rotate_ceph_mon_key(node_proto::RotateCephMonKeyRequest {})
+            .await
+            .map_err(|e| Status::internal(format!("RotateCephMonKey on {}: {e}", node.id)))?
+            .into_inner();
+        let message = if resp.success {
+            format!(
+                "{}; keyring rotated on {}; rebuild / ApplyCephConfig redistributes to other members",
+                resp.message, node.id
+            )
+        } else {
+            resp.message
+        };
+        self.record_audit(
+            &actor,
+            "RotateCephMonKey",
+            &format!("ceph_cluster/{name}"),
+            format!("via={}", node.id),
+        );
+        Ok(Response::new(controller_proto::RotateCephMonKeyResponse {
+            success: resp.success,
+            message,
+        }))
+    }
+
+    async fn rotate_ceph_osd_dmcrypt(
+        &self,
+        request: Request<controller_proto::RotateCephOsdDmcryptRequest>,
+    ) -> Result<Response<controller_proto::RotateCephOsdDmcryptResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        if req.osd_id < 0 {
+            return Err(Status::invalid_argument("osd_id must be >= 0"));
+        }
+        let row = self
+            .db
+            .get_ceph_cluster(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("ceph cluster '{name}' not found")))?;
+        let spec = ceph_cluster_spec::spec_from_json(&row.spec_json)
+            .map_err(|e| Status::internal(format!("decode ceph spec: {e}")))?;
+        if !spec.encrypt_osds {
+            return Err(Status::failed_precondition(
+                "encryptOsds is false; OSD dm-crypt rotation does not apply",
+            ));
+        }
+        if spec.nodes.is_empty() {
+            return Err(Status::failed_precondition("cluster has no members"));
+        }
+
+        // Controller request carries osd_id only. Best-effort: use the first
+        // member's primary osd_device. The agent validates the absolute path;
+        // operators must ensure it matches the OSD being rotated.
+        let member = &spec.nodes[0];
+        let device = ceph_cluster_spec::osd_devices(member)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        if device.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "member '{}' has no osd_device; cannot rotate dmcrypt without a device path",
+                member.node_id
+            )));
+        }
+        let node = self
+            .db
+            .get_node(&member.node_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "member '{}' is not registered",
+                    member.node_id
+                ))
+            })?;
+        let mut admin = self.ensure_admin_client_for_node(&node).await?;
+        let resp = admin
+            .rotate_ceph_osd_dmcrypt(node_proto::RotateCephOsdDmcryptRequest {
+                osd_id: req.osd_id,
+                device: device.clone(),
+                confirm: true,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("RotateCephOsdDmcrypt on {}: {e}", node.id)))?
+            .into_inner();
+        let message = if resp.message.is_empty() {
+            format!(
+                "osd.{} on {} device {} (device chosen from first member; verify before relying on this)",
+                req.osd_id, node.id, device
+            )
+        } else {
+            format!(
+                "{} (device {} from member {}; verify OSD/device mapping)",
+                resp.message, device, node.id
+            )
+        };
+        self.record_audit(
+            &actor,
+            "RotateCephOsdDmcrypt",
+            &format!("ceph_cluster/{name}"),
+            format!("osd={} device={} via={}", req.osd_id, device, node.id),
+        );
+        Ok(Response::new(
+            controller_proto::RotateCephOsdDmcryptResponse {
+                success: resp.success,
+                message,
+            },
+        ))
+    }
+
+    async fn list_volume_trash(
+        &self,
+        request: Request<controller_proto::ListVolumeTrashRequest>,
+    ) -> Result<Response<controller_proto::ListVolumeTrashResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        let pool = if req.pool.trim().is_empty() {
+            "kcore-vms".to_string()
+        } else {
+            req.pool.trim().to_string()
+        };
+        let namespace = req.namespace;
+        let mut admin = self
+            .admin_for_any_ceph_member()
+            .await
+            .map_err(Status::unavailable)?;
+        let resp = admin
+            .list_rbd_trash(node_proto::ListRbdTrashRequest {
+                pool: pool.clone(),
+                namespace: namespace.clone(),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("ListRbdTrash: {e}")))?
+            .into_inner();
+        let entries = resp
+            .entries
+            .into_iter()
+            .map(|e| controller_proto::VolumeTrashEntry {
+                id: e.id,
+                pool: pool.clone(),
+                namespace: namespace.clone(),
+                name: e.name,
+                deletion_time: e.deletion_time,
+            })
+            .collect();
+        Ok(Response::new(controller_proto::ListVolumeTrashResponse {
+            entries,
+        }))
+    }
+
+    async fn purge_volume_trash(
+        &self,
+        request: Request<controller_proto::PurgeVolumeTrashRequest>,
+    ) -> Result<Response<controller_proto::PurgeVolumeTrashResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let actor = Self::audit_actor(&request);
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let pool = if req.pool.trim().is_empty() {
+            "kcore-vms".to_string()
+        } else {
+            req.pool.trim().to_string()
+        };
+        let mut admin = self
+            .admin_for_any_ceph_member()
+            .await
+            .map_err(Status::unavailable)?;
+        let resp = admin
+            .purge_rbd_trash(node_proto::PurgeRbdTrashRequest {
+                pool: pool.clone(),
+                namespace: req.namespace,
+                trash_id: req.trash_id.clone(),
+                confirm: true,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("PurgeRbdTrash: {e}")))?
+            .into_inner();
+        self.record_audit(
+            &actor,
+            "PurgeVolumeTrash",
+            &format!("pool/{pool}"),
+            format!("id={} purged={}", req.trash_id, resp.purged),
+        );
+        Ok(Response::new(controller_proto::PurgeVolumeTrashResponse {
+            success: resp.success,
+            message: resp.message,
+            purged: resp.purged,
+        }))
+    }
+
     async fn get_ceph_cluster_capacity(
         &self,
         request: Request<controller_proto::GetCephClusterCapacityRequest>,
@@ -17469,6 +18618,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .upsert_shared_filesystem(&row)
                 .map_err(|e| Status::internal(e.to_string()))?;
             self.db
+                .requeue_ceph_cluster(spec.ceph_cluster.trim())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.db
                 .upsert_shared_filesystem_status(&SharedFilesystemStatusRow {
                     name: name.clone(),
                     observed_generation: 0,
@@ -17558,11 +18710,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let name = validate_network_name(&request.into_inner().name)?;
+        let cluster = self
+            .db
+            .get_shared_filesystem(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .and_then(|r| shared_filesystem_spec::spec_from_json(&r.spec_json).ok())
+            .map(|s| s.ceph_cluster);
         let success = self
             .db
             .delete_shared_filesystem(&name)
             .map_err(|e| Status::internal(e.to_string()))?;
         if success {
+            if let Some(cluster) = cluster {
+                let _ = self.db.requeue_ceph_cluster(cluster.trim());
+            }
             self.record_audit(&actor, "DeleteSharedFilesystem", &name, "");
         }
         Ok(Response::new(
@@ -17762,6 +18923,9 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 .upsert_object_store(&row)
                 .map_err(|e| Status::internal(e.to_string()))?;
             self.db
+                .requeue_ceph_cluster(spec.ceph_cluster.trim())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.db
                 .upsert_object_store_status(&ObjectStoreStatusRow {
                     name: name.clone(),
                     observed_generation: 0,
@@ -17855,11 +19019,20 @@ impl controller_proto::controller_server::Controller for ControllerService {
                 users.len()
             )));
         }
+        let cluster = self
+            .db
+            .get_object_store(&name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .and_then(|r| object_store_spec::spec_from_json(&r.spec_json).ok())
+            .map(|s| s.ceph_cluster);
         let success = self
             .db
             .delete_object_store(&name)
             .map_err(|e| Status::internal(e.to_string()))?;
         if success {
+            if let Some(cluster) = cluster {
+                let _ = self.db.requeue_ceph_cluster(cluster.trim());
+            }
             self.record_audit(&actor, "DeleteObjectStore", &name, "");
         }
         Ok(Response::new(controller_proto::DeleteObjectStoreResponse {
@@ -19717,14 +20890,17 @@ impl controller_proto::controller_server::Controller for ControllerService {
             }
         }
 
-        let local = match Self::local_provisioner_of(&req.name, &spec) {
+        let local = match self.local_provisioner_of(&req.name, &spec) {
             Ok(provisioner) => Some(provisioner),
             Err(err) => {
                 blocking_issues.push(err.message().to_string());
                 None
             }
         };
-        let rendered_nix_preview = match local.as_ref().filter(|provisioner| provisioner.enabled) {
+        let rendered_nix_preview = match local
+            .as_ref()
+            .filter(|provisioner| provisioner.renders_manifests())
+        {
             Some(provisioner) => format!(
                 "# Kubernetes configuration will be generated\n{}",
                 crate::kubernetes_local::manifests_at(provisioner, &spec.api_server_endpoint)
@@ -19776,7 +20952,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             )));
         }
 
-        let provisioner = Self::local_provisioner_of(&req.name, &spec)?;
+        let provisioner = self.local_provisioner_of(&req.name, &spec)?;
 
         // Store cluster in database
         let mut cluster_row = crate::db::KubernetesClusterRow {
@@ -19904,7 +21080,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
             self.kubernetes_version_change(&req.name, &existing.phase, &spec, req.force)?;
         let upgrading = version_change != crate::kubernetes_upgrade::VersionChange::None;
         let next_version = crate::kubernetes_versions::effective(&spec.version);
-        let provisioner = Self::local_provisioner_of(&req.name, &spec)?;
+        let provisioner = self.local_provisioner_of(&req.name, &spec)?;
         let existing_members = self
             .db
             .list_kubernetes_cluster_nodes(&req.name)
@@ -20437,6 +21613,7 @@ impl ControllerService {
     }
 
     fn local_provisioner_of(
+        &self,
         cluster: &str,
         spec: &controller_proto::KubernetesClusterSpec,
     ) -> Result<crate::kubernetes_local::LocalProvisioner, Status> {
@@ -20457,7 +21634,17 @@ impl ControllerService {
                 volume_group: volume.volume_group.as_str(),
             })
             .collect();
-        crate::kubernetes_local::normalize(
+        let ceph_cluster = declared.ceph_cluster.trim().to_string();
+        if !declared.enabled && volumes.is_empty() {
+            if ceph_cluster.is_empty() {
+                return Ok(crate::kubernetes_local::LocalProvisioner::disabled());
+            }
+            let mut provisioner =
+                crate::kubernetes_local::LocalProvisioner::ceph_only(&ceph_cluster);
+            self.resolve_ceph_csi(&mut provisioner)?;
+            return Ok(provisioner);
+        }
+        let mut provisioner = crate::kubernetes_local::normalize(
             cluster,
             &Self::kubernetes_members(spec),
             declared.enabled,
@@ -20465,7 +21652,77 @@ impl ControllerService {
             &declared.mode,
             &volumes,
         )
-        .map_err(Status::invalid_argument)
+        .map_err(Status::invalid_argument)?;
+        if provisioner.enabled && provisioner.volumes.is_empty() && ceph_cluster.is_empty() {
+            return Err(Status::invalid_argument(
+                "local provisioner requires at least one lvm or zfs volume, or cephCluster",
+            ));
+        }
+        provisioner.ceph_cluster = ceph_cluster;
+        self.resolve_ceph_csi(&mut provisioner)?;
+        Ok(provisioner)
+    }
+
+    fn resolve_ceph_csi(
+        &self,
+        provisioner: &mut crate::kubernetes_local::LocalProvisioner,
+    ) -> Result<(), Status> {
+        if !provisioner.has_ceph() {
+            return Ok(());
+        }
+        let name = provisioner.ceph_cluster.clone();
+        let row = self
+            .db
+            .get_ceph_cluster(&name)
+            .map_err(|e| Status::internal(format!("reading CephCluster '{name}': {e}")))?
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("localProvisioner.cephCluster '{name}' not found"))
+            })?;
+        let spec = ceph_cluster_spec::spec_from_json(&row.spec_json)
+            .map_err(|e| Status::internal(format!("decode CephCluster '{name}': {e}")))?;
+        if let Some(ext) = ceph_cluster_spec::active_external(&spec) {
+            provisioner.ceph_monitors = ext
+                .mon_hosts
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            provisioner.ceph_pool = if ext.pool.trim().is_empty() {
+                "kcore-vms".into()
+            } else {
+                ext.pool.trim().to_string()
+            };
+        } else {
+            provisioner.ceph_monitors = spec
+                .nodes
+                .iter()
+                .map(|n| n.mon_addr.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            provisioner.ceph_pool = "kcore-vms".into();
+        }
+        if provisioner.ceph_monitors.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "CephCluster '{name}' has no monitor addresses for CSI"
+            )));
+        }
+        // Prefer an existing SharedFilesystem on this CephCluster for CephFS CSI.
+        provisioner.ceph_filesystem = self
+            .db
+            .list_shared_filesystems()
+            .map_err(|e| Status::internal(format!("listing SharedFilesystems: {e}")))?
+            .into_iter()
+            .find_map(|fs| {
+                let fs_spec = shared_filesystem_spec::spec_from_json(&fs.spec_json).ok()?;
+                if fs_spec.ceph_cluster.trim() != name {
+                    return None;
+                }
+                Some(shared_filesystem_spec::effective_fs_name(
+                    &fs.name, &fs_spec,
+                ))
+            })
+            .unwrap_or_default();
+        Ok(())
     }
 
     fn kubernetes_config_row(
@@ -20871,9 +22128,9 @@ impl ControllerService {
             .map(|c| crate::kubernetes_local::decode(&c.local_provisioner_json))
             .transpose()
             .map_err(Status::internal)?
-            .filter(|provisioner| provisioner.enabled)
+            .filter(|provisioner| provisioner.enabled || provisioner.has_ceph())
             .map(|provisioner| controller_proto::KubernetesLocalProvisioner {
-                enabled: true,
+                enabled: provisioner.enabled,
                 storage_class_name: provisioner.storage_class_name,
                 volumes: provisioner
                     .volumes
@@ -20890,6 +22147,7 @@ impl ControllerService {
                     })
                     .collect(),
                 mode: provisioner.mode,
+                ceph_cluster: provisioner.ceph_cluster,
             });
 
         Ok(controller_proto::KubernetesCluster {
@@ -23439,6 +24697,44 @@ mod tests {
         assert!(resp.success);
     }
 
+    #[test]
+    fn a_healthy_external_ceph_cluster_makes_every_approved_node_a_client() {
+        let db = Database::open(":memory:").expect("open db");
+        let mut node = test_node();
+        node.id = "node-x".into();
+        db.upsert_node(&node).unwrap();
+        let spec = controller_proto::CephClusterSpec {
+            external: Some(controller_proto::CephExternalSpec {
+                mon_hosts: "10.0.0.1:6789".into(),
+                pool: "kcore-vms".into(),
+                client_keyring: "[client.admin]\nkey = AQB==".into(),
+                client_name: String::new(),
+            }),
+            ..Default::default()
+        };
+        db.upsert_ceph_cluster(&CephClusterRow {
+            name: "ext".into(),
+            generation: 1,
+            spec_json: crate::ceph_cluster_spec::spec_to_json(&spec).unwrap(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        let mut vm = test_vm("node-x");
+        vm.id = "vm-ext-1".into();
+        vm.name = "ext-1".into();
+        vm.storage_backend = "ceph".into();
+        db.insert_vm(&vm).unwrap();
+
+        let svc = svc_for(&db);
+        assert!(!svc.is_healthy_ceph_member("node-x").unwrap());
+        mark_ceph_cluster_healthy(&db, "ext");
+        assert!(svc.is_healthy_ceph_member("node-x").unwrap());
+        assert!(svc.ceph_member_ids().contains("node-x"));
+        assert_eq!(svc.ceph_cluster_vms_in_use("ext").unwrap(), vec!["ext-1"]);
+    }
+
     #[tokio::test]
     async fn migrate_vm_cold_fallback_reassigns_node() {
         let db = Database::open(":memory:").expect("open db");
@@ -25446,8 +26742,10 @@ mod tests {
                     cluster_iface: "eth2".into(),
                     osd_device: "/dev/nvme0n1".into(),
                     osd_devices: vec![],
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 

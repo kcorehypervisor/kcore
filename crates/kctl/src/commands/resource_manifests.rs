@@ -212,6 +212,9 @@ pub async fn apply_volume(info: &ConnectionInfo, file: &str) -> Result<()> {
             encrypt: spec.encrypt,
             node: spec.node.unwrap_or_default(),
             volume_name: spec.volume_name.unwrap_or_default(),
+            rbd_namespace: String::new(),
+            qos_iops: 0,
+            qos_bps: 0,
         })
         .await?
         .into_inner();

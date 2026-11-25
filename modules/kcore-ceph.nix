@@ -27,6 +27,11 @@ let
   cephPublicPorts = [
     3300
     6789
+  ]
+  ++ lib.optionals cfg.enableDashboard [ 8443 ]
+  ++ [
+    # mgr prometheus exporter
+    9283
   ];
   cephDaemonRange = {
     from = 6800;
@@ -113,6 +118,16 @@ in
       type = lib.types.bool;
       default = false;
       description = "Run a Ceph RADOS Gateway (RGW) instance on this node.";
+    };
+    enableRbdMirror = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Run ceph-rbd-mirror on this node for continuous RBD replication.";
+    };
+    enableDashboard = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Open the mgr dashboard port (8443) on the public iface.";
     };
     rgwPort = lib.mkOption {
       type = lib.types.port;
@@ -316,5 +331,40 @@ in
         '';
       };
     };
+
+    systemd.services."ceph-rbd-mirror@" = lib.mkIf cfg.enableRbdMirror {
+      description = "Ceph RBD mirror daemon %i";
+      after = [
+        "network-online.target"
+        "time-sync.target"
+      ];
+      wants = [
+        "network-online.target"
+        "time-sync.target"
+      ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "simple";
+        User = "ceph";
+        Group = "ceph";
+        LimitNOFILE = 1048576;
+        Environment = "CLUSTER=${cfg.clusterName}";
+        ExecStart = "${cfg.package}/bin/rbd-mirror -f --cluster ${cfg.clusterName} --id %i";
+        Restart = "on-failure";
+        RestartSec = "10s";
+      };
+    };
+
+    systemd.targets.ceph-rbd-mirror = lib.mkIf cfg.enableRbdMirror {
+      wantedBy = [ "multi-user.target" ];
+    };
+
+    # Instantiate mirror under the local daemon id when enabled.
+    systemd.services."ceph-rbd-mirror@${cfg.daemonId}" =
+      lib.mkIf (cfg.enableRbdMirror && cfg.daemonId != "")
+        {
+          wantedBy = [ "multi-user.target" ];
+          overrideStrategy = "asDropin";
+        };
   };
 }

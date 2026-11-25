@@ -786,6 +786,19 @@ export function warningsFor(kind: ResourceKind, spec: Record<string, unknown>): 
   if (kind.id === "kubernetes-cluster") {
     warnings.push("Applying a Kubernetes cluster rebuilds the member nodes through NixOS. Read the plan's blocking issues and preflight results first.");
   }
+  if (kind.id === "ceph-cluster") {
+    if (Array.isArray(spec.lostMembers) && spec.lostMembers.length > 0) {
+      warnings.push(
+        "lostMembers tells the controller those hosts will never answer: a survivor drains, then purges their OSDs and removes their mons. Use it only for a host that is gone. Check docs/ceph-lifecycle.md for whether this build acts on it.",
+      );
+    }
+    if (spec.external && typeof spec.external === "object") {
+      warnings.push("An external cluster is not bootstrapped or reconciled by kcore; VMs map the named pool with the given client key.");
+    }
+    if (str(spec, "cachePolicy") === "writeback") {
+      warnings.push("writeback keeps acknowledged writes in the client cache; a hard kill of the node loses them. writethrough is safer for failover-eligible VMs.");
+    }
+  }
   if (kind.id === "object-user") {
     warnings.push("Creation runs through kctl create object-user, which prints the secret once. This server cannot show it.");
   }

@@ -55,6 +55,11 @@ service NodeStorage {
   rpc ListChangedExtents(ListChangedExtentsRequest) returns (ListChangedExtentsResponse);
   rpc ReadVolumeExtents(ReadVolumeExtentsRequest) returns (stream VolumeBlock);
   rpc WriteVolumeExtents(stream WriteVolumeExtentsRequest) returns (WriteVolumeExtentsResponse);
+  // Lease on a stopped guest's node-local LVM or ZFS disk so ReadVolumeExtents can
+  // stream it (convert to Ceph). UnexposeSnapshot releases the lease and leaves the device alone.
+  rpc ExposeLocalDisk(ExposeLocalDiskRequest) returns (ExposeSnapshotResponse);
+  // Set one allow-listed RBD image-meta key (today only kcore.seeded).
+  rpc SetImageMeta(SetImageMetaRequest) returns (SetImageMetaResponse);
   // Instant recovery. The overlay is a qcow2 whose backing file is the vault NBD export.
   rpc PrepareInstantDisk(PrepareInstantDiskRequest) returns (PrepareInstantDiskResponse);
   rpc FinalizeInstantDisk(FinalizeInstantDiskRequest) returns (FinalizeInstantDiskResponse);
@@ -230,6 +235,29 @@ service NodeAdmin {
   // report whether every placement group is active+clean again, i.e. the
   // host's data has been re-replicated elsewhere and it can be torn down.
   rpc DrainCephHost(DrainCephHostRequest) returns (DrainCephHostResponse);
+  // Set or clear cluster-wide OSD flags (noout, norebalance, ...).
+  rpc SetCephFlags(SetCephFlagsRequest) returns (SetCephFlagsResponse);
+  // Run `ceph osd ok-to-stop` for every OSD under CRUSH host `host`. A cluster
+  // update asks this before it reboots a Ceph member.
+  rpc CheckCephOkToStop(CheckCephOkToStopRequest) returns (CheckCephOkToStopResponse);
+  // Write /etc/ceph/ceph.conf and the client keyring for an external Ceph
+  // cluster on a node that is not one of kcore's own Ceph members.
+  rpc ApplyCephClientConfig(ApplyCephClientConfigRequest) returns (ApplyCephClientConfigResponse);
+  // Mark an OSD out and report whether every PG is active+clean. Does not
+  // purge; the controller calls PurgeCephOsd once the drain is clean.
+  rpc DrainCephOsd(DrainCephOsdRequest) returns (DrainCephOsdResponse);
+  rpc PurgeCephOsd(PurgeCephOsdRequest) returns (PurgeCephOsdResponse);
+  // Crush reweight one OSD (used when a new disk joins).
+  rpc ReweightCephOsd(ReweightCephOsdRequest) returns (ReweightCephOsdResponse);
+  rpc SetCephOsdDeviceClass(SetCephOsdDeviceClassRequest) returns (SetCephOsdDeviceClassResponse);
+  // Best-effort enable of an mgr module (prometheus). Idempotent.
+  rpc EnableCephMgrModule(EnableCephMgrModuleRequest) returns (EnableCephMgrModuleResponse);
+  // Rotate client.kcore (auth del + get-or-create with the same caps).
+  rpc RotateCephClientKey(EnsureCephClientKeyRequest) returns (EnsureCephClientKeyResponse);
+  // Create or update client.kcore with caps limited to the VM pool.
+  rpc EnsureCephClientKey(EnsureCephClientKeyRequest) returns (EnsureCephClientKeyResponse);
+  // After a drain, purge OSDs and remove the mon for a host that will not answer.
+  rpc PurgeLostCephHost(PurgeLostCephHostRequest) returns (PurgeLostCephHostResponse);
   rpc GetHostCpuFlags(GetHostCpuFlagsRequest) returns (GetHostCpuFlagsResponse);
 
   // Live migration peer steps (controller orchestrates source + destination).
@@ -1438,6 +1466,148 @@ message GetCephHealthResponse {
   string raw_status = 2;
   int32 osd_up = 3;
   int32 osd_in = 4;
+  // Parsed from ceph -s; empty fields when the JSON shape is unknown.
+  repeated string mon_quorum = 5;
+  int32 mon_count = 6;
+  int32 osd_total = 7;
+  int32 pgs_total = 8;
+  int32 pgs_not_clean = 9;
+  int32 backfill_pgs = 10;
+  bool noout = 11;
+  bool norebalance = 12;
+  repeated string flags = 13;
+  repeated CephHealthCheckSummary checks = 14;
+  repeated CephPgStateCount pgs_by_state = 15;
+  int64 bytes_total = 16;
+  int64 bytes_used = 17;
+  int64 bytes_avail = 18;
+}
+
+message CephHealthCheckSummary {
+  string severity = 1;
+  string type = 2;
+  string summary = 3;
+}
+
+message CephPgStateCount {
+  string state = 1;
+  int32 count = 2;
+}
+
+message SetCephFlagsRequest {
+  // Flag names without the "osd " prefix, e.g. "noout", "norebalance".
+  repeated string set_flags = 1;
+  repeated string unset_flags = 2;
+}
+
+message SetCephFlagsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated string flags = 3;
+}
+
+message CheckCephOkToStopRequest {
+  // CRUSH host name (the node's hostname).
+  string host = 1;
+}
+
+message CheckCephOkToStopResponse {
+  bool ok = 1;
+  string message = 2;
+  // OSD ids that were checked, decimal strings.
+  repeated string osd_ids = 3;
+}
+
+message ApplyCephClientConfigRequest {
+  // Comma-separated mon_host list.
+  string mon_hosts = 1;
+  // cephx entity, e.g. client.admin.
+  string client_name = 2;
+  // Keyring body for client_name. Written 0600.
+  string keyring = 3;
+  string fsid = 4;
+}
+
+message ApplyCephClientConfigResponse {
+  bool success = 1;
+  string message = 2;
+  // False when the files already held this content.
+  bool changed = 3;
+}
+
+message DrainCephOsdRequest {
+  // OSD id as a decimal string (without the "osd." prefix).
+  string osd_id = 1;
+}
+
+message DrainCephOsdResponse {
+  bool success = 1;
+  string message = 2;
+  bool clean = 3;
+  int32 pgs_total = 4;
+  int32 pgs_not_clean = 5;
+}
+
+message PurgeCephOsdRequest {
+  string osd_id = 1;
+  string device = 2;
+}
+
+message PurgeCephOsdResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ReweightCephOsdRequest {
+  string osd_id = 1;
+  double weight = 2;
+}
+
+message ReweightCephOsdResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SetCephOsdDeviceClassRequest {
+  string osd_id = 1;
+  string device_class = 2;
+}
+
+message SetCephOsdDeviceClassResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message EnableCephMgrModuleRequest {
+  string module = 1;
+}
+
+message EnableCephMgrModuleResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message EnsureCephClientKeyRequest {
+  string client_name = 1;
+  string pool = 2;
+}
+
+message EnsureCephClientKeyResponse {
+  bool success = 1;
+  string message = 2;
+  string keyring = 3;
+}
+
+message PurgeLostCephHostRequest {
+  // CRUSH host name / daemon id used for mon rm and osd ls-tree.
+  string host = 1;
+  string daemon_id = 2;
+}
+
+message PurgeLostCephHostResponse {
+  bool success = 1;
+  string message = 2;
+  repeated string purged_osd_ids = 3;
 }
 
 message GetCephOsdLatencyRequest {}
@@ -1484,6 +1654,24 @@ message EnsureCephPoolRequest {
   string pool = 1;
   int32 size = 2;
   int32 min_size = 3;
+  string application = 4;
+  int32 pg_num = 5;
+  string crush_rule = 6;
+  string compression_mode = 7;
+  int64 quota_bytes = 8;
+  string pool_type = 9;
+  string erasure_profile = 10;
+  // secure or prefer-crc; applied once after pool ensure.
+  string ms_mode = 11;
+  CephRecoverySpec recovery = 12;
+}
+
+message CephRecoverySpec {
+  int32 max_backfills = 1;
+  int32 recovery_max_active = 2;
+  int32 scrub_begin_hour = 3;
+  int32 scrub_end_hour = 4;
+  int32 nearfull_ratio_bp = 5;
 }
 
 message EnsureCephPoolResponse {
@@ -1503,6 +1691,7 @@ message ReconcileCephOsdsResponse {
   string message = 2;
   repeated string created = 3;
   repeated string retired = 4;
+  repeated string pending_retire = 5;
 }
 
 message TeardownCephNodeRequest {}
@@ -2295,3 +2484,20 @@ message RunPostgresqlAdminResponse {
   string message = 2;
   string result = 3;
 }
+
+message ExposeLocalDiskRequest {
+  // /dev/<vg>/<lv> or /dev/zvol/<pool>/<name>.
+  string backend_handle = 1;
+  // lvm or zfs. Empty infers from the handle.
+  string storage_class = 2;
+  int32 lease_seconds = 3;
+}
+
+message SetImageMetaRequest {
+  // pool/image
+  string backend_handle = 1;
+  string key = 2;
+  string value = 3;
+}
+
+message SetImageMetaResponse {}

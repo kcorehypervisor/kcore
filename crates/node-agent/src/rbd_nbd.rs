@@ -21,16 +21,101 @@ const RBD_DEV_ROOT: &str = "/dev/rbd";
 /// sequential reads under O_DIRECT (firmware/GRUB loading a kernel) crawl at
 /// ~10 MB/s. The writeback cache stays write-through until the guest first
 /// flushes, and rbd-nbd flushes it on unmap.
-pub const MAP_TUNING: [&str; 5] = [
+pub const MAP_TUNING_WRITEBACK: [&str; 6] = [
     "--rbd-cache=true",
     "--rbd-cache-policy=writeback",
     "--rbd-readahead-trigger-requests=1",
     "--rbd-readahead-max-bytes=4194304",
     "--rbd-readahead-disable-after-bytes=0",
+    "--rbd-default-map-options=rbd_blocklist_on_break_lock=true",
 ];
+
+/// Prefer for failover-eligible guests: acknowledged writes reach the OSD
+/// before the guest sees success.
+pub const MAP_TUNING_WRITETHROUGH: [&str; 6] = [
+    "--rbd-cache=true",
+    "--rbd-cache-policy=writethrough",
+    "--rbd-readahead-trigger-requests=1",
+    "--rbd-readahead-max-bytes=4194304",
+    "--rbd-readahead-disable-after-bytes=0",
+    "--rbd-default-map-options=rbd_blocklist_on_break_lock=true",
+];
+
+/// Default map tuning (writeback). Prefer [`map_with_policy`].
+pub const MAP_TUNING: [&str; 6] = MAP_TUNING_WRITEBACK;
+
+pub fn map_tuning(cache_policy: &str) -> &'static [&'static str] {
+    if cache_policy.eq_ignore_ascii_case("writethrough") {
+        &MAP_TUNING_WRITETHROUGH
+    } else {
+        &MAP_TUNING_WRITEBACK
+    }
+}
+
+/// Keyring `EnsureCephClientKey` writes for `client.kcore` on each member.
+pub const CLIENT_KCORE_KEYRING: &str = "/etc/ceph/ceph.client.kcore.keyring";
+
+/// `-n client.kcore` once that keyring is on this host, so day-to-day rbd
+/// commands run with the pool-scoped key instead of `client.admin`. Empty
+/// otherwise: callers keep using the admin key until the keyring arrives.
+pub fn client_args() -> &'static [&'static str] {
+    client_args_for(Path::new(CLIENT_KCORE_KEYRING))
+}
+
+pub fn client_args_for(keyring: &Path) -> &'static [&'static str] {
+    if keyring.is_file() {
+        &["-n", "client.kcore"]
+    } else {
+        &[]
+    }
+}
 
 pub fn device_link(pool: &str, image: &str) -> PathBuf {
     Path::new(RBD_DEV_ROOT).join(pool).join(image)
+}
+
+/// Whether the kernel `rbd` module can map this cluster's keys.
+///
+/// Ceph 20 issues `aes256k` (32-byte) secrets. The in-tree libceph rejects them
+/// (`secret too big 32`), so krbd is unusable against a current cluster even
+/// when `/sys/module/rbd` exists. rbd-nbd stays the default; this helper only
+/// reports the probe so operators and the truth doc share one answer.
+pub fn krbd_usable() -> bool {
+    krbd_usable_with(
+        Path::new("/sys/module/rbd"),
+        Path::new("/etc/ceph/ceph.client.admin.keyring"),
+        Path::new("/etc/ceph/ceph.client.kcore.keyring"),
+    )
+}
+
+pub fn krbd_usable_with(module: &Path, admin_keyring: &Path, kcore_keyring: &Path) -> bool {
+    if !module.exists() {
+        return false;
+    }
+    for path in [admin_keyring, kcore_keyring] {
+        if let Ok(body) = std::fs::read_to_string(path) {
+            if keyring_has_aes256k(&body) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn keyring_has_aes256k(body: &str) -> bool {
+    body.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("key ")
+            && line
+                .split_whitespace()
+                .nth(2)
+                .map(|k| {
+                    // Base64 of 32 bytes is 44 chars with padding, or 43 without.
+                    let bare = k.trim_end_matches('=');
+                    bare.len() >= 42
+                })
+                .unwrap_or(false)
+    })
 }
 
 /// Extract the `/dev/nbdN` node for `pool/image` from `rbd device list -t nbd --format json`.
@@ -93,28 +178,38 @@ fn point_link_at(pool: &str, image: &str, dev: &str) -> Result<(), String> {
 
 /// Map `pool/image` (idempotent) and return the stable `/dev/rbd/<pool>/<image>` path.
 pub fn map(pool: &str, image: &str) -> Result<PathBuf, String> {
+    map_with_policy(pool, image, &env_cache_policy())
+}
+
+/// `KCORE_RBD_CACHE_POLICY` (`writeback` or `writethrough`); empty when unset.
+pub fn env_cache_policy() -> String {
+    std::env::var("KCORE_RBD_CACHE_POLICY").unwrap_or_default()
+}
+
+/// Like [`map`], with an explicit cache policy (`writeback` or `writethrough`).
+pub fn map_with_policy(pool: &str, image: &str, cache_policy: &str) -> Result<PathBuf, String> {
     if let Some(dev) = mapped_device(pool, image) {
         point_link_at(pool, image, &dev)?;
         return Ok(device_link(pool, image));
     }
     let _ = Command::new("modprobe").arg("nbd").status();
     let spec = format!("{pool}/{image}");
-    let out = Command::new("systemd-run")
-        .args([
-            "--scope",
-            "--quiet",
-            "--collect",
-            "--",
-            "rbd",
-            "device",
-            "map",
-            "-t",
-            "nbd",
-        ])
-        .args(MAP_TUNING)
-        .arg(&spec)
-        .output()
-        .map_err(|e| format!("rbd-nbd map: {e}"))?;
+    let run_map = |client: &[&str]| {
+        Command::new("systemd-run")
+            .args(["--scope", "--quiet", "--collect", "--", "rbd"])
+            .args(client)
+            .args(["device", "map", "-t", "nbd"])
+            .args(map_tuning(cache_policy))
+            .arg(&spec)
+            .output()
+            .map_err(|e| format!("rbd-nbd map: {e}"))
+    };
+    let client = client_args();
+    let mut out = run_map(client)?;
+    if !out.status.success() && !client.is_empty() {
+        // Caps on a stale client.kcore key must not stop a guest from booting.
+        out = run_map(&[])?;
+    }
     if !out.status.success() {
         return Err(format!(
             "rbd-nbd map failed: {}",
@@ -211,6 +306,7 @@ pub fn unmap_device(dev: &str) -> Result<(), String> {
     }
     let _ = Command::new("blockdev").args(["--flushbufs", dev]).status();
     let out = Command::new("rbd")
+        .args(client_args())
         .args(["device", "unmap", "-t", "nbd", dev])
         .output()
         .map_err(|e| format!("rbd-nbd unmap: {e}"))?;
@@ -254,6 +350,7 @@ pub fn unmap(pool: &str, image: &str) -> Result<(), String> {
         .args(["--flushbufs", &dev])
         .status();
     let out = Command::new("rbd")
+        .args(client_args())
         .args(["device", "unmap", "-t", "nbd", &dev])
         .output()
         .map_err(|e| format!("rbd-nbd unmap: {e}"))?;
@@ -310,5 +407,52 @@ mod tests {
             device_link("kcore-vms", "kcore-vm-a"),
             PathBuf::from("/dev/rbd/kcore-vms/kcore-vm-a")
         );
+    }
+
+    #[test]
+    fn client_args_follow_the_keyring_file() {
+        let dir = std::env::temp_dir().join(format!("kcore-rbd-client-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kr = dir.join("ceph.client.kcore.keyring");
+        let _ = std::fs::remove_file(&kr);
+        assert!(client_args_for(&kr).is_empty());
+        std::fs::write(&kr, "[client.kcore]\n\tkey = x\n").unwrap();
+        assert_eq!(client_args_for(&kr), ["-n", "client.kcore"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn map_tuning_selects_policy() {
+        assert!(map_tuning("writethrough").contains(&"--rbd-cache-policy=writethrough"));
+        assert!(map_tuning("WriteThrough").contains(&"--rbd-cache-policy=writethrough"));
+        assert!(map_tuning("writeback").contains(&"--rbd-cache-policy=writeback"));
+        assert!(map_tuning("").contains(&"--rbd-cache-policy=writeback"));
+    }
+
+    #[test]
+    fn krbd_refuses_aes256k_keyrings() {
+        let dir = std::env::temp_dir().join(format!("kcore-krbd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let module = dir.join("module");
+        std::fs::create_dir_all(&module).unwrap();
+        let admin = dir.join("admin.keyring");
+        let kcore = dir.join("kcore.keyring");
+        // 32-byte secret base64 (aes256k).
+        std::fs::write(
+            &admin,
+            "[client.admin]\n\tkey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        )
+        .unwrap();
+        std::fs::write(&kcore, "").unwrap();
+        assert!(!krbd_usable_with(&module, &admin, &kcore));
+        std::fs::write(&admin, "[client.admin]\n\tkey = AQShort==\n").unwrap();
+        assert!(krbd_usable_with(&module, &admin, &kcore));
+        assert!(!krbd_usable_with(
+            Path::new("/no/such/module"),
+            &admin,
+            &kcore
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

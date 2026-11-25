@@ -1,0 +1,19 @@
+# A Ceph cluster kcore does not run. kcore does not bootstrap it, reconcile its
+# OSDs, or remove members; it cannot be combined with `nodes`.
+# Status: the reconciler writes the client config to every non-member node.
+# The node agent maps pool kcore-vms as client.admin, so both are required.
+# See docs/ceph-lifecycle.md.
+kind: CephCluster
+metadata:
+  name: corp-ceph
+spec:
+  publicNetwork: "10.30.0.0/24"
+  clusterNetwork: "10.30.0.0/24"
+  external:
+    monHosts: "10.30.0.11:6789,10.30.0.12:6789,10.30.0.13:6789"
+    pool: kcore-vms
+    clientName: client.admin
+    # Keyring body for clientName. Stored once; never returned by get.
+    clientKeyring: |
+      [client.admin]
+          key = REPLACE_WITH_KEY

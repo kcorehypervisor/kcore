@@ -8,6 +8,7 @@ import { errorMessage } from "./rpc";
 import type { Row } from "./rows";
 import { columnsFor } from "./columns";
 import { Bars, Donut, Meter } from "./charts";
+import { DETAIL_VIEWS } from "./CephDetail";
 import { displayTitle, formatDate, label, pretty, rowTitle, sentence, text, toneColor, toneFor, usedPercent } from "./format";
 import {
   ColumnChooser,
@@ -47,11 +48,27 @@ const LIST_COLUMNS: Record<string, { name: string; kind?: "bool" | "number" }[]>
   worker_nodes: [{ name: "node_id" }, { name: "advertise_address" }, { name: "iface" }],
   nodes: [
     { name: "node_id" },
+    { name: "role" },
     { name: "osd_device" },
     { name: "osd_devices" },
     { name: "mon_addr" },
+    { name: "cluster_addr" },
     { name: "public_iface" },
     { name: "cluster_iface" },
+    { name: "weight" },
+    { name: "device_class" },
+  ],
+  pools: [
+    { name: "name" },
+    { name: "application" },
+    { name: "pool_type" },
+    { name: "size", kind: "number" },
+    { name: "min_size", kind: "number" },
+    { name: "pg_num", kind: "number" },
+    { name: "crush_rule" },
+    { name: "compression_mode" },
+    { name: "quota_bytes" },
+    { name: "erasure_profile" },
   ],
 };
 
@@ -79,11 +96,18 @@ function specToValues(fields: Field[], spec: Values): FormValues {
   return values;
 }
 
-function payload(fields: Field[], values: FormValues): Values {
+/**
+ * With `keepEmpty`, a cleared field is sent as empty so it replaces the row's
+ * value; an edit form loaded from the spec must be able to unset a field.
+ */
+function payload(fields: Field[], values: FormValues, keepEmpty = false): Values {
   const body: Values = {};
   for (const field of fields) {
     const raw = values[field.name];
-    if (raw === undefined || raw === "") continue;
+    if (raw === undefined || raw === "") {
+      if (keepEmpty && field.kind !== "file" && field.kind !== "secret") body[field.name] = field.kind === "bool" ? false : field.kind === "json" ? [] : "";
+      continue;
+    }
     if (field.kind === "bool") body[field.name] = Boolean(raw);
     else if (field.kind === "json") {
       const source = String(raw).trim();
@@ -489,7 +513,7 @@ export function ResourcePage() {
     }
     const subject = row && !resource.single ? `${action.label} ${rowTitle(row)}` : action.label;
     try {
-      const result = await action.run({ ...(row ?? {}), ...payload(action.fields, form ?? {}) });
+      const result = await action.run({ ...(row ?? {}), ...payload(action.fields, form ?? {}, Boolean(action.preload && form)) });
       settle(subject, result);
     } catch (error) {
       if (form) throw error;
@@ -635,6 +659,7 @@ export function ResourcePage() {
         loading={Boolean(drawer?.loading)}
         error={drawer?.error ?? ""}
         actions={drawer ? actions(drawer.row, true) : null}
+        view={DETAIL_VIEWS[resource.id]}
         onClose={() => setDrawer(null)}
       />
       <FormDialog request={request} onClose={() => setRequest(null)} />
@@ -687,8 +712,9 @@ function FormDialog({ request, onClose }: { request: FormRequest | null; onClose
   const [ready, setReady] = useState(true);
   const [loadError, setLoadError] = useState("");
   const fields = request?.fields ?? [];
-  const essential = fields.filter((field) => ESSENTIAL.has(field.name));
-  const rest = fields.filter((field) => !ESSENTIAL.has(field.name));
+  const up = (field: Field) => ESSENTIAL.has(field.name) || field.required;
+  const essential = fields.filter(up);
+  const rest = fields.filter((field) => !up(field));
   const split = fields.length > 8 && essential.length > 0;
   const blocked = Boolean(request && ((request.requireForce && !values.force) || (request.preload && !ready)));
 

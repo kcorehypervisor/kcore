@@ -23,9 +23,11 @@ liveness signal and the scheduler still reads `cpu_used` / `memory_used` from
 - **Pull, not push.** Controllers already reach every node on the cluster
   network. Nodes expose metrics; VictoriaMetrics scrapes them.
 - **file_sd.** The controller rewrites
-  `/etc/kcore/metrics/file_sd/nodes.json` from the SQLite node inventory about
-  every 30 seconds (`metrics.refreshIntervalSecs`). New nodes appear without a
-  `nixos-rebuild` of the metrics host.
+  `/etc/kcore/metrics/file_sd/nodes.json` (and sibling `ingress.json`,
+  `slurm.json`, `ceph.json`) from inventory about every 30 seconds
+  (`metrics.refreshIntervalSecs`). New nodes appear without a
+  `nixos-rebuild` of the metrics host. `ceph.json` scrapes each CephCluster
+  member's mgr Prometheus module on **:9283** (module enable is separate).
 - **HA.** Each controller with VictoriaMetrics scrapes the same nodes and keeps
   its own local TSDB. Query either server. Series are not replicated between
   controllers in v1.

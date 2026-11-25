@@ -590,6 +590,151 @@ pub fn parse_osd_counters(json: &serde_json::Value) -> (i32, i32) {
     (up, inn)
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypedCephHealth {
+    pub health_status: String,
+    pub mon_quorum: Vec<String>,
+    pub mon_count: i32,
+    pub osd_total: i32,
+    pub osd_up: i32,
+    pub osd_in: i32,
+    pub pgs_total: i32,
+    pub pgs_not_clean: i32,
+    pub backfill_pgs: i32,
+    pub pgs_by_state: Vec<(String, i32)>,
+    pub noout: bool,
+    pub norebalance: bool,
+    pub flags: Vec<String>,
+    pub checks: Vec<(String, String, String)>,
+    pub bytes_total: i64,
+    pub bytes_used: i64,
+    pub bytes_avail: i64,
+}
+
+/// Typed reading of `ceph -s --format json` for operators and reconcilers.
+pub fn parse_typed_health(json: &serde_json::Value) -> TypedCephHealth {
+    let health_status = json
+        .pointer("/health/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("HEALTH_ERR")
+        .to_string();
+    let mon_quorum: Vec<String> = json
+        .get("quorum_names")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mon_count = json
+        .pointer("/monmap/num_mons")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(mon_quorum.len() as i64) as i32;
+    let osd_total = json
+        .pointer("/osdmap/num_osds")
+        .or_else(|| json.pointer("/osdmap/osdmap/num_osds"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let (osd_up, osd_in) = parse_osd_counters(json);
+    let (pgs_total, pgs_not_clean) = parse_pg_clean(json);
+    let mut pgs_by_state = Vec::new();
+    let mut backfill_pgs = 0;
+    if let Some(states) = json
+        .pointer("/pgmap/pgs_by_state")
+        .and_then(|v| v.as_array())
+    {
+        for s in states {
+            let Some(state_name) = s.get("state_name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let count = s.get("count").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            if state_name.contains("backfill") || state_name.contains("backfilling") {
+                backfill_pgs += count;
+            }
+            pgs_by_state.push((state_name.to_string(), count));
+        }
+        pgs_by_state.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
+    let flags = parse_ceph_flags(json);
+    let noout = flags.iter().any(|f| f == "noout");
+    let norebalance = flags.iter().any(|f| f == "norebalance");
+    let mut checks = Vec::new();
+    if let Some(obj) = json.pointer("/health/checks").and_then(|c| c.as_object()) {
+        let mut names: Vec<&String> = obj.keys().collect();
+        names.sort();
+        for name in names {
+            let severity = obj[name]
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let summary = obj[name]
+                .pointer("/summary/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            if summary.is_empty() {
+                continue;
+            }
+            checks.push((name.clone(), severity, summary));
+        }
+    }
+    let bytes_total = json
+        .pointer("/pgmap/bytes_total")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let bytes_used = json
+        .pointer("/pgmap/bytes_used")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let bytes_avail = json
+        .pointer("/pgmap/bytes_avail")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    TypedCephHealth {
+        health_status,
+        mon_quorum,
+        mon_count,
+        osd_total,
+        osd_up,
+        osd_in,
+        pgs_total,
+        pgs_not_clean,
+        backfill_pgs,
+        pgs_by_state,
+        noout,
+        norebalance,
+        flags,
+        checks,
+        bytes_total,
+        bytes_used,
+        bytes_avail,
+    }
+}
+
+fn parse_ceph_flags(json: &serde_json::Value) -> Vec<String> {
+    let mut flags = Vec::new();
+    for pointer in ["/osdmap/flags", "/osdmap/flags_set", "/osdmap/osdmap/flags"] {
+        match json.pointer(pointer) {
+            Some(serde_json::Value::Array(items)) => {
+                flags.extend(items.iter().filter_map(|f| f.as_str()).map(str::to_string));
+            }
+            Some(serde_json::Value::String(text)) => {
+                flags.extend(
+                    text.split([',', ' '])
+                        .filter(|f| !f.is_empty())
+                        .map(str::to_string),
+                );
+            }
+            _ => {}
+        }
+    }
+    flags.sort();
+    flags.dedup();
+    flags
+}
+
 /// `ceph osd ls-tree <host> -f json`: a JSON array of OSD ids.
 pub fn parse_osd_ls_tree(stdout: &str) -> Result<Vec<String>, String> {
     let ids: Vec<serde_json::Value> =
@@ -907,6 +1052,54 @@ mod tests {
         assert_eq!(parse_osd_ls_tree("[]").unwrap(), Vec::<String>::new());
         assert!(parse_osd_ls_tree("Error ENOENT").is_err());
         assert!(parse_osd_ls_tree("[{}]").is_err());
+    }
+
+    #[test]
+    fn typed_health_reads_quorum_flags_and_checks() {
+        let json: serde_json::Value = serde_json::json!({
+            "health": {
+                "status": "HEALTH_WARN",
+                "checks": {
+                    "OSD_NEARFULL": {
+                        "severity": "HEALTH_WARN",
+                        "summary": {"message": "1 nearfull osd(s)"}
+                    }
+                }
+            },
+            "quorum_names": ["a", "b", "c"],
+            "monmap": {"num_mons": 3},
+            "osdmap": {
+                "num_osds": 3,
+                "num_up_osds": 3,
+                "num_in_osds": 2,
+                "flags": ["noout", "norebalance"]
+            },
+            "pgmap": {
+                "num_pgs": 10,
+                "bytes_total": 100,
+                "bytes_used": 40,
+                "bytes_avail": 60,
+                "pgs_by_state": [
+                    {"state_name": "active+clean", "count": 7},
+                    {"state_name": "active+remapped+backfilling", "count": 3}
+                ]
+            }
+        });
+        let h = parse_typed_health(&json);
+        assert_eq!(h.health_status, "HEALTH_WARN");
+        assert_eq!(h.mon_quorum, vec!["a", "b", "c"]);
+        assert_eq!(h.mon_count, 3);
+        assert_eq!(h.osd_total, 3);
+        assert_eq!(h.osd_up, 3);
+        assert_eq!(h.osd_in, 2);
+        assert_eq!(h.pgs_total, 10);
+        assert_eq!(h.pgs_not_clean, 3);
+        assert_eq!(h.backfill_pgs, 3);
+        assert!(h.noout);
+        assert!(h.norebalance);
+        assert_eq!(h.bytes_used, 40);
+        assert_eq!(h.checks.len(), 1);
+        assert_eq!(h.checks[0].0, "OSD_NEARFULL");
     }
 
     #[test]

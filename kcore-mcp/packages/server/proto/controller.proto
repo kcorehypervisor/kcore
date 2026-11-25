@@ -88,6 +88,9 @@ service Controller {
   // anything new on it. Uncordon returns it to scheduling.
   rpc CordonNode(CordonNodeRequest) returns (CordonNodeResponse);
   rpc UncordonNode(UncordonNodeRequest) returns (UncordonNodeResponse);
+  // Cordon, set Ceph noout, and drain Ceph VMs (or reverse). Refuses when the
+  // node is the only mon or taking it down would break pool min_size.
+  rpc SetNodeMaintenance(SetNodeMaintenanceRequest) returns (SetNodeMaintenanceResponse);
   // Remove the node after it has no VMs or networks. Revokes every certificate
   // issued to it before the row is deleted.
   rpc DeleteNode(DeleteNodeRequest) returns (DeleteNodeResponse);
@@ -160,6 +163,8 @@ service Controller {
   rpc RestoreVolume(RestoreVolumeRequest) returns (RestoreVolumeResponse);
   rpc FlattenVolume(FlattenVolumeRequest) returns (FlattenVolumeResponse);
   rpc ResizeVolume(ResizeVolumeRequest) returns (ResizeVolumeResponse);
+  // Move a detached LVM or ZFS volume onto Ceph RBD and update the row.
+  rpc ConvertVolume(ConvertVolumeRequest) returns (ConvertVolumeResponse);
 
   // Snapshot export hooks (docs/backup.md). Controllers proxy to NodeStorage.
   rpc ExposeVolumeSnapshot(ExposeVolumeSnapshotRequest) returns (ExposeVolumeSnapshotResponse);
@@ -178,6 +183,12 @@ service Controller {
   rpc UnmountVolume(UnmountVolumeRequest) returns (UnmountVolumeResponse);
   // In-place LUKS over an existing plain RBD image (data-destructive; see destroy_data).
   rpc EncryptVolume(EncryptVolumeRequest) returns (EncryptVolumeResponse);
+  // Move a stopped LVM or ZFS VM's disk onto Ceph: new RBD image, extent copy,
+  // storage_backend flip, Nix push, start. The local disk is kept.
+  rpc ConvertVmStorage(ConvertVmStorageRequest) returns (ConvertVmStorageResponse);
+  // Copy a whole Ceph volume into a new volume on another CephCluster (snapshot,
+  // expose, read extents, write). Blocking; the source stays untouched.
+  rpc CopyVolumeToCluster(CopyVolumeToClusterRequest) returns (CopyVolumeToClusterResponse);
 
   rpc CreateSnapshotPolicy(CreateSnapshotPolicyRequest) returns (CreateSnapshotPolicyResponse);
   rpc GetSnapshotPolicy(GetSnapshotPolicyRequest) returns (GetSnapshotPolicyResponse);
@@ -1630,6 +1641,17 @@ message UncordonNodeResponse {
   string message = 2;
 }
 
+message SetNodeMaintenanceRequest {
+  string node_id = 1;
+  // true = enter maintenance; false = leave.
+  bool enable = 2;
+}
+
+message SetNodeMaintenanceResponse {
+  bool success = 1;
+  string message = 2;
+}
+
 message DeleteNodeRequest {
   string node_id = 1;
 }
@@ -1663,6 +1685,8 @@ message GetClusterHealthResponse {
   string ha_lease_holder = 14;
   int64 ha_lease_term = 15;
   int32 unprotected_vms_on_lost_nodes = 16;
+  // Ceph OSD flags currently set on any managed cluster (e.g. noout).
+  repeated string ceph_flags = 17;
 }
 
 message GetHaStatusRequest {}
@@ -2439,6 +2463,19 @@ message UnmountVolumeResponse {
   VolumeInfo volume = 3;
 }
 
+message ConvertVolumeRequest {
+  string volume = 1;
+  // Must be "ceph".
+  string target_storage_class = 2;
+  string ceph_cluster = 3;
+}
+
+message ConvertVolumeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+
 message ResizeVolumeResponse {
   bool success = 1;
   string message = 2;
@@ -2912,6 +2949,49 @@ message CephClusterNodeSpec {
   string osd_device = 6;
   // Additional OSD disks on this node. `osd_device` is always included.
   repeated string osd_devices = 7;
+  // full (default), mon, or osd.
+  string role = 8;
+  // CRUSH weight override; 0 means leave Ceph's default.
+  double weight = 9;
+  // Device class override (ssd / hdd / nvme); empty means detect.
+  string device_class = 10;
+}
+
+message CephPoolSpec {
+  string name = 1;
+  // rbd, cephfs, or rgw. Empty defaults to rbd for kcore-vms.
+  string application = 2;
+  int32 size = 3;
+  int32 min_size = 4;
+  // 0 leaves the autoscaler; a positive value sets pg_num at create.
+  int32 pg_num = 5;
+  string crush_rule = 6;
+  // none / passive / aggressive / force; empty means leave Ceph default.
+  string compression_mode = 7;
+  int64 quota_bytes = 8;
+  // replicated (default) or erasure.
+  string pool_type = 9;
+  // Erasure profile name when pool_type is erasure.
+  string erasure_profile = 10;
+}
+
+message CephRecoverySpec {
+  int32 max_backfills = 1;
+  int32 recovery_max_active = 2;
+  // Hour of day 0-23; -1 means unset.
+  int32 scrub_begin_hour = 3;
+  int32 scrub_end_hour = 4;
+  // Nearfull ratio as percent × 100 (e.g. 8500 = 85%). 0 means leave default.
+  int32 nearfull_ratio_bp = 5;
+}
+
+message CephExternalSpec {
+  // Comma-separated mon_host list.
+  string mon_hosts = 1;
+  string pool = 2;
+  // client.xxx keyring body (cephx). Never returned on get after create.
+  string client_keyring = 3;
+  string client_name = 4;
 }
 
 message CephClusterSpec {
@@ -2924,6 +3004,50 @@ message CephClusterSpec {
   repeated CephClusterNodeSpec nodes = 7;
   // OSD-level dm-crypt via ceph-volume --dmcrypt. Immutable once any OSD exists.
   bool encrypt_osds = 8;
+  // Optional pools; empty means ensure the default kcore-vms RBD pool only.
+  repeated CephPoolSpec pools = 9;
+  CephRecoverySpec recovery = 10;
+  // secure or prefer-crc; empty leaves enable-msgr2 without forcing secure.
+  string ms_mode = 11;
+  // Default image features for new RBD images (e.g. layering,exclusive-lock).
+  string image_features = 12;
+  // writeback or writethrough for new maps; empty means writeback.
+  string cache_policy = 13;
+  // Node ids that will not answer; drain via survivor then purge.
+  repeated string lost_members = 14;
+  // When set, kcore does not bootstrap OSDs; VMs map this external pool.
+  CephExternalSpec external = 15;
+}
+
+message CephPgStateCount {
+  string state = 1;
+  int32 count = 2;
+}
+
+message CephHealthCheck {
+  string severity = 1;
+  string type = 2;
+  string summary = 3;
+}
+
+message CephTypedHealth {
+  string health_status = 1;
+  repeated string mon_quorum = 2;
+  int32 mon_count = 3;
+  int32 osd_total = 4;
+  int32 osd_up = 5;
+  int32 osd_in = 6;
+  int32 pgs_total = 7;
+  repeated CephPgStateCount pgs_by_state = 8;
+  bool noout = 9;
+  bool norebalance = 10;
+  repeated string flags = 11;
+  repeated CephHealthCheck checks = 12;
+  int64 bytes_total = 13;
+  int64 bytes_used = 14;
+  int64 bytes_avail = 15;
+  int32 pgs_not_clean = 16;
+  int32 backfill_pgs = 17;
 }
 
 message CephClusterStatus {
@@ -2932,6 +3056,9 @@ message CephClusterStatus {
   string health_message = 3;
   string ceph_status_json = 4;
   google.protobuf.Timestamp last_transition_at = 5;
+  CephTypedHealth typed_health = 6;
+  // In-progress day-2 note (member drain, OSD replace, backfill ramp).
+  string operation_message = 7;
 }
 
 message CephCluster {
@@ -3370,6 +3497,9 @@ message KubernetesLocalProvisioner {
   string storage_class_name = 2; // empty means "local-path"
   repeated KubernetesHostVolume volumes = 3;
   string mode = 4; // "shared" or "lvm"; empty means shared
+  // When set, install the Ceph RBD CSI StorageClass against this CephCluster
+  // (in addition to or instead of local-path when enabled is false).
+  string ceph_cluster = 5;
 }
 
 message KubernetesClusterSpec {
@@ -4208,4 +4338,41 @@ message GetPostgresqlClusterCredentialsResponse {
   string ca_pem = 5;
   // Passwords kcore generated for login roles without passwordScram.
   repeated PostgresqlRoleCredential roles = 6;
+}
+
+message ConvertVmStorageRequest {
+  // VM id or name.
+  string vm = 1;
+  // Target backend. Only "ceph" is implemented.
+  string to = 2;
+  // Required when the guest is running: the guest is stopped for the copy.
+  bool allow_stop = 3;
+}
+
+message ConvertVmStorageResponse {
+  bool success = 1;
+  string message = 2;
+  string operation_id = 3;
+  int64 bytes_total = 4;
+  int64 bytes_copied = 5;
+  // Local disk left on the node; delete it by hand once the guest is verified.
+  string source_disk = 6;
+}
+
+message CopyVolumeToClusterRequest {
+  // Volume id or name.
+  string name = 1;
+  string to_cluster = 2;
+  // Name of the new volume. Empty means <name>-copy.
+  string new_name = 3;
+  // Cluster that holds the source. Empty resolves from the volume or the only cluster.
+  string from_cluster = 4;
+}
+
+message CopyVolumeToClusterResponse {
+  bool success = 1;
+  string message = 2;
+  VolumeInfo volume = 3;
+  int64 bytes_total = 4;
+  int64 bytes_copied = 5;
 }

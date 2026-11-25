@@ -529,11 +529,27 @@ impl StorageAdapter for ZfsAdapter {
 struct CephAdapter {
     pool: String,
     image_cache_dir: PathBuf,
+    cache_policy: String,
+    image_features: String,
 }
 
 impl CephAdapter {
     fn new(cfg: &StorageConfig) -> Self {
+        let cache_policy = cfg
+            .ceph
+            .as_ref()
+            .map(|c| c.cache_policy.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(crate::rbd_nbd::env_cache_policy);
+        let image_features = cfg
+            .ceph
+            .as_ref()
+            .map(|c| c.image_features.trim().to_string())
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| std::env::var("KCORE_RBD_IMAGE_FEATURES").unwrap_or_default());
         Self {
+            cache_policy,
+            image_features,
             pool: cfg
                 .ceph
                 .as_ref()
@@ -549,7 +565,10 @@ impl CephAdapter {
             .ok_or_else(|| {
                 StorageError::new(
                     ErrorKind::InvalidArgument,
-                    format!("Ceph handle must be {}/<image>", self.pool),
+                    format!(
+                        "Ceph handle must be {}/<image> or {}/<namespace>/<image>",
+                        self.pool, self.pool
+                    ),
                 )
             })
     }
@@ -559,33 +578,94 @@ impl StorageAdapter for CephAdapter {
     fn create_volume(&self, req: CreateVolumeRequest) -> Result<String, StorageError> {
         validate_volume_create_inputs(&req)?;
         let image = sanitize_volume_name(&req.volume_id);
+        let namespace = req
+            .parameters
+            .get("rbd_namespace")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        if !namespace.is_empty() {
+            // Best-effort create; ignore already-exists.
+            let _ = run_cmd(
+                "rbd",
+                &[
+                    "namespace",
+                    "create",
+                    &format!("{}/{}", self.pool, namespace),
+                ],
+                ErrorKind::Internal,
+            );
+        }
         let size_mib = crate::ceph_bootstrap::rbd_size_mib(req.size_bytes)
             .map_err(|e| StorageError::new(ErrorKind::InvalidArgument, e))?;
         let size_arg = format!("{size_mib}M");
-        run_cmd(
-            "rbd",
-            &[
-                "create",
-                &format!("{}/{}", self.pool, image),
-                "--size",
-                &size_arg,
-                "--image-feature",
-                "layering",
-            ],
-            ErrorKind::Internal,
-        )?;
-        Ok(format!("{}/{}", self.pool, image))
+        let features = if self.image_features.is_empty() {
+            "layering,exclusive-lock"
+        } else {
+            self.image_features.as_str()
+        };
+        let spec = if namespace.is_empty() {
+            format!("{}/{}", self.pool, image)
+        } else {
+            format!("{}/{}/{}", self.pool, namespace, image)
+        };
+        let create_args = [
+            "create",
+            &spec,
+            "--size",
+            &size_arg,
+            "--image-feature",
+            features,
+        ];
+        let client = crate::rbd_nbd::client_args();
+        let mut with_client: Vec<&str> = client.to_vec();
+        with_client.extend(create_args);
+        if let Err(e) = run_cmd("rbd", &with_client, ErrorKind::Internal) {
+            if client.is_empty() {
+                return Err(e);
+            }
+            // A stale client.kcore key falls back to the admin key.
+            run_cmd("rbd", &create_args, ErrorKind::Internal)?;
+        }
+        if let Some(iops) = req.parameters.get("qos_iops") {
+            if let Ok(v) = iops.parse::<i64>() {
+                if v > 0 {
+                    let _ = run_cmd(
+                        "rbd",
+                        &["config", "image", "set", &spec, "rbd_qos_iops_limit", iops],
+                        ErrorKind::Internal,
+                    );
+                }
+            }
+        }
+        if let Some(bps) = req.parameters.get("qos_bps") {
+            if let Ok(v) = bps.parse::<i64>() {
+                if v > 0 {
+                    let _ = run_cmd(
+                        "rbd",
+                        &["config", "image", "set", &spec, "rbd_qos_bps_limit", bps],
+                        ErrorKind::Internal,
+                    );
+                }
+            }
+        }
+        Ok(spec)
     }
 
     fn delete_volume(&self, backend_handle: &str) -> Result<(), StorageError> {
         self.image(backend_handle)?;
-        run_cmd("rbd", &["rm", backend_handle], ErrorKind::Internal)
+        // Move to trash so operators can recover; purge via List/PurgeVolumeTrash.
+        run_cmd(
+            "rbd",
+            &["trash", "move", backend_handle],
+            ErrorKind::Internal,
+        )
     }
 
     fn attach_volume(&self, req: AttachVolumeRequest) -> Result<(), StorageError> {
         validate_attach_request(&req)?;
         let image = self.image(&req.backend_handle)?;
-        crate::rbd_nbd::map(&self.pool, image)
+        crate::rbd_nbd::map_with_policy(&self.pool, image, &self.cache_policy)
             .map(|_| ())
             .map_err(|e| StorageError::new(ErrorKind::Internal, e))
     }
@@ -1146,15 +1226,13 @@ pub struct FenceOutcome {
 /// `source_hosts`, plus a range covering each of those addresses, and drop
 /// any RBD lock the clients held.
 ///
-/// Images are created with `layering` only, so there is no exclusive lock
-/// to arbitrate writers: once the controller restarts a guest elsewhere the
-/// old rbd-nbd on the lost node would keep writing. The OSD blocklist is the
-/// only thing that stops it, which is why this must run before the guest is
-/// reassigned. Clients are listed by `rbd status` (watchers), with `rbd lock
-/// ls` as a second source for images that do carry locks. The range is added
-/// even when that list is empty: a missing watcher is not proof the writer
-/// stopped. With neither clients nor a usable IP range, the call fails
-/// rather than reporting the image fenced.
+/// New images carry `layering,exclusive-lock`, and maps set
+/// `rbd_blocklist_on_break_lock`. Failover still blocklists watchers and the
+/// host address range before reassignment, so a returning client whose watch
+/// already expired is cut off even when the lock list is empty. Clients are
+/// listed by `rbd status` (watchers), with `rbd lock ls` as a second source.
+/// With neither clients nor a usable IP range, the call fails rather than
+/// reporting the image fenced.
 pub struct HostStorageProbe {
     pub queried: bool,
     pub osd_state: String,
@@ -2150,6 +2228,8 @@ cidr:192.168.47.4:0/32 2026-10-27T15:47:53.253734+0000
         let adapter = CephAdapter {
             pool: "kcore-vms".into(),
             image_cache_dir: PathBuf::from("/var/lib/kcore/images"),
+            cache_policy: String::new(),
+            image_features: String::new(),
         };
         assert_eq!(adapter.image("kcore-vms/img").unwrap(), "img");
         let err = adapter.image("other/img").expect_err("wrong pool");
@@ -2174,6 +2254,8 @@ cidr:192.168.47.4:0/32 2026-10-27T15:47:53.253734+0000
         let adapter = CephAdapter {
             pool: "kcore-vms".into(),
             image_cache_dir: PathBuf::from("/var/lib/kcore/images"),
+            cache_policy: String::new(),
+            image_features: String::new(),
         };
         let err = adapter
             .create_volume(CreateVolumeRequest {
@@ -2233,6 +2315,8 @@ cidr:192.168.47.4:0/32 2026-10-27T15:47:53.253734+0000
             backend: StorageBackendKind::Ceph,
             ceph: Some(crate::config::CephConfig {
                 pool: "custom-pool".into(),
+                cache_policy: String::new(),
+                image_features: String::new(),
             }),
             ..StorageConfig::default()
         };

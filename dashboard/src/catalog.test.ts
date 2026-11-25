@@ -204,6 +204,41 @@ describe("soak", () => {
   });
 });
 
+describe("Ceph controls", () => {
+  beforeAll(() => {
+    setTransport(createRouterTransport((router) => serveUnary(router, Controller, true)));
+  });
+
+  const ceph = () => RESOURCES.find((candidate) => candidate.id === "ceph")!;
+  const base = { name: "kcore-san", public_network: "192.168.40.0/24", nodes: JSON.stringify([{ node_id: "node-103", osd_device: "/dev/sda", role: "full", weight: "1.82" }]) };
+
+  it("creates a cluster with pools, recovery and client settings", async () => {
+    const form = {
+      ...base,
+      pools: JSON.stringify([{ name: "kcore-vms", application: "rbd", size: "3", min_size: "2", quota_bytes: "1 TiB" }]),
+      max_backfills: "1",
+      scrub_begin_hour: "22",
+      nearfull_percent: "85",
+      ms_mode: "secure",
+      cache_policy: "writethrough",
+      lost_members: "node-118",
+    };
+    await expect(ceph().create!(form)).resolves.toMatchObject({ ok: true });
+  });
+
+  it("refuses a bad role, pool application, or scrub hour", async () => {
+    await expect(ceph().create!({ ...base, nodes: JSON.stringify([{ node_id: "n", role: "mds" }]) })).rejects.toThrow(FormError);
+    await expect(ceph().create!({ ...base, pools: JSON.stringify([{ name: "p", application: "nfs" }]) })).rejects.toThrow(FormError);
+    await expect(ceph().create!({ ...base, scrub_end_hour: "24" })).rejects.toThrow(FormError);
+  });
+
+  it("updates from the stored spec", () => {
+    const update = ceph().actions.find((candidate) => candidate.name === "update")!;
+    expect(update.preload).toBe(true);
+    expect(update.fields.map((field) => field.name)).toEqual(expect.arrayContaining(["pools", "lost_members", "ms_mode", "cache_policy", "image_features"]));
+  });
+});
+
 describe("ingress controls", () => {
   const resource = (id: string) => RESOURCES.find((candidate) => candidate.id === id)!;
   const action = (id: string, name: string) => resource(id).actions.find((candidate) => candidate.name === name)!;

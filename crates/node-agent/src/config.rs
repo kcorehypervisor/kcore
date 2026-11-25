@@ -188,6 +188,10 @@ pub struct ZfsConfig {
 pub struct CephConfig {
     #[serde(default = "default_ceph_pool")]
     pub pool: String,
+    #[serde(default)]
+    pub cache_policy: String,
+    #[serde(default)]
+    pub image_features: String,
 }
 
 fn default_listen_addr() -> String {

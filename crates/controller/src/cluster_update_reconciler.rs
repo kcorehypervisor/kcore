@@ -108,6 +108,8 @@ async fn reconcile_update(
         }
     }
 
+    crate::ceph_update_gate::sweep(db, clients, &update.name, &nodes).await;
+
     // Terminal cluster phases handled below when all nodes settle.
 
     if nodes
@@ -156,6 +158,21 @@ async fn reconcile_update(
 
         match node_row.phase.as_str() {
             "pending" => {
+                if let Err(err) = crate::ceph_update_gate::before_prepare(
+                    db,
+                    clients,
+                    &update.name,
+                    &node_row.node_id,
+                )
+                .await
+                {
+                    db.upsert_cluster_update_node(&ClusterUpdateNodeRow {
+                        last_error: err,
+                        ..node_row.clone()
+                    })
+                    .map_err(|e| format!("mark ceph gate: {e}"))?;
+                    return Ok(());
+                }
                 let host = db.get_node_host_status(&node_row.node_id).ok().flatten();
                 let has_generation = host.as_ref().is_some_and(|row| {
                     row.update_capabilities
@@ -806,6 +823,52 @@ pub(crate) fn rollout_order(db: &Database, nodes: &mut [ClusterUpdateNodeRow]) {
             }
         }
     });
+    // Among Ceph members, put mon/full before osd-only without moving
+    // non-members (controllers stay last).
+    prefer_ceph_mons_first(db, nodes);
+}
+
+fn prefer_ceph_mons_first(db: &Database, nodes: &mut [ClusterUpdateNodeRow]) {
+    let Ok(clusters) = db.list_ceph_clusters() else {
+        return;
+    };
+    for row in clusters {
+        let Ok(spec) = crate::ceph_cluster_spec::spec_from_json(&row.spec_json) else {
+            continue;
+        };
+        let member_set: std::collections::HashSet<&str> =
+            spec.nodes.iter().map(|n| n.node_id.as_str()).collect();
+        let member_ids: Vec<String> = nodes
+            .iter()
+            .filter(|n| member_set.contains(n.node_id.as_str()))
+            .map(|n| n.node_id.clone())
+            .collect();
+        if member_ids.len() < 2 {
+            continue;
+        }
+        let preferred = crate::ceph_update_gate::mon_first_rollout_order(&spec, &member_ids);
+        if preferred == member_ids {
+            continue;
+        }
+        let mut by_id: std::collections::HashMap<String, ClusterUpdateNodeRow> = nodes
+            .iter()
+            .cloned()
+            .map(|n| (n.node_id.clone(), n))
+            .collect();
+        let mut preferred_iter = preferred.into_iter();
+        let mut out = Vec::with_capacity(nodes.len());
+        for n in nodes.iter() {
+            if member_set.contains(n.node_id.as_str()) {
+                let next = preferred_iter.next().expect("member covered");
+                out.push(by_id.remove(&next).expect("row present"));
+            } else if let Some(row) = by_id.remove(&n.node_id) {
+                out.push(row);
+            }
+        }
+        for (i, row) in out.into_iter().enumerate() {
+            nodes[i] = row;
+        }
+    }
 }
 
 /// A node that finished its update. The canary soaks before the rollout
