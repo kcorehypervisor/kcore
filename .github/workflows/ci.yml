@@ -102,6 +102,9 @@ jobs:
       - name: Provisioning module eval
         run: nix build --no-link .#checks.x86_64-linux.provisioning-module-eval
 
+      - name: Kubernetes module eval
+        run: nix build --no-link .#checks.x86_64-linux.kubernetes-module-eval
+
       - name: Nix format check
         run: nix build --no-link .#checks.x86_64-linux.fmt-nix
 

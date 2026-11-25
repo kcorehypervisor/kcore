@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 
 use crate::db::{Database, KubernetesClusterNodeRow, KubernetesNodeUpgradeRow};
 use crate::kubernetes_lifecycle::{self, MemberSnapshot, ScaleStep};
+use crate::kubernetes_nodes::{self, GrpcNodes, KubernetesNodes, SecretFile};
 use crate::kubernetes_pki::{self, KubernetesPki, NodeInfo};
 use crate::kubernetes_upgrade::{
     self, apply_failure_summary, ApplyProgress, PendingApply, UpgradeMember, UpgradeStep,
@@ -16,16 +17,25 @@ use crate::kubernetes_upgrade::{
 use crate::kubernetes_versions;
 use crate::node_client::NodeClients;
 
+pub mod ops;
+
 /// Orchestrates Kubernetes cluster bootstrap across multiple nodes
 #[derive(Clone)]
 pub struct KubernetesOrchestrator {
     db: Database,
     node_clients: NodeClients,
+    /// Node-agent / etcd / API I/O. Tests pass a [`kubernetes_nodes::Fake`].
+    nodes: Arc<dyn KubernetesNodes>,
     /// Serializes Nix renders for one node so two cluster bootstraps cannot
     /// overwrite each other's file with a stale single-cluster config.
     node_apply_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// One bootstrap or scale task per cluster. The loop ticks every 30s.
     inflight: Arc<StdMutex<HashSet<String>>>,
+    /// When each control plane was first seen unhealthy ("cluster/node" ->
+    /// unix seconds). Lost on restart, which only restarts the repair clock.
+    unhealthy: Arc<StdMutex<HashMap<String, i64>>>,
+    /// Where scheduled and manual etcd snapshots are written.
+    backup_root: std::path::PathBuf,
 }
 
 /// Bootstrap phase for tracking progress
@@ -48,6 +58,8 @@ pub const NODES_NOT_READY: &str = "nodes not Ready";
 /// No reconcile loop acts on it, and node renders leave it out.
 pub const PHASE_DELETING: &str = "deleting";
 pub const PHASE_RECONFIGURING: &str = "reconfiguring";
+pub const PHASE_RESTORING: &str = "restoring";
+pub const PHASE_ROLLING_BACK: &str = "rolling-back";
 const APPLY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const ETCD_MEMBERS_TIMEOUT_SECS: u64 = 300;
 const KUBERNETES_DISABLED_NIX: &str = "{\n  kcore.kubernetes.enable = false;\n}\n";
@@ -84,12 +96,29 @@ impl BootstrapPhase {
 
 impl KubernetesOrchestrator {
     pub fn new(db: Database, node_clients: NodeClients) -> Self {
+        let nodes: Arc<dyn KubernetesNodes> = Arc::new(GrpcNodes::new(node_clients.clone()));
+        Self::with_nodes(db, node_clients, nodes)
+    }
+
+    pub fn with_nodes(
+        db: Database,
+        node_clients: NodeClients,
+        nodes: Arc<dyn KubernetesNodes>,
+    ) -> Self {
         Self {
             db,
             node_clients,
+            nodes,
             node_apply_locks: Arc::new(StdMutex::new(HashMap::new())),
             inflight: Arc::new(StdMutex::new(HashSet::new())),
+            unhealthy: Arc::new(StdMutex::new(HashMap::new())),
+            backup_root: std::path::PathBuf::from(ops::DEFAULT_BACKUP_ROOT),
         }
+    }
+
+    pub fn with_backup_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.backup_root = root.into();
+        self
     }
 
     fn claim(&self, cluster_name: &str) -> bool {
@@ -418,11 +447,11 @@ impl KubernetesOrchestrator {
             let api_healthy = control_plane
                 && !ip.is_empty()
                 && match &pki {
-                    Some(pki) => {
-                        apiserver_ready_at(&format!("{ip}:{api_port}"), &api_host, &pki.ca_cert)
-                            .await
-                            .unwrap_or(false)
-                    }
+                    Some(pki) => self
+                        .nodes
+                        .apiserver_ready(&format!("{ip}:{api_port}"), &api_host, &pki.ca_cert)
+                        .await
+                        .unwrap_or(false),
                     None => false,
                 };
             nodes.push(MemberHealth {
@@ -598,17 +627,6 @@ impl KubernetesOrchestrator {
         );
 
         let address = format!("{}:9091", node.ip_address);
-        // Startup redeploy runs before the controller has dialed every node.
-        if self.node_clients.get_admin(&address).is_none() {
-            self.node_clients
-                .connect(&address)
-                .await
-                .with_context(|| format!("connect node agent {address}"))?;
-        }
-        let mut admin_client = self
-            .node_clients
-            .get_admin(&address)
-            .context("node client not found")?;
 
         // Fail before the node rebuild if this cluster has no etcd certs yet.
         pki.etcd_node_certs
@@ -618,10 +636,43 @@ impl KubernetesOrchestrator {
             .get(&node.node_id)
             .context("etcd peer cert not found")?;
 
+        let cluster = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+        let kubelet_kubeconfig = if node.kubelet_kubeconfig.is_empty() {
+            let mut issued = pki.clone();
+            let kubeconfig = kubernetes_pki::issue_node_certificates(
+                &mut issued,
+                cluster_name,
+                &cluster.api_server_endpoint,
+                &NodeInfo {
+                    node_id: node.node_id.clone(),
+                    hostname: if node.hostname.is_empty() {
+                        node.node_id.clone()
+                    } else {
+                        node.hostname.clone()
+                    },
+                    ip_address: node.ip_address.clone(),
+                },
+            )?;
+            // Persist any etcd certs issue_node_certificates may have filled.
+            if issued.etcd_node_certs.len() != pki.etcd_node_certs.len()
+                || issued.etcd_node_peer_certs.len() != pki.etcd_node_peer_certs.len()
+            {
+                self.db.store_kubernetes_pki(cluster_name, &issued)?;
+            }
+            kubeconfig
+        } else {
+            node.kubelet_kubeconfig.clone()
+        };
+
         let apply_lock = self.node_apply_lock(&node.node_id);
         let _guard = apply_lock.lock().await;
+        // Kubelet credentials are delivered as a secret file; the Nix module
+        // only gets an empty string so the private key never enters /nix/store.
         let rendered = self
-            .render_node_nix(&node.node_id, cluster_name, pki, &node.kubelet_kubeconfig)
+            .render_node_nix(&node.node_id, cluster_name, pki, "")
             .await?;
 
         info!(
@@ -632,29 +683,74 @@ impl KubernetesOrchestrator {
             "generated Kubernetes configuration for every cluster on the node"
         );
 
-        // Apply configuration via node agent RPC
-        use crate::node_proto::ApplyRawKubernetesConfigRequest;
-
-        let request = ApplyRawKubernetesConfigRequest {
-            nix_config_content: rendered.nix,
-            kubeconfig_data: rendered.primary_kubeconfig,
-        };
-
-        let response = admin_client
-            .apply_raw_kubernetes_config(request)
+        let encryption = self
+            .db
+            .get_kubernetes_cluster_ops(cluster_name)
+            .ok()
+            .flatten()
+            .and_then(|ops| {
+                crate::kubernetes_hardening::EncryptionKeys::from_json(&ops.encryption_json)
+            });
+        let mut secrets = pki_secret_files(cluster_name, &node.node_id, pki, encryption.as_ref());
+        if !pki.admin_kubeconfig.is_empty() {
+            secrets.push(SecretFile {
+                path: format!(
+                    "{}/admin.conf",
+                    crate::nixgen::kubernetes_pki_key_dir(cluster_name)
+                ),
+                mode: 0o600,
+                content: pki.admin_kubeconfig.as_bytes().to_vec(),
+            });
+        }
+        if !kubelet_kubeconfig.is_empty() {
+            secrets.push(SecretFile {
+                path: format!(
+                    "{}/kubelet.conf",
+                    crate::nixgen::kubernetes_pki_key_dir(cluster_name)
+                ),
+                mode: 0o600,
+                content: kubelet_kubeconfig.into_bytes(),
+            });
+        }
+        if let Some(ops) = self
+            .db
+            .get_kubernetes_cluster_ops(cluster_name)
+            .ok()
+            .flatten()
+        {
+            let oidc = crate::kubernetes_hardening::OidcSpec::from_json(&ops.oidc_json);
+            if !oidc.ca_pem.is_empty() {
+                secrets.push(SecretFile {
+                    path: format!(
+                        "{}/oidc-ca.crt",
+                        crate::nixgen::kubernetes_pki_key_dir(cluster_name)
+                    ),
+                    mode: 0o600,
+                    content: oidc.ca_pem.into_bytes(),
+                });
+            }
+        }
+        let apply_id = self
+            .nodes
+            .apply_config(
+                &address,
+                &rendered.nix,
+                &rendered.primary_kubeconfig,
+                &secrets,
+            )
             .await
-            .context("apply_raw_kubernetes_config RPC failed")?
-            .into_inner();
+            .map_err(|e| anyhow!(e))?;
+        self.record_rendered_hash(cluster_name, &node.node_id, pki)
+            .await;
 
         info!(
             cluster = cluster_name,
             node_id = node.node_id,
-            apply_id = response.apply_id,
-            status = response.status,
+            apply_id = %apply_id,
             "Kubernetes configuration deployment started on node"
         );
 
-        Ok(response.apply_id)
+        Ok(apply_id)
     }
 
     /// Nix for every cluster that already has PKI and includes this node.
@@ -738,6 +834,8 @@ impl KubernetesOrchestrator {
                     &cfg.local_provisioner_json,
                     &cluster.api_server_endpoint,
                 ),
+                ceph_csi_manifest: self.ceph_csi_manifest_for(&cluster.name),
+                metrics_server_manifest: crate::kubernetes_csi::metrics_server_manifest(),
                 // The node's own version, not the cluster's: a rollout moves
                 // one node at a time, and any other redeploy must not jump ahead.
                 version: crate::kubernetes_versions::normalize(
@@ -746,6 +844,21 @@ impl KubernetesOrchestrator {
                         .kubernetes_node_version(&cluster.name, node_id)?
                         .unwrap_or_default(),
                 ),
+                oidc: self
+                    .db
+                    .get_kubernetes_cluster_ops(&cluster.name)?
+                    .map(|ops| crate::kubernetes_hardening::OidcSpec::from_json(&ops.oidc_json))
+                    .unwrap_or_default(),
+                default_deny_label: self
+                    .db
+                    .get_kubernetes_cluster_ops(&cluster.name)?
+                    .map(|ops| ops.default_deny_label)
+                    .unwrap_or_default(),
+                reserve_for_vms: self
+                    .db
+                    .list_vms_for_node(node_id)
+                    .map(|vms| !vms.is_empty())
+                    .unwrap_or(false),
             };
             let ports = crate::nixgen::kubernetes_listen_ports(&settings.api_server_endpoint);
             if ports.api_server == 6443 {
@@ -912,14 +1025,16 @@ impl KubernetesOrchestrator {
             if ip.is_empty() {
                 continue;
             }
-            match etcd_member_healthy(
-                ip,
-                etcd_port,
-                &pki.etcd_ca_cert,
-                &pki.apiserver_etcd_client_cert,
-                &pki.apiserver_etcd_client_key,
-            )
-            .await
+            match self
+                .nodes
+                .etcd_health(
+                    ip,
+                    etcd_port,
+                    &pki.etcd_ca_cert,
+                    &pki.apiserver_etcd_client_cert,
+                    &pki.apiserver_etcd_client_key,
+                )
+                .await
             {
                 Ok(true) => healthy += 1,
                 Ok(false) => {}
@@ -1115,7 +1230,13 @@ impl KubernetesOrchestrator {
         let Some(pki) = self.db.load_kubernetes_pki(cluster_name)? else {
             return Ok(false);
         };
-        match apiserver_ready(&cluster.api_server_endpoint, &pki.ca_cert).await {
+        let endpoint = endpoint_host_port(&cluster.api_server_endpoint);
+        let host = endpoint.split(':').next().unwrap_or("").to_string();
+        match self
+            .nodes
+            .apiserver_ready(&endpoint, &host, &pki.ca_cert)
+            .await
+        {
             Ok(ready) => Ok(ready),
             Err(e) => {
                 info!(
@@ -1185,6 +1306,76 @@ impl KubernetesOrchestrator {
         );
         if let Err(e) = self.ensure_ceph_csi_secrets(cluster_name).await {
             info!(cluster = cluster_name, error = %e, "ceph CSI secret apply failed");
+        }
+        if let Err(e) = self.ensure_storage_ceph(cluster_name).await {
+            info!(cluster = cluster_name, error = %e, "storage.ceph ensure failed");
+        }
+        Ok(())
+    }
+
+    /// When `storage.ceph` is enabled: require every member has a Ceph public
+    /// address, ensure `client.k8s-<cluster>` exists, and store its key.
+    async fn ensure_storage_ceph(&self, cluster_name: &str) -> Result<()> {
+        let Some(ops) = self.db.get_kubernetes_cluster_ops(cluster_name)? else {
+            return Ok(());
+        };
+        if ops.storage_json.trim().is_empty() {
+            return Ok(());
+        }
+        let mut storage: crate::kubernetes_csi::CephStorage =
+            serde_json::from_str(&ops.storage_json).context("storage_json")?;
+        if !storage.enabled {
+            return Ok(());
+        }
+        let members = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        for member in &members {
+            let node = self
+                .db
+                .get_node(&member.node_id)?
+                .with_context(|| format!("member {} missing", member.node_id))?;
+            let addr = node.address.split(':').next().unwrap_or("").trim();
+            if addr.is_empty() {
+                anyhow::bail!(
+                    "member {} has no address for Ceph CSI preflight",
+                    member.node_id
+                );
+            }
+        }
+        let ceph_row = self
+            .db
+            .get_ceph_cluster(&storage.cluster)?
+            .with_context(|| format!("CephCluster {} missing", storage.cluster))?;
+        let ceph_spec = crate::ceph_cluster_spec::spec_from_json(&ceph_row.spec_json)
+            .context("decode CephCluster")?;
+        let admin_member = ceph_spec
+            .nodes
+            .first()
+            .context("CephCluster has no members")?;
+        let mut admin = crate::ceph_cluster_reconciler::admin_for(
+            &self.db,
+            &self.node_clients,
+            &admin_member.node_id,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let client = format!("client.{}", storage.client_name(cluster_name));
+        let key_resp = admin
+            .ensure_ceph_client_key(tonic::Request::new(
+                crate::node_proto::EnsureCephClientKeyRequest {
+                    client_name: client,
+                    pool: storage.pool.clone(),
+                },
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("EnsureCephClientKey: {e}"))?
+            .into_inner();
+        let user_key = crate::kubernetes_local::cephx_key_from_keyring(&key_resp.keyring)
+            .context("ceph CSI keyring has no key=")?;
+        if storage.user_key != user_key {
+            storage.user_key = user_key;
+            let json = serde_json::to_string(&storage)?;
+            self.db
+                .set_kubernetes_cluster_storage_json(cluster_name, &json)?;
         }
         Ok(())
     }
@@ -1363,6 +1554,16 @@ impl KubernetesOrchestrator {
                     drained.push(node_id);
                 }
                 ScaleStep::RemoveEtcd { node_id } => {
+                    if self.member_role(cluster_name, &node_id)? == "control-plane" {
+                        if let Err(e) = self.take_snapshot(cluster_name, "pre-scale-down").await {
+                            warn!(
+                                cluster = cluster_name,
+                                node = %node_id,
+                                error = %format!("{e:#}"),
+                                "pre-scale-down snapshot skipped"
+                            );
+                        }
+                    }
                     self.etcd_member_remove(cluster_name, &node_id).await?;
                 }
                 ScaleStep::DeleteApiNode { node_id } => {
@@ -1390,6 +1591,8 @@ impl KubernetesOrchestrator {
 
     /// Advance a rolling version upgrade until a step has to wait.
     async fn reconcile_upgrade(&self, cluster_name: &str) -> Result<()> {
+        let start = self.observe_upgrade(cluster_name).await?;
+        self.record_upgrade_start(cluster_name, &start).await;
         for _ in 0..16 {
             let view = self.observe_upgrade(cluster_name).await?;
             let desired = kubernetes_versions::effective(&view.desired);
@@ -1541,7 +1744,8 @@ impl KubernetesOrchestrator {
             cluster_name,
             "degraded",
             &format!(
-                "{}: {message}. Fix the node and re-apply the manifest to resume.",
+                "{}: {message}. Fix the node and re-apply the manifest to resume, \
+                 or run `kctl kubernetes upgrade rollback` to return to the previous version.",
                 kubernetes_upgrade::UPGRADE_FAILED
             ),
         )?;
@@ -1561,7 +1765,7 @@ impl KubernetesOrchestrator {
         let name = self
             .registered_name(cluster_name, node_id, &address)
             .await?;
-        crate::kubernetes_admin::cordon(&self.node_clients, &address, &name, false)
+        kubernetes_nodes::cordon(self.nodes.as_ref(), &address, &name, false)
             .await
             .map_err(|err| anyhow!(err))
     }
@@ -1593,40 +1797,7 @@ impl KubernetesOrchestrator {
     }
 
     async fn apply_progress(&self, address: &str, apply_id: &str) -> (ApplyProgress, String) {
-        use crate::node_proto::{GetNixApplyStatusRequest, NixApplyPhase};
-        if self.node_clients.get_admin(address).is_none()
-            && self.node_clients.connect(address).await.is_err()
-        {
-            return (
-                ApplyProgress::Running,
-                format!("node agent {address} unreachable"),
-            );
-        }
-        let Some(mut admin) = self.node_clients.get_admin(address) else {
-            return (
-                ApplyProgress::Running,
-                format!("node agent {address} unreachable"),
-            );
-        };
-        match admin
-            .get_nix_apply_status(GetNixApplyStatusRequest {
-                apply_id: apply_id.to_string(),
-            })
-            .await
-        {
-            Ok(response) => {
-                let response = response.into_inner();
-                let progress = match NixApplyPhase::try_from(response.phase) {
-                    Ok(NixApplyPhase::Running) => ApplyProgress::Running,
-                    Ok(NixApplyPhase::Succeeded) => ApplyProgress::Succeeded,
-                    Ok(NixApplyPhase::Failed) => ApplyProgress::Failed,
-                    _ => ApplyProgress::Unknown,
-                };
-                (progress, response.message)
-            }
-            // A rebuild can restart the agent; keep waiting for it.
-            Err(err) => (ApplyProgress::Running, err.message().to_string()),
-        }
+        self.nodes.apply_status(address, apply_id).await
     }
 
     async fn observe_upgrade(&self, cluster_name: &str) -> Result<UpgradeView> {
@@ -1871,7 +2042,7 @@ impl KubernetesOrchestrator {
         let name = self
             .registered_name(cluster_name, node_id, &address)
             .await?;
-        crate::kubernetes_admin::drain_node(&self.node_clients, &address, &name)
+        kubernetes_nodes::drain_node(self.nodes.as_ref(), &address, &name)
             .await
             .map_err(|err| anyhow!(err))
     }
@@ -1890,7 +2061,7 @@ impl KubernetesOrchestrator {
             let name = self
                 .registered_name(cluster_name, &row.node_id, &address)
                 .await?;
-            crate::kubernetes_admin::label_worker(&self.node_clients, &address, &name)
+            kubernetes_nodes::label_worker(self.nodes.as_ref(), &address, &name)
                 .await
                 .map_err(|err| anyhow!(err))?;
         }
@@ -1902,7 +2073,7 @@ impl KubernetesOrchestrator {
         let name = self
             .registered_name(cluster_name, node_id, &address)
             .await?;
-        crate::kubernetes_admin::delete_node(&self.node_clients, &address, &name)
+        kubernetes_nodes::delete_node(self.nodes.as_ref(), &address, &name)
             .await
             .map_err(|err| anyhow!(err))?;
         Ok(())
@@ -1924,13 +2095,9 @@ impl KubernetesOrchestrator {
         } else {
             row.advertise_address.clone()
         };
-        let name = crate::kubernetes_admin::registered_node_name(
-            &nodes,
-            &row.k8s_node_name,
-            &node.hostname,
-            &ip,
-        )
-        .map_err(|err| anyhow!(err))?;
+        let name =
+            kubernetes_nodes::registered_node_name(&nodes, &row.k8s_node_name, &node.hostname, &ip)
+                .map_err(|err| anyhow!(err))?;
         if row.k8s_node_name != name {
             let mut stored = row;
             stored.k8s_node_name = name.clone();
@@ -1949,7 +2116,7 @@ impl KubernetesOrchestrator {
         } else {
             self.api_peer(cluster_name, None).await?.0
         };
-        crate::kubernetes_admin::list_nodes(&self.node_clients, &address)
+        kubernetes_nodes::list_nodes(self.nodes.as_ref(), &address)
             .await
             .map_err(|err| anyhow!(err))
     }
@@ -2038,25 +2205,11 @@ impl KubernetesOrchestrator {
     }
 
     async fn push_nix(&self, address: &str, nix: &str, kubeconfig: &str) -> Result<()> {
-        if self.node_clients.get_admin(address).is_none() {
-            self.node_clients
-                .connect(address)
-                .await
-                .with_context(|| format!("connect node agent {address}"))?;
-        }
-        let mut admin = self
-            .node_clients
-            .get_admin(address)
-            .context("node client not found")?;
-        use crate::node_proto::ApplyRawKubernetesConfigRequest;
-        admin
-            .apply_raw_kubernetes_config(ApplyRawKubernetesConfigRequest {
-                nix_config_content: nix.to_string(),
-                kubeconfig_data: kubeconfig.to_string(),
-            })
+        self.nodes
+            .apply_config(address, nix, kubeconfig, &[])
             .await
-            .context("apply_raw_kubernetes_config RPC failed")?;
-        Ok(())
+            .map(|_| ())
+            .map_err(|e| anyhow!(e))
     }
 
     async fn etcd_member_list(
@@ -2133,14 +2286,16 @@ impl KubernetesOrchestrator {
             return Ok(false);
         };
         let port = self.etcd_client_port(cluster_name)?;
-        etcd_member_healthy(
-            ip,
-            port,
-            &pki.etcd_ca_cert,
-            &pki.apiserver_etcd_client_cert,
-            &pki.apiserver_etcd_client_key,
-        )
-        .await
+        self.nodes
+            .etcd_health(
+                ip,
+                port,
+                &pki.etcd_ca_cert,
+                &pki.apiserver_etcd_client_cert,
+                &pki.apiserver_etcd_client_key,
+            )
+            .await
+            .map_err(|e| anyhow!(e))
     }
 
     fn etcd_client_port(&self, cluster_name: &str) -> Result<u16> {
@@ -2164,22 +2319,24 @@ impl KubernetesOrchestrator {
                 Ok(ip) if !ip.is_empty() => ip,
                 _ => continue,
             };
-            match tls_post(
-                &format!("{ip}:{port}"),
-                &ip,
-                path,
-                body,
-                &pki.etcd_ca_cert,
-                &pki.apiserver_etcd_client_cert,
-                &pki.apiserver_etcd_client_key,
-            )
-            .await
+            match self
+                .nodes
+                .etcd_post(
+                    &ip,
+                    port,
+                    path,
+                    body,
+                    &pki.etcd_ca_cert,
+                    &pki.apiserver_etcd_client_cert,
+                    &pki.apiserver_etcd_client_key,
+                )
+                .await
             {
                 Ok((status, response)) if (200..300).contains(&status) => return Ok(response),
                 Ok((status, response)) => {
                     last_error = anyhow!("etcd {path} on {ip} returned {status}: {response}");
                 }
-                Err(err) => last_error = err,
+                Err(err) => last_error = anyhow!(err),
             }
         }
         Err(last_error)
@@ -2197,6 +2354,140 @@ impl KubernetesOrchestrator {
         Ok(())
     }
 }
+
+/// Private keys and API-server secret configs delivered outside `/nix/store`.
+fn pki_secret_files(
+    cluster: &str,
+    node_id: &str,
+    pki: &KubernetesPki,
+    encryption: Option<&crate::kubernetes_hardening::EncryptionKeys>,
+) -> Vec<SecretFile> {
+    let root = crate::nixgen::kubernetes_pki_key_dir(cluster);
+    let mut out = vec![
+        SecretFile {
+            path: format!("{root}/ca.key"),
+            mode: 0o600,
+            content: pki.ca_key.as_bytes().to_vec(),
+        },
+        SecretFile {
+            path: format!("{root}/sa.key"),
+            mode: 0o600,
+            content: pki.sa_key.as_bytes().to_vec(),
+        },
+        SecretFile {
+            path: format!("{root}/etcd/ca.key"),
+            mode: 0o600,
+            content: pki.etcd_ca_key.as_bytes().to_vec(),
+        },
+        SecretFile {
+            path: format!("{root}/apiserver.key"),
+            mode: 0o600,
+            content: pki.apiserver_key.as_bytes().to_vec(),
+        },
+        SecretFile {
+            path: format!("{root}/apiserver-kubelet-client.key"),
+            mode: 0o600,
+            content: pki.apiserver_kubelet_client_key.as_bytes().to_vec(),
+        },
+        SecretFile {
+            path: format!("{root}/apiserver-etcd-client.key"),
+            mode: 0o600,
+            content: pki.apiserver_etcd_client_key.as_bytes().to_vec(),
+        },
+        SecretFile {
+            path: format!("{root}/encryption-config.yaml"),
+            mode: 0o600,
+            content: encryption_provider_config(encryption, pki).into_bytes(),
+        },
+        SecretFile {
+            path: format!("{root}/audit-policy.yaml"),
+            mode: 0o600,
+            content: DEFAULT_AUDIT_POLICY.as_bytes().to_vec(),
+        },
+        SecretFile {
+            path: format!("{root}/pod-security-admission.yaml"),
+            mode: 0o600,
+            content: DEFAULT_POD_SECURITY_ADMISSION.as_bytes().to_vec(),
+        },
+    ];
+    if let Some((_, key)) = pki.etcd_node_certs.get(node_id) {
+        out.push(SecretFile {
+            path: format!("{root}/etcd/server.key"),
+            mode: 0o600,
+            content: key.as_bytes().to_vec(),
+        });
+    }
+    if let Some((_, key)) = pki.etcd_node_peer_certs.get(node_id) {
+        out.push(SecretFile {
+            path: format!("{root}/etcd/peer.key"),
+            mode: 0o600,
+            content: key.as_bytes().to_vec(),
+        });
+    }
+    out
+}
+
+/// Prefer stored encryption keys; otherwise derive a bootstrap key from the CA.
+fn encryption_provider_config(
+    encryption: Option<&crate::kubernetes_hardening::EncryptionKeys>,
+    pki: &KubernetesPki,
+) -> String {
+    if let Some(keys) = encryption {
+        return keys.provider_config_yaml();
+    }
+    use aws_lc_rs::digest::{digest, SHA256};
+    let digest = digest(&SHA256, pki.ca_key.as_bytes());
+    let key_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
+    format!(
+        r#"apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - secretbox:
+          keys:
+            - name: key1
+              secret: {key_b64}
+      - identity: {{}}
+"#
+    )
+}
+
+const DEFAULT_AUDIT_POLICY: &str = r#"apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived
+rules:
+  - level: None
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+  - level: Metadata
+    omitStages:
+      - RequestReceived
+"#;
+
+const DEFAULT_POD_SECURITY_ADMISSION: &str = r#"apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: PodSecurity
+    configuration:
+      apiVersion: pod-security.admission.config.k8s.io/v1
+      kind: PodSecurityConfiguration
+      defaults:
+        enforce: "baseline"
+        enforce-version: "latest"
+        warn: "restricted"
+        warn-version: "latest"
+        audit: "restricted"
+        audit-version: "latest"
+      exemptions:
+        usernames: []
+        runtimeClasses: []
+        namespaces: ["kube-system", "ceph-csi"]
+"#;
 
 fn endpoint_host_port(raw: &str) -> String {
     raw.trim()
@@ -2564,6 +2855,25 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
             }
         }
 
+        match db.list_kubernetes_clusters_by_phase("ready") {
+            Ok(clusters) => {
+                for cluster in clusters {
+                    if !orchestrator.claim(&cluster.name) {
+                        continue;
+                    }
+                    let orchestrator = orchestrator.clone();
+                    let cluster_name = cluster.name.clone();
+                    tokio::spawn(async move {
+                        orchestrator.reconcile_ready(&cluster_name).await;
+                        orchestrator.release(&cluster_name);
+                    });
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to list ready Kubernetes clusters");
+            }
+        }
+
         match db.list_kubernetes_clusters_by_phase("scaling") {
             Ok(clusters) => {
                 for cluster in clusters {
@@ -2651,6 +2961,61 @@ pub async fn start_kubernetes_orchestrator(db: Database, node_clients: NodeClien
             }
             Err(e) => {
                 error!(error = %e, "failed to list upgrading Kubernetes clusters");
+            }
+        }
+
+        match db.list_kubernetes_clusters_by_phase(PHASE_RESTORING) {
+            Ok(clusters) => {
+                for cluster in clusters {
+                    if !orchestrator.claim(&cluster.name) {
+                        continue;
+                    }
+                    let orchestrator = orchestrator.clone();
+                    let cluster_name = cluster.name.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = orchestrator.reconcile_restore(&cluster_name).await {
+                            error!(
+                                cluster = cluster_name,
+                                error = %e,
+                                "Kubernetes etcd restore step failed"
+                            );
+                        }
+                        orchestrator.release(&cluster_name);
+                    });
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to list restoring Kubernetes clusters");
+            }
+        }
+
+        match db.list_kubernetes_clusters_by_phase(PHASE_ROLLING_BACK) {
+            Ok(clusters) => {
+                for cluster in clusters {
+                    if !orchestrator.claim(&cluster.name) {
+                        continue;
+                    }
+                    let orchestrator = orchestrator.clone();
+                    let cluster_name = cluster.name.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = orchestrator.reconcile_rollback(&cluster_name).await {
+                            error!(
+                                cluster = cluster_name,
+                                error = %e,
+                                "Kubernetes rollback step failed"
+                            );
+                            let _ = orchestrator.db.set_kubernetes_cluster_status(
+                                &cluster_name,
+                                PHASE_ROLLING_BACK,
+                                &format!("rollback step error, retrying: {e:#}"),
+                            );
+                        }
+                        orchestrator.release(&cluster_name);
+                    });
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "failed to list rolling-back Kubernetes clusters");
             }
         }
 
@@ -2835,5 +3200,61 @@ mod release_tests {
             db.get_kubernetes_cluster("b").unwrap().unwrap().phase,
             "ready"
         );
+    }
+}
+
+#[cfg(test)]
+mod fake_nodes_tests {
+    use super::*;
+    use crate::kubernetes_lifecycle::ListedNode;
+    use crate::kubernetes_nodes::Fake;
+
+    #[tokio::test]
+    async fn fake_nodes_report_api_and_etcd_health() {
+        let db = Database::open(":memory:").unwrap();
+        let fake = Fake::new(&["10.0.0.1"]);
+        fake.with_api_nodes(vec![ListedNode {
+            name: "cp-1".into(),
+            internal_ips: vec!["10.0.0.1".into()],
+            ready: true,
+            kubelet_version: "v1.36.6".into(),
+        }]);
+        let orch = KubernetesOrchestrator::with_nodes(db, NodeClients::new(None), fake.clone());
+        assert!(orch
+            .nodes
+            .apiserver_ready("10.0.0.1:6443", "10.0.0.1", "ca")
+            .await
+            .unwrap());
+        assert!(orch
+            .nodes
+            .etcd_health("10.0.0.1", 2379, "ca", "cert", "key")
+            .await
+            .unwrap());
+        let listed = kubernetes_nodes::list_nodes(orch.nodes.as_ref(), "10.0.0.1:9091")
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "cp-1");
+    }
+
+    #[tokio::test]
+    async fn fake_apply_records_pki_secrets_when_pushed() {
+        let fake = Fake::new(&["10.0.0.1"]);
+        let secrets = vec![SecretFile {
+            path: "/var/lib/kcore/kubernetes/demo/pki/ca.key".into(),
+            mode: 0o600,
+            content: b"key".to_vec(),
+        }];
+        let id = fake
+            .apply_config(
+                "10.0.0.1:9091",
+                "{ kcore.kubernetes.enable = true; }",
+                "",
+                &secrets,
+            )
+            .await
+            .unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(fake.secrets.lock().unwrap().len(), 1);
     }
 }

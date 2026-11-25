@@ -124,6 +124,83 @@ let
       controlPlane.config.systemd.services.${unit}.serviceConfig.ExecStart
     && lib.hasInfix "ETCD_INITIAL_CLUSTER=" controlPlane.config.environment.etc.${path}.text;
 
+  hardened = nixosSystem {
+    inherit (pkgs) system;
+    modules = [
+      ../modules/kcore-kubernetes.nix
+      (
+        _:
+        base
+        // {
+          kcore.kubernetes = {
+            enable = true;
+            role = "control-plane";
+            advertiseAddress = "10.0.0.1";
+            apiServerEndpoint = "10.0.0.1:6443";
+            encryptionProviderConfigFile = "/etc/kubernetes/encryption.yaml";
+            auditPolicyFile = "/etc/kubernetes/audit.yaml";
+            oidc = {
+              issuerUrl = "https://idp.example/";
+              clientId = "kcore";
+              usernameClaim = "sub";
+              groupsClaim = "groups";
+            };
+            additionalClusters.b = {
+              role = "control-plane";
+              advertiseAddress = "10.0.0.1";
+              apiServerEndpoint = "10.0.0.1:7443";
+              encryptionProviderConfigFile = "/etc/kubernetes/b/encryption.yaml";
+            };
+          };
+        }
+      )
+    ];
+  };
+  apiServerFlags = host: unit: host.config.systemd.services.${unit}.serviceConfig.ExecStart;
+  cmFlags = host: unit: host.config.systemd.services.${unit}.serviceConfig.ExecStart;
+  schedFlags = host: unit: host.config.systemd.services.${unit}.serviceConfig.ExecStart;
+
+  # Private keys come from the directory the agent wrote, not from the store.
+  keyDir = "/var/lib/kcore/kubernetes/prod/pki";
+  keyed = nixosSystem {
+    inherit (pkgs) system;
+    modules = [
+      ../modules/kcore-kubernetes.nix
+      (
+        _:
+        base
+        // {
+          kcore.kubernetes = {
+            enable = true;
+            role = "control-plane";
+            advertiseAddress = "10.0.0.1";
+            apiServerEndpoint = "10.0.0.1:6443";
+            pkiKeyDir = keyDir;
+            additionalClusters.b = {
+              role = "control-plane";
+              advertiseAddress = "10.0.0.1";
+              apiServerEndpoint = "10.0.0.1:7443";
+              pkiKeyDir = "/var/lib/kcore/kubernetes/b/pki";
+            };
+          };
+        }
+      )
+    ];
+  };
+  etcSource = host: path: host.config.environment.etc.${path}.source;
+  keysLinked =
+    host: prefix: dir:
+    lib.all (file: toString (etcSource host "${prefix}/${file}") == "${dir}/${file}") [
+      "ca.key"
+      "sa.key"
+      "apiserver.key"
+      "apiserver-kubelet-client.key"
+      "apiserver-etcd-client.key"
+      "etcd/ca.key"
+      "etcd/server.key"
+      "etcd/peer.key"
+    ];
+
   pinned = mkHost "" releases.hostPin;
   upgraded = lib.mapAttrsToList (version: _: {
     inherit version;
@@ -158,6 +235,26 @@ assert reloadsOnChange "keepalived-b";
 assert lib.elem "containerd.service" installed.config.systemd.services.kubelet.after;
 assert membersOutsideExecStart "etcd" "kubernetes/etcd-bootstrap.env";
 assert membersOutsideExecStart "etcd-b" "kubernetes/b/etcd-bootstrap.env";
+assert lib.hasInfix "--encryption-provider-config=/etc/kubernetes/encryption.yaml" (
+  apiServerFlags hardened "kube-apiserver"
+);
+assert lib.hasInfix "--encryption-provider-config=/etc/kubernetes/b/encryption.yaml" (
+  apiServerFlags hardened "kube-apiserver-b"
+);
+assert !lib.hasInfix "encryption-provider-config" (apiServerFlags controlPlane "kube-apiserver");
+assert lib.hasInfix "--audit-log-maxage=30" (apiServerFlags hardened "kube-apiserver");
+assert lib.hasInfix "--audit-log-maxbackup=10" (apiServerFlags hardened "kube-apiserver");
+assert lib.hasInfix "--audit-log-maxsize=100" (apiServerFlags hardened "kube-apiserver");
+assert lib.hasInfix "--oidc-issuer-url=https://idp.example/" (
+  apiServerFlags hardened "kube-apiserver"
+);
+assert lib.hasInfix "--profiling=false" (cmFlags hardened "kube-controller-manager");
+assert lib.hasInfix "--profiling=false" (schedFlags hardened "kube-scheduler");
+assert keysLinked keyed "kubernetes/pki" keyDir;
+assert keysLinked keyed "kubernetes/b/pki" "/var/lib/kcore/kubernetes/b/pki";
+assert !(controlPlane.config.environment.etc ? "kubernetes/pki/ca.key");
+assert toString (etcSource keyed "kubernetes/admin.conf") == "${keyDir}/admin.conf";
+assert !(lib.hasAttr "text" keyed.config.environment.etc."kubernetes/admin.conf");
 assert retiresPrimary pinned;
 assert !lib.hasInfix "b|-)" (retireScript pinned);
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;

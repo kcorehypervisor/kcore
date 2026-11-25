@@ -30,6 +30,21 @@ let
 
   keepalivedNotrack = import ./kcore-keepalived-notrack.nix { inherit pkgs; };
 
+  # With pkiKeyDir set the node agent has already written the private key
+  # there, so /etc links to it and the key never enters /nix/store. Without it
+  # the inline PEM is used, which does land in the store.
+  pkiKeyEtc =
+    dir: file: inline:
+    lib.mkIf (dir != null || inline != "") (
+      if dir != null then
+        { source = "${dir}/${file}"; }
+      else
+        {
+          text = inline;
+          mode = "0600";
+        }
+    );
+
   # The etcd data directory outlives the cluster that wrote it: deleting a
   # cluster and creating a new one on the same hosts must not start etcd on
   # the old cluster's data. The directory records the etcd CA it was written
@@ -123,6 +138,159 @@ let
     pkgs.writeShellScript "kcore-apiserver-check-${toString port}" ''
       exec ${pkgs.curl}/bin/curl -sk -m 1 -o /dev/null -f https://127.0.0.1:${toString port}/livez
     '';
+
+  hardeningOptions = {
+    encryptionProviderConfigFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "EncryptionConfiguration file for Secrets at rest. The file must already exist on the node.";
+    };
+    auditPolicyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Audit policy file. Setting it turns on API audit logging to auditLogPath.";
+    };
+    auditLogPath = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/log/kubernetes/audit.log";
+      description = "Where the API server writes audit events.";
+    };
+    podSecurityAdmissionConfigFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "AdmissionConfiguration file that configures Pod Security admission.";
+    };
+    oidc = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          issuerUrl = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "OIDC issuer URL. Null leaves OIDC off.";
+          };
+          clientId = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+          };
+          usernameClaim = lib.mkOption {
+            type = lib.types.str;
+            default = "sub";
+          };
+          groupsClaim = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+          };
+          caFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+          };
+        };
+      };
+      default = { };
+      description = "OIDC authentication for the API server.";
+    };
+    # Stays true so existing clusters keep working. Set false once nothing
+    # relies on unauthenticated health probes.
+    anonymousAuth = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Allow anonymous API requests.";
+    };
+    profiling = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Expose the API server profiling endpoints.";
+    };
+    tlsMinVersion = lib.mkOption {
+      type = lib.types.str;
+      default = "VersionTLS12";
+      description = "Minimum TLS version the API server accepts.";
+    };
+    networkPolicyDefaultDenyLabel = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        When set, install a CiliumClusterwideNetworkPolicy that denies ingress to
+        namespaces labeled with this key=true, allowing DNS and same-namespace traffic.
+      '';
+    };
+    systemReserved = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      description = "kubelet systemReserved (cpu/memory) for hosts that also run VMs.";
+    };
+    kubeReserved = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      description = "kubelet kubeReserved for hosts that also run VMs.";
+    };
+  };
+
+  kubeletReservedYaml =
+    name: attrs:
+    if attrs == { } then
+      ""
+    else
+      ''
+        ${name}:
+      ''
+      + lib.concatStrings (lib.mapAttrsToList (k: v: "          ${k}: \"${v}\"\n") attrs);
+
+  defaultDenyNetworkPolicyManifest = label: ''
+    apiVersion: cilium.io/v2
+    kind: CiliumClusterwideNetworkPolicy
+    metadata:
+      name: kcore-default-deny
+    spec:
+      description: "Deny ingress to namespaces labeled ${label}=true; allow DNS and same-namespace."
+      endpointSelector:
+        matchLabels: {}
+      ingress:
+        - fromEndpoints:
+            - matchLabels:
+                k8s:io.kubernetes.pod.namespace: kube-system
+        - toPorts:
+            - ports:
+                - port: "53"
+                  protocol: UDP
+                - port: "53"
+                  protocol: TCP
+      # Namespaces opt in with the label; without it this policy does not select them.
+      # Operators label namespaces: kubectl label ns foo ${label}=true
+  '';
+
+  # Appended after the last fixed flag, so each entry starts a continuation.
+  apiServerHardeningFlags =
+    c:
+    lib.concatMapStrings (flag: " \\\n  ${flag}") (
+      lib.optional (
+        c.encryptionProviderConfigFile != null
+      ) "--encryption-provider-config=${c.encryptionProviderConfigFile}"
+      ++ lib.optionals (c.auditPolicyFile != null) [
+        "--audit-policy-file=${c.auditPolicyFile}"
+        "--audit-log-path=${c.auditLogPath}"
+        "--audit-log-maxage=30"
+        "--audit-log-maxbackup=10"
+        "--audit-log-maxsize=100"
+      ]
+      ++ lib.optional (
+        c.podSecurityAdmissionConfigFile != null
+      ) "--admission-control-config-file=${c.podSecurityAdmissionConfigFile}"
+      ++ lib.optionals (c.oidc.issuerUrl != null) (
+        [
+          "--oidc-issuer-url=${c.oidc.issuerUrl}"
+          "--oidc-client-id=${c.oidc.clientId}"
+          "--oidc-username-claim=${c.oidc.usernameClaim}"
+        ]
+        ++ lib.optional (c.oidc.groupsClaim != "") "--oidc-groups-claim=${c.oidc.groupsClaim}"
+        ++ lib.optional (c.oidc.caFile != null) "--oidc-ca-file=${c.oidc.caFile}"
+      )
+      ++ lib.optional (!c.anonymousAuth) "--anonymous-auth=false"
+      ++ [
+        "--profiling=${lib.boolToString c.profiling}"
+        "--tls-min-version=${c.tlsMinVersion}"
+      ]
+    );
   vrrpApiServerScript = name: port: ''
     vrrp_script ${name} {
       script "${apiServerCheck port}"
@@ -600,19 +768,36 @@ let
         '';
       };
 
-      environment.etc."kubernetes/${name}/admin.conf" = lib.mkIf (c.kubeconfigData != "") {
-        text = c.kubeconfigData;
-        mode = "0600";
-      };
-      environment.etc."kubernetes/${name}/kubelet.conf" =
-        lib.mkIf (c.kubeconfigData != "" || c.kubeletKubeconfigData != "")
+      environment.etc."kubernetes/${name}/admin.conf" =
+        if c.pkiKeyDir != null then
           {
+            source = "${c.pkiKeyDir}/admin.conf";
+            mode = "0600";
+          }
+        else
+          lib.mkIf (c.kubeconfigData != "") {
+            text = c.kubeconfigData;
+            mode = "0600";
+          };
+      environment.etc."kubernetes/${name}/kubelet.conf" =
+        if c.pkiKeyDir != null then
+          {
+            source = "${c.pkiKeyDir}/kubelet.conf";
+            mode = "0600";
+          }
+        else
+          lib.mkIf (c.kubeconfigData != "" || c.kubeletKubeconfigData != "") {
             text = if c.kubeletKubeconfigData != "" then c.kubeletKubeconfigData else c.kubeconfigData;
             mode = "0600";
           };
       environment.etc."kubernetes/${name}/bootstrap-kubelet.conf" =
-        lib.mkIf (c.kubeconfigData != "" || c.kubeletKubeconfigData != "")
+        if c.pkiKeyDir != null then
           {
+            source = "${c.pkiKeyDir}/kubelet.conf";
+            mode = "0600";
+          }
+        else
+          lib.mkIf (c.kubeconfigData != "" || c.kubeletKubeconfigData != "") {
             text = if c.kubeletKubeconfigData != "" then c.kubeletKubeconfigData else c.kubeconfigData;
             mode = "0600";
           };
@@ -621,14 +806,8 @@ let
         text = c.caCrt;
         mode = "0644";
       };
-      environment.etc."kubernetes/${name}/pki/ca.key" = lib.mkIf (c.caKey != "") {
-        text = c.caKey;
-        mode = "0600";
-      };
-      environment.etc."kubernetes/${name}/pki/sa.key" = lib.mkIf (c.saKey != "") {
-        text = c.saKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/${name}/pki/ca.key" = pkiKeyEtc c.pkiKeyDir "ca.key" c.caKey;
+      environment.etc."kubernetes/${name}/pki/sa.key" = pkiKeyEtc c.pkiKeyDir "sa.key" c.saKey;
       environment.etc."kubernetes/${name}/pki/sa.pub" = lib.mkIf (c.saPub != "") {
         text = c.saPub;
         mode = "0644";
@@ -637,10 +816,9 @@ let
         text = c.apiserverCrt;
         mode = "0644";
       };
-      environment.etc."kubernetes/${name}/pki/apiserver.key" = lib.mkIf (c.apiserverKey != "") {
-        text = c.apiserverKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/${name}/pki/apiserver.key" =
+        pkiKeyEtc c.pkiKeyDir "apiserver.key"
+          c.apiserverKey;
       environment.etc."kubernetes/${name}/pki/apiserver-kubelet-client.crt" =
         lib.mkIf (c.apiserverKubeletClientCrt != "")
           {
@@ -648,11 +826,8 @@ let
             mode = "0644";
           };
       environment.etc."kubernetes/${name}/pki/apiserver-kubelet-client.key" =
-        lib.mkIf (c.apiserverKubeletClientKey != "")
-          {
-            text = c.apiserverKubeletClientKey;
-            mode = "0600";
-          };
+        pkiKeyEtc c.pkiKeyDir "apiserver-kubelet-client.key"
+          c.apiserverKubeletClientKey;
       environment.etc."kubernetes/${name}/pki/apiserver-etcd-client.crt" =
         lib.mkIf (c.apiserverEtcdClientCrt != "")
           {
@@ -660,35 +835,29 @@ let
             mode = "0644";
           };
       environment.etc."kubernetes/${name}/pki/apiserver-etcd-client.key" =
-        lib.mkIf (c.apiserverEtcdClientKey != "")
-          {
-            text = c.apiserverEtcdClientKey;
-            mode = "0600";
-          };
+        pkiKeyEtc c.pkiKeyDir "apiserver-etcd-client.key"
+          c.apiserverEtcdClientKey;
       environment.etc."kubernetes/${name}/pki/etcd/ca.crt" = lib.mkIf (c.etcdCaCrt != "") {
         text = c.etcdCaCrt;
         mode = "0644";
       };
-      environment.etc."kubernetes/${name}/pki/etcd/ca.key" = lib.mkIf (c.etcdCaKey != "") {
-        text = c.etcdCaKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/${name}/pki/etcd/ca.key" =
+        pkiKeyEtc c.pkiKeyDir "etcd/ca.key"
+          c.etcdCaKey;
       environment.etc."kubernetes/${name}/pki/etcd/server.crt" = lib.mkIf (c.etcdServerCrt != "") {
         text = c.etcdServerCrt;
         mode = "0644";
       };
-      environment.etc."kubernetes/${name}/pki/etcd/server.key" = lib.mkIf (c.etcdServerKey != "") {
-        text = c.etcdServerKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/${name}/pki/etcd/server.key" =
+        pkiKeyEtc c.pkiKeyDir "etcd/server.key"
+          c.etcdServerKey;
       environment.etc."kubernetes/${name}/pki/etcd/peer.crt" = lib.mkIf (c.etcdPeerCrt != "") {
         text = c.etcdPeerCrt;
         mode = "0644";
       };
-      environment.etc."kubernetes/${name}/pki/etcd/peer.key" = lib.mkIf (c.etcdPeerKey != "") {
-        text = c.etcdPeerKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/${name}/pki/etcd/peer.key" =
+        pkiKeyEtc c.pkiKeyDir "etcd/peer.key"
+          c.etcdPeerKey;
 
       environment.etc."kubernetes/${name}/kubelet-config.yaml" = {
         mode = "0644";
@@ -734,6 +903,7 @@ let
           streamingConnectionIdleTimeout: 4h0m0s
           syncFrequency: 1m0s
           volumePluginDir: /usr/libexec/kubernetes/kubelet-plugins/volume/exec/
+          ${kubeletReservedYaml "systemReserved" c.systemReserved}${kubeletReservedYaml "kubeReserved" c.kubeReserved}
         '';
       };
 
@@ -835,7 +1005,7 @@ let
               --service-cluster-ip-range=${c.serviceCidr} \
               --authorization-mode=Node,RBAC \
               --enable-admission-plugins=NodeRestriction \
-              --allow-privileged=true
+              --allow-privileged=true${apiServerHardeningFlags c}
           '';
           Restart = "always";
           RestartSec = "10s";
@@ -863,7 +1033,8 @@ let
               --root-ca-file=${pki}/ca.crt \
               --service-account-private-key-file=${pki}/sa.key \
               --service-cluster-ip-range=${c.serviceCidr} \
-              --use-service-account-credentials=true
+              --use-service-account-credentials=true \
+              --profiling=false
           '';
           Restart = "always";
           RestartSec = "10s";
@@ -881,7 +1052,8 @@ let
               --bind-address=127.0.0.1 \
               --secure-port=${toString c.schedulerPort} \
               --kubeconfig=${kubeconfigFile} \
-              --leader-elect=true
+              --leader-elect=true \
+              --profiling=false
           '';
           Restart = "always";
           RestartSec = "10s";
@@ -1247,6 +1419,18 @@ in
       '';
     };
 
+    metricsServerManifest = lib.mkOption {
+      type = lib.types.lines;
+      default = "";
+      description = "metrics-server manifests applied after the API is ready. Empty skips it.";
+    };
+
+    cephCsiManifest = lib.mkOption {
+      type = lib.types.lines;
+      default = "";
+      description = "Ceph RBD CSI StorageClass/Secret/ConfigMap. Empty skips it. Uses rbd-nbd.";
+    };
+
     # PKI Certificates - Kubernetes CA
     caCrt = lib.mkOption {
       type = lib.types.str;
@@ -1347,10 +1531,28 @@ in
       description = "etcd peer private key (PEM).";
     };
 
+    pkiKeyDir = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/var/lib/kcore/kubernetes/prod/pki";
+      description = ''
+        Directory holding the private keys (ca.key, sa.key, apiserver.key,
+        apiserver-kubelet-client.key, apiserver-etcd-client.key, etcd/ca.key,
+        etcd/server.key, etcd/peer.key). The node agent writes them before the
+        rebuild. /etc/kubernetes/pki links to them, so the keys stay out of the
+        Nix store. Null keeps the inline `*Key` options.
+      '';
+    };
+
     additionalClusters = lib.mkOption {
       type = lib.types.attrsOf (
         lib.types.submodule {
           options = {
+            pkiKeyDir = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Private key directory for this cluster; see kcore.kubernetes.pkiKeyDir.";
+            };
             enable = lib.mkOption {
               type = lib.types.bool;
               default = true;
@@ -1535,7 +1737,8 @@ in
               type = lib.types.str;
               default = "";
             };
-          };
+          }
+          // hardeningOptions;
         }
       );
       default = { };
@@ -1545,7 +1748,8 @@ in
         API server, kubelet, containerd, and bridge network.
       '';
     };
-  };
+  }
+  // hardeningOptions;
 
   config = lib.mkMerge [
     (lib.mkIf cfg.enable {
@@ -1676,10 +1880,17 @@ in
       };
 
       # Write kubeconfig if provided
-      environment.etc."kubernetes/admin.conf" = lib.mkIf (cfg.kubeconfigData != "") {
-        text = cfg.kubeconfigData;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/admin.conf" =
+        if cfg.pkiKeyDir != null then
+          {
+            source = "${cfg.pkiKeyDir}/admin.conf";
+            mode = "0600";
+          }
+        else
+          lib.mkIf (cfg.kubeconfigData != "") {
+            text = cfg.kubeconfigData;
+            mode = "0600";
+          };
 
       # Write PKI certificates
       environment.etc."kubernetes/pki/ca.crt" = lib.mkIf (cfg.caCrt != "") {
@@ -1687,15 +1898,9 @@ in
         mode = "0644";
       };
 
-      environment.etc."kubernetes/pki/ca.key" = lib.mkIf (cfg.caKey != "") {
-        text = cfg.caKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/pki/ca.key" = pkiKeyEtc cfg.pkiKeyDir "ca.key" cfg.caKey;
 
-      environment.etc."kubernetes/pki/sa.key" = lib.mkIf (cfg.saKey != "") {
-        text = cfg.saKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/pki/sa.key" = pkiKeyEtc cfg.pkiKeyDir "sa.key" cfg.saKey;
 
       environment.etc."kubernetes/pki/sa.pub" = lib.mkIf (cfg.saPub != "") {
         text = cfg.saPub;
@@ -1707,10 +1912,9 @@ in
         mode = "0644";
       };
 
-      environment.etc."kubernetes/pki/apiserver.key" = lib.mkIf (cfg.apiserverKey != "") {
-        text = cfg.apiserverKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/pki/apiserver.key" =
+        pkiKeyEtc cfg.pkiKeyDir "apiserver.key"
+          cfg.apiserverKey;
 
       environment.etc."kubernetes/pki/apiserver-kubelet-client.crt" =
         lib.mkIf (cfg.apiserverKubeletClientCrt != "")
@@ -1720,11 +1924,8 @@ in
           };
 
       environment.etc."kubernetes/pki/apiserver-kubelet-client.key" =
-        lib.mkIf (cfg.apiserverKubeletClientKey != "")
-          {
-            text = cfg.apiserverKubeletClientKey;
-            mode = "0600";
-          };
+        pkiKeyEtc cfg.pkiKeyDir "apiserver-kubelet-client.key"
+          cfg.apiserverKubeletClientKey;
 
       environment.etc."kubernetes/pki/apiserver-etcd-client.crt" =
         lib.mkIf (cfg.apiserverEtcdClientCrt != "")
@@ -1734,41 +1935,33 @@ in
           };
 
       environment.etc."kubernetes/pki/apiserver-etcd-client.key" =
-        lib.mkIf (cfg.apiserverEtcdClientKey != "")
-          {
-            text = cfg.apiserverEtcdClientKey;
-            mode = "0600";
-          };
+        pkiKeyEtc cfg.pkiKeyDir "apiserver-etcd-client.key"
+          cfg.apiserverEtcdClientKey;
 
       environment.etc."kubernetes/pki/etcd/ca.crt" = lib.mkIf (cfg.etcdCaCrt != "") {
         text = cfg.etcdCaCrt;
         mode = "0644";
       };
 
-      environment.etc."kubernetes/pki/etcd/ca.key" = lib.mkIf (cfg.etcdCaKey != "") {
-        text = cfg.etcdCaKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/pki/etcd/ca.key" = pkiKeyEtc cfg.pkiKeyDir "etcd/ca.key" cfg.etcdCaKey;
 
       environment.etc."kubernetes/pki/etcd/server.crt" = lib.mkIf (cfg.etcdServerCrt != "") {
         text = cfg.etcdServerCrt;
         mode = "0644";
       };
 
-      environment.etc."kubernetes/pki/etcd/server.key" = lib.mkIf (cfg.etcdServerKey != "") {
-        text = cfg.etcdServerKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/pki/etcd/server.key" =
+        pkiKeyEtc cfg.pkiKeyDir "etcd/server.key"
+          cfg.etcdServerKey;
 
       environment.etc."kubernetes/pki/etcd/peer.crt" = lib.mkIf (cfg.etcdPeerCrt != "") {
         text = cfg.etcdPeerCrt;
         mode = "0644";
       };
 
-      environment.etc."kubernetes/pki/etcd/peer.key" = lib.mkIf (cfg.etcdPeerKey != "") {
-        text = cfg.etcdPeerKey;
-        mode = "0600";
-      };
+      environment.etc."kubernetes/pki/etcd/peer.key" =
+        pkiKeyEtc cfg.pkiKeyDir "etcd/peer.key"
+          cfg.etcdPeerKey;
 
       # Kubelet configuration file
       environment.etc."kubernetes/kubelet-config.yaml" = {
@@ -1810,22 +2003,33 @@ in
           streamingConnectionIdleTimeout: 4h0m0s
           syncFrequency: 1m0s
           volumePluginDir: /usr/libexec/kubernetes/kubelet-plugins/volume/exec/
+          ${kubeletReservedYaml "systemReserved" cfg.systemReserved}${kubeletReservedYaml "kubeReserved" cfg.kubeReserved}
         '';
         mode = "0644";
       };
 
       # Bootstrap kubeconfig for kubelet (minimal, will be replaced after TLS bootstrap)
       environment.etc."kubernetes/bootstrap-kubelet.conf" =
-        lib.mkIf (cfg.kubeconfigData != "" || cfg.kubeletKubeconfigData != "")
+        if cfg.pkiKeyDir != null then
           {
+            source = "${cfg.pkiKeyDir}/kubelet.conf";
+            mode = "0600";
+          }
+        else
+          lib.mkIf (cfg.kubeconfigData != "" || cfg.kubeletKubeconfigData != "") {
             text = if cfg.kubeletKubeconfigData != "" then cfg.kubeletKubeconfigData else cfg.kubeconfigData;
             mode = "0600";
           };
 
       # Kubelet kubeconfig. A joining node uses its own client certificate.
       environment.etc."kubernetes/kubelet.conf" =
-        lib.mkIf (cfg.kubeconfigData != "" || cfg.kubeletKubeconfigData != "")
+        if cfg.pkiKeyDir != null then
           {
+            source = "${cfg.pkiKeyDir}/kubelet.conf";
+            mode = "0600";
+          }
+        else
+          lib.mkIf (cfg.kubeconfigData != "" || cfg.kubeletKubeconfigData != "") {
             text = if cfg.kubeletKubeconfigData != "" then cfg.kubeletKubeconfigData else cfg.kubeconfigData;
             mode = "0600";
           };
@@ -1906,7 +2110,7 @@ in
               --service-cluster-ip-range=${cfg.serviceCidr} \
               --authorization-mode=Node,RBAC \
               --enable-admission-plugins=NodeRestriction \
-              --allow-privileged=true
+              --allow-privileged=true${apiServerHardeningFlags cfg}
           '';
           Restart = "always";
           RestartSec = "10s";
@@ -1935,7 +2139,8 @@ in
               --root-ca-file=/etc/kubernetes/pki/ca.crt \
               --service-account-private-key-file=/etc/kubernetes/pki/sa.key \
               --service-cluster-ip-range=${cfg.serviceCidr} \
-              --use-service-account-credentials=true
+              --use-service-account-credentials=true \
+              --profiling=false
           '';
           Restart = "always";
           RestartSec = "10s";
@@ -1954,7 +2159,8 @@ in
             ${cfg.package}/bin/kube-scheduler \
               --bind-address=127.0.0.1 \
               --kubeconfig=${kubeconfigPath} \
-              --leader-elect=true
+              --leader-elect=true \
+              --profiling=false
           '';
           Restart = "always";
           RestartSec = "10s";
@@ -2061,6 +2267,86 @@ in
               ExecStart =
                 provisionerApply cfg.package "/etc/kubernetes/admin.conf"
                   "/etc/kubernetes/provisioner.yaml";
+              Restart = "on-failure";
+              RestartSec = "15s";
+            };
+          };
+
+      environment.etc."kubernetes/metrics-server.yaml" = lib.mkIf (cfg.metricsServerManifest != "") {
+        text = cfg.metricsServerManifest;
+        mode = "0644";
+      };
+
+      systemd.services.kcore-kubernetes-metrics-server =
+        lib.mkIf (cfg.role == "control-plane" && cfg.metricsServerManifest != "")
+          {
+            description = "Apply metrics-server";
+            wantedBy = [ "multi-user.target" ];
+            after = [
+              "kube-apiserver.service"
+              "kubelet.service"
+              "kcore-kubernetes-cilium.service"
+            ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart =
+                manifestApply "metrics-server" cfg.package "/etc/kubernetes/admin.conf"
+                  "/etc/kubernetes/metrics-server.yaml";
+              Restart = "on-failure";
+              RestartSec = "15s";
+            };
+          };
+
+      environment.etc."kubernetes/ceph-csi.yaml" = lib.mkIf (cfg.cephCsiManifest != "") {
+        text = cfg.cephCsiManifest;
+        mode = "0644";
+      };
+
+      systemd.services.kcore-kubernetes-ceph-csi =
+        lib.mkIf (cfg.role == "control-plane" && cfg.cephCsiManifest != "")
+          {
+            description = "Apply Ceph RBD CSI StorageClass and credentials";
+            wantedBy = [ "multi-user.target" ];
+            after = [
+              "kube-apiserver.service"
+              "kubelet.service"
+              "kcore-kubernetes-cilium.service"
+            ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart =
+                manifestApply "ceph-csi" cfg.package "/etc/kubernetes/admin.conf"
+                  "/etc/kubernetes/ceph-csi.yaml";
+              Restart = "on-failure";
+              RestartSec = "15s";
+            };
+          };
+
+      environment.etc."kubernetes/default-deny-network-policy.yaml" =
+        lib.mkIf (cfg.networkPolicyDefaultDenyLabel != null)
+          {
+            text = defaultDenyNetworkPolicyManifest cfg.networkPolicyDefaultDenyLabel;
+            mode = "0644";
+          };
+
+      systemd.services.kcore-kubernetes-default-deny =
+        lib.mkIf (cfg.role == "control-plane" && cfg.networkPolicyDefaultDenyLabel != null)
+          {
+            description = "Apply Cilium default-deny ClusterwideNetworkPolicy";
+            wantedBy = [ "multi-user.target" ];
+            after = [
+              "kube-apiserver.service"
+              "kubelet.service"
+              "kcore-kubernetes-cilium.service"
+            ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart =
+                manifestApply "default-deny" cfg.package "/etc/kubernetes/admin.conf"
+                  "/etc/kubernetes/default-deny-network-policy.yaml";
               Restart = "on-failure";
               RestartSec = "15s";
             };

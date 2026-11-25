@@ -521,6 +521,43 @@ pub struct KubernetesClusterConfigRow {
     pub kubernetes_version: String,
 }
 
+/// Reconcile, backup, repair, and rollback state for a cluster. Kept apart
+/// from [`KubernetesClusterConfigRow`] so a spec re-apply never resets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesClusterOpsRow {
+    pub auto_reconcile: bool,
+    /// Version before the upgrade in flight; empty when none is.
+    pub previous_version: String,
+    pub pre_upgrade_snapshot_id: String,
+    /// JSON backup policy, empty when disabled.
+    pub backup_json: String,
+    /// JSON repair policy, empty when disabled.
+    pub repair_json: String,
+    /// JSON Ceph CSI / storage addon config, empty when disabled.
+    pub storage_json: String,
+    /// In-flight etcd restore progress (`RestoreView` JSON), empty when idle.
+    pub restore_json: String,
+    /// JSON OIDC settings for the API server.
+    pub oidc_json: String,
+    /// JSON cert policy (`leaf_validity_days`, `renew_before_days`).
+    pub cert_json: String,
+    /// Cilium default-deny label key; empty leaves the policy off.
+    pub default_deny_label: String,
+    /// JSON encryption-at-rest keys (current + previous during rotation).
+    pub encryption_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesEtcdSnapshotRow {
+    pub id: String,
+    pub cluster_name: String,
+    pub created_at: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub path: String,
+    pub trigger: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectStoreStatusRow {
     pub name: String,
@@ -900,7 +937,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 74;
+pub const SCHEMA_VERSION: i32 = 78;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -947,6 +984,7 @@ const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_c
                     pending_join INTEGER NOT NULL DEFAULT 0,
                     pending_removal INTEGER NOT NULL DEFAULT 0,
                     k8s_node_name TEXT NOT NULL DEFAULT '',
+                    rendered_hash TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (cluster_name, node_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_cluster ON kubernetes_cluster_nodes(cluster_name);
@@ -960,8 +998,29 @@ const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_c
                     cilium_mtu INTEGER NOT NULL DEFAULT 1500,
                     cilium_tunnel TEXT NOT NULL DEFAULT 'disabled',
                     cilium_auto_direct_routes INTEGER NOT NULL DEFAULT 1,
-                    cilium_lb_ip_pools TEXT NOT NULL DEFAULT ''
-                );";
+                    cilium_lb_ip_pools TEXT NOT NULL DEFAULT '',
+                    auto_reconcile INTEGER NOT NULL DEFAULT 1,
+                    previous_version TEXT NOT NULL DEFAULT '',
+                    pre_upgrade_snapshot_id TEXT NOT NULL DEFAULT '',
+                    backup_json TEXT NOT NULL DEFAULT '',
+                    repair_json TEXT NOT NULL DEFAULT '',
+                    storage_json TEXT NOT NULL DEFAULT '',
+                    restore_json TEXT NOT NULL DEFAULT '',
+                    oidc_json TEXT NOT NULL DEFAULT '',
+                    cert_json TEXT NOT NULL DEFAULT '',
+                    default_deny_label TEXT NOT NULL DEFAULT '',
+                    encryption_json TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS kubernetes_etcd_snapshots (
+                    id TEXT PRIMARY KEY,
+                    cluster_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    trigger TEXT NOT NULL DEFAULT 'manual'
+                );
+                CREATE INDEX IF NOT EXISTS idx_k8s_etcd_snapshots_cluster ON kubernetes_etcd_snapshots(cluster_name, created_at);";
 
 const KUBERNETES_PKI_TABLE: &str = "CREATE TABLE IF NOT EXISTS kubernetes_pki (
                     cluster_name TEXT PRIMARY KEY REFERENCES kubernetes_clusters(name) ON DELETE CASCADE,
@@ -979,7 +1038,8 @@ const KUBERNETES_PKI_TABLE: &str = "CREATE TABLE IF NOT EXISTS kubernetes_pki (
                     apiserver_etcd_client_key TEXT NOT NULL,
                     admin_kubeconfig TEXT NOT NULL,
                     etcd_node_certs_json TEXT NOT NULL DEFAULT '',
-                    etcd_node_peer_certs_json TEXT NOT NULL DEFAULT ''
+                    etcd_node_peer_certs_json TEXT NOT NULL DEFAULT '',
+                    leaf_not_after TEXT NOT NULL DEFAULT ''
                 );";
 
 /// Largest controller snapshot accepted by backup and restore.
@@ -2405,6 +2465,124 @@ impl Database {
                 if present == 0 {
                     conn.execute(
                         &format!("ALTER TABLE kubernetes_cluster_nodes ADD COLUMN {column} {ddl};"),
+                        [],
+                    )?;
+                }
+            }
+        }
+
+        // Kubernetes production hardening: drift hash per member, reconcile
+        // and backup policy, upgrade rollback pointers, leaf certificate expiry.
+        if version < 75 {
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
+            conn.execute_batch(KUBERNETES_PKI_TABLE)?;
+            for (table, column, ddl) in [
+                (
+                    "kubernetes_cluster_nodes",
+                    "rendered_hash",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "kubernetes_cluster_config",
+                    "auto_reconcile",
+                    "INTEGER NOT NULL DEFAULT 1",
+                ),
+                (
+                    "kubernetes_cluster_config",
+                    "previous_version",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "kubernetes_cluster_config",
+                    "pre_upgrade_snapshot_id",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "kubernetes_cluster_config",
+                    "backup_json",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "kubernetes_cluster_config",
+                    "repair_json",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "kubernetes_pki",
+                    "leaf_not_after",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
+            ] {
+                let present: i32 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    params![column],
+                    |row| row.get(0),
+                )?;
+                if present == 0 {
+                    conn.execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl};"),
+                        [],
+                    )?;
+                }
+            }
+        }
+
+        if version < 76 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS kubernetes_etcd_snapshots (
+                    id TEXT PRIMARY KEY,
+                    cluster_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    trigger TEXT NOT NULL DEFAULT 'manual'
+                );
+                CREATE INDEX IF NOT EXISTS idx_k8s_etcd_snapshots_cluster
+                    ON kubernetes_etcd_snapshots(cluster_name, created_at);",
+            )?;
+        }
+
+        if version < 77 {
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
+            for (column, ddl) in [
+                ("storage_json", "TEXT NOT NULL DEFAULT ''"),
+                ("restore_json", "TEXT NOT NULL DEFAULT ''"),
+            ] {
+                let present: i32 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('kubernetes_cluster_config') WHERE name = ?1",
+                    params![column],
+                    |row| row.get(0),
+                )?;
+                if present == 0 {
+                    conn.execute(
+                        &format!(
+                            "ALTER TABLE kubernetes_cluster_config ADD COLUMN {column} {ddl};"
+                        ),
+                        [],
+                    )?;
+                }
+            }
+        }
+
+        if version < 78 {
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
+            for (column, ddl) in [
+                ("oidc_json", "TEXT NOT NULL DEFAULT ''"),
+                ("cert_json", "TEXT NOT NULL DEFAULT ''"),
+                ("default_deny_label", "TEXT NOT NULL DEFAULT ''"),
+                ("encryption_json", "TEXT NOT NULL DEFAULT ''"),
+            ] {
+                let present: i32 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('kubernetes_cluster_config') WHERE name = ?1",
+                    params![column],
+                    |row| row.get(0),
+                )?;
+                if present == 0 {
+                    conn.execute(
+                        &format!(
+                            "ALTER TABLE kubernetes_cluster_config ADD COLUMN {column} {ddl};"
+                        ),
                         [],
                     )?;
                 }
@@ -8354,6 +8532,315 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_kubernetes_node_rendered_hash(
+        &self,
+        cluster_name: &str,
+        node_id: &str,
+        hash: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_nodes SET rendered_hash=?3
+             WHERE cluster_name=?1 AND node_id=?2",
+            params![cluster_name, node_id, hash],
+        )?;
+        Ok(())
+    }
+
+    /// Hash of the Nix last applied to each member. Empty when never applied.
+    pub fn list_kubernetes_node_rendered_hashes(
+        &self,
+        cluster_name: &str,
+    ) -> Result<std::collections::HashMap<String, String>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, rendered_hash FROM kubernetes_cluster_nodes WHERE cluster_name=?1",
+        )?;
+        let rows = stmt.query_map(params![cluster_name], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    pub fn get_kubernetes_cluster_ops(
+        &self,
+        cluster_name: &str,
+    ) -> Result<Option<KubernetesClusterOpsRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT auto_reconcile, previous_version, pre_upgrade_snapshot_id,
+                    backup_json, repair_json, storage_json, restore_json,
+                    oidc_json, cert_json, default_deny_label, encryption_json
+             FROM kubernetes_cluster_config WHERE cluster_name=?1",
+            params![cluster_name],
+            |r| {
+                Ok(KubernetesClusterOpsRow {
+                    auto_reconcile: r.get(0)?,
+                    previous_version: r.get(1)?,
+                    pre_upgrade_snapshot_id: r.get(2)?,
+                    backup_json: r.get(3)?,
+                    repair_json: r.get(4)?,
+                    storage_json: r.get(5)?,
+                    restore_json: r.get(6)?,
+                    oidc_json: r.get(7)?,
+                    cert_json: r.get(8)?,
+                    default_deny_label: r.get(9)?,
+                    encryption_json: r.get(10)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn set_kubernetes_cluster_auto_reconcile(
+        &self,
+        cluster_name: &str,
+        enabled: bool,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET auto_reconcile=?2 WHERE cluster_name=?1",
+            params![cluster_name, enabled],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_previous_version(
+        &self,
+        cluster_name: &str,
+        version: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET previous_version=?2 WHERE cluster_name=?1",
+            params![cluster_name, version],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_pre_upgrade_snapshot_id(
+        &self,
+        cluster_name: &str,
+        snapshot_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET pre_upgrade_snapshot_id=?2 WHERE cluster_name=?1",
+            params![cluster_name, snapshot_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_backup_json(
+        &self,
+        cluster_name: &str,
+        json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET backup_json=?2 WHERE cluster_name=?1",
+            params![cluster_name, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_repair_json(
+        &self,
+        cluster_name: &str,
+        json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET repair_json=?2 WHERE cluster_name=?1",
+            params![cluster_name, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_storage_json(
+        &self,
+        cluster_name: &str,
+        json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET storage_json=?2 WHERE cluster_name=?1",
+            params![cluster_name, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_restore_json(
+        &self,
+        cluster_name: &str,
+        json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET restore_json=?2 WHERE cluster_name=?1",
+            params![cluster_name, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_oidc_json(
+        &self,
+        cluster_name: &str,
+        json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET oidc_json=?2 WHERE cluster_name=?1",
+            params![cluster_name, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_cert_json(
+        &self,
+        cluster_name: &str,
+        json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET cert_json=?2 WHERE cluster_name=?1",
+            params![cluster_name, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_default_deny_label(
+        &self,
+        cluster_name: &str,
+        label: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET default_deny_label=?2 WHERE cluster_name=?1",
+            params![cluster_name, label],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_kubernetes_cluster_encryption_json(
+        &self,
+        cluster_name: &str,
+        json: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET encryption_json=?2 WHERE cluster_name=?1",
+            params![cluster_name, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_kubernetes_etcd_snapshot(
+        &self,
+        row: &KubernetesEtcdSnapshotRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO kubernetes_etcd_snapshots
+                (id, cluster_name, created_at, sha256, size_bytes, path, trigger)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.id,
+                row.cluster_name,
+                row.created_at,
+                row.sha256,
+                row.size_bytes,
+                row.path,
+                row.trigger
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Newest first.
+    pub fn list_kubernetes_etcd_snapshots(
+        &self,
+        cluster_name: &str,
+    ) -> Result<Vec<KubernetesEtcdSnapshotRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, cluster_name, created_at, sha256, size_bytes, path, trigger
+             FROM kubernetes_etcd_snapshots WHERE cluster_name=?1
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![cluster_name], |r| {
+            Ok(KubernetesEtcdSnapshotRow {
+                id: r.get(0)?,
+                cluster_name: r.get(1)?,
+                created_at: r.get(2)?,
+                sha256: r.get(3)?,
+                size_bytes: r.get(4)?,
+                path: r.get(5)?,
+                trigger: r.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_kubernetes_etcd_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<Option<KubernetesEtcdSnapshotRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, cluster_name, created_at, sha256, size_bytes, path, trigger
+             FROM kubernetes_etcd_snapshots WHERE id=?1",
+            params![id],
+            |r| {
+                Ok(KubernetesEtcdSnapshotRow {
+                    id: r.get(0)?,
+                    cluster_name: r.get(1)?,
+                    created_at: r.get(2)?,
+                    sha256: r.get(3)?,
+                    size_bytes: r.get(4)?,
+                    path: r.get(5)?,
+                    trigger: r.get(6)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    pub fn delete_kubernetes_etcd_snapshot(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn.execute(
+            "DELETE FROM kubernetes_etcd_snapshots WHERE id=?1",
+            params![id],
+        )? > 0)
+    }
+
+    /// Earliest leaf certificate expiry, RFC 3339. Empty when not recorded.
+    pub fn kubernetes_pki_leaf_not_after(
+        &self,
+        cluster_name: &str,
+    ) -> Result<String, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT leaf_not_after FROM kubernetes_pki WHERE cluster_name=?1",
+                params![cluster_name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_kubernetes_pki_leaf_not_after(
+        &self,
+        cluster_name: &str,
+        not_after: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_pki SET leaf_not_after=?2 WHERE cluster_name=?1",
+            params![cluster_name, not_after],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_kubernetes_cluster_config(
         &self,
         row: &KubernetesClusterConfigRow,
@@ -8448,14 +8935,21 @@ impl Database {
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let etcd_node_peer_certs_json = serde_json::to_string(&pki.etcd_node_peer_certs)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let leaf_not_after = crate::kubernetes_pki::earliest_leaf_not_after(pki)
+            .and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .unwrap_or_default();
         conn.execute(
             "INSERT OR REPLACE INTO kubernetes_pki (
                 cluster_name, ca_cert, ca_key, sa_key, sa_pub,
                 etcd_ca_cert, etcd_ca_key, apiserver_cert, apiserver_key,
                 apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
                 apiserver_etcd_client_cert, apiserver_etcd_client_key,
-                admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json,
+                leaf_not_after
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 cluster_name,
                 &pki.ca_cert,
@@ -8473,6 +8967,7 @@ impl Database {
                 &pki.admin_kubeconfig,
                 etcd_node_certs_json,
                 etcd_node_peer_certs_json,
+                leaf_not_after,
             ],
         )?;
         Ok(())

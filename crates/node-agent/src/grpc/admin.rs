@@ -7159,6 +7159,8 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             "wrote raw kubernetes config with embedded PKI"
         );
 
+        write_kubernetes_secret_files(&req.secrets)?;
+
         // Generate apply_id for tracking
         let apply_id = format!("k8s-apply-{}", uuid_like_suffix());
         write_apply_state(&apply_id, NIX_APPLY_RUNNING, "queued");
@@ -7274,6 +7276,359 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             Err(err) => Err(Status::internal(format!("{err:#}"))),
         }
     }
+
+    async fn write_kubernetes_secrets(
+        &self,
+        request: Request<proto::WriteKubernetesSecretsRequest>,
+    ) -> Result<Response<proto::WriteKubernetesSecretsResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        match write_kubernetes_secret_files(&req.secrets) {
+            Ok(()) => Ok(Response::new(proto::WriteKubernetesSecretsResponse {
+                ok: true,
+                message: String::new(),
+            })),
+            Err(err) => Ok(Response::new(proto::WriteKubernetesSecretsResponse {
+                ok: false,
+                message: err.message().to_string(),
+            })),
+        }
+    }
+
+    async fn etcd_snapshot(
+        &self,
+        request: Request<proto::EtcdSnapshotRequest>,
+    ) -> Result<Response<proto::EtcdSnapshotResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        match take_etcd_snapshot(&req.cluster_name).await {
+            Ok((snapshot, sha256)) => Ok(Response::new(proto::EtcdSnapshotResponse {
+                snapshot,
+                sha256,
+                message: String::new(),
+            })),
+            Err(err) => Ok(Response::new(proto::EtcdSnapshotResponse {
+                snapshot: Vec::new(),
+                sha256: String::new(),
+                message: err,
+            })),
+        }
+    }
+
+    async fn etcd_restore(
+        &self,
+        request: Request<proto::EtcdRestoreRequest>,
+    ) -> Result<Response<proto::EtcdRestoreResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        match restore_etcd_snapshot(
+            &req.cluster_name,
+            &req.snapshot,
+            &req.initial_cluster,
+            &req.initial_cluster_token,
+        )
+        .await
+        {
+            Ok(()) => Ok(Response::new(proto::EtcdRestoreResponse {
+                ok: true,
+                message: String::new(),
+            })),
+            Err(err) => Ok(Response::new(proto::EtcdRestoreResponse {
+                ok: false,
+                message: err,
+            })),
+        }
+    }
+
+    async fn restart_systemd_units(
+        &self,
+        request: Request<proto::RestartSystemdUnitsRequest>,
+    ) -> Result<Response<proto::RestartSystemdUnitsResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        match manage_named_units(&req.units, &req.action).await {
+            Ok(()) => Ok(Response::new(proto::RestartSystemdUnitsResponse {
+                ok: true,
+                message: String::new(),
+            })),
+            Err(err) => Ok(Response::new(proto::RestartSystemdUnitsResponse {
+                ok: false,
+                message: err,
+            })),
+        }
+    }
+
+    async fn wipe_etcd_data(
+        &self,
+        request: Request<proto::WipeEtcdDataRequest>,
+    ) -> Result<Response<proto::WipeEtcdDataResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if req.check_only {
+            match etcd_data_dir_empty(&req.cluster_name) {
+                Ok(empty) => Ok(Response::new(proto::WipeEtcdDataResponse {
+                    ok: true,
+                    message: if empty {
+                        "etcd data dir absent or empty".into()
+                    } else {
+                        "etcd data dir present".into()
+                    },
+                    empty,
+                })),
+                Err(err) => Ok(Response::new(proto::WipeEtcdDataResponse {
+                    ok: false,
+                    message: err,
+                    empty: false,
+                })),
+            }
+        } else {
+            match wipe_etcd_data_dir(&req.cluster_name).await {
+                Ok(message) => Ok(Response::new(proto::WipeEtcdDataResponse {
+                    ok: true,
+                    message,
+                    empty: true,
+                })),
+                Err(err) => Ok(Response::new(proto::WipeEtcdDataResponse {
+                    ok: false,
+                    message: err,
+                    empty: false,
+                })),
+            }
+        }
+    }
+}
+
+const KUBERNETES_SECRET_ROOT: &str = "/var/lib/kcore/kubernetes/";
+
+fn write_kubernetes_secret_files(secrets: &[proto::KubernetesSecretFile]) -> Result<(), Status> {
+    for secret in secrets {
+        kcore_sanitize::assert_safe_path(&secret.path)
+            .map_err(|e| Status::invalid_argument(format!("secret path {}: {e:?}", secret.path)))?;
+        if !secret.path.starts_with(KUBERNETES_SECRET_ROOT) {
+            return Err(Status::invalid_argument(format!(
+                "secret path {} must be under {KUBERNETES_SECRET_ROOT}",
+                secret.path
+            )));
+        }
+        let path = PathBuf::from(&secret.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Status::internal(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &secret.content)
+            .map_err(|e| Status::internal(format!("write {}: {e}", tmp.display())))?;
+        let mode = if secret.mode == 0 { 0o600 } else { secret.mode };
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| Status::internal(format!("chmod {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Status::internal(format!("rename {}: {e}", path.display())))?;
+    }
+    Ok(())
+}
+
+fn etcd_data_dir(cluster: &str) -> Result<PathBuf, String> {
+    let cluster = cluster.trim();
+    if cluster.is_empty() || cluster.contains('/') || cluster.contains("..") {
+        return Err(format!("invalid cluster name {cluster:?}"));
+    }
+    if cluster == "default" || cluster.is_empty() {
+        Ok(PathBuf::from("/var/lib/etcd"))
+    } else {
+        Ok(PathBuf::from(format!("/var/lib/etcd-{cluster}")))
+    }
+}
+
+fn etcd_data_dir_empty(cluster: &str) -> Result<bool, String> {
+    let dir = etcd_data_dir(cluster)?;
+    if !dir.exists() {
+        return Ok(true);
+    }
+    let mut entries =
+        std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    Ok(entries.next().is_none())
+}
+
+async fn wipe_etcd_data_dir(cluster: &str) -> Result<String, String> {
+    let dir = etcd_data_dir(cluster)?;
+    if !dir.exists() {
+        return Ok(format!("{} already absent", dir.display()));
+    }
+    // Stop etcd first so open files do not keep the old member identity.
+    let unit = if cluster == "default" || cluster.is_empty() {
+        "etcd.service".to_string()
+    } else {
+        format!("etcd-{cluster}.service")
+    };
+    let _ = manage_named_units(&[unit], "stop").await;
+    tokio::fs::remove_dir_all(&dir)
+        .await
+        .map_err(|e| format!("remove {}: {e}", dir.display()))?;
+    Ok(format!("removed {}", dir.display()))
+}
+
+fn etcd_endpoints_env(cluster: &str) -> String {
+    // Local etcd listens on loopback; peer/client certs are configured in the unit.
+    let _ = cluster;
+    "https://127.0.0.1:2379".to_string()
+}
+
+async fn take_etcd_snapshot(cluster: &str) -> Result<(Vec<u8>, String), String> {
+    let dir = std::env::temp_dir().join(format!("kcore-etcd-snap-{cluster}"));
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("mkdir snapshot dir: {e}"))?;
+    let snap = dir.join("snapshot.db");
+    let output = tokio::process::Command::new("etcdctl")
+        .args([
+            "snapshot",
+            "save",
+            snap.to_str().unwrap_or("/tmp/snapshot.db"),
+        ])
+        .env("ETCDCTL_API", "3")
+        .env("ETCDCTL_ENDPOINTS", etcd_endpoints_env(cluster))
+        .env("ETCDCTL_CACERT", "/etc/kubernetes/pki/etcd/ca.crt")
+        .env(
+            "ETCDCTL_CERT",
+            "/etc/kubernetes/pki/apiserver-etcd-client.crt",
+        )
+        .env(
+            "ETCDCTL_KEY",
+            "/etc/kubernetes/pki/apiserver-etcd-client.key",
+        )
+        .output()
+        .await
+        .map_err(|e| format!("etcdctl snapshot save: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "etcdctl snapshot save failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let bytes = tokio::fs::read(&snap)
+        .await
+        .map_err(|e| format!("read snapshot: {e}"))?;
+    let digest = {
+        use aws_lc_rs::digest::{digest, SHA256};
+        let d = digest(&SHA256, &bytes);
+        d.as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let status = tokio::process::Command::new("etcdutl")
+        .args([
+            "snapshot",
+            "status",
+            snap.to_str().unwrap_or(""),
+            "-w",
+            "json",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("etcdutl snapshot status: {e}"))?;
+    if !status.status.success() {
+        return Err(format!(
+            "etcdutl snapshot status failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        ));
+    }
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok((bytes, digest))
+}
+
+async fn restore_etcd_snapshot(
+    cluster: &str,
+    snapshot: &[u8],
+    initial_cluster: &str,
+    initial_cluster_token: &str,
+) -> Result<(), String> {
+    let data_dir = etcd_data_dir(cluster)?;
+    let work = std::env::temp_dir().join(format!("kcore-etcd-restore-{cluster}"));
+    let _ = tokio::fs::remove_dir_all(&work).await;
+    tokio::fs::create_dir_all(&work)
+        .await
+        .map_err(|e| format!("mkdir restore dir: {e}"))?;
+    let snap = work.join("snapshot.db");
+    tokio::fs::write(&snap, snapshot)
+        .await
+        .map_err(|e| format!("write snapshot: {e}"))?;
+    let name = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "etcd".to_string());
+    let output_dir = work.join("restored");
+    let mut cmd = tokio::process::Command::new("etcdutl");
+    cmd.args([
+        "snapshot",
+        "restore",
+        snap.to_str().unwrap_or(""),
+        "--data-dir",
+        output_dir.to_str().unwrap_or(""),
+        "--name",
+        &name,
+        "--initial-cluster",
+        initial_cluster,
+        "--initial-cluster-token",
+        initial_cluster_token,
+    ]);
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("etcdutl snapshot restore: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "etcdutl snapshot restore failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if data_dir.exists() {
+        let backup = PathBuf::from(format!(
+            "{}-pre-restore-{}",
+            data_dir.display(),
+            uuid_like_suffix()
+        ));
+        tokio::fs::rename(&data_dir, &backup)
+            .await
+            .map_err(|e| format!("backup etcd data dir: {e}"))?;
+    }
+    if let Some(parent) = data_dir.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("mkdir etcd parent: {e}"))?;
+    }
+    tokio::fs::rename(&output_dir, &data_dir)
+        .await
+        .map_err(|e| format!("install restored etcd data: {e}"))?;
+    let _ = tokio::fs::remove_dir_all(&work).await;
+    Ok(())
+}
+
+async fn manage_named_units(units: &[String], action: &str) -> Result<(), String> {
+    let action = match action.trim() {
+        "" | "restart" => "restart",
+        "stop" => "stop",
+        "start" => "start",
+        other => return Err(format!("unsupported unit action {other:?}")),
+    };
+    for unit in units {
+        let unit = unit.trim();
+        if unit.is_empty() || unit.contains('/') || unit.contains("..") {
+            return Err(format!("invalid unit name {unit:?}"));
+        }
+        let output = tokio::process::Command::new("systemctl")
+            .args([action, unit])
+            .output()
+            .await
+            .map_err(|e| format!("systemctl {action} {unit}: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "systemctl {action} {unit} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    Ok(())
 }
 
 // Helper methods for Kubernetes operations

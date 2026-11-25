@@ -1,0 +1,94 @@
+# PrometheusRule for the Kubernetes metrics the kcore controller exports.
+# Adjust the namespace and the labels your Prometheus selects rules by.
+#
+# kcore_k8s_phase is one series per cluster and phase, 1 for the current phase.
+# kcore_k8s_upgrade_failed and kcore_k8s_drift_pending are 0 or 1 per cluster.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kcore-kubernetes
+  namespace: monitoring
+spec:
+  groups:
+    - name: kcore-kubernetes
+      rules:
+        - alert: KcoreKubernetesCertExpiringSoon
+          expr: kcore_k8s_cert_days_remaining < 14
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kubernetes certificate on {{ $labels.cluster }} expires in under 14 days"
+            description: "Renewal should have started at 30 days. Check the cluster phase and run kctl kubernetes rotate-certs."
+
+        - alert: KcoreKubernetesCertExpired
+          expr: kcore_k8s_cert_days_remaining <= 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kubernetes certificate on {{ $labels.cluster }} has expired"
+
+        - alert: KcoreKubernetesNoRecentSnapshot
+          expr: kcore_k8s_last_snapshot_age_seconds > 26 * 3600
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "No etcd snapshot for {{ $labels.cluster }} in 26 hours"
+
+        - alert: KcoreKubernetesEtcdBelowQuorumMargin
+          expr: |
+            kcore_k8s_etcd_healthy_members
+              < (floor(kcore_k8s_etcd_members / 2) + 1) + 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "etcd on {{ $labels.cluster }} has no spare member above quorum"
+            description: "One more failure loses quorum. Replace the failed control plane."
+
+        - alert: KcoreKubernetesEtcdQuorumLost
+          expr: |
+            kcore_k8s_etcd_healthy_members
+              < floor(kcore_k8s_etcd_members / 2) + 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "etcd on {{ $labels.cluster }} lost quorum"
+            description: "Restore from a snapshot with kctl kubernetes restore."
+
+        - alert: KcoreKubernetesClusterDegraded
+          expr: kcore_k8s_phase{phase="degraded"} == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kubernetes cluster {{ $labels.cluster }} has been degraded for 15 minutes"
+
+        - alert: KcoreKubernetesUpgradeFailed
+          expr: kcore_k8s_upgrade_failed == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kubernetes upgrade on {{ $labels.cluster }} stopped"
+            description: "Fix the node named in the cluster status, re-apply, or run kctl kubernetes upgrade rollback."
+
+        - alert: KcoreKubernetesUpgradeStuck
+          expr: kcore_k8s_phase{phase="upgrading"} == 1
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kubernetes upgrade on {{ $labels.cluster }} has run for over 2 hours"
+
+        - alert: KcoreKubernetesDriftPending
+          expr: kcore_k8s_drift_pending == 1
+          for: 1h
+          labels:
+            severity: info
+          annotations:
+            summary: "Rendered configuration for {{ $labels.cluster }} differs from what nodes run"
+            description: "Auto-reconcile is off or failing. Re-apply the cluster manifest."

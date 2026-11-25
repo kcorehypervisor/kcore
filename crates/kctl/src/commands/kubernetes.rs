@@ -46,6 +46,81 @@ struct ManifestSpec {
     /// it and re-applying upgrades the cluster one node at a time.
     #[serde(default)]
     version: String,
+    #[serde(default)]
+    storage: ManifestStorage,
+    #[serde(default)]
+    backup: Option<serde_json::Value>,
+    #[serde(default)]
+    repair: Option<serde_json::Value>,
+    #[serde(default = "default_auto_reconcile")]
+    auto_reconcile: bool,
+    #[serde(default)]
+    oidc: Option<ManifestOidc>,
+    #[serde(default)]
+    network_policy: ManifestNetworkPolicy,
+    #[serde(default)]
+    cert: Option<ManifestCertPolicy>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ManifestOidc {
+    #[serde(default)]
+    issuer_url: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    username_claim: String,
+    #[serde(default)]
+    groups_claim: String,
+    #[serde(default)]
+    ca_pem: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ManifestNetworkPolicy {
+    #[serde(default)]
+    default_deny_label: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ManifestCertPolicy {
+    #[serde(default)]
+    leaf_validity_days: i32,
+    #[serde(default)]
+    renew_before_days: i32,
+}
+
+fn default_auto_reconcile() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ManifestStorage {
+    #[serde(default)]
+    ceph: Option<ManifestCephStorage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ManifestCephStorage {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    cluster: String,
+    #[serde(default)]
+    pool: String,
+    #[serde(default)]
+    monitors: Vec<String>,
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    user_key: String,
+    #[serde(default)]
+    default: bool,
 }
 
 fn default_cluster_dns() -> String {
@@ -247,6 +322,46 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
         local_provisioner,
         schedule_on_control_plane: spec.schedule_on_control_plane,
         version: spec.version.clone(),
+        storage_ceph: spec.storage.ceph.as_ref().map(|ceph| {
+            controller_proto::KubernetesCephStorage {
+                enabled: ceph.enabled,
+                cluster: ceph.cluster.clone(),
+                pool: ceph.pool.clone(),
+                monitors: ceph.monitors.clone(),
+                user_id: ceph.user_id.clone(),
+                user_key: ceph.user_key.clone(),
+                default_storage_class: ceph.default,
+            }
+        }),
+        backup_json: spec
+            .backup
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok())
+            .unwrap_or_default(),
+        repair_json: spec
+            .repair
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok())
+            .unwrap_or_default(),
+        auto_reconcile: spec.auto_reconcile,
+        oidc: spec
+            .oidc
+            .as_ref()
+            .map(|o| controller_proto::KubernetesOidc {
+                issuer_url: o.issuer_url.clone(),
+                client_id: o.client_id.clone(),
+                username_claim: o.username_claim.clone(),
+                groups_claim: o.groups_claim.clone(),
+                ca_pem: o.ca_pem.clone(),
+            }),
+        network_policy_default_deny_label: spec.network_policy.default_deny_label.clone(),
+        cert: spec
+            .cert
+            .as_ref()
+            .map(|c| controller_proto::KubernetesCertPolicy {
+                leaf_validity_days: c.leaf_validity_days,
+                renew_before_days: c.renew_before_days,
+            }),
     }
 }
 
@@ -682,6 +797,224 @@ pub async fn scale(
         .into_inner();
 
     println!("✅ Kubernetes cluster '{}' scaled", name);
+    Ok(())
+}
+
+fn require_yes(yes: bool, what: &str) -> Result<()> {
+    if !yes {
+        bail!("{what}; re-run with --yes to go ahead");
+    }
+    Ok(())
+}
+
+pub async fn certs(info: &ConnectionInfo, name: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let response = client
+        .get_kubernetes_certificates(controller_proto::GetKubernetesCertificatesRequest {
+            name: name.to_string(),
+        })
+        .await
+        .context("get_kubernetes_certificates rpc")?
+        .into_inner();
+
+    if response.leaf_not_after.is_empty() {
+        println!("Cluster '{name}' has no recorded certificate expiry yet");
+        return Ok(());
+    }
+    println!("Leaf certificates for '{name}'");
+    println!("  expire:     {}", response.leaf_not_after);
+    println!("  remaining:  {:.1} days", response.days_remaining);
+    println!(
+        "  renewal:    {} (starts {} days before expiry)",
+        if response.renewal_due {
+            "due"
+        } else {
+            "not due"
+        },
+        response.renew_before_days
+    );
+    Ok(())
+}
+
+pub async fn rotate_certs(info: &ConnectionInfo, name: &str, force: bool, yes: bool) -> Result<()> {
+    require_yes(
+        yes,
+        &format!("rotating certificates rebuilds every node of '{name}' one at a time"),
+    )?;
+    let mut client = client::controller_client(info).await?;
+    let response = client
+        .rotate_kubernetes_certificates(controller_proto::RotateKubernetesCertificatesRequest {
+            name: name.to_string(),
+            force,
+            confirm: true,
+        })
+        .await
+        .context("rotate_kubernetes_certificates rpc")?
+        .into_inner();
+    println!("{}", response.message);
+    Ok(())
+}
+
+pub async fn rotate_encryption(info: &ConnectionInfo, name: &str, yes: bool) -> Result<()> {
+    require_yes(
+        yes,
+        &format!("rotating encryption keys restarts API servers of '{name}' and rewrites Secrets"),
+    )?;
+    let mut client = client::controller_client(info).await?;
+    let response = client
+        .rotate_kubernetes_encryption(controller_proto::RotateKubernetesEncryptionRequest {
+            name: name.to_string(),
+            confirm: true,
+        })
+        .await
+        .context("rotate_kubernetes_encryption rpc")?
+        .into_inner();
+    println!("{}", response.message);
+    Ok(())
+}
+
+fn print_snapshot(snapshot: &controller_proto::KubernetesEtcdSnapshot) {
+    println!(
+        "{}  {}  {} bytes  {}  sha256={}",
+        snapshot.id, snapshot.created_at, snapshot.size_bytes, snapshot.trigger, snapshot.sha256
+    );
+}
+
+pub async fn backup_create(info: &ConnectionInfo, name: &str) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let response = client
+        .create_kubernetes_backup(controller_proto::CreateKubernetesBackupRequest {
+            name: name.to_string(),
+            confirm: true,
+        })
+        .await
+        .context("create_kubernetes_backup rpc")?
+        .into_inner();
+    match response.snapshot {
+        Some(snapshot) => {
+            println!("Snapshot taken");
+            print_snapshot(&snapshot);
+            println!("  path: {}", snapshot.path);
+        }
+        None => println!("Snapshot taken"),
+    }
+    Ok(())
+}
+
+async fn list_snapshots(
+    info: &ConnectionInfo,
+    name: &str,
+) -> Result<Vec<controller_proto::KubernetesEtcdSnapshot>> {
+    let mut client = client::controller_client(info).await?;
+    Ok(client
+        .list_kubernetes_backups(controller_proto::ListKubernetesBackupsRequest {
+            name: name.to_string(),
+        })
+        .await
+        .context("list_kubernetes_backups rpc")?
+        .into_inner()
+        .snapshots)
+}
+
+pub async fn backup_list(info: &ConnectionInfo, name: &str) -> Result<()> {
+    let snapshots = list_snapshots(info, name).await?;
+    if snapshots.is_empty() {
+        println!("No snapshots for '{name}'");
+        return Ok(());
+    }
+    for snapshot in &snapshots {
+        print_snapshot(snapshot);
+    }
+    Ok(())
+}
+
+pub async fn backup_delete(
+    info: &ConnectionInfo,
+    name: &str,
+    snapshot: &str,
+    yes: bool,
+) -> Result<()> {
+    require_yes(
+        yes,
+        &format!("deleting snapshot {snapshot} cannot be undone"),
+    )?;
+    let mut client = client::controller_client(info).await?;
+    let response = client
+        .delete_kubernetes_backup(controller_proto::DeleteKubernetesBackupRequest {
+            name: name.to_string(),
+            snapshot_id: snapshot.to_string(),
+            confirm: true,
+        })
+        .await
+        .context("delete_kubernetes_backup rpc")?
+        .into_inner();
+    println!("{}", response.message);
+    Ok(())
+}
+
+pub async fn restore(info: &ConnectionInfo, name: &str, snapshot: &str, yes: bool) -> Result<()> {
+    let snapshots = list_snapshots(info, name).await?;
+    let Some(found) = snapshots.iter().find(|s| s.id == snapshot) else {
+        bail!("snapshot {snapshot} not found for cluster '{name}'; see `kctl kubernetes backup list {name}`");
+    };
+    require_yes(
+        yes,
+        &format!("restoring {} replaces all etcd data of '{name}'", found.id),
+    )?;
+    let mut client = client::controller_client(info).await?;
+    let response = client
+        .restore_kubernetes_backup(controller_proto::RestoreKubernetesBackupRequest {
+            name: name.to_string(),
+            snapshot_id: found.id.clone(),
+            confirm: true,
+        })
+        .await
+        .context("restore_kubernetes_backup rpc")?
+        .into_inner();
+    println!("{}", response.message);
+    Ok(())
+}
+
+pub async fn upgrade_rollback(info: &ConnectionInfo, name: &str, yes: bool) -> Result<()> {
+    require_yes(
+        yes,
+        &format!("rollback moves '{name}' back to its previous Kubernetes version, node by node"),
+    )?;
+    let mut client = client::controller_client(info).await?;
+    let response = client
+        .rollback_kubernetes_upgrade(controller_proto::RollbackKubernetesUpgradeRequest {
+            name: name.to_string(),
+            confirm: true,
+        })
+        .await
+        .context("rollback_kubernetes_upgrade rpc")?
+        .into_inner();
+    println!("{}", response.message);
+    Ok(())
+}
+
+pub async fn replace_node(
+    info: &ConnectionInfo,
+    name: &str,
+    old: &str,
+    new: &str,
+    yes: bool,
+) -> Result<()> {
+    require_yes(
+        yes,
+        &format!("replacing {old} with {new} removes {old} from '{name}'"),
+    )?;
+    let mut client = client::controller_client(info).await?;
+    client
+        .replace_kubernetes_node(controller_proto::ReplaceKubernetesNodeRequest {
+            name: name.to_string(),
+            old_node_id: old.to_string(),
+            new_node_id: new.to_string(),
+            confirm: true,
+        })
+        .await
+        .context("replace_kubernetes_node rpc")?;
+    println!("Replacing {old} with {new} in '{name}'");
     Ok(())
 }
 

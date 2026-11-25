@@ -309,9 +309,11 @@ in
       wants = [ "network-online.target" ];
       # Boot-time only: re-running it on `switch` would re-prime live OSDs.
       restartIfChanged = false;
+      # cryptsetup: encrypted OSDs (dmcrypt) cannot be opened without it.
       path = [
         pkgs.util-linux
         pkgs.lvm2
+        pkgs.cryptsetup
         pkgs.coreutils
         pkgs.systemd
       ];

@@ -350,6 +350,16 @@ service NodeAdmin {
   // Read /etc/kubernetes/admin.conf on this node and call the Kubernetes API.
   // The controller uses this instead of running kubectl.
   rpc KubernetesAdmin(KubernetesAdminRequest) returns (KubernetesAdminResponse);
+  // Write secret files for a Kubernetes cluster outside /nix/store (mode 0600).
+  rpc WriteKubernetesSecrets(WriteKubernetesSecretsRequest) returns (WriteKubernetesSecretsResponse);
+  // Take a local etcd snapshot for a cluster and return the bytes.
+  rpc EtcdSnapshot(EtcdSnapshotRequest) returns (EtcdSnapshotResponse);
+  // Restore an etcd snapshot into this node's data directory.
+  rpc EtcdRestore(EtcdRestoreRequest) returns (EtcdRestoreResponse);
+  // Remove the etcd data directory so a reinstalled host can rejoin.
+  rpc WipeEtcdData(WipeEtcdDataRequest) returns (WipeEtcdDataResponse);
+  // Restart named systemd units after a certificate roll.
+  rpc RestartSystemdUnits(RestartSystemdUnitsRequest) returns (RestartSystemdUnitsResponse);
 }
 
 // VM specification
@@ -2180,6 +2190,68 @@ message ApplyKubernetesConfigResponse {
 message ApplyRawKubernetesConfigRequest {
   string nix_config_content = 1;    // Complete Nix module text with embedded PKI
   string kubeconfig_data = 2;       // Optional: admin kubeconfig for kubectl access
+  // Secret files written before nixos-rebuild (keys outside /nix/store).
+  repeated KubernetesSecretFile secrets = 3;
+}
+
+message KubernetesSecretFile {
+  string path = 1;
+  uint32 mode = 2;
+  bytes content = 3;
+}
+
+message WriteKubernetesSecretsRequest {
+  repeated KubernetesSecretFile secrets = 1;
+}
+
+message WriteKubernetesSecretsResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message EtcdSnapshotRequest {
+  string cluster_name = 1;
+}
+
+message EtcdSnapshotResponse {
+  bytes snapshot = 1;
+  string message = 2;
+  string sha256 = 3;
+}
+
+message EtcdRestoreRequest {
+  string cluster_name = 1;
+  bytes snapshot = 2;
+  string initial_cluster = 3;
+  string initial_cluster_token = 4;
+}
+
+message EtcdRestoreResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message WipeEtcdDataRequest {
+  string cluster_name = 1;
+  // When true, only report whether the data dir is missing/empty.
+  bool check_only = 2;
+}
+
+message WipeEtcdDataResponse {
+  bool ok = 1;
+  string message = 2;
+  bool empty = 3;
+}
+
+message RestartSystemdUnitsRequest {
+  repeated string units = 1;
+  // restart (default), stop, or start
+  string action = 2;
+}
+
+message RestartSystemdUnitsResponse {
+  bool ok = 1;
+  string message = 2;
 }
 
 message GetKubernetesStatusRequest {}

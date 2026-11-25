@@ -265,6 +265,7 @@
               nixosSystem = inputs.nixpkgs.lib.nixosSystem;
             };
             kcore-mail = import ./tests/kcore-mail.nix { inherit pkgs; };
+            kubernetes-vm = import ./tests/kubernetes-vm.nix { inherit pkgs; };
             kubernetes-module-eval = import ./tests/kubernetes-module-eval.nix {
               inherit pkgs;
               inherit (pkgs) lib;

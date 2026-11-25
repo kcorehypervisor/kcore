@@ -2097,6 +2097,102 @@ enum KubernetesAction {
         #[arg(long = "remove")]
         remove: Option<String>,
     },
+    /// Show when the cluster's leaf certificates expire
+    Certs {
+        /// Cluster name
+        name: String,
+    },
+    /// Rebuild the leaf certificates one node at a time
+    RotateCerts {
+        /// Cluster name
+        name: String,
+        /// Rotate even when no certificate is inside the renewal window
+        #[arg(long)]
+        force: bool,
+        /// Go ahead without a dry-run notice
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
+    },
+    /// Rotate encryption-at-rest keys and rewrite Secrets
+    #[command(name = "rotate-encryption")]
+    RotateEncryption {
+        /// Cluster name
+        name: String,
+        /// Go ahead without a dry-run notice
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
+    },
+    /// Manage etcd snapshots
+    Backup {
+        #[command(subcommand)]
+        action: KubernetesBackupAction,
+    },
+    /// Restore etcd from a snapshot (not wired yet, see the error text)
+    Restore {
+        /// Cluster name
+        name: String,
+        /// Snapshot id from `kctl kubernetes backup list`
+        #[arg(long)]
+        snapshot: String,
+        /// Go ahead without a dry-run notice
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
+    },
+    /// Upgrade follow-up operations
+    Upgrade {
+        #[command(subcommand)]
+        action: KubernetesUpgradeAction,
+    },
+    /// Swap a failed member for a different node
+    ReplaceNode {
+        /// Cluster name
+        name: String,
+        /// Member to remove
+        #[arg(long = "old")]
+        old: String,
+        /// Registered node that takes its role
+        #[arg(long = "new")]
+        new: String,
+        /// Go ahead without a dry-run notice
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KubernetesBackupAction {
+    /// Take an etcd snapshot now
+    Create {
+        /// Cluster name
+        name: String,
+    },
+    /// List snapshots, newest first
+    List {
+        /// Cluster name
+        name: String,
+    },
+    /// Delete one snapshot
+    Delete {
+        /// Cluster name
+        name: String,
+        /// Snapshot id
+        snapshot: String,
+        /// Go ahead without a dry-run notice
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KubernetesUpgradeAction {
+    /// Go back to the version the cluster ran before its last upgrade
+    Rollback {
+        /// Cluster name
+        name: String,
+        /// Go ahead without a dry-run notice
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4145,6 +4241,81 @@ async fn main() {
             commands::kubernetes::scale(&info, name, add_cp, add_wk, rem).await
         }
 
+        Command::Kubernetes {
+            action: KubernetesAction::Certs { name },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::certs(&info, name).await
+        }
+
+        Command::Kubernetes {
+            action: KubernetesAction::RotateCerts { name, force, yes },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::rotate_certs(&info, name, *force, *yes).await
+        }
+
+        Command::Kubernetes {
+            action: KubernetesAction::RotateEncryption { name, yes },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::rotate_encryption(&info, name, *yes).await
+        }
+
+        Command::Kubernetes {
+            action: KubernetesAction::Backup { action },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            match action {
+                KubernetesBackupAction::Create { name } => {
+                    commands::kubernetes::backup_create(&info, name).await
+                }
+                KubernetesBackupAction::List { name } => {
+                    commands::kubernetes::backup_list(&info, name).await
+                }
+                KubernetesBackupAction::Delete {
+                    name,
+                    snapshot,
+                    yes,
+                } => commands::kubernetes::backup_delete(&info, name, snapshot, *yes).await,
+            }
+        }
+
+        Command::Kubernetes {
+            action:
+                KubernetesAction::Restore {
+                    name,
+                    snapshot,
+                    yes,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::restore(&info, name, snapshot, *yes).await
+        }
+
+        Command::Kubernetes {
+            action:
+                KubernetesAction::Upgrade {
+                    action: KubernetesUpgradeAction::Rollback { name, yes },
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::upgrade_rollback(&info, name, *yes).await
+        }
+
+        Command::Kubernetes {
+            action:
+                KubernetesAction::ReplaceNode {
+                    name,
+                    old,
+                    new,
+                    yes,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::replace_node(&info, name, old, new, *yes).await
+        }
+
         Command::PgCluster { action } => {
             use commands::pg_cluster::{self as pg, Verb};
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -4873,5 +5044,71 @@ mod cli_tests {
             kubernetes(&["apply", "-f", "c.yaml"]),
             KubernetesAction::Apply { yes: false, .. }
         ));
+    }
+
+    #[test]
+    fn kubernetes_day_two_commands_parse() {
+        assert!(matches!(
+            kubernetes(&["certs", "c"]),
+            KubernetesAction::Certs { .. }
+        ));
+        assert!(matches!(
+            kubernetes(&["rotate-certs", "c", "--force", "--yes"]),
+            KubernetesAction::RotateCerts {
+                force: true,
+                yes: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kubernetes(&["rotate-encryption", "c", "--yes"]),
+            KubernetesAction::RotateEncryption { yes: true, .. }
+        ));
+        assert!(matches!(
+            kubernetes(&["rotate-certs", "c"]),
+            KubernetesAction::RotateCerts {
+                force: false,
+                yes: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kubernetes(&["backup", "create", "c"]),
+            KubernetesAction::Backup {
+                action: KubernetesBackupAction::Create { .. }
+            }
+        ));
+        assert!(matches!(
+            kubernetes(&["backup", "list", "c"]),
+            KubernetesAction::Backup {
+                action: KubernetesBackupAction::List { .. }
+            }
+        ));
+        assert!(matches!(
+            kubernetes(&["backup", "delete", "c", "snap-1", "-y"]),
+            KubernetesAction::Backup {
+                action: KubernetesBackupAction::Delete { yes: true, .. }
+            }
+        ));
+        match kubernetes(&["restore", "c", "--snapshot", "snap-1"]) {
+            KubernetesAction::Restore { snapshot, .. } => assert_eq!(snapshot, "snap-1"),
+            _ => panic!("not restore"),
+        }
+        assert!(matches!(
+            kubernetes(&["upgrade", "rollback", "c", "--yes"]),
+            KubernetesAction::Upgrade {
+                action: KubernetesUpgradeAction::Rollback { yes: true, .. }
+            }
+        ));
+        match kubernetes(&["replace-node", "c", "--old", "node-1", "--new", "node-2"]) {
+            KubernetesAction::ReplaceNode { old, new, .. } => {
+                assert_eq!((old.as_str(), new.as_str()), ("node-1", "node-2"));
+            }
+            _ => panic!("not replace-node"),
+        }
+        assert!(Cli::try_parse_from(["kctl", "kubernetes", "restore", "c"]).is_err());
+        assert!(
+            Cli::try_parse_from(["kctl", "kubernetes", "replace-node", "c", "--old", "a"]).is_err()
+        );
     }
 }

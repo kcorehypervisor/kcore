@@ -191,7 +191,11 @@ pub fn write_node_targets(db: &Database, cfg: &MetricsConfig) -> Result<(), Stri
     let slurm = render_slurm_targets(db)?;
     write_atomic(&path.with_file_name("slurm.json"), &slurm)?;
     let ceph = render_ceph_targets(db)?;
-    write_atomic(&path.with_file_name("ceph.json"), &ceph)
+    write_atomic(&path.with_file_name("ceph.json"), &ceph)?;
+    write_atomic(
+        &path.with_file_name("kubernetes.prom"),
+        crate::kubernetes_metrics::collect_kubernetes_metrics(db).trim_end(),
+    )
 }
 
 fn write_atomic(path: &Path, body: &str) -> Result<(), String> {

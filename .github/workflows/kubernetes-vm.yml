@@ -1,0 +1,30 @@
+name: kubernetes-vm
+
+# NixOS VM test for the Kubernetes module. It is not part of nix-checks:
+# that job must not build the Kubernetes closure and boot a VM.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kubernetes-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v21
+
+      - name: Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+        continue-on-error: true
+
+      - name: Run the Kubernetes VM test
+        run: nix build --no-link .#checks.x86_64-linux.kubernetes-vm
