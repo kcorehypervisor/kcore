@@ -41,7 +41,7 @@ fn maybe_emit_ceph_health_webhook(
     };
     hooks.emit(
         webhooks::EVENT_CEPH_HEALTH,
-        &format!("ceph-cluster/{cluster}"),
+        format!("ceph-cluster/{cluster}"),
         serde_json::json!({
             "cluster": cluster,
             "health": status,
@@ -390,7 +390,7 @@ async fn reconcile_row(
         pool_type: "replicated".into(),
         erasure_profile: String::new(),
         ms_mode: spec.ms_mode.clone(),
-        recovery: spec.recovery.clone().map(|r| node_proto::CephRecoverySpec {
+        recovery: spec.recovery.map(|r| node_proto::CephRecoverySpec {
             max_backfills: r.max_backfills,
             recovery_max_active: r.recovery_max_active,
             scrub_begin_hour: r.scrub_begin_hour,
