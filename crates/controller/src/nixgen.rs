@@ -397,6 +397,37 @@ pub fn generate_node_config_inner(
                 out.push_str("      ];\n");
             }
         }
+        let mut filesystems: Vec<_> = volumes
+            .iter()
+            .filter(|v| {
+                v.vm_id == vm.id
+                    && v.role == crate::db::VolumeRow::ROLE_FILESYSTEM
+                    && v.is_attached()
+            })
+            .collect();
+        filesystems.sort_by_key(|v| (v.slot, v.name.as_str()));
+        if !filesystems.is_empty() {
+            out.push_str("      filesystems = [\n");
+            for v in filesystems {
+                let tag = if v.image.trim().is_empty() {
+                    v.name.as_str()
+                } else {
+                    v.image.as_str()
+                };
+                let source = if v.mount_point.trim().is_empty() {
+                    String::new()
+                } else {
+                    v.mount_point.clone()
+                };
+                out.push_str(&format!(
+                    "        {{ tag = \"{}\"; sharedFilesystem = \"{}\"; sourcePath = \"{}\"; }}\n",
+                    nix_escape(tag),
+                    nix_escape(&v.pool),
+                    nix_escape(&source),
+                ));
+            }
+            out.push_str("      ];\n");
+        }
         out.push_str(&format!("      imageSize = {};\n", vm.image_size));
         out.push_str(&format!("      cores = {};\n", vm.cpu));
         out.push_str(&format!(

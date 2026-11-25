@@ -486,6 +486,45 @@ impl proto::node_storage_server::NodeStorage for StorageService {
         }))
     }
 
+    async fn expose_local_disk(
+        &self,
+        request: Request<proto::ExposeLocalDiskRequest>,
+    ) -> Result<Response<proto::ExposeSnapshotResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        let leases = export::global_lease_table();
+        let lease = tokio::task::spawn_blocking(move || {
+            export::expose_local_disk(
+                &req.storage_class,
+                &req.backend_handle,
+                req.lease_seconds,
+                &leases,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::ExposeSnapshotResponse {
+            lease_id: lease.lease_id,
+            device_path: lease.device_path,
+            size_bytes: lease.size_bytes,
+            block_size: lease.block_size,
+        }))
+    }
+
+    async fn set_image_meta(
+        &self,
+        request: Request<proto::SetImageMetaRequest>,
+    ) -> Result<Response<proto::SetImageMetaResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX, CN_KCTL])?;
+        let req = request.into_inner();
+        tokio::task::spawn_blocking(move || {
+            export::set_image_meta(&req.backend_handle, &req.key, &req.value)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join: {e}")))??;
+        Ok(Response::new(proto::SetImageMetaResponse {}))
+    }
+
     async fn unexpose_snapshot(
         &self,
         request: Request<proto::UnexposeSnapshotRequest>,

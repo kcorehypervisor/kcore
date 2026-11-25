@@ -88,6 +88,43 @@ pub async fn resize(
     Ok(())
 }
 
+/// Copy a Ceph volume onto another CephCluster (`kctl volume copy`).
+pub async fn copy(
+    info: &ConnectionInfo,
+    source: &str,
+    dest: Option<&str>,
+    to_cluster: &str,
+    from_cluster: Option<&str>,
+) -> Result<()> {
+    copy_to_cluster(info, source, to_cluster, dest, from_cluster).await
+}
+
+/// Move a detached LVM or ZFS volume onto Ceph.
+pub async fn convert_to_ceph(
+    info: &ConnectionInfo,
+    name: &str,
+    to: &str,
+    ceph_cluster: Option<&str>,
+) -> Result<()> {
+    if to != "ceph" {
+        bail!("--to must be ceph (got '{to}')");
+    }
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .convert_volume(controller_proto::ConvertVolumeRequest {
+            volume: name.to_string(),
+            target_storage_class: to.to_string(),
+            ceph_cluster: ceph_cluster.unwrap_or_default().to_string(),
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
 pub async fn encrypt(info: &ConnectionInfo, name: &str, destroy_data: bool) -> Result<()> {
     if !destroy_data {
         bail!(
@@ -107,6 +144,72 @@ pub async fn encrypt(info: &ConnectionInfo, name: &str, destroy_data: bool) -> R
         bail!("{}", resp.message);
     }
     println!("{}", resp.message);
+    Ok(())
+}
+
+/// Backends `volume convert` accepts, checked before dialing the controller.
+fn convert_target(to: &str) -> Result<&'static str> {
+    match to.trim().to_ascii_lowercase().as_str() {
+        "ceph" => Ok("ceph"),
+        "lvm" | "zfs" => bail!(
+            "converting to {} is not implemented; only --to ceph is",
+            to.trim()
+        ),
+        "" => bail!("--to is required (ceph)"),
+        other => bail!("unknown backend '{other}'; only ceph is supported"),
+    }
+}
+
+/// Stop the VM, copy its LVM or ZFS disk onto Ceph, and switch it over.
+pub async fn convert_vm(info: &ConnectionInfo, vm: &str, to: &str, yes: bool) -> Result<()> {
+    let to = convert_target(to)?;
+    let mut client =
+        client::controller_client_with_timeout(info, client::LOCAL_DISK_MOVE_TIMEOUT).await?;
+    let resp = client
+        .convert_vm_storage(controller_proto::ConvertVmStorageRequest {
+            vm: vm.to_string(),
+            to: to.to_string(),
+            allow_stop: yes,
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    if !resp.operation_id.is_empty() {
+        println!("Operation: {}", resp.operation_id);
+    }
+    Ok(())
+}
+
+/// Copy a Ceph volume into a new volume on another CephCluster.
+pub async fn copy_to_cluster(
+    info: &ConnectionInfo,
+    volume: &str,
+    to_cluster: &str,
+    new_name: Option<&str>,
+    from_cluster: Option<&str>,
+) -> Result<()> {
+    if to_cluster.trim().is_empty() {
+        bail!("--to-cluster is required");
+    }
+    let mut client =
+        client::controller_client_with_timeout(info, client::LOCAL_DISK_MOVE_TIMEOUT).await?;
+    let resp = client
+        .copy_volume_to_cluster(controller_proto::CopyVolumeToClusterRequest {
+            name: volume.to_string(),
+            to_cluster: to_cluster.to_string(),
+            new_name: new_name.unwrap_or("").to_string(),
+            from_cluster: from_cluster.unwrap_or("").to_string(),
+        })
+        .await?
+        .into_inner();
+    if !resp.success {
+        bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    println!("Copied: {}", crate::client::format_bytes(resp.bytes_copied));
     Ok(())
 }
 
@@ -245,6 +348,9 @@ pub async fn create(
             encrypt,
             node: node.unwrap_or("").to_string(),
             volume_name: volume_name.unwrap_or("").to_string(),
+            rbd_namespace: String::new(),
+            qos_iops: 0,
+            qos_bps: 0,
         })
         .await?
         .into_inner();
@@ -599,6 +705,9 @@ pub async fn import(
                 encrypt: false,
                 node: node.unwrap_or("").to_string(),
                 volume_name: String::new(),
+                rbd_namespace: String::new(),
+                qos_iops: 0,
+                qos_bps: 0,
             })
             .await?
             .into_inner();
@@ -659,4 +768,81 @@ pub async fn import(
         resp.zero_runs
     );
     Ok(())
+}
+
+pub async fn trash_list(
+    info: &ConnectionInfo,
+    pool: Option<String>,
+    namespace: Option<String>,
+) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .list_volume_trash(controller_proto::ListVolumeTrashRequest {
+            pool: pool.unwrap_or_default(),
+            namespace: namespace.unwrap_or_default(),
+        })
+        .await
+        .context("list_volume_trash rpc")?
+        .into_inner();
+    if resp.entries.is_empty() {
+        println!("No trash entries.");
+        return Ok(());
+    }
+    for e in resp.entries {
+        let ns = if e.namespace.is_empty() {
+            String::new()
+        } else {
+            format!(" ns={}", e.namespace)
+        };
+        println!("{}\t{}/{}\t{}{}", e.id, e.pool, e.name, e.deletion_time, ns);
+    }
+    Ok(())
+}
+
+pub async fn trash_purge(
+    info: &ConnectionInfo,
+    yes: bool,
+    pool: Option<String>,
+    trash_id: Option<String>,
+    namespace: Option<String>,
+) -> Result<()> {
+    if !yes {
+        bail!("pass --yes to permanently purge RBD trash");
+    }
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .purge_volume_trash(controller_proto::PurgeVolumeTrashRequest {
+            pool: pool.unwrap_or_default(),
+            namespace: namespace.unwrap_or_default(),
+            trash_id: trash_id.unwrap_or_default(),
+            confirm: true,
+        })
+        .await
+        .context("purge_volume_trash rpc")?
+        .into_inner();
+    if !resp.success {
+        bail!("{}", resp.message);
+    }
+    println!("{}", resp.message);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_target;
+
+    #[test]
+    fn convert_accepts_only_ceph() {
+        assert_eq!(convert_target(" Ceph ").unwrap(), "ceph");
+        assert!(convert_target("lvm")
+            .unwrap_err()
+            .to_string()
+            .contains("not implemented"));
+        assert!(convert_target("zfs").is_err());
+        assert!(convert_target("").is_err());
+        assert!(convert_target("nfs")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown"));
+    }
 }

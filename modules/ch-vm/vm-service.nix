@@ -278,8 +278,10 @@ let
           fi
           if [ -z "$DEV" ]; then
             modprobe nbd || true
+            local CACHE_POLICY="''${KCORE_RBD_CACHE_POLICY:-writeback}"
+            case "$CACHE_POLICY" in writeback|writethrough) ;; *) CACHE_POLICY=writeback ;; esac
             DEV="$(${pkgs.systemd}/bin/systemd-run --scope --quiet --collect -- \
-              rbd device map -t nbd --rbd-cache=true --rbd-cache-policy=writeback \
+              rbd device map -t nbd --rbd-cache=true --rbd-cache-policy="$CACHE_POLICY" \
                 --rbd-readahead-trigger-requests=1 --rbd-readahead-max-bytes=4194304 \
                 --rbd-readahead-disable-after-bytes=0 "$IMAGE" | tail -1)"
           fi
@@ -407,6 +409,44 @@ let
         vgpuUuid
       ];
 
+      virtiofsEntries = map (fs: {
+        inherit (fs) tag sharedFilesystem;
+        source =
+          if fs.sourcePath != "" then fs.sourcePath else "/var/lib/kcore/virtiofs/${vmName}/${fs.tag}";
+        socket = "${cfg.socketDir}/${vmName}.virtiofs.${fs.tag}.sock";
+      }) vmCfg.filesystems;
+
+      virtiofsArgs = lib.concatMapStringsSep " " (
+        fs: "--fs tag=${fs.tag},socket=${fs.socket}"
+      ) virtiofsEntries;
+
+      virtiofsStartScript = pkgs.writeShellScript "virtiofs-start-${vmName}" ''
+        set -eu
+        ${lib.concatMapStrings (fs: ''
+          mkdir -p "${fs.source}"
+          # Mount CephFS when the directory is empty and not already a mount.
+          # CephFS is mounted by the node agent / operator into source before start.
+          # virtiofsd only shares the directory; cold migrate remounts on the destination.
+          rm -f "${fs.socket}"
+          ${pkgs.virtiofsd}/bin/virtiofsd \
+            --socket-path "${fs.socket}" \
+            --shared-dir "${fs.source}" \
+            --cache auto \
+            --sandbox namespace \
+            --daemonize
+        '') virtiofsEntries}
+      '';
+
+      virtiofsStopScript = pkgs.writeShellScript "virtiofs-stop-${vmName}" ''
+        set -eu
+        ${lib.concatMapStrings (fs: ''
+          if [ -S "${fs.socket}" ]; then
+            ${pkgs.procps}/bin/pkill -f -- "virtiofsd.*${fs.socket}" || true
+            rm -f "${fs.socket}"
+          fi
+        '') virtiofsEntries}
+      '';
+
       chArgs = lib.concatStringsSep " " (
         [
           "--api-socket ${socketPath}"
@@ -417,6 +457,7 @@ let
           "--serial socket=${serialSocket}"
           "--disk ${vmDiskArg} ${seedDiskArg}${lib.optionalString (dataDiskArgs != "") " ${dataDiskArgs}"}"
         ]
+        ++ lib.optional (virtiofsArgs != "") virtiofsArgs
         # A vGPU slice must not sit behind the virtual IOMMU. The manager
         # reads guest physical addresses, which only exist when the VFIO
         # container maps the whole guest before the device fd opens.
@@ -806,13 +847,15 @@ let
           lib.optionals (vfioDevices != [ ]) [ "${vfioBindScript}" ]
           ++ lib.optionals (vgpuDevices != [ ]) [ "${vgpuBindScript}" ]
           ++ [ "${startPreScript}" ]
-          ++ lib.optionals (isLvm || isZfs) [ "${localMapperScript}" ];
+          ++ lib.optionals (isLvm || isZfs) [ "${localMapperScript}" ]
+          ++ lib.optionals (virtiofsEntries != [ ]) [ "${virtiofsStartScript}" ];
         ExecStart = "${startScript}";
         ExecStop = "${stopScript}";
         ExecStopPost =
           lib.optional (vgpuDevices != [ ]) "-${vgpuClearScript}"
           ++ lib.optional isCeph "-${cephUnmapScript}"
-          ++ lib.optional (isLvm || isZfs) "-${localMapperRemoveScript}";
+          ++ lib.optional (isLvm || isZfs) "-${localMapperRemoveScript}"
+          ++ lib.optionals (virtiofsEntries != [ ]) [ "-${virtiofsStopScript}" ];
         TimeoutStopSec = 30;
         # ExecStartPre copies the image onto the volume. The 90s default is
         # shorter than a Windows qcow2 convert, which then fails the unit.

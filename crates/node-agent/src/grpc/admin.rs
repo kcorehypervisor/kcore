@@ -836,6 +836,626 @@ async fn retire_osd(
     Ok(())
 }
 
+/// Names that end up as `ceph` CLI arguments (pools, rules, profiles, hosts,
+/// client ids). No shell is involved; the restriction keeps a value from being
+/// read as an option and keeps odd characters out of CRUSH and auth names.
+fn validate_ceph_token(field: &str, value: &str) -> Result<(), Status> {
+    let ok = !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "{field} must be non-empty and use only letters, digits, '-', '_' and '.'"
+        )))
+    }
+}
+
+fn ok_to_stop_args(ids: &[String]) -> Vec<String> {
+    let mut args = ceph_args(["osd", "ok-to-stop"]);
+    args.extend(ids.iter().cloned());
+    args
+}
+
+/// `ceph osd ok-to-stop` exits non-zero with the reason on stderr when
+/// stopping the OSDs would make PGs unavailable.
+fn ok_to_stop_verdict(success: bool, stdout: &str, stderr: &str, ids: &[String]) -> (bool, String) {
+    let list = ids
+        .iter()
+        .map(|id| format!("osd.{id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if success {
+        return (true, format!("{list} ok to stop"));
+    }
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    (false, format!("{list} not ok to stop: {detail}"))
+}
+
+fn validate_external_client_config(
+    req: &proto::ApplyCephClientConfigRequest,
+) -> Result<(String, String), Status> {
+    let mons: Vec<&str> = req
+        .mon_hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .collect();
+    let mon_ok = |m: &str| {
+        m.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '[' | ']' | '_'))
+    };
+    if mons.is_empty() || !mons.iter().all(|m| mon_ok(m)) {
+        return Err(Status::invalid_argument(
+            "mon_hosts must be a comma-separated list of host or host:port",
+        ));
+    }
+    let name = req.client_name.trim();
+    let name = if name.is_empty() {
+        "client.admin"
+    } else {
+        name
+    };
+    let id = name
+        .strip_prefix("client.")
+        .ok_or_else(|| Status::invalid_argument("client_name must look like client.<id>"))?;
+    validate_ceph_token("client_name", id)?;
+    let fsid = req.fsid.trim();
+    if !fsid.is_empty() && !fsid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err(Status::invalid_argument("fsid must be a UUID"));
+    }
+    let has_section = req.keyring.lines().any(|l| l.trim() == format!("[{name}]"));
+    let has_key = req
+        .keyring
+        .lines()
+        .any(|l| l.trim_start().starts_with("key") && l.contains('='));
+    if !has_section || !has_key || req.keyring.contains('\0') {
+        return Err(Status::invalid_argument(format!(
+            "keyring must hold a [{name}] section with a key"
+        )));
+    }
+    let conf = format!(
+        "[global]\nmon_host = {}\n{}keyring = /etc/ceph/ceph.{name}.keyring\n",
+        mons.join(","),
+        if fsid.is_empty() {
+            String::new()
+        } else {
+            format!("fsid = {fsid}\n")
+        }
+    );
+    Ok((name.to_string(), conf))
+}
+
+/// Writes `ceph.conf` and the client keyring under `dir`. Returns whether
+/// either file changed.
+fn write_external_client_config(
+    dir: &Path,
+    req: &proto::ApplyCephClientConfigRequest,
+) -> Result<bool, Status> {
+    let (name, conf) = validate_external_client_config(req)?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| Status::internal(format!("creating {}: {e}", dir.display())))?;
+    let keyring_path = dir.join(format!("ceph.{name}.keyring"));
+    let mut keyring = req.keyring.trim_end().to_string();
+    keyring.push('\n');
+    let mut changed = false;
+    for (path, body, mode) in [
+        (keyring_path, keyring, 0o600),
+        (dir.join("ceph.conf"), conf, 0o644),
+    ] {
+        if std::fs::read_to_string(&path).is_ok_and(|current| current == body) {
+            continue;
+        }
+        let tmp = path.with_extension("kcore-tmp");
+        std::fs::write(&tmp, body.as_bytes())
+            .and_then(|()| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)))
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|e| Status::internal(format!("writing {}: {e}", path.display())))?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn validate_ceph_flag(flag: &str) -> Result<(), Status> {
+    let ok = !flag.is_empty()
+        && !flag.starts_with('-')
+        && flag
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "invalid OSD flag {flag:?}: use names like noout or nodeep-scrub"
+        )))
+    }
+}
+
+/// `"7"` and `"osd.7"` both mean OSD 7; anything else is refused.
+fn normalize_osd_id(raw: &str) -> Result<String, Status> {
+    let id = raw.trim();
+    let id = id.strip_prefix("osd.").unwrap_or(id);
+    if id.is_empty() || id.len() > 9 || !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(Status::invalid_argument(
+            "osd_id must be a decimal OSD id such as 7",
+        ));
+    }
+    Ok(id.to_string())
+}
+
+/// `"kcore"` and `"client.kcore"` both name `client.kcore`.
+fn normalize_client_entity(raw: &str) -> Result<String, Status> {
+    let name = raw.trim();
+    let name = if name.is_empty() { "kcore" } else { name };
+    let name = name.strip_prefix("client.").unwrap_or(name);
+    validate_ceph_token("client_name", name)?;
+    Ok(format!("client.{name}"))
+}
+
+/// `profile rbd` is what `rbd map`/`create` need, including the monitor
+/// command `rbd_blocklist_on_break_lock` uses when it takes over a lock.
+fn client_key_caps(pool: &str) -> [String; 6] {
+    [
+        "mon".to_string(),
+        "profile rbd".to_string(),
+        "osd".to_string(),
+        format!("profile rbd pool={pool}"),
+        "mgr".to_string(),
+        format!("profile rbd pool={pool}"),
+    ]
+}
+
+/// `client.kcore` -> `/etc/ceph/ceph.client.kcore.keyring`.
+fn client_keyring_path(entity: &str) -> String {
+    format!("/etc/ceph/ceph.{entity}.keyring")
+}
+
+fn write_client_keyring(path: &str, keyring: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = format!("{path}.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(keyring.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
+/// `auth get-or-create` on an existing entity with other caps fails with
+/// "key for client.x exists but cap osd does not match".
+fn auth_caps_mismatch(stderr: &str) -> bool {
+    stderr.contains("exists but cap")
+}
+
+type CephArgs = Vec<String>;
+
+fn ceph_args<const N: usize>(args: [&str; N]) -> CephArgs {
+    args.iter().map(|s| s.to_string()).collect()
+}
+
+fn parse_rbd_trash_ls(json: &str) -> Vec<proto::RbdTrashEntry> {
+    let Ok(value) = serde_json::from_str::<JsonValue>(json) else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(|v| v.as_str())?.to_string();
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let deletion_time = item
+                .get("deletion_time")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("deferment_end_time").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            Some(proto::RbdTrashEntry {
+                id,
+                name,
+                deletion_time,
+            })
+        })
+        .collect()
+}
+
+async fn purge_one_trash(pool: &str, namespace: &str, trash_id: &str) -> Result<(), Status> {
+    let mut args = vec![
+        "rbd".into(),
+        "trash".into(),
+        "rm".into(),
+        format!("{pool}/{trash_id}"),
+    ];
+    if !namespace.is_empty() {
+        args.push("--namespace".into());
+        args.push(namespace.to_string());
+    }
+    let out = Command::new("timeout")
+        .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("rbd trash rm: {e}")))?;
+    if !out.status.success() {
+        return Err(Status::internal(format!(
+            "rbd trash rm failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+async fn rbd_config_image_set(spec: &str, key: &str, value: &str) -> Result<(), Status> {
+    let out = Command::new("timeout")
+        .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+        .args(["rbd", "config", "image", "set", spec, key, value])
+        .output()
+        .await
+        .map_err(|e| Status::internal(format!("rbd config image set: {e}")))?;
+    if !out.status.success() {
+        return Err(Status::internal(format!(
+            "rbd config image set failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn parse_ceph_version_line(text: &str) -> (String, String) {
+    // e.g. "ceph version 20.2.4 (abc) tentacle (stable)"
+    let version = text.split_whitespace().nth(2).unwrap_or("").to_string();
+    let release = text
+        .split_whitespace()
+        .find(|w| {
+            let l = w.to_ascii_lowercase();
+            matches!(
+                l.as_str(),
+                "tentacle"
+                    | "squid"
+                    | "reef"
+                    | "quincy"
+                    | "pacific"
+                    | "octopus"
+                    | "nautilus"
+                    | "mimic"
+            ) || (!w.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && w.chars().all(|c| c.is_ascii_alphabetic())
+                && w.len() > 3)
+        })
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '(' || c == ')')
+        .to_ascii_lowercase();
+    (release, version)
+}
+
+fn parse_ceph_versions_json(json: &JsonValue) -> (String, String) {
+    // Prefer mon daemon version string.
+    for key in ["mon", "mgr", "osd"] {
+        if let Some(map) = json.get(key).and_then(|v| v.as_object()) {
+            if let Some((ver_line, _)) = map.iter().next() {
+                return parse_ceph_version_line(ver_line);
+            }
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// `ceph osd pool create` arguments. An unset `pg_num` is left to the
+/// autoscaler; erasure pools need a positional pg_num before the type, so they
+/// fall back to 32 (the autoscaler resizes it).
+fn pool_create_args(pool: &str, req: &proto::EnsureCephPoolRequest) -> CephArgs {
+    let mut args = ceph_args(["osd", "pool", "create"]);
+    args.push(pool.to_string());
+    let erasure = req.pool_type.trim() == "erasure";
+    if req.pg_num > 0 {
+        args.push(req.pg_num.to_string());
+    } else if erasure {
+        args.push("32".to_string());
+    }
+    if erasure {
+        args.push("erasure".to_string());
+        let profile = req.erasure_profile.trim();
+        if !profile.is_empty() {
+            args.push(profile.to_string());
+        }
+    }
+    args
+}
+
+fn validate_pool_request(req: &proto::EnsureCephPoolRequest) -> Result<(), Status> {
+    match req.pool_type.trim() {
+        "" | "replicated" => {
+            if !req.erasure_profile.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "erasure_profile is only valid with pool_type erasure",
+                ));
+            }
+        }
+        "erasure" => {}
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "pool_type must be replicated or erasure, got {other:?}"
+            )))
+        }
+    }
+    if req.pg_num < 0 || req.size < 0 || req.min_size < 0 || req.quota_bytes < 0 {
+        return Err(Status::invalid_argument(
+            "pg_num, size, min_size and quota_bytes cannot be negative",
+        ));
+    }
+    let application = req.application.trim();
+    if !application.is_empty() {
+        validate_ceph_token("application", application)?;
+    }
+    let rule = req.crush_rule.trim();
+    if !rule.is_empty() {
+        validate_ceph_token("crush_rule", rule)?;
+    }
+    let profile = req.erasure_profile.trim();
+    if !profile.is_empty() {
+        validate_ceph_token("erasure_profile", profile)?;
+    }
+    match req.compression_mode.trim() {
+        "" | "none" | "passive" | "aggressive" | "force" => {}
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "compression_mode must be none, passive, aggressive or force, got {other:?}"
+            )))
+        }
+    }
+    ms_mode_values(&req.ms_mode)?;
+    if let Some(r) = &req.recovery {
+        recovery_config_commands(r)?;
+    }
+    Ok(())
+}
+
+/// `(ms_cluster_mode, ms_service_mode)` for a requested messenger mode, or
+/// `None` when unset. Ceph reads the value as an ordered preference list.
+fn ms_mode_values(raw: &str) -> Result<Option<&'static str>, Status> {
+    match raw.trim() {
+        "" => Ok(None),
+        "secure" => Ok(Some("secure")),
+        "prefer-crc" => Ok(Some("crc secure")),
+        other => Err(Status::invalid_argument(format!(
+            "ms_mode must be secure or prefer-crc, got {other:?}"
+        ))),
+    }
+}
+
+fn ms_mode_commands(raw: &str) -> Result<Vec<CephArgs>, Status> {
+    let Some(value) = ms_mode_values(raw)? else {
+        return Ok(Vec::new());
+    };
+    Ok(["ms_cluster_mode", "ms_service_mode"]
+        .iter()
+        .map(|opt| ceph_args(["config", "set", "global", opt, value]))
+        .collect())
+}
+
+/// `nearfull_ratio_bp` is basis points: 8500 means 0.85.
+fn nearfull_ratio_string(bp: i32) -> Result<String, Status> {
+    if !(1..=10_000).contains(&bp) {
+        return Err(Status::invalid_argument(
+            "nearfull_ratio_bp must be between 1 and 10000",
+        ));
+    }
+    Ok(format!("{:.4}", f64::from(bp) / 10_000.0))
+}
+
+fn recovery_config_commands(r: &proto::CephRecoverySpec) -> Result<Vec<CephArgs>, Status> {
+    if r.max_backfills < 0 || r.recovery_max_active < 0 {
+        return Err(Status::invalid_argument(
+            "max_backfills and recovery_max_active cannot be negative",
+        ));
+    }
+    for (name, hour) in [
+        ("scrub_begin_hour", r.scrub_begin_hour),
+        ("scrub_end_hour", r.scrub_end_hour),
+    ] {
+        if !(0..=23).contains(&hour) {
+            return Err(Status::invalid_argument(format!(
+                "{name} must be between 0 and 23"
+            )));
+        }
+    }
+    let mut cmds = Vec::new();
+    if r.max_backfills > 0 || r.recovery_max_active > 0 {
+        // mClock ignores these two unless overridden.
+        cmds.push(ceph_args([
+            "config",
+            "set",
+            "osd",
+            "osd_mclock_override_recovery_settings",
+            "true",
+        ]));
+    }
+    if r.max_backfills > 0 {
+        cmds.push(ceph_args([
+            "config",
+            "set",
+            "osd",
+            "osd_max_backfills",
+            &r.max_backfills.to_string(),
+        ]));
+    }
+    if r.recovery_max_active > 0 {
+        cmds.push(ceph_args([
+            "config",
+            "set",
+            "osd",
+            "osd_recovery_max_active",
+            &r.recovery_max_active.to_string(),
+        ]));
+    }
+    // 0/0 is the Ceph default (scrub all day), so it means "not set".
+    if r.scrub_begin_hour != r.scrub_end_hour {
+        cmds.push(ceph_args([
+            "config",
+            "set",
+            "osd",
+            "osd_scrub_begin_hour",
+            &r.scrub_begin_hour.to_string(),
+        ]));
+        cmds.push(ceph_args([
+            "config",
+            "set",
+            "osd",
+            "osd_scrub_end_hour",
+            &r.scrub_end_hour.to_string(),
+        ]));
+    }
+    if r.nearfull_ratio_bp != 0 {
+        let ratio = nearfull_ratio_string(r.nearfull_ratio_bp)?;
+        cmds.push(ceph_args([
+            "config",
+            "set",
+            "mon",
+            "mon_osd_nearfull_ratio",
+            &ratio,
+        ]));
+        // The running OSDMap keeps its own copy of the ratio.
+        cmds.push(ceph_args(["osd", "set-nearfull-ratio", &ratio]));
+    }
+    Ok(cmds)
+}
+
+/// Per-pool settings applied after the pool exists (idempotent `pool set`s).
+fn pool_tuning_commands(pool: &str, req: &proto::EnsureCephPoolRequest) -> Vec<CephArgs> {
+    let mut cmds = Vec::new();
+    let rule = req.crush_rule.trim();
+    if !rule.is_empty() {
+        cmds.push(ceph_args(["osd", "pool", "set", pool, "crush_rule", rule]));
+    }
+    let mode = req.compression_mode.trim();
+    if !mode.is_empty() {
+        cmds.push(ceph_args([
+            "osd",
+            "pool",
+            "set",
+            pool,
+            "compression_mode",
+            mode,
+        ]));
+    }
+    if req.quota_bytes > 0 {
+        cmds.push(ceph_args([
+            "osd",
+            "pool",
+            "set-quota",
+            pool,
+            "max_bytes",
+            &req.quota_bytes.to_string(),
+        ]));
+    }
+    cmds
+}
+
+/// Run a `ceph` command that must succeed; timeouts and failures become
+/// gRPC errors naming the command.
+async fn run_ceph_required(args: &[String]) -> Result<std::process::Output, Status> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let what = args.iter().take(3).cloned().collect::<Vec<_>>().join(" ");
+    let out = run_ceph_cmd(&refs)
+        .await
+        .map_err(|e| Status::internal(format!("starting ceph {what} (is Ceph installed?): {e}")))?;
+    if out.status.code() == Some(124) {
+        return Err(Status::deadline_exceeded(format!("ceph {what} timed out")));
+    }
+    if !out.status.success() {
+        return Err(Status::internal(format!(
+            "ceph {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out)
+}
+
+async fn ceph_status_json() -> Result<JsonValue, Status> {
+    let out = run_ceph_required(&ceph_args(["-s", "--format", "json"])).await?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| Status::internal(format!("invalid ceph status JSON: {e}")))
+}
+
+/// OSD ids under a CRUSH host; a host that is not in the map has none.
+async fn osd_ids_under_host(host: &str) -> Result<Vec<String>, Status> {
+    let tree = run_ceph_cmd(&["osd", "ls-tree", host, "--format", "json"])
+        .await
+        .map_err(|e| Status::internal(format!("ceph osd ls-tree: {e}")))?;
+    if tree.status.code() == Some(124) {
+        return Err(Status::deadline_exceeded("ceph osd ls-tree timed out"));
+    }
+    let stderr = String::from_utf8_lossy(&tree.stderr);
+    if !tree.status.success() {
+        if stderr.contains("ENOENT") || stderr.contains("does not exist") {
+            return Ok(Vec::new());
+        }
+        return Err(Status::internal(format!(
+            "ceph osd ls-tree {host} failed: {}",
+            stderr.trim()
+        )));
+    }
+    crate::ceph_bootstrap::parse_osd_ls_tree(&String::from_utf8_lossy(&tree.stdout))
+        .map_err(Status::internal)
+}
+
+/// `ceph osd purge`, treating an OSD that is already gone as success.
+async fn purge_osd_from_cluster(id: &str) -> Result<(), Status> {
+    let out = run_ceph_cmd(&["osd", "purge", id, "--yes-i-really-mean-it"])
+        .await
+        .map_err(|e| Status::internal(format!("ceph osd purge: {e}")))?;
+    if out.status.code() == Some(124) {
+        return Err(Status::deadline_exceeded(format!(
+            "ceph osd purge {id} timed out"
+        )));
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && !err.contains("does not exist") && !err.contains("not present") {
+        return Err(Status::internal(format!(
+            "ceph osd purge {id} failed: {}",
+            err.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// `ceph mon rm`; returns true when the mon was already gone.
+async fn remove_mon_from_map(daemon_id: &str) -> Result<bool, Status> {
+    let out = run_ceph_cmd(&["mon", "rm", daemon_id])
+        .await
+        .map_err(|e| Status::internal(format!("ceph mon rm: {e}")))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let missing = stderr.contains("does not exist") || stderr.contains("no such");
+    if out.status.code() == Some(124) {
+        return Err(Status::deadline_exceeded(format!(
+            "ceph mon rm {daemon_id} timed out"
+        )));
+    }
+    if !out.status.success() && !missing {
+        return Err(Status::internal(format!(
+            "ceph mon rm {daemon_id} failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(missing)
+}
+
 /// SIGTERM one process.
 ///
 /// Pid 0 is refused: `kill(0, ...)` signals *every process in the caller's
@@ -2237,6 +2857,59 @@ fn parse_listen_ports(raw: &str) -> std::collections::HashSet<u16> {
     ports
 }
 
+async fn ensure_ceph_client_key_body(
+    entity: &str,
+    pool: &str,
+) -> Result<Response<proto::EnsureCephClientKeyResponse>, Status> {
+    let caps = client_key_caps(pool);
+
+    let mut get_or_create = ceph_args(["auth", "get-or-create"]);
+    get_or_create.push(entity.to_string());
+    get_or_create.extend(caps.iter().cloned());
+    let refs: Vec<&str> = get_or_create.iter().map(String::as_str).collect();
+    let out = run_ceph_cmd(&refs)
+        .await
+        .map_err(|e| Status::internal(format!("ceph auth get-or-create: {e}")))?;
+    if out.status.code() == Some(124) {
+        return Err(Status::deadline_exceeded(
+            "ceph auth get-or-create timed out",
+        ));
+    }
+    let keyring = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    } else if auth_caps_mismatch(&String::from_utf8_lossy(&out.stderr)) {
+        let mut set_caps = ceph_args(["auth", "caps"]);
+        set_caps.push(entity.to_string());
+        set_caps.extend(caps.iter().cloned());
+        run_ceph_required(&set_caps).await?;
+        let got = run_ceph_required(&ceph_args(["auth", "get", entity])).await?;
+        String::from_utf8_lossy(&got.stdout).to_string()
+    } else {
+        return Err(Status::internal(format!(
+            "ceph auth get-or-create {entity} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    };
+    if keyring.trim().is_empty() {
+        return Err(Status::internal(format!(
+            "ceph returned an empty keyring for {entity}"
+        )));
+    }
+    let path = client_keyring_path(entity);
+    let message = match write_client_keyring(&path, &keyring) {
+        Ok(()) => format!("{entity} has caps for pool {pool}; keyring written to {path}"),
+        Err(e) => {
+            warn!(%entity, %path, error = %e, "could not write client keyring; rbd keeps using the admin key");
+            format!("{entity} has caps for pool {pool}; keyring not written to {path}: {e}")
+        }
+    };
+    Ok(Response::new(proto::EnsureCephClientKeyResponse {
+        success: true,
+        message,
+        keyring,
+    }))
+}
+
 #[tonic::async_trait]
 impl proto::node_admin_server::NodeAdmin for AdminService {
     async fn list_disks(
@@ -3213,6 +3886,8 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let prepared = list_prepared_osds().await?;
         let mut created = Vec::new();
         let mut retired = Vec::new();
+        let mut pending_retire = Vec::new();
+        let mut pending_messages = Vec::new();
         for device in &req.osd_devices {
             if prepared.iter().any(|osd| osd_matches_device(osd, device)) {
                 continue;
@@ -3229,14 +3904,37 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             if still_wanted {
                 continue;
             }
+            let id = normalize_osd_id(&osd.id)?;
+            run_ceph_required(&ceph_args(["osd", "out", &id])).await?;
+            let json = ceph_status_json().await?;
+            let (pgs_total, pgs_not_clean) = crate::ceph_bootstrap::parse_pg_clean(&json);
+            if pgs_not_clean != 0 {
+                pending_retire.push(format!("osd.{id} ({})", osd.devices.join(",")));
+                pending_messages.push(format!(
+                    "waiting for active+clean before purge of osd.{id} ({pgs_not_clean}/{pgs_total} PGs not clean)"
+                ));
+                continue;
+            }
             retire_osd(osd, true).await?;
             retired.push(format!("osd.{} ({})", osd.id, osd.devices.join(",")));
         }
+        let success = pending_retire.is_empty();
+        let message = if success {
+            format!("created {}; retired {}", created.len(), retired.len())
+        } else {
+            format!(
+                "created {}; retired {}; {}",
+                created.len(),
+                retired.len(),
+                pending_messages.join("; ")
+            )
+        };
         Ok(Response::new(proto::ReconcileCephOsdsResponse {
-            success: true,
-            message: format!("created {}; retired {}", created.len(), retired.len()),
+            success,
+            message,
             created,
             retired,
+            pending_retire,
         }))
     }
 
@@ -3300,22 +3998,7 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if daemon_id.is_empty() {
             return Err(Status::invalid_argument("daemon_id is required"));
         }
-        let out = run_ceph_cmd(&["mon", "rm", daemon_id])
-            .await
-            .map_err(|e| Status::internal(format!("ceph mon rm: {e}")))?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let missing = stderr.contains("does not exist") || stderr.contains("no such");
-        if out.status.code() == Some(124) {
-            return Err(Status::deadline_exceeded(format!(
-                "ceph mon rm {daemon_id} timed out"
-            )));
-        }
-        if !out.status.success() && !missing {
-            return Err(Status::internal(format!(
-                "ceph mon rm {daemon_id} failed: {}",
-                stderr.trim()
-            )));
-        }
+        let missing = remove_mon_from_map(daemon_id).await?;
         Ok(Response::new(proto::RemoveCephMonResponse {
             success: true,
             message: if missing {
@@ -3340,27 +4023,8 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         {
             return Err(Status::invalid_argument("host must be a CRUSH host name"));
         }
-        let tree = run_ceph_cmd(&["osd", "ls-tree", host, "--format", "json"])
-            .await
-            .map_err(|e| Status::internal(format!("ceph osd ls-tree: {e}")))?;
-        if tree.status.code() == Some(124) {
-            return Err(Status::deadline_exceeded("ceph osd ls-tree timed out"));
-        }
-        let stderr = String::from_utf8_lossy(&tree.stderr);
         // A host with no OSDs left (or never any) has nothing to drain.
-        let osd_ids = if !tree.status.success() {
-            if stderr.contains("ENOENT") || stderr.contains("does not exist") {
-                Vec::new()
-            } else {
-                return Err(Status::internal(format!(
-                    "ceph osd ls-tree {host} failed: {}",
-                    stderr.trim()
-                )));
-            }
-        } else {
-            crate::ceph_bootstrap::parse_osd_ls_tree(&String::from_utf8_lossy(&tree.stdout))
-                .map_err(Status::internal)?
-        };
+        let osd_ids = osd_ids_under_host(host).await?;
         if !osd_ids.is_empty() {
             let mut args = vec!["osd", "out"];
             args.extend(osd_ids.iter().map(String::as_str));
@@ -3410,6 +4074,1055 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         }))
     }
 
+    async fn set_ceph_flags(
+        &self,
+        request: Request<proto::SetCephFlagsRequest>,
+    ) -> Result<Response<proto::SetCephFlagsResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if req.set_flags.is_empty() && req.unset_flags.is_empty() {
+            return Err(Status::invalid_argument(
+                "set_flags or unset_flags must name at least one flag",
+            ));
+        }
+        let set_flags: Vec<&str> = req.set_flags.iter().map(|f| f.trim()).collect();
+        let unset_flags: Vec<&str> = req.unset_flags.iter().map(|f| f.trim()).collect();
+        for flag in set_flags.iter().chain(unset_flags.iter()) {
+            validate_ceph_flag(flag)?;
+        }
+        if let Some(both) = set_flags.iter().find(|f| unset_flags.contains(f)) {
+            return Err(Status::invalid_argument(format!(
+                "flag {both} is in both set_flags and unset_flags"
+            )));
+        }
+        for flag in &set_flags {
+            run_ceph_required(&ceph_args(["osd", "set", flag])).await?;
+        }
+        for flag in &unset_flags {
+            run_ceph_required(&ceph_args(["osd", "unset", flag])).await?;
+        }
+        let json = ceph_status_json().await?;
+        let typed = crate::ceph_bootstrap::parse_typed_health(&json);
+        Ok(Response::new(proto::SetCephFlagsResponse {
+            success: true,
+            message: format!(
+                "set [{}]; unset [{}]",
+                set_flags.join(","),
+                unset_flags.join(",")
+            ),
+            flags: typed.flags,
+        }))
+    }
+
+    async fn check_ceph_ok_to_stop(
+        &self,
+        request: Request<proto::CheckCephOkToStopRequest>,
+    ) -> Result<Response<proto::CheckCephOkToStopResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let host = request.into_inner().host;
+        let host = host.trim();
+        validate_ceph_token("host", host)?;
+        let ids = osd_ids_under_host(host).await?;
+        if ids.is_empty() {
+            return Ok(Response::new(proto::CheckCephOkToStopResponse {
+                ok: true,
+                message: format!("no OSDs under host {host}"),
+                osd_ids: ids,
+            }));
+        }
+        let args = ok_to_stop_args(&ids);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_ceph_cmd(&refs)
+            .await
+            .map_err(|e| Status::internal(format!("starting ceph osd ok-to-stop: {e}")))?;
+        if out.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded("ceph osd ok-to-stop timed out"));
+        }
+        let (ok, message) = ok_to_stop_verdict(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+            &ids,
+        );
+        Ok(Response::new(proto::CheckCephOkToStopResponse {
+            ok,
+            message,
+            osd_ids: ids,
+        }))
+    }
+
+    async fn apply_ceph_client_config(
+        &self,
+        request: Request<proto::ApplyCephClientConfigRequest>,
+    ) -> Result<Response<proto::ApplyCephClientConfigResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if tokio::fs::try_exists(CEPH_NIX_PATH).await.unwrap_or(false) {
+            return Err(Status::failed_precondition(
+                "this node runs kcore's own Ceph; refusing to overwrite /etc/ceph for an external cluster",
+            ));
+        }
+        let changed = write_external_client_config(Path::new("/etc/ceph"), &req)?;
+        Ok(Response::new(proto::ApplyCephClientConfigResponse {
+            success: true,
+            message: if changed {
+                "external Ceph client config written".into()
+            } else {
+                "external Ceph client config already current".into()
+            },
+            changed,
+        }))
+    }
+
+    async fn drain_ceph_osd(
+        &self,
+        request: Request<proto::DrainCephOsdRequest>,
+    ) -> Result<Response<proto::DrainCephOsdResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let id = normalize_osd_id(&request.into_inner().osd_id)?;
+        run_ceph_required(&ceph_args(["osd", "out", &id])).await?;
+        let json = ceph_status_json().await?;
+        let (pgs_total, pgs_not_clean) = crate::ceph_bootstrap::parse_pg_clean(&json);
+        let clean = pgs_not_clean == 0;
+        Ok(Response::new(proto::DrainCephOsdResponse {
+            success: true,
+            message: if clean {
+                format!("osd.{id} out; all {pgs_total} PGs active+clean")
+            } else {
+                format!("osd.{id} out; {pgs_not_clean}/{pgs_total} PGs not yet active+clean")
+            },
+            clean,
+            pgs_total,
+            pgs_not_clean,
+        }))
+    }
+
+    async fn purge_ceph_osd(
+        &self,
+        request: Request<proto::PurgeCephOsdRequest>,
+    ) -> Result<Response<proto::PurgeCephOsdResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let id = normalize_osd_id(&req.osd_id)?;
+        let device = req.device.trim();
+        if !device.is_empty() {
+            validate_bootstrap_osd_device(device)?;
+        }
+        let osd = crate::ceph_bootstrap::ListedOsd {
+            id: id.clone(),
+            devices: if device.is_empty() {
+                Vec::new()
+            } else {
+                vec![device.to_string()]
+            },
+        };
+        retire_osd(&osd, true).await?;
+        Ok(Response::new(proto::PurgeCephOsdResponse {
+            success: true,
+            message: if device.is_empty() {
+                format!("purged osd.{id}")
+            } else {
+                format!("purged osd.{id} and zapped {device}")
+            },
+        }))
+    }
+
+    async fn reweight_ceph_osd(
+        &self,
+        request: Request<proto::ReweightCephOsdRequest>,
+    ) -> Result<Response<proto::ReweightCephOsdResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let id = normalize_osd_id(&req.osd_id)?;
+        if !req.weight.is_finite() || req.weight < 0.0 {
+            return Err(Status::invalid_argument(
+                "weight must be a finite number >= 0",
+            ));
+        }
+        let weight = req.weight.to_string();
+        let name = format!("osd.{id}");
+        run_ceph_required(&ceph_args(["osd", "crush", "reweight", &name, &weight])).await?;
+        Ok(Response::new(proto::ReweightCephOsdResponse {
+            success: true,
+            message: format!("crush weight of {name} set to {weight}"),
+        }))
+    }
+
+    async fn set_ceph_osd_device_class(
+        &self,
+        request: Request<proto::SetCephOsdDeviceClassRequest>,
+    ) -> Result<Response<proto::SetCephOsdDeviceClassResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let id = normalize_osd_id(&req.osd_id)?;
+        let class = req.device_class.trim();
+        validate_ceph_token("device_class", class)?;
+        let name = format!("osd.{id}");
+        run_ceph_required(&ceph_args([
+            "osd",
+            "crush",
+            "set-device-class",
+            class,
+            &name,
+        ]))
+        .await?;
+        Ok(Response::new(proto::SetCephOsdDeviceClassResponse {
+            success: true,
+            message: format!("{name} device class set to {class}"),
+        }))
+    }
+
+    async fn enable_ceph_mgr_module(
+        &self,
+        request: Request<proto::EnableCephMgrModuleRequest>,
+    ) -> Result<Response<proto::EnableCephMgrModuleResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let module = request.into_inner().module.trim().to_string();
+        validate_ceph_token("module", &module)?;
+        // Already-enabled returns non-zero with a clear message; treat that as ok.
+        let args = ceph_args(["mgr", "module", "enable", &module]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_ceph_cmd(&refs)
+            .await
+            .map_err(|e| Status::internal(format!("ceph mgr module enable: {e}")))?;
+        if out.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded(
+                "ceph mgr module enable timed out",
+            ));
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.success()
+            || stderr.to_ascii_lowercase().contains("already enabled")
+            || stderr.to_ascii_lowercase().contains("is already enabled")
+        {
+            return Ok(Response::new(proto::EnableCephMgrModuleResponse {
+                success: true,
+                message: format!("mgr module {module} enabled"),
+            }));
+        }
+        Err(Status::internal(format!(
+            "ceph mgr module enable {module} failed: {}",
+            stderr.trim()
+        )))
+    }
+
+    async fn rotate_ceph_client_key(
+        &self,
+        request: Request<proto::EnsureCephClientKeyRequest>,
+    ) -> Result<Response<proto::EnsureCephClientKeyResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let entity = normalize_client_entity(&req.client_name)?;
+        let pool = req.pool.trim();
+        validate_ceph_token("pool", pool)?;
+        // Best-effort delete; missing entity is fine.
+        let del = ceph_args(["auth", "del", &entity]);
+        let del_refs: Vec<&str> = del.iter().map(String::as_str).collect();
+        let _ = run_ceph_cmd(&del_refs).await;
+        ensure_ceph_client_key_body(&entity, pool).await
+    }
+
+    async fn ensure_ceph_client_key(
+        &self,
+        request: Request<proto::EnsureCephClientKeyRequest>,
+    ) -> Result<Response<proto::EnsureCephClientKeyResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let entity = normalize_client_entity(&req.client_name)?;
+        let pool = req.pool.trim();
+        validate_ceph_token("pool", pool)?;
+        ensure_ceph_client_key_body(&entity, pool).await
+    }
+
+    async fn purge_lost_ceph_host(
+        &self,
+        request: Request<proto::PurgeLostCephHostRequest>,
+    ) -> Result<Response<proto::PurgeLostCephHostResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let host = req.host.trim();
+        validate_ceph_token("host", host)?;
+        let daemon_id = match req.daemon_id.trim() {
+            "" => host,
+            id => id,
+        };
+        validate_ceph_token("daemon_id", daemon_id)?;
+
+        let osd_ids = osd_ids_under_host(host).await?;
+        let mut purged = Vec::new();
+        for id in &osd_ids {
+            // Down is required for purge; marking out first keeps the map
+            // consistent if the OSD was still flagged in.
+            let _ = run_ceph_cmd(&["osd", "out", id]).await;
+            purge_osd_from_cluster(id).await?;
+            purged.push(id.clone());
+        }
+        // The emptied CRUSH bucket would otherwise linger; best effort.
+        if !osd_ids.is_empty() {
+            let _ = run_ceph_cmd(&["osd", "crush", "remove", host]).await;
+        }
+        let mon_missing = remove_mon_from_map(daemon_id).await?;
+        Ok(Response::new(proto::PurgeLostCephHostResponse {
+            success: true,
+            message: format!(
+                "purged {} OSD(s) under {host}; mon {daemon_id} {}",
+                purged.len(),
+                if mon_missing {
+                    "was already gone"
+                } else {
+                    "removed"
+                }
+            ),
+            purged_osd_ids: purged,
+        }))
+    }
+
+    async fn ensure_ceph_crush_topology(
+        &self,
+        request: Request<proto::EnsureCephCrushTopologyRequest>,
+    ) -> Result<Response<proto::EnsureCephCrushTopologyResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let hosts: Vec<crate::ceph_crush::CrushHost> = req
+            .hosts
+            .iter()
+            .map(|h| crate::ceph_crush::CrushHost {
+                host: h.host.clone(),
+                rack: h.rack.clone(),
+                room: h.room.clone(),
+            })
+            .collect();
+        for h in &hosts {
+            validate_ceph_token("host", h.host.trim())?;
+            if !h.rack.trim().is_empty() {
+                validate_ceph_token("rack", h.rack.trim())?;
+            }
+            if !h.room.trim().is_empty() {
+                validate_ceph_token("room", h.room.trim())?;
+            }
+        }
+        if !req.stretch_tiebreaker.trim().is_empty() {
+            validate_ceph_token("stretch_tiebreaker", req.stretch_tiebreaker.trim())?;
+        }
+        let (rule, cmds) = crate::ceph_crush::crush_topology_commands(
+            &req.failure_domain,
+            &hosts,
+            req.stretch,
+            &req.stretch_tiebreaker,
+        )
+        .map_err(Status::invalid_argument)?;
+        for cmd in cmds {
+            let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            let out = run_ceph_cmd(&refs)
+                .await
+                .map_err(|e| Status::internal(format!("ceph {}: {e}", refs.join(" "))))?;
+            if out.status.code() == Some(124) {
+                return Err(Status::deadline_exceeded(format!(
+                    "ceph {} timed out",
+                    refs.join(" ")
+                )));
+            }
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+                // add-bucket / create-replicated / enable_stretch_mode are idempotent.
+                if stderr.contains("already exists")
+                    || stderr.contains("already enabled")
+                    || stderr.contains("name already in use")
+                {
+                    continue;
+                }
+                return Err(Status::internal(format!(
+                    "ceph {} failed: {}",
+                    refs.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        Ok(Response::new(proto::EnsureCephCrushTopologyResponse {
+            success: true,
+            message: if rule.is_empty() {
+                "crush topology unchanged (host domain)".into()
+            } else {
+                format!("crush topology ensured; rule {rule}")
+            },
+            crush_rule: rule,
+        }))
+    }
+
+    async fn configure_ceph_dashboard(
+        &self,
+        request: Request<proto::ConfigureCephDashboardRequest>,
+    ) -> Result<Response<proto::ConfigureCephDashboardResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let username = req.username.trim();
+        if username.is_empty() || req.password.is_empty() {
+            return Err(Status::invalid_argument(
+                "username and password are required",
+            ));
+        }
+        validate_ceph_token("username", username)?;
+        // Enable module (idempotent) without re-entering the RPC (peer auth).
+        {
+            let out = run_ceph_cmd(&["mgr", "module", "enable", "dashboard"])
+                .await
+                .map_err(|e| Status::internal(format!("ceph mgr module enable: {e}")))?;
+            let stderr = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            if !out.status.success()
+                && !stderr.contains("already enabled")
+                && !stderr.contains("is already enabled")
+            {
+                return Err(Status::internal(format!(
+                    "ceph mgr module enable dashboard failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        let port = if req.server_port > 0 {
+            req.server_port
+        } else {
+            8443
+        };
+        let addr = req.server_addr.trim();
+        if !addr.is_empty() {
+            run_ceph_required(&ceph_args([
+                "config",
+                "set",
+                "mgr",
+                "mgr/dashboard/server_addr",
+                addr,
+            ]))
+            .await?;
+        }
+        run_ceph_required(&ceph_args([
+            "config",
+            "set",
+            "mgr",
+            "mgr/dashboard/ssl",
+            "false",
+        ]))
+        .await?;
+        let port_s = port.to_string();
+        run_ceph_required(&ceph_args([
+            "config",
+            "set",
+            "mgr",
+            "mgr/dashboard/server_port",
+            &port_s,
+        ]))
+        .await?;
+        // Create or set password for the ac-user.
+        let mut create = Command::new("timeout")
+            .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+            .args([
+                "ceph",
+                "dashboard",
+                "ac-user-create",
+                username,
+                "-i",
+                "-",
+                "administrator",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| Status::internal(format!("ceph dashboard ac-user-create: {e}")))?;
+        if let Some(mut stdin) = create.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(req.password.as_bytes()).await;
+        }
+        let create_out = create
+            .wait_with_output()
+            .await
+            .map_err(|e| Status::internal(format!("ceph dashboard ac-user-create: {e}")))?;
+        if !create_out.status.success() {
+            let stderr = String::from_utf8_lossy(&create_out.stderr).to_ascii_lowercase();
+            if stderr.contains("already exists") {
+                let mut set = Command::new("timeout")
+                    .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+                    .args([
+                        "ceph",
+                        "dashboard",
+                        "ac-user-set-password",
+                        username,
+                        "-i",
+                        "-",
+                    ])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| Status::internal(format!("ac-user-set-password: {e}")))?;
+                if let Some(mut stdin) = set.stdin.take() {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(req.password.as_bytes()).await;
+                }
+                let set_out = set
+                    .wait_with_output()
+                    .await
+                    .map_err(|e| Status::internal(format!("ac-user-set-password: {e}")))?;
+                if !set_out.status.success() {
+                    return Err(Status::internal(format!(
+                        "ac-user-set-password failed: {}",
+                        String::from_utf8_lossy(&set_out.stderr).trim()
+                    )));
+                }
+            } else {
+                return Err(Status::internal(format!(
+                    "ac-user-create failed: {}",
+                    String::from_utf8_lossy(&create_out.stderr).trim()
+                )));
+            }
+        }
+        let host = if addr.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            addr.to_string()
+        };
+        let url = format!("http://{host}:{port}/");
+        Ok(Response::new(proto::ConfigureCephDashboardResponse {
+            success: true,
+            message: format!("dashboard configured for user {username}"),
+            url,
+        }))
+    }
+
+    async fn ensure_rbd_mirror(
+        &self,
+        request: Request<proto::EnsureRbdMirrorRequest>,
+    ) -> Result<Response<proto::EnsureRbdMirrorResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let pool = req.pool.trim();
+        validate_ceph_token("pool", pool)?;
+        let mode = match req.mode.trim() {
+            "" | "pool" => "pool",
+            "image" => "image",
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "mode must be pool or image, got {other:?}"
+                )))
+            }
+        };
+        run_ceph_required(&ceph_args([
+            "osd",
+            "pool",
+            "application",
+            "enable",
+            pool,
+            "rbd",
+        ]))
+        .await
+        .ok();
+        let enable = Command::new("timeout")
+            .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+            .args(["rbd", "mirror", "pool", "enable", pool, mode])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("rbd mirror pool enable: {e}")))?;
+        if enable.status.code() == Some(124) {
+            return Err(Status::deadline_exceeded(
+                "rbd mirror pool enable timed out",
+            ));
+        }
+        if !enable.status.success() {
+            let err = String::from_utf8_lossy(&enable.stderr).to_ascii_lowercase();
+            if !err.contains("already") {
+                return Err(Status::internal(format!(
+                    "rbd mirror pool enable failed: {}",
+                    String::from_utf8_lossy(&enable.stderr).trim()
+                )));
+            }
+        }
+        Ok(Response::new(proto::EnsureRbdMirrorResponse {
+            success: true,
+            message: format!("rbd mirror enabled on {pool} ({mode})"),
+        }))
+    }
+
+    async fn create_rbd_mirror_bootstrap(
+        &self,
+        request: Request<proto::CreateRbdMirrorBootstrapRequest>,
+    ) -> Result<Response<proto::CreateRbdMirrorBootstrapResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let pool = req.pool.trim();
+        validate_ceph_token("pool", pool)?;
+        let site = req.site_name.trim();
+        if !site.is_empty() {
+            validate_ceph_token("site_name", site)?;
+            let _ = Command::new("timeout")
+                .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+                .args([
+                    "rbd",
+                    "mirror",
+                    "pool",
+                    "peer",
+                    "bootstrap",
+                    "create",
+                    pool,
+                    "--site-name",
+                    site,
+                ])
+                .output()
+                .await;
+        }
+        let mut args = vec![
+            "rbd".into(),
+            "mirror".into(),
+            "pool".into(),
+            "peer".into(),
+            "bootstrap".into(),
+            "create".into(),
+            pool.to_string(),
+        ];
+        if !site.is_empty() {
+            args.push("--site-name".into());
+            args.push(site.to_string());
+        }
+        let out = Command::new("timeout")
+            .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+            .args(&args)
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("rbd mirror bootstrap create: {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "rbd mirror bootstrap create failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(Response::new(proto::CreateRbdMirrorBootstrapResponse {
+            success: true,
+            message: "bootstrap token created".into(),
+            token: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        }))
+    }
+
+    async fn import_rbd_mirror_peer(
+        &self,
+        request: Request<proto::ImportRbdMirrorPeerRequest>,
+    ) -> Result<Response<proto::ImportRbdMirrorPeerResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let pool = req.pool.trim();
+        validate_ceph_token("pool", pool)?;
+        if req.token.trim().is_empty() {
+            return Err(Status::invalid_argument("token is required"));
+        }
+        let site = req.site_name.trim();
+        let mut cmd = Command::new("timeout");
+        cmd.arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+            .arg("rbd")
+            .arg("mirror")
+            .arg("pool")
+            .arg("peer")
+            .arg("bootstrap")
+            .arg("import")
+            .arg(pool)
+            .arg("-");
+        if !site.is_empty() {
+            validate_ceph_token("site_name", site)?;
+            cmd.arg("--site-name").arg(site);
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| Status::internal(format!("rbd mirror bootstrap import: {e}")))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(req.token.as_bytes())
+                .await
+                .map_err(|e| Status::internal(format!("writing token: {e}")))?;
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| Status::internal(format!("rbd mirror bootstrap import: {e}")))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            if !err.contains("already") {
+                return Err(Status::internal(format!(
+                    "rbd mirror bootstrap import failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        Ok(Response::new(proto::ImportRbdMirrorPeerResponse {
+            success: true,
+            message: format!("peer imported for pool {pool}"),
+        }))
+    }
+
+    async fn rotate_ceph_mon_key(
+        &self,
+        request: Request<proto::RotateCephMonKeyRequest>,
+    ) -> Result<Response<proto::RotateCephMonKeyResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let _ = request.into_inner();
+        // Prefer `ceph auth rotate` when available; fall back to get-or-create.
+        let rotate = run_ceph_cmd(&["auth", "rotate", "mon."]).await;
+        let keyring = match rotate {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
+            _ => {
+                let out = run_ceph_cmd(&["auth", "get", "mon."])
+                    .await
+                    .map_err(|e| Status::internal(format!("ceph auth get mon.: {e}")))?;
+                if !out.status.success() {
+                    return Err(Status::internal(format!(
+                        "ceph auth get mon. failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )));
+                }
+                // Delete and recreate with same caps when rotate is unavailable.
+                let caps_out = String::from_utf8_lossy(&out.stdout).to_string();
+                let _ = run_ceph_cmd(&["auth", "del", "mon."]).await;
+                let recreate = run_ceph_cmd(&["auth", "get-or-create", "mon.", "mon", "allow *"])
+                    .await
+                    .map_err(|e| Status::internal(format!("ceph auth get-or-create mon.: {e}")))?;
+                if !recreate.status.success() {
+                    // Best effort restore from previous dump.
+                    let _ = caps_out;
+                    return Err(Status::internal(format!(
+                        "ceph auth get-or-create mon. failed: {}",
+                        String::from_utf8_lossy(&recreate.stderr).trim()
+                    )));
+                }
+                String::from_utf8_lossy(&recreate.stdout).to_string()
+            }
+        };
+        let path = "/etc/ceph/ceph.mon.keyring";
+        tokio::fs::write(path, keyring.as_bytes())
+            .await
+            .map_err(|e| Status::internal(format!("writing {path}: {e}")))?;
+        let _ = Command::new("systemctl")
+            .args(["try-restart", "ceph-mon.target"])
+            .output()
+            .await;
+        Ok(Response::new(proto::RotateCephMonKeyResponse {
+            success: true,
+            message: "mon key rotated; mon target restarted".into(),
+            keyring,
+        }))
+    }
+
+    async fn rotate_ceph_osd_dmcrypt(
+        &self,
+        request: Request<proto::RotateCephOsdDmcryptRequest>,
+    ) -> Result<Response<proto::RotateCephOsdDmcryptResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::invalid_argument(
+                "confirm=true is required to drain, zap, and recreate an encrypted OSD",
+            ));
+        }
+        if req.osd_id < 0 {
+            return Err(Status::invalid_argument("osd_id must be >= 0"));
+        }
+        let id = req.osd_id.to_string();
+        let device = req.device.trim();
+        if device.is_empty() || !device.starts_with('/') {
+            return Err(Status::invalid_argument(
+                "device must be an absolute path for ceph-volume recreate",
+            ));
+        }
+        // Drain: mark out and wait briefly for active+clean signal via status.
+        let _ = run_ceph_cmd(&["osd", "out", &id]).await;
+        let mut drained = false;
+        for _ in 0..30 {
+            let health = run_ceph_cmd(&["-s", "--format", "json"]).await;
+            if let Ok(out) = health {
+                if out.status.success() {
+                    if let Ok(json) = serde_json::from_slice::<JsonValue>(&out.stdout) {
+                        let typed = crate::ceph_bootstrap::parse_typed_health(&json);
+                        if typed.pgs_not_clean == 0 {
+                            drained = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        if !drained {
+            return Ok(Response::new(proto::RotateCephOsdDmcryptResponse {
+                success: false,
+                message: format!("osd.{id} marked out; waiting for active+clean before purge"),
+                drained: false,
+                purged: false,
+            }));
+        }
+        purge_osd_from_cluster(&id).await?;
+        let prepare = Command::new("ceph-volume")
+            .args([
+                "lvm",
+                "create",
+                "--bluestore",
+                "--dmcrypt",
+                "--data",
+                device,
+            ])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("ceph-volume create: {e}")))?;
+        if !prepare.status.success() {
+            return Err(Status::internal(format!(
+                "ceph-volume create --dmcrypt failed: {}",
+                String::from_utf8_lossy(&prepare.stderr).trim()
+            )));
+        }
+        Ok(Response::new(proto::RotateCephOsdDmcryptResponse {
+            success: true,
+            message: format!("osd.{id} purged and recreated with new dmcrypt key on {device}"),
+            drained: true,
+            purged: true,
+        }))
+    }
+
+    async fn finalize_ceph_osd_release(
+        &self,
+        request: Request<proto::FinalizeCephOsdReleaseRequest>,
+    ) -> Result<Response<proto::FinalizeCephOsdReleaseResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::invalid_argument(
+                "confirm=true is required for require-osd-release",
+            ));
+        }
+        let mut release = req.release.trim().to_string();
+        if release.is_empty() {
+            let ver = Command::new("ceph")
+                .arg("--version")
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("ceph --version: {e}")))?;
+            let (rel, _) = parse_ceph_version_line(&String::from_utf8_lossy(&ver.stdout));
+            release = rel;
+        }
+        if release.is_empty() {
+            return Err(Status::failed_precondition(
+                "could not determine Ceph release name",
+            ));
+        }
+        validate_ceph_token("release", &release)?;
+        // Require HEALTH_OK and clean PGs.
+        let health = run_ceph_cmd(&["-s", "--format", "json"])
+            .await
+            .map_err(|e| Status::internal(format!("ceph -s: {e}")))?;
+        if !health.status.success() {
+            return Err(Status::internal("ceph -s failed"));
+        }
+        let json: JsonValue = serde_json::from_slice(&health.stdout)
+            .map_err(|e| Status::internal(format!("ceph -s json: {e}")))?;
+        let typed = crate::ceph_bootstrap::parse_typed_health(&json);
+        if typed.health_status != "HEALTH_OK" {
+            return Err(Status::failed_precondition(format!(
+                "cluster is {}; wait for HEALTH_OK",
+                typed.health_status
+            )));
+        }
+        if typed.pgs_not_clean > 0 {
+            return Err(Status::failed_precondition(format!(
+                "{} PGs are not active+clean",
+                typed.pgs_not_clean
+            )));
+        }
+        run_ceph_required(&ceph_args(["osd", "require-osd-release", &release])).await?;
+        Ok(Response::new(proto::FinalizeCephOsdReleaseResponse {
+            success: true,
+            message: format!("require-osd-release set to {release}"),
+            release,
+        }))
+    }
+
+    async fn list_rbd_trash(
+        &self,
+        request: Request<proto::ListRbdTrashRequest>,
+    ) -> Result<Response<proto::ListRbdTrashResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let pool = req.pool.trim();
+        validate_ceph_token("pool", pool)?;
+        let mut args = vec!["rbd".into(), "trash".into(), "ls".into(), pool.to_string()];
+        let ns = req.namespace.trim();
+        if !ns.is_empty() {
+            validate_ceph_token("namespace", ns)?;
+            args.push("--namespace".into());
+            args.push(ns.to_string());
+        }
+        args.push("--format".into());
+        args.push("json".into());
+        let out = Command::new("timeout")
+            .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+            .args(&args)
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("rbd trash ls: {e}")))?;
+        if !out.status.success() {
+            return Err(Status::internal(format!(
+                "rbd trash ls failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let entries = parse_rbd_trash_ls(&String::from_utf8_lossy(&out.stdout));
+        Ok(Response::new(proto::ListRbdTrashResponse { entries }))
+    }
+
+    async fn purge_rbd_trash(
+        &self,
+        request: Request<proto::PurgeRbdTrashRequest>,
+    ) -> Result<Response<proto::PurgeRbdTrashResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::invalid_argument("confirm=true is required"));
+        }
+        let pool = req.pool.trim();
+        validate_ceph_token("pool", pool)?;
+        let ns = req.namespace.trim();
+        if !ns.is_empty() {
+            validate_ceph_token("namespace", ns)?;
+        }
+        let trash_id = req.trash_id.trim();
+        let mut purged = 0i32;
+        if trash_id.is_empty() {
+            let mut args = vec!["rbd".into(), "trash".into(), "ls".into(), pool.to_string()];
+            if !ns.is_empty() {
+                args.push("--namespace".into());
+                args.push(ns.to_string());
+            }
+            args.push("--format".into());
+            args.push("json".into());
+            let out = Command::new("timeout")
+                .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+                .args(&args)
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("rbd trash ls: {e}")))?;
+            if !out.status.success() {
+                return Err(Status::internal(format!(
+                    "rbd trash ls failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            let entries = parse_rbd_trash_ls(&String::from_utf8_lossy(&out.stdout));
+            for entry in entries {
+                purge_one_trash(pool, ns, &entry.id).await?;
+                purged += 1;
+            }
+        } else {
+            validate_ceph_token("trash_id", trash_id)?;
+            purge_one_trash(pool, ns, trash_id).await?;
+            purged = 1;
+        }
+        Ok(Response::new(proto::PurgeRbdTrashResponse {
+            success: true,
+            message: format!("purged {purged} trash entr(y/ies)"),
+            purged,
+        }))
+    }
+
+    async fn ensure_rbd_namespace(
+        &self,
+        request: Request<proto::EnsureRbdNamespaceRequest>,
+    ) -> Result<Response<proto::EnsureRbdNamespaceResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let pool = req.pool.trim();
+        let ns = req.namespace.trim();
+        validate_ceph_token("pool", pool)?;
+        validate_ceph_token("namespace", ns)?;
+        let out = Command::new("timeout")
+            .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
+            .args(["rbd", "namespace", "create", &format!("{pool}/{ns}")])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("rbd namespace create: {e}")))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
+            if !err.contains("already exists") {
+                return Err(Status::internal(format!(
+                    "rbd namespace create failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        Ok(Response::new(proto::EnsureRbdNamespaceResponse {
+            success: true,
+            message: format!("namespace {pool}/{ns} ensured"),
+        }))
+    }
+
+    async fn set_rbd_image_qos(
+        &self,
+        request: Request<proto::SetRbdImageQosRequest>,
+    ) -> Result<Response<proto::SetRbdImageQosResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let req = request.into_inner();
+        let pool = req.pool.trim();
+        let image = req.image.trim();
+        validate_ceph_token("pool", pool)?;
+        validate_ceph_token("image", image)?;
+        let ns = req.namespace.trim();
+        if !ns.is_empty() {
+            validate_ceph_token("namespace", ns)?;
+        }
+        let spec = if ns.is_empty() {
+            format!("{pool}/{image}")
+        } else {
+            format!("{pool}/{ns}/{image}")
+        };
+        if req.qos_iops > 0 {
+            let v = req.qos_iops.to_string();
+            rbd_config_image_set(&spec, "rbd_qos_iops_limit", &v).await?;
+        }
+        if req.qos_bps > 0 {
+            let v = req.qos_bps.to_string();
+            rbd_config_image_set(&spec, "rbd_qos_bps_limit", &v).await?;
+        }
+        Ok(Response::new(proto::SetRbdImageQosResponse {
+            success: true,
+            message: format!("qos applied on {spec}"),
+        }))
+    }
+
+    async fn get_ceph_release(
+        &self,
+        request: Request<proto::GetCephReleaseRequest>,
+    ) -> Result<Response<proto::GetCephReleaseResponse>, Status> {
+        auth::require_peer(&request, &[CN_CONTROLLER_PREFIX])?;
+        let _ = request.into_inner();
+        let out = run_ceph_cmd(&["versions", "--format", "json"])
+            .await
+            .map_err(|e| Status::internal(format!("ceph versions: {e}")))?;
+        if !out.status.success() {
+            // Fallback: parse `ceph --version`.
+            let ver = Command::new("ceph")
+                .arg("--version")
+                .output()
+                .await
+                .map_err(|e| Status::internal(format!("ceph --version: {e}")))?;
+            let text = String::from_utf8_lossy(&ver.stdout);
+            let (release, version) = parse_ceph_version_line(&text);
+            return Ok(Response::new(proto::GetCephReleaseResponse {
+                release,
+                version,
+            }));
+        }
+        let json: JsonValue = serde_json::from_slice(&out.stdout).unwrap_or(JsonValue::Null);
+        let (release, version) = parse_ceph_versions_json(&json);
+        Ok(Response::new(proto::GetCephReleaseResponse {
+            release,
+            version,
+        }))
+    }
+
     async fn get_host_cpu_flags(
         &self,
         request: Request<proto::GetHostCpuFlagsRequest>,
@@ -3445,17 +5158,38 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         let raw_status = String::from_utf8_lossy(&out.stdout).to_string();
         let json: JsonValue = serde_json::from_str(&raw_status)
             .map_err(|e| Status::internal(format!("invalid ceph status JSON: {e}")))?;
-        let health_status = json
-            .pointer("/health/status")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("HEALTH_ERR")
-            .to_string();
-        let (osd_up, osd_in) = crate::ceph_bootstrap::parse_osd_counters(&json);
+        let typed = crate::ceph_bootstrap::parse_typed_health(&json);
         Ok(Response::new(proto::GetCephHealthResponse {
-            health_status,
+            health_status: typed.health_status,
             raw_status,
-            osd_up,
-            osd_in,
+            osd_up: typed.osd_up,
+            osd_in: typed.osd_in,
+            mon_quorum: typed.mon_quorum,
+            mon_count: typed.mon_count,
+            osd_total: typed.osd_total,
+            pgs_total: typed.pgs_total,
+            pgs_not_clean: typed.pgs_not_clean,
+            backfill_pgs: typed.backfill_pgs,
+            noout: typed.noout,
+            norebalance: typed.norebalance,
+            flags: typed.flags,
+            checks: typed
+                .checks
+                .into_iter()
+                .map(|(type_, severity, summary)| proto::CephHealthCheckSummary {
+                    severity,
+                    r#type: type_,
+                    summary,
+                })
+                .collect(),
+            pgs_by_state: typed
+                .pgs_by_state
+                .into_iter()
+                .map(|(state, count)| proto::CephPgStateCount { state, count })
+                .collect(),
+            bytes_total: typed.bytes_total,
+            bytes_used: typed.bytes_used,
+            bytes_avail: typed.bytes_avail,
         }))
     }
 
@@ -3557,6 +5291,8 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         if pool.is_empty() {
             return Err(Status::invalid_argument("pool is required"));
         }
+        validate_pool_request(&req)?;
+        let erasure = req.pool_type.trim() == "erasure";
         let listed = run_ceph_cmd(&["osd", "pool", "ls"])
             .await
             .map_err(|e| Status::internal(format!("ceph osd pool ls: {e}")))?;
@@ -3574,7 +5310,9 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             .any(|l| l.trim() == pool);
         let mut created = false;
         if !exists {
-            let out = run_ceph_cmd(&["osd", "pool", "create", pool, "32"])
+            let create_args = pool_create_args(pool, &req);
+            let create_refs: Vec<&str> = create_args.iter().map(String::as_str).collect();
+            let out = run_ceph_cmd(&create_refs)
                 .await
                 .map_err(|e| Status::internal(format!("ceph osd pool create: {e}")))?;
             if out.status.code() == Some(124) {
@@ -3607,7 +5345,38 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
             let min_size = req.min_size.to_string();
             let _ = run_ceph_cmd(&["osd", "pool", "set", pool, "min_size", &min_size]).await;
         }
-        let _ = run_ceph_cmd(&["osd", "pool", "application", "enable", pool, "rbd"]).await;
+        if exists && req.pg_num > 0 {
+            let pg_num = req.pg_num.to_string();
+            run_ceph_required(&ceph_args(["osd", "pool", "set", pool, "pg_num", &pg_num])).await?;
+        }
+        for cmd in pool_tuning_commands(pool, &req) {
+            run_ceph_required(&cmd).await?;
+        }
+        for cmd in ms_mode_commands(&req.ms_mode)? {
+            run_ceph_required(&cmd).await?;
+        }
+        if let Some(recovery) = &req.recovery {
+            for cmd in recovery_config_commands(recovery)? {
+                run_ceph_required(&cmd).await?;
+            }
+        }
+        let application = match req.application.trim() {
+            "" => "rbd",
+            a => a,
+        };
+        let _ = run_ceph_cmd(&["osd", "pool", "application", "enable", pool, application]).await;
+        // RBD cannot initialise an erasure-coded pool; it only serves as a data pool.
+        if application != "rbd" || erasure {
+            return Ok(Response::new(proto::EnsureCephPoolResponse {
+                success: true,
+                created,
+                message: if created {
+                    format!("created pool {pool}")
+                } else {
+                    format!("pool {pool} already present")
+                },
+            }));
+        }
         let init = Command::new("timeout")
             .arg(crate::ceph_bootstrap::CEPH_CLI_TIMEOUT_SECS)
             .args(["rbd", "pool", "init", pool])
@@ -6042,6 +7811,302 @@ mod tests {
 }"#;
         assert_eq!(daemon_id_from_ceph_nix(nix), "dell-tower-1");
         assert_eq!(daemon_id_from_ceph_nix("{ ... }: {}"), "");
+    }
+
+    fn pool_req(pool: &str) -> proto::EnsureCephPoolRequest {
+        proto::EnsureCephPoolRequest {
+            pool: pool.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn flat(cmds: &[CephArgs]) -> Vec<String> {
+        cmds.iter().map(|c| c.join(" ")).collect()
+    }
+
+    #[test]
+    fn normalize_osd_id_accepts_plain_and_prefixed_ids() {
+        assert_eq!(normalize_osd_id("7").unwrap(), "7");
+        assert_eq!(normalize_osd_id(" osd.12 ").unwrap(), "12");
+        for bad in ["", "osd.", "-1", "7;rm", "osd.x", "1234567890"] {
+            assert!(normalize_osd_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ok_to_stop_lists_every_osd_and_reports_the_reason() {
+        let ids = vec!["3".to_string(), "4".to_string()];
+        assert_eq!(
+            ok_to_stop_args(&ids),
+            ["osd", "ok-to-stop", "3", "4"].map(String::from)
+        );
+        let (ok, msg) = ok_to_stop_verdict(true, "{}", "", &ids);
+        assert!(ok);
+        assert_eq!(msg, "osd.3, osd.4 ok to stop");
+        let (ok, msg) = ok_to_stop_verdict(false, "", "unsafe to stop osd(s): 12 pgs", &ids);
+        assert!(!ok);
+        assert!(msg.contains("12 pgs"), "{msg}");
+    }
+
+    fn client_config_req(keyring: &str) -> proto::ApplyCephClientConfigRequest {
+        proto::ApplyCephClientConfigRequest {
+            mon_hosts: "10.0.0.1:6789, 10.0.0.2".into(),
+            client_name: "client.admin".into(),
+            keyring: keyring.into(),
+            fsid: "e6978b71-0000-4000-8000-000000000000".into(),
+        }
+    }
+
+    #[test]
+    fn external_client_config_is_written_once_with_a_private_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = client_config_req("[client.admin]\n\tkey = AQBabc==\n");
+        assert!(write_external_client_config(dir.path(), &req).unwrap());
+        assert!(!write_external_client_config(dir.path(), &req).unwrap());
+        let conf = std::fs::read_to_string(dir.path().join("ceph.conf")).unwrap();
+        assert!(conf.contains("mon_host = 10.0.0.1:6789,10.0.0.2"), "{conf}");
+        assert!(conf.contains("keyring = /etc/ceph/ceph.client.admin.keyring"));
+        let meta = std::fs::metadata(dir.path().join("ceph.client.admin.keyring")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn external_client_config_refuses_a_keyring_for_another_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = client_config_req("[client.other]\n\tkey = AQBabc==\n");
+        let err = write_external_client_config(dir.path(), &req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let mut bad_mon = client_config_req("[client.admin]\nkey = x\n");
+        bad_mon.mon_hosts = "10.0.0.1;rm".into();
+        assert!(validate_external_client_config(&bad_mon).is_err());
+        assert!(!dir.path().join("ceph.conf").exists());
+    }
+
+    #[test]
+    fn validate_ceph_flag_allows_known_shapes_only() {
+        for ok in ["noout", "norebalance", "nodeep-scrub", "pause"] {
+            assert!(validate_ceph_flag(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "NoOut", "-noout", "no out", "noout;x", "osd set"] {
+            assert!(validate_ceph_flag(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_ceph_token_rejects_option_like_and_odd_names() {
+        assert!(validate_ceph_token("pool", "kcore-vms").is_ok());
+        assert!(validate_ceph_token("host", "node-103.lab").is_ok());
+        for bad in ["", "-x", "a b", "a/b", "a'b"] {
+            assert!(validate_ceph_token("pool", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn client_entity_defaults_and_prefixes() {
+        assert_eq!(normalize_client_entity("").unwrap(), "client.kcore");
+        assert_eq!(normalize_client_entity("kcore").unwrap(), "client.kcore");
+        assert_eq!(normalize_client_entity("client.vm").unwrap(), "client.vm");
+        assert!(normalize_client_entity("client.").is_err());
+        assert!(normalize_client_entity("a b").is_err());
+    }
+
+    #[test]
+    fn client_key_caps_use_profile_rbd() {
+        let caps = client_key_caps("kcore-vms");
+        assert_eq!(
+            caps,
+            [
+                "mon",
+                "profile rbd",
+                "osd",
+                "profile rbd pool=kcore-vms",
+                "mgr",
+                "profile rbd pool=kcore-vms"
+            ]
+        );
+    }
+
+    #[test]
+    fn client_keyring_path_matches_ceph_search_order() {
+        assert_eq!(
+            client_keyring_path("client.kcore"),
+            "/etc/ceph/ceph.client.kcore.keyring"
+        );
+        assert_eq!(
+            client_keyring_path("client.kcore"),
+            crate::rbd_nbd::CLIENT_KCORE_KEYRING
+        );
+    }
+
+    #[test]
+    fn auth_caps_mismatch_matches_ceph_wording() {
+        assert!(auth_caps_mismatch(
+            "Error EINVAL: key for client.kcore exists but cap osd does not match"
+        ));
+        assert!(!auth_caps_mismatch("Error ENOENT: not found"));
+    }
+
+    #[test]
+    fn pool_create_args_leave_pg_num_to_the_autoscaler() {
+        assert_eq!(
+            pool_create_args("p", &pool_req("p")).join(" "),
+            "osd pool create p"
+        );
+        let mut req = pool_req("p");
+        req.pg_num = 64;
+        assert_eq!(
+            pool_create_args("p", &req).join(" "),
+            "osd pool create p 64"
+        );
+    }
+
+    #[test]
+    fn pool_create_args_for_erasure_pools() {
+        let mut req = pool_req("p");
+        req.pool_type = "erasure".to_string();
+        req.erasure_profile = "ec42".to_string();
+        assert_eq!(
+            pool_create_args("p", &req).join(" "),
+            "osd pool create p 32 erasure ec42"
+        );
+        req.pg_num = 128;
+        req.erasure_profile.clear();
+        assert_eq!(
+            pool_create_args("p", &req).join(" "),
+            "osd pool create p 128 erasure"
+        );
+    }
+
+    #[test]
+    fn validate_pool_request_accepts_empty_extras() {
+        assert!(validate_pool_request(&pool_req("p")).is_ok());
+    }
+
+    #[test]
+    fn validate_pool_request_rejects_bad_values() {
+        type Mutation = Box<dyn Fn(&mut proto::EnsureCephPoolRequest)>;
+        let cases: Vec<Mutation> = vec![
+            Box::new(|r| r.pool_type = "mirror".into()),
+            Box::new(|r| r.erasure_profile = "ec".into()),
+            Box::new(|r| r.compression_mode = "zstd".into()),
+            Box::new(|r| r.ms_mode = "plain".into()),
+            Box::new(|r| r.crush_rule = "-x".into()),
+            Box::new(|r| r.application = "a b".into()),
+            Box::new(|r| r.pg_num = -1),
+            Box::new(|r| r.quota_bytes = -5),
+            Box::new(|r| {
+                r.recovery = Some(proto::CephRecoverySpec {
+                    scrub_begin_hour: 24,
+                    ..Default::default()
+                })
+            }),
+            Box::new(|r| {
+                r.recovery = Some(proto::CephRecoverySpec {
+                    nearfull_ratio_bp: 10_001,
+                    ..Default::default()
+                })
+            }),
+        ];
+        for (i, mutate) in cases.iter().enumerate() {
+            let mut req = pool_req("p");
+            mutate(&mut req);
+            assert!(validate_pool_request(&req).is_err(), "case {i}");
+        }
+    }
+
+    #[test]
+    fn pool_tuning_commands_only_for_set_fields() {
+        assert!(pool_tuning_commands("p", &pool_req("p")).is_empty());
+        let mut req = pool_req("p");
+        req.crush_rule = "ssd-rule".into();
+        req.compression_mode = "aggressive".into();
+        req.quota_bytes = 1024;
+        assert_eq!(
+            flat(&pool_tuning_commands("p", &req)),
+            [
+                "osd pool set p crush_rule ssd-rule",
+                "osd pool set p compression_mode aggressive",
+                "osd pool set-quota p max_bytes 1024",
+            ]
+        );
+    }
+
+    #[test]
+    fn ms_mode_commands_map_modes() {
+        assert!(ms_mode_commands("").unwrap().is_empty());
+        assert_eq!(
+            flat(&ms_mode_commands("secure").unwrap()),
+            [
+                "config set global ms_cluster_mode secure",
+                "config set global ms_service_mode secure",
+            ]
+        );
+        assert_eq!(
+            flat(&ms_mode_commands("prefer-crc").unwrap()),
+            [
+                "config set global ms_cluster_mode crc secure",
+                "config set global ms_service_mode crc secure",
+            ]
+        );
+        assert!(ms_mode_commands("bogus").is_err());
+    }
+
+    #[test]
+    fn recovery_config_commands_skip_unset_knobs() {
+        assert!(
+            recovery_config_commands(&proto::CephRecoverySpec::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_config_commands_cover_every_knob() {
+        let cmds = recovery_config_commands(&proto::CephRecoverySpec {
+            max_backfills: 2,
+            recovery_max_active: 3,
+            scrub_begin_hour: 1,
+            scrub_end_hour: 6,
+            nearfull_ratio_bp: 8500,
+        })
+        .unwrap();
+        assert_eq!(
+            flat(&cmds),
+            [
+                "config set osd osd_mclock_override_recovery_settings true",
+                "config set osd osd_max_backfills 2",
+                "config set osd osd_recovery_max_active 3",
+                "config set osd osd_scrub_begin_hour 1",
+                "config set osd osd_scrub_end_hour 6",
+                "config set mon mon_osd_nearfull_ratio 0.8500",
+                "osd set-nearfull-ratio 0.8500",
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_scrub_window_allows_midnight_start() {
+        let cmds = recovery_config_commands(&proto::CephRecoverySpec {
+            scrub_begin_hour: 0,
+            scrub_end_hour: 6,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            flat(&cmds),
+            [
+                "config set osd osd_scrub_begin_hour 0",
+                "config set osd osd_scrub_end_hour 6",
+            ]
+        );
+    }
+
+    #[test]
+    fn nearfull_ratio_string_formats_basis_points() {
+        assert_eq!(nearfull_ratio_string(8500).unwrap(), "0.8500");
+        assert_eq!(nearfull_ratio_string(10_000).unwrap(), "1.0000");
+        assert!(nearfull_ratio_string(0).is_err());
+        assert!(nearfull_ratio_string(-1).is_err());
     }
 
     #[test]

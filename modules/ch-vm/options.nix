@@ -220,6 +220,31 @@ let
         description = "Additional Ceph RBD data disks attached to this VM.";
       };
 
+      filesystems = lib.mkOption {
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              tag = lib.mkOption {
+                type = lib.types.str;
+                description = "virtio-fs mount tag presented to the guest.";
+              };
+              # SharedFilesystem resource name; host mounts CephFS under sourcePath.
+              sharedFilesystem = lib.mkOption {
+                type = lib.types.str;
+                description = "kcore SharedFilesystem name (CephFS).";
+              };
+              sourcePath = lib.mkOption {
+                type = lib.types.str;
+                default = "";
+                description = "Host directory shared into the guest; default /var/lib/kcore/virtiofs/<vm>/<tag>.";
+              };
+            };
+          }
+        );
+        default = [ ];
+        description = "CephFS virtio-fs mounts (cold migrate only; live migration refuses these VMs).";
+      };
+
       cores = lib.mkOption {
         type = lib.types.ints.positive;
         default = 2;

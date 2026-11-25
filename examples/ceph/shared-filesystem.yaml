@@ -1,9 +1,17 @@
+# CephFS on lab-san. The controller creates team-data-metadata and
+# team-data-data, runs `ceph fs new`, sets the quota, and authorizes each client.
+# The CephCluster reconciler turns on an MDS on its full/mon members.
+# See docs/cephfs-rgw.md.
 kind: SharedFilesystem
 metadata:
   name: team-data
 spec:
   cephCluster: lab-san
+  fsName: team-data
+  # 0 = no quota.
   quotaBytes: 1099511627776
   clients:
     - name: app-a
       paths: ["/"]
+    - name: reports
+      paths: ["/reports"]

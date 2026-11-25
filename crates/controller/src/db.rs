@@ -576,6 +576,8 @@ pub struct VolumeRow {
 impl VolumeRow {
     pub const ROLE_ROOT: &'static str = "root";
     pub const ROLE_DATA: &'static str = "data";
+    /// CephFS virtio-fs attachment: `pool` = SharedFilesystem name, `image` = mount tag.
+    pub const ROLE_FILESYSTEM: &'static str = "filesystem";
     pub const ATTACH_DETACHED: &'static str = "detached";
     pub const ATTACH_ATTACHING: &'static str = "attaching";
     pub const ATTACH_ATTACHED: &'static str = "attached";
@@ -680,6 +682,8 @@ pub struct VmOperationRow {
 
 impl VmOperationRow {
     pub const KIND_LIVE_MIGRATE: &'static str = "live_migrate";
+    /// `kctl volume convert`: a stopped LVM/ZFS disk is copied onto an RBD image.
+    pub const KIND_CONVERT_STORAGE: &'static str = "convert_storage";
     pub const PHASE_PREPARING: &'static str = "Preparing";
     /// Local-disk live move: dm-mirror is copying the volume, memory has not moved.
     pub const PHASE_MIRROR_SYNCING: &'static str = "MirrorSyncing";
@@ -4840,6 +4844,17 @@ impl Database {
         Ok(())
     }
 
+    /// Send a cluster back through the reconciler, for example after a
+    /// SharedFilesystem or ObjectStore changes where MDS/RGW should run.
+    pub fn requeue_ceph_cluster(&self, name: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE ceph_cluster_status SET observed_generation = 0 WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
     pub fn get_ceph_cluster_status(
         &self,
         name: &str,
@@ -6519,6 +6534,21 @@ impl Database {
             conn.prepare("SELECT node_id FROM vms WHERE id = ?1 OR name = ?1 LIMIT 1")?;
         let mut rows = stmt.query_map(params![vm_id], |row| row.get::<_, String>(0))?;
         rows.next().transpose()
+    }
+
+    /// Flip a VM's data-plane backend (`kctl volume convert`). Touches only
+    /// that column so a concurrent spec edit is not overwritten.
+    pub fn set_vm_storage_backend(
+        &self,
+        vm_id: &str,
+        backend: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "UPDATE vms SET storage_backend = ?1 WHERE id = ?2",
+            params![backend, vm_id],
+        )?;
+        Ok(rows > 0)
     }
 
     pub fn set_vm_auto_start(

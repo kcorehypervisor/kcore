@@ -415,3 +415,83 @@ test("set-version and promote-update reach the release RPCs", () => {
   assert.equal(promote.method, "promoteClusterUpdate");
   assert.equal(wire(promote).name, "version-v0-7-0");
 });
+
+test("an old CephCluster manifest builds the same request as before", () => {
+  const kind = findKind("ceph-cluster");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    name: "lab-san",
+    publicNetwork: "10.10.0.0/24",
+    clusterNetwork: "10.20.0.0/24",
+    replication: { size: 3, minSize: 2 },
+    nodes: [{ nodeId: "node-1", monAddr: "10.10.0.11:6789", clusterAddr: "10.20.0.11", publicIface: "eth1", clusterIface: "eth2", osdDevice: "/dev/sdb" }],
+  });
+  const decoded = wire(call) as { cephCluster: { spec: Record<string, any> } };
+  const spec = decoded.cephCluster.spec;
+  assert.equal(spec.size, 3);
+  assert.equal(spec.minSize, 2);
+  assert.equal(spec.encryptOsds, true);
+  assert.equal(spec.nodes[0].osdDevice, "/dev/sdb");
+  assert.equal(spec.recovery ?? null, null);
+  assert.equal(spec.external ?? null, null);
+  assert.deepEqual(spec.pools ?? [], []);
+});
+
+test("a CephCluster apply carries pools, recovery, roles, and lost members", () => {
+  const kind = findKind("ceph-cluster");
+  assert.ok(kind);
+  const [call] = buildApply(kind, {
+    name: "lab-san",
+    publicNetwork: "10.10.0.0/24",
+    clusterNetwork: "10.20.0.0/24",
+    size: 3,
+    minSize: 2,
+    msMode: "secure",
+    imageFeatures: ["layering", "exclusive-lock"],
+    cachePolicy: "writethrough",
+    lostMembers: ["node-4"],
+    pools: [
+      { name: "kcore-vms", application: "rbd", size: 3, minSize: 2, crushRule: "ssd", compressionMode: "passive", quotaBytes: "1T" },
+      { name: "archive", poolType: "erasure", erasureProfile: "k2m1" },
+    ],
+    recovery: { maxBackfills: 1, recoveryMaxActive: 1, scrubBeginHour: 1, nearfullRatio: 0.85 },
+    nodes: [
+      { nodeId: "node-1", monAddr: "a", osdDevice: "/dev/sdb", role: "full", weight: 1.5, deviceClass: "ssd" },
+      { nodeId: "node-2", monAddr: "b", role: "mon" },
+    ],
+  });
+  const spec = (wire(call) as { cephCluster: { spec: Record<string, any> } }).cephCluster.spec;
+  assert.equal(spec.msMode, "secure");
+  assert.equal(spec.imageFeatures, "layering,exclusive-lock");
+  assert.equal(spec.cachePolicy, "writethrough");
+  assert.deepEqual(spec.lostMembers, ["node-4"]);
+  assert.equal(spec.pools[0].crushRule, "ssd");
+  assert.equal(spec.pools[0].quotaBytes, String(1024 ** 4));
+  assert.equal(spec.pools[1].poolType, "erasure");
+  assert.equal(spec.recovery.maxBackfills, 1);
+  assert.equal(spec.recovery.scrubBeginHour, 1);
+  assert.equal(spec.recovery.scrubEndHour, -1);
+  assert.equal(spec.recovery.nearfullRatioBp, 8500);
+  assert.equal(spec.nodes[0].weight, 1.5);
+  assert.equal(spec.nodes[0].deviceClass, "ssd");
+  assert.equal(spec.nodes[1].role, "mon");
+});
+
+test("a CephCluster apply refuses bad lifecycle fields", () => {
+  const kind = findKind("ceph-cluster");
+  assert.ok(kind);
+  const base = { name: "c", publicNetwork: "10.0.0.0/24", clusterNetwork: "10.0.0.0/24" };
+  assert.throws(() => buildApply(kind, { ...base, msMode: "plain" }), /msMode/);
+  assert.throws(() => buildApply(kind, { ...base, cachePolicy: "none" }), /cachePolicy/);
+  assert.throws(() => buildApply(kind, { ...base, nodes: [{ nodeId: "n", role: "mgr" }] }), /node role/);
+  assert.throws(() => buildApply(kind, { ...base, pools: [{ name: "p", poolType: "erasure" }] }), /erasureProfile/);
+  assert.throws(() => buildApply(kind, { ...base, recovery: { scrubEndHour: 24 } }), /scrubEndHour/);
+  assert.throws(
+    () => buildApply(kind, { ...base, external: { monHosts: "10.0.0.1", pool: "rbd" }, nodes: [{ nodeId: "n" }] }),
+    /cannot also list nodes/,
+  );
+  const [call] = buildApply(kind, { ...base, external: { monHosts: ["10.0.0.1", "10.0.0.2"], pool: "rbd", clientName: "client.kcore" } });
+  const spec = (wire(call) as { cephCluster: { spec: Record<string, any> } }).cephCluster.spec;
+  assert.equal(spec.external.monHosts, "10.0.0.1,10.0.0.2");
+  assert.equal(spec.external.clientName, "client.kcore");
+});

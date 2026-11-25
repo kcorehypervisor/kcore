@@ -144,6 +144,7 @@ h3 { font-size: 13px; margin: 0; color: var(--muted); font-weight: 650; letter-s
 .banner.bad { border-left-color: var(--bad); }
 .banner.warn { border-left-color: var(--warn); }
 .chart-layout { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+.chart-layout .facts { flex: 1; min-width: 220px; }
 .legend { display: flex; flex-direction: column; gap: 6px; min-width: 140px; }
 .legend div { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .legend strong { margin-left: auto; color: var(--text); font-variant-numeric: tabular-nums; }
@@ -266,6 +267,7 @@ form.contents { display: contents; }
   border-radius: 0;
   border-right: 0;
 }
+.dialog.drawer.wide { width: min(980px, 100%); }
 .drawer-head, .toast-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .drawer-body { min-height: 0; overflow: auto; }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }

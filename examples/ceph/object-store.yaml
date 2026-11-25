@@ -1,3 +1,7 @@
+# RGW on lab-san. The controller creates the default RGW pools and, for each
+# ObjectUser, an RGW user with the stored keys. RGW is turned on for the
+# members listed below. See docs/cephfs-rgw.md.
+# Users: kctl create object-user backup-bot --store backups (prints the secret once).
 kind: ObjectStore
 metadata:
   name: backups

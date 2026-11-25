@@ -11,6 +11,8 @@ mod canary;
 mod ceph_cli;
 mod ceph_cluster_reconciler;
 mod ceph_cluster_spec;
+mod ceph_external;
+mod ceph_update_gate;
 mod cert_rotation_reconciler;
 mod cluster_health;
 mod cluster_update_reconciler;
@@ -66,6 +68,7 @@ mod vm_operation_policy;
 mod vm_operation_reconciler;
 mod volume_crypto;
 mod volume_export;
+mod volume_move;
 mod volume_snapshot;
 mod web_auth;
 mod webhooks;
@@ -222,7 +225,6 @@ async fn main() -> anyhow::Result<()> {
             sub_ca: sub_ca.clone(),
         },
     );
-    ceph_cluster_reconciler::spawn_ceph_cluster_reconciler(database.clone(), clients.clone());
     slurm_cluster_reconciler::spawn_slurm_cluster_reconciler(
         database.clone(),
         clients.clone(),
@@ -291,6 +293,8 @@ async fn main() -> anyhow::Result<()> {
 
     let webhooks =
         webhooks::Dispatcher::spawn(&cfg.webhooks, webhooks::EventSource::from_config(&cfg));
+    ceph_cluster_reconciler::set_webhooks(webhooks.clone());
+    ceph_cluster_reconciler::spawn_ceph_cluster_reconciler(database.clone(), clients.clone());
     ingress_reconciler::spawn_ingress_reconciler(
         database.clone(),
         clients.clone(),

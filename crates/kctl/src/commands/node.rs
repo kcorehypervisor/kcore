@@ -58,6 +58,23 @@ pub async fn uncordon(info: &ConnectionInfo, node_id: &str) -> Result<()> {
     }
 }
 
+pub async fn maintenance(info: &ConnectionInfo, node_id: &str, enable: bool) -> Result<()> {
+    let mut client = client::controller_client(info).await?;
+    let resp = client
+        .set_node_maintenance(controller_proto::SetNodeMaintenanceRequest {
+            node_id: node_id.to_string(),
+            enable,
+        })
+        .await?
+        .into_inner();
+    if resp.success {
+        println!("{}", resp.message);
+        Ok(())
+    } else {
+        anyhow::bail!("maintenance failed: {}", resp.message)
+    }
+}
+
 pub async fn delete(info: &ConnectionInfo, node_id: &str) -> Result<()> {
     let mut client = client::controller_client(info).await?;
     let resp = client

@@ -21,6 +21,9 @@ import {
 
 const PAGE_SIZE = 25;
 
+/** Renders an inspected record (`Detail.detail`, or the row before it loads). */
+export type DetailView = (detail: Row) => ReactNode;
+
 export function Pill({ value }: { value: string }) {
   if (!value) return <span className="muted">—</span>;
   return <span className={`pill ${toneFor(value)}`}>{value}</span>;
@@ -243,7 +246,7 @@ export function DataTable({
   );
 }
 
-function Fact({ name, value }: { name: string; value: unknown }) {
+export function Fact({ name, value }: { name: string; value: unknown }) {
   const column: Column = {
     key: name,
     label: label(name),
@@ -366,6 +369,7 @@ export function DetailDrawer({
   loading,
   error,
   actions,
+  view,
   onClose,
 }: {
   open: boolean;
@@ -375,6 +379,8 @@ export function DetailDrawer({
   loading: boolean;
   error: string;
   actions?: ReactNode;
+  /** Replaces the generic record dump for resources with their own detail page. */
+  view?: DetailView;
   onClose: () => void;
 }) {
   const [raw, setRaw] = useState(false);
@@ -387,7 +393,7 @@ export function DetailDrawer({
     <Dialog.Root open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="overlay" />
-        <Dialog.Content className="dialog drawer">
+        <Dialog.Content className={view ? "dialog drawer wide" : "dialog drawer"}>
           <header className="drawer-head">
             <Dialog.Title>{title}</Dialog.Title>
             <div className="drawer-tools">
@@ -412,6 +418,8 @@ export function DetailDrawer({
           <div className="drawer-body">
             {raw ? (
               <pre className="code">{pretty(body ?? row)}</pre>
+            ) : view && isRecord(detail ?? row) ? (
+              view((detail ?? row) as Row)
             ) : (
               <div className="stack">
                 <RecordView value={detail ?? row ?? {}} />

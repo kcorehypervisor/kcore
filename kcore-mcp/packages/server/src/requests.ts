@@ -883,20 +883,124 @@ function readLayoutFile(path: string | undefined): string {
   return readFileSync(assertArg(path, "layout file"), "utf8");
 }
 
+/**
+ * Accepts the CephCluster YAML spec (camelCase, optional `replication` nest)
+ * and the flat keys older callers send. Every field added after the first
+ * release is optional, so an old manifest builds the same request as before.
+ */
 function cephMessage(spec: Record<string, unknown>): Record<string, unknown> {
+  const replication = section(spec, "replication");
+  const size = opt(spec, "size") ?? opt(replication, "size");
+  const minSize = opt(spec, "minSize") ?? opt(replication, "minSize");
+  const external = cephExternal(section(spec, "external"));
+  const nodes = Array.isArray(spec.nodes) ? spec.nodes.map(cephNode) : [];
+  if (external && nodes.length > 0) throw new InputError("an external Ceph cluster cannot also list nodes");
   return {
     name: assertName(required(spec, "name", "name"), "name"),
     spec: {
       fsid: opt(spec, "fsid") ?? "",
       publicNetwork: assertArg(required(spec, "publicNetwork", "public network"), "public network"),
       clusterNetwork: assertArg(required(spec, "clusterNetwork", "cluster network"), "cluster network"),
-      size: opt(spec, "size") ? Number(opt(spec, "size")) : 0,
-      minSize: opt(spec, "minSize") ? Number(opt(spec, "minSize")) : 0,
+      size: size ? Number(size) : 0,
+      minSize: minSize ? Number(minSize) : 0,
       forceWipe: boolish(spec.forceWipe),
       encryptOsds: spec.encryptOsds === undefined ? true : boolish(spec.encryptOsds),
-      nodes: Array.isArray(spec.nodes) ? spec.nodes : [],
+      nodes,
+      pools: Array.isArray(spec.pools) ? spec.pools.map(cephPool) : [],
+      ...(spec.recovery === undefined ? {} : { recovery: cephRecovery(section(spec, "recovery")) }),
+      msMode: choice(opt(spec, "msMode"), ["secure", "prefer-crc"], "msMode"),
+      imageFeatures: commaList(spec.imageFeatures),
+      cachePolicy: choice(opt(spec, "cachePolicy"), ["writeback", "writethrough"], "cachePolicy"),
+      lostMembers: stringList(spec.lostMembers).map((item) => assertName(item, "lost member")),
+      ...(external ? { external } : {}),
     },
   };
+}
+
+function cephNode(value: unknown): Record<string, unknown> {
+  const row = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+  const weight = opt(row, "weight");
+  if (weight !== undefined && !(Number(weight) >= 0)) throw new InputError("node weight must be a non-negative number");
+  return {
+    nodeId: assertName(required(row, "nodeId", "node id"), "node id"),
+    monAddr: opt(row, "monAddr") ?? "",
+    clusterAddr: opt(row, "clusterAddr") ?? "",
+    publicIface: opt(row, "publicIface") ?? "",
+    clusterIface: opt(row, "clusterIface") ?? "",
+    osdDevice: opt(row, "osdDevice") ?? "",
+    osdDevices: stringList(row.osdDevices),
+    role: choice(opt(row, "role"), ["full", "mon", "osd"], "node role"),
+    weight: weight === undefined ? 0 : Number(weight),
+    deviceClass: choice(opt(row, "deviceClass"), ["ssd", "hdd", "nvme"], "device class"),
+  };
+}
+
+function cephPool(value: unknown): Record<string, unknown> {
+  const row = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+  const poolType = choice(opt(row, "poolType") ?? opt(row, "type"), ["replicated", "erasure"], "pool type");
+  const erasureProfile = opt(row, "erasureProfile") ?? "";
+  if (poolType === "erasure" && !erasureProfile) throw new InputError("an erasure pool needs erasureProfile");
+  return {
+    name: assertName(required(row, "name", "pool name"), "pool name"),
+    application: choice(opt(row, "application"), ["rbd", "cephfs", "rgw"], "pool application"),
+    size: Number(opt(row, "size") ?? 0),
+    minSize: Number(opt(row, "minSize") ?? 0),
+    pgNum: Number(opt(row, "pgNum") ?? 0),
+    crushRule: opt(row, "crushRule") ?? "",
+    compressionMode: choice(opt(row, "compressionMode") ?? opt(row, "compression"), ["none", "passive", "aggressive", "force"], "compression mode"),
+    quotaBytes: sizeBytes(opt(row, "quotaBytes") ?? "0", "pool quota"),
+    poolType,
+    erasureProfile,
+  };
+}
+
+/** Scrub hours absent from a recovery block are sent as -1 (unset), not hour 0. */
+function cephRecovery(row: Record<string, unknown>): Record<string, unknown> {
+  const hour = (key: string): number => {
+    const value = opt(row, key);
+    if (value === undefined) return -1;
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 23) throw new InputError(`${key} must be an hour from 0 to 23`);
+    return parsed;
+  };
+  let nearfull = Number(opt(row, "nearfullRatioBp") ?? 0);
+  const ratio = opt(row, "nearfullRatio");
+  if (ratio !== undefined) {
+    const parsed = Number(ratio);
+    if (!(parsed > 0 && parsed < 1)) throw new InputError("nearfullRatio must be between 0 and 1, e.g. 0.85");
+    nearfull = Math.round(parsed * 10000);
+  }
+  return {
+    maxBackfills: Number(opt(row, "maxBackfills") ?? 0),
+    recoveryMaxActive: Number(opt(row, "recoveryMaxActive") ?? 0),
+    scrubBeginHour: hour("scrubBeginHour"),
+    scrubEndHour: hour("scrubEndHour"),
+    nearfullRatioBp: nearfull,
+  };
+}
+
+function cephExternal(row: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (Object.keys(row).length === 0) return undefined;
+  const monHosts = commaList(row.monHosts);
+  if (!monHosts) throw new InputError("an external Ceph cluster needs monHosts");
+  return {
+    monHosts,
+    pool: assertArg(required(row, "pool", "external pool"), "external pool"),
+    clientKeyring: opt(row, "clientKeyring") ?? "",
+    clientName: opt(row, "clientName") ?? "",
+  };
+}
+
+function choice(value: string | undefined, allowed: string[], label: string): string {
+  if (value === undefined) return "";
+  const lowered = value.toLowerCase();
+  if (!allowed.includes(lowered)) throw new InputError(`${label} must be ${allowed.join(", ")}`);
+  return lowered;
+}
+
+function commaList(value: unknown): string {
+  if (Array.isArray(value)) return stringList(value).join(",");
+  return typeof value === "string" ? value.split(",").map((item) => item.trim()).filter(Boolean).join(",") : "";
 }
 
 /**

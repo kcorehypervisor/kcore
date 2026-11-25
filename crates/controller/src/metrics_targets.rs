@@ -126,6 +126,59 @@ pub fn render_slurm_targets(db: &Database) -> Result<String, String> {
         .map_err(|e| format!("serializing slurm file_sd targets: {e}"))
 }
 
+/// Mgr prometheus exporter listen port (after `ceph mgr module enable prometheus`).
+pub const CEPH_MGR_PROMETHEUS_PORT: u16 = 9283;
+
+/// Targets for every CephCluster member's mgr prometheus module.
+pub fn render_ceph_targets(db: &Database) -> Result<String, String> {
+    let nodes = db
+        .list_nodes()
+        .map_err(|e| format!("listing nodes for ceph metrics: {e}"))?;
+    let clusters = db
+        .list_ceph_clusters()
+        .map_err(|e| format!("listing ceph clusters for metrics: {e}"))?;
+    let mut entries: Vec<FileSdTarget> = Vec::new();
+    for row in clusters {
+        let Ok(spec) = crate::ceph_cluster_spec::spec_from_json(&row.spec_json) else {
+            continue;
+        };
+        for member in &spec.nodes {
+            let Some(node) = nodes
+                .iter()
+                .find(|n| n.id == member.node_id || n.hostname == member.node_id)
+            else {
+                continue;
+            };
+            let host = {
+                let mon = member.mon_addr.split(':').next().unwrap_or("").trim();
+                if !mon.is_empty() && mon != "0.0.0.0" {
+                    mon.to_string()
+                } else {
+                    grpc_address_host(&node.address)
+                }
+            };
+            if host.is_empty() || host == "0.0.0.0" || host == "::" {
+                continue;
+            }
+            let target = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]:{CEPH_MGR_PROMETHEUS_PORT}")
+            } else {
+                format!("{host}:{CEPH_MGR_PROMETHEUS_PORT}")
+            };
+            let mut labels = BTreeMap::new();
+            labels.insert("node_id".to_string(), node.id.clone());
+            labels.insert("job".to_string(), "ceph-mgr".to_string());
+            labels.insert("ceph_cluster".to_string(), row.name.clone());
+            entries.push(FileSdTarget {
+                targets: vec![target],
+                labels,
+            });
+        }
+    }
+    serde_json::to_string_pretty(&entries)
+        .map_err(|e| format!("serializing ceph file_sd targets: {e}"))
+}
+
 /// Atomically rewrite `cfg.file_sd_path` from the current node inventory.
 pub fn write_node_targets(db: &Database, cfg: &MetricsConfig) -> Result<(), String> {
     let body = render_node_targets(db, cfg.scrape_port)?;
@@ -136,7 +189,9 @@ pub fn write_node_targets(db: &Database, cfg: &MetricsConfig) -> Result<(), Stri
     let ingress = render_ingress_targets(db)?;
     write_atomic(&path.with_file_name("ingress.json"), &ingress)?;
     let slurm = render_slurm_targets(db)?;
-    write_atomic(&path.with_file_name("slurm.json"), &slurm)
+    write_atomic(&path.with_file_name("slurm.json"), &slurm)?;
+    let ceph = render_ceph_targets(db)?;
+    write_atomic(&path.with_file_name("ceph.json"), &ceph)
 }
 
 fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
@@ -264,6 +319,38 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("read");
         assert!(body.contains("10.0.0.5:9100"), "{body}");
         assert!(!dir.path().join(".nodes.json.tmp").exists());
+        assert!(dir.path().join("ceph.json").exists());
+    }
+
+    #[test]
+    fn ceph_targets_use_mon_addr_and_mgr_port() {
+        let db = Database::open(":memory:").expect("db");
+        db.upsert_node(&sample_node("n1", "192.168.40.103:9091", "node-103"))
+            .expect("upsert");
+        let spec = crate::controller_proto::CephClusterSpec {
+            nodes: vec![crate::controller_proto::CephClusterNodeSpec {
+                node_id: "n1".into(),
+                mon_addr: "192.168.47.2:6789".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        db.upsert_ceph_cluster(&crate::db::CephClusterRow {
+            name: "lab".into(),
+            generation: 1,
+            spec_json: crate::ceph_cluster_spec::spec_to_json(&spec).unwrap(),
+            bootstrap_json: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .expect("ceph");
+        let json = render_ceph_targets(&db).expect("render");
+        assert!(
+            json.contains(&format!("192.168.47.2:{CEPH_MGR_PROMETHEUS_PORT}")),
+            "{json}"
+        );
+        assert!(json.contains("\"job\": \"ceph-mgr\""), "{json}");
+        assert!(json.contains("\"ceph_cluster\": \"lab\""), "{json}");
     }
 
     #[test]

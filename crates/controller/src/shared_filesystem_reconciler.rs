@@ -1,5 +1,5 @@
-//! SharedFilesystem (CephFS) reconciler — scaffold: tick, phase transitions,
-//! optional local `ceph fs` probes when the CLI is present.
+//! SharedFilesystem (CephFS) reconciler: create data/metadata pools, `ceph fs new`,
+//! authorize clients when the local `ceph` CLI can reach the cluster.
 
 use std::time::Duration;
 
@@ -69,26 +69,24 @@ async fn reconcile_row(db: &Database, row: &SharedFilesystemRow) -> Result<(), S
         ));
     }
 
-    match ceph_cli::run_ceph(&["fs", "ls", "--format", "json"]) {
-        Ok(raw) if raw.contains(&format!("\"name\":\"{fs_name}\"")) || raw.contains(&fs_name) => {
-            info!(filesystem = %row.name, "cephfs volume present (stub reconcile)");
+    let meta_pool = format!("{fs_name}-metadata");
+    let data_pool = format!("{fs_name}-data");
+
+    match ensure_cephfs(&fs_name, &meta_pool, &data_pool, &spec) {
+        Ok(msg) => {
+            let msg = match crate::ceph_cluster_reconciler::daemon_push_note(
+                db,
+                spec.ceph_cluster.trim(),
+                crate::ceph_cluster_reconciler::DaemonKind::Mds,
+            ) {
+                Ok(note) => format!("{msg}; {note}"),
+                Err(error) => format!("{msg}; MDS placement unknown: {error}"),
+            };
+            info!(filesystem = %row.name, %msg, "cephfs ready");
             db.upsert_shared_filesystem_status(&SharedFilesystemStatusRow {
                 name: row.name.clone(),
                 observed_generation: row.generation,
                 phase: "healthy".into(),
-                health_message: "CephFS volume reported by ceph fs ls".into(),
-                last_transition_at: String::new(),
-            })
-            .map_err(|e| e.to_string())?;
-        }
-        Ok(_) => {
-            let msg = format!(
-                "awaiting CephFS bootstrap for '{fs_name}' (ceph fs new / pools — not automated in scaffold)"
-            );
-            db.upsert_shared_filesystem_status(&SharedFilesystemStatusRow {
-                name: row.name.clone(),
-                observed_generation: row.generation,
-                phase: "bootstrapping".into(),
                 health_message: msg,
                 last_transition_at: String::new(),
             })
@@ -100,7 +98,8 @@ async fn reconcile_row(db: &Database, row: &SharedFilesystemRow) -> Result<(), S
                 observed_generation: row.generation,
                 phase: "bootstrapping".into(),
                 health_message:
-                    "ceph CLI not available; SharedFilesystem recorded only (lab scaffold)".into(),
+                    "ceph CLI not available on the controller; SharedFilesystem recorded only"
+                        .into(),
                 last_transition_at: String::new(),
             })
             .map_err(|e| e.to_string())?;
@@ -114,6 +113,68 @@ async fn reconcile_row(db: &Database, row: &SharedFilesystemRow) -> Result<(), S
                 last_transition_at: String::new(),
             })
             .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_cephfs(
+    fs_name: &str,
+    meta_pool: &str,
+    data_pool: &str,
+    spec: &crate::controller_proto::SharedFilesystemSpec,
+) -> Result<String, CephCliError> {
+    let listed = ceph_cli::run_ceph(&["fs", "ls", "--format", "json"])?;
+    if listed.contains(&format!("\"name\":\"{fs_name}\"")) || listed.contains(fs_name) {
+        authorize_clients(fs_name, spec)?;
+        return Ok(format!("CephFS '{fs_name}' present; clients authorized"));
+    }
+
+    ensure_pool(meta_pool, 32)?;
+    ensure_pool(data_pool, 32)?;
+    let _ = ceph_cli::run_ceph(&["osd", "pool", "application", "enable", meta_pool, "cephfs"]);
+    let _ = ceph_cli::run_ceph(&["osd", "pool", "application", "enable", data_pool, "cephfs"]);
+    ceph_cli::run_ceph(&["fs", "new", fs_name, meta_pool, data_pool])?;
+    if spec.quota_bytes > 0 {
+        let q = spec.quota_bytes.to_string();
+        let _ = ceph_cli::run_ceph(&["fs", "set", fs_name, "max_bytes", &q]);
+    }
+    authorize_clients(fs_name, spec)?;
+    Ok(format!(
+        "created CephFS '{fs_name}' on pools {meta_pool}/{data_pool}"
+    ))
+}
+
+fn ensure_pool(name: &str, pg_num: i32) -> Result<(), CephCliError> {
+    let listed = ceph_cli::run_ceph(&["osd", "pool", "ls"])?;
+    if listed.lines().any(|l| l.trim() == name) {
+        return Ok(());
+    }
+    let pg = pg_num.to_string();
+    ceph_cli::run_ceph(&["osd", "pool", "create", name, &pg]).map(|_| ())
+}
+
+fn authorize_clients(
+    fs_name: &str,
+    spec: &crate::controller_proto::SharedFilesystemSpec,
+) -> Result<(), CephCliError> {
+    for client in &spec.clients {
+        let name = client.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let entity = if name.starts_with("client.") {
+            name.to_string()
+        } else {
+            format!("client.{name}")
+        };
+        let paths = if client.paths.is_empty() {
+            vec!["/".to_string()]
+        } else {
+            client.paths.clone()
+        };
+        for path in paths {
+            let _ = ceph_cli::run_ceph(&["fs", "authorize", fs_name, &entity, &path, "rw"]);
         }
     }
     Ok(())

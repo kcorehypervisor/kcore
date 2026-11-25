@@ -26,6 +26,48 @@ pub async fn kubernetes_request(
     kubernetes_request_as(clients, address, method, path, body, content_type, "").await
 }
 
+/// Upsert a Ceph CSI Opaque Secret on a control-plane node (never via Nix).
+pub async fn upsert_ceph_csi_secret(
+    clients: &NodeClients,
+    control_plane_address: &str,
+    secret_name: &str,
+    user_id: &str,
+    user_key: &str,
+) -> Result<(), String> {
+    let ns = crate::kubernetes_local::CEPH_CSI_NAMESPACE;
+    let body = crate::kubernetes_local::csi_user_secret_json(secret_name, ns, user_id, user_key);
+    let path = format!("/api/v1/namespaces/{ns}/secrets/{secret_name}");
+    let (status, resp) = kubernetes_request(
+        clients,
+        control_plane_address,
+        "PUT",
+        &path,
+        &body,
+        "application/json",
+    )
+    .await?;
+    if status == 404 {
+        let create_path = format!("/api/v1/namespaces/{ns}/secrets");
+        let (status, resp) = kubernetes_request(
+            clients,
+            control_plane_address,
+            "POST",
+            &create_path,
+            &body,
+            "application/json",
+        )
+        .await?;
+        if status != 201 && status != 200 && status != 409 {
+            return Err(format!("create secret {secret_name}: {status}: {resp}"));
+        }
+        return Ok(());
+    }
+    if status != 200 && status != 201 {
+        return Err(format!("upsert secret {secret_name}: {status}: {resp}"));
+    }
+    Ok(())
+}
+
 /// Like [`kubernetes_request`], authenticated as a ServiceAccount token when
 /// `bearer_token` is not empty and as the admin client certificate otherwise.
 pub async fn kubernetes_request_as(

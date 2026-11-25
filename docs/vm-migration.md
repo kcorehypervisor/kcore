@@ -66,7 +66,7 @@ When a node misses heartbeats for `failover.nodeTimeoutSecs` (default 30 seconds
 
 ### Fencing before the move
 
-A node the controller cannot reach is not necessarily a node whose guests have stopped. Only the controller heartbeat is known to be missing; the guest may still be running and its rbd-nbd still writing. The RBD images are created with the `layering` feature only, so Ceph itself does not arbitrate writers: starting the guest on another node would give two kernels the same ext4 filesystem (this was observed in the lab and needed `fsck` to repair).
+A node the controller cannot reach is not necessarily a node whose guests have stopped. Only the controller heartbeat is known to be missing; the guest may still be running and its rbd-nbd still writing. Images created before `exclusive-lock` was added have `layering` only, so Ceph does not arbitrate writers on them. Starting the guest on another node without fencing would give two kernels the same ext4 filesystem (this was observed in the lab and needed `fsck` to repair). Failover blocklists the lost node's clients and address range first for every image.
 
 Before reassigning each Ceph VM the controller therefore calls `NodeStorage.FenceVolume` through a healthy member of the cluster, once per attached volume. The member runs `rbd status --format json` (and `rbd lock ls`) on the image and adds every client listed from the lost node's addresses (its Ceph public address from the CephCluster spec and the host part of its gRPC address) to the OSD blocklist with `ceph osd blocklist add <addr:port/nonce> 604800`. It also adds `ceph osd blocklist range add <ip>/32` (or `/128`) for each of those addresses, so a client whose watcher has already expired is still cut off. If there is neither a client nor an IP range, the fence fails and the VM is not moved. From the next osdmap the lost node's rbd-nbd gets `EBLOCKLISTED` on every I/O. The entries last seven days. When the node heartbeats again the controller calls `UnfenceHost` to remove them. Boot units require `kcore-placement-confirmed.target`, which the node agent reaches only after the controller names the VMs that still belong on that host; Ceph units the controller has moved are masked.
 
@@ -244,7 +244,7 @@ First boot seeds the RBD with `qemu-img convert` and sets Ceph image-meta `kcore
 
 ### RBD features
 
-Images are created with **`layering` only**. Exclusive-lock is omitted so source and destination can map the same image during cutover. Changing this without another locking strategy will break live migrate.
+New images are created with `layering,exclusive-lock`, and maps set `rbd_blocklist_on_break_lock`. Source and destination still map the same image during cutover; the destination takes the lock on its first write. Images created earlier keep `layering` only until they are recreated. Status: [`ceph-lifecycle.md`](./ceph-lifecycle.md#vm-disks-and-data-safety).
 
 ### Operations and cancel
 

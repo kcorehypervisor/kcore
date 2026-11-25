@@ -171,6 +171,11 @@ enum Command {
         #[command(subcommand)]
         resource: ResizeResource,
     },
+    /// Convert storage backends (`kctl convert volume|vm`)
+    Convert {
+        #[command(subcommand)]
+        resource: ConvertResource,
+    },
     /// Format an LVM or ZFS volume as ext4 or xfs
     Format {
         #[command(subcommand)]
@@ -190,6 +195,11 @@ enum Command {
     Encrypt {
         #[command(subcommand)]
         resource: EncryptResource,
+    },
+    /// Copy a Ceph volume onto another CephCluster (`kctl volume copy`)
+    Volume {
+        #[command(subcommand)]
+        action: VolumeAction,
     },
     /// Get or list resources
     Get {
@@ -241,6 +251,11 @@ enum Command {
     PgCluster {
         #[command(subcommand)]
         action: PgClusterAction,
+    },
+    /// Ceph cluster lifecycle (`finalize-osd-release`, key/dmcrypt rotation)
+    Ceph {
+        #[command(subcommand)]
+        action: CephAction,
     },
     /// Pull a resource
     Pull {
@@ -1118,6 +1133,33 @@ enum FlattenResource {
 }
 
 #[derive(Subcommand)]
+enum ConvertResource {
+    /// Move a detached, unmounted LVM or ZFS volume onto Ceph and remove the
+    /// old backing volume. The volume keeps its name and filesystem.
+    Volume {
+        name: String,
+        /// Target storage class. Only ceph is supported.
+        #[arg(long)]
+        to: String,
+        /// CephCluster to create the image on (default: any healthy member)
+        #[arg(long = "ceph-cluster")]
+        ceph_cluster: Option<String>,
+    },
+    /// Copy a stopped LVM or ZFS VM's root disk onto Ceph and switch the guest.
+    /// The local disk is left on the node.
+    Vm {
+        /// VM id or name
+        vm: String,
+        /// Target backend (only ceph)
+        #[arg(long)]
+        to: String,
+        /// Allow stopping a running guest for the copy
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ResizeResource {
     /// Grow or shrink a volume. LVM and ZFS shrink an unmounted ext4 filesystem.
     Volume {
@@ -1182,6 +1224,106 @@ enum EncryptResource {
         /// Acknowledge that all existing volume data will be destroyed (no offline migration)
         #[arg(long = "destroy-data")]
         destroy_data: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeAction {
+    /// Copy a Ceph volume into a new volume on another CephCluster.
+    Copy {
+        /// Volume id or name
+        volume: String,
+        /// Destination CephCluster
+        #[arg(long = "to-cluster")]
+        to_cluster: String,
+        /// Name of the new volume (default: <volume>-copy)
+        #[arg(long = "name")]
+        new_name: Option<String>,
+        /// Source CephCluster when the volume does not record it
+        #[arg(long = "from-cluster")]
+        from_cluster: Option<String>,
+    },
+    /// List or purge RBD trash entries
+    Trash {
+        #[command(subcommand)]
+        action: VolumeTrashAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeTrashAction {
+    /// List RBD trash entries
+    List {
+        /// Pool name (default: kcore-vms on the controller)
+        #[arg(long)]
+        pool: Option<String>,
+        /// Optional RBD namespace
+        #[arg(long)]
+        namespace: Option<String>,
+    },
+    /// Permanently purge RBD trash
+    Purge {
+        /// Acknowledge irreversible purge
+        #[arg(long)]
+        yes: bool,
+        /// Pool name (default: kcore-vms on the controller)
+        #[arg(long)]
+        pool: Option<String>,
+        /// Trash entry id; empty purges every entry in the pool/namespace
+        #[arg(long = "id")]
+        trash_id: Option<String>,
+        /// Optional RBD namespace
+        #[arg(long)]
+        namespace: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CephAction {
+    /// Set `ceph osd require-osd-release` after a Ceph upgrade
+    #[command(name = "finalize-osd-release")]
+    FinalizeOsdRelease {
+        /// CephCluster name
+        #[arg(long)]
+        name: String,
+        /// Acknowledge the mutation
+        #[arg(long)]
+        yes: bool,
+        /// Ceph release codename (empty: ask a member for its binary release)
+        #[arg(long)]
+        release: Option<String>,
+    },
+    /// Rotate keys / dm-crypt material
+    Rotate {
+        #[command(subcommand)]
+        action: CephRotateAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CephRotateAction {
+    /// Rotate the cluster mon. key on one member (rebuild redistributes)
+    #[command(name = "mon-key")]
+    MonKey {
+        /// CephCluster name
+        #[arg(long)]
+        name: String,
+        /// Acknowledge the mutation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Drain, zap, and recreate an encrypted OSD with a fresh dmcrypt key
+    #[command(name = "osd-dmcrypt")]
+    OsdDmcrypt {
+        /// CephCluster name
+        #[arg(long)]
+        name: String,
+        /// OSD id
+        #[arg(long = "osd")]
+        osd_id: i32,
+        /// Acknowledge the mutation
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1723,6 +1865,13 @@ enum NodeAction {
     Uncordon {
         /// Node ID to uncordon
         node_id: String,
+    },
+    /// Enter or leave maintenance: cordon, drain VMs, set Ceph `noout` on a survivor
+    Maintenance {
+        /// Node ID
+        node_id: String,
+        /// on or off
+        state: String,
     },
     /// Remove a node that has no VMs or networks, and revoke its certificates
     Delete {
@@ -2928,6 +3077,23 @@ async fn main() {
             )
             .await
         }
+        Command::Convert {
+            resource:
+                ConvertResource::Volume {
+                    name,
+                    to,
+                    ceph_cluster,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::convert_to_ceph(&info, name, to, ceph_cluster.as_deref()).await
+        }
+        Command::Convert {
+            resource: ConvertResource::Vm { vm, to, yes },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::convert_vm(&info, vm, to, *yes).await
+        }
         Command::Flatten {
             resource: FlattenResource::Volume { name },
         } => {
@@ -2976,6 +3142,80 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::volume::encrypt(&info, name, *destroy_data).await
+        }
+        Command::Volume {
+            action:
+                VolumeAction::Copy {
+                    volume,
+                    to_cluster,
+                    new_name,
+                    from_cluster,
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::copy_to_cluster(
+                &info,
+                volume,
+                to_cluster,
+                new_name.as_deref(),
+                from_cluster.as_deref(),
+            )
+            .await
+        }
+        Command::Volume {
+            action:
+                VolumeAction::Trash {
+                    action: VolumeTrashAction::List { pool, namespace },
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::trash_list(&info, pool.clone(), namespace.clone()).await
+        }
+        Command::Volume {
+            action:
+                VolumeAction::Trash {
+                    action:
+                        VolumeTrashAction::Purge {
+                            yes,
+                            pool,
+                            trash_id,
+                            namespace,
+                        },
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::volume::trash_purge(
+                &info,
+                *yes,
+                pool.clone(),
+                trash_id.clone(),
+                namespace.clone(),
+            )
+            .await
+        }
+        Command::Ceph {
+            action: CephAction::FinalizeOsdRelease { name, yes, release },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::finalize_osd_release(&info, name, *yes, release.clone()).await
+        }
+        Command::Ceph {
+            action:
+                CephAction::Rotate {
+                    action: CephRotateAction::MonKey { name, yes },
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::rotate_mon_key(&info, name, *yes).await
+        }
+        Command::Ceph {
+            action:
+                CephAction::Rotate {
+                    action: CephRotateAction::OsdDmcrypt { name, osd_id, yes },
+                },
+        } => {
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::ceph_cluster::rotate_osd_dmcrypt(&info, name, *osd_id, *yes).await
         }
 
         Command::Set {
@@ -3575,6 +3815,18 @@ async fn main() {
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
             commands::node::uncordon(&info, node_id).await
+        }
+
+        Command::Node {
+            action: NodeAction::Maintenance { node_id, state },
+        } => {
+            let enable = match state.as_str() {
+                "on" => true,
+                "off" => false,
+                other => fatal(&format!("maintenance state must be on or off, got {other}")),
+            };
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::node::maintenance(&info, node_id, enable).await
         }
 
         Command::Node {

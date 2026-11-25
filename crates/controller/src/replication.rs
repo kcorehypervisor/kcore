@@ -1698,6 +1698,11 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
             let _ = db
                 .update_vm_spec(vm_id, cpu, memory_bytes)
                 .map_err(|e| format!("update vm spec {vm_id}: {e}"))?;
+            if let Some(backend) = body.get("storageBackend").and_then(Value::as_str) {
+                let _ = db
+                    .set_vm_storage_backend(vm_id, backend)
+                    .map_err(|e| format!("update vm storage backend {vm_id}: {e}"))?;
+            }
             if let Some(labels) = body.get("labels").filter(|v| !v.is_null()) {
                 let encoded = if let Some(s) = labels.as_str() {
                     s.to_string()

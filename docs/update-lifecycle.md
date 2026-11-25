@@ -45,7 +45,8 @@ Measured on `main` at 44f19ef:
   - no written controller-to-agent version skew rule;
   - no update graph, so any tag can be set over any other tag;
   - no pre-flight check separate from the update itself;
-  - no Ceph-aware ordering or `ok-to-stop` gate;
+  - no Ceph-aware ordering, and the `ok-to-stop` / `noout` gate is new (see
+    [Ceph in a cluster update](#ceph-in-a-cluster-update));
   - no comparison of an updated node with its peers;
   - no record of which state changes a release makes.
 - **Rollout strategy:** one node at a time, which is the only strategy the
@@ -261,6 +262,44 @@ of migration is the pattern.
 - **VMs that cannot migrate:** stopped and restored on their node after it
   confirms, but only when the operator opts in. Otherwise the precheck
   blocks.
+
+#### Ceph in a cluster update
+
+This is what the cluster-update reconciler does with Ceph today, and what it
+will do. Status of each item is also in
+[`ceph-lifecycle.md`](./ceph-lifecycle.md#cluster-fabric).
+
+**Runs today:**
+
+- Nodes update one at a time (`maxUnavailable: 1`), with VMs drained first
+  when `drainVms` is true. Ceph VMs live-migrate.
+- On a canary that hosts OSDs, the soak compares its median `ceph osd perf`
+  commit latency with the other OSDs and fails the canary when it is worse
+  ([`cluster-updates.md`](./cluster-updates.md)).
+- The Ceph version comes from the pin in `modules/kcore-ceph.nix`, so it moves
+  only with a kcore release. `testedOsPins` records the Ceph revision and hash
+  a release was tested with.
+
+**Implemented, not exercised live** (`crates/controller/src/ceph_update_gate.rs`):
+
+- A node that is a `CephCluster` member does not start until a surviving
+  member reports `ceph osd ok-to-stop` for its OSDs.
+- `noout` is set before that node starts and held, per update and cluster,
+  while any member is mid-update. It is cleared on the first reconcile after
+  the last member settles.
+
+**Also implemented, not exercised live:**
+
+- Waiting for every PG `active+clean` before the next Ceph member prepares
+  (`wait_active_clean` in `ceph_update_gate.rs`).
+- Ordering mon/full members before osd-only (`mon_first_rollout_order`).
+- `ceph osd require-osd-release <release>` as an explicit finalize:
+  `kctl ceph finalize-osd-release --name <cluster> --yes` after every node
+  runs the new Ceph (section 4). Until it runs, setting the previous kcore
+  tag is a supported downgrade.
+
+The gates belong in the existing cluster update as a Ceph step, not in a
+second updater.
 
 ### 7. Canary first, then one node at a time
 

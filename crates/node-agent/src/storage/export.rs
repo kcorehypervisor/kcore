@@ -1068,6 +1068,11 @@ pub fn expose_snapshot(
 
 pub fn unexpose_snapshot(lease_id: &str, leases: &LeaseTable) -> Result<(), StorageError> {
     let lease = leases.remove(lease_id)?;
+    // A local-disk lease has no snapshot to tear down, and `lvchange -an` on
+    // the guest's own LV would be wrong.
+    if lease.snapshot_name.is_empty() {
+        return Ok(());
+    }
     let plan = unexpose_snapshot_command_plan(
         lease.storage_class,
         &lease.backend_handle,
@@ -1075,6 +1080,152 @@ pub fn unexpose_snapshot(lease_id: &str, leases: &LeaseTable) -> Result<(), Stor
         &lease.device_path,
     )?;
     run_argv_plan(&plan, ErrorKind::Internal)
+}
+
+/// Device-name prefixes under `/dev/<first>/` that are not an LV: refusing
+/// them keeps `ExposeLocalDisk` from reading raw disks or RBD maps.
+const NON_LV_DEV_DIRS: &[&str] = &[
+    "disk", "mapper", "rbd", "block", "char", "pts", "shm", "input", "bus", "dri", "cpu",
+];
+
+fn is_safe_dev_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+}
+
+/// Accept `/dev/<vg>/<lv>` (lvm) or `/dev/zvol/<pool>/<name>` (zfs) and no
+/// other device node. The class is inferred from the path; `explicit`, when
+/// set, must agree with it.
+pub fn validate_local_disk_handle(
+    explicit_class: &str,
+    handle: &str,
+) -> Result<(StorageClass, String), StorageError> {
+    let h = handle.trim();
+    let bad = |msg: &str| {
+        Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            msg.to_string(),
+        ))
+    };
+    let Some(rest) = h.strip_prefix("/dev/") else {
+        return bad("local disk handle must be /dev/<vg>/<lv> or /dev/zvol/<pool>/<name>");
+    };
+    let segs: Vec<&str> = rest.split('/').collect();
+    if !segs.iter().all(|s| is_safe_dev_segment(s)) {
+        return bad("local disk handle has an unsafe path segment");
+    }
+    let class = if segs[0] == "zvol" {
+        if segs.len() < 3 {
+            return bad("zvol handle must be /dev/zvol/<pool>/<name>");
+        }
+        StorageClass::Zfs
+    } else {
+        if segs.len() != 2 || NON_LV_DEV_DIRS.contains(&segs[0]) {
+            return bad("lvm handle must be /dev/<vg>/<lv>");
+        }
+        StorageClass::Lvm
+    };
+    if !explicit_class.trim().is_empty() {
+        let given = StorageClass::parse(explicit_class)?;
+        if given != class {
+            return Err(StorageError::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "storage_class {} does not match handle {h} ({})",
+                    given.as_str(),
+                    class.as_str()
+                ),
+            ));
+        }
+    }
+    Ok((class, h.to_string()))
+}
+
+/// Lease a guest's own node-local disk for `read_extent_units`. The caller
+/// stops the guest first; this only flushes the block-device page cache (the
+/// guest wrote through the dm mapper, so blocks cached under the LV or zvol
+/// can be older than the disk) and records the lease.
+pub fn expose_local_disk(
+    storage_class: &str,
+    backend_handle: &str,
+    lease_seconds: i32,
+    leases: &LeaseTable,
+) -> Result<SnapshotLease, StorageError> {
+    let (class, handle) = validate_local_disk_handle(storage_class, backend_handle)?;
+    if !Path::new(&handle).exists() {
+        return Err(StorageError::new(
+            ErrorKind::NotFound,
+            format!("{handle} does not exist on this node"),
+        ));
+    }
+    let _ = run_cmd_capture("blockdev", &["--flushbufs", &handle]);
+    let size_bytes = device_size_bytes(Path::new(&handle))?;
+    if size_bytes <= 0 {
+        return Err(StorageError::new(
+            ErrorKind::FailedPrecondition,
+            format!("{handle} reports no size"),
+        ));
+    }
+    let lease = SnapshotLease {
+        lease_id: new_lease_id(),
+        storage_class: class,
+        backend_handle: handle.clone(),
+        snapshot_name: String::new(),
+        device_path: handle,
+        size_bytes,
+        block_size: DEFAULT_BLOCK_SIZE as i32,
+        expires_at: Instant::now() + lease_duration(lease_seconds)?,
+    };
+    leases.insert(lease.clone())?;
+    Ok(lease)
+}
+
+/// RBD image-meta keys a caller may set over gRPC.
+pub const ALLOWED_IMAGE_META_KEYS: &[&str] = &["kcore.seeded"];
+
+/// argv for `rbd image-meta set pool/image key value`.
+pub fn image_meta_set_argv(
+    backend_handle: &str,
+    key: &str,
+    value: &str,
+) -> Result<Vec<String>, StorageError> {
+    let (pool, image) = validate_pool_image_handle(backend_handle)?;
+    let key = key.trim();
+    if !ALLOWED_IMAGE_META_KEYS.contains(&key) {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            format!("image-meta key '{key}' is not allowed"),
+        ));
+    }
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(StorageError::new(
+            ErrorKind::InvalidArgument,
+            "image-meta value must be 1-64 characters of [A-Za-z0-9._-]",
+        ));
+    }
+    Ok(vec![
+        "rbd".into(),
+        "image-meta".into(),
+        "set".into(),
+        format!("{pool}/{image}"),
+        key.to_string(),
+        value.to_string(),
+    ])
+}
+
+pub fn set_image_meta(backend_handle: &str, key: &str, value: &str) -> Result<(), StorageError> {
+    let argv = image_meta_set_argv(backend_handle, key, value)?;
+    run_argv_plan(&[argv], ErrorKind::Internal)
 }
 
 /// List changed extents between two snapshots. When unsupported, returns empty
@@ -1500,6 +1651,77 @@ WRITE object=1 offset=16384 length=4096
         let got = read_block_at(&path, 8, 4).unwrap();
         assert_eq!(got, [1, 2, 3, 4]);
         assert!(is_all_zero(&read_block_at(&path, 0, 8).unwrap()));
+    }
+
+    #[test]
+    fn local_disk_handle_accepts_lv_and_zvol_only() {
+        let (c, h) = validate_local_disk_handle("", "/dev/vg_kcore/kcore-web-1").unwrap();
+        assert_eq!(c, StorageClass::Lvm);
+        assert_eq!(h, "/dev/vg_kcore/kcore-web-1");
+        let (c, _) = validate_local_disk_handle("zfs", "/dev/zvol/tank0/kcore-web-1").unwrap();
+        assert_eq!(c, StorageClass::Zfs);
+        for bad in [
+            "",
+            "kcore-vms/img",
+            "/dev/sda",
+            "/dev/mapper/kcore-vm-web",
+            "/dev/rbd/kcore-vms/img",
+            "/dev/disk/by-id",
+            "/dev/vg/../sda",
+            "/dev/vg_kcore/a/b",
+            "/dev/zvol/tank0",
+            "/dev/vg_kcore/kcore web",
+            "/dev//lv",
+        ] {
+            assert!(validate_local_disk_handle("", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn local_disk_handle_rejects_a_class_that_disagrees() {
+        assert!(validate_local_disk_handle("lvm", "/dev/zvol/tank0/x").is_err());
+        assert!(validate_local_disk_handle("zfs", "/dev/vg_kcore/x").is_err());
+        assert!(validate_local_disk_handle("bogus", "/dev/vg_kcore/x").is_err());
+    }
+
+    #[test]
+    fn unexpose_of_a_local_disk_lease_runs_nothing() {
+        let table = LeaseTable::new();
+        let id = new_lease_id();
+        table
+            .insert(SnapshotLease {
+                lease_id: id.clone(),
+                storage_class: StorageClass::Lvm,
+                backend_handle: "/dev/vg_kcore/kcore-a".into(),
+                snapshot_name: String::new(),
+                device_path: "/dev/vg_kcore/kcore-a".into(),
+                size_bytes: 1024,
+                block_size: 4096,
+                expires_at: Instant::now() + Duration::from_secs(60),
+            })
+            .unwrap();
+        unexpose_snapshot(&id, &table).unwrap();
+        assert!(table.get(&id).is_err());
+    }
+
+    #[test]
+    fn image_meta_argv_is_allow_listed() {
+        let argv = image_meta_set_argv("kcore-vms/kcore-abc", "kcore.seeded", "1").unwrap();
+        assert_eq!(
+            argv,
+            [
+                "rbd",
+                "image-meta",
+                "set",
+                "kcore-vms/kcore-abc",
+                "kcore.seeded",
+                "1"
+            ]
+        );
+        assert!(image_meta_set_argv("kcore-vms/x", "conf_rbd_cache", "1").is_err());
+        assert!(image_meta_set_argv("kcore-vms/x", "kcore.seeded", "1; rm").is_err());
+        assert!(image_meta_set_argv("kcore-vms/x", "kcore.seeded", "").is_err());
+        assert!(image_meta_set_argv("/dev/rbd/x/y", "kcore.seeded", "1").is_err());
     }
 
     #[test]

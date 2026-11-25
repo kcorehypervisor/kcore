@@ -125,6 +125,9 @@ struct ManifestLocalProvisioner {
     mode: String,
     #[serde(default)]
     volumes: Vec<ManifestHostVolume>,
+    /// CephCluster name for the RBD CSI StorageClass (optional).
+    #[serde(default)]
+    ceph_cluster: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,29 +186,31 @@ fn to_proto_spec(spec: &ManifestSpec) -> controller_proto::KubernetesClusterSpec
     };
 
     let local = &spec.local_provisioner;
-    let local_provisioner = if local.enabled || !local.volumes.is_empty() {
-        Some(controller_proto::KubernetesLocalProvisioner {
-            enabled: local.enabled,
-            storage_class_name: local.storage_class_name.clone(),
-            mode: local.mode.clone(),
-            volumes: local
-                .volumes
-                .iter()
-                .map(|volume| controller_proto::KubernetesHostVolume {
-                    name: volume.name.clone(),
-                    node_id: volume.node_id.clone(),
-                    storage_class: volume.storage_class.clone(),
-                    size_bytes: volume.size_bytes,
-                    fs_type: volume.fs_type.clone(),
-                    mount_path: volume.mount_path.clone(),
-                    role: volume.role.clone(),
-                    volume_group: volume.volume_group.clone(),
-                })
-                .collect(),
-        })
-    } else {
-        None
-    };
+    let local_provisioner =
+        if local.enabled || !local.volumes.is_empty() || !local.ceph_cluster.trim().is_empty() {
+            Some(controller_proto::KubernetesLocalProvisioner {
+                enabled: local.enabled,
+                storage_class_name: local.storage_class_name.clone(),
+                mode: local.mode.clone(),
+                volumes: local
+                    .volumes
+                    .iter()
+                    .map(|volume| controller_proto::KubernetesHostVolume {
+                        name: volume.name.clone(),
+                        node_id: volume.node_id.clone(),
+                        storage_class: volume.storage_class.clone(),
+                        size_bytes: volume.size_bytes,
+                        fs_type: volume.fs_type.clone(),
+                        mount_path: volume.mount_path.clone(),
+                        role: volume.role.clone(),
+                        volume_group: volume.volume_group.clone(),
+                    })
+                    .collect(),
+                ceph_cluster: local.ceph_cluster.clone(),
+            })
+        } else {
+            None
+        };
 
     controller_proto::KubernetesClusterSpec {
         cluster_cidr: spec.cluster_cidr.clone(),
