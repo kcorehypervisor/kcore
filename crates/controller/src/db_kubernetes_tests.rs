@@ -527,4 +527,175 @@ mod kubernetes_cluster_tests {
         );
         assert_eq!(db.kubernetes_node_version("c", "node-404").unwrap(), None);
     }
+
+    fn seed_cluster(db: &Database, name: &str) {
+        db.upsert_kubernetes_cluster(&KubernetesClusterRow {
+            name: name.to_string(),
+            generation: 1,
+            cluster_cidr: "10.244.0.0/16".to_string(),
+            service_cidr: "10.96.0.0/12".to_string(),
+            cluster_dns: "10.96.0.10".to_string(),
+            api_server_endpoint: "10.0.0.1:6443".to_string(),
+            cni: "cilium".to_string(),
+            phase: "ready".to_string(),
+            status_message: String::new(),
+            ready_control_planes: 0,
+            ready_workers: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        db.upsert_kubernetes_cluster_config(&KubernetesClusterConfigRow {
+            cluster_name: name.to_string(),
+            ha_enabled: false,
+            vip_address: String::new(),
+            vip_interface: String::new(),
+            cilium_mode: "native-routing".to_string(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".to_string(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: String::new(),
+            local_provisioner_json: String::new(),
+            schedule_on_control_plane: false,
+            kubernetes_version: String::new(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn schema_78_adds_hardening_ops_columns_idempotently() {
+        let db = Database::open(":memory:").expect("open db");
+        {
+            let conn = db.lock_conn().unwrap();
+            for (table, column) in [
+                ("kubernetes_cluster_nodes", "rendered_hash"),
+                ("kubernetes_cluster_config", "auto_reconcile"),
+                ("kubernetes_cluster_config", "previous_version"),
+                ("kubernetes_cluster_config", "pre_upgrade_snapshot_id"),
+                ("kubernetes_cluster_config", "backup_json"),
+                ("kubernetes_cluster_config", "repair_json"),
+                ("kubernetes_cluster_config", "storage_json"),
+                ("kubernetes_cluster_config", "restore_json"),
+                ("kubernetes_cluster_config", "oidc_json"),
+                ("kubernetes_cluster_config", "cert_json"),
+                ("kubernetes_cluster_config", "default_deny_label"),
+                ("kubernetes_cluster_config", "encryption_json"),
+                ("kubernetes_pki", "leaf_not_after"),
+                ("kubernetes_etcd_snapshots", "trigger"),
+            ] {
+                let present: i64 = conn
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"
+                        ),
+                        [column],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(present, 1, "{table}.{column}");
+            }
+            // Rewind and migrate again: the guarded ALTERs must not fail.
+            conn.execute_batch(
+                "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (74);",
+            )
+            .unwrap();
+        }
+        db.migrate().expect("re-run 75 through 78");
+        assert_eq!(db.schema_version_for_test(), crate::db::SCHEMA_VERSION);
+        assert_eq!(crate::db::SCHEMA_VERSION, 78);
+    }
+
+    #[test]
+    fn ops_defaults_and_setters_round_trip_without_touching_the_spec() {
+        let db = Database::open(":memory:").expect("open db");
+        seed_cluster(&db, "c");
+        let ops = db.get_kubernetes_cluster_ops("c").unwrap().unwrap();
+        assert!(ops.auto_reconcile);
+        assert_eq!(ops.previous_version, "");
+        assert_eq!(ops.backup_json, "");
+
+        db.set_kubernetes_cluster_auto_reconcile("c", false)
+            .unwrap();
+        db.set_kubernetes_cluster_previous_version("c", "1.35.2")
+            .unwrap();
+        db.set_kubernetes_cluster_pre_upgrade_snapshot_id("c", "snap-1")
+            .unwrap();
+        db.set_kubernetes_cluster_backup_json("c", "{}").unwrap();
+        db.set_kubernetes_cluster_repair_json("c", "{}").unwrap();
+        // A spec re-apply upserts the config row; ops state must survive it.
+        seed_cluster(&db, "c");
+        let ops = db.get_kubernetes_cluster_ops("c").unwrap().unwrap();
+        assert!(!ops.auto_reconcile);
+        assert_eq!(ops.previous_version, "1.35.2");
+        assert_eq!(ops.pre_upgrade_snapshot_id, "snap-1");
+        assert_eq!(ops.backup_json, "{}");
+        assert_eq!(ops.repair_json, "{}");
+        assert!(db.get_kubernetes_cluster_ops("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn rendered_hash_survives_membership_upserts() {
+        let db = Database::open(":memory:").expect("open db");
+        seed_cluster(&db, "c");
+        ensure_node(&db, "n1");
+        let member = KubernetesClusterNodeRow {
+            cluster_name: "c".to_string(),
+            node_id: "n1".to_string(),
+            role: "worker".to_string(),
+            advertise_address: "10.0.0.5".to_string(),
+            iface: "br0".to_string(),
+            initial_cluster: false,
+            join_existing: true,
+            kubelet_ready: false,
+            pending_join: false,
+            pending_removal: false,
+            k8s_node_name: String::new(),
+        };
+        db.upsert_kubernetes_cluster_node(&member).unwrap();
+        assert_eq!(
+            db.list_kubernetes_node_rendered_hashes("c").unwrap()["n1"],
+            ""
+        );
+        db.set_kubernetes_node_rendered_hash("c", "n1", "abc")
+            .unwrap();
+        db.upsert_kubernetes_cluster_node(&KubernetesClusterNodeRow {
+            kubelet_ready: true,
+            ..member
+        })
+        .unwrap();
+        assert_eq!(
+            db.list_kubernetes_node_rendered_hashes("c").unwrap()["n1"],
+            "abc"
+        );
+    }
+
+    #[test]
+    fn etcd_snapshots_list_newest_first_and_delete() {
+        use crate::db::KubernetesEtcdSnapshotRow;
+        let db = Database::open(":memory:").expect("open db");
+        let row = |id: &str, at: &str| KubernetesEtcdSnapshotRow {
+            id: id.to_string(),
+            cluster_name: "c".to_string(),
+            created_at: at.to_string(),
+            sha256: "00".to_string(),
+            size_bytes: 10,
+            path: format!("/tmp/{id}"),
+            trigger: "manual".to_string(),
+        };
+        db.insert_kubernetes_etcd_snapshot(&row("a", "2026-01-01T00:00:00Z"))
+            .unwrap();
+        db.insert_kubernetes_etcd_snapshot(&row("b", "2026-01-02T00:00:00Z"))
+            .unwrap();
+        let ids: Vec<_> = db
+            .list_kubernetes_etcd_snapshots("c")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["b", "a"]);
+        assert!(db.get_kubernetes_etcd_snapshot("a").unwrap().is_some());
+        assert!(db.delete_kubernetes_etcd_snapshot("a").unwrap());
+        assert!(!db.delete_kubernetes_etcd_snapshot("a").unwrap());
+        assert_eq!(db.list_kubernetes_etcd_snapshots("other").unwrap().len(), 0);
+    }
 }

@@ -20794,6 +20794,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
             blocking_issues.push("at least one control plane node is required".to_string());
         }
 
+        let placement = self.kubernetes_placement_findings(&spec)?;
+        blocking_issues.extend(crate::kubernetes_placement::messages(
+            &placement,
+            crate::kubernetes_placement::FindingLevel::Error,
+        ));
+        warnings.extend(crate::kubernetes_placement::messages(
+            &placement,
+            crate::kubernetes_placement::FindingLevel::Warning,
+        ));
+
         // Check if cluster already exists
         let existing = self
             .db
@@ -20940,6 +20950,23 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
         crate::kubernetes_versions::validate(&spec.version).map_err(Status::invalid_argument)?;
 
+        let placement = self.kubernetes_placement_findings(&spec)?;
+        if crate::kubernetes_placement::has_errors(&placement) {
+            return Err(Status::failed_precondition(
+                crate::kubernetes_placement::messages(
+                    &placement,
+                    crate::kubernetes_placement::FindingLevel::Error,
+                )
+                .join("; "),
+            ));
+        }
+        for warning in crate::kubernetes_placement::messages(
+            &placement,
+            crate::kubernetes_placement::FindingLevel::Warning,
+        ) {
+            warn!(cluster = %req.name, "{warning}");
+        }
+
         // Check if cluster already exists
         if let Some(_existing) = self
             .db
@@ -20978,6 +21005,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let config_row = Self::kubernetes_config_row(&req.name, &spec, &provisioner);
         self.db
             .upsert_kubernetes_cluster_config(&config_row)
+            .map_err(internal_db)?;
+        self.persist_kubernetes_ops(&req.name, &spec)
             .map_err(internal_db)?;
 
         // Store nodes
@@ -21136,6 +21165,8 @@ impl controller_proto::controller_server::Controller for ControllerService {
         let config_row = Self::kubernetes_config_row(&req.name, &spec, &provisioner);
         self.db
             .upsert_kubernetes_cluster_config(&config_row)
+            .map_err(internal_db)?;
+        self.persist_kubernetes_ops(&req.name, &spec)
             .map_err(internal_db)?;
         let volume_error = match self
             .reconcile_local_volumes(&actor, &req.name, &provisioner)
@@ -21399,6 +21430,402 @@ impl controller_proto::controller_server::Controller for ControllerService {
         )))
     }
 
+    async fn get_kubernetes_certificates(
+        &self,
+        request: Request<controller_proto::GetKubernetesCertificatesRequest>,
+    ) -> Result<Response<controller_proto::GetKubernetesCertificatesResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        self.kubernetes_cluster_or_not_found(&req.name)?;
+
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let renew_before_days = orchestrator
+            .cert_policy(&req.name)
+            .map_err(|e| Status::internal(format!("cert policy: {e:#}")))?
+            .renew_before_days;
+        let Some(not_after) = orchestrator
+            .leaf_expiry(&req.name)
+            .map_err(|e| Status::internal(format!("certificate expiry: {e:#}")))?
+        else {
+            return Ok(Response::new(
+                controller_proto::GetKubernetesCertificatesResponse {
+                    renew_before_days: renew_before_days as i32,
+                    ..Default::default()
+                },
+            ));
+        };
+        let now = time::OffsetDateTime::now_utc();
+        Ok(Response::new(
+            controller_proto::GetKubernetesCertificatesResponse {
+                leaf_not_after: not_after
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                days_remaining: (not_after - now).as_seconds_f64() / 86_400.0,
+                renew_before_days: renew_before_days as i32,
+                renewal_due: crate::kubernetes_cert_renewal::renewal_due(
+                    now,
+                    not_after,
+                    renew_before_days,
+                ),
+            },
+        ))
+    }
+
+    async fn rotate_kubernetes_certificates(
+        &self,
+        request: Request<controller_proto::RotateKubernetesCertificatesRequest>,
+    ) -> Result<Response<controller_proto::RotateKubernetesCertificatesResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let cluster = self.kubernetes_cluster_or_not_found(&req.name)?;
+        if cluster.phase != "ready" {
+            return Err(Status::failed_precondition(format!(
+                "cluster {} is {}; certificates rotate only while it is ready",
+                req.name, cluster.phase
+            )));
+        }
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let not_after = orchestrator
+            .leaf_expiry(&req.name)
+            .map_err(|e| Status::internal(format!("certificate expiry: {e:#}")))?
+            .ok_or_else(|| Status::failed_precondition("cluster has no stored certificates"))?;
+        let cfg = orchestrator
+            .cert_policy(&req.name)
+            .map_err(|e| Status::internal(format!("cert policy: {e:#}")))?;
+        if !req.force
+            && !crate::kubernetes_cert_renewal::renewal_due(
+                time::OffsetDateTime::now_utc(),
+                not_after,
+                cfg.renew_before_days,
+            )
+        {
+            return Err(Status::failed_precondition(format!(
+                "certificates are valid until {not_after}; renewal starts {} days before expiry. \
+                 Pass --force to rotate now",
+                cfg.renew_before_days
+            )));
+        }
+        // The orchestrator owns the rolling renewal and holds the cluster
+        // claim while it runs. Marking the leaves expired makes its next pass
+        // (within 30s) renew them; the new expiry is stored with the new certs.
+        self.db
+            .set_kubernetes_pki_leaf_not_after(&req.name, "1970-01-01T00:00:00Z")
+            .map_err(internal_db)?;
+        Ok(Response::new(
+            controller_proto::RotateKubernetesCertificatesResponse {
+                message: format!(
+                    "certificate rotation queued for {}; the orchestrator rebuilds one node at a \
+                     time, control planes first",
+                    req.name
+                ),
+            },
+        ))
+    }
+
+    async fn rotate_kubernetes_encryption(
+        &self,
+        request: Request<controller_proto::RotateKubernetesEncryptionRequest>,
+    ) -> Result<Response<controller_proto::RotateKubernetesEncryptionResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let cluster = self.kubernetes_cluster_or_not_found(&req.name)?;
+        if cluster.phase != "ready" {
+            return Err(Status::failed_precondition(format!(
+                "cluster {} is {}; encryption rotates only while it is ready",
+                req.name, cluster.phase
+            )));
+        }
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let message = orchestrator
+            .rotate_encryption(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("rotate encryption: {e:#}")))?;
+        Ok(Response::new(
+            controller_proto::RotateKubernetesEncryptionResponse { message },
+        ))
+    }
+
+    async fn create_kubernetes_backup(
+        &self,
+        request: Request<controller_proto::CreateKubernetesBackupRequest>,
+    ) -> Result<Response<controller_proto::CreateKubernetesBackupResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        self.kubernetes_cluster_or_not_found(&req.name)?;
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let row = orchestrator
+            .take_snapshot(&req.name, "manual")
+            .await
+            .map_err(|e| Status::unavailable(format!("etcd snapshot: {e:#}")))?;
+        Ok(Response::new(
+            controller_proto::CreateKubernetesBackupResponse {
+                snapshot: Some(kubernetes_snapshot_proto(row)),
+            },
+        ))
+    }
+
+    async fn list_kubernetes_backups(
+        &self,
+        request: Request<controller_proto::ListKubernetesBackupsRequest>,
+    ) -> Result<Response<controller_proto::ListKubernetesBackupsResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let req = request.into_inner();
+        self.kubernetes_cluster_or_not_found(&req.name)?;
+        let snapshots = self
+            .db
+            .list_kubernetes_etcd_snapshots(&req.name)
+            .map_err(internal_db)?
+            .into_iter()
+            .map(kubernetes_snapshot_proto)
+            .collect();
+        Ok(Response::new(
+            controller_proto::ListKubernetesBackupsResponse { snapshots },
+        ))
+    }
+
+    async fn delete_kubernetes_backup(
+        &self,
+        request: Request<controller_proto::DeleteKubernetesBackupRequest>,
+    ) -> Result<Response<controller_proto::DeleteKubernetesBackupResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        self.kubernetes_cluster_or_not_found(&req.name)?;
+        let snapshot = self
+            .db
+            .get_kubernetes_etcd_snapshot(&req.snapshot_id)
+            .map_err(internal_db)?
+            .filter(|row| row.cluster_name == req.name)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "snapshot {} not found for cluster {}",
+                    req.snapshot_id, req.name
+                ))
+            })?;
+        let ops = self
+            .db
+            .get_kubernetes_cluster_ops(&req.name)
+            .map_err(internal_db)?;
+        if ops.is_some_and(|ops| ops.pre_upgrade_snapshot_id == snapshot.id) {
+            return Err(Status::failed_precondition(
+                "this is the pre-upgrade snapshot a rollback may need; it is kept until the next upgrade",
+            ));
+        }
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        orchestrator
+            .delete_snapshot(&snapshot.id)
+            .await
+            .map_err(|e| Status::internal(format!("deleting snapshot: {e:#}")))?;
+        Ok(Response::new(
+            controller_proto::DeleteKubernetesBackupResponse {
+                message: format!("snapshot {} deleted", snapshot.id),
+            },
+        ))
+    }
+
+    async fn restore_kubernetes_backup(
+        &self,
+        request: Request<controller_proto::RestoreKubernetesBackupRequest>,
+    ) -> Result<Response<controller_proto::RestoreKubernetesBackupResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let cluster = self.kubernetes_cluster_or_not_found(&req.name)?;
+        if !matches!(cluster.phase.as_str(), "ready" | "degraded") {
+            return Err(Status::failed_precondition(format!(
+                "cluster {} is {}; restore only from ready or degraded",
+                req.name, cluster.phase
+            )));
+        }
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        orchestrator
+            .begin_restore(&req.name, &req.snapshot_id)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("restore: {e:#}")))?;
+        let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
+        Ok(Response::new(
+            controller_proto::RestoreKubernetesBackupResponse {
+                cluster: Some(cluster),
+                message: format!(
+                    "restore of {} queued; the API will be unavailable until etcd recovers",
+                    req.snapshot_id
+                ),
+            },
+        ))
+    }
+
+    async fn rollback_kubernetes_upgrade(
+        &self,
+        request: Request<controller_proto::RollbackKubernetesUpgradeRequest>,
+    ) -> Result<Response<controller_proto::RollbackKubernetesUpgradeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let cluster = self.kubernetes_cluster_or_not_found(&req.name)?;
+        if !matches!(cluster.phase.as_str(), "ready" | "degraded") {
+            return Err(Status::failed_precondition(format!(
+                "cluster {} is {}; roll back only from ready or degraded",
+                req.name, cluster.phase
+            )));
+        }
+        let mut config = self
+            .db
+            .get_kubernetes_cluster_config(&req.name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found("cluster config not found"))?;
+        let ops = self
+            .db
+            .get_kubernetes_cluster_ops(&req.name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found("cluster config not found"))?;
+        crate::kubernetes_rollback::rollback_allowed(
+            &config.kubernetes_version,
+            &ops.previous_version,
+            &ops.previous_version,
+        )
+        .map_err(Status::failed_precondition)?;
+
+        // Point the desired version at the stored previous version; the
+        // rolling-back reconciler drives reverse-order rebuilds.
+        config.kubernetes_version = ops.previous_version.clone();
+        self.db
+            .upsert_kubernetes_cluster_config(&config)
+            .map_err(internal_db)?;
+        let message = format!(
+            "rollback to Kubernetes {} queued",
+            crate::kubernetes_versions::effective(&ops.previous_version)
+        );
+        self.db
+            .set_kubernetes_cluster_status(
+                &req.name,
+                crate::kubernetes_orchestrator::PHASE_ROLLING_BACK,
+                &message,
+            )
+            .map_err(internal_db)?;
+        let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
+        Ok(Response::new(
+            controller_proto::RollbackKubernetesUpgradeResponse {
+                cluster: Some(cluster),
+                message,
+            },
+        ))
+    }
+
+    async fn replace_kubernetes_node(
+        &self,
+        request: Request<controller_proto::ReplaceKubernetesNodeRequest>,
+    ) -> Result<Response<controller_proto::ReplaceKubernetesNodeResponse>, Status> {
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let existing = self.kubernetes_cluster_or_not_found(&req.name)?;
+        if existing.phase != "ready" && existing.phase != "degraded" {
+            return Err(Status::failed_precondition(format!(
+                "cluster {} is {}; replace a node only from ready or degraded",
+                req.name, existing.phase
+            )));
+        }
+        let members = self
+            .db
+            .list_kubernetes_cluster_nodes(&req.name)
+            .map_err(internal_db)?;
+        let old = members
+            .iter()
+            .find(|row| row.node_id == req.old_node_id)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "{} is not a member of {}",
+                    req.old_node_id, req.name
+                ))
+            })?;
+        if members.iter().any(|row| row.node_id == req.new_node_id) {
+            return Err(Status::failed_precondition(format!(
+                "{} is already a member of {}",
+                req.new_node_id, req.name
+            )));
+        }
+        let new_node = self
+            .db
+            .get_node(&req.new_node_id)
+            .map_err(internal_db)?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "node {} is not an approved kcore node",
+                    req.new_node_id
+                ))
+            })?;
+        let add = controller_proto::KubernetesNodeSpec {
+            node_id: req.new_node_id.clone(),
+            role: old.role.clone(),
+            advertise_address: new_node
+                .address
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            iface: old.iface.clone(),
+            initial_cluster: false,
+            join_existing: true,
+        };
+        let changed = self.stage_kubernetes_membership(
+            &req.name,
+            std::slice::from_ref(&add),
+            std::slice::from_ref(&req.old_node_id),
+        )?;
+        if changed {
+            let cluster_row = crate::db::KubernetesClusterRow {
+                generation: existing.generation + 1,
+                phase: "scaling".to_string(),
+                status_message: format!("replacing {} with {}", req.old_node_id, req.new_node_id),
+                ..existing
+            };
+            self.db
+                .upsert_kubernetes_cluster(&cluster_row)
+                .map_err(internal_db)?;
+        }
+        let cluster = self.build_kubernetes_cluster_proto(&req.name)?;
+        Ok(Response::new(
+            controller_proto::ReplaceKubernetesNodeResponse {
+                cluster: Some(cluster),
+            },
+        ))
+    }
+
     async fn classify_disk_layout(
         &self,
         request: Request<controller_proto::ClassifyDiskLayoutRequest>,
@@ -21410,6 +21837,16 @@ impl controller_proto::controller_server::Controller for ControllerService {
 
 // Helper methods for Kubernetes cluster management
 impl ControllerService {
+    fn kubernetes_cluster_or_not_found(
+        &self,
+        name: &str,
+    ) -> Result<crate::db::KubernetesClusterRow, Status> {
+        self.db
+            .get_kubernetes_cluster(name)
+            .map_err(internal_db)?
+            .ok_or_else(|| Status::not_found(format!("cluster {name} not found")))
+    }
+
     fn stage_kubernetes_membership(
         &self,
         cluster_name: &str,
@@ -21543,6 +21980,49 @@ impl ControllerService {
             changed = true;
         }
         Ok(changed)
+    }
+
+    fn kubernetes_placement_findings(
+        &self,
+        spec: &controller_proto::KubernetesClusterSpec,
+    ) -> Result<Vec<crate::kubernetes_placement::PlacementFinding>, Status> {
+        let nodes = self.db.list_nodes().map_err(internal_db)?;
+        let dc_of = |node_id: &str| {
+            nodes
+                .iter()
+                .find(|n| n.id == node_id)
+                .map(|n| n.dc_id.clone())
+                .unwrap_or_default()
+        };
+        let control_planes: Vec<(String, String)> = spec
+            .control_plane_nodes
+            .iter()
+            .map(|cp| (cp.node_id.clone(), dc_of(&cp.node_id)))
+            .collect();
+        let other_dcs_exist = control_planes
+            .first()
+            .is_some_and(|(_, first)| nodes.iter().any(|n| &n.dc_id != first));
+        let mut ceph_mon_hosts = Vec::new();
+        for cluster in self.db.list_ceph_clusters().map_err(internal_db)? {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&cluster.spec_json) else {
+                continue;
+            };
+            for node in json["nodes"].as_array().into_iter().flatten() {
+                if let Some(id) = node["nodeId"].as_str() {
+                    ceph_mon_hosts.push(id.to_string());
+                }
+            }
+        }
+        let ha_enabled = spec.high_availability.as_ref().is_some_and(|ha| ha.enabled);
+        // The controller's own node id is not known here; the controller-host
+        // warning stays off until it is.
+        Ok(crate::kubernetes_placement::placement_findings(
+            &control_planes,
+            ha_enabled,
+            other_dcs_exist,
+            None,
+            &ceph_mon_hosts,
+        ))
     }
 
     /// Whether applying `spec` starts, resumes, or leaves alone a version
@@ -21756,6 +22236,85 @@ impl ControllerService {
             schedule_on_control_plane: spec.schedule_on_control_plane,
             kubernetes_version: crate::kubernetes_versions::normalize(&spec.version),
         }
+    }
+
+    fn persist_kubernetes_ops(
+        &self,
+        name: &str,
+        spec: &controller_proto::KubernetesClusterSpec,
+    ) -> Result<(), rusqlite::Error> {
+        if let Some(ceph) = spec.storage_ceph.as_ref() {
+            let storage = crate::kubernetes_csi::CephStorage {
+                enabled: ceph.enabled,
+                cluster: ceph.cluster.clone(),
+                pool: ceph.pool.clone(),
+                monitors: ceph.monitors.clone(),
+                user_key: ceph.user_key.clone(),
+                user_id: ceph.user_id.clone(),
+                default_storage_class: ceph.default_storage_class,
+            };
+            let json = serde_json::to_string(&storage).unwrap_or_default();
+            self.db.set_kubernetes_cluster_storage_json(name, &json)?;
+        }
+        if !spec.backup_json.trim().is_empty() {
+            self.db
+                .set_kubernetes_cluster_backup_json(name, &spec.backup_json)?;
+        }
+        if !spec.repair_json.trim().is_empty() {
+            self.db
+                .set_kubernetes_cluster_repair_json(name, &spec.repair_json)?;
+        }
+        if let Some(oidc) = spec.oidc.as_ref() {
+            let stored = crate::kubernetes_hardening::OidcSpec {
+                issuer_url: oidc.issuer_url.clone(),
+                client_id: oidc.client_id.clone(),
+                username_claim: if oidc.username_claim.is_empty() {
+                    "sub".into()
+                } else {
+                    oidc.username_claim.clone()
+                },
+                groups_claim: oidc.groups_claim.clone(),
+                ca_pem: oidc.ca_pem.clone(),
+            };
+            self.db
+                .set_kubernetes_cluster_oidc_json(name, &stored.to_json())?;
+        }
+        if let Some(cert) = spec.cert.as_ref() {
+            let policy = crate::kubernetes_hardening::CertPolicy {
+                leaf_validity_days: if cert.leaf_validity_days > 0 {
+                    cert.leaf_validity_days as i64
+                } else {
+                    365
+                },
+                renew_before_days: if cert.renew_before_days > 0 {
+                    cert.renew_before_days as i64
+                } else {
+                    30
+                },
+            };
+            self.db
+                .set_kubernetes_cluster_cert_json(name, &policy.to_json())?;
+        }
+        self.db.set_kubernetes_cluster_default_deny_label(
+            name,
+            &spec.network_policy_default_deny_label,
+        )?;
+        // Proto3 defaults bool to false. kctl always sends true unless the
+        // YAML sets autoReconcile: false.
+        self.db
+            .set_kubernetes_cluster_auto_reconcile(name, spec.auto_reconcile)?;
+        // Seed encryption-at-rest keys once so every control plane shares them.
+        let ops = self.db.get_kubernetes_cluster_ops(name)?;
+        if ops
+            .as_ref()
+            .map(|o| o.encryption_json.trim().is_empty())
+            .unwrap_or(true)
+        {
+            let keys = crate::kubernetes_hardening::EncryptionKeys::new_random();
+            self.db
+                .set_kubernetes_cluster_encryption_json(name, &keys.to_json())?;
+        }
+        Ok(())
     }
 
     async fn reconcile_local_volumes(
@@ -22172,6 +22731,84 @@ impl ControllerService {
                     .as_ref()
                     .map(|c| c.kubernetes_version.clone())
                     .unwrap_or_default(),
+                storage_ceph: self
+                    .db
+                    .get_kubernetes_cluster_ops(&row.name)
+                    .map_err(internal_db)?
+                    .and_then(|ops| {
+                        if ops.storage_json.trim().is_empty() {
+                            return None;
+                        }
+                        serde_json::from_str::<crate::kubernetes_csi::CephStorage>(
+                            &ops.storage_json,
+                        )
+                        .ok()
+                        .map(|s| controller_proto::KubernetesCephStorage {
+                            enabled: s.enabled,
+                            cluster: s.cluster,
+                            pool: s.pool,
+                            monitors: s.monitors,
+                            user_id: s.user_id,
+                            user_key: s.user_key,
+                            default_storage_class: s.default_storage_class,
+                        })
+                    }),
+                backup_json: self
+                    .db
+                    .get_kubernetes_cluster_ops(&row.name)
+                    .map_err(internal_db)?
+                    .map(|ops| ops.backup_json)
+                    .unwrap_or_default(),
+                repair_json: self
+                    .db
+                    .get_kubernetes_cluster_ops(&row.name)
+                    .map_err(internal_db)?
+                    .map(|ops| ops.repair_json)
+                    .unwrap_or_default(),
+                auto_reconcile: self
+                    .db
+                    .get_kubernetes_cluster_ops(&row.name)
+                    .map_err(internal_db)?
+                    .map(|ops| ops.auto_reconcile)
+                    .unwrap_or(true),
+                oidc: self
+                    .db
+                    .get_kubernetes_cluster_ops(&row.name)
+                    .map_err(internal_db)?
+                    .and_then(|ops| {
+                        let oidc = crate::kubernetes_hardening::OidcSpec::from_json(&ops.oidc_json);
+                        if !oidc.enabled() {
+                            return None;
+                        }
+                        Some(controller_proto::KubernetesOidc {
+                            issuer_url: oidc.issuer_url,
+                            client_id: oidc.client_id,
+                            username_claim: oidc.username_claim,
+                            groups_claim: oidc.groups_claim,
+                            ca_pem: oidc.ca_pem,
+                        })
+                    }),
+                network_policy_default_deny_label: self
+                    .db
+                    .get_kubernetes_cluster_ops(&row.name)
+                    .map_err(internal_db)?
+                    .map(|ops| ops.default_deny_label)
+                    .unwrap_or_default(),
+                cert: self
+                    .db
+                    .get_kubernetes_cluster_ops(&row.name)
+                    .map_err(internal_db)?
+                    .and_then(|ops| {
+                        if ops.cert_json.trim().is_empty() {
+                            return None;
+                        }
+                        let policy =
+                            crate::kubernetes_hardening::CertPolicy::from_json(&ops.cert_json);
+                        Some(controller_proto::KubernetesCertPolicy {
+                            leaf_validity_days: policy.leaf_validity_days as i32,
+                            renew_before_days: policy.renew_before_days as i32,
+                        })
+                    }),
             }),
             status: Some(controller_proto::KubernetesClusterStatus {
                 phase: row.phase.clone(),
@@ -22216,6 +22853,20 @@ fn stored_cni(api_endpoint: &str, requested: &str) -> String {
         }
     } else {
         "bridge".to_string()
+    }
+}
+
+fn kubernetes_snapshot_proto(
+    row: crate::db::KubernetesEtcdSnapshotRow,
+) -> controller_proto::KubernetesEtcdSnapshot {
+    controller_proto::KubernetesEtcdSnapshot {
+        id: row.id,
+        cluster_name: row.cluster_name,
+        created_at: row.created_at,
+        sha256: row.sha256,
+        size_bytes: row.size_bytes,
+        path: row.path,
+        trigger: row.trigger,
     }
 }
 

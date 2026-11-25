@@ -2078,6 +2078,10 @@ pub struct KubernetesNodeConfig {
     /// LVM mode leaves this empty: that mode creates a thin pool and does
     /// not install a provisioner.
     pub provisioner_manifest: String,
+    /// Ceph RBD CSI StorageClass / Secret / ConfigMap. Empty skips it.
+    pub ceph_csi_manifest: String,
+    /// metrics-server Deployment. Empty skips it.
+    pub metrics_server_manifest: String,
     /// Set for a cluster that shares the node with the primary one.
     /// The primary cluster keeps the module defaults and leaves this empty.
     pub instance: Option<KubernetesInstanceLayout>,
@@ -2242,6 +2246,18 @@ pub fn generate_kubernetes_node_config(k8s: &KubernetesNodeConfig) -> String {
             nix_multiline(&k8s.provisioner_manifest)
         ));
     }
+    if !k8s.ceph_csi_manifest.is_empty() {
+        out.push_str(&format!(
+            "    cephCsiManifest = {};\n",
+            nix_multiline(&k8s.ceph_csi_manifest)
+        ));
+    }
+    if !k8s.metrics_server_manifest.is_empty() {
+        out.push_str(&format!(
+            "    metricsServerManifest = {};\n",
+            nix_multiline(&k8s.metrics_server_manifest)
+        ));
+    }
 
     if !k8s.kubeconfig_data.is_empty() {
         out.push_str(&format!(
@@ -2286,6 +2302,8 @@ mod kubernetes_tests {
             schedule_on_control_plane: true,
             version: String::new(),
             provisioner_manifest: String::new(),
+            ceph_csi_manifest: String::new(),
+            metrics_server_manifest: String::new(),
             instance: None,
         };
 
@@ -2325,6 +2343,8 @@ mod kubernetes_tests {
             schedule_on_control_plane: false,
             version: String::new(),
             provisioner_manifest: String::new(),
+            ceph_csi_manifest: String::new(),
+            metrics_server_manifest: String::new(),
             instance: None,
         };
 
@@ -2403,6 +2423,11 @@ mod kubernetes_tests {
                 schedule_on_control_plane: false,
                 version: String::new(),
                 provisioner_manifest: String::new(),
+                ceph_csi_manifest: String::new(),
+                metrics_server_manifest: String::new(),
+                oidc: Default::default(),
+                default_deny_label: String::new(),
+                reserve_for_vms: false,
             },
         )
         .unwrap();
@@ -2413,7 +2438,40 @@ mod kubernetes_tests {
             peer_at < close,
             "etcdPeerCrt must be inside kcore.kubernetes"
         );
-        assert!(nix.contains("etcdPeerKey"));
+        assert!(nix.contains("pkiKeyDir = \"/var/lib/kcore/kubernetes/lab/pki\";"));
+        assert!(nix.contains("encryptionProviderConfigFile ="));
+        assert!(nix.contains("auditPolicyFile ="));
+        assert!(nix.contains("podSecurityAdmissionConfigFile ="));
+        assert!(nix.contains("anonymousAuth = false;"));
+        assert!(nix.contains("tlsMinVersion = \"VersionTLS12\";"));
+        assert!(!nix.contains("systemReserved ="));
+        assert!(!nix.contains("BEGIN PRIVATE KEY"));
+        assert!(!nix.contains("kubeconfigData ="));
+        for key in [
+            "caKey",
+            "saKey",
+            "apiserverKey",
+            "apiserverKubeletClientKey",
+            "apiserverEtcdClientKey",
+            "etcdCaKey",
+            "etcdServerKey",
+            "etcdPeerKey",
+        ] {
+            assert!(
+                !nix.contains(&format!("{key} =")),
+                "{key} must not be rendered into the store"
+            );
+        }
+        for secret in [
+            "CAKEY",
+            "APIKEY",
+            "AKCKEY",
+            "AECKEY",
+            "server-key",
+            "peer-key",
+        ] {
+            assert!(!nix.contains(secret), "{secret} leaked into the nix");
+        }
         assert!(nix.contains("MIIBPEER"));
         assert!(nix.contains("node-107=https://192.168.40.107:2380"));
         assert!(nix.contains("apiServerEndpoint = \"192.168.40.200:6443\""));
@@ -2424,7 +2482,91 @@ mod kubernetes_tests {
         assert!(!nix.contains("https://https://"));
         assert!(!nix.contains("environment.etc"));
         assert!(nix.ends_with("  };\n}\n"));
-        assert_eq!(nix.matches("kubeconfigData").count(), 1);
+        assert_eq!(nix.matches("kubeconfigData").count(), 0);
+    }
+
+    #[test]
+    fn oidc_and_vm_reservations_emit_when_configured() {
+        use crate::kubernetes_orchestrator::ClusterNode;
+        use crate::kubernetes_pki::KubernetesPki;
+        use std::collections::HashMap;
+
+        let node = ClusterNode {
+            node_id: "node-1".to_string(),
+            hostname: "node-1".to_string(),
+            ip_address: "10.0.0.1".to_string(),
+            iface: "eth0".to_string(),
+            initial_cluster: true,
+            role: "control-plane".to_string(),
+            kubelet_kubeconfig: String::new(),
+        };
+        let mut etcd_node_certs = HashMap::new();
+        etcd_node_certs.insert(node.node_id.clone(), ("SRV".into(), "SRVKEY".into()));
+        let mut etcd_node_peer_certs = HashMap::new();
+        etcd_node_peer_certs.insert(node.node_id.clone(), ("PEER".into(), "PEERKEY".into()));
+        let pki = KubernetesPki {
+            ca_cert: "CACERT".into(),
+            ca_key: "CAKEY".into(),
+            sa_key: "SA".into(),
+            sa_pub: "SAPUB".into(),
+            etcd_ca_cert: "ETCDCA".into(),
+            etcd_ca_key: "ETCDCAKEY".into(),
+            apiserver_cert: "APICERT".into(),
+            apiserver_key: "APIKEY".into(),
+            apiserver_kubelet_client_cert: "AKCCERT".into(),
+            apiserver_kubelet_client_key: "AKCKEY".into(),
+            apiserver_etcd_client_cert: "AECCERT".into(),
+            apiserver_etcd_client_key: "AECKEY".into(),
+            etcd_node_certs,
+            etcd_node_peer_certs,
+            admin_kubeconfig: String::new(),
+        };
+
+        let nix = generate_kubernetes_config(
+            "lab",
+            &node,
+            &pki,
+            "10.244.0.0/16",
+            "10.96.0.0/12",
+            "SRV",
+            "SRVKEY",
+            "PEER",
+            "PEERKEY",
+            std::slice::from_ref(&node),
+            &KubernetesRenderSettings {
+                api_server_endpoint: "10.0.0.1:6443".into(),
+                cluster_dns: "10.96.0.10".into(),
+                ha_enabled: false,
+                vip_address: String::new(),
+                vip_interface: String::new(),
+                cilium_mode: "native-routing".into(),
+                cilium_mtu: 1500,
+                cilium_tunnel: "disabled".into(),
+                cilium_auto_direct_routes: true,
+                cilium_lb_ip_pools: vec![],
+                schedule_on_control_plane: true,
+                version: String::new(),
+                provisioner_manifest: String::new(),
+                ceph_csi_manifest: String::new(),
+                metrics_server_manifest: String::new(),
+                oidc: crate::kubernetes_hardening::OidcSpec {
+                    issuer_url: "https://idp.example/".into(),
+                    client_id: "kcore".into(),
+                    username_claim: "email".into(),
+                    groups_claim: "groups".into(),
+                    ca_pem: "OIDCCA".into(),
+                },
+                default_deny_label: "kcore.io/default-deny".into(),
+                reserve_for_vms: true,
+            },
+        )
+        .unwrap();
+        assert!(nix.contains("issuerUrl = \"https://idp.example/\";"));
+        assert!(nix.contains("clientId = \"kcore\";"));
+        assert!(nix.contains("caFile = \"/var/lib/kcore/kubernetes/lab/pki/oidc-ca.crt\";"));
+        assert!(nix.contains("networkPolicyDefaultDenyLabel = \"kcore.io/default-deny\";"));
+        assert!(nix.contains("systemReserved ="));
+        assert!(nix.contains("kubeReserved ="));
     }
 
     #[test]
@@ -2479,6 +2621,11 @@ mod kubernetes_tests {
             schedule_on_control_plane: false,
             version: String::new(),
             provisioner_manifest: String::new(),
+            ceph_csi_manifest: String::new(),
+            metrics_server_manifest: String::new(),
+            oidc: Default::default(),
+            default_deny_label: String::new(),
+            reserve_for_vms: false,
         };
         let extra = KubernetesRenderSettings {
             api_server_endpoint: "192.168.40.201:7443".to_string(),
@@ -2496,6 +2643,11 @@ mod kubernetes_tests {
             provisioner_manifest:
                 "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: local-path-config\n"
                     .to_string(),
+            ceph_csi_manifest: String::new(),
+            metrics_server_manifest: String::new(),
+            oidc: Default::default(),
+            default_deny_label: String::new(),
+            reserve_for_vms: false,
         };
         let nix = generate_colocated_kubernetes_config(&[
             KubernetesMemberRender {
@@ -2537,6 +2689,8 @@ mod kubernetes_tests {
         assert!(nix.contains("podSubnet = \"10.245.0.0/24\""));
         assert!(nix.contains("virtualRouterId = 41"));
         assert!(nix.contains("clusterName = \"kcore-prod\""));
+        assert!(nix.contains("pkiKeyDir = \"/var/lib/kcore/kubernetes/kcore-prod/pki\";"));
+        assert!(nix.contains("pkiKeyDir = \"/var/lib/kcore/kubernetes/kcore-b/pki\";"));
         let extra = &nix[extra_at..];
         assert!(!extra.contains("ciliumMode"));
         assert!(!extra.contains("ciliumL2Interfaces"));
@@ -2674,7 +2828,13 @@ pub struct KubernetesRenderSettings {
     pub cilium_lb_ip_pools: Vec<String>,
     pub schedule_on_control_plane: bool,
     pub provisioner_manifest: String,
+    pub ceph_csi_manifest: String,
+    pub metrics_server_manifest: String,
     pub version: String,
+    pub oidc: crate::kubernetes_hardening::OidcSpec,
+    pub default_deny_label: String,
+    /// When true, emit kubelet systemReserved/kubeReserved for VM hosts.
+    pub reserve_for_vms: bool,
 }
 
 /// Generate Kubernetes node configuration for a node in the cluster
@@ -2793,6 +2953,8 @@ pub fn generate_kubernetes_member(
         schedule_on_control_plane: settings.schedule_on_control_plane,
         version: settings.version.clone(),
         provisioner_manifest: settings.provisioner_manifest.clone(),
+        ceph_csi_manifest: settings.ceph_csi_manifest.clone(),
+        metrics_server_manifest: settings.metrics_server_manifest.clone(),
         instance: layout,
     };
 
@@ -2807,44 +2969,107 @@ pub fn generate_kubernetes_member(
     };
 
     let mut nix = head.to_string();
+    // Private keys are not rendered. The node agent writes them under
+    // `pkiKeyDir` before the rebuild (see `kubernetes_pki_key_dir`), and the
+    // module links /etc/kubernetes/pki/*.key to those files so they stay out
+    // of /nix/store. Only public certificates are inline.
+    let _ = (etcd_server_key, etcd_peer_key);
     nix.push_str("\n    # PKI certificates (written by modules/kcore-kubernetes.nix)\n");
+    let key_dir = kubernetes_pki_key_dir(cluster_name);
+    nix.push_str(&format!("    pkiKeyDir = \"{}\";\n", nix_escape(&key_dir)));
+    // API server hardening: secret files live under pkiKeyDir.
+    nix.push_str(&format!(
+        "    encryptionProviderConfigFile = \"{}/encryption-config.yaml\";\n",
+        nix_escape(&key_dir)
+    ));
+    nix.push_str(&format!(
+        "    auditPolicyFile = \"{}/audit-policy.yaml\";\n",
+        nix_escape(&key_dir)
+    ));
+    nix.push_str(&format!(
+        "    podSecurityAdmissionConfigFile = \"{}/pod-security-admission.yaml\";\n",
+        nix_escape(&key_dir)
+    ));
+    nix.push_str("    anonymousAuth = false;\n");
+    nix.push_str("    profiling = false;\n");
+    nix.push_str("    tlsMinVersion = \"VersionTLS12\";\n");
+    if settings.reserve_for_vms {
+        nix.push_str("    systemReserved = { cpu = \"500m\"; memory = \"1Gi\"; };\n");
+        nix.push_str("    kubeReserved = { cpu = \"500m\"; memory = \"1Gi\"; };\n");
+    }
+    if !settings.default_deny_label.is_empty() {
+        nix.push_str(&format!(
+            "    networkPolicyDefaultDenyLabel = \"{}\";\n",
+            nix_escape(&settings.default_deny_label)
+        ));
+    }
+    if settings.oidc.enabled() {
+        let username = if settings.oidc.username_claim.is_empty() {
+            "sub"
+        } else {
+            settings.oidc.username_claim.as_str()
+        };
+        nix.push_str("    oidc = {\n");
+        nix.push_str(&format!(
+            "      issuerUrl = \"{}\";\n",
+            nix_escape(&settings.oidc.issuer_url)
+        ));
+        nix.push_str(&format!(
+            "      clientId = \"{}\";\n",
+            nix_escape(&settings.oidc.client_id)
+        ));
+        nix.push_str(&format!(
+            "      usernameClaim = \"{}\";\n",
+            nix_escape(username)
+        ));
+        if !settings.oidc.groups_claim.is_empty() {
+            nix.push_str(&format!(
+                "      groupsClaim = \"{}\";\n",
+                nix_escape(&settings.oidc.groups_claim)
+            ));
+        }
+        if !settings.oidc.ca_pem.is_empty() {
+            nix.push_str(&format!(
+                "      caFile = \"{}/oidc-ca.crt\";\n",
+                nix_escape(&key_dir)
+            ));
+        }
+        nix.push_str("    };\n");
+    }
     for (name, value) in [
         ("caCrt", pki.ca_cert.as_str()),
-        ("caKey", pki.ca_key.as_str()),
-        ("saKey", pki.sa_key.as_str()),
         ("saPub", pki.sa_pub.as_str()),
         ("apiserverCrt", pki.apiserver_cert.as_str()),
-        ("apiserverKey", pki.apiserver_key.as_str()),
         (
             "apiserverKubeletClientCrt",
             pki.apiserver_kubelet_client_cert.as_str(),
         ),
         (
-            "apiserverKubeletClientKey",
-            pki.apiserver_kubelet_client_key.as_str(),
-        ),
-        (
             "apiserverEtcdClientCrt",
             pki.apiserver_etcd_client_cert.as_str(),
         ),
-        (
-            "apiserverEtcdClientKey",
-            pki.apiserver_etcd_client_key.as_str(),
-        ),
         ("etcdCaCrt", pki.etcd_ca_cert.as_str()),
-        ("etcdCaKey", pki.etcd_ca_key.as_str()),
         ("etcdServerCrt", etcd_server_cert),
-        ("etcdServerKey", etcd_server_key),
         ("etcdPeerCrt", etcd_peer_cert),
-        ("etcdPeerKey", etcd_peer_key),
-        ("kubeconfigData", pki.admin_kubeconfig.as_str()),
-        ("kubeletKubeconfigData", node.kubelet_kubeconfig.as_str()),
+        // Empty: admin and kubelet kubeconfigs are secret files under pkiKeyDir.
+        ("kubeconfigData", ""),
+        ("kubeletKubeconfigData", ""),
     ] {
+        let _ = &node.kubelet_kubeconfig;
+        if value.is_empty() {
+            continue;
+        }
         nix.push_str(&format!("    {name} = {};\n", nix_multiline(value)));
     }
     nix.push_str(MODULE_CLOSE);
 
     Ok(nix)
+}
+
+/// Where the node agent writes a cluster's private keys. Must match
+/// `pki_secret_files` in the orchestrator.
+pub fn kubernetes_pki_key_dir(cluster_name: &str) -> String {
+    format!("/var/lib/kcore/kubernetes/{cluster_name}/pki")
 }
 
 /// One cluster's render inputs for a single node.

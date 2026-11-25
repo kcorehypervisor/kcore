@@ -250,7 +250,7 @@ service NodeAdmin {
   // Crush reweight one OSD (used when a new disk joins).
   rpc ReweightCephOsd(ReweightCephOsdRequest) returns (ReweightCephOsdResponse);
   rpc SetCephOsdDeviceClass(SetCephOsdDeviceClassRequest) returns (SetCephOsdDeviceClassResponse);
-  // Best-effort enable of an mgr module (prometheus). Idempotent.
+  // Best-effort enable of an mgr module (prometheus, dashboard). Idempotent.
   rpc EnableCephMgrModule(EnableCephMgrModuleRequest) returns (EnableCephMgrModuleResponse);
   // Rotate client.kcore (auth del + get-or-create with the same caps).
   rpc RotateCephClientKey(EnsureCephClientKeyRequest) returns (EnsureCephClientKeyResponse);
@@ -258,6 +258,26 @@ service NodeAdmin {
   rpc EnsureCephClientKey(EnsureCephClientKeyRequest) returns (EnsureCephClientKeyResponse);
   // After a drain, purge OSDs and remove the mon for a host that will not answer.
   rpc PurgeLostCephHost(PurgeLostCephHostRequest) returns (PurgeLostCephHostResponse);
+  // Ensure CRUSH buckets (room/rack/host) and a kcore-<domain> rule.
+  rpc EnsureCephCrushTopology(EnsureCephCrushTopologyRequest)
+      returns (EnsureCephCrushTopologyResponse);
+  // Enable dashboard module, set ac-user, return the URL.
+  rpc ConfigureCephDashboard(ConfigureCephDashboardRequest)
+      returns (ConfigureCephDashboardResponse);
+  rpc EnsureRbdMirror(EnsureRbdMirrorRequest) returns (EnsureRbdMirrorResponse);
+  rpc CreateRbdMirrorBootstrap(CreateRbdMirrorBootstrapRequest)
+      returns (CreateRbdMirrorBootstrapResponse);
+  rpc ImportRbdMirrorPeer(ImportRbdMirrorPeerRequest) returns (ImportRbdMirrorPeerResponse);
+  rpc RotateCephMonKey(RotateCephMonKeyRequest) returns (RotateCephMonKeyResponse);
+  rpc RotateCephOsdDmcrypt(RotateCephOsdDmcryptRequest)
+      returns (RotateCephOsdDmcryptResponse);
+  rpc FinalizeCephOsdRelease(FinalizeCephOsdReleaseRequest)
+      returns (FinalizeCephOsdReleaseResponse);
+  rpc ListRbdTrash(ListRbdTrashRequest) returns (ListRbdTrashResponse);
+  rpc PurgeRbdTrash(PurgeRbdTrashRequest) returns (PurgeRbdTrashResponse);
+  rpc EnsureRbdNamespace(EnsureRbdNamespaceRequest) returns (EnsureRbdNamespaceResponse);
+  rpc SetRbdImageQos(SetRbdImageQosRequest) returns (SetRbdImageQosResponse);
+  rpc GetCephRelease(GetCephReleaseRequest) returns (GetCephReleaseResponse);
   rpc GetHostCpuFlags(GetHostCpuFlagsRequest) returns (GetHostCpuFlagsResponse);
 
   // Live migration peer steps (controller orchestrates source + destination).
@@ -330,6 +350,16 @@ service NodeAdmin {
   // Read /etc/kubernetes/admin.conf on this node and call the Kubernetes API.
   // The controller uses this instead of running kubectl.
   rpc KubernetesAdmin(KubernetesAdminRequest) returns (KubernetesAdminResponse);
+  // Write secret files for a Kubernetes cluster outside /nix/store (mode 0600).
+  rpc WriteKubernetesSecrets(WriteKubernetesSecretsRequest) returns (WriteKubernetesSecretsResponse);
+  // Take a local etcd snapshot for a cluster and return the bytes.
+  rpc EtcdSnapshot(EtcdSnapshotRequest) returns (EtcdSnapshotResponse);
+  // Restore an etcd snapshot into this node's data directory.
+  rpc EtcdRestore(EtcdRestoreRequest) returns (EtcdRestoreResponse);
+  // Remove the etcd data directory so a reinstalled host can rejoin.
+  rpc WipeEtcdData(WipeEtcdDataRequest) returns (WipeEtcdDataResponse);
+  // Restart named systemd units after a certificate roll.
+  rpc RestartSystemdUnits(RestartSystemdUnitsRequest) returns (RestartSystemdUnitsResponse);
 }
 
 // VM specification
@@ -1587,6 +1617,164 @@ message EnableCephMgrModuleResponse {
   string message = 2;
 }
 
+message CephCrushHostPlacement {
+  string host = 1;
+  string rack = 2;
+  string room = 3;
+}
+
+message EnsureCephCrushTopologyRequest {
+  // host (default), rack, or room.
+  string failure_domain = 1;
+  repeated CephCrushHostPlacement hosts = 2;
+  bool stretch = 3;
+  // Tiebreaker mon daemon id when stretch is true.
+  string stretch_tiebreaker = 4;
+}
+
+message EnsureCephCrushTopologyResponse {
+  bool success = 1;
+  string message = 2;
+  string crush_rule = 3;
+}
+
+message ConfigureCephDashboardRequest {
+  string username = 1;
+  string password = 2;
+  // Bind address for the dashboard; empty means the node's public addr.
+  string server_addr = 3;
+  int32 server_port = 4;
+}
+
+message ConfigureCephDashboardResponse {
+  bool success = 1;
+  string message = 2;
+  string url = 3;
+}
+
+message EnsureRbdMirrorRequest {
+  string pool = 1;
+  // pool or image.
+  string mode = 2;
+}
+
+message EnsureRbdMirrorResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CreateRbdMirrorBootstrapRequest {
+  string pool = 1;
+  string site_name = 2;
+}
+
+message CreateRbdMirrorBootstrapResponse {
+  bool success = 1;
+  string message = 2;
+  string token = 3;
+}
+
+message ImportRbdMirrorPeerRequest {
+  string pool = 1;
+  string token = 2;
+  string site_name = 3;
+}
+
+message ImportRbdMirrorPeerResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RotateCephMonKeyRequest {}
+
+message RotateCephMonKeyResponse {
+  bool success = 1;
+  string message = 2;
+  string keyring = 3;
+}
+
+message RotateCephOsdDmcryptRequest {
+  int32 osd_id = 1;
+  string device = 2;
+  bool confirm = 3;
+}
+
+message RotateCephOsdDmcryptResponse {
+  bool success = 1;
+  string message = 2;
+  bool drained = 3;
+  bool purged = 4;
+}
+
+message FinalizeCephOsdReleaseRequest {
+  string release = 1;
+  bool confirm = 2;
+}
+
+message FinalizeCephOsdReleaseResponse {
+  bool success = 1;
+  string message = 2;
+  string release = 3;
+}
+
+message ListRbdTrashRequest {
+  string pool = 1;
+  string namespace = 2;
+}
+
+message RbdTrashEntry {
+  string id = 1;
+  string name = 2;
+  string deletion_time = 3;
+}
+
+message ListRbdTrashResponse {
+  repeated RbdTrashEntry entries = 1;
+}
+
+message PurgeRbdTrashRequest {
+  string pool = 1;
+  string namespace = 2;
+  string trash_id = 3;
+  bool confirm = 4;
+}
+
+message PurgeRbdTrashResponse {
+  bool success = 1;
+  string message = 2;
+  int32 purged = 3;
+}
+
+message EnsureRbdNamespaceRequest {
+  string pool = 1;
+  string namespace = 2;
+}
+
+message EnsureRbdNamespaceResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SetRbdImageQosRequest {
+  string pool = 1;
+  string namespace = 2;
+  string image = 3;
+  int64 qos_iops = 4;
+  int64 qos_bps = 5;
+}
+
+message SetRbdImageQosResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetCephReleaseRequest {}
+
+message GetCephReleaseResponse {
+  string release = 1;
+  string version = 2;
+}
+
 message EnsureCephClientKeyRequest {
   string client_name = 1;
   string pool = 2;
@@ -2002,6 +2190,68 @@ message ApplyKubernetesConfigResponse {
 message ApplyRawKubernetesConfigRequest {
   string nix_config_content = 1;    // Complete Nix module text with embedded PKI
   string kubeconfig_data = 2;       // Optional: admin kubeconfig for kubectl access
+  // Secret files written before nixos-rebuild (keys outside /nix/store).
+  repeated KubernetesSecretFile secrets = 3;
+}
+
+message KubernetesSecretFile {
+  string path = 1;
+  uint32 mode = 2;
+  bytes content = 3;
+}
+
+message WriteKubernetesSecretsRequest {
+  repeated KubernetesSecretFile secrets = 1;
+}
+
+message WriteKubernetesSecretsResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message EtcdSnapshotRequest {
+  string cluster_name = 1;
+}
+
+message EtcdSnapshotResponse {
+  bytes snapshot = 1;
+  string message = 2;
+  string sha256 = 3;
+}
+
+message EtcdRestoreRequest {
+  string cluster_name = 1;
+  bytes snapshot = 2;
+  string initial_cluster = 3;
+  string initial_cluster_token = 4;
+}
+
+message EtcdRestoreResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message WipeEtcdDataRequest {
+  string cluster_name = 1;
+  // When true, only report whether the data dir is missing/empty.
+  bool check_only = 2;
+}
+
+message WipeEtcdDataResponse {
+  bool ok = 1;
+  string message = 2;
+  bool empty = 3;
+}
+
+message RestartSystemdUnitsRequest {
+  repeated string units = 1;
+  // restart (default), stop, or start
+  string action = 2;
+}
+
+message RestartSystemdUnitsResponse {
+  bool ok = 1;
+  string message = 2;
 }
 
 message GetKubernetesStatusRequest {}

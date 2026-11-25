@@ -146,6 +146,8 @@ pub fn phase_blocks_promotion(phase: &str) -> bool {
             | "upgrading"
             | crate::kubernetes_orchestrator::PHASE_RECONFIGURING
             | crate::kubernetes_orchestrator::PHASE_DELETING
+            | crate::kubernetes_orchestrator::PHASE_RESTORING
+            | crate::kubernetes_orchestrator::PHASE_ROLLING_BACK
     )
 }
 

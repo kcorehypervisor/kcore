@@ -312,6 +312,16 @@ service Controller {
   rpc DeleteKubernetesCluster(DeleteKubernetesClusterRequest) returns (DeleteKubernetesClusterResponse);
   rpc ScaleKubernetesCluster(ScaleKubernetesClusterRequest) returns (ScaleKubernetesClusterResponse);
   rpc GetKubernetesClusterHealth(GetKubernetesClusterHealthRequest) returns (GetKubernetesClusterHealthResponse);
+  // Kubernetes day-two operations
+  rpc GetKubernetesCertificates(GetKubernetesCertificatesRequest) returns (GetKubernetesCertificatesResponse);
+  rpc RotateKubernetesCertificates(RotateKubernetesCertificatesRequest) returns (RotateKubernetesCertificatesResponse);
+  rpc RotateKubernetesEncryption(RotateKubernetesEncryptionRequest) returns (RotateKubernetesEncryptionResponse);
+  rpc CreateKubernetesBackup(CreateKubernetesBackupRequest) returns (CreateKubernetesBackupResponse);
+  rpc ListKubernetesBackups(ListKubernetesBackupsRequest) returns (ListKubernetesBackupsResponse);
+  rpc DeleteKubernetesBackup(DeleteKubernetesBackupRequest) returns (DeleteKubernetesBackupResponse);
+  rpc RestoreKubernetesBackup(RestoreKubernetesBackupRequest) returns (RestoreKubernetesBackupResponse);
+  rpc RollbackKubernetesUpgrade(RollbackKubernetesUpgradeRequest) returns (RollbackKubernetesUpgradeResponse);
+  rpc ReplaceKubernetesNode(ReplaceKubernetesNodeRequest) returns (ReplaceKubernetesNodeResponse);
 
   // SlurmCluster — Slurm host services on disjoint kcoreOS nodes.
   rpc PlanSlurmCluster(PlanSlurmClusterRequest) returns (PlanSlurmClusterResponse);
@@ -3616,6 +3626,41 @@ message KubernetesClusterSpec {
   // nixpkgs pin. Changing it and re-applying the same manifest upgrades the
   // cluster in place: control planes first, then workers, one node at a time.
   string version = 12;
+  // Optional Ceph RBD CSI addon (rbd-nbd mounter).
+  KubernetesCephStorage storage_ceph = 13;
+  // JSON backup policy (interval_secs, retain_count, retain_days, target).
+  string backup_json = 14;
+  // JSON repair policy (after_secs, spare_pool).
+  string repair_json = 15;
+  bool auto_reconcile = 16;
+  KubernetesOidc oidc = 17;
+  // Empty leaves default-deny network policy off.
+  string network_policy_default_deny_label = 18;
+  KubernetesCertPolicy cert = 19;
+}
+
+message KubernetesOidc {
+  string issuer_url = 1;
+  string client_id = 2;
+  string username_claim = 3;   // default sub
+  string groups_claim = 4;
+  // Optional PEM CA for the issuer; written to the node as a secret file.
+  string ca_pem = 5;
+}
+
+message KubernetesCertPolicy {
+  int32 leaf_validity_days = 1;    // default 365
+  int32 renew_before_days = 2;     // default 30
+}
+
+message KubernetesCephStorage {
+  bool enabled = 1;
+  string cluster = 2;              // kcore CephCluster name
+  string pool = 3;
+  repeated string monitors = 4;    // host:port
+  string user_id = 5;              // defaults to client.k8s-<cluster>
+  string user_key = 6;             // base64 Ceph key
+  bool default_storage_class = 7;
 }
 
 message KubernetesClusterStatus {
@@ -3741,6 +3786,109 @@ message GetKubernetesClusterHealthResponse {
   int32 etcd_member_count = 7;
   bool api_server_reachable = 8;
   repeated NodeHealth node_health = 9;
+}
+
+message GetKubernetesCertificatesRequest {
+  string name = 1;
+}
+
+message GetKubernetesCertificatesResponse {
+  // Earliest leaf certificate expiry, RFC 3339. Empty when not recorded.
+  string leaf_not_after = 1;
+  double days_remaining = 2;
+  // Renewal starts when this many days or fewer remain.
+  int32 renew_before_days = 3;
+  bool renewal_due = 4;
+}
+
+message RotateKubernetesCertificatesRequest {
+  string name = 1;
+  // Rotate even though no certificate is inside the renewal window.
+  bool force = 2;
+  bool confirm = 3;
+}
+
+message RotateKubernetesCertificatesResponse {
+  // The orchestrator starts the rolling renewal on its next pass.
+  string message = 1;
+}
+
+message RotateKubernetesEncryptionRequest {
+  string name = 1;
+  bool confirm = 2;
+}
+
+message RotateKubernetesEncryptionResponse {
+  string message = 1;
+}
+
+message KubernetesEtcdSnapshot {
+  string id = 1;
+  string cluster_name = 2;
+  string created_at = 3;
+  string sha256 = 4;
+  int64 size_bytes = 5;
+  string path = 6;
+  string trigger = 7;               // manual, scheduled, pre-upgrade
+}
+
+message CreateKubernetesBackupRequest {
+  string name = 1;
+  bool confirm = 2;
+}
+
+message CreateKubernetesBackupResponse {
+  KubernetesEtcdSnapshot snapshot = 1;
+}
+
+message ListKubernetesBackupsRequest {
+  string name = 1;
+}
+
+message ListKubernetesBackupsResponse {
+  repeated KubernetesEtcdSnapshot snapshots = 1;   // newest first
+}
+
+message DeleteKubernetesBackupRequest {
+  string name = 1;
+  string snapshot_id = 2;
+  bool confirm = 3;
+}
+
+message DeleteKubernetesBackupResponse {
+  string message = 1;
+}
+
+message RestoreKubernetesBackupRequest {
+  string name = 1;
+  string snapshot_id = 2;
+  bool confirm = 3;
+}
+
+message RestoreKubernetesBackupResponse {
+  KubernetesCluster cluster = 1;
+  string message = 2;
+}
+
+message RollbackKubernetesUpgradeRequest {
+  string name = 1;
+  bool confirm = 2;
+}
+
+message RollbackKubernetesUpgradeResponse {
+  KubernetesCluster cluster = 1;
+  string message = 2;
+}
+
+message ReplaceKubernetesNodeRequest {
+  string name = 1;
+  string old_node_id = 2;
+  string new_node_id = 3;
+  bool confirm = 4;
+}
+
+message ReplaceKubernetesNodeResponse {
+  KubernetesCluster cluster = 1;
 }
 
 // --- Ingress gateway (Caddy + Coraza) --------------------------------------------------------
