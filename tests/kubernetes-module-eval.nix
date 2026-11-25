@@ -254,7 +254,8 @@ assert keysLinked keyed "kubernetes/pki" keyDir;
 assert keysLinked keyed "kubernetes/b/pki" "/var/lib/kcore/kubernetes/b/pki";
 assert !(controlPlane.config.environment.etc ? "kubernetes/pki/ca.key");
 assert toString (etcSource keyed "kubernetes/admin.conf") == "${keyDir}/admin.conf";
-assert !(lib.hasAttr "text" keyed.config.environment.etc."kubernetes/admin.conf");
+# With pkiKeyDir the etc entry is a symlink (source set, text unset).
+assert keyed.config.environment.etc."kubernetes/admin.conf".text == null;
 assert retiresPrimary pinned;
 assert !lib.hasInfix "b|-)" (retireScript pinned);
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;
