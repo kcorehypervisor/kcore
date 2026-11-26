@@ -315,6 +315,7 @@ service Controller {
   // Kubernetes day-two operations
   rpc GetKubernetesCertificates(GetKubernetesCertificatesRequest) returns (GetKubernetesCertificatesResponse);
   rpc RotateKubernetesCertificates(RotateKubernetesCertificatesRequest) returns (RotateKubernetesCertificatesResponse);
+  rpc RotateKubernetesCa(RotateKubernetesCaRequest) returns (RotateKubernetesCaResponse);
   rpc RotateKubernetesEncryption(RotateKubernetesEncryptionRequest) returns (RotateKubernetesEncryptionResponse);
   rpc CreateKubernetesBackup(CreateKubernetesBackupRequest) returns (CreateKubernetesBackupResponse);
   rpc ListKubernetesBackups(ListKubernetesBackupsRequest) returns (ListKubernetesBackupsResponse);
@@ -3799,6 +3800,14 @@ message GetKubernetesCertificatesResponse {
   // Renewal starts when this many days or fewer remain.
   int32 renew_before_days = 3;
   bool renewal_due = 4;
+  // Expiry of the CA worth watching (the retiring one mid-rotation), RFC 3339.
+  string ca_not_after = 5;
+  double ca_days_remaining = 6;
+  // "idle", "trust-distributed" (after BEGIN), or "leaves-reissued" (after REISSUE).
+  string ca_rotation_phase = 7;
+  bool previous_ca_present = 8;
+  // Step whose node roll has not finished yet; empty when none is queued.
+  string ca_roll_pending = 9;
 }
 
 message RotateKubernetesCertificatesRequest {
@@ -3810,6 +3819,31 @@ message RotateKubernetesCertificatesRequest {
 
 message RotateKubernetesCertificatesResponse {
   // The orchestrator starts the rolling renewal on its next pass.
+  string message = 1;
+}
+
+enum KubernetesCaRotationStep {
+  KUBERNETES_CA_ROTATION_STEP_UNSPECIFIED = 0;
+  // Snapshot etcd, generate new CAs, roll every node onto old+new trust.
+  KUBERNETES_CA_ROTATION_STEP_BEGIN = 1;
+  // Reissue every leaf under the new CA and roll again.
+  KUBERNETES_CA_ROTATION_STEP_REISSUE = 2;
+  // Drop the old CA from trust and roll once more.
+  KUBERNETES_CA_ROTATION_STEP_RETIRE = 3;
+}
+
+message RotateKubernetesCaRequest {
+  string name = 1;
+  KubernetesCaRotationStep step = 2;
+  bool confirm = 3;
+  // BEGIN only: replace the etcd CA as well as the Kubernetes CA.
+  bool include_etcd = 4;
+  // BEGIN only: go ahead without the pre-rotation etcd snapshot.
+  bool skip_backup = 5;
+}
+
+message RotateKubernetesCaResponse {
+  // The orchestrator rolls the nodes on its next pass.
   string message = 1;
 }
 

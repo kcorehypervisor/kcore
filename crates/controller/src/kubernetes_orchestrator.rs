@@ -458,7 +458,11 @@ impl KubernetesOrchestrator {
                 && match &pki {
                     Some(pki) => self
                         .nodes
-                        .apiserver_ready(&format!("{ip}:{api_port}"), &api_host, &pki.ca_cert)
+                        .apiserver_ready(
+                            &format!("{ip}:{api_port}"),
+                            &api_host,
+                            &kubernetes_pki::ca_trust_bundle(pki),
+                        )
                         .await
                         .unwrap_or(false),
                     None => false,
@@ -977,7 +981,7 @@ impl KubernetesOrchestrator {
                 .etcd_health(
                     &ip,
                     etcd_port,
-                    &pki.etcd_ca_cert,
+                    &kubernetes_pki::etcd_ca_trust_bundle(&pki),
                     &pki.apiserver_etcd_client_cert,
                     &pki.apiserver_etcd_client_key,
                 )
@@ -1092,7 +1096,7 @@ impl KubernetesOrchestrator {
                 .etcd_health(
                     ip,
                     etcd_port,
-                    &pki.etcd_ca_cert,
+                    &kubernetes_pki::etcd_ca_trust_bundle(&pki),
                     &pki.apiserver_etcd_client_cert,
                     &pki.apiserver_etcd_client_key,
                 )
@@ -1296,7 +1300,7 @@ impl KubernetesOrchestrator {
         let host = endpoint.split(':').next().unwrap_or("").to_string();
         match self
             .nodes
-            .apiserver_ready(&endpoint, &host, &pki.ca_cert)
+            .apiserver_ready(&endpoint, &host, &kubernetes_pki::ca_trust_bundle(&pki))
             .await
         {
             Ok(ready) => Ok(ready),
@@ -2352,7 +2356,7 @@ impl KubernetesOrchestrator {
             .etcd_health(
                 ip,
                 port,
-                &pki.etcd_ca_cert,
+                &kubernetes_pki::etcd_ca_trust_bundle(&pki),
                 &pki.apiserver_etcd_client_cert,
                 &pki.apiserver_etcd_client_key,
             )
@@ -2388,7 +2392,7 @@ impl KubernetesOrchestrator {
                     port,
                     path,
                     body,
-                    &pki.etcd_ca_cert,
+                    &kubernetes_pki::etcd_ca_trust_bundle(&pki),
                     &pki.apiserver_etcd_client_cert,
                     &pki.apiserver_etcd_client_key,
                 )

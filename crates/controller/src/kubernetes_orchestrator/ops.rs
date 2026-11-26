@@ -20,7 +20,7 @@ use crate::kubernetes_repair::{self, CpHealth, RepairDecision};
 
 /// Bump when `modules/kcore-kubernetes.nix` changes in a way the rendered Nix
 /// alone does not show, so every node is reconciled onto it.
-pub const MODULE_VERSION: &str = "kcore-kubernetes-module-1";
+pub const MODULE_VERSION: &str = "kcore-kubernetes-module-2";
 pub const DEFAULT_BACKUP_ROOT: &str = "/var/lib/kcore/kubernetes-backups";
 
 pub const NOTICE_DRIFT: &str = "configuration drift";
@@ -28,13 +28,34 @@ pub const NOTICE_REPAIR: &str = "repair alert";
 pub const NOTICE_BACKUP: &str = "backup failed";
 pub const NOTICE_CERTS: &str = "certificate renewal";
 pub const NOTICE_CA: &str = "CA expiry";
-const NOTICE_PREFIXES: [&str; 5] = [
+pub const NOTICE_CA_ROLL: &str = "CA rotation";
+const NOTICE_PREFIXES: [&str; 6] = [
     NOTICE_DRIFT,
     NOTICE_REPAIR,
     NOTICE_BACKUP,
     NOTICE_CERTS,
     NOTICE_CA,
+    NOTICE_CA_ROLL,
 ];
+
+/// One operator-gated step of a dual-CA rotation. Steps never chain on
+/// their own; each one rolls the nodes once and stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaRotationStep {
+    Begin,
+    Reissue,
+    Retire,
+}
+
+impl CaRotationStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Reissue => "reissue",
+            Self::Retire => "retire",
+        }
+    }
+}
 
 pub fn is_notice(message: &str) -> bool {
     NOTICE_PREFIXES
@@ -96,21 +117,38 @@ impl KubernetesOrchestrator {
             Err(e) => info!(cluster = cluster_name, error = %e, "etcd health sample failed"),
         }
 
-        match self.reconcile_cert_renewal(cluster_name, false).await {
-            Ok(Some(notice)) => notices.push(notice),
-            Ok(None) => {}
-            Err(e) => {
-                error!(cluster = cluster_name, error = %format!("{e:#}"), "certificate renewal failed");
-                notices.push(format!("{NOTICE_CERTS} failed: {e:#}"));
+        // A queued CA roll goes first, and while it is unfinished neither leaf
+        // renewal nor drift reconcile touches the nodes.
+        let ca_rolling = match self.reconcile_ca_roll(cluster_name).await {
+            Ok(Some(notice)) => {
+                notices.push(notice);
+                true
             }
-        }
-
-        match self.reconcile_drift(cluster_name).await {
-            Ok(DriftOutcome::Clean) => {}
-            Ok(DriftOutcome::Reconciling) => return,
-            Ok(DriftOutcome::Pending(notice)) => notices.push(notice),
+            Ok(None) => false,
             Err(e) => {
-                error!(cluster = cluster_name, error = %format!("{e:#}"), "drift check failed");
+                error!(cluster = cluster_name, error = %format!("{e:#}"), "CA rotation roll failed");
+                notices.push(format!("{NOTICE_CA_ROLL} failed: {e:#}"));
+                true
+            }
+        };
+
+        if !ca_rolling {
+            match self.reconcile_cert_renewal(cluster_name, false).await {
+                Ok(Some(notice)) => notices.push(notice),
+                Ok(None) => {}
+                Err(e) => {
+                    error!(cluster = cluster_name, error = %format!("{e:#}"), "certificate renewal failed");
+                    notices.push(format!("{NOTICE_CERTS} failed: {e:#}"));
+                }
+            }
+
+            match self.reconcile_drift(cluster_name).await {
+                Ok(DriftOutcome::Clean) => {}
+                Ok(DriftOutcome::Reconciling) => return,
+                Ok(DriftOutcome::Pending(notice)) => notices.push(notice),
+                Err(e) => {
+                    error!(cluster = cluster_name, error = %format!("{e:#}"), "drift check failed");
+                }
             }
         }
 
@@ -153,13 +191,30 @@ impl KubernetesOrchestrator {
         })
     }
 
-    fn ca_expiry_notice(&self, cluster_name: &str) -> Option<String> {
+    /// Surfaces the CA state only; the next rotation step is always the
+    /// operator's call.
+    pub(super) fn ca_expiry_notice(&self, cluster_name: &str) -> Option<String> {
         let pki = self.db.load_kubernetes_pki(cluster_name).ok().flatten()?;
-        let not_after = kubernetes_pki::pem_not_after_public(&pki.ca_cert)?;
+        let phase = kubernetes_pki::ca_rotation_phase(&pki);
+        let next = match phase {
+            kubernetes_pki::CaRotationPhase::Idle => None,
+            kubernetes_pki::CaRotationPhase::TrustDistributed => Some(CaRotationStep::Reissue),
+            kubernetes_pki::CaRotationPhase::LeavesReissued => Some(CaRotationStep::Retire),
+        };
+        if let Some(next) = next {
+            return Some(format!(
+                "{NOTICE_CA}: dual-CA rotation in progress ({}); next: kctl kubernetes rotate-ca \
+                 {cluster_name} --step {}",
+                phase.as_str(),
+                next.as_str()
+            ));
+        }
+        let not_after = kubernetes_pki::ca_not_after_for_notice(&pki)?;
         let days = (not_after - OffsetDateTime::now_utc()).whole_days();
         if days < 365 {
             Some(format!(
-                "{NOTICE_CA}: cluster CA expires in {days} days; plan a dual-CA rotation"
+                "{NOTICE_CA}: cluster CA expires in {days} days; plan a dual-CA rotation \
+                 (kctl kubernetes rotate-ca {cluster_name} --step begin)"
             ))
         } else {
             None
@@ -353,7 +408,41 @@ impl KubernetesOrchestrator {
         if !force && !renewal_due(OffsetDateTime::now_utc(), not_after, cfg.renew_before_days) {
             return Ok(None);
         }
+        // Mid dual-CA rotation a renewal would sign under the new CA before
+        // the operator asked for it; REISSUE renews every leaf anyway.
+        if let Some(pki) = self.db.load_kubernetes_pki(cluster_name)? {
+            if kubernetes_pki::dual_ca_active(&pki) {
+                return Ok(Some(format!(
+                    "{NOTICE_CERTS} deferred: dual-CA rotation in progress; \
+                     kctl kubernetes rotate-ca {cluster_name} --step reissue renews the leaves"
+                )));
+            }
+        }
 
+        let summary = self.roll_nodes(cluster_name, true, NOTICE_CERTS).await?;
+        if summary.is_none() {
+            let renewed = self.leaf_expiry(cluster_name)?;
+            info!(
+                cluster = cluster_name,
+                ?renewed,
+                "leaf certificates replaced on every node"
+            );
+            self.db
+                .set_kubernetes_cluster_status(cluster_name, "ready", "certificates renewed")?;
+        }
+        Ok(summary)
+    }
+
+    /// Rebuild then restart one serving node at a time, control planes
+    /// first, waiting for etcd between control planes. With `reissue` the
+    /// leaves are issued again just before the first node moves. None when
+    /// every node rolled; otherwise a notice starting with `notice`.
+    async fn roll_nodes(
+        &self,
+        cluster_name: &str,
+        reissue: bool,
+        notice: &str,
+    ) -> Result<Option<String>> {
         let serving: HashSet<String> = self
             .db
             .list_kubernetes_cluster_nodes(cluster_name)?
@@ -395,7 +484,7 @@ impl KubernetesOrchestrator {
             match next_renewal_step(&view) {
                 RenewalStep::Idle => {
                     summary = Some(format!(
-                        "{NOTICE_CERTS} waiting: {}/{} nodes done",
+                        "{notice} waiting: {}/{} nodes done",
                         view.restarted.len(),
                         view.members.len()
                     ));
@@ -405,23 +494,24 @@ impl KubernetesOrchestrator {
                     info!(
                         cluster = cluster_name,
                         nodes = view.restarted.len(),
-                        "certificates renewed"
+                        notice,
+                        "every node rolled"
                     );
                     break;
                 }
                 RenewalStep::Failed { reason } => {
-                    summary = Some(format!("{NOTICE_CERTS} failed: {reason}"));
+                    summary = Some(format!("{notice} failed: {reason}"));
                     break;
                 }
                 RenewalStep::RenewNode { node_id } => {
-                    if !reissued {
+                    if reissue && !reissued {
                         self.reissue_leaf_certs(cluster_name).await?;
                         reissued = true;
                     }
                     self.db.set_kubernetes_cluster_status(
                         cluster_name,
                         "ready",
-                        &format!("{NOTICE_CERTS}: rebuilding {node_id}"),
+                        &format!("{notice}: rebuilding {node_id}"),
                     )?;
                     match self.rebuild_for_renewal(cluster_name, &node_id).await {
                         Ok(()) => {
@@ -468,17 +558,180 @@ impl KubernetesOrchestrator {
                 }
             }
         }
-        if summary.is_none() && reissued {
-            let renewed = self.leaf_expiry(cluster_name)?;
-            info!(
-                cluster = cluster_name,
-                ?renewed,
-                "leaf certificates replaced on every node"
-            );
-            self.db
-                .set_kubernetes_cluster_status(cluster_name, "ready", "certificates renewed")?;
-        }
         Ok(summary)
+    }
+
+    // ---- dual-CA rotation ------------------------------------------------
+
+    /// Refuse a CA step unless the cluster is ready, etcd and the API are
+    /// healthy, no other roll is queued or running, and every serving node
+    /// already runs the configuration the stored PKI renders.
+    async fn ca_rotation_gate(&self, cluster_name: &str) -> Result<()> {
+        let cluster = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+        if cluster.phase != "ready" {
+            anyhow::bail!(
+                "cluster {cluster_name} is {}; the CA rotates only while it is ready",
+                cluster.phase
+            );
+        }
+        if cluster
+            .status_message
+            .starts_with(&format!("{NOTICE_CERTS}: rebuilding"))
+            || cluster
+                .status_message
+                .starts_with(&format!("{NOTICE_CERTS} waiting"))
+        {
+            anyhow::bail!("a leaf certificate renewal is rolling; wait for it to finish");
+        }
+        let ops = self
+            .db
+            .get_kubernetes_cluster_ops(cluster_name)?
+            .context("cluster config not found")?;
+        if !ops.ca_roll_pending.is_empty() {
+            anyhow::bail!(
+                "the {} step is still rolling onto the nodes; wait for it to finish",
+                ops.ca_roll_pending
+            );
+        }
+        let rows = self.db.list_kubernetes_cluster_nodes(cluster_name)?;
+        if rows.iter().any(|r| r.pending_join || r.pending_removal) {
+            anyhow::bail!("membership is changing; wait for the scale to finish");
+        }
+        let health = self.observe_health(cluster_name).await?;
+        if !health.api_reachable {
+            anyhow::bail!("the API server is not ready");
+        }
+        let sick: Vec<&str> = health
+            .nodes
+            .iter()
+            .filter(|n| n.role != "worker" && !n.etcd_healthy)
+            .map(|n| n.node_id.as_str())
+            .collect();
+        if !sick.is_empty() {
+            anyhow::bail!("etcd is not healthy on {}", sick.join(", "));
+        }
+        let pki = self
+            .db
+            .load_kubernetes_pki(cluster_name)?
+            .context("PKI not found")?;
+        let stored = self.db.list_kubernetes_node_rendered_hashes(cluster_name)?;
+        let mut behind = Vec::new();
+        for row in &rows {
+            let current = self.drift_hash(cluster_name, &row.node_id, &pki).await?;
+            if stored.get(&row.node_id).map(String::as_str) != Some(current.as_str()) {
+                behind.push(row.node_id.clone());
+            }
+        }
+        if !behind.is_empty() {
+            anyhow::bail!(
+                "{} not yet running the current configuration; let the drift reconcile or the \
+                 previous step finish first",
+                behind.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    /// Run one dual-CA step: change the stored PKI and queue a roll of every
+    /// node, which the orchestrator loop carries out control planes first.
+    /// BEGIN takes an etcd snapshot first unless `skip_backup`.
+    pub async fn rotate_ca(
+        &self,
+        cluster_name: &str,
+        step: CaRotationStep,
+        include_etcd: bool,
+        skip_backup: bool,
+    ) -> Result<String> {
+        use kubernetes_pki::CaRotationPhase;
+
+        self.ca_rotation_gate(cluster_name).await?;
+        let mut pki = self
+            .db
+            .load_kubernetes_pki(cluster_name)?
+            .context("PKI not found")?;
+        let phase = kubernetes_pki::ca_rotation_phase(&pki);
+        let expected = match step {
+            CaRotationStep::Begin => CaRotationPhase::Idle,
+            CaRotationStep::Reissue => CaRotationPhase::TrustDistributed,
+            CaRotationStep::Retire => CaRotationPhase::LeavesReissued,
+        };
+        if phase != expected {
+            anyhow::bail!(
+                "the {} step needs CA phase {}, but the cluster is {}",
+                step.as_str(),
+                expected.as_str(),
+                phase.as_str()
+            );
+        }
+
+        let mut snapshot = String::new();
+        if step == CaRotationStep::Begin && !skip_backup {
+            let row = self
+                .take_snapshot(cluster_name, "pre-ca-rotation")
+                .await
+                .context("etcd snapshot before the CA rotation (pass skip_backup to go without)")?;
+            snapshot = format!("; etcd snapshot {}", row.id);
+        }
+
+        // Queued before the PKI changes, so the drift reconcile never sees
+        // the new render and rolls it without restarting units.
+        self.db
+            .set_kubernetes_cluster_ca_roll_pending(cluster_name, step.as_str())?;
+        let changed = match step {
+            CaRotationStep::Begin => kubernetes_pki::begin_ca_rotation(&mut pki, include_etcd)
+                .and_then(|()| Ok(self.db.store_kubernetes_pki(cluster_name, &pki)?)),
+            CaRotationStep::Reissue => self.reissue_leaf_certs(cluster_name).await,
+            CaRotationStep::Retire => kubernetes_pki::retire_previous_ca(&mut pki)
+                .and_then(|()| Ok(self.db.store_kubernetes_pki(cluster_name, &pki)?)),
+        };
+        if let Err(e) = changed {
+            self.db
+                .set_kubernetes_cluster_ca_roll_pending(cluster_name, "")?;
+            return Err(e);
+        }
+        info!(
+            cluster = cluster_name,
+            step = step.as_str(),
+            include_etcd,
+            "dual-CA step stored; node roll queued"
+        );
+        Ok(format!(
+            "CA rotation {} queued for {cluster_name}{snapshot}; the orchestrator rebuilds and \
+             restarts one node at a time, control planes first",
+            step.as_str()
+        ))
+    }
+
+    /// Carry out a queued CA step's node roll. None when nothing is queued
+    /// or the roll just finished; a notice while it is unfinished, which
+    /// keeps the step queued so the next pass rolls again.
+    pub(super) async fn reconcile_ca_roll(&self, cluster_name: &str) -> Result<Option<String>> {
+        let Some(ops) = self.db.get_kubernetes_cluster_ops(cluster_name)? else {
+            return Ok(None);
+        };
+        if ops.ca_roll_pending.is_empty() {
+            return Ok(None);
+        }
+        let step = ops.ca_roll_pending;
+        let label = format!("{NOTICE_CA_ROLL} {step}");
+        if let Some(summary) = self.roll_nodes(cluster_name, false, &label).await? {
+            return Ok(Some(summary));
+        }
+        self.db
+            .set_kubernetes_cluster_ca_roll_pending(cluster_name, "")?;
+        self.db.set_kubernetes_cluster_status(
+            cluster_name,
+            "ready",
+            &format!("{label}: every node rolled"),
+        )?;
+        info!(
+            cluster = cluster_name,
+            step, "dual-CA step rolled onto every node"
+        );
+        Ok(None)
     }
 
     /// Push the renewed configuration (public certs in the Nix, keys as
@@ -1142,7 +1395,7 @@ impl KubernetesOrchestrator {
                 let host = endpoint.split(':').next().unwrap_or("");
                 let ready = self
                     .nodes
-                    .apiserver_ready(endpoint, host, &pki.ca_cert)
+                    .apiserver_ready(endpoint, host, &kubernetes_pki::ca_trust_bundle(&pki))
                     .await
                     .unwrap_or(false);
                 if ready {
@@ -1972,6 +2225,174 @@ mod tests {
             .unwrap();
         assert!(notice.starts_with(NOTICE_CERTS), "{notice}");
         assert!(fake.units_restarted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ca_notice_is_quiet_when_idle_and_names_the_next_step_mid_rotation() {
+        let (db, _fake, orch) = ready_cluster().await;
+        assert!(
+            orch.ca_expiry_notice("lab").is_none(),
+            "a new CA is not due"
+        );
+
+        let mut pki = db.load_kubernetes_pki("lab").unwrap().unwrap();
+        kubernetes_pki::begin_ca_rotation(&mut pki, true).unwrap();
+        db.store_kubernetes_pki("lab", &pki).unwrap();
+        let notice = orch.ca_expiry_notice("lab").unwrap();
+        assert!(notice.starts_with(NOTICE_CA), "{notice}");
+        assert!(notice.contains("trust-distributed"), "{notice}");
+        assert!(notice.contains("--step reissue"), "{notice}");
+
+        orch.reissue_leaf_certs("lab").await.unwrap();
+        let notice = orch.ca_expiry_notice("lab").unwrap();
+        assert!(notice.contains("leaves-reissued"), "{notice}");
+        assert!(notice.contains("--step retire"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn dual_ca_rotation_runs_three_operator_steps() {
+        let (db, fake, orch) = ready_cluster().await;
+        let dir = tempfile::tempdir().unwrap();
+        let orch = orch.with_backup_root(dir.path());
+        orch.reconcile_drift("lab").await.unwrap();
+        let original = db.load_kubernetes_pki("lab").unwrap().unwrap();
+        let pending = |db: &Database| {
+            db.get_kubernetes_cluster_ops("lab")
+                .unwrap()
+                .unwrap()
+                .ca_roll_pending
+        };
+
+        for step in [CaRotationStep::Reissue, CaRotationStep::Retire] {
+            let err = orch.rotate_ca("lab", step, false, false).await.unwrap_err();
+            assert!(format!("{err:#}").contains("idle"), "{err:#}");
+        }
+
+        // BEGIN: snapshot, new CAs, old leaves, roll queued.
+        orch.rotate_ca("lab", CaRotationStep::Begin, true, false)
+            .await
+            .unwrap();
+        let snapshots = db.list_kubernetes_etcd_snapshots("lab").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].trigger, "pre-ca-rotation");
+        assert_eq!(pending(&db), "begin");
+        let begun = db.load_kubernetes_pki("lab").unwrap().unwrap();
+        assert_eq!(begun.previous_ca_cert, original.ca_cert);
+        assert_eq!(begun.previous_etcd_ca_cert, original.etcd_ca_cert);
+        assert_eq!(begun.apiserver_cert, original.apiserver_cert);
+        assert_eq!(begun.sa_key, original.sa_key);
+        assert!(
+            fake.calls_named("apply").is_empty(),
+            "the loop rolls, not the call"
+        );
+
+        let err = orch
+            .rotate_ca("lab", CaRotationStep::Reissue, false, false)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("still rolling"), "{err:#}");
+
+        assert!(orch.reconcile_ca_roll("lab").await.unwrap().is_none());
+        assert_eq!(pending(&db), "");
+        assert_eq!(fake.calls_named("apply").len(), 3);
+        assert_eq!(fake.units_restarted.lock().unwrap().len(), 3);
+        assert!(orch.reconcile_ca_roll("lab").await.unwrap().is_none());
+        assert_eq!(
+            fake.calls_named("apply").len(),
+            3,
+            "a finished roll is not repeated"
+        );
+
+        // Leaf renewal stays out of the way while two CAs are trusted.
+        let deferred = orch
+            .reconcile_cert_renewal("lab", true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deferred.contains("deferred"), "{deferred}");
+        assert_eq!(fake.calls_named("apply").len(), 3);
+
+        let err = orch
+            .rotate_ca("lab", CaRotationStep::Retire, false, false)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("trust-distributed"), "{err:#}");
+
+        // REISSUE: every leaf under the new CA, still both trusted.
+        orch.rotate_ca("lab", CaRotationStep::Reissue, false, false)
+            .await
+            .unwrap();
+        assert_eq!(pending(&db), "reissue");
+        let reissued = db.load_kubernetes_pki("lab").unwrap().unwrap();
+        assert!(kubernetes_pki::leaves_under_active_ca(&reissued));
+        assert_eq!(reissued.previous_ca_cert, original.ca_cert);
+        assert_ne!(reissued.apiserver_cert, original.apiserver_cert);
+        assert!(orch.reconcile_ca_roll("lab").await.unwrap().is_none());
+        assert_eq!(fake.calls_named("apply").len(), 6);
+
+        // RETIRE: back to one CA, the new one.
+        orch.rotate_ca("lab", CaRotationStep::Retire, false, false)
+            .await
+            .unwrap();
+        let retired = db.load_kubernetes_pki("lab").unwrap().unwrap();
+        assert!(retired.previous_ca_cert.is_empty());
+        assert!(retired.previous_etcd_ca_cert.is_empty());
+        assert_eq!(retired.ca_cert, begun.ca_cert);
+        assert_eq!(retired.sa_key, original.sa_key);
+        assert!(orch.reconcile_ca_roll("lab").await.unwrap().is_none());
+        assert_eq!(fake.calls_named("apply").len(), 9);
+        assert_eq!(snapshots.len(), 1, "only BEGIN snapshots");
+        assert!(orch.ca_expiry_notice("lab").is_none());
+        assert!(matches!(
+            orch.reconcile_drift("lab").await.unwrap(),
+            DriftOutcome::Clean
+        ));
+    }
+
+    #[tokio::test]
+    async fn ca_rotation_refuses_unconverged_or_unhealthy_clusters() {
+        let (db, fake, orch) = ready_cluster().await;
+        orch.reconcile_drift("lab").await.unwrap();
+
+        db.set_kubernetes_node_rendered_hash("lab", "cp2", &"0".repeat(64))
+            .unwrap();
+        let err = orch
+            .rotate_ca("lab", CaRotationStep::Begin, true, true)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("cp2"), "{err:#}");
+        let pki = db.load_kubernetes_pki("lab").unwrap().unwrap();
+        let hash = orch.drift_hash("lab", "cp2", &pki).await.unwrap();
+        db.set_kubernetes_node_rendered_hash("lab", "cp2", &hash)
+            .unwrap();
+
+        fake.etcd_members
+            .lock()
+            .unwrap()
+            .insert("10.0.0.3".to_string(), false);
+        let err = orch
+            .rotate_ca("lab", CaRotationStep::Begin, true, true)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("etcd"), "{err:#}");
+
+        db.set_kubernetes_cluster_status("lab", "upgrading", "")
+            .unwrap();
+        let err = orch
+            .rotate_ca("lab", CaRotationStep::Begin, true, true)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("upgrading"), "{err:#}");
+        assert!(!kubernetes_pki::dual_ca_active(
+            &db.load_kubernetes_pki("lab").unwrap().unwrap()
+        ));
+        assert_eq!(
+            db.get_kubernetes_cluster_ops("lab")
+                .unwrap()
+                .unwrap()
+                .ca_roll_pending,
+            ""
+        );
     }
 
     #[tokio::test]

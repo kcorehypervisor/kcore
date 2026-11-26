@@ -545,6 +545,9 @@ pub struct KubernetesClusterOpsRow {
     pub default_deny_label: String,
     /// JSON encryption-at-rest keys (current + previous during rotation).
     pub encryption_json: String,
+    /// Dual-CA step (`begin`, `reissue`, `retire`) whose node roll has not
+    /// finished; empty when none is queued.
+    pub ca_roll_pending: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -937,7 +940,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 78;
+pub const SCHEMA_VERSION: i32 = 79;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -1009,7 +1012,8 @@ const KUBERNETES_CLUSTER_TABLES: &str = "CREATE TABLE IF NOT EXISTS kubernetes_c
                     oidc_json TEXT NOT NULL DEFAULT '',
                     cert_json TEXT NOT NULL DEFAULT '',
                     default_deny_label TEXT NOT NULL DEFAULT '',
-                    encryption_json TEXT NOT NULL DEFAULT ''
+                    encryption_json TEXT NOT NULL DEFAULT '',
+                    ca_roll_pending TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS kubernetes_etcd_snapshots (
                     id TEXT PRIMARY KEY,
@@ -1039,7 +1043,11 @@ const KUBERNETES_PKI_TABLE: &str = "CREATE TABLE IF NOT EXISTS kubernetes_pki (
                     admin_kubeconfig TEXT NOT NULL,
                     etcd_node_certs_json TEXT NOT NULL DEFAULT '',
                     etcd_node_peer_certs_json TEXT NOT NULL DEFAULT '',
-                    leaf_not_after TEXT NOT NULL DEFAULT ''
+                    leaf_not_after TEXT NOT NULL DEFAULT '',
+                    previous_ca_cert TEXT NOT NULL DEFAULT '',
+                    previous_ca_key TEXT NOT NULL DEFAULT '',
+                    previous_etcd_ca_cert TEXT NOT NULL DEFAULT '',
+                    previous_etcd_ca_key TEXT NOT NULL DEFAULT ''
                 );";
 
 /// Largest controller snapshot accepted by backup and restore.
@@ -2582,6 +2590,34 @@ impl Database {
                     conn.execute(
                         &format!(
                             "ALTER TABLE kubernetes_cluster_config ADD COLUMN {column} {ddl};"
+                        ),
+                        [],
+                    )?;
+                }
+            }
+        }
+
+        // Dual-CA rotation: the retiring CAs while both are trusted, and the
+        // node roll an operator step queued for the orchestrator.
+        if version < 79 {
+            conn.execute_batch(KUBERNETES_CLUSTER_TABLES)?;
+            conn.execute_batch(KUBERNETES_PKI_TABLE)?;
+            for (table, column) in [
+                ("kubernetes_pki", "previous_ca_cert"),
+                ("kubernetes_pki", "previous_ca_key"),
+                ("kubernetes_pki", "previous_etcd_ca_cert"),
+                ("kubernetes_pki", "previous_etcd_ca_key"),
+                ("kubernetes_cluster_config", "ca_roll_pending"),
+            ] {
+                let present: i32 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    params![column],
+                    |row| row.get(0),
+                )?;
+                if present == 0 {
+                    conn.execute(
+                        &format!(
+                            "ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT '';"
                         ),
                         [],
                     )?;
@@ -8568,7 +8604,8 @@ impl Database {
         conn.query_row(
             "SELECT auto_reconcile, previous_version, pre_upgrade_snapshot_id,
                     backup_json, repair_json, storage_json, restore_json,
-                    oidc_json, cert_json, default_deny_label, encryption_json
+                    oidc_json, cert_json, default_deny_label, encryption_json,
+                    ca_roll_pending
              FROM kubernetes_cluster_config WHERE cluster_name=?1",
             params![cluster_name],
             |r| {
@@ -8584,10 +8621,24 @@ impl Database {
                     cert_json: r.get(8)?,
                     default_deny_label: r.get(9)?,
                     encryption_json: r.get(10)?,
+                    ca_roll_pending: r.get(11)?,
                 })
             },
         )
         .optional()
+    }
+
+    pub fn set_kubernetes_cluster_ca_roll_pending(
+        &self,
+        cluster_name: &str,
+        step: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE kubernetes_cluster_config SET ca_roll_pending=?2 WHERE cluster_name=?1",
+            params![cluster_name, step],
+        )?;
+        Ok(())
     }
 
     pub fn set_kubernetes_cluster_auto_reconcile(
@@ -8948,8 +8999,10 @@ impl Database {
                 apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
                 apiserver_etcd_client_cert, apiserver_etcd_client_key,
                 admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json,
-                leaf_not_after
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                leaf_not_after, previous_ca_cert, previous_ca_key,
+                previous_etcd_ca_cert, previous_etcd_ca_key
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                      ?18, ?19, ?20, ?21)",
             params![
                 cluster_name,
                 &pki.ca_cert,
@@ -8968,6 +9021,10 @@ impl Database {
                 etcd_node_certs_json,
                 etcd_node_peer_certs_json,
                 leaf_not_after,
+                &pki.previous_ca_cert,
+                &pki.previous_ca_key,
+                &pki.previous_etcd_ca_cert,
+                &pki.previous_etcd_ca_key,
             ],
         )?;
         Ok(())
@@ -8983,7 +9040,8 @@ impl Database {
                     etcd_ca_cert, etcd_ca_key, apiserver_cert, apiserver_key,
                     apiserver_kubelet_client_cert, apiserver_kubelet_client_key,
                     apiserver_etcd_client_cert, apiserver_etcd_client_key,
-                    admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json
+                    admin_kubeconfig, etcd_node_certs_json, etcd_node_peer_certs_json,
+                    previous_ca_cert, previous_ca_key, previous_etcd_ca_cert, previous_etcd_ca_key
              FROM kubernetes_pki WHERE cluster_name=?1",
         )?;
         let mut rows = stmt.query_map(params![cluster_name], |r| {
@@ -9005,6 +9063,10 @@ impl Database {
                 admin_kubeconfig: r.get(12)?,
                 etcd_node_certs,
                 etcd_node_peer_certs,
+                previous_ca_cert: r.get(15)?,
+                previous_ca_key: r.get(16)?,
+                previous_etcd_ca_cert: r.get(17)?,
+                previous_etcd_ca_key: r.get(18)?,
             })
         })?;
         rows.next().transpose()

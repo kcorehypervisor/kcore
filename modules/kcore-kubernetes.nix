@@ -45,6 +45,11 @@ let
         }
     );
 
+  # caCrt is what every verifier trusts and may hold two CAs mid-rotation.
+  # The controller manager signs with ca.key, so it gets the one CA that
+  # matches that key.
+  signingCrt = c: if c.caSigningCrt != "" then c.caSigningCrt else c.caCrt;
+
   # The etcd data directory outlives the cluster that wrote it: deleting a
   # cluster and creating a new one on the same hosts must not start etcd on
   # the old cluster's data. The directory records the etcd CA it was written
@@ -52,6 +57,10 @@ let
   # A directory with no marker is adopted, so live clusters keep their data.
   # An empty member directory (a crash before the first WAL) is removed
   # because etcd refuses --initial-cluster-state=new on it.
+  # The CA file is a trust bundle during a dual-CA rotation, so the marker
+  # holds the hash of the whole file and of each certificate in it, and data
+  # is kept when any of them is still present. A single-certificate file
+  # hashes the same either way, so markers from before the bundle still match.
   etcdPrepare =
     tag: dataDir: caFile:
     pkgs.writeShellScript "kcore-etcd-prepare-${tag}" ''
@@ -61,9 +70,21 @@ let
         rm -rf "$dir/member"
       fi
       [ -r ${caFile} ] || exit 0
-      want=$(${pkgs.coreutils}/bin/sha256sum ${caFile} | ${pkgs.coreutils}/bin/cut -d' ' -f1)
+      split=$(${pkgs.coreutils}/bin/mktemp -d)
+      trap 'rm -rf "$split"' EXIT
+      ${pkgs.gawk}/bin/awk -v d="$split" '/-----BEGIN /{n++} n{print > (d "/" n)}' ${caFile}
+      want=$(
+        {
+          ${pkgs.coreutils}/bin/sha256sum < ${caFile} | ${pkgs.coreutils}/bin/cut -d' ' -f1
+          for f in "$split"/*; do
+            [ -e "$f" ] || continue
+            ${pkgs.coreutils}/bin/sha256sum < "$f" | ${pkgs.coreutils}/bin/cut -d' ' -f1
+          done
+        } | ${pkgs.coreutils}/bin/sort -u
+      )
       mark="$dir/kcore-etcd-ca.sha256"
-      if [ -d "$dir/member" ] && [ -e "$mark" ] && [ "$(cat "$mark")" != "$want" ]; then
+      if [ -d "$dir/member" ] && [ -s "$mark" ] \
+        && ! printf '%s\n' "$want" | ${pkgs.gnugrep}/bin/grep -Fxq -f "$mark"; then
         stale="$dir/member.stale-$(${pkgs.coreutils}/bin/date +%s)"
         echo "etcd data in $dir was written under another cluster CA; moving it to $stale"
         mv "$dir/member" "$stale"
@@ -806,6 +827,10 @@ let
         text = c.caCrt;
         mode = "0644";
       };
+      environment.etc."kubernetes/${name}/pki/ca-signing.crt" = lib.mkIf (c.caCrt != "") {
+        text = signingCrt c;
+        mode = "0644";
+      };
       environment.etc."kubernetes/${name}/pki/ca.key" = pkiKeyEtc c.pkiKeyDir "ca.key" c.caKey;
       environment.etc."kubernetes/${name}/pki/sa.key" = pkiKeyEtc c.pkiKeyDir "sa.key" c.saKey;
       environment.etc."kubernetes/${name}/pki/sa.pub" = lib.mkIf (c.saPub != "") {
@@ -1026,7 +1051,7 @@ let
               --cluster-cidr=${c.clusterCidr} \
               --cluster-name=${c.clusterName} \
               --node-cidr-mask-size=24 \
-              --cluster-signing-cert-file=${pki}/ca.crt \
+              --cluster-signing-cert-file=${pki}/ca-signing.crt \
               --cluster-signing-key-file=${pki}/ca.key \
               --kubeconfig=${kubeconfigFile} \
               --leader-elect=true \
@@ -1435,7 +1460,19 @@ in
     caCrt = lib.mkOption {
       type = lib.types.str;
       default = "";
-      description = "Kubernetes CA certificate (PEM).";
+      description = ''
+        Kubernetes CA trust bundle (PEM). During a dual-CA rotation this holds
+        the retiring CA followed by the new one; every verifier reads it.
+      '';
+    };
+
+    caSigningCrt = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        The CA certificate that matches ca.key, used only by the controller
+        manager to sign. Empty falls back to caCrt.
+      '';
     };
 
     caKey = lib.mkOption {
@@ -1677,6 +1714,11 @@ in
               type = lib.types.str;
               default = "";
             };
+            caSigningCrt = lib.mkOption {
+              type = lib.types.str;
+              default = "";
+              description = "Signing CA certificate for this cluster; see kcore.kubernetes.caSigningCrt.";
+            };
             caKey = lib.mkOption {
               type = lib.types.str;
               default = "";
@@ -1895,6 +1937,10 @@ in
       # Write PKI certificates
       environment.etc."kubernetes/pki/ca.crt" = lib.mkIf (cfg.caCrt != "") {
         text = cfg.caCrt;
+        mode = "0644";
+      };
+      environment.etc."kubernetes/pki/ca-signing.crt" = lib.mkIf (cfg.caCrt != "") {
+        text = signingCrt cfg;
         mode = "0644";
       };
 
@@ -2132,7 +2178,7 @@ in
               --cluster-cidr=${cfg.clusterCidr} \
               --cluster-name=${cfg.clusterName} \
               --node-cidr-mask-size=24 \
-              --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt \
+              --cluster-signing-cert-file=/etc/kubernetes/pki/ca-signing.crt \
               --cluster-signing-key-file=/etc/kubernetes/pki/ca.key \
               --kubeconfig=${kubeconfigPath} \
               --leader-elect=true \

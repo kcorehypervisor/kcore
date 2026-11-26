@@ -21446,32 +21446,49 @@ impl controller_proto::controller_server::Controller for ControllerService {
             .cert_policy(&req.name)
             .map_err(|e| Status::internal(format!("cert policy: {e:#}")))?
             .renew_before_days;
+        let now = time::OffsetDateTime::now_utc();
+        let mut response = controller_proto::GetKubernetesCertificatesResponse {
+            renew_before_days: renew_before_days as i32,
+            ca_rotation_phase: crate::kubernetes_pki::CaRotationPhase::Idle
+                .as_str()
+                .to_string(),
+            ..Default::default()
+        };
+        if let Some(pki) = self
+            .db
+            .load_kubernetes_pki(&req.name)
+            .map_err(internal_db)?
+        {
+            response.ca_rotation_phase = crate::kubernetes_pki::ca_rotation_phase(&pki)
+                .as_str()
+                .to_string();
+            response.previous_ca_present = crate::kubernetes_pki::dual_ca_active(&pki);
+            if let Some(ca_not_after) = crate::kubernetes_pki::ca_not_after_for_notice(&pki) {
+                response.ca_not_after = ca_not_after
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                response.ca_days_remaining = (ca_not_after - now).as_seconds_f64() / 86_400.0;
+            }
+        }
+        response.ca_roll_pending = self
+            .db
+            .get_kubernetes_cluster_ops(&req.name)
+            .map_err(internal_db)?
+            .map(|ops| ops.ca_roll_pending)
+            .unwrap_or_default();
         let Some(not_after) = orchestrator
             .leaf_expiry(&req.name)
             .map_err(|e| Status::internal(format!("certificate expiry: {e:#}")))?
         else {
-            return Ok(Response::new(
-                controller_proto::GetKubernetesCertificatesResponse {
-                    renew_before_days: renew_before_days as i32,
-                    ..Default::default()
-                },
-            ));
+            return Ok(Response::new(response));
         };
-        let now = time::OffsetDateTime::now_utc();
-        Ok(Response::new(
-            controller_proto::GetKubernetesCertificatesResponse {
-                leaf_not_after: not_after
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default(),
-                days_remaining: (not_after - now).as_seconds_f64() / 86_400.0,
-                renew_before_days: renew_before_days as i32,
-                renewal_due: crate::kubernetes_cert_renewal::renewal_due(
-                    now,
-                    not_after,
-                    renew_before_days,
-                ),
-            },
-        ))
+        response.leaf_not_after = not_after
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        response.days_remaining = (not_after - now).as_seconds_f64() / 86_400.0;
+        response.renewal_due =
+            crate::kubernetes_cert_renewal::renewal_due(now, not_after, renew_before_days);
+        Ok(Response::new(response))
     }
 
     async fn rotate_kubernetes_certificates(
@@ -21488,6 +21505,18 @@ impl controller_proto::controller_server::Controller for ControllerService {
             return Err(Status::failed_precondition(format!(
                 "cluster {} is {}; certificates rotate only while it is ready",
                 req.name, cluster.phase
+            )));
+        }
+        if self
+            .db
+            .load_kubernetes_pki(&req.name)
+            .map_err(internal_db)?
+            .is_some_and(|pki| crate::kubernetes_pki::dual_ca_active(&pki))
+        {
+            return Err(Status::failed_precondition(format!(
+                "a dual-CA rotation is in progress on {}; `kctl kubernetes rotate-ca {} --step \
+                 reissue` renews the leaves under the new CA",
+                req.name, req.name
             )));
         }
         let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
@@ -21528,6 +21557,53 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     req.name
                 ),
             },
+        ))
+    }
+
+    async fn rotate_kubernetes_ca(
+        &self,
+        request: Request<controller_proto::RotateKubernetesCaRequest>,
+    ) -> Result<Response<controller_proto::RotateKubernetesCaResponse>, Status> {
+        use crate::kubernetes_orchestrator::ops::CaRotationStep;
+        use controller_proto::KubernetesCaRotationStep as Proto;
+
+        self.require_operator(&request, OperatorRole::ClusterAdmin)?;
+        let req = request.into_inner();
+        if !req.confirm {
+            return Err(Status::failed_precondition("confirm must be true"));
+        }
+        let step = match Proto::try_from(req.step) {
+            Ok(Proto::Begin) => CaRotationStep::Begin,
+            Ok(Proto::Reissue) => CaRotationStep::Reissue,
+            Ok(Proto::Retire) => CaRotationStep::Retire,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "step must be BEGIN, REISSUE, or RETIRE",
+                ))
+            }
+        };
+        if step != CaRotationStep::Begin && (req.include_etcd || req.skip_backup) {
+            return Err(Status::invalid_argument(
+                "include_etcd and skip_backup apply to the BEGIN step only",
+            ));
+        }
+        let cluster = self.kubernetes_cluster_or_not_found(&req.name)?;
+        if cluster.phase != "ready" {
+            return Err(Status::failed_precondition(format!(
+                "cluster {} is {}; the CA rotates only while it is ready",
+                req.name, cluster.phase
+            )));
+        }
+        let orchestrator = crate::kubernetes_orchestrator::KubernetesOrchestrator::new(
+            self.db.clone(),
+            self.clients.clone(),
+        );
+        let message = orchestrator
+            .rotate_ca(&req.name, step, req.include_etcd, req.skip_backup)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("rotate CA: {e:#}")))?;
+        Ok(Response::new(
+            controller_proto::RotateKubernetesCaResponse { message },
         ))
     }
 

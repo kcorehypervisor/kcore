@@ -2396,6 +2396,7 @@ mod kubernetes_tests {
             etcd_node_certs,
             etcd_node_peer_certs,
             admin_kubeconfig: "apiVersion: v1\nkind: Config\n".to_string(),
+            ..Default::default()
         };
 
         let nix = generate_kubernetes_config(
@@ -2520,6 +2521,7 @@ mod kubernetes_tests {
             etcd_node_certs,
             etcd_node_peer_certs,
             admin_kubeconfig: String::new(),
+            ..Default::default()
         };
 
         let nix = generate_kubernetes_config(
@@ -2570,6 +2572,102 @@ mod kubernetes_tests {
     }
 
     #[test]
+    fn dual_ca_renders_the_trust_bundle_and_a_separate_signing_cert() {
+        use crate::kubernetes_orchestrator::ClusterNode;
+        use crate::kubernetes_pki::KubernetesPki;
+        use std::collections::HashMap;
+
+        let node = ClusterNode {
+            node_id: "node-1".to_string(),
+            hostname: "node-1".to_string(),
+            ip_address: "10.0.0.1".to_string(),
+            iface: "eth0".to_string(),
+            initial_cluster: true,
+            role: "control-plane".to_string(),
+            kubelet_kubeconfig: String::new(),
+        };
+        let pem = |body: &str| {
+            format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
+        };
+        let idle = KubernetesPki {
+            ca_cert: pem("NEWCA"),
+            ca_key: "NEWCAKEY".into(),
+            sa_pub: "SAPUB".into(),
+            etcd_ca_cert: pem("NEWETCD"),
+            etcd_ca_key: "NEWETCDKEY".into(),
+            apiserver_cert: "APICERT".into(),
+            etcd_node_certs: HashMap::from([(
+                node.node_id.clone(),
+                ("SRV".into(), "SRVKEY".into()),
+            )]),
+            etcd_node_peer_certs: HashMap::from([(
+                node.node_id.clone(),
+                ("PEER".into(), "PEERKEY".into()),
+            )]),
+            ..Default::default()
+        };
+        let dual = KubernetesPki {
+            previous_ca_cert: pem("OLDCA"),
+            previous_ca_key: "OLDCAKEY".into(),
+            previous_etcd_ca_cert: pem("OLDETCD"),
+            previous_etcd_ca_key: "OLDETCDKEY".into(),
+            ..idle.clone()
+        };
+        let settings = KubernetesRenderSettings {
+            api_server_endpoint: "10.0.0.1:6443".into(),
+            cluster_dns: "10.96.0.10".into(),
+            ha_enabled: false,
+            vip_address: String::new(),
+            vip_interface: String::new(),
+            cilium_mode: "native-routing".into(),
+            cilium_mtu: 1500,
+            cilium_tunnel: "disabled".into(),
+            cilium_auto_direct_routes: true,
+            cilium_lb_ip_pools: vec![],
+            schedule_on_control_plane: true,
+            version: String::new(),
+            provisioner_manifest: String::new(),
+            ceph_csi_manifest: String::new(),
+            metrics_server_manifest: String::new(),
+            oidc: Default::default(),
+            default_deny_label: String::new(),
+            reserve_for_vms: false,
+        };
+        let render = |pki: &KubernetesPki| {
+            generate_kubernetes_config(
+                "lab",
+                &node,
+                pki,
+                "10.244.0.0/16",
+                "10.96.0.0/12",
+                "SRV",
+                "SRVKEY",
+                "PEER",
+                "PEERKEY",
+                std::slice::from_ref(&node),
+                &settings,
+            )
+            .unwrap()
+        };
+
+        let nix = render(&idle);
+        assert!(!nix.contains("caSigningCrt"), "idle renders as before");
+        assert!(nix.contains(&format!("caCrt = ''{}''", pem("NEWCA"))));
+
+        let nix = render(&dual);
+        assert!(nix.contains(&format!("caCrt = ''{}{}''", pem("OLDCA"), pem("NEWCA"))));
+        assert!(nix.contains(&format!("caSigningCrt = ''{}''", pem("NEWCA"))));
+        assert!(nix.contains(&format!(
+            "etcdCaCrt = ''{}{}''",
+            pem("OLDETCD"),
+            pem("NEWETCD")
+        )));
+        for secret in ["OLDCAKEY", "NEWCAKEY", "OLDETCDKEY", "NEWETCDKEY"] {
+            assert!(!nix.contains(secret), "{secret} leaked into the nix");
+        }
+    }
+
+    #[test]
     fn colocated_clusters_keep_primary_ports_and_nest_the_extra() {
         use crate::kubernetes_orchestrator::ClusterNode;
         use crate::kubernetes_pki::KubernetesPki;
@@ -2606,6 +2704,7 @@ mod kubernetes_tests {
                 ("peer".to_string(), "peer-key".to_string()),
             )]),
             admin_kubeconfig: "apiVersion: v1\n".to_string(),
+            ..Default::default()
         };
         let primary = KubernetesRenderSettings {
             api_server_endpoint: "192.168.40.200:6443".to_string(),
@@ -3036,8 +3135,18 @@ pub fn generate_kubernetes_member(
         }
         nix.push_str("    };\n");
     }
+    let ca_trust = crate::kubernetes_pki::ca_trust_bundle(pki);
+    let etcd_ca_trust = crate::kubernetes_pki::etcd_ca_trust_bundle(pki);
+    // Only set while it differs from the trust bundle, so an idle cluster
+    // renders as before and a module without the option still evaluates.
+    let ca_signing = if ca_trust == pki.ca_cert {
+        ""
+    } else {
+        pki.ca_cert.as_str()
+    };
     for (name, value) in [
-        ("caCrt", pki.ca_cert.as_str()),
+        ("caCrt", ca_trust.as_str()),
+        ("caSigningCrt", ca_signing),
         ("saPub", pki.sa_pub.as_str()),
         ("apiserverCrt", pki.apiserver_cert.as_str()),
         (
@@ -3048,7 +3157,7 @@ pub fn generate_kubernetes_member(
             "apiserverEtcdClientCrt",
             pki.apiserver_etcd_client_cert.as_str(),
         ),
-        ("etcdCaCrt", pki.etcd_ca_cert.as_str()),
+        ("etcdCaCrt", etcd_ca_trust.as_str()),
         ("etcdServerCrt", etcd_server_cert),
         ("etcdPeerCrt", etcd_peer_cert),
         // Empty: admin and kubelet kubeconfigs are secret files under pkiKeyDir.

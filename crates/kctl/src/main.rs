@@ -2097,10 +2097,31 @@ enum KubernetesAction {
         #[arg(long = "remove")]
         remove: Option<String>,
     },
-    /// Show when the cluster's leaf certificates expire
+    /// Show when the cluster's leaf certificates and CA expire
     Certs {
         /// Cluster name
         name: String,
+    },
+    /// Replace the cluster CA in three operator-run steps: begin, reissue, retire
+    #[command(name = "rotate-ca")]
+    RotateCa {
+        /// Cluster name
+        name: String,
+        /// Which step to run; each one rolls every node once and stops
+        #[arg(long, value_enum)]
+        step: commands::kubernetes::CaStep,
+        /// begin: replace the etcd CA too (the default)
+        #[arg(long, conflicts_with = "kubernetes_only")]
+        include_etcd: bool,
+        /// begin: replace only the Kubernetes CA and keep the etcd CA
+        #[arg(long)]
+        kubernetes_only: bool,
+        /// begin: go ahead without the pre-rotation etcd snapshot
+        #[arg(long)]
+        skip_backup: bool,
+        /// Go ahead without a dry-run notice
+        #[arg(short = 'y', long, alias = "confirm")]
+        yes: bool,
     },
     /// Rebuild the leaf certificates one node at a time
     RotateCerts {
@@ -4249,6 +4270,33 @@ async fn main() {
         }
 
         Command::Kubernetes {
+            action:
+                KubernetesAction::RotateCa {
+                    name,
+                    step,
+                    include_etcd,
+                    kubernetes_only,
+                    skip_backup,
+                    yes,
+                },
+        } => {
+            let begin = *step == commands::kubernetes::CaStep::Begin;
+            if !begin && (*include_etcd || *kubernetes_only || *skip_backup) {
+                fatal("--include-etcd, --kubernetes-only and --skip-backup apply to --step begin only");
+            }
+            let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
+            commands::kubernetes::rotate_ca(
+                &info,
+                name,
+                *step,
+                begin && !*kubernetes_only,
+                *skip_backup,
+                *yes,
+            )
+            .await
+        }
+
+        Command::Kubernetes {
             action: KubernetesAction::RotateCerts { name, force, yes },
         } => {
             let info = resolve_controller(&cli).unwrap_or_else(|e| fatal(&e));
@@ -5064,6 +5112,71 @@ mod cli_tests {
             kubernetes(&["rotate-encryption", "c", "--yes"]),
             KubernetesAction::RotateEncryption { yes: true, .. }
         ));
+        assert!(matches!(
+            kubernetes(&[
+                "rotate-ca",
+                "c",
+                "--step",
+                "begin",
+                "--kubernetes-only",
+                "--yes"
+            ]),
+            KubernetesAction::RotateCa {
+                step: commands::kubernetes::CaStep::Begin,
+                kubernetes_only: true,
+                include_etcd: false,
+                skip_backup: false,
+                yes: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kubernetes(&["rotate-ca", "c", "--step", "reissue"]),
+            KubernetesAction::RotateCa {
+                step: commands::kubernetes::CaStep::Reissue,
+                yes: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kubernetes(&["rotate-ca", "c", "--step", "retire", "-y"]),
+            KubernetesAction::RotateCa {
+                step: commands::kubernetes::CaStep::Retire,
+                yes: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kubernetes(&[
+                "rotate-ca",
+                "c",
+                "--step",
+                "begin",
+                "--include-etcd",
+                "--skip-backup"
+            ]),
+            KubernetesAction::RotateCa {
+                include_etcd: true,
+                skip_backup: true,
+                ..
+            }
+        ));
+        for bad in [
+            &["rotate-ca", "c"][..],
+            &["rotate-ca", "c", "--step", "flip"],
+            &[
+                "rotate-ca",
+                "c",
+                "--step",
+                "begin",
+                "--include-etcd",
+                "--kubernetes-only",
+            ],
+        ] {
+            let mut argv = vec!["kctl", "kubernetes"];
+            argv.extend_from_slice(bad);
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?} must not parse");
+        }
         assert!(matches!(
             kubernetes(&["rotate-certs", "c"]),
             KubernetesAction::RotateCerts {

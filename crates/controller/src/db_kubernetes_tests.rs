@@ -600,9 +600,71 @@ mod kubernetes_cluster_tests {
             )
             .unwrap();
         }
-        db.migrate().expect("re-run 75 through 78");
+        db.migrate().expect("re-run 75 through 79");
         assert_eq!(db.schema_version_for_test(), crate::db::SCHEMA_VERSION);
-        assert_eq!(crate::db::SCHEMA_VERSION, 78);
+        assert_eq!(crate::db::SCHEMA_VERSION, 79);
+    }
+
+    #[test]
+    fn schema_79_adds_dual_ca_columns_to_a_78_database() {
+        let db = Database::open(":memory:").expect("open db");
+        seed_cluster(&db, "c");
+        let pki = crate::kubernetes_pki::generate_kubernetes_pki(
+            "c",
+            "10.0.0.1:6443",
+            "10.96.0.0/12",
+            &[crate::kubernetes_pki::NodeInfo {
+                node_id: "n1".to_string(),
+                hostname: "n1".to_string(),
+                ip_address: "10.0.0.2".to_string(),
+            }],
+        )
+        .unwrap();
+        db.store_kubernetes_pki("c", &pki).unwrap();
+        {
+            let conn = db.lock_conn().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE kubernetes_pki DROP COLUMN previous_ca_cert;
+                 ALTER TABLE kubernetes_pki DROP COLUMN previous_ca_key;
+                 ALTER TABLE kubernetes_pki DROP COLUMN previous_etcd_ca_cert;
+                 ALTER TABLE kubernetes_pki DROP COLUMN previous_etcd_ca_key;
+                 ALTER TABLE kubernetes_cluster_config DROP COLUMN ca_roll_pending;
+                 DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (78);",
+            )
+            .unwrap();
+        }
+        db.migrate().expect("migrate 78 -> 79");
+        db.migrate().expect("re-run is a no-op");
+
+        let loaded = db.load_kubernetes_pki("c").unwrap().unwrap();
+        assert_eq!(loaded.ca_cert, pki.ca_cert);
+        assert!(loaded.previous_ca_cert.is_empty());
+        assert_eq!(
+            db.get_kubernetes_cluster_ops("c")
+                .unwrap()
+                .unwrap()
+                .ca_roll_pending,
+            ""
+        );
+
+        let mut rotating = loaded.clone();
+        crate::kubernetes_pki::begin_ca_rotation(&mut rotating, true).unwrap();
+        db.store_kubernetes_pki("c", &rotating).unwrap();
+        db.set_kubernetes_cluster_ca_roll_pending("c", "begin")
+            .unwrap();
+        let back = db.load_kubernetes_pki("c").unwrap().unwrap();
+        assert_eq!(back.previous_ca_cert, pki.ca_cert);
+        assert_eq!(back.previous_ca_key, pki.ca_key);
+        assert_eq!(back.previous_etcd_ca_cert, pki.etcd_ca_cert);
+        assert_eq!(back.previous_etcd_ca_key, pki.etcd_ca_key);
+        assert_eq!(back.ca_cert, rotating.ca_cert);
+        assert_eq!(
+            db.get_kubernetes_cluster_ops("c")
+                .unwrap()
+                .unwrap()
+                .ca_roll_pending,
+            "begin"
+        );
     }
 
     #[test]

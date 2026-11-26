@@ -238,7 +238,16 @@ ssh node-107 'sudo systemctl start kube-apiserver'
 
 ### Cluster CA expiry (dual-CA)
 
-When status shows `CA expiry: … plan a dual-CA rotation`, follow [kubernetes-dual-ca-rotation.md](./kubernetes-dual-ca-rotation.md). Leaf renewals (`kctl kubernetes rotate-certs`) do not replace the CA.
+When status shows `CA expiry: … plan a dual-CA rotation`, replace the CA in three steps. Run each one after the previous roll has finished. Details and rollback are in [kubernetes-dual-ca-rotation.md](./kubernetes-dual-ca-rotation.md).
+
+```bash
+kctl kubernetes rotate-ca lab --step begin --yes     # snapshot, new CA, old+new trust
+kctl kubernetes certs lab                            # wait until "rolling" is gone
+kctl kubernetes rotate-ca lab --step reissue --yes   # every leaf under the new CA
+kctl kubernetes rotate-ca lab --step retire --yes    # drop the old CA
+```
+
+Leaf renewals (`kctl kubernetes rotate-certs`) do not replace the CA, and are refused while a CA rotation is in progress.
 
 ### Scale Cluster (Add Worker)
 
