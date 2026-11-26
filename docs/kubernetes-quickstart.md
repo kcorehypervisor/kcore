@@ -236,6 +236,10 @@ ssh node-107 'sudo systemctl start kube-apiserver'
 
 ## Common Operations
 
+### Cluster CA expiry (dual-CA)
+
+When status shows `CA expiry: … plan a dual-CA rotation`, follow [kubernetes-dual-ca-rotation.md](./kubernetes-dual-ca-rotation.md). Leaf renewals (`kctl kubernetes rotate-certs`) do not replace the CA.
+
 ### Scale Cluster (Add Worker)
 
 The worker must already be an approved kcore node. `kctl kubernetes scale` joins it. Applying a manifest whose membership differs from the cluster scales that difference. A node added after the first create uses `initial-cluster-state=existing` and does not bootstrap etcd again. Workers do not join etcd.

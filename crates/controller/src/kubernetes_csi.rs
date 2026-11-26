@@ -380,76 +380,7 @@ spec:
           emptyDir:
             medium: Memory
 ---
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: volumesnapshotclasses.snapshot.storage.k8s.io
-spec:
-  group: snapshot.storage.k8s.io
-  names:
-    kind: VolumeSnapshotClass
-    listKind: VolumeSnapshotClassList
-    plural: volumesnapshotclasses
-    singular: volumesnapshotclass
-  scope: Cluster
-  versions:
-    - name: v1
-      served: true
-      storage: true
-      schema:
-        openAPIV3Schema:
-          type: object
-          properties:
-            driver:
-              type: string
-            deletionPolicy:
-              type: string
-            parameters:
-              type: object
-              additionalProperties:
-                type: string
----
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: volumesnapshots.snapshot.storage.k8s.io
-spec:
-  group: snapshot.storage.k8s.io
-  names:
-    kind: VolumeSnapshot
-    listKind: VolumeSnapshotList
-    plural: volumesnapshots
-    singular: volumesnapshot
-  scope: Namespaced
-  versions:
-    - name: v1
-      served: true
-      storage: true
-      schema:
-        openAPIV3Schema:
-          type: object
-          x-kubernetes-preserve-unknown-fields: true
----
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: volumesnapshotcontents.snapshot.storage.k8s.io
-spec:
-  group: snapshot.storage.k8s.io
-  names:
-    kind: VolumeSnapshotContent
-    listKind: VolumeSnapshotContentList
-    plural: volumesnapshotcontents
-    singular: volumesnapshotcontent
-  scope: Cluster
-  versions:
-    - name: v1
-      served: true
-      storage: true
-      schema:
-        openAPIV3Schema:
-          type: object
-          x-kubernetes-preserve-unknown-fields: true
+{crds}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -498,7 +429,18 @@ parameters:
         cephcsi = CEPH_CSI_IMAGE,
         registrar = CSI_NODE_DRIVER_IMAGE,
         snapctrl = SNAPSHOT_CONTROLLER_IMAGE,
+        crds = snapshot_crds(),
     )
+}
+
+/// Upstream external-snapshotter CRDs (v7.0.2 schemas), embedded at compile time.
+fn snapshot_crds() -> String {
+    [
+        include_str!("csi_crds/volumesnapshotclasses.yaml"),
+        include_str!("csi_crds/volumesnapshots.yaml"),
+        include_str!("csi_crds/volumesnapshotcontents.yaml"),
+    ]
+    .join("\n")
 }
 
 /// metrics-server addon for kubectl top / HPA.
@@ -637,5 +579,14 @@ mod tests {
         assert!(yaml.contains("csi-rbdplugin-provisioner"));
         assert!(yaml.contains("mounter: rbd-nbd"));
         assert!(yaml.contains(CEPH_CSI_IMAGE));
+        // Upstream external-snapshotter CRDs (not the old minimal stubs).
+        assert!(yaml.contains("volumesnapshotclasses.snapshot.storage.k8s.io"));
+        assert!(yaml.contains("volumesnapshots.snapshot.storage.k8s.io"));
+        assert!(yaml.contains("volumesnapshotcontents.snapshot.storage.k8s.io"));
+        assert!(yaml.contains("x-kubernetes-validations") || yaml.contains("openAPIV3Schema"));
+        assert!(
+            yaml.len() > 20_000,
+            "embedded CRDs should be full upstream schemas"
+        );
     }
 }
