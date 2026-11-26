@@ -281,6 +281,15 @@ impl KubernetesOrchestrator {
 
         // Phase 3: Wait for etcd quorum. Workers are kubelet members and do
         // not count toward that majority.
+        self.update_phase(cluster_name, BootstrapPhase::WaitingForEtcdLeader)
+            .await?;
+        let first_cp = nodes
+            .iter()
+            .find(|n| n.role != "worker")
+            .context("cluster has no control-plane node")?;
+        self.wait_for_etcd_leader(cluster_name, &first_cp.node_id, 180)
+            .await?;
+
         self.update_phase(cluster_name, BootstrapPhase::WaitingForQuorum)
             .await?;
         let control_planes = nodes.iter().filter(|node| node.role != "worker").count();
@@ -917,29 +926,82 @@ impl KubernetesOrchestrator {
         })
     }
 
-    async fn wait_for_etcd_leader(&self, node_id: &str, timeout_secs: u64) -> Result<()> {
-        info!(node_id = node_id, "waiting for etcd leader election");
-
-        // Get node address from database
-        let node = self.db.get_node(node_id)?.context("node not found")?;
-        let address = &node.address;
-
-        let _client = self
-            .node_clients
-            .get_admin(address)
-            .context("node client not found")?;
-
+    /// Probe `/health` on the member's etcd client port until it answers healthy
+    /// or `timeout_secs` elapses.
+    async fn wait_for_etcd_leader(
+        &self,
+        cluster_name: &str,
+        node_id: &str,
+        timeout_secs: u64,
+    ) -> Result<()> {
+        info!(
+            cluster = cluster_name,
+            node_id = node_id,
+            "waiting for etcd leader election"
+        );
+        let pki = self
+            .db
+            .load_kubernetes_pki(cluster_name)?
+            .context("PKI not found")?;
+        let cluster = self
+            .db
+            .get_kubernetes_cluster(cluster_name)?
+            .context("cluster not found")?;
+        let row = self
+            .db
+            .list_kubernetes_cluster_nodes(cluster_name)?
+            .into_iter()
+            .find(|r| r.node_id == node_id)
+            .with_context(|| format!("{node_id} is not a member of {cluster_name}"))?;
+        let ip = if row.advertise_address.is_empty() {
+            self.db
+                .get_node(node_id)?
+                .context("node not found")?
+                .address
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            row.advertise_address.clone()
+        };
+        if ip.is_empty() {
+            anyhow::bail!("no advertise address for {node_id}");
+        }
+        let etcd_port =
+            crate::nixgen::kubernetes_listen_ports(&cluster.api_server_endpoint).etcd_client;
         let start = std::time::Instant::now();
         while start.elapsed().as_secs() < timeout_secs {
-            // TODO: Implement actual etcd status check via node agent RPC
-            // For now, just wait and assume etcd is starting up
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            info!(node_id = node_id, "waiting for etcd...");
+            match self
+                .nodes
+                .etcd_health(
+                    &ip,
+                    etcd_port,
+                    &pki.etcd_ca_cert,
+                    &pki.apiserver_etcd_client_cert,
+                    &pki.apiserver_etcd_client_key,
+                )
+                .await
+            {
+                Ok(true) => {
+                    info!(cluster = cluster_name, node_id, "etcd is healthy");
+                    return Ok(());
+                }
+                Ok(false) => {
+                    info!(cluster = cluster_name, node_id, "etcd not healthy yet");
+                }
+                Err(e) => {
+                    info!(
+                        cluster = cluster_name,
+                        node_id,
+                        error = %e,
+                        "etcd health probe failed"
+                    );
+                }
+            }
+            sleep(Duration::from_secs(2)).await;
         }
-
-        // Assume etcd is ready after timeout period
-        info!(node_id = node_id, "assuming etcd is ready");
-        Ok(())
+        anyhow::bail!("etcd on {node_id} did not become healthy within {timeout_secs}s")
     }
 
     async fn wait_for_etcd_quorum(

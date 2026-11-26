@@ -681,6 +681,24 @@ impl KubernetesOrchestrator {
             spec.retain_days,
             &protected,
         ) {
+            if let BackupTarget::S3 {
+                bucket,
+                prefix,
+                credentials_file,
+                endpoint,
+            } = &spec.target
+            {
+                if let Err(e) =
+                    delete_snapshot_s3(bucket, prefix, &id, credentials_file, endpoint).await
+                {
+                    warn!(
+                        cluster = cluster_name,
+                        snapshot = %id,
+                        error = %e,
+                        "s3 snapshot prune failed"
+                    );
+                }
+            }
             if let Err(e) = self.delete_snapshot(&id).await {
                 warn!(cluster = cluster_name, snapshot = %id, error = %format!("{e:#}"), "snapshot prune failed");
             }
@@ -1293,41 +1311,9 @@ impl KubernetesOrchestrator {
                 .map_err(|e| anyhow!("restart apiserver on {}: {e}", cp.node_id))?;
         }
         let rewrite_address = self.member_admin_address(cluster_name, &cps[0].node_id)?;
-        let (status, body) = self
-            .nodes
-            .kube(&rewrite_address, "GET", "/api/v1/secrets?limit=500", "", "")
-            .await
-            .map_err(|e| anyhow!("list secrets: {e}"))?;
-        if status != 200 {
-            anyhow::bail!("list secrets returned {status}: {body}");
-        }
-        // Best-effort rewrite: replace each secret so the apiserver re-encrypts
-        // with the new primary key. Large clusters may need a follow-up pass.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-            if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
-                for item in items {
-                    let ns = item
-                        .pointer("/metadata/namespace")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("default");
-                    let name = item
-                        .pointer("/metadata/name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("");
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let path = format!("/api/v1/namespaces/{ns}/secrets/{name}");
-                    let payload = item.to_string();
-                    let _ = self
-                        .nodes
-                        .kube(&rewrite_address, "PUT", &path, &payload, "application/json")
-                        .await;
-                }
-            }
-        }
+        let rewritten = self.rewrite_all_secrets(&rewrite_address).await?;
         Ok(format!(
-            "encryption key {} rolled onto {}; secrets rewrite started on {}",
+            "encryption key {} rolled onto {}; rewrote {rewritten} secrets on {}",
             next.current_id,
             cps.iter()
                 .map(|c| c.node_id.as_str())
@@ -1335,6 +1321,79 @@ impl KubernetesOrchestrator {
                 .join(","),
             cps[0].node_id
         ))
+    }
+
+    /// Page through every Secret and PUT it back so the apiserver re-encrypts
+    /// with the current primary key (same effect as `kubectl get secrets -A
+    /// -o json | kubectl replace -f -`).
+    async fn rewrite_all_secrets(&self, address: &str) -> Result<usize> {
+        let mut rewritten = 0usize;
+        let mut cont = String::new();
+        loop {
+            let path = if cont.is_empty() {
+                "/api/v1/secrets?limit=500".to_string()
+            } else {
+                format!(
+                    "/api/v1/secrets?limit=500&continue={}",
+                    urlencoding_path(&cont)
+                )
+            };
+            let (status, body) = self
+                .nodes
+                .kube(address, "GET", &path, "", "")
+                .await
+                .map_err(|e| anyhow!("list secrets: {e}"))?;
+            if status != 200 {
+                anyhow::bail!("list secrets returned {status}: {body}");
+            }
+            let v: serde_json::Value = serde_json::from_str(&body).context("parse secrets list")?;
+            let items = v
+                .get("items")
+                .and_then(|i| i.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for item in items {
+                let ns = item
+                    .pointer("/metadata/namespace")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("default");
+                let name = item
+                    .pointer("/metadata/name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let put_path = format!("/api/v1/namespaces/{ns}/secrets/{name}");
+                let payload = item.to_string();
+                match self
+                    .nodes
+                    .kube(address, "PUT", &put_path, &payload, "application/json")
+                    .await
+                {
+                    Ok((200..=299, _)) => rewritten += 1,
+                    Ok((code, resp)) => warn!(
+                        secret = %format!("{ns}/{name}"),
+                        status = code,
+                        body = %resp,
+                        "secret rewrite failed"
+                    ),
+                    Err(e) => {
+                        warn!(secret = %format!("{ns}/{name}"), error = %e, "secret rewrite failed")
+                    }
+                }
+            }
+            let next = v
+                .pointer("/metadata/continue")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            if next.is_empty() {
+                break;
+            }
+            cont = next;
+        }
+        Ok(rewritten)
     }
 
     fn api_endpoint(&self, cluster_name: &str) -> Result<String> {
@@ -1456,8 +1515,27 @@ impl KubernetesOrchestrator {
     }
 }
 
-/// Upload a snapshot file to S3 using credentials from a JSON file:
-/// `{"access_key","secret_key","endpoint"?}`. Uses `aws s3 cp` when available.
+/// Percent-encode a continue token for the Kubernetes list API.
+fn urlencoding_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Upload a snapshot file to S3 (SigV4 PutObject) using credentials JSON:
+/// `{"access_key","secret_key","endpoint"?,"region"?}`.
 async fn upload_snapshot_s3(
     local_path: &str,
     bucket: &str,
@@ -1469,46 +1547,34 @@ async fn upload_snapshot_s3(
     let raw = tokio::fs::read_to_string(credentials_file)
         .await
         .map_err(|e| format!("read {credentials_file}: {e}"))?;
-    let creds: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("parse credentials: {e}"))?;
-    let access = creds
-        .get("access_key")
-        .and_then(|v| v.as_str())
-        .ok_or("credentials missing access_key")?;
-    let secret = creds
-        .get("secret_key")
-        .and_then(|v| v.as_str())
-        .ok_or("credentials missing secret_key")?;
-    let ep = if endpoint.is_empty() {
-        creds
-            .get("endpoint")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        endpoint.to_string()
-    };
-    let key = if prefix.is_empty() {
-        format!("{id}.db")
-    } else {
-        format!("{}/{id}.db", prefix.trim_matches('/'))
-    };
-    let uri = format!("s3://{bucket}/{key}");
-    let mut cmd = tokio::process::Command::new("aws");
-    cmd.args(["s3", "cp", local_path, &uri]);
-    if !ep.is_empty() {
-        cmd.args(["--endpoint-url", &ep]);
-    }
-    cmd.env("AWS_ACCESS_KEY_ID", access)
-        .env("AWS_SECRET_ACCESS_KEY", secret);
-    let out = cmd.output().await.map_err(|e| format!("aws s3 cp: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "aws s3 cp failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(())
+    let creds = crate::kubernetes_s3::S3Credentials::from_json(&raw, endpoint)
+        .map_err(|e| e.to_string())?;
+    let key = crate::kubernetes_s3::object_key(prefix, id);
+    let body = tokio::fs::read(local_path)
+        .await
+        .map_err(|e| format!("read {local_path}: {e}"))?;
+    crate::kubernetes_s3::put_object(&creds, bucket, &key, &body)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a snapshot object from S3 before pruning local metadata.
+async fn delete_snapshot_s3(
+    bucket: &str,
+    prefix: &str,
+    id: &str,
+    credentials_file: &str,
+    endpoint: &str,
+) -> Result<(), String> {
+    let raw = tokio::fs::read_to_string(credentials_file)
+        .await
+        .map_err(|e| format!("read {credentials_file}: {e}"))?;
+    let creds = crate::kubernetes_s3::S3Credentials::from_json(&raw, endpoint)
+        .map_err(|e| e.to_string())?;
+    let key = crate::kubernetes_s3::object_key(prefix, id);
+    crate::kubernetes_s3::delete_object(&creds, bucket, &key)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

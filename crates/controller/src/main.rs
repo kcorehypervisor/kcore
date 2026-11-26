@@ -47,6 +47,7 @@ mod kubernetes_pki;
 mod kubernetes_placement;
 mod kubernetes_repair;
 mod kubernetes_rollback;
+mod kubernetes_s3;
 mod kubernetes_upgrade;
 mod kubernetes_versions;
 mod local_migrate;
