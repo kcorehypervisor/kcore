@@ -201,6 +201,35 @@ let
       "etcd/peer.key"
     ];
 
+  # Mid dual-CA rotation: verifiers trust both CAs, the signer uses one.
+  dualCa = nixosSystem {
+    inherit (pkgs) system;
+    modules = [
+      ../modules/kcore-kubernetes.nix
+      (
+        _:
+        base
+        // {
+          kcore.kubernetes = {
+            enable = true;
+            role = "control-plane";
+            advertiseAddress = "10.0.0.1";
+            apiServerEndpoint = "10.0.0.1:6443";
+            caCrt = "OLDCA\nNEWCA\n";
+            caSigningCrt = "NEWCA\n";
+            additionalClusters.b = {
+              role = "control-plane";
+              advertiseAddress = "10.0.0.1";
+              apiServerEndpoint = "10.0.0.1:7443";
+              caCrt = "ONLYCA\n";
+            };
+          };
+        }
+      )
+    ];
+  };
+  etcText = host: path: host.config.environment.etc.${path}.text;
+
   pinned = mkHost "" releases.hostPin;
   upgraded = lib.mapAttrsToList (version: _: {
     inherit version;
@@ -256,6 +285,21 @@ assert !(controlPlane.config.environment.etc ? "kubernetes/pki/ca.key");
 assert toString (etcSource keyed "kubernetes/admin.conf") == "${keyDir}/admin.conf";
 # With pkiKeyDir the etc entry is a symlink (source set, text unset).
 assert keyed.config.environment.etc."kubernetes/admin.conf".text == null;
+assert etcText dualCa "kubernetes/pki/ca.crt" == "OLDCA\nNEWCA\n";
+assert etcText dualCa "kubernetes/pki/ca-signing.crt" == "NEWCA\n";
+assert etcText dualCa "kubernetes/b/pki/ca-signing.crt" == "ONLYCA\n";
+assert lib.hasInfix "--cluster-signing-cert-file=/etc/kubernetes/pki/ca-signing.crt" (
+  cmFlags dualCa "kube-controller-manager"
+);
+assert lib.hasInfix "--root-ca-file=/etc/kubernetes/pki/ca.crt" (
+  cmFlags dualCa "kube-controller-manager"
+);
+assert lib.hasInfix "--cluster-signing-cert-file=/etc/kubernetes/b/pki/ca-signing.crt" (
+  cmFlags dualCa "kube-controller-manager-b"
+);
+assert lib.hasInfix "--client-ca-file=/etc/kubernetes/pki/ca.crt" (
+  apiServerFlags dualCa "kube-apiserver"
+);
 assert retiresPrimary pinned;
 assert !lib.hasInfix "b|-)" (retireScript pinned);
 assert pinned.config.kcore.kubernetes.package == pkgs.kubernetes;

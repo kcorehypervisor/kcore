@@ -68,7 +68,8 @@
               || (toString path) == "${toString ./.}/modules/kcore-slurm.nix"
               || (toString path) == "${toString ./.}/modules/kcore-postgresql-cluster.nix"
               || pkgs.lib.hasPrefix "${toString ./.}/tests/fixtures/postgresql-cluster/" (toString path)
-              || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path);
+              || pkgs.lib.hasPrefix "${toString ./.}/crates/kcore-console/" (toString path)
+              || pkgs.lib.hasPrefix "${toString ./.}/crates/controller/src/csi_crds/" (toString path);
           };
 
           commonArgs = {

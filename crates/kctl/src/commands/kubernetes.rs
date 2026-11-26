@@ -819,20 +819,85 @@ pub async fn certs(info: &ConnectionInfo, name: &str) -> Result<()> {
 
     if response.leaf_not_after.is_empty() {
         println!("Cluster '{name}' has no recorded certificate expiry yet");
-        return Ok(());
+    } else {
+        println!("Leaf certificates for '{name}'");
+        println!("  expire:     {}", response.leaf_not_after);
+        println!("  remaining:  {:.1} days", response.days_remaining);
+        println!(
+            "  renewal:    {} (starts {} days before expiry)",
+            if response.renewal_due {
+                "due"
+            } else {
+                "not due"
+            },
+            response.renew_before_days
+        );
     }
-    println!("Leaf certificates for '{name}'");
-    println!("  expire:     {}", response.leaf_not_after);
-    println!("  remaining:  {:.1} days", response.days_remaining);
-    println!(
-        "  renewal:    {} (starts {} days before expiry)",
-        if response.renewal_due {
-            "due"
-        } else {
-            "not due"
-        },
-        response.renew_before_days
-    );
+    if !response.ca_not_after.is_empty() {
+        println!("Cluster CA");
+        println!(
+            "  expire:     {}{}",
+            response.ca_not_after,
+            if response.previous_ca_present {
+                " (retiring CA)"
+            } else {
+                ""
+            }
+        );
+        println!("  remaining:  {:.1} days", response.ca_days_remaining);
+        println!("  rotation:   {}", response.ca_rotation_phase);
+        if !response.ca_roll_pending.is_empty() {
+            println!("  rolling:    {} step", response.ca_roll_pending);
+        }
+    }
+    Ok(())
+}
+
+/// One step of `kctl kubernetes rotate-ca`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CaStep {
+    Begin,
+    Reissue,
+    Retire,
+}
+
+pub async fn rotate_ca(
+    info: &ConnectionInfo,
+    name: &str,
+    step: CaStep,
+    include_etcd: bool,
+    skip_backup: bool,
+    yes: bool,
+) -> Result<()> {
+    use controller_proto::KubernetesCaRotationStep as Proto;
+    let (proto_step, what) = match step {
+        CaStep::Begin => (
+            Proto::Begin,
+            "BEGIN generates a new cluster CA and rebuilds every node onto old+new trust",
+        ),
+        CaStep::Reissue => (
+            Proto::Reissue,
+            "REISSUE signs every leaf certificate with the new CA and rebuilds every node",
+        ),
+        CaStep::Retire => (
+            Proto::Retire,
+            "RETIRE removes the old CA from trust and rebuilds every node",
+        ),
+    };
+    require_yes(yes, &format!("{what} of '{name}'"))?;
+    let mut client = client::controller_client(info).await?;
+    let response = client
+        .rotate_kubernetes_ca(controller_proto::RotateKubernetesCaRequest {
+            name: name.to_string(),
+            step: proto_step as i32,
+            confirm: true,
+            include_etcd,
+            skip_backup,
+        })
+        .await
+        .context("rotate_kubernetes_ca rpc")?
+        .into_inner();
+    println!("{}", response.message);
     Ok(())
 }
 
