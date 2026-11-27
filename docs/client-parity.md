@@ -22,13 +22,13 @@ The clients are `kctl` (commands and `apply -f` manifests), the Terraform provid
 | Object user | yes | `ObjectUser` | `kcore_object_user` | delete only | yes | `examples/object-user` |
 | Kubernetes cluster | yes | `KubernetesCluster` | `kcore_kubernetes_cluster` | `kubernetes-cluster` | yes | `examples/kubernetes` |
 | Cluster update | yes | `ClusterUpdate` | `kcore_cluster_update` | `cluster-update` | yes | `examples/cluster-update` |
-| Cluster version and canary | `update version`, `update cluster promote` | n/a | `kcore_cluster_version` | `set-version`, `promote-update` | Release page | n/a |
+| Cluster version and canary | `update version` (`--reboot`), `update cluster promote` | `Cluster` `spec.version` / `spec.update` | `kcore_cluster` (`version`, `update`), `kcore_cluster_version` (deprecated) | `set-version` (`reboot`), `promote-update` | Release page | `examples/cluster` |
 | Slurm cluster | yes | `SlurmCluster` | `kcore_slurm_cluster` | `slurm-cluster` | yes | `examples/slurm` |
 | Ingress gateway, route, WAF policy | yes | `IngressGateway`, `IngressRoute`, `WafPolicy` | `kcore_ingress_gateway`, `kcore_ingress_route`, `kcore_waf_policy` | `ingress-gateway`, `ingress-route`, `waf-policy` | yes | `examples/ingress` |
 | vGPU host (NVIDIA, Intel, AMD) | yes | `NodeVgpu` | `kcore_vgpu_host` | `node-vgpu` | node actions | `examples/vgpu` |
 | Operator and roles | yes | `Operator` | `kcore_operator` | `operator`, role operations | yes | `examples/operator` |
-| Node | yes | `NodeInstall` | `kcore_node` | `node` (read, delete), node operations | yes | `examples/node-install` |
-| Cluster context | yes | `Cluster` | `kcore_cluster` | `cluster` | n/a | `examples/cluster` |
+| Node | yes | `NodeInstall` (legacy), or `Cluster` `spec.nodes` | `kcore_node` (deprecated), or `kcore_cluster` `node` blocks | `node` (read, delete), node operations | yes | `examples/node-install`, `examples/cluster` |
+| Cluster | yes | `Cluster` (version, nodes, update policy) | `kcore_cluster` | `cluster` | n/a | `examples/cluster` |
 
 ## What changed in this reconciliation
 

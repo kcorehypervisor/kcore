@@ -2889,6 +2889,10 @@ message SetClusterVersionRequest {
   // "community", "enterprise", or empty. Empty uses enterprise when a
   // subscription is stored, otherwise community.
   string channel = 8;
+  // Force every node this rollout updates to stage a boot and reboot.
+  // False keeps auto activation (switch in place when the kernel is unchanged).
+  // Only read when a rollout starts; an unchanged version reboots nothing.
+  bool reboot = 9;
 }
 
 message SetClusterVersionResponse {
@@ -2920,13 +2924,25 @@ message NodeVersion {
 }
 
 message GetClusterVersionResponse {
-  // Last version set with SetClusterVersion, empty when none was.
+  // Desired release tag (or the newest version-* update when none was stored).
   string version = 1;
   string flake_ref = 2;
   string flake_rev = 3;
   string update_name = 4;
   ClusterUpdatePhase phase = 5;
   repeated NodeVersion nodes = 6;
+  // Desired update policy. Empty / false when no desired record exists.
+  bool drain_vms = 7;
+  bool reboot = 8;
+  bool no_canary = 9;
+  int32 canary_soak_seconds = 10;
+  string canary_node_id = 11;
+  string channel = 12;
+  // True when every approved, heartbeating node reports the desired version
+  // and no version-* update is active.
+  bool in_sync = 13;
+  // Why the cluster is not converging, empty when in_sync or no desired record.
+  string status_message = 14;
 }
 
 message SetSubscriptionRequest {

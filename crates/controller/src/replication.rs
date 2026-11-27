@@ -849,6 +849,7 @@ fn apply_replication_event(
         | "volume.detach"
         | "volume_snapshot.create"
         | "volume_snapshot.delete"
+        | "desired_cluster.set"
         | "controller.register" => {
             // Phase-2 skeleton: payload validation + typed dispatch point.
             Ok(())
@@ -1457,6 +1458,92 @@ fn apply_head_to_domain(db: &Database, head: &ReplicationResourceHeadRow) -> Res
                 db.upsert_node_labels(node_id, &labels)
                     .map_err(|e| format!("upsert node labels {node_id}: {e}"))?;
             }
+            let kcore_version = body
+                .get("kcoreVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !kcore_version.is_empty() {
+                let booted = body
+                    .get("bootedGeneration")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let nixos = body
+                    .get("nixosGeneration")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let caps = body
+                    .get("updateCapabilities")
+                    .and_then(Value::as_array)
+                    .map(|vals| {
+                        vals.iter()
+                            .filter_map(|v| v.as_str().map(ToString::to_string))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let schema_version = body
+                    .get("schemaVersion")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32;
+                let nixpkgs_rev = body.get("nixpkgsRev").and_then(Value::as_str).unwrap_or("");
+                db.upsert_node_host_status(
+                    node_id,
+                    kcore_version,
+                    booted,
+                    nixos,
+                    &caps,
+                    schema_version,
+                    nixpkgs_rev,
+                )
+                .map_err(|e| format!("upsert host status {node_id}: {e}"))?;
+            }
+            Ok(())
+        }
+        "desired_cluster.set" => {
+            let version = required_str(&body, "version", &head.resource_key)?;
+            let row = crate::db::ClusterDesiredVersionRow {
+                version: version.to_string(),
+                flake_ref: body
+                    .get("flakeRef")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                channel: body
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                drain_vms: body
+                    .get("drainVms")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                reboot: body.get("reboot").and_then(Value::as_bool).unwrap_or(false),
+                no_canary: body
+                    .get("noCanary")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                canary_soak_seconds: body
+                    .get("canarySoakSeconds")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0) as i32,
+                canary_node_id: body
+                    .get("canaryNodeId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                last_rollout_generation: body
+                    .get("lastRolloutGeneration")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                last_rollout_name: body
+                    .get("lastRolloutName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                updated_at: String::new(),
+            };
+            db.upsert_cluster_desired_version(&row)
+                .map_err(|e| format!("upsert desired cluster version: {e}"))?;
             Ok(())
         }
         "vm.create" => {

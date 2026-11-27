@@ -1664,7 +1664,7 @@ export const RESOURCES: Resource[] = [
     single: true,
     title: "Release",
     group: "Cluster",
-    terraform: ["kcore_cluster_version"],
+    terraform: ["kcore_cluster", "kcore_cluster_version"],
     kctl: "update version get",
     idField: "version",
     fields: [],
@@ -1678,6 +1678,7 @@ export const RESOURCES: Resource[] = [
           f("version", "Release tag", true, "v0.7.0"),
           f("flake_ref", "Flake ref", false, "github:kcorehypervisor/kcore"),
           bool("drain_vms", "Drain VMs before a reboot"),
+          bool("reboot", "Force reboot on every updated node"),
           f("soak", "Canary soak", false, "1h, or 1d for a new NixOS release"),
           f("canary_node", "Canary node", false, "a worker; empty picks one"),
           bool("no_canary", "No canary"),
@@ -1695,6 +1696,7 @@ export const RESOURCES: Resource[] = [
             canarySoakSeconds: noCanary ? 0 : soak(v, "soak"),
             noCanary,
             canaryNodeId: noCanary ? "" : text(v, "canary_node"),
+            reboot: flag(v, "reboot"),
           });
           return { ok: true, message: resp.message };
         },

@@ -532,6 +532,9 @@ enum UpdateVersionCmd {
         /// Update every node one at a time with no canary
         #[arg(long)]
         no_canary: bool,
+        /// Force every updated node to stage a boot and reboot
+        #[arg(long)]
+        reboot: bool,
     },
     /// Show the version set last and what each node runs
     Get,
@@ -3458,6 +3461,7 @@ async fn main() {
                     soak,
                     canary,
                     no_canary,
+                    reboot,
                 } => {
                     commands::cluster_update::set_version(
                         &info,
@@ -3471,6 +3475,7 @@ async fn main() {
                             node: canary.as_deref(),
                             disabled: *no_canary,
                         },
+                        *reboot,
                     )
                     .await
                 }
@@ -4842,18 +4847,11 @@ async fn main() {
                 .unwrap_or_else(|e| fatal(&format!("{e:#}")));
             match classified.local {
                 Some(commands::apply::LocalManifestKind::Cluster) => {
-                    if *dry_run {
-                        println!("--- dry run ---");
-                        print!("{}", classified.content);
-                        println!("--- end ---");
-                        Ok(())
-                    } else {
-                        let config_path = cli
-                            .config
-                            .clone()
-                            .unwrap_or_else(config::default_config_path);
-                        commands::cluster::create_from_manifest(file, &config_path)
-                    }
+                    let config_path = cli
+                        .config
+                        .clone()
+                        .unwrap_or_else(config::default_config_path);
+                    commands::cluster::apply_from_manifest(file, &config_path, *dry_run).await
                 }
                 Some(commands::apply::LocalManifestKind::NodeInstall) => {
                     if *dry_run {

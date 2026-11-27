@@ -454,6 +454,11 @@ ALTER TABLE kubernetes_cluster_nodes DROP COLUMN upgrade_apply_id;
 ALTER TABLE kubernetes_cluster_nodes DROP COLUMN upgrade_cordoned;",
         irreversible: false,
     },
+    SchemaDown {
+        version: 80,
+        sql: "DROP TABLE IF EXISTS cluster_desired_version;",
+        irreversible: false,
+    },
 ];
 
 #[cfg(test)]

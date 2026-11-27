@@ -397,6 +397,7 @@ export function buildOperation(action: string, spec: Record<string, unknown>): R
           noCanary,
           canaryNodeId: canaryNode ? assertName(canaryNode, "canary node") : "",
           channel,
+          reboot: boolish(spec.reboot),
         },
       };
     }

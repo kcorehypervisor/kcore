@@ -602,7 +602,7 @@ mod kubernetes_cluster_tests {
         }
         db.migrate().expect("re-run 75 through 79");
         assert_eq!(db.schema_version_for_test(), crate::db::SCHEMA_VERSION);
-        assert_eq!(crate::db::SCHEMA_VERSION, 79);
+        assert_eq!(crate::db::SCHEMA_VERSION, 80);
     }
 
     #[test]

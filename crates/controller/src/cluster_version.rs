@@ -225,7 +225,7 @@ pub struct EnterpriseTarget {
 }
 
 /// Approved, and rebooted by the controller when the node staged a new
-/// kernel.
+/// kernel. `force_reboot` stages a boot on every updated node.
 pub fn update_spec(
     name: &str,
     flake_ref: &str,
@@ -240,6 +240,7 @@ pub fn update_spec(
         release,
         node_ids,
         drain_vms,
+        false,
         strategy,
         "community",
         None,
@@ -252,6 +253,7 @@ pub fn update_spec_with_channel(
     release: &Release,
     node_ids: Vec<String>,
     drain_vms: bool,
+    force_reboot: bool,
     strategy: ClusterUpdateStrategy,
     channel: &str,
     enterprise: Option<EnterpriseTarget>,
@@ -259,6 +261,11 @@ pub fn update_spec_with_channel(
     let (prebuilt_url, prebuilt_sha256) = match enterprise {
         Some(e) => (e.prebuilt_url, e.prebuilt_sha256),
         None => (String::new(), String::new()),
+    };
+    let activation_mode = if force_reboot {
+        ClusterUpdateActivationMode::ClusterUpdateActivationBoot as i32
+    } else {
+        ClusterUpdateActivationMode::ClusterUpdateActivationAuto as i32
     };
     ClusterUpdateSpec {
         name: name.to_string(),
@@ -278,7 +285,7 @@ pub fn update_spec_with_channel(
         }),
         strategy: Some(strategy),
         drain_vms,
-        activation_mode: ClusterUpdateActivationMode::ClusterUpdateActivationAuto as i32,
+        activation_mode,
         reboot_policy: "auto".into(),
         approval_policy: ClusterUpdateApprovalPolicy::ClusterUpdateApprovalAuto as i32,
         automatic_rollback: true,

@@ -2,4 +2,19 @@ kind: Cluster
 metadata:
   name: prod
 spec:
-  controller: 192.168.40.107:9090
+  version: v0.8.3
+  update:
+    reboot: false
+    drainVms: true
+  nodes:
+    - name: kvm-node-107
+      address: 192.168.40.107
+      osDisk: /dev/sda
+      controller: true
+      dcId: DC1
+      insecure: true
+    - name: kvm-node-105
+      address: 192.168.40.105
+      osDisk: /dev/sda
+      dcId: DC1
+      insecure: true

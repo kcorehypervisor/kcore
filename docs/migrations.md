@@ -26,7 +26,11 @@ schema_version
 
 ## Current schema version
 
-**67**
+**80**
+
+Version 80 adds the single-row `cluster_desired_version` table (desired release
+tag and update policy for declarative `kind: Cluster` / `SetClusterVersion`).
+Rolling back to 79 drops that table. `MIN_COMPATIBLE_SCHEMA_READER` stays 56.
 
 Version 67 adds `ingress_gateways`, `ingress_gateway_status`, `ingress_routes`,
 `ingress_route_status`, `waf_policies` and `waf_events` for the ingress
