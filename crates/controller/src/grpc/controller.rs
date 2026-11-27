@@ -495,6 +495,7 @@ const EVT_CLUSTER_UPDATE_APPROVE: &str = "cluster_update.approve";
 const EVT_CLUSTER_UPDATE_CANCEL: &str = "cluster_update.cancel";
 const EVT_CLUSTER_UPDATE_ROLLBACK: &str = "cluster_update.rollback";
 const EVT_CLUSTER_UPDATE_PROMOTE: &str = "cluster_update.promote";
+const EVT_CLUSTER_DESIRED_VERSION_SET: &str = "desired_cluster.set";
 const EVT_OPERATOR_UPSERT: &str = "operator.upsert";
 const EVT_OPERATOR_DELETE: &str = "operator.delete";
 const EVT_OPERATOR_ROLE_GRANT: &str = "operator_role.grant";
@@ -9254,6 +9255,12 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     "cpuUsed": cpu_used,
                     "memoryUsed": mem_used,
                     "lastHeartbeat": node.last_heartbeat,
+                    "kcoreVersion": req.kcore_version,
+                    "bootedGeneration": req.booted_generation,
+                    "nixosGeneration": req.nixos_generation,
+                    "updateCapabilities": req.update_capabilities,
+                    "schemaVersion": req.schema_version,
+                    "nixpkgsRev": req.nixpkgs_rev,
                 }),
             )?;
         }
@@ -19668,269 +19675,72 @@ impl controller_proto::controller_server::Controller for ControllerService {
         self.require_operator(&request, OperatorRole::ClusterAdmin)?;
         let actor = Self::audit_actor(&request);
         let req = request.into_inner();
-        let tag = cluster_version::normalize_tag(&req.version).map_err(Status::invalid_argument)?;
-        let subscription = self.db.get_subscription().map_err(internal_db)?;
-        let channel = match req.channel.trim() {
-            "" => {
-                if subscription
-                    .as_ref()
-                    .is_some_and(|s| !s.token.trim().is_empty())
-                {
-                    "enterprise"
-                } else {
-                    "community"
-                }
-            }
-            "community" | "enterprise" => req.channel.trim(),
-            other => {
-                return Err(Status::invalid_argument(format!(
-                    "channel must be community or enterprise, got {other}"
-                )));
-            }
+        let dry_run = req.dry_run;
+        let input = crate::cluster_version_reconciler::DesiredVersionInput {
+            version: req.version,
+            flake_ref: req.flake_ref,
+            channel: req.channel,
+            drain_vms: req.drain_vms,
+            reboot: req.reboot,
+            no_canary: req.no_canary,
+            canary_soak_seconds: req.canary_soak_seconds,
+            canary_node_id: req.canary_node_id,
+            dry_run,
+            persist_desired: true,
+            only_ready_nodes: false,
         };
-        if channel == "enterprise" && !req.flake_ref.trim().is_empty() {
-            return Err(Status::invalid_argument(
-                "flake_ref cannot be set with channel=enterprise",
-            ));
-        }
-        let flake_ref = match req.flake_ref.trim() {
-            "" => cluster_version::DEFAULT_FLAKE_REF.to_string(),
-            other => other.to_string(),
-        };
-        let name = cluster_version::update_name(&tag);
-        let updates = self.db.list_cluster_updates().map_err(internal_db)?;
-        if let Some(active) = updates.iter().find(|u| {
-            matches!(
-                u.phase.as_str(),
-                "pending" | "ready" | "rolling_out" | "rolling_back"
-            )
-        }) {
-            if active.name != name || active.phase == "rolling_back" {
+        let outcome =
+            crate::cluster_version_reconciler::start_cluster_version(&self.db, input).await?;
+        use crate::cluster_version_reconciler::StartOutcome;
+        let resp = match outcome {
+            StartOutcome::Busy { name, phase } => {
                 return Err(Status::failed_precondition(format!(
-                    "cluster update {} is {}; wait for it to finish or cancel it",
-                    active.name, active.phase
+                    "cluster update {name} is {phase}; wait for it to finish or cancel it"
                 )));
             }
-            let spec = cluster_update_spec::spec_from_json(&active.spec_json)
-                .map_err(|e| Status::internal(format!("decode spec: {e}")))?;
-            let mut rows = self
-                .db
-                .list_cluster_update_nodes(&active.name)
-                .map_err(internal_db)?;
-            crate::cluster_update_reconciler::rollout_order(&self.db, &mut rows);
-            let ordered: Vec<String> = rows.into_iter().map(|row| row.node_id).collect();
-            let canary = crate::canary::pick(&self.db, &spec, &ordered).unwrap_or_default();
-            let canary_soak_seconds = if canary.is_empty() {
-                0
-            } else {
-                spec.strategy
-                    .as_ref()
-                    .map(|s| s.canary_soak_seconds)
-                    .unwrap_or_default()
-            };
-            return Ok(Response::new(controller_proto::SetClusterVersionResponse {
-                canary_node_id: canary,
-                canary_soak_seconds,
-                direction: String::new(),
-                version: tag,
-                flake_rev: active.flake_rev.clone(),
-                target_node_ids: spec
-                    .selector
-                    .as_ref()
-                    .map(|s| s.node_ids.clone())
-                    .unwrap_or_default(),
-                update_name: active.name.clone(),
-                cluster_update: Some(cluster_update_row_to_proto(active, spec)),
-                message: "this version is already rolling out".into(),
-            }));
-        }
-
-        let (release, enterprise_target) = if channel == "enterprise" {
-            let token = subscription
-                .as_ref()
-                .map(|s| s.token.as_str())
-                .unwrap_or("");
-            let ent = crate::enterprise::resolve_release(token, &tag)
-                .await
-                .map_err(|e| {
-                    Status::failed_precondition(format!(
-                        "enterprise channel for {tag}: {e}; check the subscription with `kctl get subscription`"
-                    ))
-                })?;
-            // Public source by commit (tag may still be embargoed).
-            let release = cluster_version::resolve_release_at_rev(
-                crate::enterprise::DEFAULT_FLAKE_REF,
-                &tag,
-                &ent.kcore_rev,
-            )
-            .await
-            .map_err(Status::failed_precondition)?;
-            (
-                release,
-                Some(cluster_version::EnterpriseTarget {
-                    prebuilt_url: ent.prebuilt_url,
-                    prebuilt_sha256: ent.prebuilt_sha256,
-                }),
-            )
-        } else {
-            let release = cluster_version::resolve_release(&flake_ref, &tag)
-                .await
-                .map_err(Status::failed_precondition)?;
-            (release, None)
+            StartOutcome::Holding { reason } => {
+                return Err(Status::failed_precondition(reason));
+            }
+            StartOutcome::Unchanged { response, .. }
+            | StartOutcome::DryRun { response }
+            | StartOutcome::AlreadyRolling { response }
+            | StartOutcome::Started { response } => response,
         };
-        cluster_version::check_schema(&release, crate::db::MIN_COMPATIBLE_SCHEMA_READER)
-            .map_err(Status::failed_precondition)?;
-        let versions: Vec<(String, String)> = self
-            .db
-            .list_nodes()
-            .map_err(internal_db)?
-            .into_iter()
-            .map(|node| {
-                let version = self
-                    .db
-                    .get_node_host_status(&node.id)
-                    .ok()
-                    .flatten()
-                    .map(|host| host.kcore_version)
-                    .unwrap_or_default();
-                (node.id, version)
-            })
-            .collect();
-        let (direction, target_ids) = cluster_version::plan(&release.version, &versions);
-        let mut resp = controller_proto::SetClusterVersionResponse {
-            direction: direction.to_string(),
-            version: tag.clone(),
-            flake_rev: release.flake_rev.clone(),
-            target_node_ids: target_ids.clone(),
-            ..Default::default()
-        };
-        if target_ids.is_empty() {
-            resp.message = format!("every node runs {tag}");
-            return Ok(Response::new(resp));
+        if !dry_run {
+            if let Some(desired) = self.db.get_cluster_desired_version().map_err(internal_db)? {
+                let _ = self.log_replication_event_required(
+                    &actor,
+                    Some("SetClusterVersion"),
+                    EVT_CLUSTER_DESIRED_VERSION_SET,
+                    "desired_cluster/default",
+                    serde_json::json!({
+                        "version": desired.version,
+                        "flakeRef": desired.flake_ref,
+                        "channel": desired.channel,
+                        "drainVms": desired.drain_vms,
+                        "reboot": desired.reboot,
+                        "noCanary": desired.no_canary,
+                        "canarySoakSeconds": desired.canary_soak_seconds,
+                        "canaryNodeId": desired.canary_node_id,
+                        "lastRolloutGeneration": desired.last_rollout_generation,
+                        "lastRolloutName": desired.last_rollout_name,
+                    }),
+                );
+            }
+            if !resp.update_name.is_empty() {
+                let _ = self.log_replication_event_required(
+                    &actor,
+                    Some("SetClusterVersion"),
+                    EVT_CLUSTER_UPDATE_CREATE,
+                    &resp.update_name,
+                    serde_json::json!({
+                        "generation": resp.cluster_update.as_ref().map(|u| u.generation).unwrap_or(0),
+                        "tag": resp.version.clone(),
+                        "direction": resp.direction.clone(),
+                    }),
+                );
+            }
         }
-
-        let canary_node = req.canary_node_id.trim();
-        if !(0..=crate::canary::MAX_SOAK_SECS).contains(&req.canary_soak_seconds) {
-            return Err(Status::invalid_argument(format!(
-                "canary_soak_seconds must be between 0 and {}",
-                crate::canary::MAX_SOAK_SECS
-            )));
-        }
-        let soak_secs = match req.canary_soak_seconds {
-            0 => crate::canary::default_soak_secs(
-                &release.nixos_release,
-                &crate::canary::running_nixos_release(),
-            ),
-            secs => secs,
-        };
-        let strategy =
-            cluster_version::strategy((!req.no_canary).then_some((soak_secs, canary_node)));
-        let spec = cluster_version::update_spec_with_channel(
-            &name,
-            &flake_ref,
-            &release,
-            target_ids.clone(),
-            req.drain_vms,
-            strategy,
-            channel,
-            enterprise_target,
-        );
-        cluster_update_spec::validate_spec(&spec).map_err(Status::invalid_argument)?;
-        let mut ordered: Vec<ClusterUpdateNodeRow> = target_ids
-            .iter()
-            .map(|node_id| ClusterUpdateNodeRow {
-                update_name: name.clone(),
-                node_id: node_id.clone(),
-                observed_generation: 0,
-                phase: "pending".into(),
-                current_version: String::new(),
-                target_version: release.version.clone(),
-                prepared_closure: String::new(),
-                current_generation: String::new(),
-                target_generation: String::new(),
-                requires_reboot: false,
-                last_error: String::new(),
-                last_transition_at: String::new(),
-            })
-            .collect();
-        crate::cluster_update_reconciler::rollout_order(&self.db, &mut ordered);
-        let ordered: Vec<String> = ordered.into_iter().map(|row| row.node_id).collect();
-        if !req.no_canary {
-            crate::canary::check_named(&self.db, &ordered, canary_node)
-                .map_err(Status::invalid_argument)?;
-        }
-        if let Some(canary) = crate::canary::pick(&self.db, &spec, &ordered) {
-            resp.canary_node_id = canary;
-            resp.canary_soak_seconds = soak_secs;
-        }
-        if req.dry_run {
-            resp.message = format!("dry run: would {direction} {} node(s)", target_ids.len());
-            return Ok(Response::new(resp));
-        }
-        let spec_json = cluster_update_spec::spec_to_json(&spec)
-            .map_err(|e| Status::internal(format!("encode spec: {e}")))?;
-        let existing = self.db.get_cluster_update(&name).map_err(internal_db)?;
-        let generation = existing
-            .as_ref()
-            .map(|row| row.generation.saturating_add(1))
-            .unwrap_or(1);
-        self.db
-            .upsert_cluster_update(&ClusterUpdateRow {
-                name: name.clone(),
-                generation,
-                target_version: release.version.clone(),
-                flake_ref: flake_ref.clone(),
-                flake_rev: release.flake_rev.clone(),
-                spec_json,
-                phase: "ready".into(),
-                approval_status: "approved".into(),
-                created_at: existing.map(|row| row.created_at).unwrap_or_default(),
-                updated_at: String::new(),
-            })
-            .map_err(internal_db)?;
-        let node_rows: Vec<ClusterUpdateNodeRow> = resp
-            .target_node_ids
-            .iter()
-            .map(|node_id| ClusterUpdateNodeRow {
-                update_name: name.clone(),
-                node_id: node_id.clone(),
-                observed_generation: generation,
-                phase: "pending".into(),
-                current_version: String::new(),
-                target_version: release.version.clone(),
-                prepared_closure: String::new(),
-                current_generation: String::new(),
-                target_generation: String::new(),
-                requires_reboot: false,
-                last_error: String::new(),
-                last_transition_at: String::new(),
-            })
-            .collect();
-        self.db
-            .replace_cluster_update_nodes(&name, &node_rows)
-            .map_err(internal_db)?;
-        let stored = self
-            .db
-            .get_cluster_update(&name)
-            .map_err(internal_db)?
-            .ok_or_else(|| Status::internal("cluster update vanished"))?;
-        let _ = self.log_replication_event_required(
-            &actor,
-            Some("SetClusterVersion"),
-            EVT_CLUSTER_UPDATE_CREATE,
-            &name,
-            serde_json::json!({ "generation": generation, "tag": tag, "direction": direction }),
-        );
-        resp.update_name = name;
-        resp.cluster_update = Some(cluster_update_row_to_proto(&stored, spec));
-        resp.message = if resp.canary_node_id.is_empty() {
-            format!("{direction} to {tag} started")
-        } else {
-            format!(
-                "{direction} to {tag} started; canary {} soaks for {}s before the other nodes",
-                resp.canary_node_id, resp.canary_soak_seconds
-            )
-        };
         Ok(Response::new(resp))
     }
 
@@ -19939,6 +19749,7 @@ impl controller_proto::controller_server::Controller for ControllerService {
         request: Request<controller_proto::GetClusterVersionRequest>,
     ) -> Result<Response<controller_proto::GetClusterVersionResponse>, Status> {
         self.require_operator(&request, OperatorRole::ReadOnly)?;
+        let desired = self.db.get_cluster_desired_version().map_err(internal_db)?;
         let latest = self
             .db
             .list_cluster_updates()
@@ -19981,14 +19792,34 @@ impl controller_proto::controller_server::Controller for ControllerService {
                     node_id: node.id,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let (in_sync, status_message) = crate::cluster_version_reconciler::status_fields(
+            &self.db,
+            desired.as_ref(),
+            latest.as_ref(),
+            &nodes,
+        );
         let mut resp = controller_proto::GetClusterVersionResponse {
             nodes,
+            in_sync,
+            status_message,
             ..Default::default()
         };
+        if let Some(d) = desired.as_ref() {
+            resp.version = d.version.clone();
+            resp.flake_ref = d.flake_ref.clone();
+            resp.drain_vms = d.drain_vms;
+            resp.reboot = d.reboot;
+            resp.no_canary = d.no_canary;
+            resp.canary_soak_seconds = d.canary_soak_seconds;
+            resp.canary_node_id = d.canary_node_id.clone();
+            resp.channel = d.channel.clone();
+        }
         if let Some(row) = latest {
-            resp.version = format!("v{}", row.target_version);
-            resp.flake_ref = row.flake_ref;
+            if resp.version.is_empty() {
+                resp.version = format!("v{}", row.target_version);
+                resp.flake_ref = row.flake_ref.clone();
+            }
             resp.flake_rev = row.flake_rev;
             resp.phase = cluster_update_phase_to_proto(&row.phase);
             resp.update_name = row.name;

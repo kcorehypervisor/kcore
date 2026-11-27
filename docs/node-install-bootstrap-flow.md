@@ -9,6 +9,13 @@ Install a node from live ISO to disk and ensure that, after reboot:
 - the node can join or host the controller as configured
 - certificate trust is anchored in the selected cluster CA
 
+The preferred operator path is a declarative `kind: Cluster` (or Terraform
+`kcore_cluster`) that lists nodes and a desired `version`. Apply probes the live
+ISO, installs missing nodes, and sets the cluster version. `kctl node install`
+and `kind: NodeInstall` remain for one-off installs. The agent refuses
+`InstallToDisk` unless it is running in live-ISO mode, so an mTLS call cannot
+overwrite `/etc/kcore/certs` on an already-installed node.
+
 ## Existing Debian or other Linux
 
 On a running systemd Linux server:

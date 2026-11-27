@@ -391,6 +391,7 @@ pub async fn set_version(
     drain_vms: bool,
     dry_run: bool,
     canary: CanaryArgs<'_>,
+    reboot: bool,
 ) -> Result<()> {
     if canary.disabled && (canary.soak.is_some() || canary.node.is_some()) {
         bail!("--no-canary cannot be combined with --soak or --canary");
@@ -413,6 +414,7 @@ pub async fn set_version(
             no_canary: canary.disabled,
             canary_node_id: canary.node.unwrap_or("").into(),
             channel: channel.into(),
+            reboot,
         })
         .await
         .context("set_cluster_version rpc")?

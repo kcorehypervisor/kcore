@@ -429,6 +429,27 @@ pub struct SubscriptionRow {
     pub updated_at: String,
 }
 
+/// Desired kcore release for the whole cluster. One row (`id = 1`).
+/// Written by `SetClusterVersion`; the version reconciler converges nodes onto it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterDesiredVersionRow {
+    pub version: String,
+    pub flake_ref: String,
+    pub channel: String,
+    pub drain_vms: bool,
+    pub reboot: bool,
+    pub no_canary: bool,
+    pub canary_soak_seconds: i32,
+    pub canary_node_id: String,
+    /// Generation of the last rollout this desired record started. Used to
+    /// hold after a failed or cancelled rollout until the operator applies again.
+    pub last_rollout_generation: i64,
+    /// Tag of that last rollout (`version-vX-Y-Z` name without the prefix is not
+    /// stored; the update name is).
+    pub last_rollout_name: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SharedFilesystemRow {
     pub name: String,
@@ -940,7 +961,7 @@ pub struct CrlStateRow {
 }
 
 /// Schema version written by [`Database::migrate`].
-pub const SCHEMA_VERSION: i32 = 79;
+pub const SCHEMA_VERSION: i32 = 80;
 
 /// Oldest schema a previous controller binary can still open after this release.
 /// Versions 57 and 59 only add `node_host_status`. Version 58 is unused so a
@@ -2623,6 +2644,25 @@ impl Database {
                     )?;
                 }
             }
+        }
+
+        if version < 80 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cluster_desired_version (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    version TEXT NOT NULL DEFAULT '',
+                    flake_ref TEXT NOT NULL DEFAULT '',
+                    channel TEXT NOT NULL DEFAULT '',
+                    drain_vms INTEGER NOT NULL DEFAULT 0,
+                    reboot INTEGER NOT NULL DEFAULT 0,
+                    no_canary INTEGER NOT NULL DEFAULT 0,
+                    canary_soak_seconds INTEGER NOT NULL DEFAULT 0,
+                    canary_node_id TEXT NOT NULL DEFAULT '',
+                    last_rollout_generation INTEGER NOT NULL DEFAULT 0,
+                    last_rollout_name TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                );",
+            )?;
         }
 
         const CURRENT_VERSION: i32 = SCHEMA_VERSION;
@@ -4990,6 +5030,77 @@ impl Database {
     pub fn clear_subscription(&self) -> Result<(), rusqlite::Error> {
         let conn = self.lock_conn()?;
         conn.execute("DELETE FROM subscription WHERE id = 1", [])?;
+        Ok(())
+    }
+
+    pub fn get_cluster_desired_version(
+        &self,
+    ) -> Result<Option<ClusterDesiredVersionRow>, rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT version, flake_ref, channel, drain_vms, reboot, no_canary,
+                    canary_soak_seconds, canary_node_id, last_rollout_generation,
+                    last_rollout_name, updated_at
+             FROM cluster_desired_version WHERE id = 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(ClusterDesiredVersionRow {
+                version: row.get(0)?,
+                flake_ref: row.get(1)?,
+                channel: row.get(2)?,
+                drain_vms: row.get::<_, i32>(3)? != 0,
+                reboot: row.get::<_, i32>(4)? != 0,
+                no_canary: row.get::<_, i32>(5)? != 0,
+                canary_soak_seconds: row.get(6)?,
+                canary_node_id: row.get(7)?,
+                last_rollout_generation: row.get(8)?,
+                last_rollout_name: row.get(9)?,
+                updated_at: row.get(10)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_cluster_desired_version(
+        &self,
+        row: &ClusterDesiredVersionRow,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO cluster_desired_version (
+                id, version, flake_ref, channel, drain_vms, reboot, no_canary,
+                canary_soak_seconds, canary_node_id, last_rollout_generation,
+                last_rollout_name, updated_at
+             ) VALUES (
+                1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                strftime('%Y-%m-%dT%H:%M:%SZ','now')
+             )
+             ON CONFLICT(id) DO UPDATE SET
+               version = excluded.version,
+               flake_ref = excluded.flake_ref,
+               channel = excluded.channel,
+               drain_vms = excluded.drain_vms,
+               reboot = excluded.reboot,
+               no_canary = excluded.no_canary,
+               canary_soak_seconds = excluded.canary_soak_seconds,
+               canary_node_id = excluded.canary_node_id,
+               last_rollout_generation = excluded.last_rollout_generation,
+               last_rollout_name = excluded.last_rollout_name,
+               updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            params![
+                row.version,
+                row.flake_ref,
+                row.channel,
+                row.drain_vms as i32,
+                row.reboot as i32,
+                row.no_canary as i32,
+                row.canary_soak_seconds,
+                row.canary_node_id,
+                row.last_rollout_generation,
+                row.last_rollout_name,
+            ],
+        )?;
         Ok(())
     }
 
@@ -11402,6 +11513,35 @@ mod tests {
         assert_eq!(got.token, "ghp_rotated");
         db.clear_subscription().expect("clear");
         assert!(db.get_subscription().expect("get").is_none());
+    }
+
+    #[test]
+    fn cluster_desired_version_round_trip() {
+        let db = Database::open(":memory:").expect("open");
+        assert!(db.get_cluster_desired_version().expect("get").is_none());
+        let row = ClusterDesiredVersionRow {
+            version: "v0.9.0".into(),
+            flake_ref: "github:kcorehypervisor/kcore".into(),
+            channel: "community".into(),
+            drain_vms: true,
+            reboot: true,
+            no_canary: false,
+            canary_soak_seconds: 3600,
+            canary_node_id: "node-105".into(),
+            last_rollout_generation: 2,
+            last_rollout_name: "version-v0-9-0".into(),
+            updated_at: String::new(),
+        };
+        db.upsert_cluster_desired_version(&row).expect("upsert");
+        let got = db.get_cluster_desired_version().expect("get").expect("row");
+        assert_eq!(got.version, "v0.9.0");
+        assert!(got.drain_vms);
+        assert!(got.reboot);
+        assert_eq!(got.canary_soak_seconds, 3600);
+        assert_eq!(got.canary_node_id, "node-105");
+        assert_eq!(got.last_rollout_generation, 2);
+        assert_eq!(got.last_rollout_name, "version-v0-9-0");
+        assert!(!got.updated_at.is_empty());
     }
 
     #[test]

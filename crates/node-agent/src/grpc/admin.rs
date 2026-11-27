@@ -165,6 +165,15 @@ impl AdminService {
         self
     }
 
+    /// True on the live ISO (no TLS section) and in unit tests without PKI.
+    /// An installed node always has a `[tls]` section and must refuse install.
+    fn is_live_installer(&self) -> bool {
+        match &self.pki {
+            Some(pki) => pki.cfg.tls.is_none(),
+            None => true,
+        }
+    }
+
     async fn resolve_vm_ssh_ip(
         &self,
         vm_name: &str,
@@ -6623,6 +6632,11 @@ impl proto::node_admin_server::NodeAdmin for AdminService {
         request: Request<proto::InstallToDiskRequest>,
     ) -> Result<Response<proto::InstallToDiskResponse>, Status> {
         auth::require_peer_insecure_ok(&request, &[CN_KCTL])?;
+        if !self.is_live_installer() {
+            return Err(Status::failed_precondition(
+                "this node is already installed; install-to-disk only runs on the live ISO",
+            ));
+        }
         let req = request.into_inner();
         if req.os_disk.is_empty() {
             return Err(Status::invalid_argument("os_disk is required"));
@@ -9151,6 +9165,49 @@ mod tests {
         .await
         .expect_err("missing controller mode should fail");
         assert_eq!(neither.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn install_refuses_an_installed_node_with_tls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nix_path = temp.path().join("kcore-vms.nix");
+        let cfg = crate::config::Config {
+            node_id: "node-1".into(),
+            listen_addr: "0.0.0.0:9091".into(),
+            controller_addr: String::new(),
+            controllers: vec![],
+            dc_id: "DC1".into(),
+            tls: Some(crate::config::TlsConfig {
+                ca_file: "/etc/kcore/certs/ca.crt".into(),
+                cert_file: "/etc/kcore/certs/node.crt".into(),
+                key_file: "/etc/kcore/certs/node.key".into(),
+            }),
+            vm_socket_dir: "/run/kcore".into(),
+            nix_config_path: nix_path.display().to_string(),
+            storage: crate::config::StorageConfig::default(),
+            cert_rotation: crate::config::CertRotationConfig::default(),
+            revocation: crate::config::NodeRevocationConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
+            ha: crate::config::NodeHaConfig::default(),
+        };
+        let svc = AdminService::new(nix_path.display().to_string())
+            .with_pki(cfg, crate::pki::reload::ReloadHandle::new());
+        let err = <AdminService as proto::node_admin_server::NodeAdmin>::install_to_disk(
+            &svc,
+            Request::new(proto::InstallToDiskRequest {
+                os_disk: "/dev/sda".into(),
+                run_controller: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("installed node must refuse install");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("already installed"),
+            "{}",
+            err.message()
+        );
     }
 
     #[test]

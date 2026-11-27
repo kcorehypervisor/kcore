@@ -21,10 +21,16 @@ same lock. An ISO install and an update to the same tag build the same system.
 ```bash
 kctl update version set v0.7.0            # upgrade, or downgrade to a lower tag
 kctl update version set v0.7.0 --dry-run   # resolve and compare only
+kctl update version set v0.7.0 --reboot    # force every updated node to reboot
 kctl update version get                    # the version set last and each node's
 kctl set subscription --token-file ./tok   # enterprise channel (paying customers)
 kctl update version set v0.8.0 --channel enterprise
 ```
+
+A declarative `kind: Cluster` manifest (or Terraform `kcore_cluster`) also sets the
+desired version. The controller stores it and converges approved, heartbeating
+nodes onto it. `reboot: true` / `reboot = true` only affects nodes a rollout
+updates; an unchanged version reboots nothing.
 
 `SetClusterVersion` (what `kctl` and the Terraform provider call):
 
@@ -172,8 +178,9 @@ kctl update version set v0.7.0 --soak 4h --canary node-b
 kctl update version set v0.7.0 --no-canary
 ```
 
-Terraform sets the same with `kcore_cluster_version` (`version`,
-`canary_soak_seconds`, `canary_node`, `no_canary`).
+Terraform sets the same with `kcore_cluster` (`version`, `update { reboot, … }`)
+or the deprecated `kcore_cluster_version` (`version`, `canary_soak_seconds`,
+`canary_node`, `no_canary`, `reboot`).
 
 A hand-written ClusterUpdate asks for a canary with `strategyType: canary`,
 and optionally `canarySoakSeconds` and `canaryNode`. `batch` and `per-dc` are

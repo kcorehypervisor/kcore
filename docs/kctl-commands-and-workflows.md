@@ -282,6 +282,13 @@ KubernetesCluster, ClusterUpdate, SlurmCluster, IngressGateway, IngressRoute,
 WafPolicy, NodeVgpu, Cluster, NodeInstall, Volume, SnapshotPolicy and Operator. Each has a parsed example under
 `examples/`.
 
+A `kind: Cluster` manifest can declare `spec.version`, `spec.update` (including
+`reboot`), and `spec.nodes`. Apply creates PKI when needed, installs live-ISO
+nodes, skips registered ones, and calls `SetClusterVersion`. `--dry-run` prints
+the per-node plan. Prefer that over separate `kctl create cluster` plus
+`NodeInstall` plus `kctl update version set`. `NodeInstall` remains for one-off
+installs.
+
 `Volume`, `SnapshotPolicy` and `Operator` follow the controller's own rules.
 A volume is immutable, so applying one that exists reports it and changes
 nothing. A snapshot policy is an upsert. An operator is created when missing,

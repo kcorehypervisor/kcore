@@ -18,6 +18,7 @@ mod cluster_health;
 mod cluster_update_reconciler;
 mod cluster_update_spec;
 mod cluster_version;
+mod cluster_version_reconciler;
 mod config;
 mod crypto_profile;
 mod db;
@@ -250,6 +251,10 @@ async fn main() -> anyhow::Result<()> {
             default_network: cfg.default_network.clone(),
             sub_ca: sub_ca.clone(),
         },
+    );
+    cluster_version_reconciler::spawn_cluster_version_reconciler(
+        database.clone(),
+        cfg.replication.clone(),
     );
     snapshot_policy_reconciler::spawn_snapshot_policy_reconciler(database.clone(), clients.clone());
     vm_operation_reconciler::spawn_vm_operation_reconciler(database.clone(), clients.clone());

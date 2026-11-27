@@ -172,7 +172,7 @@ describe("release controls", () => {
     await expect(set.run({ version: "v0.7.0", no_canary: "true" })).resolves.toMatchObject({ ok: true });
     await expect(set.run({ version: "v0.7.0", no_canary: "true", soak: "1h" })).rejects.toThrow(FormError);
     await expect(set.run({ version: "v0.7.0", soak: "8d" })).rejects.toThrow(FormError);
-    expect(resource("release").terraform).toEqual(["kcore_cluster_version"]);
+    expect(resource("release").terraform).toEqual(["kcore_cluster", "kcore_cluster_version"]);
   });
 
   it("promotes the canary of a cluster update, and refuses with no rollout", async () => {

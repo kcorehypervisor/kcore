@@ -396,15 +396,17 @@ test("set-version and promote-update reach the release RPCs", () => {
     noCanary: false,
     canaryNodeId: "node-b",
     channel: "",
+    reboot: false,
   });
   assert.equal(wire(buildOperation("set-version", { version: "0.7.0", channel: "enterprise" })).channel, "enterprise");
   assert.throws(() => buildOperation("set-version", { version: "0.7.0", channel: "beta" }), /channel/);
-  const plain = buildOperation("set-version", { version: "v0.7.0", noCanary: true, dryRun: true });
+  const plain = buildOperation("set-version", { version: "v0.7.0", noCanary: true, dryRun: true, reboot: true });
   const decoded = wire(plain);
   assert.equal(decoded.version, "v0.7.0");
   assert.equal(decoded.dryRun, true);
   assert.equal(decoded.noCanary, true);
   assert.equal(decoded.canarySoakSeconds, 0);
+  assert.equal(decoded.reboot, true);
   assert.throws(() => buildOperation("set-version", { version: "0.7.0", noCanary: true, soak: 60 }), /noCanary/);
   assert.throws(() => buildOperation("set-version", { version: "0.7.0", soak: "8d" }), /between/);
   assert.throws(() => buildOperation("set-version", { version: "0.7.0", soak: "soon" }), /duration/);
